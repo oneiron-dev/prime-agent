@@ -7,6 +7,7 @@ import type {
 	ResponseInput,
 	ResponseInputContent,
 	ResponseInputImage,
+	ResponseInputItem,
 	ResponseInputText,
 	ResponseOutputMessage,
 	ResponseReasoningItem,
@@ -134,6 +135,12 @@ export function convertResponsesMessages<TApi extends Api>(
 
 	let msgIndex = 0;
 	for (const msg of transformedMessages) {
+		if (msg.role === "openaiResponsesCompaction") {
+			if (msg.version === 1 && msg.provider === model.provider && msg.api === model.api && msg.model === model.id) {
+				messages.push(...(msg.items as unknown as ResponseInputItem[]));
+			}
+			continue;
+		}
 		if (msg.role === "user") {
 			if (typeof msg.content === "string") {
 				messages.push({

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added unary OpenAI Responses compaction with native replay of provider-scoped opaque compaction items.
+
 ## [0.7.1] - 2026-08-07
 
 ## [0.7.0] - 2026-08-05

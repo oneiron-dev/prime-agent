@@ -6343,6 +6343,10 @@ export class InteractiveMode {
 				// Tool results are rendered inline with tool calls, handled separately
 				break;
 			}
+			case "openaiResponsesCompaction": {
+				// Provider-opaque checkpoints are replay-only and never rendered.
+				break;
+			}
 			default: {
 				const _exhaustive: never = message;
 			}

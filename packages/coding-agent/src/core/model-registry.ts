@@ -131,6 +131,8 @@ const OpenAICompletionsCompatSchema = Type.Object({
 const OpenAIResponsesCompatSchema = Type.Object({
 	sendSessionIdHeader: Type.Optional(Type.Boolean()),
 	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
+	supportsResponsesCompact: Type.Optional(Type.Boolean()),
+	supportsWebSocket: Type.Optional(Type.Boolean()),
 });
 
 const AnthropicMessagesCompatSchema = Type.Object({

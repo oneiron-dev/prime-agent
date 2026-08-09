@@ -113,6 +113,7 @@ prime-agent --offline
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `compaction.enabled` | boolean | `true` | Enable auto-compaction |
+| `compaction.mode` | string | `"auto"` | `"auto"` uses remote compaction only when model compatibility declares support, `"remote"` requires that declaration, and `"local"` always uses a text summary |
 | `compaction.reserveTokens` | number | `16384` | Tokens reserved for LLM response |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens to keep (not summarized) |
 
@@ -120,6 +121,7 @@ prime-agent --offline
 {
   "compaction": {
     "enabled": true,
+    "mode": "auto",
     "reserveTokens": 16384,
     "keepRecentTokens": 20000
   }
@@ -299,6 +301,7 @@ See [packages.md](packages.md) for package management details.
   "theme": "dark",
   "compaction": {
     "enabled": true,
+    "mode": "auto",
     "reserveTokens": 16384,
     "keepRecentTokens": 20000
   },

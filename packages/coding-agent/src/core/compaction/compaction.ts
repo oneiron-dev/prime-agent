@@ -7,14 +7,23 @@
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai";
+import { compactOpenAIResponses, completeSimple, createOpenAIResponsesCompactionMessage } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "../messages.js";
-import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
+import {
+	buildSessionContext,
+	type CompactionEntry,
+	type CompactionFallback,
+	type CompactionMechanism,
+	isValidRemoteCompactionState,
+	type RemoteCompactionState,
+	type SessionEntry,
+} from "../session-manager.js";
+import type { CompactionMode } from "../settings-manager.js";
 import {
 	computeFileLists,
 	createFileOps,
@@ -87,6 +96,14 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 		return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
 	}
 	if (entry.type === "compaction") {
+		if (entry.mechanism === "remote" && isValidRemoteCompactionState(entry.remoteCompaction)) {
+			return createOpenAIResponsesCompactionMessage(
+				entry.remoteCompaction.provider,
+				entry.remoteCompaction.modelId,
+				entry.remoteCompaction.items,
+				new Date(entry.timestamp).getTime(),
+			);
+		}
 		return createCompactionSummaryMessage(
 			entry.summary,
 			entry.tokensBefore,
@@ -111,6 +128,18 @@ export interface CompactionResult<T = unknown> {
 	tokensBefore: number;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
+	mechanism?: CompactionMechanism;
+	remoteCompaction?: RemoteCompactionState;
+	fallback?: CompactionFallback;
+}
+
+export function projectCompactionResultForExternalUse<T>(result: CompactionResult<T>): CompactionResult<T> {
+	return {
+		summary: result.summary,
+		firstKeptEntryId: result.firstKeptEntryId,
+		tokensBefore: result.tokensBefore,
+		details: result.details,
+	};
 }
 
 // ============================================================================
@@ -121,12 +150,14 @@ export const COMPACT_SKILL_NAME = "compact";
 
 export interface CompactionSettings {
 	enabled: boolean;
+	mode?: CompactionMode;
 	reserveTokens: number;
 	keepRecentTokens: number;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
+	mode: "auto",
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
 };
@@ -295,6 +326,8 @@ export function estimateTokens(message: AgentMessage): number {
 			chars = message.summary.length;
 			return Math.ceil(chars / 4);
 		}
+		case "openaiResponsesCompaction":
+			return 0;
 	}
 
 	return 0;
@@ -324,6 +357,7 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 						cutPoints.push(i);
 						break;
 					case "toolResult":
+					case "openaiResponsesCompaction":
 						break;
 				}
 				break;
@@ -625,8 +659,10 @@ export interface CompactionPreparation {
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
-	/** Summary from previous compaction, for iterative update */
+	/** Summary from previous local compaction, for iterative update. */
 	previousSummary?: string;
+	/** Opaque checkpoint from the previous remote compaction, for native replay. */
+	previousRemoteCompaction?: RemoteCompactionState;
 	/** File operations extracted from messagesToSummarize */
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
@@ -636,6 +672,7 @@ export interface CompactionPreparation {
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	options: { restartFromRoot?: boolean } = {},
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -650,12 +687,21 @@ export function prepareCompaction(
 	}
 
 	let previousSummary: string | undefined;
+	let previousRemoteCompaction: RemoteCompactionState | undefined;
 	let boundaryStart = 0;
-	if (prevCompactionIndex >= 0) {
+	if (prevCompactionIndex >= 0 && !options.restartFromRoot) {
 		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
-		previousSummary = prevCompaction.summary;
-		const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
-		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
+		if (prevCompaction.mechanism === "remote") {
+			if (isValidRemoteCompactionState(prevCompaction.remoteCompaction)) {
+				previousRemoteCompaction = prevCompaction.remoteCompaction;
+				const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
+				boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
+			}
+		} else {
+			previousSummary = prevCompaction.summary;
+			const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
+			boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
+		}
 	}
 	const boundaryEnd = pathEntries.length;
 
@@ -690,7 +736,12 @@ export function prepareCompaction(
 
 	// Everything fits in the keep-recent window and there is no previous summary
 	// to carry forward — compacting would summarize an empty conversation.
-	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0 && !previousSummary) {
+	if (
+		messagesToSummarize.length === 0 &&
+		turnPrefixMessages.length === 0 &&
+		!previousSummary &&
+		!previousRemoteCompaction
+	) {
 		return undefined;
 	}
 
@@ -711,6 +762,7 @@ export function prepareCompaction(
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,
+		previousRemoteCompaction,
 		fileOps,
 		settings,
 	};
@@ -821,6 +873,82 @@ export async function compact(
 		firstKeptEntryId,
 		tokensBefore,
 		details: { readFiles, modifiedFiles } as CompactionDetails,
+		mechanism: "local",
+	};
+}
+
+export function shouldUseRemoteCompaction(model: Model<any>, mode: CompactionMode): boolean {
+	if (mode === "local" || model.api !== "openai-responses") return false;
+	return (model as Model<"openai-responses">).compat?.supportsResponsesCompact === true;
+}
+
+export function remoteCompactionCompatibilityError(model: Model<any>, mode: CompactionMode): string | undefined {
+	if (mode !== "remote" || shouldUseRemoteCompaction(model, mode)) return undefined;
+	return `Remote compaction is not declared supported for ${model.provider}/${model.id} (${model.api})`;
+}
+
+export function canReplayRemoteCompaction(state: RemoteCompactionState, model: Model<any>): boolean {
+	return (
+		isValidRemoteCompactionState(state) &&
+		model.api === "openai-responses" &&
+		state.provider === model.provider &&
+		state.api === model.api &&
+		state.modelId === model.id
+	);
+}
+
+export async function compactRemote(
+	preparation: CompactionPreparation,
+	model: Model<"openai-responses">,
+	apiKey: string,
+	systemPrompt: string,
+	headers?: Record<string, string>,
+	customInstructions?: string,
+	signal?: AbortSignal,
+	sessionId?: string,
+): Promise<CompactionResult<CompactionDetails>> {
+	const remoteMessages: AgentMessage[] = [];
+	if (preparation.previousSummary) {
+		remoteMessages.push(
+			createCompactionSummaryMessage(
+				preparation.previousSummary,
+				preparation.tokensBefore,
+				new Date().toISOString(),
+			),
+		);
+	}
+	if (preparation.previousRemoteCompaction) {
+		remoteMessages.push(
+			createOpenAIResponsesCompactionMessage(
+				preparation.previousRemoteCompaction.provider,
+				preparation.previousRemoteCompaction.modelId,
+				preparation.previousRemoteCompaction.items,
+			),
+		);
+	}
+	remoteMessages.push(...preparation.messagesToSummarize, ...preparation.turnPrefixMessages);
+	const result = await compactOpenAIResponses(
+		model,
+		{ systemPrompt, messages: convertToLlm(remoteMessages) },
+		{ apiKey, headers, signal, sessionId, customInstructions },
+	);
+	const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
+	const summary =
+		"Provider-native OpenAI Responses compaction checkpoint (opaque)." +
+		formatFileOperations(readFiles, modifiedFiles);
+	return {
+		summary,
+		firstKeptEntryId: preparation.firstKeptEntryId,
+		tokensBefore: preparation.tokensBefore,
+		details: { readFiles, modifiedFiles },
+		mechanism: "remote",
+		remoteCompaction: {
+			version: 1,
+			provider: model.provider,
+			api: "openai-responses",
+			modelId: model.id,
+			items: result.items,
+		},
 	};
 }
 

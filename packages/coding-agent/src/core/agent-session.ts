@@ -42,6 +42,7 @@ import type {
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	getResponsesCompactFallbackReason,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	modelsAreEqual,
@@ -107,12 +108,17 @@ import {
 	COMPACT_SKILL_NAME,
 	type CompactionResult,
 	calculateContextTokens,
+	canReplayRemoteCompaction,
 	collectEntriesForBranchSummary,
 	compact,
+	compactRemote,
 	estimateContextTokens,
 	generateBranchSummary,
 	prepareCompaction,
+	projectCompactionResultForExternalUse,
+	remoteCompactionCompatibilityError,
 	shouldCompact,
+	shouldUseRemoteCompaction,
 } from "./compaction/index.js";
 import {
 	type ContextTreeNode,
@@ -251,6 +257,7 @@ import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessag
 import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
+	projectSessionEntryForExternalUse,
 	type SessionHeader,
 	SessionManager,
 } from "./session-manager.js";
@@ -6621,7 +6628,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
+		this.sessionManager.appendModelChange(model.provider, model.id, model.api);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
 		// Re-clamp thinking level for new model's capabilities
@@ -6696,7 +6703,7 @@ export class AgentSession {
 
 		// Apply model
 		this.agent.state.model = next.model;
-		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+		this.sessionManager.appendModelChange(next.model.provider, next.model.id, next.model.api);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
 		// Apply thinking level.
@@ -6739,7 +6746,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = nextModel;
-		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id, nextModel.api);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
 		// Re-clamp thinking level for new model's capabilities
@@ -7130,10 +7137,81 @@ export class AgentSession {
 			}
 		}
 
-		const { summary, firstKeptEntryId, tokensBefore, details } =
-			extensionCompaction ??
-			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
+		const compactionMode = settings.mode ?? "auto";
+		const compatibilityError = extensionCompaction
+			? undefined
+			: remoteCompactionCompatibilityError(model, compactionMode);
+		if (compatibilityError) {
+			throw new CompactionSkippedError(compatibilityError);
+		}
 
+		let compactionResult: CompactionResult;
+		if (extensionCompaction) {
+			compactionResult = {
+				...extensionCompaction,
+				mechanism: "extension",
+				remoteCompaction: undefined,
+			};
+		} else if (shouldUseRemoteCompaction(model, compactionMode)) {
+			try {
+				const remotePreparation =
+					preparation.previousRemoteCompaction &&
+					!canReplayRemoteCompaction(preparation.previousRemoteCompaction, model)
+						? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+						: preparation;
+				if (!remotePreparation) {
+					throw new CompactionSkippedError("Session is too short to rebuild for remote compaction");
+				}
+				compactionResult = await compactRemote(
+					remotePreparation,
+					model as Model<"openai-responses">,
+					apiKey,
+					this.systemPrompt,
+					headers,
+					customInstructions,
+					signal,
+					this.sessionManager.getSessionId(),
+				);
+			} catch (error) {
+				const fallbackReason = getResponsesCompactFallbackReason(error);
+				if (!fallbackReason) throw error;
+				const localPreparation = preparation.previousRemoteCompaction
+					? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+					: preparation;
+				if (!localPreparation) {
+					throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
+				}
+				compactionResult = await compact(
+					localPreparation,
+					model,
+					apiKey,
+					headers,
+					customInstructions,
+					signal,
+					this.thinkingLevel,
+				);
+				compactionResult.fallback = { from: "remote", reason: fallbackReason };
+			}
+		} else {
+			const localPreparation = preparation.previousRemoteCompaction
+				? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+				: preparation;
+			if (!localPreparation) {
+				throw new CompactionSkippedError("Session is too short to compact locally");
+			}
+			compactionResult = await compact(
+				localPreparation,
+				model,
+				apiKey,
+				headers,
+				customInstructions,
+				signal,
+				this.thinkingLevel,
+			);
+		}
+
+		const { summary, firstKeptEntryId, tokensBefore, details, mechanism, remoteCompaction, fallback } =
+			compactionResult;
 		if (signal.aborted) {
 			throw new Error("Compaction cancelled");
 		}
@@ -7145,6 +7223,7 @@ export class AgentSession {
 			details,
 			fromExtension,
 			customInstructions,
+			{ mechanism: mechanism ?? (fromExtension ? "extension" : "local"), remoteCompaction, fallback },
 		);
 		const newEntries = this.sessionManager.getEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
@@ -7158,14 +7237,14 @@ export class AgentSession {
 		if (savedCompactionEntry) {
 			await this._extensionRunner.emit({
 				type: "session_compact",
-				compactionEntry: savedCompactionEntry,
+				compactionEntry: projectSessionEntryForExternalUse(savedCompactionEntry) as CompactionEntry,
 				fromExtension,
 			});
 		}
 		await this._notifyKernelStateAfterCompaction();
 		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
 
-		return { summary, firstKeptEntryId, tokensBefore, details };
+		return projectCompactionResultForExternalUse(compactionResult);
 	}
 
 	private async _reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void> {
@@ -8975,7 +9054,7 @@ export class AgentSession {
 				rlmDepth: options.rlmDepth,
 			});
 		}
-		childSessionManager.appendModelChange(options.model.provider, options.model.id);
+		childSessionManager.appendModelChange(options.model.provider, options.model.id, options.model.api);
 		childSessionManager.appendThinkingLevelChange(options.thinkingLevel);
 		childSessionManager.appendServiceTierChange(options.serviceTier);
 
@@ -11124,7 +11203,10 @@ export class AgentSession {
 		// Re-chain parentIds to form a linear sequence
 		let prevId: string | null = null;
 		for (const entry of branchEntries) {
-			const linear = { ...entry, parentId: prevId };
+			// Opaque remote checkpoints are not portable. Omit them so a reopened
+			// export rebuilds from the original ancestor messages retained in JSONL.
+			if (entry.type === "compaction" && entry.mechanism === "remote") continue;
+			const linear = { ...projectSessionEntryForExternalUse(entry), parentId: prevId };
 			lines.push(JSON.stringify(linear));
 			prevId = entry.id;
 		}

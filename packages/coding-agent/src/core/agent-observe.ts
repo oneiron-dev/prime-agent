@@ -158,6 +158,8 @@ function messageText(message: AgentMessage): string {
 			return message.summary;
 		case "compactionSummary":
 			return message.summary;
+		case "openaiResponsesCompaction":
+			return "[remote compaction checkpoint]";
 		default: {
 			const exhaustive: never = message;
 			return JSON.stringify(exhaustive);

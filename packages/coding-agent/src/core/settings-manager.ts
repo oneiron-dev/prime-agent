@@ -8,8 +8,11 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
 
+export type CompactionMode = "auto" | "remote" | "local";
+
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
+	mode?: CompactionMode; // default: auto
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
 	agentCallable?: boolean; // default: true - expose the compact skill so the model can request compaction
@@ -860,6 +863,10 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getCompactionMode(): CompactionMode {
+		return this.settings.compaction?.mode ?? "auto";
+	}
+
 	getCompactionReserveTokens(): number {
 		return this.settings.compaction?.reserveTokens ?? 16384;
 	}
@@ -872,9 +879,15 @@ export class SettingsManager {
 		return this.settings.compaction?.agentCallable ?? true;
 	}
 
-	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
+	getCompactionSettings(): {
+		enabled: boolean;
+		mode: CompactionMode;
+		reserveTokens: number;
+		keepRecentTokens: number;
+	} {
 		return {
 			enabled: this.getCompactionEnabled(),
+			mode: this.getCompactionMode(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
 		};

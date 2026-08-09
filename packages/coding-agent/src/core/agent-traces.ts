@@ -11,7 +11,12 @@ import {
 	PRIME_INFERENCE_PROVIDER_ID,
 	resolvePrimeAgentTracesBaseUrl,
 } from "./prime-inference-auth.js";
-import type { SessionHeader, SessionManager } from "./session-manager.js";
+import {
+	projectSessionEntryForExternalUse,
+	type SessionEntry,
+	type SessionHeader,
+	type SessionManager,
+} from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
 
 const MAX_TRACE_BYTES = 20 * 1024 * 1024;
@@ -138,6 +143,22 @@ function stringEnv(name: string): string | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function projectSessionJsonlForExternalUse(body: string): string {
+	return body
+		.split("\n")
+		.map((line) => {
+			if (!line.trim()) return line;
+			try {
+				const value: unknown = JSON.parse(line);
+				if (!isRecord(value) || value.type === "session") return line;
+				return JSON.stringify(projectSessionEntryForExternalUse(value as unknown as SessionEntry));
+			} catch {
+				return line;
+			}
+		})
+		.join("\n");
 }
 
 function describeError(error: unknown): string {
@@ -486,7 +507,7 @@ export async function previewAgentTraceFile(options: AgentTracePreviewOptions): 
 	let body = "";
 	if (fileSize <= MAX_TRACE_BYTES) {
 		try {
-			body = await readFile(options.sessionFile, "utf8");
+			body = projectSessionJsonlForExternalUse(await readFile(options.sessionFile, "utf8"));
 		} catch (error) {
 			return { status: "failed", message: describeError(error) };
 		}
@@ -766,7 +787,7 @@ async function performAgentTraceUpload(
 
 	let body: string;
 	try {
-		body = await readFile(options.sessionFile, "utf8");
+		body = projectSessionJsonlForExternalUse(await readFile(options.sessionFile, "utf8"));
 	} catch (error) {
 		return { status: "failed", message: describeError(error) };
 	}

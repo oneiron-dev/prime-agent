@@ -545,6 +545,10 @@ function toChatMessages(messages: Message[], supportsImages: boolean): ChatCompl
 			continue;
 		}
 
+		if (msg.role === "openaiResponsesCompaction") {
+			continue;
+		}
+
 		const toolContent: ContentChunk[] = [];
 		const textResult = msg.content
 			.filter((part) => part.type === "text")

@@ -247,7 +247,27 @@ export interface ToolResultMessage<TDetails = any> {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
-export type Message = UserMessage | AssistantMessage | ToolResultMessage;
+/** Opaque Responses API item returned by `/responses/compact`. */
+export interface OpenAIResponsesCompactionItem {
+	type: string;
+	[key: string]: unknown;
+}
+
+/**
+ * Provider-scoped compaction state replayed natively by the OpenAI Responses provider.
+ * Other providers ignore this message instead of serializing the opaque items as text.
+ */
+export interface OpenAIResponsesCompactionMessage {
+	role: "openaiResponsesCompaction";
+	version: 1;
+	provider: Provider;
+	api: "openai-responses";
+	model: string;
+	items: OpenAIResponsesCompactionItem[];
+	timestamp: number;
+}
+
+export type Message = UserMessage | AssistantMessage | ToolResultMessage | OpenAIResponsesCompactionMessage;
 
 import type { TSchema } from "typebox";
 
@@ -332,6 +352,10 @@ export interface OpenAIResponsesCompat {
 	sendSessionIdHeader?: boolean;
 	/** Whether the provider supports `prompt_cache_retention: "24h"`. Default: true. */
 	supportsLongCacheRetention?: boolean;
+	/** Whether the provider/model supports unary `POST /responses/compact`. Default: false. */
+	supportsResponsesCompact?: boolean;
+	/** Whether the provider/model supports Responses WebSocket transport. Default: false. */
+	supportsWebSocket?: boolean;
 }
 
 /** Compatibility settings for Anthropic Messages-compatible APIs. */

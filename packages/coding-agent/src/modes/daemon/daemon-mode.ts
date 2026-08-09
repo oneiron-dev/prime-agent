@@ -109,6 +109,9 @@ import {
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
 import {
+	projectAgentMessagesForExternalUse,
+	projectSessionContextForExternalUse,
+	projectSessionFlatTreeForExternalUse,
 	readSessionInfo,
 	resolveSessionRlmDepth,
 	type SessionInfo,
@@ -2924,7 +2927,7 @@ export class AgentDaemon {
 		this.assertAgentFamilyReachable(currentState, targetState);
 		const limit = normalizeObserveLimit(input.limit);
 		const maxChars = normalizeObserveMaxChars(input.maxChars);
-		const messages = targetState.runtime.session.messages;
+		const messages = projectAgentMessagesForExternalUse(targetState.runtime.session.messages);
 		const startIndex = Math.max(0, messages.length - limit);
 		return {
 			agent: this.createAgentObserveSummary(targetState, currentState),
@@ -2943,7 +2946,7 @@ export class AgentDaemon {
 	): AgentObserveAgentSummary {
 		const summary = summaryForActiveSession(state);
 		const session = state.runtime.session;
-		const messages = session.messages;
+		const messages = projectAgentMessagesForExternalUse(session.messages);
 		const latest = messages.at(-1);
 		const status = session.isStreaming
 			? session.state.pendingToolCalls.size > 0
@@ -4126,7 +4129,7 @@ export class AgentDaemon {
 			case "get_messages": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_messages", {
-					messages: state.runtime.session.messages,
+					messages: projectAgentMessagesForExternalUse(state.runtime.session.messages),
 				});
 			}
 
@@ -4462,14 +4465,14 @@ export class AgentDaemon {
 			case "get_session_context": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_session_context", {
-					context: state.runtime.session.buildSessionContext(),
+					context: projectSessionContextForExternalUse(state.runtime.session.buildSessionContext()),
 				});
 			}
 
 			case "get_session_tree": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_session_tree", {
-					flatNodes: state.runtime.session.sessionManager.getFlatTree(),
+					flatNodes: projectSessionFlatTreeForExternalUse(state.runtime.session.sessionManager.getFlatTree()),
 					leafId: state.runtime.session.sessionManager.getLeafId(),
 				});
 			}
@@ -4616,7 +4619,7 @@ export class AgentDaemon {
 			activeSessionId: state.activeSessionId,
 			summary: summaryForActiveSession(state),
 			state: connectionState,
-			messages: session.messages,
+			messages: projectAgentMessagesForExternalUse(session.messages),
 			// Omit duplicate heavy payloads from attach. The client can derive render
 			// context from messages + state, and fetch the full session tree lazily
 			// when the tree/branch selector opens.

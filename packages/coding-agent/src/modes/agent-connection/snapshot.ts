@@ -3,6 +3,11 @@ import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { AgentSession } from "../../core/agent-session.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
+import {
+	projectAgentMessagesForExternalUse,
+	projectSessionContextForExternalUse,
+	projectSessionTreeForExternalUse,
+} from "../../core/session-manager.js";
 import type {
 	AgentConnectionArtifactReference,
 	AgentConnectionArtifactType,
@@ -65,13 +70,14 @@ export function createAgentConnectionSnapshot(
 ): AgentConnectionSnapshot {
 	const session = runtime.session;
 	const sessionManager = session.sessionManager;
+	const streamingMessage = session.state?.streamingMessage;
 	return {
 		state: createAgentConnectionState(runtime, activeSessionId),
-		messages: [...session.messages],
-		...(session.state?.streamingMessage ? { streamingMessage: session.state.streamingMessage } : {}),
-		sessionContext: session.buildSessionContext(),
+		messages: projectAgentMessagesForExternalUse(session.messages),
+		...(streamingMessage && streamingMessage.role !== "openaiResponsesCompaction" ? { streamingMessage } : {}),
+		sessionContext: projectSessionContextForExternalUse(session.buildSessionContext()),
 		sessionTree: {
-			tree: sessionManager.getTree(),
+			tree: projectSessionTreeForExternalUse(sessionManager.getTree()),
 			leafId: sessionManager.getLeafId(),
 		},
 	};

@@ -5,7 +5,7 @@ import { APP_NAME, getExportTemplateDir } from "../../config.js";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/interactive/theme/theme.js";
 import type { ToolDefinition } from "../extensions/types.js";
 import type { SessionEntry } from "../session-manager.js";
-import { SessionManager } from "../session-manager.js";
+import { projectSessionEntryForExternalUse, SessionManager } from "../session-manager.js";
 
 /**
  * Interface for rendering custom tools to HTML.
@@ -261,7 +261,7 @@ export async function exportSessionToHtml(
 
 	const sessionData: SessionData = {
 		header: sm.getHeader(),
-		entries,
+		entries: entries.map(projectSessionEntryForExternalUse),
 		leafId: sm.getLeafId(),
 		systemPrompt: state?.systemPrompt,
 		tools: state?.tools?.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
@@ -295,7 +295,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 
 	const sessionData: SessionData = {
 		header: sm.getHeader(),
-		entries: sm.getEntries(),
+		entries: sm.getEntries().map(projectSessionEntryForExternalUse),
 		leafId: sm.getLeafId(),
 		systemPrompt: undefined,
 		tools: undefined,

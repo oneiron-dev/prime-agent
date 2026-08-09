@@ -358,7 +358,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	} else {
 		// Save initial configuration for new sessions so it can be restored on resume.
 		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
+			sessionManager.appendModelChange(model.provider, model.id, model.api);
 		}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}

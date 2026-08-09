@@ -16,7 +16,12 @@ import type {
 import type { ExtensionUIContext } from "../../core/extensions/types.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
-import { SessionManager } from "../../core/session-manager.js";
+import {
+	projectAgentMessagesForExternalUse,
+	projectSessionContextForExternalUse,
+	projectSessionTreeForExternalUse,
+	SessionManager,
+} from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
@@ -93,7 +98,7 @@ export class InProcessAgentConnection implements AgentConnection {
 			await this.emit({
 				type: "session_replaced",
 				state: createAgentConnectionState(this.runtimeHost),
-				messages: this.runtimeHost.session.messages,
+				messages: projectAgentMessagesForExternalUse(this.runtimeHost.session.messages),
 			});
 		});
 	}
@@ -126,7 +131,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getMessages(): Promise<AgentMessage[]> {
-		return this.session.state.messages;
+		return projectAgentMessagesForExternalUse(this.session.state.messages);
 	}
 
 	async getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined> {
@@ -158,12 +163,12 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getSessionContext(): Promise<AgentConnectionSessionContext> {
-		return this.session.buildSessionContext();
+		return projectSessionContextForExternalUse(this.session.buildSessionContext());
 	}
 
 	async getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }> {
 		return {
-			tree: this.session.sessionManager.getTree(),
+			tree: projectSessionTreeForExternalUse(this.session.sessionManager.getTree()),
 			leafId: this.session.sessionManager.getLeafId(),
 		};
 	}
