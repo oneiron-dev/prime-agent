@@ -1,5 +1,4 @@
 import type { ResponseInput, ResponseStreamEvent } from "openai/resources/responses/responses.js";
-import NodeWebSocket from "ws";
 import { registerSessionResourceCleanup } from "../session-resources.js";
 import type { Api, AssistantMessage, Model } from "../types.js";
 import type { AssistantMessageEventStream } from "../utils/event-stream.js";
@@ -23,16 +22,30 @@ type SocketConstructor = new (
 	url: string,
 	protocols?: string | string[] | { headers?: Record<string, string> },
 ) => Socket;
-let socketConstructorOverride: SocketConstructor | undefined;
-export function setOpenAIResponsesWebSocketConstructorForTesting(ctor?: SocketConstructor): void {
+type UndiciModule = { WebSocket: SocketConstructor };
+type DynamicImport = (specifier: string) => Promise<unknown>;
+const dynamicImport: DynamicImport = (specifier) => import(specifier);
+const UNDICI_SPECIFIER = "un" + "dici";
+let socketConstructorOverride: SocketConstructor | null | undefined;
+let authenticatedSocketConstructorPromise: Promise<SocketConstructor | undefined> | undefined;
+
+function loadAuthenticatedSocketConstructor(): Promise<SocketConstructor | undefined> {
+	if (socketConstructorOverride !== undefined) return Promise.resolve(socketConstructorOverride ?? undefined);
+	if (typeof process === "undefined" || !(process.versions?.node || process.versions?.bun)) {
+		return Promise.resolve(undefined);
+	}
+	authenticatedSocketConstructorPromise ??= dynamicImport(UNDICI_SPECIFIER)
+		.then((module) => (module as UndiciModule).WebSocket)
+		.catch(() => undefined);
+	return authenticatedSocketConstructorPromise;
+}
+
+export function setOpenAIResponsesWebSocketConstructorForTesting(ctor?: SocketConstructor | null): void {
 	socketConstructorOverride = ctor;
 }
 
-export function hasAuthenticatedOpenAIResponsesWebSocketRuntime(): boolean {
-	return (
-		socketConstructorOverride !== undefined ||
-		(typeof process !== "undefined" && Boolean(process.versions?.node || process.versions?.bun))
-	);
+export async function hasAuthenticatedOpenAIResponsesWebSocketRuntime(): Promise<boolean> {
+	return (await loadAuthenticatedSocketConstructor()) !== undefined;
 }
 interface RequestBody {
 	input?: ResponseInput | string;
@@ -84,9 +97,7 @@ function errorFromEvent(event: unknown, fallback: string): Error {
 }
 async function connect(url: string, headers: Headers, signal?: AbortSignal): Promise<Socket> {
 	if (signal?.aborted) throw new Error("Request was aborted");
-	const isNodeRuntime = typeof process !== "undefined" && Boolean(process.versions?.node || process.versions?.bun);
-	const Ctor =
-		socketConstructorOverride ?? (isNodeRuntime ? (NodeWebSocket as unknown as SocketConstructor) : undefined);
+	const Ctor = await loadAuthenticatedSocketConstructor();
 	if (!Ctor) throw new Error("Authenticated WebSocket transport is not available in this runtime");
 	return new Promise((resolve, reject) => {
 		let socket: Socket;

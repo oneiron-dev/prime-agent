@@ -25,7 +25,11 @@ import {
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
-import { processOpenAIResponsesWebSocket, resolveOpenAIResponsesWebSocketUrl } from "./openai-responses-websocket.js";
+import {
+	hasAuthenticatedOpenAIResponsesWebSocketRuntime,
+	processOpenAIResponsesWebSocket,
+	resolveOpenAIResponsesWebSocketUrl,
+} from "./openai-responses-websocket.js";
 import { buildBaseOptions } from "./simple-options.js";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -117,7 +121,10 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 				) => applyServiceTierPricing(usage, serviceTier, model),
 			};
 			const transport = options?.transport ?? "auto";
-			const websocketEnabled = transport !== "sse" && (transport !== "auto" || compat.supportsWebSocket);
+			const websocketEnabled =
+				transport !== "sse" &&
+				(transport !== "auto" ||
+					(compat.supportsWebSocket && (await hasAuthenticatedOpenAIResponsesWebSocketRuntime())));
 			let requestId: string | undefined;
 			let websocketStarted = false;
 			if (websocketEnabled) {

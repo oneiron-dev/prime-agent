@@ -248,6 +248,13 @@ describe("generic OpenAI Responses WebSocket transport", () => {
 		expect(onResponse).toHaveBeenCalledOnce();
 		expect(onResponse).toHaveBeenCalledWith({ status: 101, headers: {} }, model);
 	});
+	it("keeps auto on SSE when authenticated WebSocket headers are unavailable", async () => {
+		setOpenAIResponsesWebSocketConstructorForTesting(null);
+		for await (const _event of streamOpenAIResponses(model, { messages: [] }, { apiKey: "key", transport: "auto" })) {
+		}
+		expect(MockWebSocket.instances).toHaveLength(0);
+		expect(sdk.calls).toBe(1);
+	});
 	it("keeps auto on SSE when the model does not advertise WebSocket support", async () => {
 		setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
 		const sseOnlyModel = { ...model, compat: { supportsWebSocket: false } };
