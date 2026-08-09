@@ -116,4 +116,100 @@ describe("OpenAI Responses remote compaction", () => {
 			getResponsesCompactFallbackReason(Object.assign(new Error("server error"), { status: 500 })),
 		).toBeUndefined();
 	});
+
+	const compactionSummaryItem = {
+		type: "compaction_summary",
+		id: "cmp_summary_1",
+		encrypted_content: "cpa-opaque-ciphertext",
+		extra_future_field: { preserved: true },
+	};
+
+	async function compactWithOutput(output: unknown[]) {
+		const fetchMock = vi.fn(async () => {
+			return new Response(
+				JSON.stringify({
+					id: "resp_compact_1",
+					object: "response.compaction",
+					created_at: 1,
+					output,
+					usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 },
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const result = await compactOpenAIResponses(
+			model,
+			{ messages: [{ role: "user", content: "old context", timestamp: 1 }] },
+			{ apiKey: "test-key", maxRetries: 0 },
+		);
+		return { result, fetchMock };
+	}
+
+	it("accepts CPA compaction_summary checkpoints with nonempty encrypted_content", async () => {
+		const output = [
+			{ type: "message", role: "user", id: "msg_1", status: "completed", content: [] },
+			compactionSummaryItem,
+		];
+		const { result } = await compactWithOutput(output);
+		expect(result.items).toEqual(output);
+		expect(result.items.at(-1)).toEqual(compactionSummaryItem);
+	});
+
+	it("accepts OpenAI compaction checkpoints and preserves companion item order/types/fields", async () => {
+		const output = [
+			{ type: "message", role: "assistant", id: "msg_a", status: "completed", content: [], future_a: 1 },
+			compactionItem,
+			{ type: "unknown_companion", id: "uc_1", payload: { keep: true } },
+		];
+		const { result } = await compactWithOutput(output);
+		expect(result.items).toEqual(output);
+		expect(result.items.map((item) => item.type)).toEqual(["message", "compaction", "unknown_companion"]);
+	});
+
+	it("fail-closes when checkpoint encrypted_content is empty or missing", async () => {
+		await expect(
+			compactWithOutput([
+				{ type: "message", role: "user", id: "msg_1", status: "completed", content: [] },
+				{ type: "compaction_summary", id: "cmp_empty", encrypted_content: "" },
+			]),
+		).rejects.toThrow(/invalid output items/);
+		await expect(
+			compactWithOutput([
+				{ type: "compaction", id: "cmp_missing" },
+				{ type: "message", role: "user", id: "msg_1", status: "completed", content: [] },
+			]),
+		).rejects.toThrow(/invalid output items/);
+		await expect(
+			compactWithOutput([{ type: "message", role: "user", id: "msg_1", status: "completed", content: [] }]),
+		).rejects.toThrow(/invalid output items/);
+	});
+
+	it("replays compaction and compaction_summary items repeatedly without mutation", () => {
+		const withSummary = createOpenAIResponsesCompactionMessage(
+			"cpa-r",
+			"gpt-test",
+			[{ type: "message", role: "user", id: "msg_1", status: "completed", content: [] }, compactionSummaryItem],
+			1,
+		);
+		const withCompaction = createOpenAIResponsesCompactionMessage("cpa-r", "gpt-test", [compactionItem], 1);
+		const convert = (messages: Context["messages"]) =>
+			convertResponsesMessages(model, { messages }, new Set(["openai", "openai-codex", "opencode"]), {
+				includeSystemPrompt: false,
+			});
+
+		const firstSummary = convert([withSummary]);
+		const secondSummary = convert([withSummary]);
+		expect(firstSummary).toEqual(withSummary.items);
+		expect(secondSummary).toEqual(withSummary.items);
+		expect(firstSummary).toEqual(secondSummary);
+
+		const firstCompaction = convert([withCompaction]);
+		const secondCompaction = convert([withCompaction]);
+		expect(firstCompaction).toEqual([compactionItem]);
+		expect(secondCompaction).toEqual([compactionItem]);
+		// Source message items remain untouched across repeated replays
+		expect(withSummary.items.at(-1)).toEqual(compactionSummaryItem);
+		expect(withCompaction.items.at(-1)).toEqual(compactionItem);
+	});
 });

@@ -524,15 +524,17 @@ export function isValidRemoteCompactionState(value: unknown): value is RemoteCom
 	) {
 		return false;
 	}
-	let hasCompactionItem = false;
+	let hasCompactionCheckpoint = false;
 	for (const item of value.items) {
 		if (!isRecord(item) || typeof item.type !== "string") return false;
-		if (item.type === "compaction") {
+		// Accept OpenAI `compaction` and CPA `compaction_summary` checkpoint types.
+		// Unknown companion item types are allowed; one valid checkpoint is required.
+		if (item.type === "compaction" || item.type === "compaction_summary") {
 			if (typeof item.encrypted_content !== "string" || item.encrypted_content.length === 0) return false;
-			hasCompactionItem = true;
+			hasCompactionCheckpoint = true;
 		}
 	}
-	return hasCompactionItem;
+	return hasCompactionCheckpoint;
 }
 
 function remoteCompactionMatchesModel(

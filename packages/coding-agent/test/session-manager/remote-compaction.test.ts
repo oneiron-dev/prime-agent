@@ -258,6 +258,20 @@ describe("remote compaction session replay", () => {
 			modelId: "gpt-test",
 			items: [{ type: "compaction", encrypted_content: "" }],
 		},
+		{
+			version: 1,
+			provider: "cpa-r",
+			api: "openai-responses",
+			modelId: "gpt-test",
+			items: [{ type: "compaction_summary", encrypted_content: "" }],
+		},
+		{
+			version: 1,
+			provider: "cpa-r",
+			api: "openai-responses",
+			modelId: "gpt-test",
+			items: [{ type: "message", role: "user", id: "msg_only" }],
+		},
 	])("fails closed to raw history for malformed remote state %#", (malformed) => {
 		const { entries, compaction } = fixture();
 		compaction.remoteCompaction = malformed as RemoteCompactionState;
@@ -265,6 +279,40 @@ describe("remote compaction session replay", () => {
 		expect(context.messages.some((message) => message.role === "openaiResponsesCompaction")).toBe(false);
 		expect(context.messages[0]?.role).toBe("user");
 		expect(JSON.stringify(context.messages)).not.toContain("opaque-ciphertext");
+	});
+
+	it("accepts CPA compaction_summary checkpoints and preserves companion items exactly", () => {
+		const summaryItems: OpenAIResponsesCompactionItem[] = [
+			{ type: "message", role: "user", id: "msg_old", status: "completed", content: [] },
+			{
+				type: "compaction_summary",
+				id: "cmp_summary_1",
+				encrypted_content: "cpa-opaque-ciphertext",
+				future_field: { mustRoundTrip: true },
+			},
+			{ type: "unknown_companion", id: "uc_1", keep: true },
+		];
+		const { entries, compaction } = fixture();
+		compaction.remoteCompaction = {
+			version: 1,
+			provider: "cpa-r",
+			api: "openai-responses",
+			modelId: "gpt-test",
+			items: summaryItems,
+		};
+		const context = buildSessionContext(entries);
+		const remote = context.messages[0];
+		expect(remote.role).toBe("openaiResponsesCompaction");
+		if (remote.role !== "openaiResponsesCompaction") throw new Error("missing remote checkpoint");
+		expect(remote.items).toEqual(summaryItems);
+		expect(JSON.stringify(remote.items)).toContain("cpa-opaque-ciphertext");
+		const nativeInput = convertResponsesMessages(
+			responsesModel,
+			{ messages: convertToLlm(context.messages) },
+			new Set(["openai", "openai-codex", "opencode"]),
+			{ includeSystemPrompt: false },
+		);
+		expect(nativeInput.slice(0, 3)).toEqual(summaryItems);
 	});
 
 	it("keeps an exact tool pair when the retained boundary starts at the function call", () => {

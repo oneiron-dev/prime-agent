@@ -24,6 +24,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isCompactionCheckpointItem(item: Record<string, unknown>): boolean {
+	return (
+		(item.type === "compaction" || item.type === "compaction_summary") &&
+		typeof item.encrypted_content === "string" &&
+		item.encrypted_content.length > 0
+	);
+}
+
+/**
+ * Deep-clone provider output items for durable replay.
+ * Requires at least one checkpoint item (`compaction` or `compaction_summary`) with
+ * nonempty encrypted_content. Preserves every item's original type/IDs/order/fields.
+ */
 function cloneCompactionItems(output: unknown): OpenAIResponsesCompactionItem[] {
 	if (!Array.isArray(output) || output.length === 0) {
 		throw new Error("Remote Responses compaction returned no output items");
@@ -33,7 +46,7 @@ function cloneCompactionItems(output: unknown): OpenAIResponsesCompactionItem[] 
 	if (
 		!Array.isArray(cloned) ||
 		cloned.some((item) => !isRecord(item) || typeof item.type !== "string") ||
-		!cloned.some((item) => isRecord(item) && item.type === "compaction")
+		!cloned.some((item) => isRecord(item) && isCompactionCheckpointItem(item))
 	) {
 		throw new Error("Remote Responses compaction returned invalid output items");
 	}
