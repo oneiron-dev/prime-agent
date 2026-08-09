@@ -335,6 +335,80 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
+	it("releases an explicit name after reasoning validation rejects it", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [
+				{ id: "parent-model", reasoning: true },
+				{ id: "non-reasoning-child", reasoning: false },
+			],
+		});
+		try {
+			await expect(
+				harness.session.runRlmChild("unsupported reasoning", {
+					name: "reusable-worker",
+					model: `${provider}/non-reasoning-child`,
+					reasoning: "high",
+				}),
+			).rejects.toThrow("is not supported");
+			harness.setResponses([fauxAssistantMessage("reused name answer")]);
+			await expect(
+				harness.session.runRlmChild("reuse the rejected name", { name: "reusable-worker", reasoning: "low" }),
+			).resolves.toMatchObject({ name: "reusable-worker" });
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("admits only one concurrent child with the same explicit name", async () => {
+		const harness = await createHarness({ provider, models: [{ id: "parent-model", reasoning: true }] });
+		try {
+			harness.setResponses([fauxAssistantMessage("one child answer")]);
+			const results = await Promise.allSettled([
+				harness.session.runRlmChild("first child", { name: "shared-worker", reasoning: "low" }),
+				harness.session.runRlmChild("second child", { name: "shared-worker", reasoning: "high" }),
+			]);
+			expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+			expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("inherits a supported parent reasoning level when omitted", async () => {
+		const harness = await createHarness({ provider, models: [{ id: "parent-model", reasoning: true }] });
+		try {
+			harness.session.setThinkingLevel("high");
+			harness.setResponses([fauxAssistantMessage("inherited reasoning answer")]);
+			const result = await harness.session.runRlmChild("inherit reasoning");
+			await vi.waitFor(() =>
+				expect(harness.session.getRlmChildSession(result.rlm_child_id)?.thinkingLevel).toBe("high"),
+			);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("persists an explicit child reasoning level", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "parent-model", reasoning: true }],
+			persistSession: true,
+		});
+		try {
+			harness.setResponses([fauxAssistantMessage("persisted reasoning answer")]);
+			const result = await harness.session.runRlmChild("persist reasoning", { reasoning: "low" });
+			await vi.waitFor(async () => {
+				expect((await harness.session.listRlmSubagents()).subagents[0]?.status).toBe("completed");
+			});
+			const childSessions = await SessionManager.list(harness.tempDir, result.session_dir!);
+			const persisted = SessionManager.open(childSessions[0]!.path, result.session_dir!);
+			expect(persisted.buildSessionContext().thinkingLevel).toBe("low");
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("uses independent explicit reasoning levels for concurrent children", async () => {
 		const harness = await createHarness({
 			provider,

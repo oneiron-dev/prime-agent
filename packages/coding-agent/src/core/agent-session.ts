@@ -9708,23 +9708,28 @@ export class AgentSession {
 			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
 		}
 		let modelSelection: RlmSubagentModelSelection;
+		let childSessionDir: string;
+		let childNodeId: string;
+		let sessionName: string;
 		try {
 			if (requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(requestedSessionName, true);
 			modelSelection = await this._resolveRlmSubagentModel(requestedModel);
-		} finally {
-			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
-		}
-		if (requestedReasoning && !getSupportedThinkingLevels(modelSelection.model).includes(requestedReasoning)) {
-			throw new Error(
-				`Requested subagent reasoning "${requestedReasoning}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"`,
-			);
-		}
-		if (this._disposed || this._disposing) throw new Error("Cannot spawn a subagent after its parent was disposed");
+			if (requestedReasoning && !getSupportedThinkingLevels(modelSelection.model).includes(requestedReasoning)) {
+				throw new Error(
+					`Requested subagent reasoning "${requestedReasoning}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"`,
+				);
+			}
+			if (this._disposed || this._disposing)
+				throw new Error("Cannot spawn a subagent after its parent was disposed");
 
-		const childSessionDir = this._createChildRlmSessionDir();
-		const childNodeId = basename(childSessionDir);
-		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
-		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
+			childSessionDir = this._createChildRlmSessionDir();
+			childNodeId = basename(childSessionDir);
+			sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
+			if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
+		} catch (error) {
+			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
+			throw error;
+		}
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const label = rlmChildLabel(prompt);
@@ -9748,6 +9753,7 @@ export class AgentSession {
 			if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 		};
 		this._activeRlmChildRuns.set(run.id, run);
+		if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
 		const emitChildUpdate = () => {
 			const childModel = childSession?.model ?? modelSelection.model;
 			this._emit({
