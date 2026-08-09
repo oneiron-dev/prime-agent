@@ -128,7 +128,14 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			let requestId: string | undefined;
 			let websocketStarted = false;
 			if (websocketEnabled) {
+				// Mirror createClient session-affinity headers before user overrides.
 				const websocketHeaders = new Headers(model.headers);
+				if (cacheSessionId) {
+					if (compat.sendSessionIdHeader) {
+						websocketHeaders.set("session_id", cacheSessionId);
+					}
+					websocketHeaders.set("x-client-request-id", cacheSessionId);
+				}
 				for (const [key, value] of Object.entries(options?.headers ?? {})) websocketHeaders.set(key, value);
 				websocketHeaders.set("Authorization", `Bearer ${apiKey}`);
 				try {

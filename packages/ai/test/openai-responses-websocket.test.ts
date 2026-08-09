@@ -48,10 +48,13 @@ class MockWebSocket {
 	readonly listeners = new Map<string, Set<Listener>>();
 	readonly sent: Record<string, unknown>[] = [];
 	readyState = 0;
+	readonly options?: { headers?: Record<string, string> };
 	constructor(
 		readonly url: string,
-		readonly options?: { headers?: Record<string, string> },
+		protocols?: string | string[] | { headers?: Record<string, string> },
 	) {
+		this.options =
+			typeof protocols === "object" && protocols !== null && !Array.isArray(protocols) ? protocols : undefined;
 		MockWebSocket.instances.push(this);
 		queueMicrotask(() => {
 			this.readyState = 1;
@@ -266,5 +269,87 @@ describe("generic OpenAI Responses WebSocket transport", () => {
 		}
 		expect(MockWebSocket.instances).toHaveLength(0);
 		expect(sdk.calls).toBe(1);
+	});
+
+	it("mirrors SSE session-affinity headers when caching is enabled", async () => {
+		setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
+		const wsModel = {
+			...model,
+			headers: { "x-model-header": "from-model" },
+			compat: { supportsWebSocket: true, sendSessionIdHeader: true },
+		};
+		for await (const _event of streamOpenAIResponses(
+			wsModel,
+			{ messages: [] },
+			{ apiKey: "key", transport: "websocket", sessionId: "sess-123", cacheRetention: "short" },
+		)) {
+		}
+		expect(MockWebSocket.instances).toHaveLength(1);
+		const headers = MockWebSocket.instances[0]!.options?.headers ?? {};
+		expect(headers.authorization ?? headers.Authorization).toBe("Bearer key");
+		expect(headers["x-model-header"] ?? headers["X-Model-Header"]).toBe("from-model");
+		expect(headers.session_id ?? headers.Session_id).toBe("sess-123");
+		expect(headers["x-client-request-id"] ?? headers["X-Client-Request-Id"]).toBe("sess-123");
+	});
+
+	it("omits session_id when sendSessionIdHeader is false but still sets x-client-request-id", async () => {
+		setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
+		const wsModel = {
+			...model,
+			compat: { supportsWebSocket: true, sendSessionIdHeader: false },
+		};
+		for await (const _event of streamOpenAIResponses(
+			wsModel,
+			{ messages: [] },
+			{ apiKey: "key", transport: "websocket", sessionId: "sess-456", cacheRetention: "short" },
+		)) {
+		}
+		const headers = MockWebSocket.instances[0]!.options?.headers ?? {};
+		expect(headers.session_id ?? headers.Session_id).toBeUndefined();
+		expect(headers["x-client-request-id"] ?? headers["X-Client-Request-Id"]).toBe("sess-456");
+	});
+
+	it("does not set session-affinity headers when cache retention is none", async () => {
+		setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
+		for await (const _event of streamOpenAIResponses(
+			model,
+			{ messages: [] },
+			{ apiKey: "key", transport: "websocket", sessionId: "sess-none", cacheRetention: "none" },
+		)) {
+		}
+		const headers = MockWebSocket.instances[0]!.options?.headers ?? {};
+		expect(headers.session_id ?? headers.Session_id).toBeUndefined();
+		expect(headers["x-client-request-id"] ?? headers["X-Client-Request-Id"]).toBeUndefined();
+		expect(headers.authorization ?? headers.Authorization).toBe("Bearer key");
+	});
+
+	it("lets explicit user headers override session-affinity defaults like SSE createClient", async () => {
+		setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
+		const wsModel = {
+			...model,
+			headers: { "x-model-header": "from-model" },
+			compat: { supportsWebSocket: true, sendSessionIdHeader: true },
+		};
+		for await (const _event of streamOpenAIResponses(
+			wsModel,
+			{ messages: [] },
+			{
+				apiKey: "key",
+				transport: "websocket",
+				sessionId: "sess-default",
+				cacheRetention: "short",
+				headers: {
+					session_id: "user-session",
+					"x-client-request-id": "user-request",
+					"x-model-header": "from-user",
+				},
+			},
+		)) {
+		}
+		const headers = MockWebSocket.instances[0]!.options?.headers ?? {};
+		expect(headers.session_id ?? headers.Session_id).toBe("user-session");
+		expect(headers["x-client-request-id"] ?? headers["X-Client-Request-Id"]).toBe("user-request");
+		expect(headers["x-model-header"] ?? headers["X-Model-Header"]).toBe("from-user");
+		expect(headers.authorization ?? headers.Authorization).toBe("Bearer key");
 	});
 });
