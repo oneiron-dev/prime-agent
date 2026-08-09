@@ -297,10 +297,68 @@ describe("ENG-4649 subagent model selection", () => {
 			expect(result.session_dir).not.toBeNull();
 			const childSessions = await SessionManager.list(harness.tempDir, result.session_dir!);
 			const persisted = SessionManager.open(childSessions[0]!.path, result.session_dir!);
-			expect(persisted.buildSessionContext().model).toEqual({
-				provider,
-				modelId: "child-model",
+			expect(persisted.buildSessionContext()).toMatchObject({
+				model: { provider, modelId: "child-model" },
+				thinkingLevel: "off",
 			});
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("validates explicit child reasoning against the selected model without clamping", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [
+				{ id: "parent-model", reasoning: true },
+				{ id: "non-reasoning-child", reasoning: false },
+			],
+		});
+		try {
+			await expect(harness.session.runRlmChild("reject invalid reasoning type", { reasoning: 42 })).rejects.toThrow(
+				"rlm.run reasoning must be a Prime ThinkingLevel string",
+			);
+			await expect(
+				harness.session.runRlmChild("reject invalid reasoning value", { reasoning: "turbo" }),
+			).rejects.toThrow("rlm.run reasoning must be a Prime ThinkingLevel string");
+			await expect(
+				harness.session.runRlmChild("reject unsupported child reasoning", {
+					model: `${provider}/non-reasoning-child`,
+					reasoning: "high",
+				}),
+			).rejects.toThrow(
+				`Requested subagent reasoning "high" is not supported by model "${provider}/non-reasoning-child"`,
+			);
+			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("uses independent explicit reasoning levels for concurrent children", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "parent-model", reasoning: true }],
+		});
+		try {
+			harness.setResponses([fauxAssistantMessage("low child answer"), fauxAssistantMessage("high child answer")]);
+			await Promise.all([
+				harness.session.runRlmChild("low reasoning child", { name: "low-worker", reasoning: "low" }),
+				harness.session.runRlmChild("high reasoning child", { name: "high-worker", reasoning: "high" }),
+			]);
+			await vi.waitFor(async () => {
+				const children = (await harness.session.listRlmSubagents()).subagents;
+				expect(children).toHaveLength(2);
+				expect(children.every((child) => child.status === "completed")).toBe(true);
+			});
+			const children = (await harness.session.listRlmSubagents()).subagents;
+			const levels = Object.fromEntries(
+				children.map((child) => [
+					child.session_name,
+					harness.session.getRlmChildSession(child.rlm_child_id)?.thinkingLevel,
+				]),
+			);
+			expect(levels).toMatchObject({ "low-worker": "low", "high-worker": "high" });
 		} finally {
 			harness.cleanup();
 		}
