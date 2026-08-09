@@ -14,6 +14,7 @@ import type {
 	StreamOptions,
 	Usage,
 } from "../types.js";
+import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import {
@@ -24,6 +25,7 @@ import {
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
+import { processOpenAIResponsesWebSocket, resolveOpenAIResponsesWebSocketUrl } from "./openai-responses-websocket.js";
 import { buildBaseOptions } from "./simple-options.js";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -98,6 +100,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 		try {
 			// Create OpenAI client
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
+			const compat = getCompat(model);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
 			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId);
@@ -106,6 +109,60 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			if (nextParams !== undefined) {
 				params = nextParams as ResponseCreateParamsStreaming;
 			}
+			const responseStreamOptions = {
+				serviceTier: options?.serviceTier,
+				applyServiceTierPricing: (
+					usage: Usage,
+					serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
+				) => applyServiceTierPricing(usage, serviceTier, model),
+			};
+			const transport = options?.transport ?? "auto";
+			const websocketEnabled = transport !== "sse" && (transport !== "auto" || compat.supportsWebSocket);
+			let requestId: string | undefined;
+			let websocketStarted = false;
+			if (websocketEnabled) {
+				const websocketHeaders = new Headers(model.headers);
+				for (const [key, value] of Object.entries(options?.headers ?? {})) websocketHeaders.set(key, value);
+				websocketHeaders.set("Authorization", `Bearer ${apiKey}`);
+				try {
+					await processOpenAIResponsesWebSocket({
+						url: resolveOpenAIResponsesWebSocketUrl(model.baseUrl),
+						headers: websocketHeaders,
+						body: { ...params },
+						output,
+						stream,
+						model,
+						sessionId: options?.sessionId,
+						cached: transport === "auto" || transport === "websocket-cached",
+						signal: options?.signal,
+						streamOptions: responseStreamOptions,
+						onFirstEvent: () => {
+							websocketStarted = true;
+							stream.push({ type: "start", partial: output });
+						},
+					});
+					if (options?.signal?.aborted) throw new Error("Request was aborted");
+					stream.push({
+						type: "done",
+						reason: output.stopReason as "stop" | "length" | "toolUse",
+						message: output,
+					});
+					stream.end();
+					return;
+				} catch (error) {
+					appendAssistantMessageDiagnostic(
+						output,
+						createAssistantMessageDiagnostic("provider_transport_failure", error, {
+							configuredTransport: transport,
+							fallbackTransport: websocketStarted ? undefined : "sse",
+							eventsEmitted: websocketStarted,
+							phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
+						}),
+					);
+					if (websocketStarted || options?.signal?.aborted) throw error;
+				}
+			}
+
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
@@ -113,13 +170,9 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			};
 			const { data: openaiStream, response } = await client.responses.create(params, requestOptions).withResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
-			const requestId = response.headers.get("x-request-id") ?? undefined;
+			requestId = response.headers.get("x-request-id") ?? undefined;
 			stream.push({ type: "start", partial: output });
-
-			await processResponsesStream(openaiStream, output, stream, model, {
-				serviceTier: options?.serviceTier,
-				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
-			});
+			await processResponsesStream(openaiStream, output, stream, model, responseStreamOptions);
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
