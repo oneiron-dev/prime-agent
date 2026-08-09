@@ -1,4 +1,5 @@
 import type { ResponseInput, ResponseStreamEvent } from "openai/resources/responses/responses.js";
+import NodeWebSocket from "ws";
 import { registerSessionResourceCleanup } from "../session-resources.js";
 import type { Api, AssistantMessage, Model } from "../types.js";
 import type { AssistantMessageEventStream } from "../utils/event-stream.js";
@@ -22,6 +23,17 @@ type SocketConstructor = new (
 	url: string,
 	protocols?: string | string[] | { headers?: Record<string, string> },
 ) => Socket;
+let socketConstructorOverride: SocketConstructor | undefined;
+export function setOpenAIResponsesWebSocketConstructorForTesting(ctor?: SocketConstructor): void {
+	socketConstructorOverride = ctor;
+}
+
+export function hasAuthenticatedOpenAIResponsesWebSocketRuntime(): boolean {
+	return (
+		socketConstructorOverride !== undefined ||
+		(typeof process !== "undefined" && Boolean(process.versions?.node || process.versions?.bun))
+	);
+}
 interface RequestBody {
 	input?: ResponseInput | string;
 	previous_response_id?: string | null;
@@ -72,8 +84,10 @@ function errorFromEvent(event: unknown, fallback: string): Error {
 }
 async function connect(url: string, headers: Headers, signal?: AbortSignal): Promise<Socket> {
 	if (signal?.aborted) throw new Error("Request was aborted");
-	const Ctor = (globalThis as { WebSocket?: unknown }).WebSocket as SocketConstructor | undefined;
-	if (typeof Ctor !== "function") throw new Error("WebSocket transport is not available in this runtime");
+	const isNodeRuntime = typeof process !== "undefined" && Boolean(process.versions?.node || process.versions?.bun);
+	const Ctor =
+		socketConstructorOverride ?? (isNodeRuntime ? (NodeWebSocket as unknown as SocketConstructor) : undefined);
+	if (!Ctor) throw new Error("Authenticated WebSocket transport is not available in this runtime");
 	return new Promise((resolve, reject) => {
 		let socket: Socket;
 		let settled = false;
@@ -272,23 +286,28 @@ function withoutInput(body: RequestBody) {
 	return rest;
 }
 function cachedBody(entry: Entry, body: RequestBody): RequestBody | undefined {
-	const c = entry.continuation;
+	const continuation = entry.continuation;
+	if (!continuation) return undefined;
 	if (
-		!c ||
-		typeof c.body.input === "string" ||
+		typeof continuation.body.input === "string" ||
 		typeof body.input === "string" ||
-		JSON.stringify(withoutInput(c.body)) !== JSON.stringify(withoutInput(body))
-	)
-		return;
+		JSON.stringify(withoutInput(continuation.body)) !== JSON.stringify(withoutInput(body))
+	) {
+		entry.continuation = undefined;
+		return undefined;
+	}
 	const current = body.input ?? [];
-	const baseline = [...(c.body.input ?? []), ...c.responseItems];
+	const baseline = [...(continuation.body.input ?? []), ...continuation.responseItems];
 	if (
 		current.length < baseline.length ||
 		JSON.stringify(current.slice(0, baseline.length)) !== JSON.stringify(baseline)
-	)
-		return;
-	return { ...body, previous_response_id: c.responseId, input: current.slice(baseline.length) };
+	) {
+		entry.continuation = undefined;
+		return undefined;
+	}
+	return { ...body, previous_response_id: continuation.responseId, input: current.slice(baseline.length) };
 }
+
 export function resolveOpenAIResponsesWebSocketUrl(baseUrl?: string): string {
 	const url = new URL((baseUrl?.trim() || "https://api.openai.com/v1").replace(/\/+$/, ""));
 	if (!url.pathname.endsWith("/responses")) url.pathname = `${url.pathname.replace(/\/$/, "")}/responses`;
@@ -307,15 +326,15 @@ export async function processOpenAIResponsesWebSocket<TApi extends Api>(args: {
 	signal?: AbortSignal;
 	streamOptions?: OpenAIResponsesStreamOptions;
 	onFirstEvent(): void;
+	onOpen?(): void | Promise<void>;
 }): Promise<void> {
 	const acquired = await acquire(args.url, args.headers, args.sessionId, args.signal);
 	let keep = true;
 	const delta = args.cached && acquired.entry ? cachedBody(acquired.entry, args.body) : undefined;
 	const request = delta ?? args.body;
 	try {
-		acquired.socket.send(
-			JSON.stringify({ type: delta && acquired.reused ? "response.append" : "response.create", ...request }),
-		);
+		await args.onOpen?.();
+		acquired.socket.send(JSON.stringify({ type: "response.create", ...request }));
 		let first = true;
 		const marked = (async function* () {
 			for await (const event of events(acquired.socket, args.signal)) {

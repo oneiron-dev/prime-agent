@@ -136,12 +136,17 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 						cached: transport === "auto" || transport === "websocket-cached",
 						signal: options?.signal,
 						streamOptions: responseStreamOptions,
+						// WebSocket APIs do not expose upgrade response headers portably; report the successful 101 handshake.
+						onOpen: () => options?.onResponse?.({ status: 101, headers: {} }, model),
 						onFirstEvent: () => {
 							websocketStarted = true;
 							stream.push({ type: "start", partial: output });
 						},
 					});
 					if (options?.signal?.aborted) throw new Error("Request was aborted");
+					if (output.stopReason === "aborted" || output.stopReason === "error") {
+						throw streamFailureFromStopReason(output.stopReasonRaw);
+					}
 					stream.push({
 						type: "done",
 						reason: output.stopReason as "stop" | "length" | "toolUse",

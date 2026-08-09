@@ -37,6 +37,7 @@ import {
 	closeOpenAIResponsesWebSocketSessions,
 	processOpenAIResponsesWebSocket,
 	resolveOpenAIResponsesWebSocketUrl,
+	setOpenAIResponsesWebSocketConstructorForTesting,
 } from "../src/providers/openai-responses-websocket.js";
 import type { AssistantMessage, Model } from "../src/types.js";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.js";
@@ -149,14 +150,14 @@ afterEach(() => {
 	closeOpenAIResponsesWebSocketSessions();
 	MockWebSocket.instances = [];
 	sdk.calls = 0;
-	delete (globalThis as { WebSocket?: unknown }).WebSocket;
+	setOpenAIResponsesWebSocketConstructorForTesting(undefined);
 });
 describe("generic OpenAI Responses WebSocket transport", () => {
 	it("resolves the standard responses WebSocket endpoint", () => {
 		expect(resolveOpenAIResponsesWebSocketUrl("https://cpa.test/v1")).toBe("wss://cpa.test/v1/responses");
 	});
 	it("uses bearer auth, reuses a session socket, and appends only the input delta", async () => {
-		(globalThis as { WebSocket?: unknown }).WebSocket = MockWebSocket;
+		setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
 		const firstInput = [{ role: "user", content: "one" }];
 		expect((await request(firstInput)).starts).toBe(1);
 		expect((await request([...firstInput, { role: "user", content: "two" }])).starts).toBe(1);
@@ -165,7 +166,7 @@ describe("generic OpenAI Responses WebSocket transport", () => {
 		expect(socket.options?.headers?.authorization).toBe("Bearer key");
 		expect(socket.sent[0]).toMatchObject({ type: "response.create", input: firstInput });
 		expect(socket.sent[1]).toMatchObject({
-			type: "response.append",
+			type: "response.create",
 			previous_response_id: "resp_1",
 			input: [{ role: "user", content: "two" }],
 		});
@@ -176,7 +177,7 @@ describe("generic OpenAI Responses WebSocket transport", () => {
 				queueMicrotask(() => this.emit("error", { message: "connect failed" }));
 			}
 		}
-		(globalThis as { WebSocket?: unknown }).WebSocket = FailingWebSocket;
+		setOpenAIResponsesWebSocketConstructorForTesting(FailingWebSocket);
 		const events = [];
 		for await (const event of streamOpenAIResponses(model, { messages: [] }, { apiKey: "key", transport: "auto" }))
 			events.push(event.type);
@@ -192,7 +193,7 @@ describe("generic OpenAI Responses WebSocket transport", () => {
 				});
 			}
 		}
-		(globalThis as { WebSocket?: unknown }).WebSocket = StartedThenFailingWebSocket;
+		setOpenAIResponsesWebSocketConstructorForTesting(StartedThenFailingWebSocket);
 		const events = [];
 		for await (const event of streamOpenAIResponses(model, { messages: [] }, { apiKey: "key", transport: "auto" }))
 			events.push(event.type);
@@ -201,14 +202,54 @@ describe("generic OpenAI Responses WebSocket transport", () => {
 	});
 
 	it("never opens a WebSocket when transport is sse", async () => {
-		(globalThis as { WebSocket?: unknown }).WebSocket = MockWebSocket;
+		setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
 		for await (const _event of streamOpenAIResponses(model, { messages: [] }, { apiKey: "key", transport: "sse" })) {
 		}
 		expect(MockWebSocket.instances).toHaveLength(0);
 		expect(sdk.calls).toBe(1);
 	});
+	it("clears stale continuation before the next request", async () => {
+		setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
+		await request([{ role: "user", content: "one" }]);
+		await request([{ role: "user", content: "unrelated" }]);
+		await request([{ role: "user", content: "third" }]);
+		const sent = MockWebSocket.instances[0]!.sent;
+		expect(sent[1]).not.toHaveProperty("previous_response_id");
+		expect(sent[2]).not.toHaveProperty("previous_response_id");
+	});
+	it("treats a failed completed response as a terminal WebSocket error", async () => {
+		class FailedResponseWebSocket extends MockWebSocket {
+			override send() {
+				queueMicrotask(() => {
+					this.message({ type: "response.created", response: { id: "failed" } } as ResponseStreamEvent);
+					this.message({
+						type: "response.completed",
+						response: { id: "failed", status: "failed" },
+					} as ResponseStreamEvent);
+				});
+			}
+		}
+		setOpenAIResponsesWebSocketConstructorForTesting(FailedResponseWebSocket);
+		const events = [];
+		for await (const event of streamOpenAIResponses(model, { messages: [] }, { apiKey: "key", transport: "auto" }))
+			events.push(event.type);
+		expect(sdk.calls).toBe(0);
+		expect(events).toEqual(["start", "error"]);
+	});
+	it("reports the synthetic 101 WebSocket handshake response", async () => {
+		setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
+		const onResponse = vi.fn();
+		for await (const _event of streamOpenAIResponses(
+			model,
+			{ messages: [] },
+			{ apiKey: "key", transport: "auto", onResponse },
+		)) {
+		}
+		expect(onResponse).toHaveBeenCalledOnce();
+		expect(onResponse).toHaveBeenCalledWith({ status: 101, headers: {} }, model);
+	});
 	it("keeps auto on SSE when the model does not advertise WebSocket support", async () => {
-		(globalThis as { WebSocket?: unknown }).WebSocket = MockWebSocket;
+		setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
 		const sseOnlyModel = { ...model, compat: { supportsWebSocket: false } };
 		for await (const _event of streamOpenAIResponses(
 			sseOnlyModel,
