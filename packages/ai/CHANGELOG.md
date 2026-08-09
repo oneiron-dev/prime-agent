@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added capability-gated WebSocket transport for generic OpenAI Responses providers, with authenticated Node/Bun connections, cached continuation, session-affinity headers, and SSE fallback only before the first response event.
 - Added unary OpenAI Responses compaction with native replay of provider-scoped opaque compaction items.
 
 ## [0.7.1] - 2026-08-07

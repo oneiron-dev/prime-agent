@@ -23,7 +23,12 @@ flowchart TD
 When the model delegates work:
 
 ```python
-handle = await rlm("inspect the API", name="api-reviewer")
+handle = await rlm(
+    "inspect the API",
+    name="api-reviewer",
+    model="provider/model-id",
+    reasoning="high",
+)
 print(handle.rlm_child_id, handle.name, handle.session_dir, handle.model)
 ```
 
@@ -150,23 +155,25 @@ await rlm.run("subtask")
 
 Supported `rlm.run` options are:
 
-- `name`: a unique readable child session name; and
-- `model`: an exact `provider/model` selector from `rlm.find_models()`.
+- `name`: a unique readable child session name;
+- `model`: an exact `provider/model` selector from `rlm.find_models()`; and
+- `reasoning`: an explicit reasoning level for the selected child model.
 
-Unknown options fail instead of being ignored. Model search is bounded to active, non-expired credentials. If an exact selection is unavailable or fails auth preflight, spawn fails instead of silently falling back to another model. A child otherwise inherits the parent model.
+Unknown options fail instead of being ignored. Model search is bounded to active, non-expired credentials. If an exact selection is unavailable or fails auth preflight, spawn fails instead of silently falling back to another model. Explicit `reasoning` is validated after resolving the child model and fails when that model does not support the requested level; it is never silently clamped or remapped. A child inherits the parent model and compatible parent reasoning level when those options are omitted. Explicit child names remain reserved through model resolution, reasoning validation, and task admission so concurrent spawns cannot claim the same name.
 
 ## Child Execution
 
 `AgentSession.runRlmChild()` performs the following sequence:
 
 1. Check `RLM_DEPTH < RLM_MAX_DEPTH`.
-2. Resolve the requested model or inherit the parent model.
-3. Create a `sub-xxxxxxxx` child directory under the parent artifact directory.
-4. Admit the task into the parent registry and return its `RLMSpawnHandle`.
-5. In detached work, create a child `SessionManager`, `Agent`, and `AgentSession`.
-6. Reuse provider hooks, resource loader, model registry, tools, transport, retry settings, and thinking configuration.
-7. Run the child prompt, retain its session, and update lifecycle state independently of the admission call.
-8. Attribute child usage to the parent assistant turn and persist the attribution.
+2. Reserve an explicit child name, then resolve the requested model or inherit the parent model.
+3. Validate an explicit child reasoning level against the resolved model, or inherit a compatible parent level.
+4. Create a `sub-xxxxxxxx` child directory under the parent artifact directory.
+5. Admit the task into the parent registry and return its `RLMSpawnHandle`.
+6. In detached work, create a child `SessionManager`, `Agent`, and `AgentSession`.
+7. Reuse provider hooks, resource loader, model registry, tools, transport, retry settings, and thinking configuration.
+8. Run the child prompt, retain its session, and update lifecycle state independently of the admission call.
+9. Attribute child usage to the parent assistant turn and persist the attribution.
 
 Children receive incremented `RLM_DEPTH`, the inherited maximum depth, and their own `RLM_SESSION_DIR`. The default maximum depth is 1, so root sessions may create children and those children may not create grandchildren unless the limit is configured higher.
 
@@ -260,6 +267,7 @@ Provider credentials are resolved by the TypeScript host. The bounded model cata
 | Depth limit reached | Python raises before opening a comm; the host checks again. |
 | Unsupported options | Host rejects the request. |
 | Requested model unavailable | Spawn fails instead of substituting another model. |
+| Requested reasoning unsupported | Spawn fails before admission; the explicit name reservation is released for reuse. |
 | Shell-channel comm reply | Deadlock risk; current replies use control. |
 | Child cancellation | Host aborts the child and removes failed/cancelled registry entries. |
 | Parent teardown | Active descendants are cancelled and their runtimes are closed. |

@@ -893,9 +893,14 @@ interface OpenAICompletionsCompat {
 }
 
 interface OpenAIResponsesCompat {
-  // Reserved for future use
+  sendSessionIdHeader?: boolean;      // Send `session_id` from sessionId when caching is enabled (default: true)
+  supportsLongCacheRetention?: boolean; // Support `prompt_cache_retention: "24h"` (default: true)
+  supportsResponsesCompact?: boolean; // Support unary POST /responses/compact (default: false)
+  supportsWebSocket?: boolean;        // Support the Responses WebSocket endpoint (default: false)
 }
 ```
+
+For generic `openai-responses` models, `transport: "auto"` selects WebSocket only when `supportsWebSocket` is true and the runtime can create an authenticated socket; browser runtimes remain on SSE. A WebSocket failure may fall back to SSE only before the first response event. Provider-native compaction is a separate unary HTTP operation and is attempted only when `supportsResponsesCompact` is true.
 
 If `compat` is not set, the library falls back to URL-based detection. If `compat` is partially set, unspecified fields use the detected defaults. This is useful for:
 
