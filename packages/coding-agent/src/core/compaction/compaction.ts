@@ -20,6 +20,7 @@ import {
 	type CompactionFallback,
 	type CompactionMechanism,
 	isValidRemoteCompactionState,
+	projectAgentMessagesForExternalUse,
 	type RemoteCompactionState,
 	type SessionEntry,
 } from "../session-manager.js";
@@ -139,6 +140,16 @@ export function projectCompactionResultForExternalUse<T>(result: CompactionResul
 		firstKeptEntryId: result.firstKeptEntryId,
 		tokensBefore: result.tokensBefore,
 		details: result.details,
+	};
+}
+
+/** Remove provider-opaque remote compaction state from extension-facing preparation. */
+export function projectCompactionPreparationForExternalUse(preparation: CompactionPreparation): CompactionPreparation {
+	const { previousRemoteCompaction: _previousRemoteCompaction, ...publicPreparation } = preparation;
+	return {
+		...publicPreparation,
+		messagesToSummarize: projectAgentMessagesForExternalUse(preparation.messagesToSummarize),
+		turnPrefixMessages: projectAgentMessagesForExternalUse(preparation.turnPrefixMessages),
 	};
 }
 

@@ -426,7 +426,7 @@ Key methods for working with sessions programmatically.
 - `appendThinkingLevelChange(level)` - Record thinking change
 - `appendServiceTierChange(tier)` - Record provider service-tier change
 - `appendModelChange(provider, modelId)` - Record model change
-- `appendCompaction(summary, firstKeptEntryId, tokensBefore, details?, fromHook?, customInstructions?)` - Add compaction
+- `appendCompaction(summary, firstKeptEntryId, tokensBefore, details?, fromHook?, customInstructions?, metadata?)` - Add compaction
 - `appendCustomEntry(customType, data?)` - Extension state (not in context)
 - `appendChildUsageAttribution(targetId, childUsage, aggregateUsage)` - Persist RLM child usage folded into a parent assistant message
 - `appendSessionInfo(name)` - Set session display name
