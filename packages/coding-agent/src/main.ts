@@ -293,7 +293,14 @@ export function shouldEnsureDaemonBeforeActiveSessionLookup(options: DaemonActiv
 	);
 }
 
-type ActiveDaemonSessionSummaryLookup = (socketPath: string, selector: string) => Promise<SessionSummary | undefined>;
+const ACTIVE_DAEMON_SESSION_LOOKUP_TIMEOUT_MS = 3000;
+const ACTIVE_DAEMON_SESSION_LOOKUP_RETRY_TIMEOUT_MS = 10_000;
+
+type ActiveDaemonSessionSummaryLookup = (
+	socketPath: string,
+	selector: string,
+	timeoutMs: number,
+) => Promise<SessionSummary | undefined>;
 
 interface ActiveDaemonSessionSummaryLookupOptions {
 	fallbackOnError?: boolean;
@@ -305,9 +312,13 @@ export async function findActiveDaemonSessionSummaryForInteractiveStartup(
 	selector: string,
 	options: ActiveDaemonSessionSummaryLookupOptions = {},
 ): Promise<SessionSummary | undefined> {
+	const lookup = options.lookup ?? findActiveDaemonSessionSummary;
 	try {
-		return await (options.lookup ?? findActiveDaemonSessionSummary)(socketPath, selector);
+		return await lookup(socketPath, selector, ACTIVE_DAEMON_SESSION_LOOKUP_TIMEOUT_MS);
 	} catch (error) {
+		if (options.fallbackOnError === false && isTimedOutActiveDaemonSessionLookupError(error)) {
+			return await lookup(socketPath, selector, ACTIVE_DAEMON_SESSION_LOOKUP_RETRY_TIMEOUT_MS);
+		}
 		if (options.fallbackOnError === false) {
 			throw error;
 		}
@@ -884,15 +895,24 @@ function isUnknownActiveSessionError(message: string): boolean {
 	return message.startsWith("Unknown active session:");
 }
 
+function isTimedOutActiveDaemonSessionLookupError(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		error.message.startsWith("Timed out after ") &&
+		error.message.includes(' waiting for the Prime Agent daemon response to "get_state".')
+	);
+}
+
 async function findActiveDaemonSessionSummary(
 	socketPath: string,
 	selector: string,
+	timeoutMs = ACTIVE_DAEMON_SESSION_LOOKUP_TIMEOUT_MS,
 ): Promise<SessionSummary | undefined> {
 	const client = new DaemonClient(socketPath);
 	await client.connect(250);
 
 	try {
-		const response = await client.request({ type: "get_state", activeSessionId: selector }, 3000);
+		const response = await client.request({ type: "get_state", activeSessionId: selector }, timeoutMs);
 		if (!response.success) {
 			if (isUnknownActiveSessionError(response.error)) {
 				return undefined;

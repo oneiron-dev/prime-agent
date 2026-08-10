@@ -231,15 +231,79 @@ describe("daemon-backed interactive session manager routing", () => {
 		).resolves.toBeUndefined();
 	});
 
-	test("propagates active-session lookup failures for explicit attach", async () => {
+	test("retries a timed-out active-session lookup for explicit attach", async () => {
+		const timeouts: number[] = [];
+		await expect(
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", {
+				fallbackOnError: false,
+				lookup: async (_socketPath, _selector, timeoutMs) => {
+					timeouts.push(timeoutMs);
+					if (timeouts.length === 1) {
+						throw activeDaemonGetStateTimeout(timeoutMs);
+					}
+					return makeSessionSummary({
+						id: "active-1",
+						activeSessionId: "active-1",
+						sessionId: "session-1",
+					});
+				},
+			}),
+		).resolves.toMatchObject({ activeSessionId: "active-1" });
+		expect(timeouts).toEqual([3000, 10_000]);
+	});
+
+	test("surfaces the bounded retry timeout when explicit attach remains unavailable", async () => {
+		const timeouts: number[] = [];
+		await expect(
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", {
+				fallbackOnError: false,
+				lookup: async (_socketPath, _selector, timeoutMs) => {
+					timeouts.push(timeoutMs);
+					throw activeDaemonGetStateTimeout(timeoutMs);
+				},
+			}),
+		).rejects.toThrow('Timed out after 10000ms waiting for the Prime Agent daemon response to "get_state".');
+		expect(timeouts).toEqual([3000, 10_000]);
+	});
+
+	test("does not retry permanent active-session lookup failures for explicit attach", async () => {
+		let attempts = 0;
 		await expect(
 			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", {
 				fallbackOnError: false,
 				lookup: async () => {
+					attempts++;
 					throw new Error("protocol mismatch");
 				},
 			}),
 		).rejects.toThrow("protocol mismatch");
+		expect(attempts).toBe(1);
+	});
+
+	test("keeps definitive missing and ambiguous explicit attach selectors unchanged", async () => {
+		let missingAttempts = 0;
+		await expect(
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "missing", {
+				fallbackOnError: false,
+				lookup: async () => {
+					missingAttempts++;
+					return undefined;
+				},
+			}),
+		).resolves.toBeUndefined();
+		expect(missingAttempts).toBe(1);
+
+		let ambiguousAttempts = 0;
+		await expect(
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "worker", {
+				fallbackOnError: false,
+				lookup: async () => {
+					ambiguousAttempts++;
+					throw new Error('Ambiguous active session "worker"');
+				},
+			}),
+		).rejects.toThrow('Ambiguous active session "worker"');
+		expect(ambiguousAttempts).toBe(1);
 	});
 
 	test("uses daemon active-session summary when probing succeeds", async () => {
@@ -467,6 +531,12 @@ describe("runtime session option resolution", () => {
 		});
 	});
 });
+
+function activeDaemonGetStateTimeout(timeoutMs: number): Error {
+	return new Error(
+		`Timed out after ${timeoutMs}ms waiting for the Prime Agent daemon response to "get_state". Socket: /tmp/prime.sock.`,
+	);
+}
 
 function makeSessionSummary(overrides: Partial<SessionSummary>): SessionSummary {
 	return {
