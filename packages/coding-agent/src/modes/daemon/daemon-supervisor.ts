@@ -3474,6 +3474,7 @@ export class DaemonSupervisor {
 			transcript = new SnapshotTranscriptCache({
 				activeSessionId,
 				snapshotId: loaded.snapshotStream.id,
+				messageCount: loaded.snapshotStream.messageCount,
 				cacheRoot: this.snapshotCacheRoot,
 				targetChunkBytes: loaded.snapshotStream.targetChunkBytes,
 			});
@@ -3545,8 +3546,10 @@ export class DaemonSupervisor {
 			messages: result.messages ? [] : undefined,
 			snapshot: { ...result.snapshot, messages: [] },
 			snapshotStream: {
+				// The transcript, not the live summary, decides how many messages the stream carries;
+				// a summary can count messages the transcript never receives.
 				id: transcript.snapshotId,
-				messageCount: result.snapshot.summary.messageCount,
+				messageCount: transcript.messageCount,
 				targetChunkBytes: transcript.targetChunkBytes,
 			},
 		};
@@ -3856,6 +3859,7 @@ export class DaemonSupervisor {
 					const transcript = new SnapshotTranscriptCache({
 						activeSessionId,
 						snapshotId: begin.snapshotId,
+						messageCount: begin.messageCount,
 						cacheRoot: this.snapshotCacheRoot,
 						targetChunkBytes: begin.targetChunkBytes,
 					});

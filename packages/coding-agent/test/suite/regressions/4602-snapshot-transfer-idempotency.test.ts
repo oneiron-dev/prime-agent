@@ -633,6 +633,83 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(replaced.worker.transcriptCaches.get(activeSessionId)?.snapshotId).toBe("snapshot-4602-new");
 	});
 
+	it("advertises the transcript message count when the summary counts a message the transcript omits", async () => {
+		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-count.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			descriptorDir: "/tmp/eng-4602-supervisor-count-state",
+		});
+		const { close, worker } = workerHarness();
+		const transcriptMessages: AgentMessage[] = [
+			{ role: "user", content: "first", timestamp: 1 },
+			{ role: "user", content: "second", timestamp: 2 },
+		];
+		const frames = snapshotFrames(transcriptMessages);
+		// The worker streams only the messages it exposes; its summary still counts a synthetic
+		// message (for example a remote compaction marker) that never reaches the transcript.
+		const begin = {
+			...frames.begin,
+			snapshot: {
+				...frames.begin.snapshot,
+				summary: { ...frames.begin.snapshot.summary, messageCount: transcriptMessages.length + 1 },
+			},
+		} satisfies DaemonOutbound;
+		const chunkFrame = frame(frames.chunk);
+		const socket = new PassThrough();
+		const written: Buffer[] = [];
+		socket.on("data", (chunk: Buffer) => written.push(Buffer.from(chunk)));
+		const client = socketClient("chunked", socket);
+		const internals = supervisor as unknown as {
+			clients: Set<DaemonSocketClient>;
+			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+			createStreamedAttachResult(
+				result: DaemonAttachResult,
+				transcript: SnapshotTranscriptCache,
+			): DaemonAttachResult;
+			streamSnapshot(
+				client: DaemonSocketClient,
+				worker: WorkerHarness,
+				result: DaemonAttachResult,
+				transcript: SnapshotTranscriptCache,
+			): Promise<void>;
+		};
+		internals.clients.add(client);
+		internals.handleWorkerFrame(worker, frame(begin));
+		internals.handleWorkerFrame(worker, {
+			...chunkFrame,
+			payload: Buffer.from(`${chunkFrame.payload.toString("utf8")}\n`),
+		});
+		internals.handleWorkerFrame(worker, frame(frames.end));
+		const cached = worker.snapshotCache.get(activeSessionId);
+		const transcript = worker.transcriptCaches.get(activeSessionId);
+		if (!cached || !transcript) {
+			throw new Error("worker snapshot was not cached");
+		}
+		expect(cached.snapshot.summary.messageCount).toBe(transcriptMessages.length + 1);
+
+		const streamed = internals.createStreamedAttachResult(cached, transcript);
+		await internals.streamSnapshot(client, worker, streamed, transcript);
+
+		const records = Buffer.concat(written)
+			.toString("utf8")
+			.split("\n")
+			.filter((line) => line.length > 0)
+			.map((line) => JSON.parse(line) as DaemonOutbound);
+		const beginRecord = records[0];
+		if (beginRecord?.type !== "session_snapshot_begin") {
+			throw new Error("snapshot stream did not begin");
+		}
+		const delivered = records.reduce(
+			(total, record) => (record.type === "session_snapshot_chunk" ? total + record.messages.length : total),
+			0,
+		);
+		expect(streamed.snapshotStream?.messageCount).toBe(transcriptMessages.length);
+		expect(beginRecord.messageCount).toBe(delivered);
+		expect(delivered).toBe(transcriptMessages.length);
+		expect(records.at(-1)?.type).toBe("session_snapshot_end");
+		expect(close).not.toHaveBeenCalled();
+		socket.destroy();
+	});
+
 	it("fails one public snapshot without dropping another session on the shared client", async () => {
 		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-public.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },

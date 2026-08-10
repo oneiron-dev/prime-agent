@@ -14,6 +14,8 @@ export interface SnapshotTranscriptCacheOptions {
 	activeSessionId: string;
 	snapshotId: string;
 	messages?: readonly AgentMessage[];
+	/** Messages the transcript will hold once complete; required when chunks are appended instead of encoded. */
+	messageCount?: number;
 	cacheRoot: string;
 	targetChunkBytes?: number;
 	memoryCacheBytes?: number;
@@ -87,11 +89,13 @@ export class SnapshotTranscriptCache {
 	readonly targetChunkBytes: number;
 	readonly snapshotId: string;
 	readonly activeSessionId: string;
+	readonly messageCount: number;
 
 	constructor(private readonly options: SnapshotTranscriptCacheOptions) {
 		this.targetChunkBytes = options.targetChunkBytes ?? SNAPSHOT_TARGET_CHUNK_BYTES;
 		this.snapshotId = options.snapshotId;
 		this.activeSessionId = options.activeSessionId;
+		this.messageCount = options.messages?.length ?? options.messageCount ?? 0;
 		if (options.messages) {
 			this.encodeMessages(options.messages);
 			this.completed = true;
