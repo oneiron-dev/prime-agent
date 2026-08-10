@@ -304,14 +304,12 @@ export class DaemonSessionSummarizer {
 		const isWorking = isSessionWorking(state);
 		const previous = state.summaryState;
 		// Idle sessions with a current verdict need no refresh; working sessions
-		// always refresh so the recap keeps up with the in-progress turn.
+		// always refresh so the recap keeps up with the in-progress turn. A blank
+		// fallback recap is still settled for this message count; only new messages
+		// make the verdict stale and earn another attempt.
 		const contentUnchanged = previous?.basedOnMessageCount === messageCount;
-		const owesIdleVerdict = !isWorking && previous?.taskState === undefined;
-		// A blank recap means the model call hasn't succeeded yet (e.g. the
-		// needs_input fallback fired on a transient failure); keep retrying until a
-		// real summary lands so the recap isn't left permanently empty.
-		const owesSummary = !isWorking && !previous?.summary;
-		if (contentUnchanged && !isWorking && !owesIdleVerdict && !owesSummary) {
+		const owesIdleVerdict = !isWorking && (!contentUnchanged || previous?.taskState === undefined);
+		if (!isWorking && !owesIdleVerdict) {
 			return;
 		}
 		// Include the in-progress message so a long streaming turn gets a live recap.
@@ -332,9 +330,7 @@ export class DaemonSessionSummarizer {
 			// settle it to needs_input.
 			const result =
 				generated ??
-				(!isWorking && (owesIdleVerdict || owesSummary)
-					? { summary: previous?.summary ?? "", taskState: "needs_input" as const }
-					: undefined);
+				(owesIdleVerdict ? { summary: previous?.summary ?? "", taskState: "needs_input" as const } : undefined);
 			if (!result) {
 				return;
 			}
@@ -358,9 +354,10 @@ export class DaemonSessionSummarizer {
 				basedOnMessageCount: messageCount,
 			};
 			const changed = previous?.summary !== status.summary || previous?.taskState !== status.taskState;
+			const materiallyChanged = changed || previous?.basedOnMessageCount !== status.basedOnMessageCount;
 			state.summaryState = status;
-			// Persist only settled idle verdicts, never mid-stream.
-			if (!isWorking) {
+			// Persist only settled idle verdicts, never mid-stream or duplicate statuses.
+			if (!isWorking && materiallyChanged) {
 				try {
 					session.sessionManager.appendAgentStatus(status);
 				} catch {

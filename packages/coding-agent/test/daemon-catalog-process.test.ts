@@ -1,9 +1,14 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { type SessionInfo, SessionManager } from "../src/core/session-manager.js";
-import { listSavedSessionSiblings, resolveCatalogSessionMatch } from "../src/modes/daemon/daemon-catalog-process.js";
+import {
+	DaemonCatalogClient,
+	handleCatalogRequest,
+	listSavedSessionSiblings,
+	resolveCatalogSessionMatch,
+} from "../src/modes/daemon/daemon-catalog-process.js";
 
 function session(id: string, name: string | undefined, path: string): SessionInfo {
 	return {
@@ -19,6 +24,115 @@ function session(id: string, name: string | undefined, path: string): SessionInf
 		allMessagesText: "",
 	};
 }
+
+describe("daemon catalog list IPC", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("coalesces callback-free concurrent global lists without stream records", async () => {
+		const listedSession = session("listed-session", "listed", "/tmp/listed.jsonl");
+		let scans = 0;
+		let sharedScan: Promise<SessionInfo[]> | undefined;
+		let finishScan: (() => void) | undefined;
+		vi.spyOn(SessionManager, "listAll").mockImplementation((callbacks) => {
+			if (callbacks !== undefined) {
+				scans++;
+				return Promise.resolve([listedSession]);
+			}
+			if (!sharedScan) {
+				scans++;
+				sharedScan = new Promise((resolve) => {
+					finishScan = () => resolve([listedSession]);
+				});
+			}
+			return sharedScan;
+		});
+		const messages: Array<{ type: string; id?: string }> = [];
+		const send = (message: { type: string; id?: string }) => messages.push(message);
+
+		const first = handleCatalogRequest(
+			{ type: "request", id: "first", command: "list", sessionDir: "/tmp/sessions", stream: false },
+			send,
+		);
+		const second = handleCatalogRequest(
+			{ type: "request", id: "second", command: "list", sessionDir: "/tmp/sessions", stream: false },
+			send,
+		);
+
+		expect(scans).toBe(1);
+		finishScan?.();
+		await Promise.all([first, second]);
+		expect(messages).toEqual([
+			expect.objectContaining({ type: "response", id: "first" }),
+			expect.objectContaining({ type: "response", id: "second" }),
+		]);
+	});
+
+	it("keeps callback-bearing global lists independent and streams each request", async () => {
+		const listedSession = session("listed-session", "listed", "/tmp/listed.jsonl");
+		let scans = 0;
+		vi.spyOn(SessionManager, "listAll").mockImplementation(async (callbacks) => {
+			scans++;
+			callbacks?.onProgress?.(1, 1);
+			callbacks?.onSession?.(listedSession);
+			return [listedSession];
+		});
+		const messages: Array<{ type: string; id?: string }> = [];
+		const send = (message: { type: string; id?: string }) => messages.push(message);
+
+		await Promise.all([
+			handleCatalogRequest(
+				{ type: "request", id: "first", command: "list", sessionDir: "/tmp/sessions", stream: true },
+				send,
+			),
+			handleCatalogRequest(
+				{ type: "request", id: "second", command: "list", sessionDir: "/tmp/sessions", stream: true },
+				send,
+			),
+		]);
+
+		expect(scans).toBe(2);
+		for (const id of ["first", "second"]) {
+			expect(messages.filter((message) => message.id === id).map((message) => message.type)).toEqual([
+				"progress",
+				"session",
+				"response",
+			]);
+		}
+	});
+
+	it("preserves streaming for legacy list requests without a stream flag", async () => {
+		const listedSession = session("legacy-session", "legacy", "/tmp/legacy.jsonl");
+		vi.spyOn(SessionManager, "listAll").mockImplementation(async (callbacks) => {
+			callbacks?.onProgress?.(1, 1);
+			callbacks?.onSession?.(listedSession);
+			return [listedSession];
+		});
+		const messages: Array<{ type: string; id?: string }> = [];
+
+		await handleCatalogRequest(
+			{ type: "request", id: "legacy", command: "list", sessionDir: "/tmp/sessions" },
+			(message) => messages.push(message),
+		);
+
+		expect(messages.map((message) => message.type)).toEqual(["progress", "session", "response"]);
+	});
+
+	it("marks list IPC requests as streaming only when callbacks are provided", async () => {
+		const client = new DaemonCatalogClient(() => {});
+		const request = vi.fn().mockResolvedValue({ sessions: [] });
+		Object.defineProperty(client, "request", { value: request });
+		const callbacks = { onProgress: vi.fn() };
+
+		await client.list(undefined, "/tmp/sessions");
+		await client.list(undefined, "/tmp/sessions", callbacks);
+
+		expect(request.mock.calls[0]?.[0]).toMatchObject({ command: "list", stream: false });
+		expect(request.mock.calls[1]?.[0]).toMatchObject({ command: "list", stream: true });
+		expect(request.mock.calls[1]?.[1]).toBe(callbacks);
+	});
+});
 
 describe("daemon catalog selector resolution", () => {
 	it("reads only a saved child's persisted sibling set", async () => {

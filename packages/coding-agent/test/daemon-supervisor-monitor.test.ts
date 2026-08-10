@@ -15,6 +15,7 @@ import {
 	createDaemonCommandEnvelope,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
+	type DaemonResponse,
 	success,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
@@ -1793,6 +1794,341 @@ describe("daemon worker supervisor monitoring", () => {
 			capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
 			supportsExtensionUi: false,
 		});
+	});
+
+	it("keeps timed-out attach retries on one bounded worker snapshot load", async () => {
+		vi.useFakeTimers();
+		type AttachClient = {
+			id: string;
+			capabilities: Set<string>;
+			supportsExtensionUi: boolean;
+			attachedActiveSessionIds: Set<string>;
+		};
+		const activeSessionId = "active-slow-attach";
+		const summary = {
+			id: activeSessionId,
+			activeSessionId,
+			lifecycle: "live",
+			activity: "idle",
+			isSessionActive: false,
+			sessionId: "session-slow-attach",
+			cwd: "/tmp/project",
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		} satisfies SessionSummary;
+		const attachResult = {
+			activeSessionId,
+			snapshot: { summary, messages: [] },
+			client: { id: "worker-client", capabilities: [] },
+			lastEventSequence: 0,
+		} as unknown as DaemonAttachResult;
+		const workerResponse = createDeferred<DaemonResponse>();
+		const request = vi.fn((_command: unknown, timeoutMs = 30_000): Promise<DaemonResponse> => {
+			return new Promise((resolveRequest, rejectRequest) => {
+				const timeout = setTimeout(
+					() => rejectRequest(new Error("Timed out waiting for daemon worker response to attach")),
+					timeoutMs,
+				);
+				void workerResponse.promise.then(
+					(response) => {
+						clearTimeout(timeout);
+						resolveRequest(response);
+					},
+					(error) => {
+						clearTimeout(timeout);
+						rejectRequest(error);
+					},
+				);
+			});
+		});
+		const worker = {
+			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
+			client: { request },
+			summaries: new Map([[activeSessionId, summary]]),
+			snapshotCache: new Map<string, DaemonAttachResult>(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map<string, Promise<DaemonAttachResult>>(),
+		};
+		const firstClient: AttachClient = {
+			id: "client-1",
+			capabilities: new Set(),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set(),
+		};
+		const retryClient: AttachClient = {
+			id: "client-2",
+			capabilities: new Set(),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([firstClient, retryClient]),
+			streamReconstructor: { seed: vi.fn() },
+			syncWorkerExtensionUi: vi.fn(async () => {}),
+		}) as {
+			attachClient(client: AttachClient, command: { type: "attach"; activeSessionId: string }): Promise<unknown>;
+		};
+
+		const firstAttach = supervisor.attachClient(firstClient, { type: "attach", activeSessionId }).then(
+			(result) => ({ status: "fulfilled" as const, result }),
+			(error: unknown) => ({ status: "rejected" as const, error }),
+		);
+		await Promise.resolve();
+		expect(request).toHaveBeenCalledOnce();
+		expect(request.mock.calls[0]?.[1]).toBe(5 * 60_000);
+
+		await vi.advanceTimersByTimeAsync(30_000);
+		const retryAttach = supervisor.attachClient(retryClient, { type: "attach", activeSessionId }).then(
+			(result) => ({ status: "fulfilled" as const, result }),
+			(error: unknown) => ({ status: "rejected" as const, error }),
+		);
+		await Promise.resolve();
+
+		expect(request).toHaveBeenCalledOnce();
+		workerResponse.resolve(success("worker-attach", "attach", attachResult));
+		await expect(Promise.all([firstAttach, retryAttach])).resolves.toEqual([
+			expect.objectContaining({ status: "fulfilled" }),
+			expect.objectContaining({ status: "fulfilled" }),
+		]);
+	});
+
+	it("expires a streamed attach load that stalls after the worker response and allows a fresh retry", async () => {
+		vi.useFakeTimers();
+		type AttachClient = {
+			id: string;
+			capabilities: Set<string>;
+			supportsExtensionUi: boolean;
+			attachedActiveSessionIds: Set<string>;
+		};
+		type AttachData = {
+			transcript?: {
+				snapshotId: string;
+				waitForChunk(index: number): Promise<Buffer | undefined>;
+				markComplete(): void;
+			};
+			releaseTranscript?: () => void;
+		};
+		const cacheRoot = mkdtempSync(join(tmpdir(), "prime-supervisor-attach-deadline-"));
+		const activeSessionId = "active-stalled-stream";
+		const summary = {
+			id: activeSessionId,
+			activeSessionId,
+			lifecycle: "live",
+			activity: "idle",
+			isSessionActive: false,
+			sessionId: "session-stalled-stream",
+			cwd: "/tmp/project",
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: 1,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		} satisfies SessionSummary;
+		const attachResult = (snapshotId: string, lastEventSequence: number) =>
+			({
+				activeSessionId,
+				snapshot: { summary, messages: [], lastEventSequence },
+				client: { id: "worker-client", capabilities: ["chunked_snapshot"] },
+				lastEventSequence,
+				snapshotStream: { id: snapshotId, messageCount: 1, targetChunkBytes: 1024 },
+			}) as unknown as DaemonAttachResult;
+		const request = vi
+			.fn()
+			.mockResolvedValueOnce(success("worker-attach-1", "attach", attachResult("snapshot-1", 0)))
+			.mockResolvedValueOnce(success("worker-attach-2", "attach", attachResult("snapshot-2", 1)));
+		const worker = {
+			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
+			client: { request },
+			summaries: new Map([[activeSessionId, summary]]),
+			snapshotCache: new Map<string, DaemonAttachResult>(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map<string, Promise<DaemonAttachResult>>(),
+		};
+		const createClient = (id: string): AttachClient => ({
+			id,
+			capabilities: new Set(["chunked_snapshot"]),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set(),
+		});
+		const firstClient = createClient("client-1");
+		const retryClient = createClient("client-2");
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([firstClient, retryClient]),
+			snapshotCacheRoot: cacheRoot,
+			streamReconstructor: { seed: vi.fn() },
+			syncWorkerExtensionUi: vi.fn(async () => {}),
+		}) as {
+			attachClient(
+				client: AttachClient,
+				command: { type: "attach"; activeSessionId: string; capabilities: ["chunked_snapshot"] },
+			): Promise<AttachData>;
+		};
+
+		try {
+			const first = await supervisor.attachClient(firstClient, {
+				type: "attach",
+				activeSessionId,
+				capabilities: ["chunked_snapshot"],
+			});
+			expect(first.transcript?.snapshotId).toBe("snapshot-1");
+			expect(worker.snapshotLoads.has(`${activeSessionId}:chunked`)).toBe(true);
+			const stalled = first.transcript?.waitForChunk(0).then(
+				() => ({ status: "fulfilled" as const }),
+				(error: unknown) => ({ status: "rejected" as const, error }),
+			);
+
+			await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+			await expect(stalled).resolves.toMatchObject({
+				status: "rejected",
+				error: expect.objectContaining({ message: "Timed out waiting for snapshot snapshot-1 transfer" }),
+			});
+			expect(worker.snapshotLoads.has(`${activeSessionId}:chunked`)).toBe(false);
+			expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
+			expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
+			expect(worker.snapshotGenerations.has(activeSessionId)).toBe(false);
+			expect(worker.client).toBeDefined();
+			first.releaseTranscript?.();
+
+			const retry = await supervisor.attachClient(retryClient, {
+				type: "attach",
+				activeSessionId,
+				capabilities: ["chunked_snapshot"],
+			});
+			expect(request).toHaveBeenCalledTimes(2);
+			expect(retry.transcript?.snapshotId).toBe("snapshot-2");
+			retry.transcript?.markComplete();
+			retry.releaseTranscript?.();
+			await vi.advanceTimersByTimeAsync(0);
+			expect(worker.snapshotLoads.has(`${activeSessionId}:chunked`)).toBe(false);
+		} finally {
+			vi.useRealTimers();
+			rmSync(cacheRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("does not retire a newer snapshot generation when an older attach deadline expires", async () => {
+		vi.useFakeTimers();
+		type AttachClient = {
+			id: string;
+			capabilities: Set<string>;
+			supportsExtensionUi: boolean;
+			attachedActiveSessionIds: Set<string>;
+		};
+		type SnapshotTranscript = {
+			snapshotId: string;
+			waitForChunk(index: number): Promise<Buffer | undefined>;
+			markComplete(): void;
+			dispose(): void;
+		};
+		type SnapshotGeneration = { incoming: boolean; transcript: SnapshotTranscript };
+		type AttachData = { transcript?: SnapshotTranscript; releaseTranscript?: () => void };
+		const cacheRoot = mkdtempSync(join(tmpdir(), "prime-supervisor-attach-generation-deadline-"));
+		const activeSessionId = "active-newer-stream";
+		const summary = {
+			id: activeSessionId,
+			activeSessionId,
+			lifecycle: "live",
+			activity: "idle",
+			isSessionActive: false,
+			sessionId: "session-newer-stream",
+			cwd: "/tmp/project",
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: 1,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		} satisfies SessionSummary;
+		const attachResult = (snapshotId: string, lastEventSequence: number) =>
+			({
+				activeSessionId,
+				snapshot: { summary, messages: [], lastEventSequence },
+				client: { id: "worker-client", capabilities: ["chunked_snapshot"] },
+				lastEventSequence,
+				snapshotStream: { id: snapshotId, messageCount: 1, targetChunkBytes: 1024 },
+			}) as unknown as DaemonAttachResult;
+		const request = vi.fn().mockResolvedValue(success("worker-attach", "attach", attachResult("snapshot-old", 0)));
+		const worker = {
+			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
+			client: { request },
+			summaries: new Map([[activeSessionId, summary]]),
+			snapshotCache: new Map<string, DaemonAttachResult>(),
+			transcriptCaches: new Map<string, SnapshotTranscript>(),
+			snapshotGenerations: new Map<string, Map<string, SnapshotGeneration>>(),
+			snapshotLoads: new Map<string, Promise<DaemonAttachResult>>(),
+		};
+		const client: AttachClient = {
+			id: "client-1",
+			capabilities: new Set(["chunked_snapshot"]),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([client]),
+			snapshotCacheRoot: cacheRoot,
+			streamReconstructor: { seed: vi.fn() },
+			syncWorkerExtensionUi: vi.fn(async () => {}),
+		}) as {
+			attachClient(
+				attachClient: AttachClient,
+				command: { type: "attach"; activeSessionId: string; capabilities: ["chunked_snapshot"] },
+			): Promise<AttachData>;
+			cacheLoadedSnapshot(
+				residentWorker: typeof worker,
+				activeSessionId: string,
+				loaded: DaemonAttachResult,
+				observedSnapshotId: string | undefined,
+			): DaemonAttachResult;
+		};
+
+		try {
+			const first = await supervisor.attachClient(client, {
+				type: "attach",
+				activeSessionId,
+				capabilities: ["chunked_snapshot"],
+			});
+			const oldGeneration = worker.snapshotGenerations.get(activeSessionId)?.get("snapshot-old");
+			expect(oldGeneration).toBeDefined();
+			oldGeneration!.incoming = true;
+
+			supervisor.cacheLoadedSnapshot(worker, activeSessionId, attachResult("snapshot-new", 1), "snapshot-old");
+			const newerTranscript = worker.transcriptCaches.get(activeSessionId);
+			expect(newerTranscript?.snapshotId).toBe("snapshot-new");
+			let newerSettled = false;
+			void newerTranscript?.waitForChunk(0).then(
+				() => {
+					newerSettled = true;
+				},
+				() => {
+					newerSettled = true;
+				},
+			);
+
+			await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+			expect(worker.snapshotLoads.has(`${activeSessionId}:chunked`)).toBe(false);
+			expect(worker.snapshotGenerations.get(activeSessionId)?.has("snapshot-old")).toBe(false);
+			expect(worker.snapshotGenerations.get(activeSessionId)?.has("snapshot-new")).toBe(true);
+			expect(worker.transcriptCaches.get(activeSessionId)).toBe(newerTranscript);
+			expect(worker.snapshotCache.get(activeSessionId)?.snapshotStream?.id).toBe("snapshot-new");
+			expect(newerSettled).toBe(false);
+			expect(worker.client).toBeDefined();
+
+			first.releaseTranscript?.();
+			newerTranscript?.markComplete();
+			newerTranscript?.dispose();
+		} finally {
+			vi.useRealTimers();
+			rmSync(cacheRoot, { recursive: true, force: true });
+		}
 	});
 
 	it("does not retain an attachment when snapshot loading fails", async () => {

@@ -104,10 +104,10 @@ function makeSupervisor(idleEvictionMinutes: number | "off" = 90): SupervisorInt
 }
 
 describe("daemon supervisor whole-tree eviction", () => {
-	it("derives a bounded sweep interval from the live threshold", () => {
+	it("schedules enabled cleanup within one minute while keeping off inexpensive", () => {
 		expect(idleEvictionSweepIntervalMs("off")).toBe(5 * 60_000);
-		expect(idleEvictionSweepIntervalMs(90)).toBe(5 * 60_000);
-		expect(idleEvictionSweepIntervalMs(6)).toBe(2 * 60_000);
+		expect(idleEvictionSweepIntervalMs(90)).toBe(60_000);
+		expect(idleEvictionSweepIntervalMs(6)).toBe(60_000);
 		expect(idleEvictionSweepIntervalMs(1)).toBe(60_000);
 	});
 
@@ -253,7 +253,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 
 		try {
 			supervisor.scheduleIdleEvictionSweep();
-			await vi.advanceTimersByTimeAsync(5 * 60_000);
+			await vi.advanceTimersByTimeAsync(60_000);
 			expect(idle.client?.request).toHaveBeenCalledOnce();
 
 			const shutdown = supervisor.shutdown(42, false).then(

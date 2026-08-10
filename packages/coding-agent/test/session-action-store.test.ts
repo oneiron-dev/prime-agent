@@ -302,10 +302,23 @@ describe("child passivation capability", () => {
 		hasParent: true,
 		hasNonPassiveDescendants: false,
 		isHydrating: false,
+		isTerminalRetainedChild: false,
+	};
+	const terminalChild = {
+		...idleChild,
+		lastActivityAt: now - 60_000,
+		isTerminalRetainedChild: true,
 	};
 
 	it("accepts an idle leaf child at the shared inclusive threshold", () => {
 		expect(canPassivateSession(idleChild, 90, now)).toBe(true);
+	});
+
+	it("uses a fixed one-minute grace only for terminal retained children", () => {
+		expect(canPassivateSession(terminalChild, 90, now)).toBe(true);
+		expect(canPassivateSession({ ...terminalChild, lastActivityAt: now - 60_000 + 1 }, 90, now)).toBe(false);
+		expect(canPassivateSession({ ...terminalChild, lastActivityAt: now - 30_000 }, 0.5, now)).toBe(true);
+		expect(canPassivateSession({ ...terminalChild, isTerminalRetainedChild: false }, 90, now)).toBe(false);
 	});
 
 	it.each([
@@ -316,15 +329,14 @@ describe("child passivation capability", () => {
 		["attached child", { attachedClients: 1 }],
 		["heartbeat child", { hasRegisteredHeartbeat: true }],
 		["cron child", { hasRegisteredCronJob: true }],
-		["recent child", { lastActivityAt: now - 89 * 60_000 }],
 		["child without activity time", { lastActivityAt: Number.NaN }],
-	])("rejects a %s", (_name, override) => {
-		expect(canPassivateSession({ ...idleChild, ...override }, 90, now)).toBe(false);
+	])("rejects a terminal %s", (_name, override) => {
+		expect(canPassivateSession({ ...terminalChild, ...override }, 90, now)).toBe(false);
 	});
 
 	it("shares the whole-tree off and invalid threshold behavior", () => {
-		expect(canPassivateSession(idleChild, "off", now)).toBe(false);
-		expect(canPassivateSession(idleChild, 0, now)).toBe(false);
-		expect(canPassivateSession(idleChild, Number.NaN, now)).toBe(false);
+		expect(canPassivateSession(terminalChild, "off", now)).toBe(false);
+		expect(canPassivateSession(terminalChild, 0, now)).toBe(false);
+		expect(canPassivateSession(terminalChild, Number.NaN, now)).toBe(false);
 	});
 });

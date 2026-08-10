@@ -15,7 +15,7 @@ interface SessionInfoWire extends Omit<SessionInfo, "created" | "modified"> {
 }
 
 type CatalogRequest =
-	| { type: "request"; id: string; command: "list"; cwd?: string; sessionDir?: string }
+	| { type: "request"; id: string; command: "list"; cwd?: string; sessionDir?: string; stream?: boolean }
 	| { type: "request"; id: string; command: "resolve"; selector: string; cwd: string; sessionDir?: string }
 	| { type: "request"; id: string; command: "siblings"; sessionPath: string }
 	| { type: "request"; id: string; command: "rename"; sessionPath: string; name: string }
@@ -173,20 +173,27 @@ export async function runDaemonCatalogProcess(): Promise<never> {
 	return new Promise(() => {});
 }
 
-async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
+/** @internal Exported to test catalog subprocess dispatch without spawning a process. */
+export async function handleCatalogRequest(
+	request: CatalogRequest,
+	send: (message: CatalogOutbound) => void = sendCatalogMessage,
+): Promise<void> {
 	try {
 		switch (request.command) {
 			case "list": {
-				const callbacks = {
-					onProgress: (loaded: number, total: number) =>
-						sendCatalogMessage({ type: "progress", id: request.id, loaded, total }),
-					onSession: (session: SessionInfo) =>
-						sendCatalogMessage({ type: "session", id: request.id, session: serializeSessionInfo(session) }),
-				};
+				const callbacks =
+					request.stream !== false
+						? {
+								onProgress: (loaded: number, total: number) =>
+									send({ type: "progress", id: request.id, loaded, total }),
+								onSession: (session: SessionInfo) =>
+									send({ type: "session", id: request.id, session: serializeSessionInfo(session) }),
+							}
+						: undefined;
 				const sessions = request.cwd
 					? await SessionManager.list(request.cwd, request.sessionDir, callbacks)
 					: await SessionManager.listAll(callbacks, request.sessionDir);
-				sendCatalogMessage({
+				send({
 					type: "response",
 					id: request.id,
 					success: true,
@@ -200,7 +207,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					request.selector,
 				);
 				if (localMatch) {
-					sendCatalogMessage({
+					send({
 						type: "response",
 						id: request.id,
 						success: true,
@@ -213,7 +220,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					request.selector,
 				);
 				if (globalMatch) {
-					sendCatalogMessage({
+					send({
 						type: "response",
 						id: request.id,
 						success: true,
@@ -224,7 +231,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				throw new Error(`No session found matching '${request.selector}'`);
 			}
 			case "siblings":
-				sendCatalogMessage({
+				send({
 					type: "response",
 					id: request.id,
 					success: true,
@@ -233,10 +240,10 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				return;
 			case "rename":
 				SessionManager.open(request.sessionPath).appendSessionInfo(request.name.trim());
-				sendCatalogMessage({ type: "response", id: request.id, success: true });
+				send({ type: "response", id: request.id, success: true });
 				return;
 			case "delete":
-				sendCatalogMessage({
+				send({
 					type: "response",
 					id: request.id,
 					success: true,
@@ -246,7 +253,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 			case "archive": {
 				const session = await readSessionInfo(request.sessionPath);
 				if (!session || session.id !== request.sessionId) {
-					sendCatalogMessage({
+					send({
 						type: "response",
 						id: request.id,
 						success: true,
@@ -257,7 +264,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				if (session.state?.status !== "archived") {
 					SessionManager.open(request.sessionPath).appendSessionState({ status: "archived" });
 				}
-				sendCatalogMessage({
+				send({
 					type: "response",
 					id: request.id,
 					success: true,
@@ -275,15 +282,15 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 						operations: request.operations,
 					},
 				);
-				sendCatalogMessage({ type: "response", id: request.id, success: true });
+				send({ type: "response", id: request.id, success: true });
 				return;
 			case "shutdown":
-				sendCatalogMessage({ type: "response", id: request.id, success: true });
+				send({ type: "response", id: request.id, success: true });
 				setImmediate(() => process.exit(0));
 				return;
 		}
 	} catch (error) {
-		sendCatalogMessage({
+		send({
 			type: "response",
 			id: request.id,
 			success: false,
@@ -322,7 +329,7 @@ export class DaemonCatalogClient {
 
 	async list(cwd?: string, sessionDir?: string, callbacks?: CatalogListCallbacks): Promise<SessionInfo[]> {
 		const data = await this.request<{ sessions: SessionInfoWire[] }>(
-			{ type: "request", id: randomUUID(), command: "list", cwd, sessionDir },
+			{ type: "request", id: randomUUID(), command: "list", cwd, sessionDir, stream: callbacks !== undefined },
 			callbacks,
 		);
 		return data.sessions.map(deserializeSessionInfo);

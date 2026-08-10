@@ -1161,11 +1161,14 @@ interface SessionInfoCacheEntry {
 	info: SessionInfo | null;
 }
 
+const SESSION_INFO_SCAN_FAILED = Symbol("session-info-scan-failed");
+
 // Session files are append-only, so an unchanged (size, mtimeMs) means identical
 // content: cache list metadata and rescan only files that changed.
 const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
+const sessionInfoReadsInFlight = new Map<string, Promise<SessionInfo | null>>();
 
-export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
+async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null> {
 	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
 		stats = await stat(filePath);
@@ -1176,12 +1179,35 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
 		return cached.info;
 	}
-	const info = await scanSessionInfo(filePath, stats);
-	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info });
-	return info;
+	const result = await scanSessionInfo(filePath, stats);
+	if (result === SESSION_INFO_SCAN_FAILED) {
+		return null;
+	}
+	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info: result });
+	return result;
 }
 
-async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeof stat>>): Promise<SessionInfo | null> {
+export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
+	const inFlight = sessionInfoReadsInFlight.get(filePath);
+	if (inFlight) {
+		return inFlight;
+	}
+
+	const read = readSessionInfoOnce(filePath);
+	sessionInfoReadsInFlight.set(filePath, read);
+	try {
+		return await read;
+	} finally {
+		if (sessionInfoReadsInFlight.get(filePath) === read) {
+			sessionInfoReadsInFlight.delete(filePath);
+		}
+	}
+}
+
+async function scanSessionInfo(
+	filePath: string,
+	stats: Awaited<ReturnType<typeof stat>>,
+): Promise<SessionInfo | null | typeof SESSION_INFO_SCAN_FAILED> {
 	try {
 		let header: SessionHeader | undefined;
 		let messageCount = 0;
@@ -1287,7 +1313,7 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			agentStatus,
 		};
 	} catch {
-		return null;
+		return SESSION_INFO_SCAN_FAILED;
 	}
 }
 
@@ -1339,6 +1365,14 @@ async function listSessionsFromDir(
 
 	return sessions;
 }
+
+async function listAllSessionsFromDir(sessionsDir: string, callbacks?: SessionListCallbacks): Promise<SessionInfo[]> {
+	const sessions = await listSessionsFromDir(sessionsDir, callbacks);
+	sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+	return sessions;
+}
+
+const pendingSessionListAllScans = new Map<string, Promise<SessionInfo[]>>();
 
 /**
  * Manages conversation sessions as append-only trees stored in JSONL files.
@@ -2483,8 +2517,24 @@ export class SessionManager {
 	 */
 	static async listAll(callbacks?: SessionListCallbacks, sessionDir?: string): Promise<SessionInfo[]> {
 		const sessionsDir = sessionDir ?? getSessionsDir();
-		const sessions = await listSessionsFromDir(sessionsDir, callbacks);
-		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-		return sessions;
+		if (callbacks !== undefined) {
+			return listAllSessionsFromDir(sessionsDir, callbacks);
+		}
+
+		const scanKey = resolve(sessionsDir);
+		const pending = pendingSessionListAllScans.get(scanKey);
+		if (pending) {
+			return [...(await pending)];
+		}
+
+		const scan = listAllSessionsFromDir(sessionsDir);
+		pendingSessionListAllScans.set(scanKey, scan);
+		try {
+			return [...(await scan)];
+		} finally {
+			if (pendingSessionListAllScans.get(scanKey) === scan) {
+				pendingSessionListAllScans.delete(scanKey);
+			}
+		}
 	}
 }

@@ -126,7 +126,15 @@ type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 
 const structuredLog = getLogger("coding-agent.daemon-supervisor");
 const WORKER_CONNECT_TIMEOUT_MS = 30_000;
+// Public attach requests still time out after 30s. Keep their shared worker snapshot
+// load alive longer so retries join it instead of starting overlapping snapshot builds.
+const WORKER_ATTACH_REQUEST_TIMEOUT_MS = 5 * 60_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+// Short explicit grace period for a root worker to acknowledge `kill` before
+// the supervisor force-stops its process group. Public `stop` must stay
+// bounded even when a worker is wedged, so it cannot ride the 24h
+// WORKER_REQUEST_TIMEOUT_MS.
+export const WORKER_KILL_ACK_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // The whole pre-commit prepare (drain + worker fencing) must finish inside the
@@ -136,8 +144,8 @@ const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 const OWNED_WORKER_DISCONNECT_GRACE_MS = 30_000;
-const IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS = 5 * 60_000;
-const IDLE_EVICTION_MIN_SWEEP_INTERVAL_MS = 60_000;
+const IDLE_EVICTION_DISABLED_SWEEP_INTERVAL_MS = 5 * 60_000;
+const IDLE_EVICTION_SWEEP_INTERVAL_MS = 60_000;
 const IDLE_EVICTION_DRAIN_TIMEOUT_MS = 5_000;
 const CHILD_PASSIVATION_PER_WORKER_CAP = 2;
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
@@ -490,11 +498,7 @@ function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): strin
 }
 
 export function idleEvictionSweepIntervalMs(idleEvictionMinutes: IdleEvictionMinutes): number {
-	if (idleEvictionMinutes === "off") return IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS;
-	return Math.max(
-		IDLE_EVICTION_MIN_SWEEP_INTERVAL_MS,
-		Math.min(IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS, (idleEvictionMinutes * 60_000) / 3),
-	);
+	return idleEvictionMinutes === "off" ? IDLE_EVICTION_DISABLED_SWEEP_INTERVAL_MS : IDLE_EVICTION_SWEEP_INTERVAL_MS;
 }
 
 function workerSocketPath(supervisorSocketPath: string, workerId: string): string {
@@ -1902,13 +1906,7 @@ export class DaemonSupervisor {
 				return await forward();
 			}
 			this.persistWorkerStopTombstone(match.worker, true);
-			let response: DaemonResponse;
-			try {
-				response = await this.forwardToWorker(match.worker, resolvedCommand);
-			} finally {
-				await this.stopWorker(match.worker, true, false, true);
-			}
-			return response;
+			return await this.stopKilledRootWorker(match.worker, resolvedCommand);
 		} finally {
 			if (admission) this.deletePromptAdmission(admission);
 		}
@@ -3249,6 +3247,31 @@ export class DaemonSupervisor {
 		return responseWithId(response, command.id);
 	}
 
+	// Bounded root stop behind `kill`: the worker gets WORKER_KILL_ACK_TIMEOUT_MS
+	// to acknowledge (running its graceful closeSession), then the supervisor
+	// terminates only that worker's process group with the existing
+	// SIGTERM/SIGKILL escalation. Reachable workers keep the original graceful
+	// stopWorker path; a wedged worker is force-stopped inside seconds and the
+	// caller still gets a kill-shaped success instead of a 24h wait. The
+	// caller's tombstone plus stopWorker's archiveOnStop finalization preserve
+	// the saved session state required for `--resume`.
+	private async stopKilledRootWorker(worker: ResidentWorker, command: DaemonCommand): Promise<DaemonResponse> {
+		let response: DaemonResponse | undefined;
+		try {
+			response = await this.forwardToWorker(worker, command, WORKER_KILL_ACK_TIMEOUT_MS);
+		} catch (error) {
+			this.log(
+				`Worker ${worker.descriptor.workerId} did not acknowledge root kill within ${WORKER_KILL_ACK_TIMEOUT_MS}ms; forcing stop: ${String(error)}`,
+			);
+		}
+		if (response === undefined) {
+			await this.stopWorker(worker, true, true, true);
+			return success(command.id, "kill");
+		}
+		await this.stopWorker(worker, true, false, true);
+		return response;
+	}
+
 	private async attachClient(
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "attach" }>,
@@ -3308,33 +3331,59 @@ export class DaemonSupervisor {
 					const observedSnapshotId =
 						match.worker.transcriptCaches.get(activeSessionId)?.snapshotId ??
 						match.worker.snapshotCache.get(activeSessionId)?.snapshotStream?.id;
+					let loadedGeneration: SnapshotTranscriptGeneration | undefined;
 					loading = (async () => {
 						if (!match.worker.client) {
 							throw new Error("Session worker is not connected");
 						}
-						const response = await match.worker.client.request({
-							type: "attach",
-							activeSessionId,
-							capabilities: client.capabilities.has("chunked_snapshot")
-								? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
-								: ["attach_snapshot", "event_sequence", "slim_attach"],
-							supportsExtensionUi: false,
-							env: command.env ?? collectDaemonClientEnv(),
-						});
+						const response = await match.worker.client.request(
+							{
+								type: "attach",
+								activeSessionId,
+								capabilities: client.capabilities.has("chunked_snapshot")
+									? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
+									: ["attach_snapshot", "event_sequence", "slim_attach"],
+								supportsExtensionUi: false,
+								env: command.env ?? collectDaemonClientEnv(),
+							},
+							WORKER_ATTACH_REQUEST_TIMEOUT_MS,
+						);
 						const loaded = attachResultFromResponse(response);
 						if (match.worker.snapshotLoads.get(snapshotLoadKey) !== loading) {
 							throw new SnapshotLoadInvalidatedError("Session snapshot changed during attach");
 						}
-						return this.cacheLoadedSnapshot(match.worker, activeSessionId, loaded, observedSnapshotId);
+						const cached = this.cacheLoadedSnapshot(match.worker, activeSessionId, loaded, observedSnapshotId);
+						const snapshotId = loaded.snapshotStream?.id;
+						loadedGeneration = snapshotId
+							? this.snapshotGeneration(match.worker, loaded.activeSessionId, snapshotId)
+							: undefined;
+						return cached;
 					})();
 					match.worker.snapshotLoads.set(snapshotLoadKey, loading);
+					const loadDeadline = setTimeout(() => {
+						if (match.worker.snapshotLoads.get(snapshotLoadKey) !== loading) {
+							return;
+						}
+						match.worker.snapshotLoads.delete(snapshotLoadKey);
+						if (!loadedGeneration) {
+							return;
+						}
+						const snapshotId = loadedGeneration.transcript.snapshotId;
+						if (this.snapshotGeneration(match.worker, activeSessionId, snapshotId) !== loadedGeneration) {
+							return;
+						}
+						this.failSnapshotGeneration(
+							match.worker,
+							activeSessionId,
+							loadedGeneration,
+							new Error(`Timed out waiting for snapshot ${snapshotId} transfer`),
+						);
+					}, WORKER_ATTACH_REQUEST_TIMEOUT_MS);
+					loadDeadline.unref();
 					void loading.then(
-						async (loaded) => {
+						async () => {
 							try {
-								const snapshotId = loaded.snapshotStream?.id;
-								const transcript = snapshotId
-									? this.snapshotGeneration(match.worker, loaded.activeSessionId, snapshotId)?.transcript
-									: undefined;
+								const transcript = loadedGeneration?.transcript;
 								if (transcript && !transcript.complete) {
 									let chunkIndex = 0;
 									while (await transcript.waitForChunk(chunkIndex)) {
@@ -3344,12 +3393,14 @@ export class DaemonSupervisor {
 							} catch {
 								// Failed transfers must allow a fresh snapshot request.
 							} finally {
+								clearTimeout(loadDeadline);
 								if (match.worker.snapshotLoads.get(snapshotLoadKey) === loading) {
 									match.worker.snapshotLoads.delete(snapshotLoadKey);
 								}
 							}
 						},
 						() => {
+							clearTimeout(loadDeadline);
 							if (match.worker.snapshotLoads.get(snapshotLoadKey) === loading) {
 								match.worker.snapshotLoads.delete(snapshotLoadKey);
 							}

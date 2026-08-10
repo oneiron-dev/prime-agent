@@ -9,6 +9,7 @@
 - Changed sent agent messages in the IPython cell UI to show only the message text with a `╰─` gutter when expanded, matching received messages, and hid the raw `agent_message.send` receipt dictionary.
 - Fixed Homebrew installs attempting to self-update their versioned Cellar keg instead of directing users to `brew upgrade prime-agent` ([#844](https://github.com/PrimeIntellect-ai/prime-agent/issues/844))
 - Fixed chunked session snapshots advertising the session summary's message count instead of the count the transcript actually carries, which failed attach with "Snapshot ... contained N of N+1 messages" when the snapshot omitted a message the summary still counted.
+- Fixed large RLM trees becoming unresponsive by coalescing session, registry, passive-tree, and attach snapshot reads; suppressing duplicate idle-status writes; passivating completed children in bounded bursts; and bounding targeted root-worker stops.
 - Fixed custom prerelease builds showing an update notice for the official stable release with the same version number, which would have replaced the custom build.
 
 ## [0.7.1] - 2026-08-07

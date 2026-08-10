@@ -1,5 +1,15 @@
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -44,6 +54,7 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
+import { createDeferred } from "./suite/scheduling.js";
 
 describe("daemon mode helpers", () => {
 	it("preserves envelope client identity while registering prompt admission", () => {
@@ -485,6 +496,98 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("reuses one passive walk in family catalogs without changing standalone message lists", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-family-catalog-passive-walk.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const current = makeState("catalog-current");
+		current.runtime = {
+			...current.runtime,
+			cwd: "/tmp",
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: {
+				sessionId: "session-catalog-current",
+				sessionName: "catalog-current",
+				sessionFile: "/tmp/catalog-current.jsonl",
+				rlmDepth: 0,
+				isSessionActive: false,
+				isStreaming: false,
+				unfinishedActionCount: 0,
+				hasRunningRlmChildren: () => false,
+			},
+		} as never;
+		const passiveEntry = {
+			type: "rlm_subagent" as const,
+			childId: "passive-child",
+			sessionName: "passive-child",
+			sessionDir: "/tmp/passive-child",
+			sessionFile: "/tmp/passive-child.jsonl",
+			parentSessionId: current.runtime.session.sessionId,
+			parentSessionFile: current.runtime.session.sessionFile,
+			rlmDepth: 1,
+			status: "completed" as const,
+			createdAt: 1,
+			updatedAt: new Date(0).toISOString(),
+		};
+		const passiveDescendants = [
+			{
+				rootParentState: current,
+				entry: passiveEntry,
+				info: {
+					path: passiveEntry.sessionFile,
+					id: "session-passive-child",
+					cwd: "/tmp",
+					name: "passive-child",
+					rlmDepth: 1,
+					created: new Date(0),
+					modified: new Date(0),
+					messageCount: 0,
+					firstMessage: "",
+					allMessagesText: "",
+				},
+				chain: [passiveEntry],
+			},
+		];
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			listPassiveRlmSubagents: ReturnType<typeof vi.fn>;
+			createAgentMessageListResult(
+				state: ActiveSessionState,
+				passive?: readonly (typeof passiveDescendants)[number][],
+			): Promise<{ agents: Array<{ activeSessionId: string }> }>;
+			createAgentFamilyCatalog(state?: ActiveSessionState): Promise<Array<{ id: string; sessionPath?: string }>>;
+		};
+		internals.sessions.set(current.activeSessionId, current);
+		internals.listPassiveRlmSubagents = vi.fn(async () => passiveDescendants);
+		const createMessageList = vi.spyOn(internals, "createAgentMessageListResult");
+		const listAll = vi.spyOn(SessionManager, "listAll").mockResolvedValue([]);
+		try {
+			const catalog = await internals.createAgentFamilyCatalog(current);
+
+			expect(internals.listPassiveRlmSubagents).toHaveBeenCalledOnce();
+			expect(createMessageList).toHaveBeenCalledWith(current, passiveDescendants);
+			expect(catalog).toContainEqual(
+				expect.objectContaining({
+					id: "session-passive-child",
+					sessionPath: canonicalSessionPath(passiveEntry.sessionFile),
+				}),
+			);
+
+			internals.listPassiveRlmSubagents.mockClear();
+			createMessageList.mockClear();
+			const standalone = await internals.createAgentMessageListResult(current);
+			expect(internals.listPassiveRlmSubagents).toHaveBeenCalledOnce();
+			expect(createMessageList).toHaveBeenCalledWith(current);
+			expect(standalone.agents).toContainEqual(
+				expect.objectContaining({ activeSessionId: "session-passive-child" }),
+			);
+		} finally {
+			createMessageList.mockRestore();
+			listAll.mockRestore();
+		}
+	});
+
 	it("canonicalizes symlinked paths in the family catalog and name reservations", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-family-catalog-paths-"));
 		try {
@@ -717,6 +820,165 @@ describe("daemon mode helpers", () => {
 		).rejects.toThrow("registry write failed");
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
+	});
+
+	it("singleflights registry reads and invalidates cached parses on mtime changes and appends", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-registry-read-cache-"));
+		const readGate = createDeferred<void>();
+		try {
+			const registryPath = join(tempDir, "rlm-subagents.jsonl");
+			const parentSessionFile = join(tempDir, "parent.jsonl");
+			const runningEntry = {
+				type: "rlm_subagent" as const,
+				childId: "cached-child",
+				sessionName: "cached-child",
+				sessionDir: join(tempDir, "child"),
+				sessionFile: join(tempDir, "child.jsonl"),
+				parentSessionId: "parent-session",
+				parentSessionFile,
+				rlmDepth: 1,
+				rlmMaxDepth: 4,
+				status: "running" as const,
+				createdAt: 1,
+				updatedAt: "2026-01-01T00:00:00.000Z",
+			};
+			type RegistryEntry = Omit<typeof runningEntry, "status"> & {
+				status: "running" | "completed" | "deleted";
+			};
+			const initialContents = `${JSON.stringify(runningEntry)}\n`;
+			writeFileSync(registryPath, initialContents);
+			const parentState = makeState("registry-parent");
+			parentState.runtime = {
+				...parentState.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: {
+					sessionId: runningEntry.parentSessionId,
+					sessionFile: parentSessionFile,
+					sessionManager: { getSessionArtifactDir: () => tempDir },
+				},
+			} as never;
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+			});
+			const internals = daemon as unknown as {
+				readRlmSubagentRegistryFile(path: string): Promise<string>;
+				parseRlmSubagentRegistryContents(contents: string): RegistryEntry[];
+				readLatestRlmSubagentRegistryPath(path: string): Promise<RegistryEntry[]>;
+				appendRlmSubagentRegistryEntry(state: ActiveSessionState, entry: RegistryEntry): boolean;
+			};
+			const originalRead = internals.readRlmSubagentRegistryFile.bind(daemon);
+			const readStarted = createDeferred<void>();
+			const readFile = vi.spyOn(internals, "readRlmSubagentRegistryFile").mockImplementation(async (path) => {
+				readStarted.resolve();
+				await readGate.promise;
+				return originalRead(path);
+			});
+			const parse = vi.spyOn(internals, "parseRlmSubagentRegistryContents");
+			try {
+				const concurrentReads = [
+					internals.readLatestRlmSubagentRegistryPath(registryPath),
+					internals.readLatestRlmSubagentRegistryPath(registryPath),
+					internals.readLatestRlmSubagentRegistryPath(registryPath),
+				];
+				await readStarted.promise;
+				expect(readFile).toHaveBeenCalledOnce();
+				readGate.resolve();
+				await expect(Promise.all(concurrentReads)).resolves.toEqual([
+					[runningEntry],
+					[runningEntry],
+					[runningEntry],
+				]);
+				expect(parse).toHaveBeenCalledOnce();
+
+				await expect(internals.readLatestRlmSubagentRegistryPath(registryPath)).resolves.toEqual([runningEntry]);
+				expect(readFile).toHaveBeenCalledOnce();
+				expect(parse).toHaveBeenCalledOnce();
+
+				const deletedEntry = { ...runningEntry, status: "deleted" as const };
+				const rewrittenContents = `${JSON.stringify(deletedEntry)}\n`;
+				expect(Buffer.byteLength(rewrittenContents)).toBe(Buffer.byteLength(initialContents));
+				writeFileSync(registryPath, rewrittenContents);
+				const changedMtime = new Date(Date.now() + 10_000);
+				utimesSync(registryPath, changedMtime, changedMtime);
+				await expect(internals.readLatestRlmSubagentRegistryPath(registryPath)).resolves.toEqual([deletedEntry]);
+				expect(readFile).toHaveBeenCalledTimes(2);
+				expect(parse).toHaveBeenCalledTimes(2);
+
+				const completedEntry = { ...runningEntry, status: "completed" as const };
+				expect(internals.appendRlmSubagentRegistryEntry(parentState, completedEntry)).toBe(true);
+				await expect(internals.readLatestRlmSubagentRegistryPath(registryPath)).resolves.toEqual([completedEntry]);
+				expect(readFile).toHaveBeenCalledTimes(3);
+				expect(parse).toHaveBeenCalledTimes(3);
+			} finally {
+				readFile.mockRestore();
+				parse.mockRestore();
+			}
+		} finally {
+			readGate.resolve();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("appends from the registry tail without full-reading existing content", () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-registry-tail-"));
+		try {
+			const parentSessionFile = join(tempDir, "parent.jsonl");
+			const firstEntry = {
+				type: "rlm_subagent" as const,
+				childId: "first-child",
+				sessionName: "first-child",
+				sessionDir: join(tempDir, "first-child"),
+				sessionFile: join(tempDir, "first-child.jsonl"),
+				parentSessionId: "parent-session",
+				parentSessionFile,
+				rlmDepth: 1,
+				rlmMaxDepth: 4,
+				status: "running" as const,
+				createdAt: 1,
+				updatedAt: "2026-01-01T00:00:00.000Z",
+			};
+			const secondEntry = {
+				...firstEntry,
+				childId: "second-child",
+				sessionName: "second-child",
+				sessionDir: join(tempDir, "second-child"),
+				sessionFile: join(tempDir, "second-child.jsonl"),
+			};
+			const registryPath = join(tempDir, "rlm-subagents.jsonl");
+			writeFileSync(registryPath, JSON.stringify(firstEntry));
+			const parentState = makeState("registry-tail-parent");
+			parentState.runtime = {
+				...parentState.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: {
+					sessionId: firstEntry.parentSessionId,
+					sessionFile: parentSessionFile,
+					sessionManager: { getSessionArtifactDir: () => tempDir },
+				},
+			} as never;
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+			});
+			const internals = daemon as unknown as {
+				appendRlmSubagentRegistryEntry(state: ActiveSessionState, entry: typeof firstEntry): boolean;
+			};
+			const fullRead = vi.spyOn(fs, "readFileSync");
+			syncBuiltinESMExports();
+			try {
+				expect(internals.appendRlmSubagentRegistryEntry(parentState, secondEntry)).toBe(true);
+				expect(fullRead).not.toHaveBeenCalled();
+			} finally {
+				fullRead.mockRestore();
+				syncBuiltinESMExports();
+			}
+			expect(readFileSync(registryPath, "utf8")).toBe(
+				`${JSON.stringify(firstEntry)}\n${JSON.stringify(secondEntry)}\n`,
+			);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("persists a real child completion for passive discovery, roster, and listing", async () => {
@@ -5451,7 +5713,7 @@ describe("daemon mode helpers", () => {
 
 			expect(internals.buildRlmChildSnapshotsWithPassiveRlmSubagents).toHaveBeenCalledTimes(2);
 			expect(snapshot.children).toEqual([expect.objectContaining({ id: "new-child" })]);
-			expect(snapshot.messages).toBe(replacementSession.messages);
+			expect(snapshot.messages).toEqual(replacementSession.messages);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -5490,6 +5752,88 @@ describe("daemon mode helpers", () => {
 			});
 			expect(internals.buildRlmChildSnapshotsWithPassiveRlmSubagents).toHaveBeenCalledTimes(4);
 		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("singleflights concurrent session snapshot loads and clears them after success or failure", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-snapshot-singleflight-"));
+		let releaseInitial!: () => void;
+		const initialGate = new Promise<void>((resolve) => {
+			releaseInitial = resolve;
+		});
+		let releaseFailure!: () => void;
+		const failureGate = new Promise<void>((resolve) => {
+			releaseFailure = resolve;
+		});
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSessionSnapshot(state: ActiveSessionState): Promise<DaemonAttachResult["snapshot"]>;
+				createConnectionState: ReturnType<typeof vi.fn>;
+				buildRlmChildSnapshotsWithPassiveRlmSubagents: ReturnType<typeof vi.fn>;
+			};
+			const state = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			internals.createConnectionState = vi.fn(() => ({}));
+			const snapshotFailure = new Error("passive snapshot failed");
+			let phase: "initial" | "after-success" | "failure" | "retry" = "initial";
+			const buildChildren = vi.fn(async () => {
+				const activePhase = phase;
+				if (activePhase === "initial") await initialGate;
+				if (activePhase === "failure") {
+					await failureGate;
+					throw snapshotFailure;
+				}
+				return [{ id: `${activePhase}-child`, status: "done", sessionDir: tempDir }];
+			});
+			internals.buildRlmChildSnapshotsWithPassiveRlmSubagents = buildChildren;
+
+			const initialLoads = Array.from({ length: 128 }, () => internals.createSessionSnapshot(state));
+			expect(new Set(initialLoads)).toHaveLength(1);
+			expect(buildChildren).toHaveBeenCalledOnce();
+			state.lastEventSequence = 37;
+			releaseInitial();
+
+			const initialSnapshots = await Promise.all(initialLoads);
+			expect(new Set(initialSnapshots)).toHaveLength(1);
+			expect(initialSnapshots[0]).toMatchObject({
+				lastEventSequence: 37,
+				lastEventCursor: { generation: state.eventGeneration, sequence: 37 },
+				children: [{ id: "initial-child" }],
+			});
+
+			phase = "after-success";
+			state.lastEventSequence = 38;
+			const afterSuccess = await internals.createSessionSnapshot(state);
+			expect(buildChildren).toHaveBeenCalledTimes(2);
+			expect(afterSuccess).not.toBe(initialSnapshots[0]);
+			expect(afterSuccess).toMatchObject({
+				lastEventSequence: 38,
+				children: [{ id: "after-success-child" }],
+			});
+
+			phase = "failure";
+			const failedLoads = Array.from({ length: 128 }, () => internals.createSessionSnapshot(state));
+			expect(new Set(failedLoads)).toHaveLength(1);
+			expect(buildChildren).toHaveBeenCalledTimes(3);
+			releaseFailure();
+			const failures = await Promise.allSettled(failedLoads);
+			for (const failure of failures) {
+				expect(failure.status).toBe("rejected");
+				if (failure.status === "rejected") expect(failure.reason).toBe(snapshotFailure);
+			}
+
+			phase = "retry";
+			state.lastEventSequence = 39;
+			await expect(internals.createSessionSnapshot(state)).resolves.toMatchObject({
+				lastEventSequence: 39,
+				children: [{ id: "retry-child" }],
+			});
+			expect(buildChildren).toHaveBeenCalledTimes(4);
+		} finally {
+			releaseInitial();
+			releaseFailure();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -6807,7 +7151,7 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("limits each worker sweep and leaves non-leaf children resident", async () => {
+	it("drains terminal retained leaves ahead of the generic idle limit", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-passivation-cap.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			createRuntime: vi.fn(),
@@ -6818,7 +7162,8 @@ describe("daemon mode helpers", () => {
 		const queuedLeaf = makeState("queued-leaf", "root");
 		const nonLeaf = makeState("non-leaf", "root");
 		const nested = makeState("nested", "non-leaf");
-		const states = [root, oldestLeaf, nextLeaf, queuedLeaf, nonLeaf, nested];
+		const terminalLeaves = Array.from({ length: 33 }, (_, index) => makeState(`terminal-${index}`, "root"));
+		const states = [root, oldestLeaf, nextLeaf, queuedLeaf, nonLeaf, nested, ...terminalLeaves];
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
 			listPassiveRlmSubagents: ReturnType<typeof vi.fn>;
@@ -6827,14 +7172,7 @@ describe("daemon mode helpers", () => {
 			passivateIdleChildren(threshold: number, now: number, limit: number): Promise<number>;
 		};
 		for (const state of states) internals.sessions.set(state.activeSessionId, state);
-		const order = new Map([
-			[oldestLeaf, 1],
-			[nextLeaf, 2],
-			[queuedLeaf, 3],
-			[nested, 4],
-			[nonLeaf, 5],
-			[root, 6],
-		]);
+		const order = new Map(states.map((state, index) => [state, index + 1]));
 		internals.listPassiveRlmSubagents = vi.fn(async () => []);
 		internals.sessionPassivationSnapshot = vi.fn(async (state: ActiveSessionState) => ({
 			isSessionActive: false,
@@ -6845,18 +7183,80 @@ describe("daemon mode helpers", () => {
 			hasParent: state !== root,
 			hasNonPassiveDescendants: state === nonLeaf,
 			isHydrating: false,
+			isTerminalRetainedChild: terminalLeaves.includes(state),
 		}));
 		internals.passivateSession = vi.fn(async () => true);
 
-		await expect(internals.passivateIdleChildren(90, 200 * 60_000, 2)).resolves.toBe(2);
+		await expect(internals.passivateIdleChildren(90, 200 * 60_000, 2)).resolves.toBe(35);
 		expect(internals.sessionPassivationSnapshot).toHaveBeenCalledTimes(states.length);
-		expect(internals.passivateSession).toHaveBeenCalledTimes(2);
-		expect(internals.passivateSession.mock.calls.map((call) => call[0])).toEqual([oldestLeaf, nextLeaf]);
-		expect(internals.passivateSession).not.toHaveBeenCalledWith(nonLeaf, expect.anything(), expect.anything());
-		expect(internals.passivateSession).not.toHaveBeenCalledWith(queuedLeaf, expect.anything(), expect.anything());
+		expect(internals.passivateSession).toHaveBeenCalledTimes(35);
+		expect(internals.passivateSession.mock.calls.map((call) => call[0])).toEqual([
+			...terminalLeaves,
+			oldestLeaf,
+			nextLeaf,
+		]);
 	});
 
-	it("passivates an idle leaf and makes list, attach, and message use the normal passive wake path", async () => {
+	it("drains 147 terminal children in one bounded yielding passivation call", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-passivation-burst.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const root = makeState("burst-root");
+		const terminalLeaves = Array.from({ length: 147 }, (_, index) =>
+			makeState(`burst-terminal-${index}`, root.activeSessionId),
+		);
+		const states = [root, ...terminalLeaves];
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			listPassiveRlmSubagents: ReturnType<typeof vi.fn>;
+			sessionPassivationSnapshot: ReturnType<typeof vi.fn>;
+			passivateSession: ReturnType<typeof vi.fn>;
+			passivateIdleChildren(threshold: number | "off", now: number, limit: number): Promise<number>;
+		};
+		for (const state of states) internals.sessions.set(state.activeSessionId, state);
+		internals.listPassiveRlmSubagents = vi.fn(async () => []);
+		internals.sessionPassivationSnapshot = vi.fn(async (state: ActiveSessionState) => ({
+			isSessionActive: false,
+			attachedClients: 0,
+			hasRegisteredHeartbeat: false,
+			hasRegisteredCronJob: false,
+			lastActivityAt: terminalLeaves.indexOf(state),
+			hasParent: state !== root,
+			hasNonPassiveDescendants: false,
+			isHydrating: false,
+			isTerminalRetainedChild: state !== root,
+		}));
+		let calls = 0;
+		let inFlight = 0;
+		let maxInFlight = 0;
+		let yieldedAfterFirstBatch = false;
+		internals.passivateSession = vi.fn(async (state: ActiveSessionState) => {
+			calls += 1;
+			if (calls === 32) {
+				setImmediate(() => {
+					yieldedAfterFirstBatch = true;
+				});
+			}
+			if (calls > 32) expect(yieldedAfterFirstBatch).toBe(true);
+			inFlight += 1;
+			maxInFlight = Math.max(maxInFlight, inFlight);
+			await Promise.resolve();
+			inFlight -= 1;
+			internals.sessions.delete(state.activeSessionId);
+			return true;
+		});
+
+		await expect(internals.passivateIdleChildren("off", 200 * 60_000, 2)).resolves.toBe(0);
+		expect(internals.listPassiveRlmSubagents).not.toHaveBeenCalled();
+		await expect(internals.passivateIdleChildren(90, 200 * 60_000, 2)).resolves.toBe(147);
+		expect(internals.passivateSession).toHaveBeenCalledTimes(147);
+		expect(internals.passivateSession.mock.calls.map((call) => call[0])).toEqual(terminalLeaves);
+		expect(maxInFlight).toBe(32);
+		expect(yieldedAfterFirstBatch).toBe(true);
+	});
+
+	it("passivates a completed retained child after one minute and preserves passive wake paths", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passivate-child-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
@@ -6866,17 +7266,29 @@ describe("daemon mode helpers", () => {
 				createAgentMessageController(
 					getCurrentState: () => ActiveSessionState | undefined,
 				): AgentSessionMessageController;
+				sessionPassivationSnapshot(state: ActiveSessionState): Promise<{
+					lastActivityAt: number;
+					isTerminalRetainedChild: boolean;
+				}>;
 				passivateIdleChildren(threshold: number | "off", now: number, limit: number): Promise<number>;
 				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 			};
 			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
 			const firstChild = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
 			const parentSession = parentState.runtime.session as unknown as {
+				getRlmChildRunStatus: ReturnType<typeof vi.fn>;
 				releaseRlmChildSession: ReturnType<typeof vi.fn>;
 			};
+			parentSession.getRlmChildRunStatus = vi.fn(() => "done");
 			parentSession.releaseRlmChildSession = vi.fn(() => vi.fn());
+			firstChild.runtime.metadata.rehydratedCompleted = false;
 
-			expect(await internals.passivateIdleChildren(90, Date.parse("2036-08-01T12:00:00Z"), 2)).toBe(1);
+			const firstSnapshot = await internals.sessionPassivationSnapshot(firstChild);
+			expect(firstSnapshot.isTerminalRetainedChild).toBe(true);
+			expect(Number.isFinite(firstSnapshot.lastActivityAt)).toBe(true);
+			expect(await internals.passivateIdleChildren("off", firstSnapshot.lastActivityAt + 60_000, 2)).toBe(0);
+			expect(await internals.passivateIdleChildren(90, firstSnapshot.lastActivityAt + 60_000 - 1, 2)).toBe(0);
+			expect(await internals.passivateIdleChildren(90, firstSnapshot.lastActivityAt + 60_000, 2)).toBe(1);
 			expect(internals.sessions.has(firstChild.activeSessionId)).toBe(false);
 			expect(parentSession.releaseRlmChildSession).toHaveBeenCalledWith(fixture.childId, firstChild.runtime.session);
 			expect(fixture.runtimeSessions[1]?.disposeAsync).toHaveBeenCalledOnce();
@@ -6893,15 +7305,17 @@ describe("daemon mode helpers", () => {
 					getOrHydrateBoundSessionState(id: string): Promise<ActiveSessionState>;
 				}
 			).getOrHydrateBoundSessionState(String(passiveRow?.sessionId));
-			expect(attachedState.runtime.metadata).toMatchObject({ rlmChildId: fixture.childId });
+			expect(attachedState.runtime.metadata).toMatchObject({
+				rlmChildId: fixture.childId,
+				rehydratedCompleted: true,
+			});
 
 			// Detach so the same runtime can passivate again and prove a2a wake/delivery.
-			attachedState?.clients.clear();
-			const parentSessionAgain = parentState.runtime.session as unknown as {
-				releaseRlmChildSession: ReturnType<typeof vi.fn>;
-			};
-			parentSessionAgain.releaseRlmChildSession = vi.fn(() => vi.fn());
-			expect(await internals.passivateIdleChildren(90, Date.parse("2036-08-01T12:00:00Z"), 2)).toBe(1);
+			attachedState.clients.clear();
+			parentSession.releaseRlmChildSession = vi.fn(() => vi.fn());
+			const rehydratedSnapshot = await internals.sessionPassivationSnapshot(attachedState);
+			expect(rehydratedSnapshot.isTerminalRetainedChild).toBe(true);
+			expect(await internals.passivateIdleChildren(90, rehydratedSnapshot.lastActivityAt + 60_000, 2)).toBe(1);
 			await expect(
 				internals
 					.createAgentMessageController(() => parentState)
@@ -9819,6 +10233,7 @@ function makeRuntimeSession(
 		},
 		setSubagentRuntimeHost: vi.fn(),
 		getRlmChildRunStatus: vi.fn(() => "running"),
+		isRetainedRlmChildSession: vi.fn(() => false),
 		registerRlmChildSession: vi.fn(() => true),
 		releaseRlmChildSession: vi.fn(() => vi.fn()),
 		subscribe: vi.fn(() => vi.fn()),

@@ -916,6 +916,91 @@ describe("daemon supervisor resident workers", () => {
 		},
 	);
 
+	it(
+		"bounded-stops a wedged root worker while the supervisor and sibling workers survive",
+		{ tags: ["process-stress"], timeout: 60_000 },
+		async () => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			const sessionDir = join(agentDir, "sessions");
+			const socketPath = join(
+				tmpdir(),
+				`prime-supervisor-wedged-stop-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+			);
+			mkdirSync(projectDir, { recursive: true });
+			const sessionFiles = ["wedged root", "sibling root"].map((content, index) => {
+				const manager = SessionManager.create(projectDir, sessionDir);
+				manager.appendMessage({ role: "user", content, timestamp: index + 1 });
+				const sessionFile = manager.getSessionFile();
+				if (!sessionFile) {
+					throw new Error("Fixture session did not persist");
+				}
+				return sessionFile;
+			});
+
+			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const client = await connectEventually(socketPath, supervisor);
+			const created = await Promise.all(
+				sessionFiles.map((sessionPath) =>
+					client.request({
+						type: "create",
+						sessionPath,
+						config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+					}),
+				),
+			);
+			const summaries = created.map((response) => {
+				if (!response.success) {
+					throw new Error(response.error);
+				}
+				return requireSummary(response.data);
+			});
+			const wedged = summaries[0]!;
+			const sibling = summaries[1]!;
+			if (!wedged.workerPid || !sibling.workerPid) {
+				throw new Error("Resident workers did not expose their pids");
+			}
+			workerPids.add(wedged.workerPid);
+			workerPids.add(sibling.workerPid);
+			expect(wedged.workerPid).not.toBe(sibling.workerPid);
+			const wedgedActiveSessionId = wedged.activeSessionId ?? wedged.id;
+
+			process.kill(wedged.workerPid, "SIGSTOP");
+			const startedAt = Date.now();
+			const killed = await client.request({ type: "kill", activeSessionId: wedgedActiveSessionId }, 30_000);
+			expect(killed.success).toBe(true);
+			expect(Date.now() - startedAt).toBeLessThan(30_000);
+
+			await waitForProcessGone(wedged.workerPid);
+			workerPids.delete(wedged.workerPid);
+			await waitForCondition(
+				() => countWorkerDescriptors(agentDir) === 1,
+				"Wedged worker descriptor was not removed after the bounded stop",
+			);
+
+			const listed = await client.request({ type: "list" });
+			expect(listed.success).toBe(true);
+			const remaining = requireSessionList(listed.success ? listed.data : undefined);
+			expect(remaining.map((session) => session.activeSessionId ?? session.id)).toEqual([
+				sibling.activeSessionId ?? sibling.id,
+			]);
+			expect(remaining[0]!.workerPid).toBe(sibling.workerPid);
+			try {
+				process.kill(sibling.workerPid, 0);
+			} catch {
+				throw new Error("Sibling worker was not left alive by the bounded stop");
+			}
+			expect((await readSessionInfo(sessionFiles[0]!))?.state).toEqual({ status: "archived" });
+
+			await client.request({ type: "shutdown" });
+			client.close();
+			await waitForSocketGone(socketPath);
+			await waitForProcessGone(sibling.workerPid);
+			workerPids.delete(sibling.workerPid);
+		},
+	);
+
 	it("hosts and adopts isolated worker processes", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");

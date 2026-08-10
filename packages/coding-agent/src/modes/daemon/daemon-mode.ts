@@ -11,16 +11,18 @@ import { createHash, randomUUID } from "node:crypto";
 import {
 	closeSync,
 	existsSync,
+	fstatSync,
 	fsyncSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
+	readSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
@@ -238,6 +240,7 @@ const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
+const CHILD_PASSIVATION_BATCH_SIZE = 32;
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -406,6 +409,12 @@ type PassiveRlmSubagent = PassiveRlmRoot & {
 	chain: PersistedRlmSubagentRegistryEntry[];
 };
 
+interface RlmSubagentRegistryReadCacheEntry {
+	size: number;
+	mtimeMs: number;
+	entries: PersistedRlmSubagentRegistryEntry[];
+}
+
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
 
@@ -447,6 +456,8 @@ export class AgentDaemon {
 	private socketIdentity?: DaemonSocketIdentity;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly sessions = new Map<string, ActiveSessionState>();
+	private readonly sessionSnapshotLoads = new Map<ActiveSessionState, Promise<DaemonSessionSnapshot>>();
+	private readonly pendingPassiveRlmSubagentScans = new Map<boolean, Promise<PassiveRlmSubagent[]>>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
 	/** Covers path resolution through publication in openingSessions, before the runtime promise exists. */
 	private readonly reservingSessionOpens = new Map<string, Promise<void>>();
@@ -501,6 +512,9 @@ export class AgentDaemon {
 	// visible to host controllers during bind, excluded from targeting.
 	private readonly bindingSessions = new Set<string>();
 	private readonly pendingSessionNames = new Set<string>();
+	private readonly rlmSubagentRegistryReadCache = new Map<string, RlmSubagentRegistryReadCacheEntry>();
+	private readonly rlmSubagentRegistryReadFlights = new Map<string, Promise<PersistedRlmSubagentRegistryEntry[]>>();
+	private readonly rlmSubagentRegistryReadRevisions = new Map<string, number>();
 	private restoreActiveSessionId: string | undefined;
 	private supervisorMonitorTimer?: ReturnType<typeof setTimeout>;
 	private supervisorFenceTimer?: ReturnType<typeof setTimeout>;
@@ -888,6 +902,21 @@ export class AgentDaemon {
 		return join(artifactDir, RLM_SUBAGENT_REGISTRY_FILE);
 	}
 
+	private rlmSubagentRegistryAppendSeparator(handle: number): "" | "\n" {
+		const { size } = fstatSync(handle);
+		if (size === 0) return "";
+		const tail = Buffer.allocUnsafe(1);
+		const bytesRead = readSync(handle, tail, 0, 1, size - 1);
+		return bytesRead === 1 && tail[0] === 0x0a ? "" : "\n";
+	}
+
+	private invalidateRlmSubagentRegistryRead(path: string): void {
+		const key = resolve(path);
+		this.rlmSubagentRegistryReadCache.delete(key);
+		this.rlmSubagentRegistryReadFlights.delete(key);
+		this.rlmSubagentRegistryReadRevisions.set(key, (this.rlmSubagentRegistryReadRevisions.get(key) ?? 0) + 1);
+	}
+
 	private appendRlmSubagentRegistryEntry(
 		parentState: ActiveSessionState,
 		entry: PersistedRlmSubagentRegistryEntry,
@@ -896,12 +925,13 @@ export class AgentDaemon {
 		if (!path) {
 			return true;
 		}
+		let registryMayHaveChanged = false;
 		try {
 			mkdirSync(dirname(path), { recursive: true });
-			const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
-			const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
-			const handle = openSync(path, "a");
+			const handle = openSync(path, "a+");
 			try {
+				const separator = this.rlmSubagentRegistryAppendSeparator(handle);
+				registryMayHaveChanged = true;
 				writeSync(handle, `${separator}${JSON.stringify(entry)}\n`);
 				fsyncSync(handle);
 			} finally {
@@ -913,6 +943,8 @@ export class AgentDaemon {
 				`failed to persist RLM subagent registry entry: ${error instanceof Error ? error.message : String(error)}`,
 			);
 			return false;
+		} finally {
+			if (registryMayHaveChanged) this.invalidateRlmSubagentRegistryRead(path);
 		}
 	}
 
@@ -982,28 +1014,13 @@ export class AgentDaemon {
 		);
 	}
 
-	private async readLatestRlmSubagentRegistryPath(
-		path: string | undefined,
-		throwOnReadError = false,
-	): Promise<PersistedRlmSubagentRegistryEntry[]> {
-		if (!path) {
-			return [];
-		}
+	private readRlmSubagentRegistryFile(path: string): Promise<string> {
+		return readFile(path, "utf8");
+	}
+
+	private parseRlmSubagentRegistryContents(contents: string): PersistedRlmSubagentRegistryEntry[] {
 		const latest = new Map<string, PersistedRlmSubagentRegistryEntry>();
-		let lines: string[];
-		try {
-			lines = (await readFile(path, "utf8")).split(/\r?\n/);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-				return [];
-			}
-			this.log(`failed to read RLM subagent registry: ${error instanceof Error ? error.message : String(error)}`);
-			if (throwOnReadError) {
-				throw error;
-			}
-			return [];
-		}
-		for (const line of lines) {
+		for (const line of contents.split(/\r?\n/)) {
 			const trimmed = line.trim();
 			if (!trimmed) {
 				continue;
@@ -1032,6 +1049,76 @@ export class AgentDaemon {
 		return [...latest.values()];
 	}
 
+	private async loadLatestRlmSubagentRegistryPath(
+		path: string,
+		revision: number,
+	): Promise<PersistedRlmSubagentRegistryEntry[]> {
+		let fileStat: Awaited<ReturnType<typeof stat>>;
+		try {
+			fileStat = await stat(path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				this.rlmSubagentRegistryReadCache.delete(path);
+				return [];
+			}
+			throw error;
+		}
+		const cached = this.rlmSubagentRegistryReadCache.get(path);
+		if (cached && cached.size === fileStat.size && cached.mtimeMs === fileStat.mtimeMs) {
+			return cached.entries;
+		}
+		let contents: string;
+		try {
+			contents = await this.readRlmSubagentRegistryFile(path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				this.rlmSubagentRegistryReadCache.delete(path);
+				return [];
+			}
+			throw error;
+		}
+		const entries = this.parseRlmSubagentRegistryContents(contents);
+		if ((this.rlmSubagentRegistryReadRevisions.get(path) ?? 0) === revision) {
+			this.rlmSubagentRegistryReadCache.set(path, {
+				size: fileStat.size,
+				mtimeMs: fileStat.mtimeMs,
+				entries,
+			});
+		}
+		return entries;
+	}
+
+	private async readLatestRlmSubagentRegistryPath(
+		path: string | undefined,
+		throwOnReadError = false,
+	): Promise<PersistedRlmSubagentRegistryEntry[]> {
+		if (!path) {
+			return [];
+		}
+		const key = resolve(path);
+		let loading = this.rlmSubagentRegistryReadFlights.get(key);
+		if (!loading) {
+			loading = this.loadLatestRlmSubagentRegistryPath(key, this.rlmSubagentRegistryReadRevisions.get(key) ?? 0);
+			this.rlmSubagentRegistryReadFlights.set(key, loading);
+		}
+		try {
+			return await loading;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				return [];
+			}
+			this.log(`failed to read RLM subagent registry: ${error instanceof Error ? error.message : String(error)}`);
+			if (throwOnReadError) {
+				throw error;
+			}
+			return [];
+		} finally {
+			if (this.rlmSubagentRegistryReadFlights.get(key) === loading) {
+				this.rlmSubagentRegistryReadFlights.delete(key);
+			}
+		}
+	}
+
 	private rlmSubagentRegistryPathForEntry(entry: PersistedRlmSubagentRegistryEntry, info: SessionInfo): string {
 		return join(dirname(entry.sessionDir), "session-artifacts", info.id, RLM_SUBAGENT_REGISTRY_FILE);
 	}
@@ -1041,9 +1128,34 @@ export class AgentDaemon {
 	}
 
 	/** Walk each supplied parent's persisted child tree once, without creating runtimes. */
-	private async listPassiveRlmSubagents(
-		savedRoots: SessionInfo[] = [],
-		includeResident = false,
+	private listPassiveRlmSubagents(savedRoots?: SessionInfo[], includeResident = false): Promise<PassiveRlmSubagent[]> {
+		if (savedRoots !== undefined) {
+			return this.scanPassiveRlmSubagents(savedRoots, includeResident);
+		}
+
+		const pending = this.pendingPassiveRlmSubagentScans.get(includeResident);
+		if (pending) {
+			return pending.then((passive) => [...passive]);
+		}
+
+		const scan = this.scanPassiveRlmSubagents([], includeResident);
+		const trackedScan = scan.then(
+			(passive) => {
+				this.pendingPassiveRlmSubagentScans.delete(includeResident);
+				return passive;
+			},
+			(error: unknown) => {
+				this.pendingPassiveRlmSubagentScans.delete(includeResident);
+				throw error;
+			},
+		);
+		this.pendingPassiveRlmSubagentScans.set(includeResident, trackedScan);
+		return trackedScan.then((passive) => [...passive]);
+	}
+
+	private async scanPassiveRlmSubagents(
+		savedRoots: SessionInfo[],
+		includeResident: boolean,
 	): Promise<PassiveRlmSubagent[]> {
 		const passive: PassiveRlmSubagent[] = [];
 		const visit = async (
@@ -1096,7 +1208,7 @@ export class AgentDaemon {
 	}
 
 	private async passiveRlmSubagentsByPath(
-		savedRoots: SessionInfo[] = [],
+		savedRoots?: SessionInfo[],
 		includeResident = false,
 	): Promise<Map<string, PassiveRlmSubagent>> {
 		return new Map(
@@ -1179,7 +1291,7 @@ export class AgentDaemon {
 		target: string,
 		includeResident = false,
 	): Promise<PassiveRlmSubagent | undefined> {
-		const matches = [...(await this.passiveRlmSubagentsByPath([], includeResident)).values()].filter(
+		const matches = [...(await this.passiveRlmSubagentsByPath(undefined, includeResident)).values()].filter(
 			({ entry, info }) =>
 				entry.childId === target ||
 				resolve(entry.sessionFile) === resolve(target) ||
@@ -2423,6 +2535,22 @@ export class AgentDaemon {
 		const passiveDescendants = passiveRlmSubagents ?? (await this.listPassiveRlmSubagents());
 		const summary = summaryForActiveSession(state);
 		const sessionFile = state.runtime.session.sessionFile;
+		const metadata = state.runtime.metadata;
+		const parentState = metadata.parentActiveSessionId
+			? this.sessions.get(metadata.parentActiveSessionId)
+			: undefined;
+		const childRunStatus =
+			metadata.kind === "subagent" && metadata.rlmChildId !== undefined
+				? parentState?.runtime.session.getRlmChildRunStatus(metadata.rlmChildId)
+				: undefined;
+		const isTerminalRetainedChild =
+			metadata.kind === "subagent" &&
+			metadata.rlmChildId !== undefined &&
+			(metadata.rehydratedCompleted === true ||
+				childRunStatus === "done" ||
+				(childRunStatus === undefined &&
+					parentState?.runtime.session.isRetainedRlmChildSession(metadata.rlmChildId, state.runtime.session) ===
+						true));
 		const jobs = this.cronStore
 			.list()
 			.filter(
@@ -2445,7 +2573,7 @@ export class AgentDaemon {
 			hasRegisteredHeartbeat: jobs.some((job) => isHeartbeatCronJob(job) && job.status === "active"),
 			hasRegisteredCronJob: jobs.some((job) => !isHeartbeatCronJob(job)),
 			lastActivityAt: Date.parse(summary.lastActivityAt ?? ""),
-			hasParent: state.runtime.metadata.kind === "subagent" && !!state.runtime.metadata.parentActiveSessionId,
+			hasParent: metadata.kind === "subagent" && !!metadata.parentActiveSessionId,
 			hasNonPassiveDescendants: getChildActiveSessionStates(this.sessions, state).length > 0,
 			isHydrating:
 				this.bindingSessions.has(state.activeSessionId) ||
@@ -2455,6 +2583,7 @@ export class AgentDaemon {
 						passive.rootParentState === state &&
 						passive.chain.some((entry) => this.openingSessions.has(resolve(entry.sessionFile))),
 				),
+			isTerminalRetainedChild,
 		};
 	}
 
@@ -2538,23 +2667,50 @@ export class AgentDaemon {
 		now: number,
 		limit: number,
 	): Promise<number> {
-		if (this.shuttingDown || this.updateRestart !== undefined || limit <= 0) return 0;
+		if (this.shuttingDown || this.updateRestart !== undefined || idleEvictionMinutes === "off" || limit <= 0) {
+			return 0;
+		}
 		const states = [...this.sessions.values()];
 		const passiveRlmSubagents = await this.listPassiveRlmSubagents();
-		const snapshots = await Promise.all(
-			states.map(async (state) => ({
-				state,
-				snapshot: await this.sessionPassivationSnapshot(state, passiveRlmSubagents),
-			})),
-		);
-		const candidates = snapshots
+		const snapshots: Array<{ state: ActiveSessionState; snapshot: SessionPassivationSnapshot }> = [];
+		for (let offset = 0; offset < states.length; offset += CHILD_PASSIVATION_BATCH_SIZE) {
+			const batch = states.slice(offset, offset + CHILD_PASSIVATION_BATCH_SIZE);
+			snapshots.push(
+				...(await Promise.all(
+					batch.map(async (state) => ({
+						state,
+						snapshot: await this.sessionPassivationSnapshot(state, passiveRlmSubagents),
+					})),
+				)),
+			);
+			if (offset + CHILD_PASSIVATION_BATCH_SIZE < states.length) {
+				await new Promise<void>((resolveYield) => setImmediate(resolveYield));
+			}
+		}
+		const eligible = snapshots
 			.filter(({ snapshot }) => canPassivateSession(snapshot, idleEvictionMinutes, now))
-			.sort((left, right) => left.snapshot.lastActivityAt - right.snapshot.lastActivityAt)
-			.slice(0, limit);
-		const results = await Promise.all(
-			candidates.map(({ state, snapshot }) => this.passivateSession(state, idleEvictionMinutes, now, snapshot)),
-		);
-		return results.filter(Boolean).length;
+			.sort(
+				(left, right) =>
+					Number(right.snapshot.isTerminalRetainedChild) - Number(left.snapshot.isTerminalRetainedChild) ||
+					left.snapshot.lastActivityAt - right.snapshot.lastActivityAt,
+			);
+		const candidates = [
+			...eligible.filter(({ snapshot }) => snapshot.isTerminalRetainedChild),
+			...eligible.filter(({ snapshot }) => !snapshot.isTerminalRetainedChild).slice(0, limit),
+		];
+		let passivated = 0;
+		for (let offset = 0; offset < candidates.length; offset += CHILD_PASSIVATION_BATCH_SIZE) {
+			const batch = candidates.slice(offset, offset + CHILD_PASSIVATION_BATCH_SIZE);
+			const results = await Promise.all(
+				batch.map(({ state, snapshot }) => this.passivateSession(state, idleEvictionMinutes, now, snapshot)),
+			);
+			passivated += results.filter(Boolean).length;
+			if (offset + CHILD_PASSIVATION_BATCH_SIZE < candidates.length) {
+				await new Promise<void>((resolveYield) => setImmediate(resolveYield));
+				if (this.shuttingDown || this.updateRestart !== undefined) break;
+			}
+		}
+		return passivated;
 	}
 
 	private findPassivationBySessionFile(sessionFile: string): Promise<void> | undefined {
@@ -4592,7 +4748,20 @@ export class AgentDaemon {
 		};
 	}
 
-	private async createSessionSnapshot(state: ActiveSessionState): Promise<DaemonSessionSnapshot> {
+	private createSessionSnapshot(state: ActiveSessionState): Promise<DaemonSessionSnapshot> {
+		const pending = this.sessionSnapshotLoads.get(state);
+		if (pending) return pending;
+
+		const load = this.createSessionSnapshotOnce(state).finally(() => {
+			if (this.sessionSnapshotLoads.get(state) === load) {
+				this.sessionSnapshotLoads.delete(state);
+			}
+		});
+		this.sessionSnapshotLoads.set(state, load);
+		return load;
+	}
+
+	private async createSessionSnapshotOnce(state: ActiveSessionState): Promise<DaemonSessionSnapshot> {
 		const metadata = state.runtime.metadata;
 		const parent =
 			metadata.parentActiveSessionId || metadata.parentSessionId || metadata.rlmParentNodeId || metadata.rlmChildId
@@ -4916,11 +5085,15 @@ export class AgentDaemon {
 		};
 	}
 
-	private async createAgentMessageListResult(current: ActiveSessionState): Promise<AgentSessionMessageListResult> {
+	private async createAgentMessageListResult(
+		current: ActiveSessionState,
+		passiveRlmSubagents?: readonly PassiveRlmSubagent[],
+	): Promise<AgentSessionMessageListResult> {
 		const localAgents = this.listTargetableSessionStates(current).map((state) =>
 			this.createAgentMessageAgentSummary(state),
 		);
-		for (const passive of await this.listPassiveRlmSubagents()) {
+		const passiveDescendants = passiveRlmSubagents ?? (await this.listPassiveRlmSubagents());
+		for (const passive of passiveDescendants) {
 			const { entry, info } = passive;
 			localAgents.push({
 				// Before hydration the persisted session id is its supervisor-routable id.
@@ -4966,7 +5139,8 @@ export class AgentDaemon {
 	private async createAgentFamilyCatalog(currentState?: ActiveSessionState): Promise<AgentFamilyCatalogEntry[]> {
 		const current =
 			currentState ?? [...this.sessions.values()].find((state) => !this.bindingSessions.has(state.activeSessionId));
-		const listed = current ? await this.createAgentMessageListResult(current) : { agents: [] };
+		const passiveRlmSubagents = await this.listPassiveRlmSubagents();
+		const listed = current ? await this.createAgentMessageListResult(current, passiveRlmSubagents) : { agents: [] };
 		const remotePeers = new Set(this.remoteAgentPeers.values());
 		const localAgents = current
 			? [this.createAgentMessageAgentSummary(current), ...listed.agents.filter((agent) => !remotePeers.has(agent))]
@@ -5018,7 +5192,7 @@ export class AgentDaemon {
 			if (entry && state.runtime.session.sessionFile)
 				entry.sessionPath = canonicalSessionPath(state.runtime.session.sessionFile);
 		}
-		for (const passive of await this.listPassiveRlmSubagents()) {
+		for (const passive of passiveRlmSubagents) {
 			const entry = byId.get(passive.info.id);
 			if (entry) entry.sessionPath = canonicalSessionPath(passive.entry.sessionFile);
 		}

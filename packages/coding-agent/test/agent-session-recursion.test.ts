@@ -860,6 +860,8 @@ describe("AgentSession rlm recursion", () => {
 		const spawned = await root.runRlmChild("completed task", { name: "completed-worker" });
 		const internals = root as unknown as InspectableRlmSession;
 		await waitFor(() => internals._activeRlmChildRuns.get(spawned.rlm_child_id)?.status === "done");
+		expect(root.getRlmChildRunStatus(spawned.rlm_child_id)).toBe("done");
+		expect(root.isRetainedRlmChildSession(spawned.rlm_child_id, child)).toBe(false);
 		await waitFor(() => promptInjectedMessage.mock.calls.length === 1);
 		const send = internals._createKernelHostHandlers()["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
@@ -873,6 +875,8 @@ describe("AgentSession rlm recursion", () => {
 
 		releaseTerminalInjection();
 		await waitFor(() => !internals._activeRlmChildRuns.has(spawned.rlm_child_id));
+		expect(root.getRlmChildRunStatus(spawned.rlm_child_id)).toBeUndefined();
+		expect(root.isRetainedRlmChildSession(spawned.rlm_child_id, child)).toBe(true);
 	});
 
 	it("propagates pending child startup failure to an immediate roled send", async () => {
@@ -1370,7 +1374,7 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
-	it("notifies the runtime host when the initial child task completes", async () => {
+	it("passivates a real retained child after its completed run settles", async () => {
 		const child = createSession({ rlmSessionDir: join(tempDir, "host-completion-child") });
 		const completeRlmSubagentRuntime = vi.fn(() => true);
 		const root = createSession({
@@ -1382,12 +1386,72 @@ describe("AgentSession rlm recursion", () => {
 		});
 
 		const spawned = await root.runRlmChild("persist completion");
-		await vi.waitFor(() => {
-			expect(completeRlmSubagentRuntime).toHaveBeenCalledWith(spawned.rlm_child_id, child);
-		});
+		await waitFor(() => root.getRlmChildRunStatus(spawned.rlm_child_id) === undefined);
+		expect(completeRlmSubagentRuntime).toHaveBeenCalledWith(spawned.rlm_child_id, child);
+		expect(root.isRetainedRlmChildSession(spawned.rlm_child_id, child)).toBe(true);
 		expect((await root.listRlmSubagents()).subagents).toContainEqual(
 			expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "completed" }),
 		);
+
+		const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+			createRuntime: vi.fn(),
+		});
+		const parentState = {
+			activeSessionId: "parent-active",
+			clients: new Set(),
+			pendingAttaches: 0,
+			lastEventSequence: 0,
+			runtime: {
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: root,
+				diagnostics: [],
+			},
+		} as unknown as ActiveSessionState;
+		const childState = {
+			activeSessionId: "child-active",
+			clients: new Set(),
+			pendingAttaches: 0,
+			lastEventSequence: 0,
+			runtime: {
+				metadata: {
+					kind: "subagent",
+					createdAt: 1,
+					parentActiveSessionId: parentState.activeSessionId,
+					parentSessionId: root.sessionId,
+					rlmChildId: spawned.rlm_child_id,
+					rlmParentNodeId: spawned.rlm_child_id,
+					sessionDir: spawned.session_dir,
+				},
+				session: child,
+				diagnostics: [],
+			},
+		} as unknown as ActiveSessionState;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			listPassiveRlmSubagents: ReturnType<typeof vi.fn>;
+			closeSession: ReturnType<typeof vi.fn>;
+			sessionPassivationSnapshot(state: ActiveSessionState): Promise<{
+				lastActivityAt: number;
+				isTerminalRetainedChild: boolean;
+			}>;
+			passivateIdleChildren(threshold: number, now: number, limit: number): Promise<number>;
+		};
+		internals.sessions.set(parentState.activeSessionId, parentState);
+		internals.sessions.set(childState.activeSessionId, childState);
+		internals.listPassiveRlmSubagents = vi.fn(async () => []);
+		internals.closeSession = vi.fn(async (state: ActiveSessionState) => {
+			internals.sessions.delete(state.activeSessionId);
+			await state.runtime.session.disposeAsync();
+		});
+
+		const snapshot = await internals.sessionPassivationSnapshot(childState);
+		expect(root.getRlmChildRunStatus(spawned.rlm_child_id)).toBeUndefined();
+		expect(snapshot.isTerminalRetainedChild).toBe(true);
+		expect(Number.isFinite(snapshot.lastActivityAt)).toBe(true);
+		await expect(internals.passivateIdleChildren(90, snapshot.lastActivityAt + 60_000, 2)).resolves.toBe(1);
+		expect(internals.closeSession).toHaveBeenCalledWith(childState, "shutdown", true, false);
+		expect(root.isRetainedRlmChildSession(spawned.rlm_child_id, child)).toBe(false);
 	});
 
 	it("projects retained child follow-up turns into parent child-update activity", async () => {

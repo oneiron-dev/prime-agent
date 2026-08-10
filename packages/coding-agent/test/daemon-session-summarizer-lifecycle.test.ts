@@ -5,6 +5,7 @@ import { DaemonSessionSummarizer } from "../src/modes/daemon/daemon-session-summ
 // The debounce the summarizer waits for after a turn settles (kept in sync with
 // SETTLE_DEBOUNCE_MS in the module).
 const SETTLE_MS = 2000;
+const SWEEP_MS = 25_000;
 
 function makeState(
 	opts: { working?: boolean; messages?: number; kind?: "top-level" | "subagent"; persisted?: unknown } = {},
@@ -71,24 +72,53 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 		expect(state.summaryState).toMatchObject({ taskState: "needs_input", basedOnMessageCount: 2 });
 	});
 
-	test("retries after a needs_input fallback until a real summary lands", async () => {
+	test("a blank fallback settles repeated idle sweeps without more generation or persistence", async () => {
 		vi.useFakeTimers();
-		const generate = vi
-			.fn()
-			.mockResolvedValueOnce(undefined) // transient failure → blank needs_input fallback
-			.mockResolvedValue({ summary: "Reviewed the diff", taskState: "completed" });
+		const generate = vi.fn().mockResolvedValue(undefined);
+		const state = makeState({ working: false });
+		const summarizer = new DaemonSessionSummarizer(() => [state], undefined, generate);
+		const appended = (state as unknown as { appendedStatuses: unknown[] }).appendedStatuses;
+
+		summarizer.start();
+		summarizer.notifyActivity(state);
+		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
+		expect(generate).toHaveBeenCalledOnce();
+		expect(state.summaryState).toEqual({ summary: "", taskState: "needs_input", basedOnMessageCount: 2 });
+		expect(appended).toHaveLength(1);
+
+		await vi.advanceTimersByTimeAsync(SWEEP_MS * 3);
+		expect(generate).toHaveBeenCalledOnce();
+		expect(appended).toHaveLength(1);
+		summarizer.stop();
+	});
+
+	test("a changed message count permits one fresh attempt and persistence after a blank fallback", async () => {
+		vi.useFakeTimers();
+		const generate = vi.fn().mockResolvedValue(undefined);
 		const summarizer = new DaemonSessionSummarizer(() => [], undefined, generate);
 		const state = makeState({ working: false });
+		const appended = (state as unknown as { appendedStatuses: unknown[] }).appendedStatuses;
 
 		summarizer.notifyActivity(state);
 		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
-		expect(state.summaryState).toMatchObject({ summary: "", taskState: "needs_input" });
+		expect(state.summaryState).toEqual({ summary: "", taskState: "needs_input", basedOnMessageCount: 2 });
+		expect(appended).toHaveLength(1);
 
-		// A blank recap still owes a summary, so a later sweep retries and records it.
+		(state.runtime.session.messages as unknown[]).push({ role: "user", content: "new task" });
 		summarizer.notifyActivity(state);
 		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
 		expect(generate).toHaveBeenCalledTimes(2);
-		expect(state.summaryState).toMatchObject({ summary: "Reviewed the diff", taskState: "completed" });
+		expect(generate.mock.calls[1]?.[0].messages).toHaveLength(3);
+		expect(state.summaryState).toEqual({ summary: "", taskState: "needs_input", basedOnMessageCount: 3 });
+		expect(appended).toEqual([
+			{ summary: "", taskState: "needs_input", basedOnMessageCount: 2 },
+			{ summary: "", taskState: "needs_input", basedOnMessageCount: 3 },
+		]);
+
+		summarizer.notifyActivity(state);
+		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
+		expect(generate).toHaveBeenCalledTimes(2);
+		expect(appended).toHaveLength(2);
 	});
 
 	test("refreshes a working session even when the message count is unchanged", async () => {

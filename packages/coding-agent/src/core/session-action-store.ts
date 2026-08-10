@@ -323,6 +323,7 @@ export interface SessionPassivationSnapshot extends SessionEvictionSnapshot {
 	hasParent: boolean;
 	hasNonPassiveDescendants: boolean;
 	isHydrating: boolean;
+	isTerminalRetainedChild: boolean;
 }
 
 export interface WorkerEvictionSnapshot {
@@ -352,17 +353,25 @@ function isIdleEvictionThresholdMet(
 	);
 }
 
+const TERMINAL_RETAINED_CHILD_PASSIVATION_GRACE_MINUTES = 1;
+
 /** Pure per-node residency policy. Roots remain owned by whole-worker eviction. */
 export function canPassivateSession(
 	session: SessionPassivationSnapshot,
 	idleEvictionMinutes: IdleEvictionMinutes,
 	now = Date.now(),
 ): boolean {
+	if (idleEvictionMinutes === "off" || !Number.isFinite(idleEvictionMinutes) || idleEvictionMinutes <= 0) {
+		return false;
+	}
+	const thresholdMinutes = session.isTerminalRetainedChild
+		? Math.min(idleEvictionMinutes, TERMINAL_RETAINED_CHILD_PASSIVATION_GRACE_MINUTES)
+		: idleEvictionMinutes;
 	return (
 		session.hasParent &&
 		!session.hasNonPassiveDescendants &&
 		!session.isHydrating &&
-		isIdleEvictionThresholdMet(session, idleEvictionMinutes, now)
+		isIdleEvictionThresholdMet(session, thresholdMinutes, now)
 	);
 }
 

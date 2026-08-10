@@ -1,7 +1,25 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+interface FileLinesModule {
+	readFirstLineSync(filePath: string, maxBytes?: number): string | undefined;
+	readLinesAsBuffers(filePath: string): AsyncGenerator<Buffer>;
+}
+
+type ReadLinesAsBuffers = FileLinesModule["readLinesAsBuffers"];
+
+const fileLineMocks = vi.hoisted(() => ({
+	readLinesAsBuffers: vi.fn<ReadLinesAsBuffers>(),
+}));
+
+vi.mock("../../src/utils/file-lines.js", async (importOriginal) => {
+	const actual = await importOriginal<FileLinesModule>();
+	fileLineMocks.readLinesAsBuffers.mockImplementation(actual.readLinesAsBuffers);
+	return { ...actual, readLinesAsBuffers: fileLineMocks.readLinesAsBuffers };
+});
+
 import {
 	findMostRecentSession,
 	loadEntriesFromFile,
@@ -156,6 +174,131 @@ describe("loadEntriesFromFile", () => {
 		expect(entries[2]).toMatchObject({ type: "message", id: "2" });
 	});
 });
+
+describe("readSessionInfo", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `session-info-test-${Date.now()}-${Math.random()}`);
+		mkdirSync(tempDir, { recursive: true });
+		fileLineMocks.readLinesAsBuffers.mockClear();
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	function createSessionContent(firstMessage: string): string {
+		return `${[
+			JSON.stringify({
+				type: "session",
+				id: "session-info-test",
+				timestamp: "2025-01-01T00:00:00Z",
+				cwd: tempDir,
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "message-1",
+				parentId: null,
+				timestamp: "2025-01-01T00:00:01Z",
+				message: { role: "user", content: firstMessage, timestamp: 1 },
+			}),
+		].join("\n")}\n`;
+	}
+
+	it("shares an in-flight scan and still invalidates completed cache entries by size or mtime", async () => {
+		const file = join(tempDir, "session.jsonl");
+		const initialContent = createSessionContent("alpha");
+		writeFileSync(file, initialContent);
+
+		const [first, second, third] = await Promise.all([
+			readSessionInfo(file),
+			readSessionInfo(file),
+			readSessionInfo(file),
+		]);
+
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledTimes(1);
+		expect(first?.firstMessage).toBe("alpha");
+		expect(second).toBe(first);
+		expect(third).toBe(first);
+
+		expect(await readSessionInfo(file)).toBe(first);
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledTimes(1);
+
+		const initialStats = statSync(file);
+		const sameSizeContent = createSessionContent("bravo");
+		expect(Buffer.byteLength(sameSizeContent)).toBe(initialStats.size);
+		writeFileSync(file, sameSizeContent);
+		const changedTime = new Date(initialStats.mtimeMs + 2000);
+		utimesSync(file, changedTime, changedTime);
+		const mtimeChangedStats = statSync(file);
+		expect(mtimeChangedStats.size).toBe(initialStats.size);
+		expect(mtimeChangedStats.mtimeMs).not.toBe(initialStats.mtimeMs);
+
+		const mtimeChanged = await readSessionInfo(file);
+		expect(mtimeChanged?.firstMessage).toBe("bravo");
+		expect(mtimeChanged).not.toBe(first);
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledTimes(2);
+
+		const secondMessage = JSON.stringify({
+			type: "message",
+			id: "message-2",
+			parentId: "message-1",
+			timestamp: "2025-01-01T00:00:02Z",
+			message: { role: "assistant", content: "done", timestamp: 2 },
+		});
+		writeFileSync(file, `${sameSizeContent}${secondMessage}\n`);
+		expect(statSync(file).size).toBeGreaterThan(mtimeChangedStats.size);
+
+		const sizeChanged = await readSessionInfo(file);
+		expect(sizeChanged?.messageCount).toBe(2);
+		expect(sizeChanged).not.toBe(mtimeChanged);
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledTimes(3);
+	});
+
+	it("does not cache a transient stream failure and clears its concurrent flight", async () => {
+		const file = join(tempDir, "retry.jsonl");
+		writeFileSync(file, createSessionContent("recovered"));
+		const scanStarted = deferred();
+		const releaseScan = deferred();
+		fileLineMocks.readLinesAsBuffers.mockImplementationOnce(async function* () {
+			scanStarted.resolve();
+			await releaseScan.promise;
+			yield Buffer.alloc(0);
+			const error = new Error("too many open files") as NodeJS.ErrnoException;
+			error.code = "EMFILE";
+			throw error;
+		});
+
+		const first = readSessionInfo(file);
+		const second = readSessionInfo(file);
+		await scanStarted.promise;
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledTimes(1);
+		releaseScan.resolve();
+		await expect(Promise.all([first, second])).resolves.toEqual([null, null]);
+
+		const recovered = await readSessionInfo(file);
+		expect(recovered?.firstMessage).toBe("recovered");
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledTimes(2);
+	});
+
+	it("caches a completed scan of an invalid session file", async () => {
+		const file = join(tempDir, "invalid.jsonl");
+		writeFileSync(file, '{"type":"message"}\n');
+
+		expect(await readSessionInfo(file)).toBeNull();
+		expect(await readSessionInfo(file)).toBeNull();
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledTimes(1);
+	});
+});
+
+function deferred(): { promise: Promise<void>; resolve(): void } {
+	let resolve!: () => void;
+	const promise = new Promise<void>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
 
 describe("session tree metadata", () => {
 	it.each(["2.5", "2oops", "9007199254740993"])("rejects invalid RLM_DEPTH value %s", (value) => {

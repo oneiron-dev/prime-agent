@@ -9142,6 +9142,11 @@ export class AgentSession {
 		return this._activeRlmChildRuns.get(childId)?.status;
 	}
 
+	/** True when this exact direct child session is retained after its run settles. */
+	isRetainedRlmChildSession(childId: string, session: AgentSession): boolean {
+		return this._rlmChildSessions.get(childId) === session;
+	}
+
 	private async _currentActiveSessionId(): Promise<string | undefined> {
 		try {
 			return (await this._agentMessageController?.listAgents())?.current?.activeSessionId;
