@@ -4,6 +4,7 @@ const DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL = "https://pub-728493de92a943e2a9b2d
 const STABLE_VERSION_MANIFEST_PATH = "latest.json";
 const BETA_VERSION_MANIFEST_PATH = "beta.json";
 const DEFAULT_VERSION_CHECK_TIMEOUT_MS = 10000;
+const BETA_PRERELEASE_PATTERN = /^beta(?:\.|$)/;
 
 export interface LatestPiRelease {
 	version: string;
@@ -98,7 +99,21 @@ function normalizeReleaseVersion(version: string): string {
 
 function getReleaseManifestPath(currentVersion: string): string {
 	const prerelease = parsePackageVersion(currentVersion)?.prerelease;
-	return prerelease?.match(/^beta(?:\.|$)/) ? BETA_VERSION_MANIFEST_PATH : STABLE_VERSION_MANIFEST_PATH;
+	return prerelease?.match(BETA_PRERELEASE_PATTERN) ? BETA_VERSION_MANIFEST_PATH : STABLE_VERSION_MANIFEST_PATH;
+}
+
+/**
+ * Custom builds carry a nonstandard prerelease tag (e.g. `0.7.1-oneiron.20260810.2`) and read the stable
+ * manifest, where SemVer ranks the official `0.7.1` above them. Advertising it would replace the custom
+ * build rather than update it. Only that same-base stable release is suppressed; newer official versions
+ * and beta builds are unaffected.
+ */
+function isSameReleaseAsCustomBuild(currentVersion: string, candidateVersion: string): boolean {
+	const current = parsePackageVersion(currentVersion);
+	const candidate = parsePackageVersion(candidateVersion);
+	if (!current?.prerelease || !candidate || candidate.prerelease) return false;
+	if (BETA_PRERELEASE_PATTERN.test(current.prerelease)) return false;
+	return current.major === candidate.major && current.minor === candidate.minor && current.patch === candidate.patch;
 }
 
 function resolveReleaseUrl(baseUrl: string, pathOrUrl: string): string | undefined {
@@ -163,7 +178,10 @@ export async function getLatestPiVersion(
 export async function checkForNewPiVersion(currentVersion: string): Promise<string | undefined> {
 	try {
 		const latestVersion = await getLatestPiVersion(currentVersion);
-		if (latestVersion && isNewerPackageVersion(latestVersion, currentVersion)) {
+		if (!latestVersion || isSameReleaseAsCustomBuild(currentVersion, latestVersion)) {
+			return undefined;
+		}
+		if (isNewerPackageVersion(latestVersion, currentVersion)) {
 			return latestVersion;
 		}
 		return undefined;

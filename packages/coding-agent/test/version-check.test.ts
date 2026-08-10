@@ -45,6 +45,27 @@ describe("version checks", () => {
 		await expect(checkForNewPiVersion("1.2.2")).resolves.toBe("1.2.3");
 	});
 
+	it("does not advertise the same stable release to custom prerelease builds", async () => {
+		const fetchMock = vi.fn(async () => Response.json({ version: "v0.7.1" }));
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(checkForNewPiVersion("0.7.1-oneiron.20260810.2")).resolves.toBeUndefined();
+	});
+
+	it("still advertises newer stable releases to custom prerelease builds", async () => {
+		const fetchMock = vi.fn(async () => Response.json({ version: "v0.7.2" }));
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(checkForNewPiVersion("0.7.1-oneiron.20260810.2")).resolves.toBe("0.7.2");
+	});
+
+	it("keeps advertising the stable release that supersedes a beta build", async () => {
+		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.4" }));
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(checkForNewPiVersion("1.2.4-beta.123.1.1234567")).resolves.toBe("1.2.4");
+	});
+
 	it("uses the Prime Agent release manifest with a Prime Agent user agent", async () => {
 		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.4" }));
 		vi.stubGlobal("fetch", fetchMock);
