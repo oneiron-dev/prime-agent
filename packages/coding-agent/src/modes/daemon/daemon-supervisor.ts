@@ -43,7 +43,7 @@ import {
 import { canonicalSessionPath, getProcessStartId, SessionAlreadyActiveError } from "../../core/session-lease.js";
 import { readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { SettingsManager } from "../../core/settings-manager.js";
-import { signalProcessGroupOrProcess } from "../../utils/child-process.js";
+import { isProcessAlive, processIdExists, signalProcessGroupOrProcess } from "../../utils/child-process.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
@@ -144,6 +144,13 @@ const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
+const STOP_FINALIZATION_RECHECK_MS = 250;
+const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
+const STOP_FINALIZATION_RETRY_MS = 5000;
+// Polling loops probe existence cheaply via kill(0); the ps-backed zombie and
+// identity checks are throttled so a wedged worker cannot saturate the
+// supervisor event loop with synchronous subprocess spawns.
+const LIVENESS_IDENTITY_RECHECK_MS = 500;
 const OWNED_WORKER_DISCONNECT_GRACE_MS = 30_000;
 const IDLE_EVICTION_DISABLED_SWEEP_INTERVAL_MS = 5 * 60_000;
 const IDLE_EVICTION_SWEEP_INTERVAL_MS = 60_000;
@@ -268,6 +275,7 @@ interface ResidentWorker {
 	intentionalStop: boolean;
 	stopRevision: number;
 	launchEnv?: Record<string, string>;
+	stopFinalization?: Promise<void>;
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
 	updateRestartPrepareClient?: DaemonWorkerClient;
@@ -335,6 +343,8 @@ class SupervisorRecoveryCancelledError extends Error {
 }
 
 class SnapshotLoadInvalidatedError extends Error {}
+
+class WorkerStopTimeoutError extends Error {}
 
 function isSupervisorGenerationStale(error: unknown): boolean {
 	return (
@@ -512,15 +522,6 @@ function workerSocketPath(supervisorSocketPath: string, workerId: string): strin
 
 function looksLikeSessionPath(selector: string): boolean {
 	return isAbsolute(selector) || selector.endsWith(".jsonl") || selector.includes("/") || selector.includes("\\");
-}
-
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
 }
 
 function isFinalizedTranscriptEvent(eventType: string | undefined): boolean {
@@ -2376,9 +2377,6 @@ export class DaemonSupervisor {
 		await this.assertRecoveryAllowed();
 		if (worker.descriptor.stopRequestedAt) {
 			try {
-				// A tombstoned worker must not run long enough to elect another
-				// supervisor while its intentional stop is being adopted.
-				signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
 				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
 				this.log(`Completed intentional stop for worker ${worker.descriptor.workerId} during supervisor adoption`);
 			} catch (error) {
@@ -4591,6 +4589,30 @@ const workerClient = this.requireAvailableWorkerClient(match.worker);
 		renameSync(tempPath, path);
 	}
 
+	/**
+	 * Verdict on whether a pid is still the process we launched. Callers must
+	 * be conservative in both directions: signal a pid only on "current"
+	 * (never SIGKILL a recycled pid), and clean up a registration only on
+	 * "gone"/"replaced" (never orphan a live worker because a transient
+	 * identity lookup failed).
+	 */
+	private processIdentity(
+		pid: number,
+		processStartId: string | undefined,
+	): "current" | "replaced" | "gone" | "unknown" {
+		if (!isProcessAlive(pid)) {
+			return "gone";
+		}
+		if (processStartId === undefined) {
+			return "unknown";
+		}
+		const observed = getProcessStartId(pid);
+		if (observed === undefined) {
+			return "unknown";
+		}
+		return observed === processStartId ? "current" : "replaced";
+	}
+
 	private async stopWorker(
 		worker: ResidentWorker,
 		removeDescriptor: boolean,
@@ -4606,6 +4628,24 @@ const workerClient = this.requireAvailableWorkerClient(match.worker);
 		if (!recoveryCleanup) {
 			worker.stopRevision++;
 		}
+		// A retry can rescind this stop and relaunch the worker while we await
+		// below. Bind every liveness check and signal to the process this stop
+		// entered with, and abort cleanup once the stop no longer applies: the
+		// pid changed (relaunched) or a removeDescriptor stop lost its tombstone
+		// (rescinded, even before the successor pid lands).
+		const entryPid = worker.descriptor.pid;
+		const entryStartId = worker.descriptor.processStartId;
+		const assertStopStillApplies = () => {
+			if (directChild) {
+				return;
+			}
+			if (
+				worker.descriptor.pid !== entryPid ||
+				(removeDescriptor && worker.descriptor.stopRequestedAt === undefined)
+			) {
+				throw new Error(`Session worker ${worker.descriptor.workerId} was relaunched during stop`);
+			}
+		};
 		try {
 			if (removeDescriptor) {
 				this.persistWorkerStopTombstone(worker, archiveSession);
@@ -4654,22 +4694,42 @@ const workerClient = this.requireAvailableWorkerClient(match.worker);
 			worker.client = undefined;
 		} else if (directChild) {
 			directChild.child.kill("SIGTERM");
-		} else if (isProcessAlive(worker.descriptor.pid)) {
-			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGTERM");
+		} else if (this.processIdentity(entryPid, entryStartId) === "current") {
+			signalProcessGroupOrProcess(entryPid, "SIGTERM");
 		}
-		const isWorkerProcessAlive = () =>
-			directChild
-				? directChild.child.exitCode === null && directChild.child.signalCode === null
-				: isProcessAlive(worker.descriptor.pid);
+		// Identity-aware in both directions: a replaced pid counts as gone (never
+		// signal a recycled pid) while an unknown identity counts as alive (never
+		// clean up a possibly-live worker on a transient lookup failure). kill(0)
+		// runs on every poll; the expensive identity check is throttled.
+		let identityVerdict: "current" | "replaced" | "gone" | "unknown" = "current";
+		let identityCheckedAt = 0;
+		const isWorkerProcessAlive = () => {
+			if (directChild) {
+				return directChild.child.exitCode === null && directChild.child.signalCode === null;
+			}
+			if (!processIdExists(entryPid)) {
+				return false;
+			}
+			const now = Date.now();
+			if (now - identityCheckedAt >= LIVENESS_IDENTITY_RECHECK_MS) {
+				identityCheckedAt = now;
+				identityVerdict = this.processIdentity(entryPid, entryStartId);
+			}
+			return identityVerdict !== "replaced" && identityVerdict !== "gone";
+		};
 		const gracefulDeadline = Date.now() + (force ? 500 : 2000);
 		while (isWorkerProcessAlive() && Date.now() < gracefulDeadline) {
 			await delay(25);
 		}
+		let sigkillSent = false;
 		if (force && isWorkerProcessAlive()) {
 			if (directChild) {
-				directChild.child.kill("SIGKILL");
-			} else {
-				signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
+				sigkillSent = directChild.child.kill("SIGKILL");
+			} else if (this.processIdentity(entryPid, entryStartId) === "current") {
+				// Fresh, unthrottled check: the cached verdict may be up to 500ms
+				// old, long enough for the pid to be recycled.
+				signalProcessGroupOrProcess(entryPid, "SIGKILL");
+				sigkillSent = true;
 			}
 			const forceDeadline = Date.now() + 1000;
 			while (isWorkerProcessAlive() && Date.now() < forceDeadline) {
@@ -4678,16 +4738,23 @@ const workerClient = this.requireAvailableWorkerClient(match.worker);
 		}
 		if (isWorkerProcessAlive()) {
 			worker.intentionalStop = worker.descriptor.stopRequestedAt !== undefined;
-			throw new Error(`Session worker ${worker.descriptor.workerId} did not stop${force ? " after SIGKILL" : ""}`);
+			if (removeDescriptor) {
+				this.scheduleWorkerStopFinalization(worker);
+			}
+			throw new WorkerStopTimeoutError(
+				`Session worker ${worker.descriptor.workerId} did not stop${sigkillSent ? " after SIGKILL" : ""}`,
+			);
 		}
 		if (directChild) {
 			await directChild.closed;
 		}
+		assertStopStillApplies();
 		if (removeDescriptor && worker.descriptor.archiveOnStop) {
 			if (force) {
 				this.reclaimStoppedWorkerCronLock(worker);
 			}
 			await this.finalizeArchivedWorkerStop(worker);
+			assertStopStillApplies();
 		}
 		this.workers.delete(worker.descriptor.workerId);
 		if (removeDescriptor) {
@@ -4696,6 +4763,105 @@ const workerClient = this.requireAvailableWorkerClient(match.worker);
 		if (!this.shuttingDown) {
 			void this.syncAgentPeers().catch(() => undefined);
 			this.broadcastHeartbeatsChanged();
+		}
+	}
+
+	/**
+	 * A stop that timed out leaves a tombstoned registration behind. Keep
+	 * escalating in the background until the process is gone, then finish the
+	 * interrupted cleanup instead of leaving a dead worker registered forever.
+	 */
+	private scheduleWorkerStopFinalization(worker: ResidentWorker): void {
+		if (worker.stopFinalization) {
+			return;
+		}
+		worker.stopFinalization = this.finalizeTimedOutWorkerStop(worker).finally(() => {
+			worker.stopFinalization = undefined;
+		});
+	}
+
+	private async finalizeTimedOutWorkerStop(worker: ResidentWorker): Promise<void> {
+		// Bind to the exact process generation being stopped: a retry can rescind
+		// the stop and relaunch with a new pid, and the OS can recycle the old
+		// pid. The finalizer must never follow either successor.
+		const pid = worker.descriptor.pid;
+		const processStartId = worker.descriptor.processStartId;
+		const stopRevision = worker.stopRevision;
+		const isStopGenerationCurrent = () =>
+			this.workers.get(worker.descriptor.workerId) === worker &&
+			worker.stopRevision === stopRevision &&
+			worker.descriptor.stopRequestedAt !== undefined &&
+			worker.descriptor.pid === pid;
+		// A replaced pid counts as gone (never SIGKILL a recycled pid); an
+		// unobservable identity counts as alive (never clean up a possibly-live
+		// worker). kill(0) probes every poll; ps-backed checks are throttled.
+		let stoppedVerdict = true;
+		let stoppedCanSignal = processStartId !== undefined;
+		let stoppedCheckedAt = 0;
+		const isStoppedProcessAlive = () => {
+			if (!processIdExists(pid)) {
+				return false;
+			}
+			const now = Date.now();
+			if (now - stoppedCheckedAt < LIVENESS_IDENTITY_RECHECK_MS) {
+				return stoppedVerdict;
+			}
+			stoppedCheckedAt = now;
+			if (!isProcessAlive(pid)) {
+				stoppedVerdict = false;
+			} else if (processStartId === undefined) {
+				stoppedVerdict = true;
+				// Without an identity captured while the original worker was known
+				// alive, this pid may now belong to an unrelated process. Keep
+				// waiting for it to disappear, but never escalate by pid alone.
+				stoppedCanSignal = false;
+			} else {
+				const observed = getProcessStartId(pid);
+				stoppedVerdict = observed !== processStartId ? observed === undefined : true;
+				stoppedCanSignal = observed === processStartId;
+			}
+			return stoppedVerdict;
+		};
+		const sigkillDeadline = Date.now() + STOP_FINALIZATION_SIGKILL_GRACE_MS;
+		let killed = false;
+		while (!this.shuttingDown) {
+			if (!isStopGenerationCurrent()) {
+				return;
+			}
+			if (!isStoppedProcessAlive()) {
+				break;
+			}
+			if (!killed && stoppedCanSignal && Date.now() >= sigkillDeadline) {
+				// Fresh, unthrottled identity check right before signalling: the
+				// cached verdict may be up to 500ms old, long enough for the pid
+				// to be recycled by an unrelated process. A transiently
+				// unobservable identity skips this attempt but keeps escalation
+				// armed so a wedged worker is still killed on a later pass.
+				const observedNow = processStartId === undefined ? undefined : getProcessStartId(pid);
+				if (processStartId === undefined || observedNow === processStartId) {
+					signalProcessGroupOrProcess(pid, "SIGKILL");
+					killed = true;
+				}
+			}
+			await unrefDelay(STOP_FINALIZATION_RECHECK_MS);
+		}
+		// Retry transient cleanup failures (for example catalog archival) so a
+		// dead worker's registration is never stranded permanently. Each attempt
+		// bumps the worker's stopRevision, so rescission is detected through the
+		// registration and tombstone instead of the waiting-phase snapshot.
+		const isCleanupStillWanted = () =>
+			this.workers.get(worker.descriptor.workerId) === worker &&
+			worker.descriptor.stopRequestedAt !== undefined &&
+			worker.descriptor.pid === pid;
+		while (!this.shuttingDown && isCleanupStillWanted()) {
+			try {
+				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
+				this.log(`Finalized timed-out stop for worker ${worker.descriptor.workerId}`);
+				return;
+			} catch (error) {
+				this.reportCleanupFailure(`timed-out worker stop ${worker.descriptor.workerId}`, error);
+				await unrefDelay(STOP_FINALIZATION_RETRY_MS);
+			}
 		}
 	}
 
@@ -4910,7 +5076,18 @@ const workerClient = this.requireAvailableWorkerClient(match.worker);
 		}
 		if (stopWorkers) {
 			await Promise.all(
-				[...this.workers.values()].map((worker) => this.stopWorker(worker, true, forceWorkers, true)),
+				[...this.workers.values()].map(async (worker) => {
+					try {
+						await this.stopWorker(worker, true, forceWorkers, true);
+					} catch (error) {
+						if (!(error instanceof WorkerStopTimeoutError)) {
+							throw error;
+						}
+						this.log(
+							`Worker ${worker.descriptor.workerId} remains tombstoned for recovery after shutdown: ${error.message}`,
+						);
+					}
+				}),
 			);
 			if (!this.hasPersistedWorkerDescriptors()) {
 				rmSync(this.supervisorConfigPath, { force: true });
