@@ -60,7 +60,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 15 adds the mutate_queued_message command and queue_message_mutation capability.
 // Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
 export const DAEMON_SCHEMA_REVISION = 16;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-1bcb9e7f1a49";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-816309b1cd50";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
