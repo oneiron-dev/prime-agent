@@ -3428,7 +3428,7 @@ export class DaemonSupervisor {
 						match.worker.snapshotCache.get(activeSessionId)?.snapshotStream?.id;
 					let loadedGeneration: SnapshotTranscriptGeneration | undefined;
 					loading = (async () => {
-const workerClient = this.requireAvailableWorkerClient(match.worker);
+						const workerClient = this.requireAvailableWorkerClient(match.worker);
 						const response = await workerClient.request(
 							{
 								type: "attach",
