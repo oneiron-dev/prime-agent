@@ -113,6 +113,7 @@ import {
 	type DaemonCreateCommand,
 	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
+	type DaemonWorkerLifecycle,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
@@ -768,7 +769,7 @@ export class DaemonSupervisor {
 		return {
 			lifecycle: worker.descriptor.lifecycle,
 			isConnected: worker.client !== undefined,
-			isStopping: worker.intentionalStop || worker.descriptor.stopRequestedAt !== undefined,
+			isStopping: this.isWorkerStopping(worker),
 			hasOwnerClient: worker.descriptor.ownerClientId !== undefined,
 			isPreparingUpdateRestart:
 				this.updateRestartPhase !== undefined || worker.updateRestartPrepareClient !== undefined,
@@ -1580,7 +1581,7 @@ export class DaemonSupervisor {
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
 					return this.forwardToWorker(match.worker, command);
 				}
-				const first = [...this.workers.values()].find((worker) => this.isVisibleWorker(worker) && worker.client);
+				const first = [...this.workers.values()].find((worker) => this.isLiveWorker(worker) && worker.client);
 				if (!first) {
 					return success(command.id, command.type, { paused: false, limits: {} });
 				}
@@ -1594,7 +1595,7 @@ export class DaemonSupervisor {
 				}
 				const responses = await Promise.all(
 					[...this.workers.values()]
-						.filter((worker) => this.isVisibleWorker(worker) && worker.client)
+						.filter((worker) => this.isLiveWorker(worker) && worker.client)
 						.map((worker) => this.forwardToWorker(worker, command)),
 				);
 				const failed = responses.find((response) => !response.success);
@@ -1609,8 +1610,7 @@ export class DaemonSupervisor {
 				const responses = await Promise.all(
 					[...this.workers.values()]
 						.filter(
-							(worker) =>
-								this.isVisibleWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready",
+							(worker) => this.isLiveWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready",
 						)
 						.map((worker) =>
 							this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
@@ -1634,7 +1634,7 @@ export class DaemonSupervisor {
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
 					return this.forwardToWorker(match.worker, command);
 				}
-				const workers = [...this.workers.values()].filter((worker) => this.isVisibleWorker(worker));
+				const workers = [...this.workers.values()].filter((worker) => this.isLiveWorker(worker));
 				const heartbeats = new Map<string, AgentConnectionHeartbeat>();
 				const snapshots: Array<{ heartbeats?: AgentConnectionHeartbeat[]; response?: DaemonResponse }> =
 					await Promise.all(
@@ -1718,8 +1718,7 @@ export class DaemonSupervisor {
 				const listed = await Promise.all(
 					[...this.workers.values()]
 						.filter(
-							(worker) =>
-								this.isVisibleWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready",
+							(worker) => this.isLiveWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready",
 						)
 						.map(async (worker) => ({
 							worker,
@@ -1836,10 +1835,8 @@ export class DaemonSupervisor {
 				if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {
 					throw new Error("Agent messaging cannot target the sending session");
 				}
-				if (!target.worker.client) {
-					throw new Error("Target session worker is not connected");
-				}
-				const response = await target.worker.client.requestWorker(
+				const targetClient = this.requireAvailableWorkerClient(target.worker);
+				const response = await targetClient.requestWorker(
 					{
 						type: "worker_deliver_message",
 						targetActiveSessionId,
@@ -1917,10 +1914,14 @@ export class DaemonSupervisor {
 		command: Extract<DaemonCommand, { type: "list" }>,
 	): Promise<DaemonResponse> {
 		await Promise.all(
-			[...this.workers.values()].map((worker) => this.refreshWorkerSummaries(worker).catch(() => undefined)),
+			[...this.workers.values()]
+				.filter((worker) => !this.isWorkerStopping(worker))
+				.map((worker) => this.refreshWorkerSummaries(worker).catch(() => undefined)),
 		);
 		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 		const clientOwnedWorkers = [...this.workers.values()].filter((worker) => !this.isVisibleWorker(worker));
+		// Stopping workers stay listed (with an honest workerState) because this
+		// list also feeds busy-daemon safety checks in daemon-launch.
 		const active = [...this.workers.values()]
 			.filter(
 				(worker) =>
@@ -2899,6 +2900,9 @@ export class DaemonSupervisor {
 	}
 
 	private async refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
+		if (this.isWorkerStopping(worker)) {
+			throw new Error("Session worker is stopping");
+		}
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
@@ -3055,9 +3059,7 @@ export class DaemonSupervisor {
 			.then(async () => {
 				const readyWorkers = [...this.workers.values()].filter(
 					(worker): worker is ResidentWorker & { client: DaemonWorkerClient } =>
-						this.isVisibleWorker(worker) &&
-						worker.descriptor.lifecycle === "ready" &&
-						worker.client !== undefined,
+						this.isLiveWorker(worker) && worker.descriptor.lifecycle === "ready" && worker.client !== undefined,
 				);
 				await Promise.all(
 					readyWorkers.map(async (worker) => {
@@ -3082,6 +3084,41 @@ export class DaemonSupervisor {
 
 	private isVisibleWorker(worker: ResidentWorker): boolean {
 		return worker.descriptor.ownerClientId === undefined;
+	}
+
+	/** A worker with a durable or in-memory stop intent is stopping, never live. */
+	private isWorkerStopping(worker: ResidentWorker): boolean {
+		return worker.intentionalStop || worker.descriptor.stopRequestedAt !== undefined;
+	}
+
+	/** Live workers are visible to all clients and not stopping. */
+	private isLiveWorker(worker: ResidentWorker): boolean {
+		return this.isVisibleWorker(worker) && !this.isWorkerStopping(worker);
+	}
+
+	/**
+	 * The lifecycle reported to clients. A stop intent always wins, and a worker
+	 * whose process connection is gone is never reported as "ready".
+	 */
+	private effectiveWorkerState(worker: ResidentWorker): DaemonWorkerLifecycle {
+		if (this.isWorkerStopping(worker)) {
+			return "stopping";
+		}
+		if (worker.descriptor.lifecycle === "ready" && worker.client === undefined) {
+			return "recovering";
+		}
+		return worker.descriptor.lifecycle;
+	}
+
+	private requireAvailableWorkerClient(worker: ResidentWorker, allowStopping = false): DaemonWorkerClient {
+		if (
+			!worker.client ||
+			worker.descriptor.lifecycle !== "ready" ||
+			(!allowStopping && this.isWorkerStopping(worker))
+		) {
+			throw new Error(`Session worker is ${this.effectiveWorkerState(worker)}`);
+		}
+		return worker.client;
 	}
 
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {
@@ -3128,7 +3165,7 @@ export class DaemonSupervisor {
 			...summary,
 			attachedClients: [...this.clients].filter((client) => client.attachedActiveSessionIds.has(activeSessionId))
 				.length,
-			workerState: worker.descriptor.lifecycle,
+			workerState: this.effectiveWorkerState(worker),
 			workerPid: worker.descriptor.pid,
 		};
 	}
@@ -3233,10 +3270,8 @@ export class DaemonSupervisor {
 		command: DaemonCommand,
 		timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
 	): Promise<DaemonResponse> {
-		if (!worker.client || worker.descriptor.lifecycle !== "ready") {
-			throw new Error(`Session worker is ${worker.descriptor.lifecycle}`);
-		}
-		const response = await worker.client.request(withoutCommandId(command), timeoutMs);
+		const client = this.requireAvailableWorkerClient(worker, command.type === "kill");
+		const response = await client.request(withoutCommandId(command), timeoutMs);
 		if (command.type === "get_state" && response.success && isSessionSummary(response.data)) {
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}
@@ -3303,6 +3338,7 @@ export class DaemonSupervisor {
 		}
 		const match = await this.findWorkerForClient(client, command.activeSessionId);
 		this.assertTelemetryAttachAllowed(match.worker, command.telemetryDisabled);
+		this.requireAvailableWorkerClient(match.worker);
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
 		const duplicateValidation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
 		if (duplicateValidation) {
@@ -3333,10 +3369,8 @@ export class DaemonSupervisor {
 						match.worker.snapshotCache.get(activeSessionId)?.snapshotStream?.id;
 					let loadedGeneration: SnapshotTranscriptGeneration | undefined;
 					loading = (async () => {
-						if (!match.worker.client) {
-							throw new Error("Session worker is not connected");
-						}
-						const response = await match.worker.client.request(
+const workerClient = this.requireAvailableWorkerClient(match.worker);
+						const response = await workerClient.request(
 							{
 								type: "attach",
 								activeSessionId,
@@ -3420,6 +3454,7 @@ export class DaemonSupervisor {
 				}
 			}
 		}
+		this.requireAvailableWorkerClient(match.worker);
 		const wasAttached = client.attachedActiveSessionIds.has(activeSessionId);
 		let transcript: SnapshotTranscriptCache | undefined;
 		if (client.capabilities.has("chunked_snapshot")) {
@@ -4383,11 +4418,12 @@ export class DaemonSupervisor {
 	private async prepareUpdateRestartFenced(deadline: number): Promise<DaemonUpdateRestartManifest> {
 		const residents = [...this.workers.values()];
 		const unavailable = residents.find(
-			(worker) => worker.descriptor.lifecycle !== "ready" || worker.client === undefined,
+			(worker) =>
+				this.isWorkerStopping(worker) || worker.descriptor.lifecycle !== "ready" || worker.client === undefined,
 		);
 		if (unavailable) {
 			throw new Error(
-				`Cannot prepare update restart while resident worker ${unavailable.descriptor.workerId} is ${unavailable.descriptor.lifecycle}${unavailable.client ? "" : " and disconnected"}`,
+				`Cannot prepare update restart while resident worker ${unavailable.descriptor.workerId} is ${this.effectiveWorkerState(unavailable)}${unavailable.client ? "" : " and disconnected"}`,
 			);
 		}
 		const workers = residents as Array<ResidentWorker & { client: DaemonWorkerClient }>;
