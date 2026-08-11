@@ -147,6 +147,7 @@ const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 const STOP_FINALIZATION_RECHECK_MS = 250;
 const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
 const STOP_FINALIZATION_RETRY_MS = 5000;
+const STALE_RECLAIM_WAIT_MS = 10_000;
 // Polling loops probe existence cheaply via kill(0); the ps-backed zombie and
 // identity checks are throttled so a wedged worker cannot saturate the
 // supervisor event loop with synchronous subprocess spawns.
@@ -1998,7 +1999,7 @@ export class DaemonSupervisor {
 		const ownerClientId = command.lifecycle === "client_owned" ? clientId : undefined;
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
-			if (activeMatches.length === 1) {
+			if (activeMatches.length === 1 && !(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker))) {
 				return this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath);
 			}
 			if (activeMatches.length > 1) {
@@ -2010,7 +2011,7 @@ export class DaemonSupervisor {
 				: await this.catalog.resolve(command.sessionPath, config.cwd ?? process.cwd(), config.sessionDir);
 			createCommand = { ...createCommand, sessionPath };
 			const existing = this.findWorkerBySessionFile(sessionPath);
-			if (existing) {
+			if (existing && !(await this.reclaimStaleWorkerRegistration(existing.worker))) {
 				return this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath);
 			}
 			// A passive child from a stopped worker reopens as top-level here (pre-existing behavior);
@@ -2059,6 +2060,46 @@ export class DaemonSupervisor {
 			return worker;
 		}
 		throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
+	}
+
+	/**
+	 * A stopping worker whose process already died can strand its registration
+	 * (for example when the stop timed out and its finalization was interrupted
+	 * by a supervisor restart). Such a registration would block reopening the
+	 * saved transcript forever, so complete the interrupted stop and let the
+	 * caller launch a fresh worker for the saved session.
+	 */
+	private async reclaimStaleWorkerRegistration(worker: ResidentWorker): Promise<boolean> {
+		if (worker.client !== undefined || worker.recovery !== undefined) {
+			return false;
+		}
+		if (worker.descriptor.stopRequestedAt === undefined) {
+			return false;
+		}
+		// Fail fast before waiting on anything: only a confirmed-dead process is
+		// reclaimable. A live, unknown, or still-stopping worker is left alone
+		// and the caller reports the session as already active.
+		const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+		if (identity !== "gone" && identity !== "replaced") {
+			return false;
+		}
+		// Single cleanup path: the background stop finalizer is identity-aware,
+		// retrying, and single-flighted, so concurrent resumes share one stop.
+		// The wait is bounded so a resume request always returns promptly.
+		this.scheduleWorkerStopFinalization(worker);
+		const finalization = worker.stopFinalization;
+		if (finalization) {
+			await Promise.race([finalization.catch(() => undefined), unrefDelay(STALE_RECLAIM_WAIT_MS)]);
+		}
+		if (this.workers.get(worker.descriptor.workerId) === worker) {
+			// The process is confirmed dead, so the registration must never be
+			// reused; slow cleanup fails the resume honestly instead.
+			throw new Error(
+				`Stopped session worker ${worker.descriptor.workerId} is still being cleaned up; retry shortly`,
+			);
+		}
+		this.log(`Reclaimed stale registration for stopped worker ${worker.descriptor.workerId}`);
+		return true;
 	}
 
 	private async promoteOwnedWorker(client: DaemonSocketClient, worker: ResidentWorker): Promise<void> {
@@ -2377,6 +2418,26 @@ export class DaemonSupervisor {
 		await this.assertRecoveryAllowed();
 		if (worker.descriptor.stopRequestedAt) {
 			try {
+				// A descriptor persisted before identity tracking has no
+				// processStartId, so stopWorker could neither signal the live
+				// process nor let the finalizer escalate. Authenticating on the
+				// worker's socket proves the pid still belongs to our worker, so
+				// the start id observed while it was alive can be persisted (and
+				// the connected client gives stopWorker its graceful IPC path).
+				if (worker.descriptor.processStartId === undefined && isProcessAlive(worker.descriptor.pid)) {
+					const observedProcessStartId = getProcessStartId(worker.descriptor.pid);
+					try {
+						await this.connectWorker(worker, 2000);
+						if (observedProcessStartId) {
+							worker.descriptor.processStartId = observedProcessStartId;
+							this.persistWorker(worker);
+						}
+					} catch {
+						// Unverifiable identity stays untrusted; the stop below
+						// still runs its graceful path and the finalizer keeps
+						// waiting rather than signalling a possibly-recycled pid.
+					}
+				}
 				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
 				this.log(`Completed intentional stop for worker ${worker.descriptor.workerId} during supervisor adoption`);
 			} catch (error) {
