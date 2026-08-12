@@ -2091,6 +2091,8 @@ export class AgentsViewMode implements Component, Focusable {
 		const client = this.requireClient();
 		this.setStatusMessage(running ? "Stopping subagent..." : "Deleting subagent...");
 		try {
+			let status: string;
+			let tone: "warning" | undefined;
 			if (!running && client.supportsServerCapability("delete_rlm_subagent")) {
 				const data = requireDaemonData(
 					await client.request({
@@ -2102,14 +2104,11 @@ export class AgentsViewMode implements Component, Focusable {
 				const deleted = isRecord(data) && data.deleted === true;
 				const stillRunning = isRecord(data) && data.reason === "running";
 				const cleanupPersisted = deleted ? this.removeDeletedSessionPreferences(pending.sessionId) : true;
-				this.setStatusMessage(
-					deleted
-						? `Subagent deleted${cleanupPersisted ? "" : "; pin/order cleanup did not persist"}`
-						: stillRunning
-							? "Subagent is running; stop it first"
-							: "Subagent already removed",
-					{ render: false },
-				);
+				status = deleted
+					? `Subagent deleted${cleanupPersisted ? "" : "; pin/order cleanup did not persist"}`
+					: stillRunning
+						? "Subagent is running; stop it first"
+						: "Subagent already removed";
 			} else {
 				const data = requireDaemonData(
 					await client.request({
@@ -2119,16 +2118,18 @@ export class AgentsViewMode implements Component, Focusable {
 					}),
 				);
 				const cancelled = isRecord(data) && data.cancelled === true;
-				this.setStatusMessage(
-					running
-						? cancelled
-							? "Subagent stopped"
-							: "Subagent already finished"
-						: "The daemon cannot delete subagents; it was left unchanged",
-					{ render: false, ...(running ? {} : { tone: "warning" as const }) },
-				);
+				status = running
+					? cancelled
+						? "Subagent stopped"
+						: "Subagent already finished"
+					: "The daemon cannot delete subagents; it was left unchanged";
+				tone = running ? undefined : "warning";
 			}
-			await this.refreshSessions();
+			const refreshed = await this.refreshSessions({ preserveStatusOnError: true });
+			this.setStatusMessage(`${status}${refreshed ? "" : "; refresh failed"}`, {
+				render: false,
+				...(tone ? { tone } : {}),
+			});
 		} catch (error) {
 			const command = running ? "cancel_rlm_child" : "delete_rlm_subagent";
 			this.setStatusMessage(

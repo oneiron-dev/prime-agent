@@ -192,7 +192,7 @@ describe("AgentsViewMode", () => {
 			removeDeletedSessionPreferences(sessionId: string) {
 				return this.applyAgentsViewStateOperation({ type: "removeSession", sessionId });
 			},
-			refreshSessions: vi.fn(async () => true),
+			refreshSessions: vi.fn(async () => false),
 			handleKillSubagentSelected(row: unknown) {
 				return invoke("handleKillSubagentSelected", self, row);
 			},
@@ -226,9 +226,12 @@ describe("AgentsViewMode", () => {
 			childId: "passive-child",
 		});
 		expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancel_rlm_child" }));
-		expect(self.setStatusMessage).toHaveBeenCalledWith("Subagent deleted; pin/order cleanup did not persist", {
-			render: false,
-		});
+		expect(self.setStatusMessage).toHaveBeenCalledWith(
+			"Subagent deleted; pin/order cleanup did not persist; refresh failed",
+			{
+				render: false,
+			},
+		);
 		expect(self.applyAgentsViewStateOperation).toHaveBeenCalledWith({
 			type: "removeSession",
 			sessionId: "passive-child-session",
