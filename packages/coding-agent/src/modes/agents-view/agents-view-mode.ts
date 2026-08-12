@@ -199,8 +199,8 @@ export async function resolveAgentsViewSessionUiServices(
 	return options.createUiServicesForSession ? await options.createUiServicesForSession(summary) : options.uiServices;
 }
 
-// Stripping cwd opens the session in its own stored directory; overrideCwd is
-// sent when that directory no longer exists so the daemon doesn't reject it.
+// Resume callers pass a known-good cwd explicitly. Stripping cwd is retained
+// only for callers that cannot resolve either the stored or fallback directory.
 export function createAgentsViewResumeConfig(
 	config: AgentSessionRuntimeConfig,
 	overrideCwd?: string,
@@ -318,7 +318,13 @@ export function resolveAgentsViewOpenCwd(
 	summary: SessionSummary,
 	fallbackCwd: string | undefined,
 ): { overrideCwd?: string; notice?: string } {
-	if (!summary.cwd || existsSync(summary.cwd) || !fallbackCwd) {
+	if (!summary.cwd) {
+		return {};
+	}
+	if (existsSync(summary.cwd)) {
+		return { overrideCwd: summary.cwd };
+	}
+	if (!fallbackCwd) {
 		return {};
 	}
 	return {

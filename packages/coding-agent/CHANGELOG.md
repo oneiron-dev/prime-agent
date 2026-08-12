@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed Agents View failing to resume saved sessions when the daemon's original working directory no longer exists.
 - Added configurable Agents View pinning and in-section session reordering.
 - Fixed Up and Down Arrow navigation in Agents View to wrap cyclically across selectable sessions.
 - Added strict per-child `model=` and `reasoning=` selection to `rlm()`, preserving inheritance when omitted and rejecting explicit reasoning levels unsupported by the selected child model.

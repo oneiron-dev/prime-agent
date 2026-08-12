@@ -786,10 +786,13 @@ describe("agents view state", () => {
 		expect(config.cwd).toBe("/tmp/dashboard");
 	});
 
-	test("opens an existing-cwd session in its own directory with no override or notice", () => {
+	test("passes an existing saved-session cwd explicitly instead of inheriting the daemon default", () => {
 		const dir = mkdtempSync(join(tmpdir(), "agents-view-cwd-"));
 		try {
-			expect(resolveAgentsViewOpenCwd(makeSummary({ cwd: dir }), "/tmp/launch")).toEqual({});
+			const { overrideCwd, notice } = resolveAgentsViewOpenCwd(makeSummary({ cwd: dir }), "/tmp/launch");
+			expect(overrideCwd).toBe(dir);
+			expect(notice).toBeUndefined();
+			expect(createAgentsViewResumeConfig({ cwd: "/tmp/stale-daemon-default" }, overrideCwd).cwd).toBe(dir);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
