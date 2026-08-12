@@ -187,6 +187,7 @@ describe("AgentsViewMode", () => {
 			ui: { requestRender: vi.fn() },
 			requireClient: () => client,
 			setStatusMessage: vi.fn(),
+			applyAgentsViewStateOperation: vi.fn(),
 			refreshSessions: vi.fn(async () => true),
 			handleKillSubagentSelected(row: unknown) {
 				return invoke("handleKillSubagentSelected", self, row);
@@ -222,11 +223,16 @@ describe("AgentsViewMode", () => {
 		});
 		expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancel_rlm_child" }));
 		expect(self.setStatusMessage).toHaveBeenCalledWith("Subagent deleted", { render: false });
+		expect(self.applyAgentsViewStateOperation).toHaveBeenCalledWith({
+			type: "removeSession",
+			sessionId: "passive-child-session",
+		});
 	});
 
 	it("uses cancel when an inactive subagent starts running during confirmation", async () => {
 		const request = vi.fn(async () => ({ success: true as const, data: { cancelled: true } }));
 		const self = {
+			applyAgentsViewStateOperation: vi.fn(),
 			requireClient: () => ({ request, supportsServerCapability: () => true }),
 			setStatusMessage: vi.fn(),
 			refreshSessions: vi.fn(async () => true),
@@ -234,7 +240,12 @@ describe("AgentsViewMode", () => {
 		await invoke(
 			"killSubagent",
 			self,
-			{ identity: "child-row", rootActiveSessionId: "root-active", childId: "passive-child" },
+			{
+				identity: "child-row",
+				rootActiveSessionId: "root-active",
+				childId: "passive-child",
+				sessionId: "child-session",
+			},
 			{ section: "running", activitySection: "running" },
 		);
 		expect(request).toHaveBeenCalledWith({
@@ -243,11 +254,13 @@ describe("AgentsViewMode", () => {
 			childId: "passive-child",
 		});
 		expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ type: "delete_rlm_subagent" }));
+		expect(self.applyAgentsViewStateOperation).not.toHaveBeenCalled();
 	});
 
 	it("falls back to cancel-only when subagent deletion is unsupported", async () => {
 		const request = vi.fn(async () => ({ success: true as const, data: { cancelled: false } }));
 		const self = {
+			applyAgentsViewStateOperation: vi.fn(),
 			requireClient: () => ({ request, supportsServerCapability: () => false }),
 			setStatusMessage: vi.fn(),
 			refreshSessions: vi.fn(async () => true),
@@ -255,7 +268,12 @@ describe("AgentsViewMode", () => {
 		await invoke(
 			"killSubagent",
 			self,
-			{ identity: "child-row", rootActiveSessionId: "root-active", childId: "passive-child" },
+			{
+				identity: "child-row",
+				rootActiveSessionId: "root-active",
+				childId: "passive-child",
+				sessionId: "child-session",
+			},
 			{ section: "inactive" },
 		);
 		expect(request).toHaveBeenCalledWith({
@@ -267,6 +285,7 @@ describe("AgentsViewMode", () => {
 			render: false,
 			tone: "warning",
 		});
+		expect(self.applyAgentsViewStateOperation).not.toHaveBeenCalled();
 	});
 
 	it("checks telemetry policy before replying from an opted-out agents view", async () => {
@@ -986,6 +1005,17 @@ describe("agents view startup notices", () => {
 		self.renameTarget = {};
 		invoke("handleInput", self, "\u001b[1;2A");
 		expect(self.reorderSelection).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("Agents View deletion preference cleanup", () => {
+	it("removes durable preferences only when the saved-session deletion success path invokes its hook", () => {
+		const applyAgentsViewStateOperation = vi.fn();
+		invoke("removeDeletedSessionPreferences", { applyAgentsViewStateOperation }, "durable-root-session");
+		expect(applyAgentsViewStateOperation).toHaveBeenCalledWith({
+			type: "removeSession",
+			sessionId: "durable-root-session",
+		});
 	});
 });
 

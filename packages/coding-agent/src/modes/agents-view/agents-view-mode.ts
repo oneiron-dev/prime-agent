@@ -1225,6 +1225,11 @@ export class AgentsViewMode implements Component, Focusable {
 		return this.deleteConfirmExpiresAt > Date.now();
 	}
 
+	/** Called only after the daemon conclusively deletes a saved session. */
+	private removeDeletedSessionPreferences(sessionId: string): void {
+		this.applyAgentsViewStateOperation({ type: "removeSession", sessionId });
+	}
+
 	private applyAgentsViewStateOperation(operation: AgentsViewStateOperation): void {
 		const result = this.stateStore.apply(operation);
 		if (result.persistenceError) {
@@ -1997,7 +2002,7 @@ export class AgentsViewMode implements Component, Focusable {
 						return;
 					}
 					this.pendingDeleteAgent = undefined;
-					this.applyAgentsViewStateOperation?.({ type: "removeSession", sessionId: row.summary.sessionId });
+					this.removeDeletedSessionPreferences(row.summary.sessionId);
 					const refreshed = await this.refreshSavedSessions({ preserveStatusOnError: true });
 					const success = result.method === "trash" ? "Session moved to trash" : "Session deleted";
 					this.setStatusMessage(refreshed ? success : `${success}; refresh failed`);
