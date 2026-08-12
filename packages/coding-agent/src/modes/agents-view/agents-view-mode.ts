@@ -1106,11 +1106,11 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private handleListNavigation(data: string): boolean {
 		if (this.keybindings.matches(data, "tui.select.up")) {
-			this.moveSelection(-1);
+			this.moveSelection(-1, { wrap: true });
 			return true;
 		}
 		if (this.keybindings.matches(data, "tui.select.down")) {
-			this.moveSelection(1);
+			this.moveSelection(1, { wrap: true });
 			return true;
 		}
 		if (this.keybindings.matches(data, "tui.select.pageUp")) {
@@ -1240,7 +1240,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.ui.requestRender();
 	}
 
-	private moveSelection(delta: number): void {
+	private moveSelection(delta: number, options: { wrap?: boolean } = {}): void {
 		const selectableIndexes = this.getSelectableRowIndexes();
 		if (selectableIndexes.length === 0) {
 			return;
@@ -1248,7 +1248,9 @@ export class AgentsViewMode implements Component, Focusable {
 		const currentPosition = selectableIndexes.includes(this.selectedIndex)
 			? selectableIndexes.indexOf(this.selectedIndex)
 			: 0;
-		const nextPosition = Math.max(0, Math.min(selectableIndexes.length - 1, currentPosition + delta));
+		const nextPosition = options.wrap
+			? (currentPosition + delta + selectableIndexes.length) % selectableIndexes.length
+			: Math.max(0, Math.min(selectableIndexes.length - 1, currentPosition + delta));
 		this.selectedIndex = selectableIndexes[nextPosition] ?? 0;
 		this.syncSelectedRowState();
 		this.clearDeleteConfirmation({ render: false });

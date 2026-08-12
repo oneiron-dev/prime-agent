@@ -114,6 +114,36 @@ describe("AgentsViewMode", () => {
 		expect(self.selectedIndex).toBe(4);
 	});
 
+	it("wraps normal navigation across selectable pinned and nested rows", () => {
+		const self = {
+			rows: [
+				{ kind: "heading", selectable: false, identity: "pinned-heading" },
+				{ kind: "agent", selectable: true, identity: "pinned-agent" },
+				{ kind: "heading", selectable: false, identity: "running-heading" },
+				{ kind: "agent", selectable: true, identity: "filtered-agent" },
+				{ kind: "code", selectable: false, identity: "spawn-code" },
+				{ kind: "subagent", selectable: true, identity: "nested-agent" },
+			],
+			selectedIndex: 5,
+			replyTarget: undefined,
+			getSelectableRowIndexes() {
+				return this.rows.flatMap((row, index) => (row.selectable ? [index] : []));
+			},
+			collapseSubagentListsOutsideSelection: vi.fn(),
+			syncSelectedRowState: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		};
+
+		invoke("moveSelection", self, 1, { wrap: true });
+		expect(self.selectedIndex).toBe(1);
+
+		invoke("moveSelection", self, -1, { wrap: true });
+		expect(self.selectedIndex).toBe(5);
+		expect(self.collapseSubagentListsOutsideSelection).toHaveBeenCalledTimes(2);
+		expect(self.syncSelectedRowState).toHaveBeenCalledTimes(2);
+	});
+
 	it("re-resolves subagent state before choosing stop or delete intent", async () => {
 		const child = summary({
 			id: "passive-child-session",
