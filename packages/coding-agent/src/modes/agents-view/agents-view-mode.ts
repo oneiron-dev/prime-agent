@@ -867,11 +867,7 @@ export class AgentsViewMode implements Component, Focusable {
 			mouse: false,
 			viewportControls: false,
 		});
-		const startupStatusMessage = this.persistentState.statusMessage;
-		this.persistentState.statusMessage = undefined;
-		if (startupStatusMessage) {
-			this.setStatusMessage(startupStatusMessage, { render: false });
-		}
+		this.restoreStartupStatusMessage();
 		this.ui.requestRender(true);
 		onThemeChange(() => {
 			this.ui.invalidate();
@@ -1017,6 +1013,17 @@ export class AgentsViewMode implements Component, Focusable {
 		const listRows = Math.max(0, height - lines.length);
 		lines.push(...this.renderSessionRows(width, listRows));
 		return lines;
+	}
+
+	private restoreStartupStatusMessage(): void {
+		const startupStatusMessage = this.persistentState.statusMessage;
+		this.persistentState.statusMessage = undefined;
+		if (!startupStatusMessage) return;
+		const currentStatus = this.statusMessage;
+		this.setStatusMessage(combineAgentsViewStartupNotices(currentStatus, startupStatusMessage), {
+			render: false,
+			...(this.statusMessageTone === "warning" ? { tone: "warning" as const } : {}),
+		});
 	}
 
 	private loadStartupNotices(): void {

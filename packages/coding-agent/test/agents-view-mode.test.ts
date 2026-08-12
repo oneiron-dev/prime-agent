@@ -1080,6 +1080,23 @@ describe("Agents View root deletion persistence", () => {
 	});
 });
 
+describe("Agents View startup status recovery", () => {
+	it("combines a persisted startup notice with a failed queued persistence warning", () => {
+		const self = {
+			persistentState: { statusMessage: "Prior startup notice" },
+			statusMessage: "Agents View state change will not persist",
+			statusMessageTone: "warning",
+			setStatusMessage: vi.fn(),
+		};
+		invoke("restoreStartupStatusMessage", self);
+		expect(self.persistentState.statusMessage).toBeUndefined();
+		expect(self.setStatusMessage).toHaveBeenCalledWith(
+			"Agents View state change will not persist · Prior startup notice",
+			{ render: false, tone: "warning" },
+		);
+	});
+});
+
 describe("Agents View durable operation recovery", () => {
 	function storePath(): string {
 		return join(mkdtempSync(join(tmpdir(), "agents-view-mode-")), "state.json");
