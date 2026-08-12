@@ -1,5 +1,9 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { AgentsViewStateStore } from "../src/core/agents-view-state-store.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -982,5 +986,91 @@ describe("agents view startup notices", () => {
 		self.renameTarget = {};
 		invoke("handleInput", self, "\u001b[1;2A");
 		expect(self.reorderSelection).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("Agents View durable operation recovery", () => {
+	function storePath(): string {
+		return join(mkdtempSync(join(tmpdir(), "agents-view-mode-")), "state.json");
+	}
+	it("queues failed operations, replays FIFO, and preserves double toggles", () => {
+		const store = new AgentsViewStateStore(storePath());
+		const realApply = store.apply.bind(store);
+		let fail = true;
+		(store as unknown as { apply: typeof store.apply }).apply = ((op) =>
+			fail
+				? {
+						state: { version: 1, pinnedRootSessionIds: [], manualOrder: {} },
+						persistenceError: new Error("locked"),
+					}
+				: realApply(op)) as typeof store.apply;
+		const self = {
+			stateStore: store,
+			persistentState: { pinnedRootSessionIds: [], manualOrder: {} } as AgentsViewPersistentState,
+			agentsViewStateDirty: false,
+			markAgentsViewStateDirty: vi.fn(),
+		};
+		invoke("applyAgentsViewStateOperation", self, { type: "togglePin", sessionId: "x" });
+		invoke("applyAgentsViewStateOperation", self, { type: "togglePin", sessionId: "x" });
+		expect(self.persistentState.pendingAgentsViewStateOperations).toHaveLength(2);
+		fail = false;
+		invoke("flushAgentsViewStateOperations", self);
+		expect(store.load().state.pinnedRootSessionIds).toEqual([]);
+		expect(self.persistentState.pendingAgentsViewStateOperations).toEqual([]);
+	});
+
+	it("does not clobber another client while replaying a queued operation", () => {
+		const path = storePath(),
+			store = new AgentsViewStateStore(path),
+			other = new AgentsViewStateStore(path);
+		const realApply = store.apply.bind(store);
+		let fail = true;
+		(store as unknown as { apply: typeof store.apply }).apply = ((op) =>
+			fail
+				? {
+						state: { version: 1, pinnedRootSessionIds: [], manualOrder: {} },
+						persistenceError: new Error("locked"),
+					}
+				: realApply(op)) as typeof store.apply;
+		const self = {
+			stateStore: store,
+			persistentState: { pinnedRootSessionIds: ["x"], manualOrder: {} },
+			agentsViewStateDirty: false,
+			markAgentsViewStateDirty: vi.fn(),
+		};
+		invoke("applyAgentsViewStateOperation", self, { type: "togglePin", sessionId: "x" });
+		other.apply({ type: "togglePin", sessionId: "y" });
+		fail = false;
+		invoke("flushAgentsViewStateOperations", self);
+		expect(other.load().state.pinnedRootSessionIds).toEqual(["y", "x"]);
+	});
+
+	it("finish retains a failed queue", () => {
+		const store = {
+			apply: vi.fn(() => ({
+				state: { version: 1, pinnedRootSessionIds: [], manualOrder: {} },
+				persistenceError: new Error("locked"),
+			})),
+		};
+		const self = {
+			stopped: false,
+			agentsViewStateDirty: true,
+			stateStore: store,
+			persistentState: { pendingAgentsViewStateOperations: [{ type: "togglePin" as const, sessionId: "x" }] },
+			markAgentsViewStateDirty: vi.fn(),
+			savedCatalogGeneration: 0,
+			liveCatalogGeneration: 0,
+			heartbeatCatalogGeneration: 0,
+			clearCtrlCExitHint: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			setStatusMessage: vi.fn(),
+			ui: { stop: vi.fn() },
+			unsubscribeClientClose: undefined,
+			unsubscribeClientMessage: undefined,
+			client: undefined,
+			resolveRun: undefined,
+		};
+		invoke("finish", self, { type: "exit" });
+		expect(self.persistentState.pendingAgentsViewStateOperations).toHaveLength(1);
 	});
 });

@@ -629,6 +629,11 @@ export function getCronJobsPath(agentDir: string = getAgentDir()): string {
 	return join(agentDir, "cron-jobs.json");
 }
 
+/** Get path to durable Agents View UI state. */
+export function getAgentsViewStatePath(agentDir: string = getAgentDir()): string {
+	return join(agentDir, "agents-view-state.json");
+}
+
 /** Get path to tools directory */
 export function getToolsDir(): string {
 	return join(getAgentDir(), "tools");

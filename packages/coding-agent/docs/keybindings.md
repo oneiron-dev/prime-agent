@@ -217,6 +217,6 @@ Binding `ctrl+p` below releases the conflicting `app.messages.expand` default; s
 
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
-| `app.agents.reorderUp` | `shift+up` | Move selected agent within its section and sibling group |
+| `app.agents.reorderUp` | `shift+up` | Move selected agent within its section and sibling group; order is durable per local profile and machine |
 | `app.agents.reorderDown` | `shift+down` | Move selected agent within its section and sibling group |
 | `app.agents.togglePin` | `ctrl+t` | Pin or unpin the selected agent tree in Agents View (for this process) |

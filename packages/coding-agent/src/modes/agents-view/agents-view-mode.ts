@@ -15,6 +15,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSION } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
+import { type AgentsViewStateOperation, AgentsViewStateStore } from "../../core/agents-view-state-store.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
 import { SessionManager } from "../../core/session-manager.js";
 import {
@@ -131,6 +132,7 @@ export interface AgentsViewModeOptions {
 	initialSession?: SessionSummary;
 	/** When set, the first view is rooted at this session's direct children. */
 	initialScopeKey?: AgentsViewScopeKey;
+	agentsViewStateStore?: AgentsViewStateStore;
 }
 
 export type AgentsViewRunResult =
@@ -176,6 +178,7 @@ export type AgentsViewPersistentState = {
 	heartbeats?: AgentConnectionHeartbeat[];
 	pinnedRootSessionIds?: string[];
 	manualOrder?: AgentsViewManualOrder;
+	pendingAgentsViewStateOperations?: AgentsViewStateOperation[];
 };
 
 type PromptCommand = Extract<DaemonCommand, { type: "prompt" }>;
@@ -190,6 +193,7 @@ type PendingKillSubagent = {
 	identity: string;
 	rootActiveSessionId: string;
 	childId: string;
+	sessionId: string;
 };
 
 export async function resolveAgentsViewSessionUiServices(
@@ -696,11 +700,14 @@ export class AgentsViewMode implements Component, Focusable {
 	private statusMessageSticky = false;
 	private statusMessageTimer: ReturnType<typeof setTimeout> | undefined;
 	private stopped = false;
+	private readonly stateStore: AgentsViewStateStore;
+	private agentsViewStateDirty = false;
 
 	constructor(
 		private readonly options: AgentsViewModeOptions,
 		private readonly persistentState: AgentsViewPersistentState = {},
 	) {
+		this.stateStore = options.agentsViewStateStore ?? new AgentsViewStateStore();
 		const initialFrames =
 			persistentState.scopeFrames ??
 			createInitialAgentsViewScopeFrames(
@@ -844,6 +851,15 @@ export class AgentsViewMode implements Component, Focusable {
 	async run(): Promise<AgentsViewRunResult> {
 		this.client = new DaemonClient(this.requireSocketPath());
 		await this.client.connect();
+		const durableState = this.stateStore.load();
+		if (!durableState.persistenceError) {
+			this.persistentState.pinnedRootSessionIds = durableState.state.pinnedRootSessionIds;
+			this.persistentState.manualOrder = durableState.state.manualOrder;
+			this.flushAgentsViewStateOperations();
+		} else {
+			this.agentsViewStateDirty = true;
+			this.persistentState.statusMessage = durableState.persistenceError.message;
+		}
 		this.subscribeToClientClose(this.client);
 		this.unsubscribeClientMessage = this.client.onMessage((message) => {
 			if (message.type === "heartbeats_changed") void this.refreshHeartbeats();
@@ -1067,6 +1083,7 @@ export class AgentsViewMode implements Component, Focusable {
 		if (pinned.has(row.rootSessionId)) pinned.delete(row.rootSessionId);
 		else pinned.add(row.rootSessionId);
 		this.persistentState.pinnedRootSessionIds = [...pinned];
+		this.applyAgentsViewStateOperation?.({ type: "togglePin", sessionId: row.rootSessionId });
 		this.rebuildRows();
 		this.ui.requestRender();
 	}
@@ -1106,6 +1123,7 @@ export class AgentsViewMode implements Component, Focusable {
 		if (target < 0 || neighborIndex < 0) return;
 		[normalized[target], normalized[neighborIndex]] = [normalized[neighborIndex]!, normalized[target]!];
 		this.persistentState.manualOrder = { ...order, [group]: normalized };
+		this.applyAgentsViewStateOperation?.({ type: "setGroupOrder", group, orderedIds: normalized });
 		this.rebuildRows();
 		this.ui.requestRender();
 	}
@@ -1205,6 +1223,39 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private isDeleteConfirmationVisible(): boolean {
 		return this.deleteConfirmExpiresAt > Date.now();
+	}
+
+	private applyAgentsViewStateOperation(operation: AgentsViewStateOperation): void {
+		const result = this.stateStore.apply(operation);
+		if (result.persistenceError) {
+			this.persistentState.pendingAgentsViewStateOperations ??= [];
+			this.persistentState.pendingAgentsViewStateOperations.push(operation);
+			this.markAgentsViewStateDirty(result.persistenceError);
+			return;
+		}
+		this.persistentState.pinnedRootSessionIds = result.state.pinnedRootSessionIds;
+		this.persistentState.manualOrder = result.state.manualOrder;
+		this.flushAgentsViewStateOperations();
+	}
+
+	private flushAgentsViewStateOperations(): void {
+		const pending = this.persistentState.pendingAgentsViewStateOperations ?? [];
+		while (pending.length > 0) {
+			const result = this.stateStore.apply(pending[0]!);
+			if (result.persistenceError) {
+				this.markAgentsViewStateDirty(result.persistenceError);
+				return;
+			}
+			pending.shift();
+			this.persistentState.pinnedRootSessionIds = result.state.pinnedRootSessionIds;
+			this.persistentState.manualOrder = result.state.manualOrder;
+		}
+		this.agentsViewStateDirty = false;
+	}
+
+	private markAgentsViewStateDirty(error: Error): void {
+		this.agentsViewStateDirty = true;
+		this.setStatusMessage(error.message, { tone: "warning" });
 	}
 
 	private setStatusMessage(
@@ -1946,6 +1997,7 @@ export class AgentsViewMode implements Component, Focusable {
 						return;
 					}
 					this.pendingDeleteAgent = undefined;
+					this.applyAgentsViewStateOperation?.({ type: "removeSession", sessionId: row.summary.sessionId });
 					const refreshed = await this.refreshSavedSessions({ preserveStatusOnError: true });
 					const success = result.method === "trash" ? "Session moved to trash" : "Session deleted";
 					this.setStatusMessage(refreshed ? success : `${success}; refresh failed`);
@@ -1988,7 +2040,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.setStatusMessage("Cannot stop subagent without its parent agent");
 			return;
 		}
-		this.pendingKillSubagent = { identity, rootActiveSessionId, childId };
+		this.pendingKillSubagent = { identity, rootActiveSessionId, childId, sessionId: row.summary.sessionId };
 		this.showDeleteConfirmation();
 	}
 
@@ -2007,6 +2059,9 @@ export class AgentsViewMode implements Component, Focusable {
 				);
 				const deleted = isRecord(data) && data.deleted === true;
 				const stillRunning = isRecord(data) && data.reason === "running";
+				if (deleted || (!stillRunning && isRecord(data) && data.reason === "not_found")) {
+					this.applyAgentsViewStateOperation?.({ type: "removeSession", sessionId: pending.sessionId });
+				}
 				this.setStatusMessage(
 					deleted
 						? "Subagent deleted"
@@ -2221,6 +2276,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.reconcileCatalogs();
 	}
 
+	// Stale preferences are inert; future GC must require two successful full live+saved catalog passes.
 	private reconcileCatalogs(): void {
 		const visibleSessions = this.lastListedSummaries.filter((summary) =>
 			shouldShowAgentsViewSession(summary, this.inactiveAgentIdentities.has(getSummaryIdentity(summary))),
@@ -2425,6 +2481,7 @@ export class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		this.stopped = true;
+		if (this.agentsViewStateDirty) this.flushAgentsViewStateOperations?.();
 		this.savedCatalogGeneration += 1;
 		this.liveCatalogGeneration += 1;
 		this.heartbeatCatalogGeneration += 1;
