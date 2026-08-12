@@ -66,6 +66,7 @@ import {
 	type StartupNotices,
 } from "../shared/startup-notices.js";
 import {
+	type AgentsViewManualOrder,
 	type AgentsViewRow,
 	type AgentsViewScopeFrame,
 	type AgentsViewScopeKey,
@@ -76,6 +77,7 @@ import {
 	createUnattachableChildOpenResult,
 	filterUnifiedSessions,
 	formatHeartbeatBadge,
+	getAgentsViewReorderGroup,
 	getAgentsViewSelectionKey,
 	getAgentsViewSessionTitle,
 	getAgentsViewSummaryIdentity as getSummaryIdentity,
@@ -168,6 +170,8 @@ export type AgentsViewPersistentState = {
 	lastSuccessfulLiveSummaries?: SessionSummary[];
 	savedCatalogGeneration?: number;
 	heartbeats?: AgentConnectionHeartbeat[];
+	pinnedRootSessionIds?: string[];
+	manualOrder?: AgentsViewManualOrder;
 };
 
 type PromptCommand = Extract<DaemonCommand, { type: "prompt" }>;
@@ -863,7 +867,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.heartbeatPollTimer = setInterval(() => void this.refreshHeartbeats(), HEARTBEAT_POLL_INTERVAL_MS);
 		this.heartbeatPollTimer.unref?.();
 		this.animationTimer = setInterval(() => {
-			if (!this.rows.some((row) => row.section === "running")) return;
+			if (!this.rows.some((row) => row.activitySection === "running")) return;
 			this.workingIconFrame += 1;
 			this.ui.requestRender();
 		}, WORKING_ICON_INTERVAL_MS);
@@ -923,6 +927,18 @@ export class AgentsViewMode implements Component, Focusable {
 				this.openSelected();
 				return;
 			}
+		}
+		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.togglePin")) {
+			this.togglePinSelection();
+			return;
+		}
+		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.reorderUp")) {
+			this.reorderSelection(-1);
+			return;
+		}
+		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.reorderDown")) {
+			this.reorderSelection(1);
+			return;
 		}
 		if (!this.replyTarget && this.handleListNavigation(data)) {
 			return;
@@ -1027,6 +1043,57 @@ export class AgentsViewMode implements Component, Focusable {
 		// (e.g. the tmux fix instructions) stay readable instead of truncating.
 		const wrapWidth = Math.max(1, width - 1);
 		return formatted.flatMap((line) => wrapTextWithAnsi(line, wrapWidth).map((wrapped) => ` ${wrapped}`));
+	}
+
+	private togglePinSelection(): void {
+		const row = this.rows[this.selectedIndex];
+		if (!row?.selectable || (row.kind !== "agent" && row.kind !== "subagent" && row.kind !== "subagent-summary"))
+			return;
+		const pinned = new Set(this.persistentState.pinnedRootSessionIds ?? []);
+		if (pinned.has(row.rootSessionId)) pinned.delete(row.rootSessionId);
+		else pinned.add(row.rootSessionId);
+		this.persistentState.pinnedRootSessionIds = [...pinned];
+		this.rebuildRows();
+		this.ui.requestRender();
+	}
+
+	private reorderSelection(direction: -1 | 1): void {
+		const row = this.rows[this.selectedIndex];
+		if (!row?.selectable || (row.kind !== "agent" && row.kind !== "subagent")) return;
+		const group = getAgentsViewReorderGroup(row);
+		if (!group) return;
+		const visiblePeers = this.rows.filter(
+			(candidate) =>
+				candidate.selectable &&
+				candidate.displaySection === row.displaySection &&
+				getAgentsViewReorderGroup(candidate) === group,
+		);
+		const visibleIndex = visiblePeers.findIndex((candidate) => candidate.identity === row.identity);
+		if (visibleIndex < 0 || visibleIndex + direction < 0 || visibleIndex + direction >= visiblePeers.length) return;
+		const fullRows = buildAgentsViewRows(
+			this.scopedRecords,
+			this.expandedSubagentParents,
+			this.programShownParents,
+			this.scopeKey,
+			this.getRowBuildOptions(),
+		);
+		const fullPeers = fullRows.filter(
+			(candidate) => candidate.selectable && getAgentsViewReorderGroup(candidate) === group,
+		);
+		const order = this.persistentState.manualOrder ?? {};
+		const saved = order[group] ?? [];
+		const normalized = [
+			...saved,
+			...fullPeers.map((candidate) => candidate.sessionId).filter((id) => !saved.includes(id)),
+		];
+		const neighbor = visiblePeers[visibleIndex + direction]!;
+		const target = normalized.indexOf(row.sessionId);
+		const neighborIndex = normalized.indexOf(neighbor.sessionId);
+		if (target < 0 || neighborIndex < 0) return;
+		[normalized[target], normalized[neighborIndex]] = [normalized[neighborIndex]!, normalized[target]!];
+		this.persistentState.manualOrder = { ...order, [group]: normalized };
+		this.rebuildRows();
+		this.ui.requestRender();
 	}
 
 	private handleListNavigation(data: string): boolean {
@@ -1270,6 +1337,13 @@ export class AgentsViewMode implements Component, Focusable {
 		return filterUnifiedSessions(this.scopedRecords, (text) => matchesSearchText(text, query));
 	}
 
+	private getRowBuildOptions(): { pinnedRootSessionIds: ReadonlySet<string>; manualOrder: AgentsViewManualOrder } {
+		return {
+			pinnedRootSessionIds: new Set(this.persistentState.pinnedRootSessionIds ?? []),
+			manualOrder: this.persistentState.manualOrder ?? {},
+		};
+	}
+
 	/** Rebuild rows from the last fetched summaries, keeping selection on the same row. */
 	private rebuildRows(): void {
 		const selectedIdentity = this.rows[this.selectedIndex]?.identity;
@@ -1278,6 +1352,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.expandedSubagentParents,
 			this.programShownParents,
 			this.scopeKey,
+			this.getRowBuildOptions(),
 		);
 		const index =
 			selectedIdentity === undefined ? -1 : this.rows.findIndex((row) => row.identity === selectedIdentity);
@@ -1944,7 +2019,7 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async killSubagent(pending: PendingKillSubagent, currentRow: AgentsViewRow): Promise<void> {
-		const running = currentRow.section === "running";
+		const running = currentRow.activitySection === "running";
 		const client = this.requireClient();
 		this.setStatusMessage(running ? "Stopping subagent..." : "Deleting subagent...");
 		try {
@@ -2198,6 +2273,10 @@ export class AgentsViewMode implements Component, Focusable {
 			this.expandedSubagentParents,
 			this.programShownParents,
 			this.scopeKey,
+			{
+				pinnedRootSessionIds: new Set(this.persistentState.pinnedRootSessionIds ?? []),
+				manualOrder: this.persistentState.manualOrder ?? {},
+			},
 		);
 		this.applyPendingAncestorExpansion();
 		this.restoreSelection();
@@ -2492,7 +2571,7 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private getAgentCountsText(): string {
 		const counts = countRowsBySection(this.rows);
-		return `${counts.running} running, ${counts.idle} idle, ${counts.inactive} inactive`;
+		return `${counts.pinned} pinned, ${counts.running} running, ${counts.idle} idle, ${counts.inactive} inactive`;
 	}
 
 	private renderSessionRows(width: number, maxRows: number): string[] {
@@ -2561,12 +2640,12 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		const pendingDelete = row.kind === "agent" && this.isPendingDeleteRow(row);
 		const pendingKill = row.kind === "subagent" && this.isPendingKillSubagentRow(row);
-		const rawIcon = this.getRowIcon(row.section);
-		const icon = this.formatRowIcon(row.section, rawIcon);
+		const rawIcon = this.getRowIcon(row.activitySection);
+		const icon = this.formatRowIcon(row.activitySection, rawIcon);
 		const indent = "  ".repeat(row.depth);
 		const age = formatSessionDuration(row.summary);
-		const details = row.section === "inactive" ? `${row.summary.messageCount} · ${age}` : age;
-		const detailsWidth = row.section === "inactive" ? Math.max(10, visibleWidth(details)) : 10;
+		const details = row.activitySection === "inactive" ? `${row.summary.messageCount} · ${age}` : age;
+		const detailsWidth = row.activitySection === "inactive" ? Math.max(10, visibleWidth(details)) : 10;
 		const heartbeatBadge = !pendingDelete && !pendingKill ? formatHeartbeatBadge(row.heartbeat) : "";
 		const heartbeatCell = heartbeatBadge ? theme.fg("error", heartbeatBadge) : "";
 		const heartbeatWidth = visibleWidth(heartbeatBadge);
@@ -2582,7 +2661,7 @@ export class AgentsViewMode implements Component, Focusable {
 		const title = pendingDelete
 			? this.getPendingDeleteTitle()
 			: pendingKill
-				? `${keyText("app.agents.delete")} again to ${row.section === "running" ? "stop" : "delete"}`
+				? `${keyText("app.agents.delete")} again to ${row.activitySection === "running" ? "stop" : "delete"}`
 				: styleRowTitle(row);
 		// Append the background summary as a dim suffix on the same line, e.g.
 		// "fix auth · Refactoring token validation". Hidden during delete/stop
@@ -2685,18 +2764,20 @@ export class AgentsViewMode implements Component, Focusable {
 		const selectedSubagent = selectedRow?.kind === "subagent";
 		const hints = [
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
+			`${keyText("app.agents.reorderUp")}/${keyText("app.agents.reorderDown")} reorder`,
+			`${keyText("app.agents.togglePin")} ${(selectedRow?.kind === "agent" || selectedRow?.kind === "subagent" || selectedRow?.kind === "subagent-summary") && (this.persistentState.pinnedRootSessionIds ?? []).includes(selectedRow.rootSessionId) ? "unpin" : "pin"}`,
 			`${keyText("tui.select.confirm")} open`,
 			`${keyText("app.agents.open")} open`,
 			selectedAgent
-				? `${keyText("app.agents.reply")} ${selectedRow?.section === "inactive" ? "resume" : "reply"}`
+				? `${keyText("app.agents.reply")} ${selectedRow?.activitySection === "inactive" ? "resume" : "reply"}`
 				: undefined,
 			`${keyText("app.agents.new")} new`,
 			selectedAgent ? `${keyText("app.agents.rename")} rename` : undefined,
 			selectedAgent
-				? `${keyText("app.agents.delete")} ${selectedRow?.section === "inactive" ? "delete" : "stop/deactivate"}`
+				? `${keyText("app.agents.delete")} ${selectedRow?.activitySection === "inactive" ? "delete" : "stop/deactivate"}`
 				: undefined,
 			selectedSubagent
-				? `${keyText("app.agents.delete")} ${selectedRow.section === "running" ? "stop" : "delete"}`
+				? `${keyText("app.agents.delete")} ${selectedRow.activitySection === "running" ? "stop" : "delete"}`
 				: undefined,
 			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
 		]
@@ -2739,7 +2820,7 @@ export class AgentsViewMode implements Component, Focusable {
 		return this.rows[this.selectedIndex]?.summary.cwd ?? this.options.uiServices.getInitialCwd();
 	}
 
-	private getRowIcon(section: AgentsViewSection): string {
+	private getRowIcon(section: "running" | "idle" | "inactive"): string {
 		switch (section) {
 			case "running":
 				return workingIconFrame(this.workingIconFrame);
@@ -2754,7 +2835,7 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	private formatRowIcon(section: AgentsViewSection, icon: string): string {
+	private formatRowIcon(section: "running" | "idle" | "inactive", icon: string): string {
 		switch (section) {
 			case "running":
 				return theme.bold(icon);
@@ -2778,36 +2859,23 @@ type DisplayItem =
 
 function buildDisplayItems(rows: readonly AgentsViewRow[]): DisplayItem[] {
 	const items: DisplayItem[] = [];
-	const sections: AgentsViewSection[] = ["running", "idle", "inactive"];
+	const sections: AgentsViewSection[] = ["pinned", "running", "idle", "inactive"];
 	for (const [index, section] of sections.entries()) {
-		if (index > 0) {
-			items.push({ type: "spacer" });
-		}
+		if (index > 0) items.push({ type: "spacer" });
 		items.push({ type: "heading", section });
 		const sectionRows = getDisplayRowsForSection(rows, section);
-		if (sectionRows.length === 0) {
-			items.push({ type: "empty", section });
-			continue;
-		}
-		for (const row of sectionRows) {
-			items.push({ type: "row", row });
-		}
+		if (sectionRows.length === 0) items.push({ type: "empty", section });
+		else for (const row of sectionRows) items.push({ type: "row", row });
 	}
 	return items;
 }
 
-// Nested rows (subagent summaries and expanded subagents) always render in
-// their top-level agent's section block, regardless of their own section.
 function getDisplayRowsForSection(rows: readonly AgentsViewRow[], section: AgentsViewSection): AgentsViewRow[] {
 	const result: AgentsViewRow[] = [];
 	let include = false;
 	for (const row of rows) {
-		if (row.depth === 0) {
-			include = row.section === section;
-		}
-		if (include) {
-			result.push(row);
-		}
+		if (row.depth === 0) include = row.displaySection === section;
+		if (include) result.push(row);
 	}
 	return result;
 }
@@ -2815,9 +2883,10 @@ function getDisplayRowsForSection(rows: readonly AgentsViewRow[], section: Agent
 function countRowsBySection(rows: readonly AgentsViewRow[]): Record<AgentsViewSection, number> {
 	const agents = rows.filter((row) => row.kind === "agent");
 	return {
-		running: agents.filter((row) => row.section === "running").length,
-		idle: agents.filter((row) => row.section === "idle").length,
-		inactive: agents.filter((row) => row.section === "inactive").length,
+		pinned: agents.filter((row) => row.displaySection === "pinned").length,
+		running: agents.filter((row) => row.displaySection === "running").length,
+		idle: agents.filter((row) => row.displaySection === "idle").length,
+		inactive: agents.filter((row) => row.displaySection === "inactive").length,
 	};
 }
 

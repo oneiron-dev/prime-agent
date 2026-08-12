@@ -42,6 +42,9 @@ export interface AppKeybindings {
 	"app.agents.delete": true;
 	"app.agents.program": true;
 	"app.agents.rename": true;
+	"app.agents.togglePin": true;
+	"app.agents.reorderUp": true;
+	"app.agents.reorderDown": true;
 	"app.tree.foldOrUp": true;
 	"app.tree.unfoldOrDown": true;
 	"app.tree.editLabel": true;
@@ -130,6 +133,9 @@ export const KEYBINDINGS = {
 	"app.agents.delete": { defaultKeys: "ctrl+x", description: "Stop or delete selected agent" },
 	"app.agents.program": { defaultKeys: "ctrl+o", description: "Show the program that spawned subagents" },
 	"app.agents.rename": { defaultKeys: "ctrl+r", description: "Rename selected agent session" },
+	"app.agents.togglePin": { defaultKeys: "ctrl+t", description: "Pin or unpin selected agent tree" },
+	"app.agents.reorderUp": { defaultKeys: "shift+up", description: "Move selected agent up" },
+	"app.agents.reorderDown": { defaultKeys: "shift+down", description: "Move selected agent down" },
 	"app.tree.foldOrUp": {
 		defaultKeys: ["ctrl+left", "alt+left"],
 		description: "Fold tree branch or move up",

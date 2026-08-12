@@ -21,6 +21,7 @@ import {
 	resolveAgentsViewSessionUiServices,
 	shouldReconnectAgentsViewDaemon,
 } from "../src/modes/agents-view/agents-view-mode.js";
+import { getAgentsViewReorderGroup } from "../src/modes/agents-view/agents-view-state.js";
 import {
 	type AgentsViewScopeFrame,
 	aggregateSessionHeartbeats,
@@ -1547,3 +1548,53 @@ function makeUiServices(cwd: string): InteractiveModeUiServices {
 		getThemes: (): Theme[] => [],
 	};
 }
+
+describe("agents view pin and ordering regressions", () => {
+	test("places pinned roots before running while retaining live activity and child placement", () => {
+		const root = makeSummary({ sessionId: "root", id: "root", activity: "idle" });
+		const running = makeSummary({ sessionId: "running", id: "running", activity: "working" });
+		const child = makeSummary({
+			sessionId: "child",
+			id: "child",
+			runtimeKind: "subagent",
+			parentSessionId: "root",
+			activity: "working",
+		});
+		const collapsedRows = buildAgentsViewRows([running, root, child], new Set(), new Set(), undefined, {
+			pinnedRootSessionIds: new Set(["root"]),
+		});
+		const rootIdentity = collapsedRows.find((row) => row.sessionId === "root")?.identity;
+		expect(rootIdentity).toBeDefined();
+		const rows = buildAgentsViewRows([running, root, child], new Set([rootIdentity!]), new Set(), undefined, {
+			pinnedRootSessionIds: new Set(["root"]),
+		});
+		expect(rows[0]).toMatchObject({ sessionId: "root", displaySection: "pinned", activitySection: "idle" });
+		expect(rows.findIndex((row) => row.sessionId === "running")).toBeGreaterThan(0);
+		expect(rows.find((row) => row.sessionId === "child")).toMatchObject({
+			displaySection: "pinned",
+			activitySection: "running",
+			rootSessionId: "root",
+		});
+	});
+
+	test("uses immediate parent and spawn code to isolate child reorder groups", () => {
+		const child = (parentSessionId: string, spawnCode: string) =>
+			({ kind: "subagent" as const, depth: 1, parentSessionId, summary: { spawnCode } }) as never;
+		expect(getAgentsViewReorderGroup(child("root", "a"))).toBe("children:root:a");
+		expect(getAgentsViewReorderGroup(child("first", "a"))).toBe("children:first:a");
+		expect(getAgentsViewReorderGroup(child("root", "b"))).toBe("children:root:b");
+	});
+
+	test("keeps saved root order across sections while adding new peers", () => {
+		const a = makeSummary({ sessionId: "a", id: "a", activity: "working", created: "2026-01-01T00:00:00Z" });
+		const b = makeSummary({ sessionId: "b", id: "b", activity: "idle", created: "2026-01-03T00:00:00Z" });
+		const c = makeSummary({ sessionId: "c", id: "c", activity: "working", created: "2026-01-02T00:00:00Z" });
+		const rows = buildAgentsViewRows([a, b, c], new Set(), new Set(), undefined, {
+			manualOrder: { roots: ["b", "a"] },
+		});
+		expect(
+			rows.filter((row) => row.depth === 0 && row.displaySection === "running").map((row) => row.sessionId),
+		).toEqual(["a", "c"]);
+		expect(rows.find((row) => row.sessionId === "b")?.displaySection).toBe("idle");
+	});
+});

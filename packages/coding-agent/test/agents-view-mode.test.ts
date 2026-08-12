@@ -12,7 +12,7 @@ import {
 	createInitialAgentsViewPersistentState,
 	runAgentsViewMode,
 } from "../src/modes/agents-view/agents-view-mode.js";
-import { resolveAgentsViewLeftResult } from "../src/modes/agents-view/agents-view-state.js";
+import { buildAgentsViewRows, resolveAgentsViewLeftResult } from "../src/modes/agents-view/agents-view-state.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
 import { stopThemeWatcher } from "../src/modes/interactive/theme/theme.js";
@@ -197,7 +197,7 @@ describe("AgentsViewMode", () => {
 			"killSubagent",
 			self,
 			{ identity: "child-row", rootActiveSessionId: "root-active", childId: "passive-child" },
-			{ section: "running" },
+			{ section: "running", activitySection: "running" },
 		);
 		expect(request).toHaveBeenCalledWith({
 			type: "cancel_rlm_child",
@@ -734,5 +734,93 @@ describe("agents view startup notices", () => {
 		});
 
 		expect(runs).toBe(2);
+	});
+
+	it("pins a selectable subagent summary through its root", () => {
+		const summaryRow = {
+			kind: "subagent-summary",
+			selectable: true,
+			rootSessionId: "root-session",
+		};
+		const self = {
+			rows: [summaryRow],
+			selectedIndex: 0,
+			persistentState: { pinnedRootSessionIds: [] as string[] },
+			rebuildRows: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		};
+
+		invoke("togglePinSelection", self);
+		expect(self.persistentState.pinnedRootSessionIds).toEqual(["root-session"]);
+		expect(self.rebuildRows).toHaveBeenCalledOnce();
+		expect(self.ui.requestRender).toHaveBeenCalledOnce();
+
+		invoke("togglePinSelection", self);
+		expect(self.persistentState.pinnedRootSessionIds).toEqual([]);
+		expect(self.rebuildRows).toHaveBeenCalledTimes(2);
+		expect(self.ui.requestRender).toHaveBeenCalledTimes(2);
+	});
+
+	it("reorders filtered root peers without dropping hidden peers", () => {
+		const roots = ["A", "B", "C", "D"].map((sessionId) =>
+			summary({ id: sessionId, activeSessionId: sessionId, sessionId, created: "2026-01-01T00:00:00Z" }),
+		);
+		const rows = buildAgentsViewRows([roots[0]!, roots[2]!]);
+		const self = {
+			rows,
+			selectedIndex: rows.findIndex((row) => row.sessionId === "A"),
+			persistentState: { manualOrder: { roots: ["A", "B", "C", "D"] } },
+			scopedRecords: roots,
+			expandedSubagentParents: new Set<string>(),
+			programShownParents: new Set<string>(),
+			scopeKey: undefined,
+			getRowBuildOptions: () => ({ manualOrder: { roots: ["A", "B", "C", "D"] } }),
+			rebuildRows: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		};
+
+		invoke("reorderSelection", self, 1);
+		expect(self.persistentState.manualOrder.roots).toEqual(["C", "B", "A", "D"]);
+		expect(self.rebuildRows).toHaveBeenCalledOnce();
+		expect(rows[self.selectedIndex]?.identity).toBe(rows.find((row) => row.sessionId === "A")?.identity);
+
+		invoke("reorderSelection", self, -1);
+		expect(self.rebuildRows).toHaveBeenCalledOnce();
+	});
+
+	it("dispatches pin and reorder bindings while searching but not while replying or renaming", () => {
+		const bindings = {
+			"app.agents.togglePin": "\u0014",
+			"app.agents.reorderUp": "\u001b[1;2A",
+			"app.agents.reorderDown": "\u001b[1;2B",
+		};
+		const self = {
+			replyTarget: undefined as object | undefined,
+			renameTarget: undefined as object | undefined,
+			editor: { getText: () => "active filter", handleInput: vi.fn() },
+			keybindings: { matches: (data: string, action: string) => bindings[action as keyof typeof bindings] === data },
+			clearStickyStatusMessage: vi.fn(),
+			clearCtrlCExitHint: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			togglePinSelection: vi.fn(),
+			reorderSelection: vi.fn(),
+			handleListNavigation: () => false,
+			queryChanged: vi.fn(),
+		};
+
+		invoke("handleInput", self, "\u0014");
+		invoke("handleInput", self, "\u001b[1;2A");
+		invoke("handleInput", self, "\u001b[1;2B");
+		expect(self.togglePinSelection).toHaveBeenCalledOnce();
+		expect(self.reorderSelection).toHaveBeenNthCalledWith(1, -1);
+		expect(self.reorderSelection).toHaveBeenNthCalledWith(2, 1);
+
+		self.replyTarget = {};
+		invoke("handleInput", self, "\u0014");
+		expect(self.togglePinSelection).toHaveBeenCalledOnce();
+		self.replyTarget = undefined;
+		self.renameTarget = {};
+		invoke("handleInput", self, "\u001b[1;2A");
+		expect(self.reorderSelection).toHaveBeenCalledTimes(2);
 	});
 });

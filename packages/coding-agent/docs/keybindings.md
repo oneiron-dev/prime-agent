@@ -205,3 +205,11 @@ On native Windows, `app.suspend` has no default binding because Windows terminal
   "tui.editor.cursorWordRight": ["alt+right", "alt+w"]
 }
 ```
+
+## Agents View
+
+| Keybinding id | Default | Description |
+|--------|---------|-------------|
+| `app.agents.reorderUp` | `shift+up` | Move selected agent within its section and sibling group |
+| `app.agents.reorderDown` | `shift+down` | Move selected agent within its section and sibling group |
+| `app.agents.togglePin` | `ctrl+t` | Pin or unpin the selected agent tree in Agents View (for this process) |
