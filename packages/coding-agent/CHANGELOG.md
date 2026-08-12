@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Added configurable Agents View pinning and in-section session reordering.
+- Fixed Up and Down Arrow navigation in Agents View to wrap cyclically across selectable sessions.
 - Added strict per-child `model=` and `reasoning=` selection to `rlm()`, preserving inheritance when omitted and rejecting explicit reasoning levels unsupported by the selected child model.
 - Added configurable provider-native Responses compaction with durable branch-aware replay and local fallback for declared compatible models.
 - Added capability-gated generic Responses WebSocket transport, while keeping unary remote compaction on HTTP.

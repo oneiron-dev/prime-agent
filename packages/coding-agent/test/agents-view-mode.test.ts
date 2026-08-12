@@ -129,7 +129,6 @@ describe("AgentsViewMode", () => {
 			getSelectableRowIndexes() {
 				return this.rows.flatMap((row, index) => (row.selectable ? [index] : []));
 			},
-			collapseSubagentListsOutsideSelection: vi.fn(),
 			syncSelectedRowState: vi.fn(),
 			clearDeleteConfirmation: vi.fn(),
 			ui: { requestRender: vi.fn() },
@@ -140,8 +139,9 @@ describe("AgentsViewMode", () => {
 
 		invoke("moveSelection", self, -1, { wrap: true });
 		expect(self.selectedIndex).toBe(5);
-		expect(self.collapseSubagentListsOutsideSelection).toHaveBeenCalledTimes(2);
 		expect(self.syncSelectedRowState).toHaveBeenCalledTimes(2);
+		expect(self.clearDeleteConfirmation).toHaveBeenCalledTimes(2);
+		expect(self.ui.requestRender).toHaveBeenCalledTimes(2);
 	});
 
 	it("re-resolves subagent state before choosing stop or delete intent", async () => {
