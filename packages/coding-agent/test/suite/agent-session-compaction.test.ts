@@ -152,25 +152,6 @@ describe("AgentSession compaction characterization", () => {
 		});
 	});
 
-	it("uses SSE for local compaction summaries", async () => {
-		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
-		harnesses.push(harness);
-		harness.sessionManager.appendMessage({ role: "user", content: "old request ".repeat(200), timestamp: 1 });
-		harness.sessionManager.appendMessage(createAssistant(harness, { totalTokens: 80_000, timestamp: 2 }));
-		harness.sessionManager.appendMessage({ role: "user", content: "recent request", timestamp: 3 });
-		const transports: Array<string | undefined> = [];
-		harness.setResponses([
-			(_context, options) => {
-				transports.push(options?.transport);
-				return fauxAssistantMessage("model-generated summary");
-			},
-		]);
-
-		await harness.session.compact();
-
-		expect(transports).toEqual(["sse"]);
-	});
-
 	it("renders an executing /compact as activity instead of queued work", async () => {
 		let releaseCompaction: () => void = () => {};
 		const compactionGate = new Promise<void>((resolve) => {

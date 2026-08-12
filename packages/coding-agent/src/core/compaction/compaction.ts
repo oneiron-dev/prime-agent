@@ -635,8 +635,8 @@ export async function generateSummary(
 
 	const completionOptions =
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel, transport: "sse" as const }
-			: { maxTokens, signal, apiKey, headers, transport: "sse" as const };
+			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
+			: { maxTokens, signal, apiKey, headers };
 
 	const response = await completeSimple(
 		model,
@@ -991,8 +991,8 @@ async function generateTurnPrefixSummary(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel, transport: "sse" as const }
-			: { maxTokens, signal, apiKey, headers, transport: "sse" as const },
+			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
+			: { maxTokens, signal, apiKey, headers },
 	);
 
 	if (response.stopReason === "error") {
