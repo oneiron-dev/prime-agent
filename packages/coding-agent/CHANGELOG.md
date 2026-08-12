@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed local compaction summaries to use SSE so a provider WebSocket error cannot trap `/compact`.
 - Fixed Agents View failing to resume saved sessions when the daemon's original working directory no longer exists.
 - Added configurable Agents View pinning and in-section session reordering, persisted per local profile and machine.
 - Fixed Up and Down Arrow navigation in Agents View to wrap cyclically across selectable sessions.

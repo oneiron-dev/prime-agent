@@ -59,7 +59,54 @@ async function* createFunctionCallEvents(argumentsJson: string): AsyncIterable<R
 	} as ResponseStreamEvent;
 }
 
+async function* createNestedCpaErrorEvent(): AsyncIterable<ResponseStreamEvent> {
+	yield {
+		type: "error",
+		status: 401,
+		error: {
+			type: "authentication_error",
+			code: "invalid_api_key",
+			message: "Authorization: Bearer cpa-secret-value was rejected",
+		},
+	} as unknown as ResponseStreamEvent;
+}
+
 describe("openai responses partialJson cleanup", () => {
+	it("classifies nested CPA error frames without retaining bearer credentials", async () => {
+		const model: Model<"openai-responses"> = {
+			id: "gpt-5-mini",
+			name: "GPT-5 Mini",
+			api: "openai-responses",
+			provider: "cpa-r",
+			baseUrl: "https://cpa.test/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const result = processResponsesStream(
+			createNestedCpaErrorEvent(),
+			createOutput(model),
+			new AssistantMessageEventStream(),
+			model,
+		);
+		await expect(result).rejects.toThrow(
+			"Provider authentication failed (authentication_error, invalid_api_key, 401): Authorization: Bearer [REDACTED] was rejected",
+		);
+		await result.catch((error: unknown) => {
+			expect(error).toMatchObject({
+				info: {
+					kind: "auth",
+					status: 401,
+					providerErrorType: "authentication_error",
+					providerErrorCode: "invalid_api_key",
+					raw: expect.not.stringContaining("cpa-secret-value"),
+				},
+			});
+		});
+	});
+
 	it("removes partialJson from persisted tool-call blocks at output_item.done", async () => {
 		const model: Model<"openai-responses"> = {
 			id: "gpt-5-mini",

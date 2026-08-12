@@ -23,6 +23,8 @@ export interface StreamFailureInfo {
 	kind: StreamFailureKind;
 	/** Provider's own error/stop identifier, e.g. "overloaded_error" or "SAFETY". */
 	providerErrorType?: string;
+	/** Provider's more-specific error code, when it supplies one separately from its type. */
+	providerErrorCode?: string;
 	status?: number;
 	requestId?: string;
 	/** Truncated raw provider payload for post-mortems. */
@@ -53,7 +55,11 @@ const KIND_MESSAGES: Record<StreamFailureKind, string> = {
 
 /** Build a user-facing message like "Provider overloaded (overloaded_error, 529) [request_id: req_abc]". */
 export function streamFailureMessage(info: StreamFailureInfo, detail?: string): string {
-	const qualifiers = [info.providerErrorType, info.status !== undefined ? String(info.status) : undefined]
+	const qualifiers = [
+		info.providerErrorType,
+		info.providerErrorCode !== info.providerErrorType ? info.providerErrorCode : undefined,
+		info.status !== undefined ? String(info.status) : undefined,
+	]
 		.filter(Boolean)
 		.join(", ");
 	let message = KIND_MESSAGES[info.kind];
@@ -223,6 +229,7 @@ export function recordStreamFailure(
 		api: model.api,
 		kind: info.kind,
 		providerErrorType: info.providerErrorType,
+		providerErrorCode: info.providerErrorCode,
 		status: info.status,
 		requestId: info.requestId,
 		message: output.errorMessage,

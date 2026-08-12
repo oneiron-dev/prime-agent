@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed OpenAI Responses streams to classify nested provider error frames without exposing credential-like values.
 - Added capability-gated WebSocket transport for generic OpenAI Responses providers, with authenticated Node/Bun connections, cached continuation, session-affinity headers, and SSE fallback only before the first response event.
 - Added unary OpenAI Responses compaction with native replay of provider-scoped opaque compaction items.
 

@@ -32,7 +32,7 @@ import type { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { classifyStreamFailure, StreamFailureError } from "../utils/stream-failure.js";
+import { classifyStreamFailure, StreamFailureError, streamFailureMessage } from "../utils/stream-failure.js";
 import { transformMessages } from "./transform-messages.js";
 
 // =============================================================================
@@ -83,6 +83,56 @@ export interface ConvertResponsesMessagesOptions {
 
 export interface ConvertResponsesToolsOptions {
 	strict?: boolean | null;
+}
+
+type ResponsesErrorFrame = {
+	status?: number;
+	providerErrorType?: string;
+	providerErrorCode?: string;
+	message?: string;
+	raw?: string;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getString(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function redactErrorText(value: string, maxLength = 500): string {
+	const redacted = value
+		.replace(/\bBearer\s+[^\s,;)}\]]+/gi, "Bearer [REDACTED]")
+		.replace(
+			/\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\b\s*([:=])\s*[^\s,;)}\]]+/gi,
+			"$1$2[REDACTED]",
+		);
+	return redacted.length > maxLength ? `${redacted.slice(0, maxLength)}...` : redacted;
+}
+
+/** Accepts both OpenAI's flat error event and CPA's nested error envelope. */
+function parseResponsesErrorFrame(event: unknown): ResponsesErrorFrame {
+	const frame = isRecord(event) ? event : {};
+	const nested = isRecord(frame.error) ? frame.error : undefined;
+	const providerErrorType = getString(nested?.type);
+	const providerErrorCode = getString(nested?.code) ?? getString(frame.code);
+	const message = getString(nested?.message) ?? getString(frame.message);
+	const status = typeof frame.status === "number" ? frame.status : undefined;
+	const safeRaw = {
+		type: "error",
+		...(status !== undefined ? { status } : {}),
+		...(providerErrorType ? { providerErrorType } : {}),
+		...(providerErrorCode ? { providerErrorCode } : {}),
+		...(message ? { message: redactErrorText(message, 1000) } : {}),
+	};
+	return {
+		status,
+		providerErrorType: providerErrorType ?? providerErrorCode,
+		providerErrorCode,
+		message: message ? redactErrorText(message) : undefined,
+		raw: JSON.stringify(safeRaw),
+	};
 }
 
 // =============================================================================
@@ -526,10 +576,18 @@ export async function processResponsesStream<TApi extends Api>(
 				output.stopReasonRaw = response.status;
 			}
 		} else if (event.type === "error") {
-			throw new StreamFailureError(`Error Code ${event.code}: ${event.message}`, {
-				kind: classifyStreamFailure(event.code ?? undefined),
-				providerErrorType: event.code ?? undefined,
-			});
+			const error = parseResponsesErrorFrame(event);
+			const info = {
+				kind: classifyStreamFailure(error.providerErrorType, error.status),
+				providerErrorType: error.providerErrorType,
+				providerErrorCode: error.providerErrorCode,
+				status: error.status,
+				raw: error.raw,
+			};
+			throw new StreamFailureError(
+				streamFailureMessage(info, error.message ?? "provider sent an error event without a message"),
+				info,
+			);
 		} else if (event.type === "response.failed") {
 			const error = event.response?.error;
 			const details = event.response?.incomplete_details;
