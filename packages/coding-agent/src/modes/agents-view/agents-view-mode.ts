@@ -133,6 +133,7 @@ export interface AgentsViewModeOptions {
 	/** When set, the first view is rooted at this session's direct children. */
 	initialScopeKey?: AgentsViewScopeKey;
 	agentsViewStateStore?: AgentsViewStateStore;
+	deleteSavedSession?: typeof deleteDaemonSavedSession;
 }
 
 export type AgentsViewRunResult =
@@ -851,15 +852,7 @@ export class AgentsViewMode implements Component, Focusable {
 	async run(): Promise<AgentsViewRunResult> {
 		this.client = new DaemonClient(this.requireSocketPath());
 		await this.client.connect();
-		const durableState = this.stateStore.load();
-		if (!durableState.persistenceError) {
-			this.persistentState.pinnedRootSessionIds = durableState.state.pinnedRootSessionIds;
-			this.persistentState.manualOrder = durableState.state.manualOrder;
-			this.flushAgentsViewStateOperations();
-		} else {
-			this.agentsViewStateDirty = true;
-			this.persistentState.statusMessage = durableState.persistenceError.message;
-		}
+		this.loadAgentsViewState();
 		this.subscribeToClientClose(this.client);
 		this.unsubscribeClientMessage = this.client.onMessage((message) => {
 			if (message.type === "heartbeats_changed") void this.refreshHeartbeats();
@@ -1075,6 +1068,24 @@ export class AgentsViewMode implements Component, Focusable {
 		return formatted.flatMap((line) => wrapTextWithAnsi(line, wrapWidth).map((wrapped) => ` ${wrapped}`));
 	}
 
+	private loadAgentsViewState(): boolean {
+		const pending = this.persistentState.pendingAgentsViewStateOperations ?? [];
+		const durableState = this.stateStore.load();
+		if (pending.length > 0) {
+			// Pending intents are the UI authority until their FIFO queue drains.
+			return this.flushAgentsViewStateOperations();
+		}
+		if (!durableState.persistenceError) {
+			this.persistentState.pinnedRootSessionIds = durableState.state.pinnedRootSessionIds;
+			this.persistentState.manualOrder = durableState.state.manualOrder;
+			this.agentsViewStateDirty = false;
+			return true;
+		}
+		this.agentsViewStateDirty = true;
+		this.persistentState.statusMessage = durableState.persistenceError.message;
+		return false;
+	}
+
 	private togglePinSelection(): void {
 		const row = this.rows[this.selectedIndex];
 		if (!row?.selectable || (row.kind !== "agent" && row.kind !== "subagent" && row.kind !== "subagent-summary"))
@@ -1083,7 +1094,11 @@ export class AgentsViewMode implements Component, Focusable {
 		if (pinned.has(row.rootSessionId)) pinned.delete(row.rootSessionId);
 		else pinned.add(row.rootSessionId);
 		this.persistentState.pinnedRootSessionIds = [...pinned];
-		this.applyAgentsViewStateOperation?.({ type: "togglePin", sessionId: row.rootSessionId });
+		this.applyAgentsViewStateOperation?.({
+			type: "setPin",
+			sessionId: row.rootSessionId,
+			pinned: pinned.has(row.rootSessionId),
+		});
 		this.rebuildRows();
 		this.ui.requestRender();
 	}
@@ -1118,12 +1133,21 @@ export class AgentsViewMode implements Component, Focusable {
 			...fullPeers.map((candidate) => candidate.sessionId).filter((id) => !saved.includes(id)),
 		];
 		const neighbor = visiblePeers[visibleIndex + direction]!;
+		// The store needs the order observed before this local optimistic swap.
+		const baseOrder = [...normalized];
 		const target = normalized.indexOf(row.sessionId);
 		const neighborIndex = normalized.indexOf(neighbor.sessionId);
 		if (target < 0 || neighborIndex < 0) return;
 		[normalized[target], normalized[neighborIndex]] = [normalized[neighborIndex]!, normalized[target]!];
 		this.persistentState.manualOrder = { ...order, [group]: normalized };
-		this.applyAgentsViewStateOperation?.({ type: "setGroupOrder", group, orderedIds: normalized });
+		this.applyAgentsViewStateOperation?.({
+			type: "placePeer",
+			group,
+			sessionId: row.sessionId,
+			neighborSessionId: neighbor.sessionId,
+			before: direction === -1,
+			baseOrder,
+		});
 		this.rebuildRows();
 		this.ui.requestRender();
 	}
@@ -1226,36 +1250,47 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	/** Called only after the daemon conclusively deletes a saved session. */
-	private removeDeletedSessionPreferences(sessionId: string): void {
-		this.applyAgentsViewStateOperation({ type: "removeSession", sessionId });
+	private removeDeletedSessionPreferences(sessionId: string): boolean {
+		return this.applyAgentsViewStateOperation({ type: "removeSession", sessionId });
 	}
 
-	private applyAgentsViewStateOperation(operation: AgentsViewStateOperation): void {
+	private applyAgentsViewStateOperation(operation: AgentsViewStateOperation): boolean {
+		const pending = this.persistentState.pendingAgentsViewStateOperations ?? [];
+		if (pending.length > 0) {
+			pending.push(operation);
+			this.flushAgentsViewStateOperations?.();
+			return pending.length === 0;
+		}
 		const result = this.stateStore.apply(operation);
 		if (result.persistenceError) {
-			this.persistentState.pendingAgentsViewStateOperations ??= [];
-			this.persistentState.pendingAgentsViewStateOperations.push(operation);
+			this.persistentState.pendingAgentsViewStateOperations = [operation];
 			this.markAgentsViewStateDirty(result.persistenceError);
-			return;
+			return false;
 		}
 		this.persistentState.pinnedRootSessionIds = result.state.pinnedRootSessionIds;
 		this.persistentState.manualOrder = result.state.manualOrder;
-		this.flushAgentsViewStateOperations();
+		this.agentsViewStateDirty = false;
+		return true;
 	}
 
-	private flushAgentsViewStateOperations(): void {
+	private flushAgentsViewStateOperations(): boolean {
 		const pending = this.persistentState.pendingAgentsViewStateOperations ?? [];
+		let finalState: { pinnedRootSessionIds: string[]; manualOrder: AgentsViewManualOrder } | undefined;
 		while (pending.length > 0) {
 			const result = this.stateStore.apply(pending[0]!);
 			if (result.persistenceError) {
 				this.markAgentsViewStateDirty(result.persistenceError);
-				return;
+				return false;
 			}
 			pending.shift();
-			this.persistentState.pinnedRootSessionIds = result.state.pinnedRootSessionIds;
-			this.persistentState.manualOrder = result.state.manualOrder;
+			finalState = result.state;
+		}
+		if (finalState) {
+			this.persistentState.pinnedRootSessionIds = finalState.pinnedRootSessionIds;
+			this.persistentState.manualOrder = finalState.manualOrder;
 		}
 		this.agentsViewStateDirty = false;
+		return true;
 	}
 
 	private markAgentsViewStateDirty(error: Error): void {
@@ -1990,7 +2025,7 @@ export class AgentsViewMode implements Component, Focusable {
 						await this.refreshSessions();
 						return;
 					}
-					const result = await deleteDaemonSavedSession(
+					const result = await (this.options.deleteSavedSession ?? deleteDaemonSavedSession)(
 						this.requireClient(),
 						this.getSavedSessionCatalogContext(),
 						row.summary.sessionFile,
@@ -2002,10 +2037,12 @@ export class AgentsViewMode implements Component, Focusable {
 						return;
 					}
 					this.pendingDeleteAgent = undefined;
-					this.removeDeletedSessionPreferences(row.summary.sessionId);
+					const cleanupPersisted = this.removeDeletedSessionPreferences(row.summary.sessionId);
 					const refreshed = await this.refreshSavedSessions({ preserveStatusOnError: true });
 					const success = result.method === "trash" ? "Session moved to trash" : "Session deleted";
-					this.setStatusMessage(refreshed ? success : `${success}; refresh failed`);
+					this.setStatusMessage(
+						`${success}${cleanupPersisted ? "" : "; pin/order cleanup did not persist"}${refreshed ? "" : "; refresh failed"}`,
+					);
 				} catch (error) {
 					this.setStatusMessage(formatError("Failed to delete session", error));
 				}
@@ -2064,12 +2101,10 @@ export class AgentsViewMode implements Component, Focusable {
 				);
 				const deleted = isRecord(data) && data.deleted === true;
 				const stillRunning = isRecord(data) && data.reason === "running";
-				if (deleted || (!stillRunning && isRecord(data) && data.reason === "not_found")) {
-					this.applyAgentsViewStateOperation?.({ type: "removeSession", sessionId: pending.sessionId });
-				}
+				const cleanupPersisted = deleted ? this.removeDeletedSessionPreferences(pending.sessionId) : true;
 				this.setStatusMessage(
 					deleted
-						? "Subagent deleted"
+						? `Subagent deleted${cleanupPersisted ? "" : "; pin/order cleanup did not persist"}`
 						: stillRunning
 							? "Subagent is running; stop it first"
 							: "Subagent already removed",

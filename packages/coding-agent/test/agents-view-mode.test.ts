@@ -108,6 +108,7 @@ describe("AgentsViewMode", () => {
 			selectedIndex: 4,
 			rebuildRows: vi.fn(),
 			syncSelectedRowState: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
 			ui: { requestRender: vi.fn() },
 		};
 
@@ -187,7 +188,10 @@ describe("AgentsViewMode", () => {
 			ui: { requestRender: vi.fn() },
 			requireClient: () => client,
 			setStatusMessage: vi.fn(),
-			applyAgentsViewStateOperation: vi.fn(),
+			applyAgentsViewStateOperation: vi.fn((_operation: unknown) => false),
+			removeDeletedSessionPreferences(sessionId: string) {
+				return this.applyAgentsViewStateOperation({ type: "removeSession", sessionId });
+			},
 			refreshSessions: vi.fn(async () => true),
 			handleKillSubagentSelected(row: unknown) {
 				return invoke("handleKillSubagentSelected", self, row);
@@ -201,8 +205,8 @@ describe("AgentsViewMode", () => {
 			showDeleteConfirmation() {
 				return invoke("showDeleteConfirmation", self);
 			},
-			clearDeleteConfirmation(options: unknown) {
-				return invoke("clearDeleteConfirmation", self, options);
+			clearDeleteConfirmation(_options: unknown) {
+				return invoke("clearDeleteConfirmation", self, _options);
 			},
 			killSubagent(pending: unknown, row: unknown) {
 				return invoke("killSubagent", self, pending, row);
@@ -222,7 +226,9 @@ describe("AgentsViewMode", () => {
 			childId: "passive-child",
 		});
 		expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancel_rlm_child" }));
-		expect(self.setStatusMessage).toHaveBeenCalledWith("Subagent deleted", { render: false });
+		expect(self.setStatusMessage).toHaveBeenCalledWith("Subagent deleted; pin/order cleanup did not persist", {
+			render: false,
+		});
 		expect(self.applyAgentsViewStateOperation).toHaveBeenCalledWith({
 			type: "removeSession",
 			sessionId: "passive-child-session",
@@ -1009,9 +1015,11 @@ describe("agents view startup notices", () => {
 });
 
 describe("Agents View deletion preference cleanup", () => {
-	it("removes durable preferences only when the saved-session deletion success path invokes its hook", () => {
-		const applyAgentsViewStateOperation = vi.fn();
-		invoke("removeDeletedSessionPreferences", { applyAgentsViewStateOperation }, "durable-root-session");
+	it("returns deletion-cleanup persistence status", () => {
+		const applyAgentsViewStateOperation = vi.fn(() => false);
+		expect(invoke("removeDeletedSessionPreferences", { applyAgentsViewStateOperation }, "durable-root-session")).toBe(
+			false,
+		);
 		expect(applyAgentsViewStateOperation).toHaveBeenCalledWith({
 			type: "removeSession",
 			sessionId: "durable-root-session",
@@ -1019,34 +1027,86 @@ describe("Agents View deletion preference cleanup", () => {
 	});
 });
 
+describe("Agents View root deletion persistence", () => {
+	function rootDeleteSelf(deleteResult: { ok: boolean; method?: "trash" | "delete"; error?: string }, cleanup = true) {
+		const row = {
+			selectable: true,
+			kind: "agent",
+			identity: "file:/tmp/root.jsonl",
+			summary: summary({ activeSessionId: undefined, sessionFile: "/tmp/root.jsonl", sessionId: "root" }),
+		};
+		const deleteSavedSession = vi.fn(async () => deleteResult);
+		const self = {
+			rows: [row],
+			selectedIndex: 0,
+			pendingKillSubagent: undefined,
+			pendingDeleteAgent: { identity: "file:/tmp/root.jsonl" },
+			deleteConfirmExpiresAt: Date.now() + 1000,
+			options: { deleteSavedSession },
+			requireClient: vi.fn(() => ({ request: vi.fn(async () => ({ success: true, data: { sessions: [] } })) })),
+			getSavedSessionCatalogContext: vi.fn(() => ({ cwd: "/tmp" })),
+			lastListedSummaries: [],
+			removeDeletedSessionPreferences: vi.fn(() => cleanup),
+			refreshSavedSessions: vi.fn(async () => true),
+			setStatusMessage: vi.fn(),
+			refreshSessions: vi.fn(),
+			stopAgentForDeletion: vi.fn(),
+			deactivatePendingAgent: vi.fn(),
+			isDeleteConfirmationVisible() {
+				return true;
+			},
+			showDeleteConfirmation: vi.fn(),
+			clearDeleteConfirmation(_options: unknown) {},
+		};
+		return { self, deleteSavedSession };
+	}
+
+	it("gates root preference cleanup on an actual saved delete and retains delete success when cleanup queues", async () => {
+		const succeeded = rootDeleteSelf({ ok: true, method: "delete" }, false);
+		await invoke("handleDeleteSelected", succeeded.self);
+		expect(succeeded.deleteSavedSession).toHaveBeenCalledOnce();
+		expect(succeeded.self.removeDeletedSessionPreferences).toHaveBeenCalledWith("root");
+		expect(succeeded.self.setStatusMessage).toHaveBeenCalledWith(
+			"Session deleted; pin/order cleanup did not persist",
+		);
+
+		const failed = rootDeleteSelf({ ok: false, error: "nope" });
+		await invoke("handleDeleteSelected", failed.self);
+		expect(failed.self.removeDeletedSessionPreferences).not.toHaveBeenCalled();
+		expect(failed.self.setStatusMessage).toHaveBeenCalledWith("Failed to delete session: nope", { tone: "error" });
+	});
+});
+
 describe("Agents View durable operation recovery", () => {
 	function storePath(): string {
 		return join(mkdtempSync(join(tmpdir(), "agents-view-mode-")), "state.json");
 	}
-	it("queues failed operations, replays FIFO, and preserves double toggles", () => {
+	it("appends a newer desired pin behind a failed head and drains FIFO", () => {
 		const store = new AgentsViewStateStore(storePath());
 		const realApply = store.apply.bind(store);
-		let fail = true;
+		let healthy = false;
 		(store as unknown as { apply: typeof store.apply }).apply = ((op) =>
-			fail
-				? {
-						state: { version: 1, pinnedRootSessionIds: [], manualOrder: {} },
+			healthy
+				? realApply(op)
+				: {
+						state: { version: 1, pinnedRootSessionIds: [], manualOrder: Object.create(null) },
 						persistenceError: new Error("locked"),
-					}
-				: realApply(op)) as typeof store.apply;
+					}) as typeof store.apply;
 		const self = {
 			stateStore: store,
 			persistentState: { pinnedRootSessionIds: [], manualOrder: {} } as AgentsViewPersistentState,
 			agentsViewStateDirty: false,
 			markAgentsViewStateDirty: vi.fn(),
+			flushAgentsViewStateOperations() {
+				return invoke("flushAgentsViewStateOperations", self);
+			},
 		};
-		invoke("applyAgentsViewStateOperation", self, { type: "togglePin", sessionId: "x" });
-		invoke("applyAgentsViewStateOperation", self, { type: "togglePin", sessionId: "x" });
-		expect(self.persistentState.pendingAgentsViewStateOperations).toHaveLength(2);
-		fail = false;
-		invoke("flushAgentsViewStateOperations", self);
-		expect(store.load().state.pinnedRootSessionIds).toEqual([]);
+		invoke("applyAgentsViewStateOperation", self, { type: "setPin", sessionId: "x", pinned: true });
+		healthy = true;
+		invoke("applyAgentsViewStateOperation", self, { type: "setPin", sessionId: "x", pinned: false });
 		expect(self.persistentState.pendingAgentsViewStateOperations).toEqual([]);
+		expect(store.load().state.pinnedRootSessionIds).toEqual([]);
+		expect(self.persistentState.pinnedRootSessionIds).toEqual([]);
 	});
 
 	it("does not clobber another client while replaying a queued operation", () => {
@@ -1068,11 +1128,78 @@ describe("Agents View durable operation recovery", () => {
 			agentsViewStateDirty: false,
 			markAgentsViewStateDirty: vi.fn(),
 		};
-		invoke("applyAgentsViewStateOperation", self, { type: "togglePin", sessionId: "x" });
-		other.apply({ type: "togglePin", sessionId: "y" });
+		invoke("applyAgentsViewStateOperation", self, { type: "setPin", sessionId: "x", pinned: true });
+		other.apply({ type: "setPin", sessionId: "y", pinned: true });
 		fail = false;
 		invoke("flushAgentsViewStateOperations", self);
 		expect(other.load().state.pinnedRootSessionIds).toEqual(["y", "x"]);
+	});
+
+	it("retains optimistic full-tail state after a partial prefix then adopts authority only after drain", () => {
+		const store = new AgentsViewStateStore(storePath());
+		const realApply = store.apply.bind(store);
+		let failSecond = true,
+			calls = 0;
+		(store as unknown as { apply: typeof store.apply }).apply = ((op) => {
+			calls++;
+			if (calls === 2 && failSecond)
+				return {
+					state: { version: 1, pinnedRootSessionIds: ["a"], manualOrder: Object.create(null) },
+					persistenceError: new Error("locked"),
+				};
+			return realApply(op);
+		}) as typeof store.apply;
+		const self = {
+			stateStore: store,
+			persistentState: {
+				pinnedRootSessionIds: ["optimistic-a", "optimistic-b"],
+				manualOrder: { sentinel: ["keep"] },
+				pendingAgentsViewStateOperations: [
+					{ type: "setPin" as const, sessionId: "a", pinned: true },
+					{ type: "setPin" as const, sessionId: "b", pinned: true },
+				],
+			},
+			agentsViewStateDirty: false,
+			markAgentsViewStateDirty: vi.fn(),
+		};
+		expect(invoke("flushAgentsViewStateOperations", self)).toBe(false);
+		expect(self.persistentState.pinnedRootSessionIds).toEqual(["optimistic-a", "optimistic-b"]);
+		expect(self.persistentState.manualOrder).toEqual({ sentinel: ["keep"] });
+		expect(self.persistentState.pendingAgentsViewStateOperations).toEqual([
+			{ type: "setPin", sessionId: "b", pinned: true },
+		]);
+		failSecond = false;
+		expect(invoke("flushAgentsViewStateOperations", self)).toBe(true);
+		expect(self.persistentState.pinnedRootSessionIds).toEqual(["a", "b"]);
+	});
+
+	it("does not adopt loaded disk state while a remounted queue cannot flush", () => {
+		const stateStore = {
+			load: vi.fn(() => ({
+				state: { version: 1 as const, pinnedRootSessionIds: ["disk"], manualOrder: { disk: ["disk"] } },
+			})),
+			apply: vi.fn(() => ({
+				state: { version: 1 as const, pinnedRootSessionIds: ["disk"], manualOrder: {} },
+				persistenceError: new Error("locked"),
+			})),
+		};
+		const self = {
+			stateStore,
+			persistentState: {
+				pinnedRootSessionIds: ["optimistic"],
+				manualOrder: { keep: ["optimistic"] },
+				pendingAgentsViewStateOperations: [{ type: "setPin" as const, sessionId: "optimistic", pinned: true }],
+			},
+			agentsViewStateDirty: false,
+			markAgentsViewStateDirty: vi.fn(),
+			flushAgentsViewStateOperations() {
+				return invoke("flushAgentsViewStateOperations", self);
+			},
+		};
+		expect(invoke("loadAgentsViewState", self)).toBe(false);
+		expect(self.persistentState.pinnedRootSessionIds).toEqual(["optimistic"]);
+		expect(self.persistentState.manualOrder).toEqual({ keep: ["optimistic"] });
+		expect(self.persistentState.pendingAgentsViewStateOperations).toHaveLength(1);
 	});
 
 	it("finish retains a failed queue", () => {
@@ -1086,7 +1213,9 @@ describe("Agents View durable operation recovery", () => {
 			stopped: false,
 			agentsViewStateDirty: true,
 			stateStore: store,
-			persistentState: { pendingAgentsViewStateOperations: [{ type: "togglePin" as const, sessionId: "x" }] },
+			persistentState: {
+				pendingAgentsViewStateOperations: [{ type: "setPin" as const, sessionId: "x", pinned: true }],
+			},
 			markAgentsViewStateDirty: vi.fn(),
 			savedCatalogGeneration: 0,
 			liveCatalogGeneration: 0,

@@ -17,8 +17,15 @@ import { appendRotatingLog, getAgentLogPath, getAgentsViewStatePath } from "../c
 export const AGENTS_VIEW_STATE_VERSION = 1;
 export type AgentsViewManualOrder = Record<string, string[]>;
 export type AgentsViewStateOperation =
-	| { type: "togglePin"; sessionId: string }
-	| { type: "setGroupOrder"; group: string; orderedIds: readonly string[] }
+	| { type: "setPin"; sessionId: string; pinned: boolean }
+	| {
+			group: string;
+			type: "placePeer";
+			sessionId: string;
+			neighborSessionId: string;
+			before: boolean;
+			baseOrder: readonly string[];
+	  }
 	| { type: "removeSession"; sessionId: string };
 export interface AgentsViewState {
 	version: 1;
@@ -29,79 +36,106 @@ export interface AgentsViewStateResult {
 	state: AgentsViewState;
 	persistenceError?: Error;
 }
+export interface AgentsViewStateCoordination {
+	acquire(path: string): () => void;
+}
 
-const EMPTY_STATE = (): AgentsViewState => ({ version: 1, pinnedRootSessionIds: [], manualOrder: {} });
+const empty = (): AgentsViewState => ({
+	version: 1,
+	pinnedRootSessionIds: [],
+	manualOrder: Object.create(null) as AgentsViewManualOrder,
+});
 
-function diagnostic(message: string, cause?: unknown): Error {
+function report(message: string, cause?: unknown): Error {
 	const error = new Error(message);
 	if (cause instanceof Error) error.cause = cause;
 	return error;
 }
 
-function uniqueStrings(value: unknown): string[] {
+function strings(value: unknown): string[] {
 	if (!Array.isArray(value)) return [];
 	const seen = new Set<string>();
 	const result: string[] = [];
 	for (const item of value) {
-		if (typeof item !== "string" || item.length === 0 || seen.has(item)) continue;
-		seen.add(item);
-		result.push(item);
+		if (typeof item === "string" && item.length > 0 && !seen.has(item)) {
+			seen.add(item);
+			result.push(item);
+		}
 	}
 	return result;
 }
 
 function normalize(value: unknown): AgentsViewState {
 	const input = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-	const manualOrder: AgentsViewManualOrder = {};
+	const manualOrder = Object.create(null) as AgentsViewManualOrder;
 	if (input.manualOrder && typeof input.manualOrder === "object") {
 		for (const key of Object.keys(input.manualOrder as object).sort()) {
-			const ids = uniqueStrings((input.manualOrder as Record<string, unknown>)[key]);
+			const ids = strings((input.manualOrder as Record<string, unknown>)[key]);
 			if (ids.length > 0) manualOrder[key] = ids;
 		}
 	}
-	return { version: 1, pinnedRootSessionIds: uniqueStrings(input.pinnedRootSessionIds), manualOrder };
+	return { version: 1, pinnedRootSessionIds: strings(input.pinnedRootSessionIds), manualOrder };
 }
 
-function withLock<T>(path: string, action: () => T): T {
-	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-	let release: (() => void) | undefined;
-	for (let attempt = 0; attempt < 100; attempt++) {
-		try {
-			release = lockSync(path, { realpath: false, lockfilePath: `${path}.lock`, stale: 30_000 });
-			break;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || attempt === 99) throw error;
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+const defaultCoordination: AgentsViewStateCoordination = {
+	acquire(path) {
+		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		for (let i = 0; i < 100; i++) {
+			try {
+				return lockSync(path, { realpath: false, lockfilePath: `${path}.lock`, stale: 30_000 });
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || i === 99) throw error;
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+			}
 		}
-	}
-	if (!release) throw new Error("Could not coordinate Agents View state");
+		throw new Error("Could not coordinate Agents View state");
+	},
+};
+
+function withLock<T>(path: string, coordination: AgentsViewStateCoordination, action: () => T): T {
+	const release = coordination.acquire(path);
+	let actionError: unknown;
 	try {
 		return action();
+	} catch (error) {
+		actionError = error;
+		throw error;
 	} finally {
-		release();
+		try {
+			release();
+		} catch (error) {
+			// A committed action remains successful even if housekeeping cannot unlock.
+			appendRotatingLog(
+				getAgentLogPath(),
+				`Agents View state lock release failed: ${error instanceof Error ? error.message : "unknown error"}`,
+			);
+			if (actionError) {
+				// Preserve the action failure; a release failure is only diagnostic.
+			}
+		}
 	}
 }
 
 function readState(path: string): AgentsViewState {
-	if (!existsSync(path)) return EMPTY_STATE();
+	if (!existsSync(path)) return empty();
 	const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
 	if (!parsed || typeof parsed !== "object" || (parsed as Record<string, unknown>).version !== 1) {
-		throw diagnostic("Agents View state is corrupt or unsupported; changes will not persist");
+		throw report("Agents View state is corrupt or unsupported; changes will not persist");
 	}
 	return normalize(parsed);
 }
 
 function writeState(path: string, state: AgentsViewState): void {
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-	const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-	let descriptor: number | undefined;
+	const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	let fd: number | undefined;
 	try {
-		descriptor = openSync(tempPath, "w", 0o600);
-		writeFileSync(descriptor, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-		fsyncSync(descriptor);
-		closeSync(descriptor);
-		descriptor = undefined;
-		renameSync(tempPath, path);
+		fd = openSync(temp, "w", 0o600);
+		writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+		fsyncSync(fd);
+		closeSync(fd);
+		fd = undefined;
+		renameSync(temp, path);
 		try {
 			const dir = openSync(dirname(path), "r");
 			try {
@@ -109,77 +143,78 @@ function writeState(path: string, state: AgentsViewState): void {
 			} finally {
 				closeSync(dir);
 			}
-		} catch {
-			/* best effort */
-		}
+		} catch {}
 	} finally {
-		if (descriptor !== undefined) closeSync(descriptor);
+		if (fd !== undefined) closeSync(fd);
 		try {
-			unlinkSync(tempPath);
-		} catch {
-			/* already renamed or unavailable */
-		}
+			unlinkSync(temp);
+		} catch {}
 	}
 }
 
 export class AgentsViewStateStore {
-	constructor(private readonly path = getAgentsViewStatePath()) {}
-	get filePath(): string {
-		return this.path;
-	}
+	constructor(
+		private readonly path = getAgentsViewStatePath(),
+		private readonly coordination: AgentsViewStateCoordination = defaultCoordination,
+	) {}
+
 	load(): AgentsViewStateResult {
 		try {
-			return { state: withLock(this.path, () => readState(this.path)) };
-		} catch (error) {
-			const persistenceError = diagnostic("Agents View state could not be loaded; changes will not persist", error);
+			return { state: withLock(this.path, this.coordination, () => readState(this.path)) };
+		} catch (cause) {
+			const persistenceError = report("Agents View state could not be loaded; changes will not persist", cause);
 			appendRotatingLog(getAgentLogPath(), `Agents View state: ${persistenceError.message}`);
-			return { state: EMPTY_STATE(), persistenceError };
+			return { state: empty(), persistenceError };
 		}
 	}
-	private mutate(operation: AgentsViewStateOperation): AgentsViewStateResult {
+
+	apply(operation: AgentsViewStateOperation): AgentsViewStateResult {
 		try {
 			return {
-				state: withLock(this.path, () => {
+				state: withLock(this.path, this.coordination, () => {
 					const state = readState(this.path);
 					switch (operation.type) {
-						case "togglePin": {
+						case "setPin": {
 							const pins = new Set(state.pinnedRootSessionIds);
-							if (pins.has(operation.sessionId)) pins.delete(operation.sessionId);
-							else pins.add(operation.sessionId);
+							if (operation.pinned) pins.add(operation.sessionId);
+							else pins.delete(operation.sessionId);
 							state.pinnedRootSessionIds = [...pins];
 							break;
 						}
-						case "setGroupOrder": {
-							const requested = uniqueStrings(operation.orderedIds);
-							const existing = state.manualOrder[operation.group] ?? [];
-							state.manualOrder[operation.group] = [
-								...requested,
-								...existing.filter((id) => !requested.includes(id)),
-							];
+						case "placePeer": {
+							const base = strings(operation.baseOrder);
+							const current = state.manualOrder[operation.group] ?? [];
+							const ids = [...current, ...base.filter((id) => !current.includes(id))];
+							const target = ids.indexOf(operation.sessionId);
+							const neighbor = ids.indexOf(operation.neighborSessionId);
+							if (
+								target >= 0 &&
+								neighbor >= 0 &&
+								((operation.before && target > neighbor) || (!operation.before && target < neighbor))
+							) {
+								[ids[target], ids[neighbor]] = [ids[neighbor]!, ids[target]!];
+							}
+							if (ids.length > 0) state.manualOrder[operation.group] = ids;
 							break;
 						}
 						case "removeSession":
+							state.pinnedRootSessionIds = state.pinnedRootSessionIds.filter((id) => id !== operation.sessionId);
 							for (const key of Object.keys(state.manualOrder)) {
 								if (key.startsWith(`children:${operation.sessionId}:`)) delete state.manualOrder[key];
 								else
 									state.manualOrder[key] = state.manualOrder[key]!.filter((id) => id !== operation.sessionId);
 							}
-							state.pinnedRootSessionIds = state.pinnedRootSessionIds.filter((id) => id !== operation.sessionId);
 							break;
 					}
-					state.pinnedRootSessionIds = uniqueStrings(state.pinnedRootSessionIds);
-					state.manualOrder = normalize(state).manualOrder;
-					writeState(this.path, state);
-					return state;
+					const normalized = normalize(state);
+					writeState(this.path, normalized);
+					return normalized;
 				}),
 			};
-		} catch (error) {
-			const persistenceError = diagnostic("Agents View state change will not persist", error);
+		} catch (cause) {
+			const persistenceError = report("Agents View state change will not persist", cause);
 			appendRotatingLog(getAgentLogPath(), `Agents View state: ${persistenceError.message}`);
-			return { state: EMPTY_STATE(), persistenceError };
+			return { state: empty(), persistenceError };
 		}
-	}
-	apply(operation: AgentsViewStateOperation): AgentsViewStateResult {
-		return this.mutate(operation);
 	}
 }

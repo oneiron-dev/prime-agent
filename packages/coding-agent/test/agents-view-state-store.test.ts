@@ -3,70 +3,104 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lockSync } from "proper-lockfile";
 import { describe, expect, test } from "vitest";
-import { AgentsViewStateStore } from "../src/core/agents-view-state-store.js";
+import { type AgentsViewStateCoordination, AgentsViewStateStore } from "../src/core/agents-view-state-store.js";
 
 function statePath(): string {
 	return join(mkdtempSync(join(tmpdir(), "agents-view-state-")), "agents-view-state.json");
 }
 
+function place(group: string, sessionId: string, neighborSessionId: string, before: boolean, baseOrder: string[]) {
+	return { type: "placePeer" as const, group, sessionId, neighborSessionId, before, baseOrder };
+}
+
 describe("AgentsViewStateStore", () => {
-	test("roundtrips setGroupOrder, preserves trailing ids, and is idempotent", () => {
-		const store = new AgentsViewStateStore(statePath());
-		store.apply({ type: "setGroupOrder", group: "roots", orderedIds: ["a", "b", "c"] });
-		expect(
-			store.apply({ type: "setGroupOrder", group: "roots", orderedIds: ["c", "a", "a"] }).state.manualOrder.roots,
-		).toEqual(["c", "a", "b"]);
-		expect(
-			store.apply({ type: "setGroupOrder", group: "roots", orderedIds: ["c", "a"] }).state.manualOrder.roots,
-		).toEqual(["c", "a", "b"]);
+	test("placePeer has an empty-base no-op, is idempotent, composes stale moves, and preserves hidden ids", () => {
+		const path = statePath(),
+			left = new AgentsViewStateStore(path),
+			right = new AgentsViewStateStore(path);
+		expect(left.apply(place("roots", "missing", "also-missing", true, [])).state.manualOrder.roots).toBeUndefined();
+		left.apply(place("roots", "a", "b", false, ["a", "b", "c", "d", "hidden"]));
+		right.apply(place("roots", "c", "d", false, ["a", "b", "c", "d"]));
+		expect(left.load().state.manualOrder.roots).toEqual(["b", "a", "d", "c", "hidden"]);
+		expect(right.apply(place("roots", "c", "d", false, ["a", "b", "c", "d"])).state.manualOrder.roots).toEqual([
+			"b",
+			"a",
+			"d",
+			"c",
+			"hidden",
+		]);
 	});
 
-	test("preserves malformed and future schema bytes on load and mutate", () => {
-		for (const bytes of ["{ malformed", '{"version":2,"future":true}']) {
-			const path = statePath();
+	test("does not fabricate a pair absent from both stored and base orders", () => {
+		const store = new AgentsViewStateStore(statePath());
+		store.apply(place("roots", "a", "b", false, ["a", "b", "trail"]));
+		store.apply(place("roots", "ghost", "void", true, []));
+		expect(store.load().state.manualOrder.roots).toEqual(["b", "a", "trail"]);
+	});
+
+	test("preserves malformed, future, and non-object bytes fail-closed", () => {
+		for (const bytes of ["{ malformed", '{"version":2,"future":true}', "null"]) {
+			const path = statePath(),
+				store = new AgentsViewStateStore(path);
 			writeFileSync(path, bytes);
-			const store = new AgentsViewStateStore(path);
 			expect(store.load().persistenceError).toBeInstanceOf(Error);
-			expect(store.apply({ type: "togglePin", sessionId: "x" }).persistenceError).toBeInstanceOf(Error);
+			expect(store.apply({ type: "setPin", sessionId: "x", pinned: true }).persistenceError).toBeInstanceOf(Error);
 			expect(readFileSync(path, "utf8")).toBe(bytes);
 		}
 	});
 
-	test("returns bounded contention failure without changing the target", () => {
-		const path = statePath();
-		const store = new AgentsViewStateStore(path);
-		store.apply({ type: "togglePin", sessionId: "before" });
-		const release = lockSync(path, { realpath: false, lockfilePath: `${path}.lock`, stale: 30_000 });
-		const start = Date.now();
-		const result = store.apply({ type: "togglePin", sessionId: "blocked" });
-		const elapsed = Date.now() - start;
-		release();
-		expect(result.persistenceError).toBeInstanceOf(Error);
-		expect(elapsed).toBeLessThan(1_500);
-		expect(store.load().state.pinnedRootSessionIds).toEqual(["before"]);
-		expect(store.apply({ type: "togglePin", sessionId: "blocked" }).state.pinnedRootSessionIds).toEqual([
-			"before",
-			"blocked",
-		]);
-	});
-
-	test("merges interleaved independent instances without lost updates", () => {
-		const path = statePath(),
-			left = new AgentsViewStateStore(path),
-			right = new AgentsViewStateStore(path);
-		left.apply({ type: "togglePin", sessionId: "a" });
-		right.apply({ type: "setGroupOrder", group: "roots", orderedIds: ["one"] });
-		left.apply({ type: "togglePin", sessionId: "b" });
-		right.apply({ type: "removeSession", sessionId: "one" });
-		expect(left.load().state).toEqual({ version: 1, pinnedRootSessionIds: ["a", "b"], manualOrder: {} });
-	});
-
-	test("writes parsable private state with no temporary residue", () => {
+	test("normalizes supported v1 shapes and retains __proto__ as a null-prototype own key", () => {
 		const path = statePath(),
 			store = new AgentsViewStateStore(path);
-		store.apply({ type: "togglePin", sessionId: "x" });
+		writeFileSync(
+			path,
+			'{"version":1,"pinnedRootSessionIds":"wrong","manualOrder":{"__proto__":["x", "x", 1],"bad":"wrong"},"future":true}',
+		);
+		const loaded = store.load().state;
+		expect(Object.getPrototypeOf(loaded.manualOrder)).toBeNull();
+		expect(Object.getOwnPropertyDescriptor(loaded.manualOrder, "__proto__")?.value).toEqual(["x"]);
+		store.apply({ type: "setPin", sessionId: "y", pinned: true });
+		expect(
+			Object.getOwnPropertyDescriptor(JSON.parse(readFileSync(path, "utf8")).manualOrder, "__proto__")?.value,
+		).toEqual(["x"]);
+	});
+
+	test("returns success after an action commits even when lock release throws", () => {
+		const coordination: AgentsViewStateCoordination = {
+			acquire: () => () => {
+				throw new Error("release failed");
+			},
+		};
+		const path = statePath(),
+			store = new AgentsViewStateStore(path, coordination);
+		const result = store.apply({ type: "setPin", sessionId: "committed", pinned: true });
+		expect(result.persistenceError).toBeUndefined();
+		expect(JSON.parse(readFileSync(path, "utf8")).pinnedRootSessionIds).toEqual(["committed"]);
+	});
+
+	test("returns bounded contention failure without changing target", () => {
+		const path = statePath(),
+			store = new AgentsViewStateStore(path);
+		store.apply({ type: "setPin", sessionId: "before", pinned: true });
+		const release = lockSync(path, { realpath: false, lockfilePath: `${path}.lock`, stale: 30_000 });
+		const start = Date.now(),
+			result = store.apply({ type: "setPin", sessionId: "blocked", pinned: true });
+		release();
+		expect(result.persistenceError).toBeInstanceOf(Error);
+		expect(Date.now() - start).toBeLessThan(1_500);
+		expect(store.load().state.pinnedRootSessionIds).toEqual(["before"]);
+	});
+
+	test("writes parsable private state, creates a private parent, and leaves no lock or temp", () => {
+		const path = join(mkdtempSync(join(tmpdir(), "agents-view-state-")), "nested", "state.json"),
+			store = new AgentsViewStateStore(path);
+		store.apply({ type: "setPin", sessionId: "x", pinned: true });
 		expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ version: 1 });
 		expect(existsSync(`${path}.lock`)).toBe(false);
-		if (process.platform !== "win32") expect(statSync(path).mode & 0o777).toBe(0o600);
+		expect(existsSync(`${path}.tmp`)).toBe(false);
+		if (process.platform !== "win32") {
+			expect(statSync(path).mode & 0o777).toBe(0o600);
+			expect(statSync(join(path, "..")).mode & 0o777).toBe(0o700);
+		}
 	});
 });
