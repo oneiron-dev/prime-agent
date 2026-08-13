@@ -106,6 +106,11 @@ describe("OpenAI Responses remote compaction", () => {
 		).toBe("HTTP 503 compact endpoint temporarily unavailable");
 		expect(
 			getResponsesCompactFallbackReason(
+				Object.assign(new Error("no auth available"), { status: 503, code: "auth_unavailable" }),
+			),
+		).toBeUndefined();
+		expect(
+			getResponsesCompactFallbackReason(
 				Object.assign(new Error("compact unsupported opaque-ciphertext"), { status: 400 }),
 			),
 		).toBe("HTTP 400 compact unsupported");

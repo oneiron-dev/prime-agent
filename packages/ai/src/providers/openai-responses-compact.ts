@@ -125,6 +125,9 @@ export function getResponsesCompactFallbackReason(error: unknown): string | unde
 		return `HTTP ${status} compact endpoint unavailable`;
 	}
 	if (status === 502 || status === 503 || status === 504) {
+		if (/(?:auth_unavailable|no auth available)/i.test(`${code ?? ""} ${message}`)) {
+			return undefined;
+		}
 		return `HTTP ${status} compact endpoint temporarily unavailable`;
 	}
 	if (
