@@ -393,3 +393,7 @@ Configure compaction in `~/.prime/agent/settings.json` or `<project-dir>/.prime/
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.
+
+## Codex Remote Compaction V2
+
+V2 is separately capability-gated by `supportsResponsesRemoteCompactionV2`. It streams ordinary `/responses` with `remote_compaction_v2` and a terminal `compaction_trigger`; it never uses unary `/responses/compact`. A successful stream has exactly one opaque checkpoint. Its replay record retains user Response messages only within a 64k UTF-8 byte-estimated token bound (tokens are `ceil(bytes / 4)`) plus exactly one opaque checkpoint, while the live system/developer prompt is re-injected on each request. Compaction instructions are request-only and are never persisted. The flag defaults false and is intended for explicit runtime model-level grants only.

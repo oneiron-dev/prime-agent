@@ -354,6 +354,8 @@ export interface OpenAIResponsesCompat {
 	supportsLongCacheRetention?: boolean;
 	/** Whether the provider/model supports unary `POST /responses/compact`. Default: false. */
 	supportsResponsesCompact?: boolean;
+	/** Whether the provider/model supports Codex Remote Compaction V2 over streaming `/responses`. Default: false. */
+	supportsResponsesRemoteCompactionV2?: boolean;
 	/** Whether the provider/model supports Responses WebSocket transport. Default: false. */
 	supportsWebSocket?: boolean;
 }

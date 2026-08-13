@@ -461,22 +461,27 @@ describe("ModelRegistry", () => {
 			expect(compat?.cacheControlFormat).toBe("anthropic");
 		});
 
-		test("compat schema accepts Responses compact and WebSocket capability flags", () => {
+		test("compat schema preserves an explicit model-level Responses V2 capability", () => {
 			writeRawModelsJson({
 				demo: {
 					baseUrl: "https://example.com/v1",
 					apiKey: "DEMO_KEY",
 					api: "openai-responses",
 					compat: { supportsResponsesCompact: true, supportsWebSocket: true },
-					models: [{ id: "demo-model" }],
+					models: [{ id: "without-v2" }, { id: "with-v2", compat: { supportsResponsesRemoteCompactionV2: true } }],
 				},
 			});
 
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
-			const compat = registry.find("demo", "demo-model")?.compat as OpenAIResponsesCompat | undefined;
+			const withoutV2 = registry.find("demo", "without-v2")?.compat as OpenAIResponsesCompat | undefined;
+			const withV2 = registry.find("demo", "with-v2")?.compat as OpenAIResponsesCompat | undefined;
 			expect(registry.getError()).toBeUndefined();
-			expect(compat?.supportsResponsesCompact).toBe(true);
-			expect(compat?.supportsWebSocket).toBe(true);
+			expect(withoutV2?.supportsResponsesCompact).toBe(true);
+			expect(withoutV2?.supportsWebSocket).toBe(true);
+			expect(withoutV2?.supportsResponsesRemoteCompactionV2).toBeUndefined();
+			expect(withV2?.supportsResponsesCompact).toBe(true);
+			expect(withV2?.supportsWebSocket).toBe(true);
+			expect(withV2?.supportsResponsesRemoteCompactionV2).toBe(true);
 		});
 
 		test("compat schema accepts Anthropic eager tool input streaming flag", () => {

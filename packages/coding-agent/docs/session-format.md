@@ -458,3 +458,7 @@ Key methods for working with sessions programmatically.
 - `getSessionId()` - Session UUID
 - `getSessionFile()` - Session file path (undefined for in-memory)
 - `isPersisted()` - Whether session is saved to disk
+
+## Remote compaction checkpoints
+
+Remote compaction uses `version: 1` and `mechanism: "remote"`. For Codex Remote Compaction V2, `remoteCompaction.items` contains retained plaintext user Responses `message` items followed by exactly one opaque `compaction` or `compaction_summary` checkpoint. Unknown checkpoint fields are preserved for replay.

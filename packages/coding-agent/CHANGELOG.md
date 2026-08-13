@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added V2-first remote compaction selection with opaque checkpoint replay and retained user-only plaintext with live prompts re-injected; runtime model grants remain separate.
+
 - Fixed local compaction failures caused by unclassified nested OpenAI Responses WebSocket errors; compaction keeps the model-selected transport, including WebSockets for `cpa-r` routes.
 - Fixed Agents View failing to resume saved sessions when the daemon's original working directory no longer exists.
 - Added configurable Agents View pinning and in-section session reordering, persisted per local profile and machine.

@@ -896,11 +896,12 @@ interface OpenAIResponsesCompat {
   sendSessionIdHeader?: boolean;      // Send `session_id` from sessionId when caching is enabled (default: true)
   supportsLongCacheRetention?: boolean; // Support `prompt_cache_retention: "24h"` (default: true)
   supportsResponsesCompact?: boolean; // Support unary POST /responses/compact (default: false)
+  supportsResponsesRemoteCompactionV2?: boolean; // Codex streaming V2 (default: false)
   supportsWebSocket?: boolean;        // Support the Responses WebSocket endpoint (default: false)
 }
 ```
 
-For generic `openai-responses` models, `transport: "auto"` selects WebSocket only when `supportsWebSocket` is true and the runtime can create an authenticated socket; browser runtimes remain on SSE. A WebSocket failure may fall back to SSE only before the first response event. Provider-native compaction is a separate unary HTTP operation and is attempted only when `supportsResponsesCompact` is true.
+For generic `openai-responses` models, `transport: "auto"` selects WebSocket only when `supportsWebSocket` is true and the runtime can create an authenticated socket; browser runtimes remain on SSE. A WebSocket failure may fall back to SSE only before the first response event. Provider-native unary compaction is attempted only when `supportsResponsesCompact` is true. Codex Remote Compaction V2 is a separate, default-false capability intended only for explicit model-level runtime grants: it uses ordinary streaming `/responses` with `stream: true`, `store: false`, `x-codex-beta-features: remote_compaction_v2`, and a terminal `compaction_trigger`; it never calls unary `/responses/compact`.
 
 If `compat` is not set, the library falls back to URL-based detection. If `compat` is partially set, unspecified fields use the detected defaults. This is useful for:
 

@@ -7,7 +7,12 @@
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
-import { compactOpenAIResponses, completeSimple, createOpenAIResponsesCompactionMessage } from "@earendil-works/pi-ai";
+import {
+	compactOpenAIResponses,
+	compactOpenAIResponsesV2,
+	completeSimple,
+	createOpenAIResponsesCompactionMessage,
+} from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -888,13 +893,116 @@ export async function compact(
 	};
 }
 
+export function shouldUseRemoteCompactionV2(model: Model<any>, mode: CompactionMode): boolean {
+	if (mode === "local" || model.api !== "openai-responses") return false;
+	return (model as Model<"openai-responses">).compat?.supportsResponsesRemoteCompactionV2 === true;
+}
+
+function isV2Record(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** @internal Exported for deterministic persisted-state contract tests. */
+export function retainedV2Items(input: readonly unknown[], checkpoint: { type: string; [key: string]: unknown }) {
+	const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+	// Only user messages are durable; the live system/developer prompt is re-injected.
+	const messages: Array<{ type: string; role?: string; [key: string]: unknown }> = input
+		.filter((item): item is Record<string, unknown> => isV2Record(item) && item.role === "user")
+		.map((item) => ({ ...clone(item), type: "message" }));
+	const utf8Bytes = (value: string) => new TextEncoder().encode(value).byteLength;
+	const approxTokenCount = (value: string) => Math.ceil(utf8Bytes(value) / 4);
+	const approxTokensFromByteCount = (bytes: number) => Math.ceil(bytes / 4);
+	const truncateText = (value: unknown, maxTokens: number) => {
+		if (typeof value !== "string") return "";
+		if (value === "") return "";
+		const maxBytes = maxTokens * 4;
+		const totalBytes = utf8Bytes(value);
+		if (maxBytes === 0) return `…${approxTokensFromByteCount(totalBytes)} tokens truncated…`;
+		if (totalBytes <= maxBytes) return value;
+		const left = Math.floor(maxBytes / 2);
+		const right = maxBytes - left;
+		let offset = 0;
+		let prefix = "";
+		let prefixEnd = 0;
+		for (const ch of value) {
+			offset += utf8Bytes(ch);
+			if (offset <= left) {
+				prefix += ch;
+				prefixEnd = offset;
+			}
+		}
+		const suffixStartLimit = totalBytes - right;
+		let suffix = "";
+		offset = 0;
+		for (const ch of value) {
+			const start = offset;
+			offset += utf8Bytes(ch);
+			if (start >= Math.max(suffixStartLimit, prefixEnd)) suffix += ch;
+		}
+		const removed = approxTokensFromByteCount(totalBytes - maxBytes);
+		return `${prefix}…${removed} tokens truncated…${suffix}`;
+	};
+	const tokenCount = (value: unknown) => (typeof value === "string" ? approxTokenCount(value) : 0);
+	const messageTokens = (item: (typeof messages)[number]) => {
+		const content = item.content;
+		if (typeof content === "string") return tokenCount(content);
+		return Array.isArray(content)
+			? content.reduce(
+					(total, part) =>
+						total +
+						(isV2Record(part) && (part.type === "input_text" || part.type === "output_text")
+							? tokenCount(part.text)
+							: 0),
+					0,
+				)
+			: 0;
+	};
+	const truncate = (item: (typeof messages)[number], budget: number) => {
+		if (typeof item.content === "string") {
+			const content = truncateText(item.content, budget);
+			return content ? { ...item, content } : undefined;
+		}
+		if (!Array.isArray(item.content)) return item;
+		let remaining = budget;
+		const content = item.content.flatMap((part) => {
+			if (!isV2Record(part) || (part.type !== "input_text" && part.type !== "output_text")) return [clone(part)];
+			const tokens = tokenCount(part.text);
+			if (!remaining) return [];
+			if (tokens <= remaining) {
+				remaining -= tokens;
+				return [clone(part)];
+			}
+			const text = truncateText(part.text, remaining);
+			remaining = 0;
+			return text ? [{ ...clone(part), text }] : [];
+		});
+		return content.length ? { ...item, content } : undefined;
+	};
+	let remaining = 64_000;
+	const kept: typeof messages = [];
+	for (const item of [...messages].reverse()) {
+		if (!remaining) continue;
+		const tokens = Math.max(1, messageTokens(item));
+		if (tokens <= remaining) {
+			kept.push(item);
+			remaining -= tokens;
+		} else {
+			const boundary = truncate(item, remaining);
+			if (boundary) kept.push(boundary);
+			remaining = 0;
+		}
+	}
+	return [...kept.reverse(), clone(checkpoint)];
+}
+
 export function shouldUseRemoteCompaction(model: Model<any>, mode: CompactionMode): boolean {
 	if (mode === "local" || model.api !== "openai-responses") return false;
 	return (model as Model<"openai-responses">).compat?.supportsResponsesCompact === true;
 }
 
 export function remoteCompactionCompatibilityError(model: Model<any>, mode: CompactionMode): string | undefined {
-	if (mode !== "remote" || shouldUseRemoteCompaction(model, mode)) return undefined;
+	if (mode !== "remote" || shouldUseRemoteCompactionV2(model, mode) || shouldUseRemoteCompaction(model, mode))
+		return undefined;
 	return `Remote compaction is not declared supported for ${model.provider}/${model.id} (${model.api})`;
 }
 
@@ -959,6 +1067,58 @@ export async function compactRemote(
 			api: "openai-responses",
 			modelId: model.id,
 			items: result.items,
+		},
+	};
+}
+
+export async function compactRemoteV2(
+	preparation: CompactionPreparation,
+	model: Model<"openai-responses">,
+	apiKey: string,
+	systemPrompt: string,
+	headers?: Record<string, string>,
+	customInstructions?: string,
+	signal?: AbortSignal,
+	sessionId?: string,
+): Promise<CompactionResult<CompactionDetails>> {
+	const remoteMessages: AgentMessage[] = [];
+	if (preparation.previousSummary)
+		remoteMessages.push(
+			createCompactionSummaryMessage(
+				preparation.previousSummary,
+				preparation.tokensBefore,
+				new Date().toISOString(),
+			),
+		);
+	if (preparation.previousRemoteCompaction)
+		remoteMessages.push(
+			createOpenAIResponsesCompactionMessage(
+				preparation.previousRemoteCompaction.provider,
+				preparation.previousRemoteCompaction.modelId,
+				preparation.previousRemoteCompaction.items,
+			),
+		);
+	remoteMessages.push(...preparation.messagesToSummarize, ...preparation.turnPrefixMessages);
+	const result = await compactOpenAIResponsesV2(
+		model,
+		{ systemPrompt, messages: convertToLlm(remoteMessages) },
+		{ apiKey, headers, signal, sessionId, customInstructions },
+	);
+	const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
+	return {
+		summary:
+			"Provider-native OpenAI Responses compaction checkpoint (opaque)." +
+			formatFileOperations(readFiles, modifiedFiles),
+		firstKeptEntryId: preparation.firstKeptEntryId,
+		tokensBefore: preparation.tokensBefore,
+		details: { readFiles, modifiedFiles },
+		mechanism: "remote",
+		remoteCompaction: {
+			version: 1,
+			provider: model.provider,
+			api: "openai-responses",
+			modelId: model.id,
+			items: retainedV2Items(result.input, result.items[0]!),
 		},
 	};
 }

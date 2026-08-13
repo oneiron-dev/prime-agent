@@ -27,9 +27,11 @@ type DynamicImport = (specifier: string) => Promise<unknown>;
 const dynamicImport: DynamicImport = (specifier) => import(specifier);
 const UNDICI_SPECIFIER = "un" + "dici";
 let socketConstructorOverride: SocketConstructor | null | undefined;
+let socketConstructorLoaderOverride: (() => Promise<SocketConstructor | undefined>) | undefined;
 let authenticatedSocketConstructorPromise: Promise<SocketConstructor | undefined> | undefined;
 
 function loadAuthenticatedSocketConstructor(): Promise<SocketConstructor | undefined> {
+	if (socketConstructorLoaderOverride) return socketConstructorLoaderOverride();
 	if (socketConstructorOverride !== undefined) return Promise.resolve(socketConstructorOverride ?? undefined);
 	if (typeof process === "undefined" || !(process.versions?.node || process.versions?.bun)) {
 		return Promise.resolve(undefined);
@@ -42,6 +44,12 @@ function loadAuthenticatedSocketConstructor(): Promise<SocketConstructor | undef
 
 export function setOpenAIResponsesWebSocketConstructorForTesting(ctor?: SocketConstructor | null): void {
 	socketConstructorOverride = ctor;
+}
+
+export function setOpenAIResponsesWebSocketConstructorLoaderForTesting(
+	loader?: () => Promise<SocketConstructor | undefined>,
+): void {
+	socketConstructorLoaderOverride = loader;
 }
 
 export async function hasAuthenticatedOpenAIResponsesWebSocketRuntime(): Promise<boolean> {
@@ -60,10 +68,17 @@ interface Continuation {
 interface Entry {
 	socket: Socket;
 	busy: boolean;
+	identity: string;
 	timer?: ReturnType<typeof setTimeout>;
 	continuation?: Continuation;
 }
 const cache = new Map<string, Entry>();
+interface Claim {
+	generation: number;
+	identity: string;
+}
+const claims = new Map<string, Claim>();
+let nextGeneration = 0;
 
 function close(socket: Socket, reason = "done") {
 	try {
@@ -72,6 +87,8 @@ function close(socket: Socket, reason = "done") {
 }
 export function closeOpenAIResponsesWebSocketSessions(sessionId?: string): void {
 	const entries = sessionId ? [[sessionId, cache.get(sessionId)] as const] : [...cache.entries()];
+	if (sessionId) claims.delete(sessionId);
+	else claims.clear();
 	for (const [id, entry] of entries) {
 		if (!entry) continue;
 		if (entry.timer) clearTimeout(entry.timer);
@@ -83,6 +100,19 @@ registerSessionResourceCleanup(closeOpenAIResponsesWebSocketSessions);
 
 function reusable(socket: Socket) {
 	return socket.readyState === undefined || socket.readyState === 1;
+}
+// This identity is intentionally process-local: it prevents credential-bearing sockets
+// from being reused across routes without ever persisting or logging the credentials.
+function connectionIdentity(url: string, headers: Headers): string {
+	return JSON.stringify([
+		url,
+		[...headers.entries()].map(([key, value]) => [key.toLowerCase(), value]).sort(([a], [b]) => a.localeCompare(b)),
+	]);
+}
+function createAbortError(): Error {
+	const error = new Error("Request was aborted");
+	error.name = "AbortError";
+	return error;
 }
 function errorFromEvent(event: unknown, fallback: string): Error {
 	if (event && typeof event === "object") {
@@ -96,8 +126,9 @@ function errorFromEvent(event: unknown, fallback: string): Error {
 	return new Error(fallback);
 }
 async function connect(url: string, headers: Headers, signal?: AbortSignal): Promise<Socket> {
-	if (signal?.aborted) throw new Error("Request was aborted");
+	if (signal?.aborted) throw createAbortError();
 	const Ctor = await loadAuthenticatedSocketConstructor();
+	if (signal?.aborted) throw createAbortError();
 	if (!Ctor) throw new Error("Authenticated WebSocket transport is not available in this runtime");
 	return new Promise((resolve, reject) => {
 		let socket: Socket;
@@ -131,7 +162,7 @@ async function connect(url: string, headers: Headers, signal?: AbortSignal): Pro
 			settled = true;
 			cleanup();
 			close(socket, "aborted");
-			reject(new Error("Request was aborted"));
+			reject(createAbortError());
 		};
 		try {
 			socket = new Ctor(url, { headers: headersToRecord(headers) });
@@ -143,18 +174,21 @@ async function connect(url: string, headers: Headers, signal?: AbortSignal): Pro
 		socket.addEventListener("error", onError);
 		socket.addEventListener("close", onClose);
 		signal?.addEventListener("abort", onAbort);
+		// Replay an abort that raced socket construction and listener registration.
+		if (signal?.aborted) onAbort();
 	});
 }
 function expire(sessionId: string, entry: Entry) {
 	if (entry.timer) clearTimeout(entry.timer);
 	entry.timer = setTimeout(() => {
-		if (!entry.busy) {
-			close(entry.socket, "idle_timeout");
-			cache.delete(sessionId);
-		}
+		if (entry.busy) return;
+		close(entry.socket, "idle_timeout");
+		if (cache.get(sessionId) === entry) cache.delete(sessionId);
 	}, CACHE_TTL_MS);
 }
 async function acquire(url: string, headers: Headers, sessionId: string | undefined, signal?: AbortSignal) {
+	if (signal?.aborted) throw createAbortError();
+	const identity = connectionIdentity(url, headers);
 	if (!sessionId) {
 		const socket = await connect(url, headers, signal);
 		return {
@@ -164,13 +198,23 @@ async function acquire(url: string, headers: Headers, sessionId: string | undefi
 			release: (_keep: boolean) => close(socket),
 		};
 	}
-	const old = cache.get(sessionId);
+	// Every session acquire claims its logical order, including a fast reuse.
+	const claim: Claim = { generation: ++nextGeneration, identity };
+	claims.set(sessionId, claim);
+	let old = cache.get(sessionId);
 	if (old?.timer) {
 		clearTimeout(old.timer);
 		old.timer = undefined;
 	}
-	if (old && !old.busy && reusable(old.socket)) {
+	if (old && old.identity !== identity) {
+		// A route or handshake change invalidates the old authenticated connection.
+		close(old.socket, "connection_identity_changed");
+		if (cache.get(sessionId) === old) cache.delete(sessionId);
+		old = undefined;
+	}
+	if (old && old.identity === identity && !old.busy && reusable(old.socket)) {
 		old.busy = true;
+		if (claims.get(sessionId) === claim) claims.delete(sessionId);
 		return {
 			socket: old.socket,
 			entry: old,
@@ -178,28 +222,47 @@ async function acquire(url: string, headers: Headers, sessionId: string | undefi
 			release: (keep: boolean) => {
 				if (!keep || !reusable(old.socket)) {
 					close(old.socket);
-					cache.delete(sessionId);
+					if (cache.get(sessionId) === old) cache.delete(sessionId);
 				} else {
 					old.busy = false;
-					expire(sessionId, old);
+					if (cache.get(sessionId) === old) expire(sessionId, old);
+					else close(old.socket, "connection_identity_changed");
 				}
 			},
 		};
 	}
 	if (old && !old.busy) {
 		close(old.socket);
-		cache.delete(sessionId);
+		if (cache.get(sessionId) === old) cache.delete(sessionId);
 	}
-	const socket = await connect(url, headers, signal);
-	if (old?.busy)
+	// The pre-cache claim remains live while this new socket connects.
+	let socket: Socket;
+	try {
+		socket = await connect(url, headers, signal);
+	} catch (error) {
+		if (claims.get(sessionId) === claim) claims.delete(sessionId);
+		throw error;
+	}
+	// A newer claim owns the slot even while it is still connecting. This socket is ephemeral.
+	if (claims.get(sessionId) !== claim)
 		return {
 			socket,
 			entry: undefined as Entry | undefined,
 			reused: false,
 			release: (_keep: boolean) => close(socket),
 		};
-	const entry: Entry = { socket, busy: true };
+	const occupant = cache.get(sessionId);
+	if (occupant && !occupant.busy) {
+		if (occupant.timer) clearTimeout(occupant.timer);
+		close(occupant.socket, occupant.identity === identity ? "connection_replaced" : "connection_identity_changed");
+		if (cache.get(sessionId) === occupant) cache.delete(sessionId);
+	} else if (occupant && occupant.identity !== identity) {
+		close(occupant.socket, "connection_identity_changed");
+	}
+	// A same-identity busy occupant can finish; entry-reference guards prevent its stale release/timer touching us.
+	const entry: Entry = { socket, busy: true, identity };
 	cache.set(sessionId, entry);
+	claims.delete(sessionId);
 	return {
 		socket,
 		entry,
@@ -210,7 +273,8 @@ async function acquire(url: string, headers: Headers, sessionId: string | undefi
 				if (cache.get(sessionId) === entry) cache.delete(sessionId);
 			} else {
 				entry.busy = false;
-				expire(sessionId, entry);
+				if (cache.get(sessionId) === entry) expire(sessionId, entry);
+				else close(socket, "connection_identity_changed");
 			}
 		},
 	};
@@ -223,7 +287,7 @@ async function decode(data: unknown): Promise<string | undefined> {
 	if (data && typeof data === "object" && "arrayBuffer" in data)
 		return new TextDecoder().decode(await (data as { arrayBuffer(): Promise<ArrayBuffer> }).arrayBuffer());
 }
-async function* events(socket: Socket, signal?: AbortSignal): AsyncGenerator<ResponseStreamEvent> {
+async function* events(socket: Socket, signal?: AbortSignal, send?: () => void): AsyncGenerator<ResponseStreamEvent> {
 	const queue: ResponseStreamEvent[] = [];
 	let wake: (() => void) | undefined;
 	let done = false;
@@ -241,7 +305,7 @@ async function* events(socket: Socket, signal?: AbortSignal): AsyncGenerator<Res
 				if (!text) return;
 				const parsed = JSON.parse(text) as ResponseStreamEvent;
 				queue.push(parsed);
-				if (parsed.type === "response.completed" || parsed.type === "response.failed") {
+				if (parsed.type === "response.completed" || parsed.type === "response.failed" || parsed.type === "error") {
 					completed = true;
 					done = true;
 				}
@@ -264,7 +328,7 @@ async function* events(socket: Socket, signal?: AbortSignal): AsyncGenerator<Res
 		notify();
 	};
 	const onAbort = () => {
-		failure = new Error("Request was aborted");
+		failure = createAbortError();
 		done = true;
 		notify();
 	};
@@ -272,7 +336,13 @@ async function* events(socket: Socket, signal?: AbortSignal): AsyncGenerator<Res
 	socket.addEventListener("error", onError);
 	socket.addEventListener("close", onClose);
 	signal?.addEventListener("abort", onAbort);
+	if (signal?.aborted) {
+		failure = createAbortError();
+		done = true;
+	}
 	try {
+		// Register collection listeners before sending; some runtimes can answer synchronously.
+		if (!failure) send?.();
 		while (true) {
 			if (queue.length) {
 				yield queue.shift()!;
@@ -319,6 +389,49 @@ function cachedBody(entry: Entry, body: RequestBody): RequestBody | undefined {
 	return { ...body, previous_response_id: continuation.responseId, input: current.slice(baseline.length) };
 }
 
+export async function collectOpenAIResponsesWebSocketEvents(args: {
+	url: string;
+	headers: Headers;
+	body: RequestBody;
+	sessionId?: string;
+	signal?: AbortSignal;
+	onOpen?(): void | Promise<void>;
+	onFirstEvent?(): void;
+	onEvent(event: ResponseStreamEvent): void | Promise<void>;
+}): Promise<void> {
+	const acquired = await acquire(args.url, args.headers, args.sessionId, args.signal);
+	let keep = true;
+	try {
+		// A V2 trigger is a full replacement request, never a generation continuation.
+		if (acquired.entry) acquired.entry.continuation = undefined;
+		await args.onOpen?.();
+		if (args.signal?.aborted) {
+			keep = false;
+			throw createAbortError();
+		}
+		// Remote compaction V2 must always send the complete request, never a cached delta.
+		let first = true;
+		for await (const event of events(acquired.socket, args.signal, () =>
+			acquired.socket.send(JSON.stringify({ type: "response.create", ...args.body })),
+		)) {
+			if (first) {
+				first = false;
+				args.onFirstEvent?.();
+			}
+			await args.onEvent(event);
+		}
+		if (args.signal?.aborted) {
+			keep = false;
+			throw createAbortError();
+		}
+	} catch (error) {
+		keep = false;
+		throw error;
+	} finally {
+		acquired.release(keep);
+	}
+}
+
 export function resolveOpenAIResponsesWebSocketUrl(baseUrl?: string): string {
 	const url = new URL((baseUrl?.trim() || "https://api.openai.com/v1").replace(/\/+$/, ""));
 	if (!url.pathname.endsWith("/responses")) url.pathname = `${url.pathname.replace(/\/$/, "")}/responses`;
@@ -345,10 +458,15 @@ export async function processOpenAIResponsesWebSocket<TApi extends Api>(args: {
 	const request = delta ?? args.body;
 	try {
 		await args.onOpen?.();
-		acquired.socket.send(JSON.stringify({ type: "response.create", ...request }));
+		if (args.signal?.aborted) {
+			keep = false;
+			throw createAbortError();
+		}
 		let first = true;
 		const marked = (async function* () {
-			for await (const event of events(acquired.socket, args.signal)) {
+			for await (const event of events(acquired.socket, args.signal, () =>
+				acquired.socket.send(JSON.stringify({ type: "response.create", ...request })),
+			)) {
 				if (first) {
 					first = false;
 					args.onFirstEvent();
@@ -357,8 +475,10 @@ export async function processOpenAIResponsesWebSocket<TApi extends Api>(args: {
 			}
 		})();
 		await processResponsesStream(marked, args.output, args.stream, args.model, args.streamOptions);
-		if (args.signal?.aborted) keep = false;
-		else if (args.cached && acquired.entry && args.output.responseId)
+		if (args.signal?.aborted) {
+			keep = false;
+			throw createAbortError();
+		} else if (args.cached && acquired.entry && args.output.responseId)
 			acquired.entry.continuation = {
 				body: args.body,
 				responseId: args.output.responseId,

@@ -43,6 +43,7 @@ import {
 	clampThinkingLevel,
 	cleanupSessionResources,
 	getResponsesCompactFallbackReason,
+	getResponsesRemoteCompactionV2FallbackReason,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	modelsAreEqual,
@@ -112,6 +113,7 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	compactRemote,
+	compactRemoteV2,
 	estimateContextTokens,
 	generateBranchSummary,
 	prepareCompaction,
@@ -120,6 +122,7 @@ import {
 	remoteCompactionCompatibilityError,
 	shouldCompact,
 	shouldUseRemoteCompaction,
+	shouldUseRemoteCompactionV2,
 } from "./compaction/index.js";
 import {
 	type ContextTreeNode,
@@ -7233,6 +7236,44 @@ export class AgentSession {
 				mechanism: "extension",
 				remoteCompaction: undefined,
 			};
+		} else if (shouldUseRemoteCompactionV2(model, compactionMode)) {
+			try {
+				const remotePreparation =
+					preparation.previousRemoteCompaction &&
+					!canReplayRemoteCompaction(preparation.previousRemoteCompaction, model)
+						? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+						: preparation;
+				if (!remotePreparation)
+					throw new CompactionSkippedError("Session is too short to rebuild for remote compaction");
+				compactionResult = await compactRemoteV2(
+					remotePreparation,
+					model as Model<"openai-responses">,
+					apiKey,
+					this.systemPrompt,
+					headers,
+					customInstructions,
+					signal,
+					this.sessionManager.getSessionId(),
+				);
+			} catch (error) {
+				const fallbackReason = getResponsesRemoteCompactionV2FallbackReason(error);
+				if (!fallbackReason) throw error;
+				const localPreparation = preparation.previousRemoteCompaction
+					? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+					: preparation;
+				if (!localPreparation)
+					throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
+				compactionResult = await compact(
+					localPreparation,
+					model,
+					apiKey,
+					headers,
+					customInstructions,
+					signal,
+					this.thinkingLevel,
+				);
+				compactionResult.fallback = { from: "remote", reason: fallbackReason };
+			}
 		} else if (shouldUseRemoteCompaction(model, compactionMode)) {
 			try {
 				const remotePreparation =
