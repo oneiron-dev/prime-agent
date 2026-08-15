@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added opt-in session-affinity headers for Anthropic Messages-compatible providers with prompt caching.
+
 - Added an opt-in `supportsResponsesRemoteCompactionV2` capability for streaming Codex Remote Compaction V2; unary `/responses/compact` behavior remains unchanged.
 
 - Fixed OpenAI Responses streams to classify nested provider error frames without exposing credential-like values.

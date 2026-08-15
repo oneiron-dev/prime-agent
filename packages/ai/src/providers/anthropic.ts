@@ -178,6 +178,21 @@ function getAnthropicCompat(model: Model<"anthropic-messages">): Required<Anthro
 	return {
 		supportsEagerToolInputStreaming: model.compat?.supportsEagerToolInputStreaming ?? true,
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
+		sendSessionAffinityHeaders: model.compat?.sendSessionAffinityHeaders ?? false,
+	};
+}
+
+function getSessionAffinityHeaders(
+	model: Model<"anthropic-messages">,
+	options: AnthropicOptions | undefined,
+	cacheRetention: CacheRetention,
+): Record<string, string> | undefined {
+	if (!options?.sessionId || cacheRetention === "none" || !getAnthropicCompat(model).sendSessionAffinityHeaders) {
+		return undefined;
+	}
+	return {
+		"x-client-request-id": options.sessionId,
+		"x-session-affinity": options.sessionId,
 	};
 }
 
@@ -482,6 +497,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 		};
 
 		try {
+			const { retention, cacheControl } = getCacheControl(model, options?.cacheRetention);
+			const sessionAffinityHeaders = getSessionAffinityHeaders(model, options, retention);
 			let client: Anthropic;
 			let isOAuth: boolean;
 
@@ -507,11 +524,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					shouldUseFineGrainedToolStreamingBeta(model, context),
 					options?.headers,
 					copilotDynamicHeaders,
+					sessionAffinityHeaders,
 				);
 				client = created.client;
 				isOAuth = created.isOAuthToken;
 			}
-			const { cacheControl } = getCacheControl(model, options?.cacheRetention);
 			const usesAnthropicCachePricing = hasStandardAnthropicCachePricing(model);
 			let cacheWriteCost =
 				cacheControl && usesAnthropicCachePricing
@@ -853,6 +870,7 @@ function createClient(
 	useFineGrainedToolStreamingBeta: boolean,
 	optionsHeaders?: Record<string, string>,
 	dynamicHeaders?: Record<string, string>,
+	sessionAffinityHeaders?: Record<string, string>,
 ): { client: Anthropic; isOAuthToken: boolean } {
 	// Adaptive thinking models (Opus 4.6, Sonnet 4.6) have interleaved thinking built-in.
 	// The beta header is deprecated on Opus 4.6 and redundant on Sonnet 4.6, so skip it.
@@ -881,6 +899,7 @@ function createClient(
 					...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
 				},
 				model.headers,
+				sessionAffinityHeaders,
 				optionsHeaders,
 			),
 		});
@@ -903,6 +922,7 @@ function createClient(
 				},
 				model.headers,
 				dynamicHeaders,
+				sessionAffinityHeaders,
 				optionsHeaders,
 			),
 		});
@@ -926,6 +946,7 @@ function createClient(
 					"x-app": "cli",
 				},
 				model.headers,
+				sessionAffinityHeaders,
 				optionsHeaders,
 			),
 		});
@@ -945,6 +966,7 @@ function createClient(
 				...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
 			},
 			model.headers,
+			sessionAffinityHeaders,
 			optionsHeaders,
 		),
 	});
