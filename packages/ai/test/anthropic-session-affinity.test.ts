@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { describe, expect, it } from "vitest";
+import Anthropic from "@anthropic-ai/sdk";
+import { describe, expect, it, vi } from "vitest";
 import { streamAnthropic } from "../src/providers/anthropic.js";
 import type { Context, Model } from "../src/types.js";
 
@@ -45,6 +46,7 @@ function writeEmptySseResponse(response: ServerResponse): void {
 async function captureAnthropicRequest(
 	compat: Model<"anthropic-messages">["compat"],
 	options: Parameters<typeof streamAnthropic>[2],
+	createClient?: (baseUrl: string) => Anthropic,
 ): Promise<CapturedRequest> {
 	let capturedRequest: CapturedRequest | undefined;
 	const server = createServer(async (request, response) => {
@@ -56,9 +58,11 @@ async function captureAnthropicRequest(
 	const address = server.address() as AddressInfo;
 
 	try {
-		const requestStream = streamAnthropic(createModel(`http://127.0.0.1:${address.port}`, compat), context, {
+		const baseUrl = `http://127.0.0.1:${address.port}`;
+		const requestStream = streamAnthropic(createModel(baseUrl, compat), context, {
 			apiKey: "test-key",
 			...options,
+			...(createClient ? { client: createClient(baseUrl) } : {}),
 		});
 		for await (const event of requestStream) {
 			if (event.type === "done" || event.type === "error") break;
@@ -74,10 +78,13 @@ async function captureAnthropicRequest(
 }
 
 describe("Anthropic session-affinity headers", () => {
-	it("sends affinity headers for opted-in cached sessions without request metadata", async () => {
-		const request = await captureAnthropicRequest({ sendSessionAffinityHeaders: true }, { sessionId: "session-123" });
-		expect(request.headers["x-client-request-id"]).toBe("session-123");
-		expect(request.headers["x-session-affinity"]).toBe("session-123");
+	it("sends stable opaque affinity headers for opted-in cached sessions without request metadata", async () => {
+		const sessionId = "session-123";
+		const request = await captureAnthropicRequest({ sendSessionAffinityHeaders: true }, { sessionId });
+		const affinityKey = request.headers["x-client-request-id"];
+		expect(affinityKey).toMatch(/^[A-Za-z0-9_-]{43}$/);
+		expect(request.headers["x-session-affinity"]).toBe(affinityKey);
+		expect(affinityKey).not.toContain(sessionId);
 		expect(request.body.metadata).toBeUndefined();
 	});
 
@@ -99,15 +106,43 @@ describe("Anthropic session-affinity headers", () => {
 		}
 	});
 
-	it("lets explicit request headers override generated affinity headers", async () => {
+	it("lets case-insensitive explicit request headers override generated affinity headers", async () => {
 		const request = await captureAnthropicRequest(
 			{ sendSessionAffinityHeaders: true },
 			{
 				sessionId: "session-123",
-				headers: { "x-client-request-id": "explicit-request", "x-session-affinity": "explicit-affinity" },
+				headers: { "X-Client-Request-Id": "explicit-request", "X-Session-Affinity": "explicit-affinity" },
 			},
 		);
 		expect(request.headers["x-client-request-id"]).toBe("explicit-request");
 		expect(request.headers["x-session-affinity"]).toBe("explicit-affinity");
+	});
+
+	it("applies generated and explicit affinity headers to supplied clients", async () => {
+		const request = await captureAnthropicRequest(
+			{ sendSessionAffinityHeaders: true },
+			{
+				sessionId: "session-123",
+				headers: { "X-Client-Request-Id": "explicit-request", "X-Session-Affinity": "explicit-affinity" },
+			},
+			(baseUrl) => new Anthropic({ apiKey: "test-key", baseURL: baseUrl, dangerouslyAllowBrowser: true }),
+		);
+		expect(request.headers["x-client-request-id"]).toBe("explicit-request");
+		expect(request.headers["x-session-affinity"]).toBe("explicit-affinity");
+	});
+
+	it("does not expose the raw session ID when ANTHROPIC_LOG is debug", async () => {
+		const sessionId = "SESSION-SHOULD-NOT-APPEAR-IN-LOG";
+		const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+		const previousLogLevel = process.env.ANTHROPIC_LOG;
+		process.env.ANTHROPIC_LOG = "debug";
+		try {
+			await captureAnthropicRequest({ sendSessionAffinityHeaders: true }, { sessionId });
+			expect(JSON.stringify(debug.mock.calls)).not.toContain(sessionId);
+		} finally {
+			if (previousLogLevel === undefined) delete process.env.ANTHROPIC_LOG;
+			else process.env.ANTHROPIC_LOG = previousLogLevel;
+			debug.mockRestore();
+		}
 	});
 });

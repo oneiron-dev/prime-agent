@@ -513,6 +513,24 @@ describe("ModelRegistry", () => {
 			expect(compat?.supportsEagerToolInputStreaming).toBe(false);
 		});
 
+		test("provider-level Anthropic session affinity compatibility survives cloning custom models", () => {
+			writeRawModelsJson({
+				demo: {
+					baseUrl: "https://example.com",
+					apiKey: "DEMO_KEY",
+					api: "anthropic-messages",
+					compat: { sendSessionAffinityHeaders: true },
+					models: [{ id: "demo-model" }],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const compat = registry.find("demo", "demo-model")?.compat as AnthropicMessagesCompat | undefined;
+
+			expect(registry.getError()).toBeUndefined();
+			expect(compat?.sendSessionAffinityHeaders).toBe(true);
+		});
+
 		test("compat schema accepts long cache retention flag", () => {
 			writeRawModelsJson({
 				demo: {

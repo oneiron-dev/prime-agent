@@ -182,17 +182,29 @@ function getAnthropicCompat(model: Model<"anthropic-messages">): Required<Anthro
 	};
 }
 
-function getSessionAffinityHeaders(
+function base64urlEncode(bytes: Uint8Array): string {
+	let binary = "";
+	for (const byte of bytes) {
+		binary += String.fromCharCode(byte);
+	}
+	return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+async function getSessionAffinityHeaders(
 	model: Model<"anthropic-messages">,
 	options: AnthropicOptions | undefined,
 	cacheRetention: CacheRetention,
-): Record<string, string> | undefined {
+): Promise<Record<string, string> | undefined> {
 	if (!options?.sessionId || cacheRetention === "none" || !getAnthropicCompat(model).sendSessionAffinityHeaders) {
 		return undefined;
 	}
+
+	// Hashing keeps a session sticky without placing its identifier on the wire or in SDK debug logs.
+	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(options.sessionId));
+	const affinityKey = base64urlEncode(new Uint8Array(digest));
 	return {
-		"x-client-request-id": options.sessionId,
-		"x-session-affinity": options.sessionId,
+		"x-client-request-id": affinityKey,
+		"x-session-affinity": affinityKey,
 	};
 }
 
@@ -498,7 +510,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 
 		try {
 			const { retention, cacheControl } = getCacheControl(model, options?.cacheRetention);
-			const sessionAffinityHeaders = getSessionAffinityHeaders(model, options, retention);
+			const sessionAffinityHeaders = await getSessionAffinityHeaders(model, options, retention);
 			let client: Anthropic;
 			let isOAuth: boolean;
 
@@ -543,6 +555,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
+				// Supplied clients skip createClient, so apply the same per-request override ordering here.
+				...(options?.client ? { headers: mergeHeaders(sessionAffinityHeaders, options.headers) } : {}),
 			};
 			const response = await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
