@@ -548,6 +548,71 @@ describe("Large session fixture", () => {
 	});
 });
 
+describe("synthetic state retention", () => {
+	it("does not retain an oversized IPython state notice when cutting at the next user boundary", () => {
+		const entries = [
+			{
+				type: "message",
+				id: "old",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: createUserMessage("old request"),
+			},
+			{
+				type: "custom_message",
+				id: "state",
+				parentId: "old",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				customType: "ipython_state",
+				content: "x".repeat(300_000),
+				display: false,
+			},
+			{
+				type: "message",
+				id: "recent",
+				parentId: "state",
+				timestamp: "2026-01-01T00:00:02.000Z",
+				message: createUserMessage("recent request"),
+			},
+		] as SessionEntry[];
+		const cut = findCutPoint(entries, 0, entries.length, 1_000);
+		expect(cut.firstKeptEntryIndex).toBe(2);
+		const preparation = prepareCompaction(entries, { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 1_000 });
+		expect(preparation?.messagesToSummarize.some((message) => message.role === "custom")).toBe(false);
+		expect(preparation?.firstKeptEntryId).toBe("recent");
+	});
+
+	it("excludes the exact worker recovery custom type", () => {
+		const entries = [
+			{
+				type: "message",
+				id: "old",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: createUserMessage("old"),
+			},
+			{
+				type: "custom_message",
+				id: "recovery",
+				parentId: "old",
+				timestamp: "2026-01-01T00:00:01.000Z",
+				customType: "prime-agent.worker_recovery",
+				content: "recovery details",
+				display: false,
+			},
+			{
+				type: "message",
+				id: "recent",
+				parentId: "recovery",
+				timestamp: "2026-01-01T00:00:02.000Z",
+				message: createUserMessage("recent"),
+			},
+		] as SessionEntry[];
+		const preparation = prepareCompaction(entries, { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 1 });
+		expect(preparation?.messagesToSummarize.some((message) => message.role === "custom")).toBe(false);
+	});
+});
+
 // ============================================================================
 // LLM integration tests (skipped without API key)
 // ============================================================================
@@ -604,38 +669,4 @@ describe.skipIf(!process.env.ANTHROPIC_OAUTH_TOKEN)("LLM summarization", () => {
 		console.log("Original messages:", loaded.messages.length);
 		console.log("After compaction:", reloaded.messages.length);
 	}, 60000);
-	describe("synthetic state retention", () => {
-		it("does not retain an oversized IPython state notice when cutting at the next user boundary", () => {
-			const entries = [
-				{
-					type: "message",
-					id: "old",
-					parentId: null,
-					timestamp: "2026-01-01T00:00:00.000Z",
-					message: createUserMessage("old request"),
-				},
-				{
-					type: "custom_message",
-					id: "state",
-					parentId: "old",
-					timestamp: "2026-01-01T00:00:01.000Z",
-					customType: "ipython_state",
-					content: "x".repeat(300_000),
-					display: false,
-				},
-				{
-					type: "message",
-					id: "recent",
-					parentId: "state",
-					timestamp: "2026-01-01T00:00:02.000Z",
-					message: createUserMessage("recent request"),
-				},
-			] as SessionEntry[];
-			const cut = findCutPoint(entries, 0, entries.length, 1);
-			expect(cut.firstKeptEntryIndex).toBe(2);
-			const preparation = prepareCompaction(entries, { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 1 });
-			expect(preparation?.messagesToSummarize.some((message) => message.role === "custom")).toBe(false);
-			expect(preparation?.firstKeptEntryId).toBe("recent");
-		});
-	});
 });

@@ -497,7 +497,7 @@ export function findCutPoint(
 	while (cutIndex > startIndex) {
 		const prevEntry = entries[cutIndex - 1];
 		// Stop at session header or compaction boundaries
-		if (prevEntry.type === "compaction") {
+		if (prevEntry.type === "compaction" || isSyntheticCompactionEntry(prevEntry)) {
 			break;
 		}
 		if (prevEntry.type === "message") {
@@ -628,8 +628,15 @@ function summaryRequestByteLimit(model: Model<any>, reserveTokens: number, maxTo
 
 function elideSummaryForRequest(summary: string, limit: number): string {
 	if (Buffer.byteLength(summary, "utf8") <= limit) return summary;
-	const kept = Math.max(256, Math.floor(limit / 2));
-	return `${summary.slice(0, kept)}\n[... prior summary elided for request safety ...]\n${summary.slice(-kept)}`;
+	const marker = "\n[... prior summary elided for request safety ...]\n";
+	let keptChars = Math.max(1, Math.floor((limit - Buffer.byteLength(marker, "utf8")) / 8));
+	let result = "";
+	// JS slices are character based; reduce until the final UTF-8 request is exact-safe.
+	do {
+		result = `${summary.slice(0, keptChars)}${marker}${summary.slice(-keptChars)}`;
+		keptChars--;
+	} while (Buffer.byteLength(result, "utf8") > limit && keptChars > 0);
+	return result;
 }
 
 /** Generate a summary with byte-bounded, rolling partwise compaction. */
