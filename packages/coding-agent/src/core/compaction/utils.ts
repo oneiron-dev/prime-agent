@@ -2,6 +2,7 @@
  * Shared utilities for compaction and branch summarization.
  */
 
+import { createHash } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 
@@ -176,7 +177,37 @@ export function splitConversationForSummary(messages: Message[], maxBytes: numbe
 		} else chunk = candidate;
 	}
 	if (chunk) chunks.push(chunk);
-	return chunks;
+	return capSummaryChunks(chunks);
+}
+
+/** Hard ceiling on summarization requests per compaction, bounding cost and latency. */
+export const MAX_SUMMARY_CHUNKS = 32;
+const HEAD_SUMMARY_CHUNKS = 2;
+
+/**
+ * Deterministic, explicitly lossy emergency fallback: a history that would need more
+ * than MAX_SUMMARY_CHUNKS requests keeps its opening and its most recent chunks, and
+ * replaces the middle with a verifiable integrity marker.
+ */
+function capSummaryChunks(chunks: string[]): string[] {
+	if (chunks.length <= MAX_SUMMARY_CHUNKS) return chunks;
+	const tailCount = MAX_SUMMARY_CHUNKS - HEAD_SUMMARY_CHUNKS - 1;
+	const omitted = chunks.slice(HEAD_SUMMARY_CHUNKS, chunks.length - tailCount);
+	const hash = createHash("sha256");
+	let omittedBytes = 0;
+	for (const omittedChunk of omitted) {
+		hash.update(omittedChunk, "utf8");
+		omittedBytes += Buffer.byteLength(omittedChunk, "utf8");
+	}
+	const marker = [
+		"[Compaction integrity marker]",
+		`Omitted middle chunks: ${omitted.length}`,
+		`Omitted UTF-8 bytes: ${omittedBytes}`,
+		`SHA-256 of omitted chunks: ${hash.digest("hex")}`,
+		"This middle history was not summarized because the session exceeded the maximum",
+		`of ${MAX_SUMMARY_CHUNKS} summarization requests. Treat it as permanently lost detail.`,
+	].join("\n");
+	return [...chunks.slice(0, HEAD_SUMMARY_CHUNKS), marker, ...chunks.slice(chunks.length - tailCount)];
 }
 
 // ============================================================================

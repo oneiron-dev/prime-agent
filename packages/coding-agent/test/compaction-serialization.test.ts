@@ -1,6 +1,10 @@
 import type { Message } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { serializeConversation, splitConversationForSummary } from "../src/core/compaction/utils.js";
+import {
+	MAX_SUMMARY_CHUNKS,
+	serializeConversation,
+	splitConversationForSummary,
+} from "../src/core/compaction/utils.js";
 
 describe("serializeConversation", () => {
 	it("should truncate long tool results", () => {
@@ -126,5 +130,20 @@ describe("serializeConversation", () => {
 		expect(huge).toHaveLength(1);
 		expect(huge[0]).not.toBe("");
 		expect(Buffer.byteLength(huge[0]!, "utf8")).toBeLessThanOrEqual(64 * 1024);
+	});
+	it("caps summarization requests with a deterministic integrity marker", () => {
+		const messages: Message[] = Array.from({ length: 200 }, (_unused, index) => ({
+			role: "user" as const,
+			content: `message-${index}-${"a".repeat(900)}`,
+			timestamp: index,
+		}));
+		const chunks = splitConversationForSummary(messages, 1_000);
+		expect(chunks.length).toBe(MAX_SUMMARY_CHUNKS);
+		expect(chunks[0]).toContain("message-0-");
+		expect(chunks[chunks.length - 1]).toContain("message-199-");
+		const marker = chunks[2]!;
+		expect(marker).toContain("Omitted middle chunks: 169");
+		expect(marker).toMatch(/SHA-256 of omitted chunks: [0-9a-f]{64}/);
+		expect(splitConversationForSummary(messages, 1_000)).toEqual(chunks);
 	});
 });
