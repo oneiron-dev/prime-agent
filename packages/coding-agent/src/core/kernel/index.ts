@@ -8,6 +8,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
+import { killProcessTree } from "../../utils/shell.js";
 import { ensureKernelPython, type KernelBootstrapProgressHandler, type KernelPythonSkill } from "./bootstrap.js";
 import { ForkServerUnavailable, forkKernel, isForkServerEnabled } from "./fork-server.js";
 import {
@@ -39,6 +40,11 @@ const SNAPSHOT_MAX_OUTPUT_CHARS = 1_000_000;
 // on-disk copy is the fallback if this is exceeded.
 const SNAPSHOT_DISPOSE_TIMEOUT_MS = 5000;
 const KERNEL_ABORT_GRACE_MS = 1000;
+export const INTERNAL_LIST_TIMEOUT_MS = 5000;
+export const INTERNAL_SNAPSHOT_TIMEOUT_MS = 60_000;
+export const INTERNAL_RESTORE_TIMEOUT_MS = 120_000;
+export const INTERNAL_BOOTSTRAP_TIMEOUT_MS = 120_000;
+export const DEFAULT_IPYTHON_CELL_TIMEOUT_MS = 30 * 60 * 1000;
 const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
@@ -104,6 +110,8 @@ export interface ExecuteOptions {
 	maxOutputChars?: number;
 	/** Synthetic host cell (snapshot/restore/list); excluded from lastCellCode attribution. */
 	internal?: boolean;
+	/** Hard deadline for a user cell. Internal cells use their own bounded paths. */
+	timeoutMs?: number;
 }
 
 /** MIME tag the `edit` skill emits diff payloads under, via `display_data`. */
@@ -164,7 +172,9 @@ export interface ExecuteResult {
 	attachments?: KernelAttachment[];
 	/** Agent messages sent from this cell, in order. */
 	sentAgentMessages?: KernelSentAgentMessage[];
-	status: "ok" | "error" | "aborted";
+	status: "ok" | "error" | "aborted" | "timed_out";
+	/** The kernel had to be killed because it ignored the hard deadline. */
+	kernelReplaced?: boolean;
 	error?: { ename: string; evalue: string; traceback: string[] };
 	durationMs: number;
 }
@@ -647,6 +657,7 @@ export class KernelManager {
 			const kernel = spawn(python, ["-m", "ipykernel_launcher", "-f", connection.path], {
 				cwd: this.options.cwd,
 				env: this.options.env ? { ...process.env, ...this.options.env } : process.env,
+				detached: process.platform !== "win32",
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			this.kernel = kernel;
@@ -889,6 +900,18 @@ export class KernelManager {
 			reject: result.reject,
 		};
 		let abortTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
+		let deadlineTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
+		let deadlineGraceTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
+		const clearDeadlineTimer = () => {
+			if (deadlineTimer) {
+				globalThis.clearTimeout(deadlineTimer);
+				deadlineTimer = undefined;
+			}
+			if (deadlineGraceTimer) {
+				globalThis.clearTimeout(deadlineGraceTimer);
+				deadlineGraceTimer = undefined;
+			}
+		};
 		const clearAbortTimer = () => {
 			if (abortTimer) {
 				globalThis.clearTimeout(abortTimer);
@@ -902,6 +925,19 @@ export class KernelManager {
 			execution.status = "aborted";
 			this.resolveExecution(execution, { clearActive: false });
 		};
+		const onDeadline = () => {
+			if (this.activeExecution !== execution) return;
+			void this.interrupt().catch(() => undefined);
+			execution.status = "timed_out";
+			deadlineGraceTimer = globalThis.setTimeout(() => {
+				if (this.activeExecution !== execution) return;
+				// Mark shutdown before settling so queued work cannot reuse a wedged kernel.
+				this.state = "shutdown";
+				this.resolveExecution(execution, { clearActive: true, kernelReplaced: true });
+				void this.kill();
+			}, KERNEL_ABORT_GRACE_MS);
+			deadlineGraceTimer.unref?.();
+		};
 		const onAbort = () => {
 			void this.interrupt().catch(() => undefined);
 			clearAbortTimer();
@@ -913,6 +949,10 @@ export class KernelManager {
 
 		try {
 			this.activeExecution = execution;
+			if (opts.timeoutMs !== undefined && opts.timeoutMs > 0) {
+				deadlineTimer = globalThis.setTimeout(onDeadline, opts.timeoutMs);
+				deadlineTimer.unref?.();
+			}
 			opts.signal?.addEventListener("abort", onAbort, { once: true });
 			if (opts.signal?.aborted) {
 				onAbort();
@@ -936,6 +976,7 @@ export class KernelManager {
 			return await result.promise;
 		} finally {
 			clearAbortTimer();
+			clearDeadlineTimer();
 			opts.signal?.removeEventListener("abort", onAbort);
 		}
 	}
@@ -1033,7 +1074,7 @@ export class KernelManager {
 		} else if (t === "error") {
 			const c = incoming.content as { ename: string; evalue: string; traceback: string[] };
 			execution.error = c;
-			execution.status = "error";
+			if (execution.status !== "timed_out") execution.status = "error";
 		} else if (t === "status") {
 			const c = incoming.content as { execution_state: string };
 			if (c.execution_state === "idle") {
@@ -1049,7 +1090,10 @@ export class KernelManager {
 		this.resolveExecution(execution, { clearActive: true });
 	}
 
-	private resolveExecution(execution: ActiveExecution, options: { clearActive: boolean }): void {
+	private resolveExecution(
+		execution: ActiveExecution,
+		options: { clearActive: boolean; kernelReplaced?: boolean },
+	): void {
 		const didClearActive = options.clearActive && this.activeExecution === execution;
 		if (options.clearActive && this.activeExecution === execution) {
 			this.activeExecution = undefined;
@@ -1070,7 +1114,7 @@ export class KernelManager {
 				result = `${result.slice(0, execution.maxChars)}\n[... output truncated at ${execution.maxChars} chars ...]`;
 			}
 
-			if (execution.opts.signal?.aborted) status = "aborted";
+			if (execution.opts.signal?.aborted && status !== "timed_out") status = "aborted";
 
 			execution.resolve({
 				stdout,
@@ -1082,6 +1126,7 @@ export class KernelManager {
 				error: execution.error,
 				status,
 				durationMs: Date.now() - execution.started,
+				kernelReplaced: options.kernelReplaced,
 			});
 		}
 		if (didClearActive) {
@@ -1302,7 +1347,11 @@ export class KernelManager {
 		this.iopubPumpPromise = undefined;
 		try {
 			if (this.kernel) {
-				this.kernel.kill(killSignal);
+				if (this.kernel.pid) {
+					killProcessTree(this.kernel.pid);
+				} else {
+					this.kernel.kill(killSignal);
+				}
 			} else if (this.kernelPid !== undefined && !this.forkedKernelDied()) {
 				// Only signal a forked kernel confirmed still alive: a dead pid may have
 				// been recycled by the OS, and a kill would then hit an unrelated process.
@@ -1407,7 +1456,11 @@ export class KernelManager {
 		if (!cfg || !this.isRunning) return null;
 		const code = buildSnapshotCode(cfg.path, cfg.manifestPath, cfg.maxBytes ?? DEFAULT_SNAPSHOT_MAX_BYTES);
 		try {
-			const r = await this.enqueueExecute(code, { maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS, internal: true });
+			const r = await this.enqueueExecute(code, {
+				maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS,
+				internal: true,
+				timeoutMs: INTERNAL_SNAPSHOT_TIMEOUT_MS,
+			});
 			if (r.status !== "ok") {
 				this.appendKernelDiagnostic(`state snapshot failed: ${r.error?.evalue ?? r.stderr}`);
 				return null;
@@ -1429,7 +1482,11 @@ export class KernelManager {
 		if (!cfg) return null;
 		const code = buildRestoreCode(cfg.path);
 		try {
-			const r = await this.enqueueExecute(code, { maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS, internal: true });
+			const r = await this.enqueueExecute(code, {
+				maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS,
+				internal: true,
+				timeoutMs: INTERNAL_RESTORE_TIMEOUT_MS,
+			});
 			if (r.status !== "ok") {
 				this.appendKernelDiagnostic(`state restore failed: ${r.error?.evalue ?? r.stderr}`);
 				return null;
@@ -1448,6 +1505,7 @@ export class KernelManager {
 			const r = await this.enqueueExecute(buildListNamesCode(), {
 				maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS,
 				internal: true,
+				timeoutMs: INTERNAL_LIST_TIMEOUT_MS,
 				signal,
 			});
 			if (r.status !== "ok") {

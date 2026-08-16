@@ -8,8 +8,10 @@ import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 import { withKernelBootPermit } from "../kernel/boot-gate.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
 import {
+	DEFAULT_IPYTHON_CELL_TIMEOUT_MS,
 	type ExecuteResult,
 	type HostRequestHandlers,
+	INTERNAL_BOOTSTRAP_TIMEOUT_MS,
 	type KernelAttachment,
 	KernelBusyAfterInterruptError,
 	type KernelDiffDisplay,
@@ -247,7 +249,7 @@ export type IpythonToolInput = Static<typeof ipythonSchema>;
 
 export interface IpythonToolDetails {
 	durationMs?: number;
-	status?: "ok" | "error" | "aborted" | "starting";
+	status?: "ok" | "error" | "aborted" | "timed_out" | "starting";
 	errorEname?: string;
 	stdout?: string;
 	stderr?: string;
@@ -275,6 +277,8 @@ export interface IpythonToolOptions {
 	commandPrefix?: string;
 	/** Optional explicit shell path for bare %%bash cells. */
 	shellPath?: string;
+	/** Owner-configured hard ceiling for agent user cells. Defaults to 30 minutes. */
+	commandTimeoutSeconds?: number;
 	sessionId?: string;
 	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
 	hostHandlers?: HostRequestHandlers;
@@ -361,6 +365,11 @@ export class IpythonKernelProvisioner {
 	/** Whether a kernel has finished starting and is currently running. */
 	get hasRunningKernel(): boolean {
 		return this.startedManager?.isRunning ?? false;
+	}
+
+	get commandTimeoutMs(): number {
+		const seconds = this.options?.commandTimeoutSeconds;
+		return seconds && Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : DEFAULT_IPYTHON_CELL_TIMEOUT_MS;
 	}
 
 	/** Live user-defined names in the kernel namespace, or null if listing failed / no kernel. */
@@ -518,6 +527,8 @@ export class IpythonKernelProvisioner {
 				this.emitStartupProgress("Preparing IPython runtime...");
 				const bootstrap = await m.execute(buildRlmBootstrapCode(this.options?.pythonSkills), {
 					signal: startupSignal,
+					internal: true,
+					timeoutMs: INTERNAL_BOOTSTRAP_TIMEOUT_MS,
 				});
 				if (bootstrap.status !== "ok") {
 					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
@@ -578,16 +589,21 @@ async function executeWithBusyKernelChoice(
 	while (true) {
 		const m = await provisioner.ensure(reportStartupProgress, signal);
 		try {
-			return {
-				result: await m.execute(code, {
-					signal,
-					onStream,
-					onLateSentAgentMessage: onLateSentAgentMessage
-						? (message) => onLateSentAgentMessage(toolCallId, message)
-						: undefined,
-				}),
-				kernelRestarted,
-			};
+			const result = await m.execute(code, {
+				signal,
+				onStream,
+				timeoutMs: provisioner.commandTimeoutMs,
+				onLateSentAgentMessage: onLateSentAgentMessage
+					? (message) => onLateSentAgentMessage(toolCallId, message)
+					: undefined,
+			});
+			if (result.kernelReplaced) {
+				// The manager has already killed the wedged process; discard its sockets
+				// so the next cell provisions a clean kernel.
+				await provisioner.kill();
+				kernelRestarted = true;
+			}
+			return { result, kernelRestarted };
 		} catch (error) {
 			if (!(error instanceof KernelBusyAfterInterruptError) || signal?.aborted) {
 				throw error;
@@ -670,6 +686,10 @@ export function createIpythonToolDefinition(
 				if (r.status === "error" && r.error) {
 					text += (text ? "\n" : "") + r.error.traceback.join("\n");
 				}
+				if (r.status === "timed_out") {
+					const timeoutNotice = `IPython cell was killed after reaching the ${provisioner.commandTimeoutMs / 1000} second hard deadline. MUST NOT be retried unchanged; decompose or rewrite it into bounded phases that report progress.`;
+					text = text ? `${text}\n\n${timeoutNotice}` : timeoutNotice;
+				}
 				if (kernelRestarted) {
 					text = text ? `${KERNEL_RESTART_NOTICE}\n\n${text}` : KERNEL_RESTART_NOTICE;
 				}
@@ -692,7 +712,7 @@ export function createIpythonToolDefinition(
 						kernelRestarted,
 						error: r.error,
 					},
-					isError: r.status === "error" || r.status === "aborted",
+					isError: r.status === "error" || r.status === "aborted" || r.status === "timed_out",
 				};
 			} finally {
 				if (hasWorkingMessage) {

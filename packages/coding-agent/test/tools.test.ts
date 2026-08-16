@@ -261,6 +261,38 @@ describe("Coding Agent Tools", () => {
 			);
 		});
 
+		it("caps requested timeouts at the configured hard command deadline", async () => {
+			const operations: BashOperations = {
+				exec: async (_command, _cwd, { timeout }) => {
+					expect(timeout).toBe(2);
+					throw new Error("timeout:2");
+				},
+			};
+			const bash = createBashTool(testDir, { operations, commandTimeoutSeconds: 2 });
+			await expect(bash.execute("deadline", { command: "slow", timeout: 90 })).rejects.toThrow(
+				/Command timed out after 2 seconds and was killed by the hard deadline[\s\S]*MUST NOT be retried unchanged/,
+			);
+		});
+
+		it("rejects zero and negative requested timeouts", async () => {
+			for (const timeout of [0, -1]) {
+				await expect(bashTool.execute("invalid-timeout", { command: "echo no", timeout })).rejects.toThrow(
+					"timeout must be a positive number of seconds",
+				);
+			}
+		});
+
+		it("uses the hard command deadline when the model omits timeout", async () => {
+			const operations: BashOperations = {
+				exec: async (_command, _cwd, { timeout }) => {
+					expect(timeout).toBe(2);
+					return { exitCode: 0 };
+				},
+			};
+			const bash = createBashTool(testDir, { operations, commandTimeoutSeconds: 2 });
+			await bash.execute("deadline-default", { command: "fast" });
+		});
+
 		it("should include full output path for truncated timeout and abort errors", async () => {
 			for (const testCase of [
 				{ error: "timeout:5", expected: "Command timed out after 5 seconds" },

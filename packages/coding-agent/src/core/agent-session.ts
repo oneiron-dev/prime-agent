@@ -8670,6 +8670,7 @@ export class AgentSession {
 					provisioner: this._ipythonKernelProvisioner,
 					commandPrefix: this.settingsManager.getShellCommandPrefix(),
 					shellPath: this.settingsManager.getShellPath(),
+					commandTimeoutSeconds: this.settingsManager.getCommandTimeoutSeconds(),
 					onLateSentAgentMessage: (toolCallId, message) =>
 						this._recordLateIpythonSentAgentMessage(toolCallId, message),
 				},

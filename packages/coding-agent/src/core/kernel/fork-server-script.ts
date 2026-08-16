@@ -51,6 +51,8 @@ def _import_template():
 
 
 def _run_child(connection_path, cwd, env):
+    # Give every forked kernel its own process group so host cleanup owns descendants.
+    os.setsid()
     # We are the forked child; become the ipykernel server on the given connection.
     from ipykernel.kernelapp import IPKernelApp
 
