@@ -936,6 +936,27 @@ export function remoteCompactionCompatibilityError(model: Model<any>, mode: Comp
 	return `Remote compaction is not declared supported for ${model.provider}/${model.id} (${model.api})`;
 }
 
+/** Opaque remote checkpoints preserve input verbatim; never replay bulky synthetic state. */
+export function hasOversizedSyntheticRemoteCheckpoint(state: RemoteCompactionState, maxBytes = 16 * 1024): boolean {
+	for (const item of state.items) {
+		const text = JSON.stringify(item);
+		if (Buffer.byteLength(text, "utf8") > maxBytes && /<ipython_state(?:_restored)?|<heartbeat/i.test(text))
+			return true;
+	}
+	return false;
+}
+
+/** A remote checkpoint that barely reduced a near-window context must migrate locally. */
+export function isIneffectiveRemoteCompaction(
+	tokensBefore: number,
+	postTokens: number,
+	contextWindow: number,
+): boolean {
+	if (tokensBefore <= 0 || contextWindow <= 0) return false;
+	const reduction = 1 - postTokens / tokensBefore;
+	return postTokens >= contextWindow * 0.8 && reduction < 0.15;
+}
+
 export function canReplayRemoteCompaction(state: RemoteCompactionState, model: Model<any>): boolean {
 	return (
 		isValidRemoteCompactionState(state) &&

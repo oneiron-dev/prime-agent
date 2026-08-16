@@ -114,6 +114,9 @@ import {
 	compactRemote,
 	estimateContextTokens,
 	generateBranchSummary,
+	getLastAssistantUsage,
+	hasOversizedSyntheticRemoteCheckpoint,
+	isIneffectiveRemoteCompaction,
 	prepareCompaction,
 	projectCompactionPreparationForExternalUse,
 	projectCompactionResultForExternalUse,
@@ -7165,34 +7168,23 @@ export class AgentSession {
 				remoteCompaction: undefined,
 			};
 		} else if (shouldUseRemoteCompaction(model, compactionMode)) {
-			try {
-				const remotePreparation =
-					preparation.previousRemoteCompaction &&
-					!canReplayRemoteCompaction(preparation.previousRemoteCompaction, model)
-						? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
-						: preparation;
-				if (!remotePreparation) {
-					throw new CompactionSkippedError("Session is too short to rebuild for remote compaction");
-				}
-				compactionResult = await compactRemote(
-					remotePreparation,
-					model as Model<"openai-responses">,
-					apiKey,
-					this.systemPrompt,
-					headers,
-					customInstructions,
-					signal,
-					this.sessionManager.getSessionId(),
-				);
-			} catch (error) {
-				const fallbackReason = getResponsesCompactFallbackReason(error);
-				if (!fallbackReason) throw error;
-				const localPreparation = preparation.previousRemoteCompaction
-					? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
-					: preparation;
-				if (!localPreparation) {
-					throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
-				}
+			const priorRemote = preparation.previousRemoteCompaction;
+			const latestUsage = getLastAssistantUsage(pathEntries);
+			const forceLocal =
+				priorRemote &&
+				(hasOversizedSyntheticRemoteCheckpoint(priorRemote) ||
+					(latestUsage !== undefined &&
+						isIneffectiveRemoteCompaction(
+							preparation.tokensBefore,
+							calculateContextTokens(latestUsage),
+							model.contextWindow,
+						)));
+			if (forceLocal) {
+				const localPreparation = prepareCompaction(pathEntries, settings, { restartFromRoot: true });
+				if (!localPreparation)
+					throw new CompactionSkippedError(
+						"Session is too short to migrate ineffective remote compaction locally",
+					);
 				compactionResult = await compact(
 					localPreparation,
 					model,
@@ -7202,8 +7194,50 @@ export class AgentSession {
 					signal,
 					this.thinkingLevel,
 				);
-				compactionResult.fallback = { from: "remote", reason: fallbackReason };
-			}
+				compactionResult.fallback = {
+					from: "remote",
+					reason: "Remote checkpoint was ineffective or preserved oversized synthetic state",
+				};
+			} else
+				try {
+					const remotePreparation =
+						preparation.previousRemoteCompaction &&
+						!canReplayRemoteCompaction(preparation.previousRemoteCompaction, model)
+							? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+							: preparation;
+					if (!remotePreparation) {
+						throw new CompactionSkippedError("Session is too short to rebuild for remote compaction");
+					}
+					compactionResult = await compactRemote(
+						remotePreparation,
+						model as Model<"openai-responses">,
+						apiKey,
+						this.systemPrompt,
+						headers,
+						customInstructions,
+						signal,
+						this.sessionManager.getSessionId(),
+					);
+				} catch (error) {
+					const fallbackReason = getResponsesCompactFallbackReason(error);
+					if (!fallbackReason) throw error;
+					const localPreparation = preparation.previousRemoteCompaction
+						? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+						: preparation;
+					if (!localPreparation) {
+						throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
+					}
+					compactionResult = await compact(
+						localPreparation,
+						model,
+						apiKey,
+						headers,
+						customInstructions,
+						signal,
+						this.thinkingLevel,
+					);
+					compactionResult.fallback = { from: "remote", reason: fallbackReason };
+				}
 		} else {
 			const localPreparation = preparation.previousRemoteCompaction
 				? prepareCompaction(pathEntries, settings, { restartFromRoot: true })

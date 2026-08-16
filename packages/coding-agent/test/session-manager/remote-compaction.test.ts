@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import { convertResponsesMessages } from "../../../ai/src/providers/openai-responses-shared.js";
 import {
 	canReplayRemoteCompaction,
+	hasOversizedSyntheticRemoteCheckpoint,
+	isIneffectiveRemoteCompaction,
 	prepareCompaction,
 	shouldUseRemoteCompaction,
 } from "../../src/core/compaction/compaction.js";
@@ -369,5 +371,20 @@ describe("remote compaction session replay", () => {
 		expect(shouldUseRemoteCompaction({ ...base, api: "openai-completions" }, "remote")).toBe(false);
 		expect(canReplayRemoteCompaction(remoteState, { ...base, id: "gpt-other" })).toBe(false);
 		expect(canReplayRemoteCompaction(remoteState, { ...base, provider: "other-provider" })).toBe(false);
+	});
+	it("rejects synthetic oversized remote checkpoints and ineffective near-window shrink", () => {
+		const state = {
+			...remoteState,
+			items: [
+				{
+					type: "message",
+					role: "user",
+					content: [{ type: "input_text", text: `<ipython_state>${"x".repeat(230_000)}</ipython_state>` }],
+				},
+			],
+		} as RemoteCompactionState;
+		expect(hasOversizedSyntheticRemoteCheckpoint(state)).toBe(true);
+		expect(isIneffectiveRemoteCompaction(370_512, 341_945, 400_000)).toBe(true);
+		expect(isIneffectiveRemoteCompaction(370_512, 180_000, 400_000)).toBe(false);
 	});
 });
