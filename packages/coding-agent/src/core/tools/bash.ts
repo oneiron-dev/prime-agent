@@ -23,8 +23,19 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult
 
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	timeout: Type.Optional(
+		Type.Number({ description: "Timeout in seconds (optional; cannot exceed the hard command deadline)" }),
+	),
 });
+
+export const DEFAULT_COMMAND_TIMEOUT_SECONDS = 30 * 60;
+
+function effectiveCommandTimeout(requestedSeconds: number | undefined, configuredSeconds: number): number {
+	if (requestedSeconds !== undefined && (!Number.isFinite(requestedSeconds) || requestedSeconds <= 0)) {
+		throw new Error("timeout must be a positive number of seconds");
+	}
+	return requestedSeconds === undefined ? configuredSeconds : Math.min(requestedSeconds, configuredSeconds);
+}
 
 export type BashToolInput = Static<typeof bashSchema>;
 
@@ -149,6 +160,8 @@ export interface BashToolOptions {
 	shellPath?: string;
 	/** Hook to adjust command, cwd, or env before execution */
 	spawnHook?: BashSpawnHook;
+	/** Owner-configured hard ceiling for each command. Defaults to 30 minutes. */
+	commandTimeoutSeconds?: number;
 }
 
 const BASH_PREVIEW_LINES = 5;
@@ -280,6 +293,10 @@ export function createBashToolDefinition(
 	const ops = options?.operations ?? createLocalBashOperations({ shellPath: options?.shellPath });
 	const commandPrefix = options?.commandPrefix;
 	const spawnHook = options?.spawnHook;
+	const configuredTimeout = options?.commandTimeoutSeconds ?? DEFAULT_COMMAND_TIMEOUT_SECONDS;
+	if (!Number.isFinite(configuredTimeout) || configuredTimeout <= 0) {
+		throw new Error("commandTimeoutSeconds must be a positive number");
+	}
 	const definition: ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> = {
 		name: "bash",
 		label: "bash",
@@ -293,6 +310,7 @@ export function createBashToolDefinition(
 			onUpdate?,
 			_ctx?,
 		) {
+			const effectiveTimeout = effectiveCommandTimeout(timeout, configuredTimeout);
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
 			const output = new OutputAccumulator({ tempFilePrefix: "pi-bash" });
@@ -382,7 +400,7 @@ export function createBashToolDefinition(
 					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
 						onData: handleData,
 						signal,
-						timeout,
+						timeout: effectiveTimeout,
 						env: spawnContext.env,
 					});
 					exitCode = result.exitCode;
@@ -394,7 +412,12 @@ export function createBashToolDefinition(
 					}
 					if (err instanceof Error && err.message.startsWith("timeout:")) {
 						const timeoutSecs = err.message.split(":")[1];
-						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
+						throw new Error(
+							appendStatus(
+								text,
+								`Command timed out after ${timeoutSecs} seconds and was killed by the hard deadline (configured ${configuredTimeout}s; effective ${effectiveTimeout}s). MUST NOT be retried unchanged; decompose or rewrite it into bounded phases that report progress.`,
+							),
+						);
 					}
 					throw err;
 				}

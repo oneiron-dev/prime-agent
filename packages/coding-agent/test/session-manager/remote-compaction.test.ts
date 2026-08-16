@@ -3,7 +3,11 @@ import { describe, expect, it } from "vitest";
 import { convertResponsesMessages } from "../../../ai/src/providers/openai-responses-shared.js";
 import {
 	canReplayRemoteCompaction,
+	hasOversizedSyntheticRemoteCheckpoint,
+	isIneffectiveRemoteCompaction,
 	prepareCompaction,
+	sampleRemotePostCheckpointUsage,
+	shouldMigrateRemoteCheckpoint,
 	shouldUseRemoteCompaction,
 } from "../../src/core/compaction/compaction.js";
 import { convertToLlm } from "../../src/core/messages.js";
@@ -369,5 +373,96 @@ describe("remote compaction session replay", () => {
 		expect(shouldUseRemoteCompaction({ ...base, api: "openai-completions" }, "remote")).toBe(false);
 		expect(canReplayRemoteCompaction(remoteState, { ...base, id: "gpt-other" })).toBe(false);
 		expect(canReplayRemoteCompaction(remoteState, { ...base, provider: "other-provider" })).toBe(false);
+	});
+	it("rejects synthetic oversized remote checkpoints and ineffective near-window shrink", () => {
+		const state = {
+			...remoteState,
+			items: [
+				{
+					type: "message",
+					role: "user",
+					content: [{ type: "input_text", text: `<ipython_state>${"x".repeat(230_000)}</ipython_state>` }],
+				},
+			],
+		} as RemoteCompactionState;
+		expect(hasOversizedSyntheticRemoteCheckpoint(state)).toBe(true);
+		expect(isIneffectiveRemoteCompaction(370_512, 341_945, 400_000)).toBe(true);
+		expect(isIneffectiveRemoteCompaction(370_512, 180_000, 400_000)).toBe(false);
+		expect(shouldMigrateRemoteCheckpoint(remoteState, 370_512, 341_945, 400_000)).toBe(true);
+		expect(shouldMigrateRemoteCheckpoint(remoteState, 370_512, 180_000, 400_000)).toBe(false);
+	});
+	it("selects post-checkpoint evidence that actually proves checkpoint size", () => {
+		const contextWindow = 400_000;
+		function assistant(overrides: Partial<AssistantMessage>): AssistantMessage {
+			return {
+				role: "assistant",
+				content: [],
+				api: "openai-responses",
+				provider: "cpa-r",
+				model: "gpt-test",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 1,
+				...overrides,
+			} as AssistantMessage;
+		}
+		const zeroUsageError = assistant({
+			stopReason: "error",
+			errorMessage: "WebSocket closed before response.completed",
+		});
+		const incidentUsage = assistant({
+			usage: {
+				input: 334_265,
+				output: 0,
+				cacheRead: 7_680,
+				cacheWrite: 0,
+				totalTokens: 341_945,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		});
+
+		// A zero-usage generic error proves nothing; the next real usage row decides.
+		const skipped = sampleRemotePostCheckpointUsage([zeroUsageError, incidentUsage], contextWindow);
+		expect(skipped).toEqual({ overflow: false, postTokens: 341_945 });
+		expect(shouldMigrateRemoteCheckpoint(remoteState, 370_512, skipped.postTokens, contextWindow)).toBe(true);
+
+		// An explicit context overflow is decisive even with zero usage.
+		const overflow = sampleRemotePostCheckpointUsage(
+			[assistant({ stopReason: "error", errorMessage: "400 invalid_request_error: context_too_large" })],
+			contextWindow,
+		);
+		expect(overflow.overflow).toBe(true);
+		expect(overflow.postTokens).toBeUndefined();
+
+		// A healthy checkpoint that halved the context stays on the remote path.
+		const healthy = sampleRemotePostCheckpointUsage(
+			[
+				zeroUsageError,
+				assistant({
+					usage: {
+						input: 180_000,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 180_000,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+				}),
+			],
+			contextWindow,
+		);
+		expect(healthy).toEqual({ overflow: false, postTokens: 180_000 });
+		expect(shouldMigrateRemoteCheckpoint(remoteState, 370_512, healthy.postTokens, contextWindow)).toBe(false);
+
+		// No post-checkpoint evidence at all leaves the remote path untouched.
+		expect(sampleRemotePostCheckpointUsage([], contextWindow)).toEqual({ overflow: false });
+		expect(sampleRemotePostCheckpointUsage([zeroUsageError], contextWindow)).toEqual({ overflow: false });
 	});
 });

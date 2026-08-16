@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AGENT_MESSAGE_DISPLAY_MIME, KernelManager, type KernelSentAgentMessage } from "../src/core/kernel/index.js";
+import {
+	AGENT_MESSAGE_DISPLAY_MIME,
+	isSameLinuxProcessIdentity,
+	KernelManager,
+	type KernelSentAgentMessage,
+	readLinuxProcessStartTime,
+	signalKernelProcessTree,
+} from "../src/core/kernel/index.js";
 
 async function waitForCalls(mock: { mock: { calls: unknown[][] } }, count: number): Promise<void> {
 	for (let i = 0; i < 20; i++) {
@@ -10,6 +17,25 @@ async function waitForCalls(mock: { mock: { calls: unknown[][] } }, count: numbe
 	}
 	expect(mock.mock.calls.length).toBeGreaterThanOrEqual(count);
 }
+
+describe("kernel process-tree signaling", () => {
+	it("rejects a recycled Linux PID whose starttime differs", () => {
+		if (process.platform !== "linux") return;
+		const startTime = readLinuxProcessStartTime(process.pid);
+		expect(startTime).toBeDefined();
+		expect(isSameLinuxProcessIdentity(process.pid, `${startTime}x`)).toBe(false);
+	});
+
+	it("signals the owned process group with the requested graceful signal", () => {
+		const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+		try {
+			signalKernelProcessTree(4321, "SIGTERM");
+			expect(kill).toHaveBeenCalledWith(-4321, "SIGTERM");
+		} finally {
+			kill.mockRestore();
+		}
+	});
+});
 
 describe("KernelManager abort handling", () => {
 	afterEach(() => {
@@ -247,6 +273,61 @@ describe("KernelManager abort handling", () => {
 		await vi.advanceTimersByTimeAsync(1000);
 
 		await expect(executePromise).resolves.toMatchObject({ status: "aborted" });
+		expect(controlSend).toHaveBeenCalled();
+	});
+
+	it("preserves timed_out when the interrupt produces KeyboardInterrupt before idle", async () => {
+		vi.useFakeTimers();
+		const manager = new KernelManager({ cwd: process.cwd() });
+		const shellSend = vi.fn(async (_frames: Buffer[]) => {});
+		const controlSend = vi.fn(async (_frames: Buffer[]) => {});
+		Object.assign(
+			manager as unknown as {
+				state: "running";
+				connection: object;
+				shell: object;
+				control: object;
+				start: () => Promise<void>;
+			},
+			{
+				state: "running",
+				connection: {
+					ip: "127.0.0.1",
+					transport: "tcp",
+					shell_port: 1,
+					iopub_port: 2,
+					stdin_port: 3,
+					control_port: 4,
+					hb_port: 5,
+					signature_scheme: "hmac-sha256",
+					key: "test-key",
+					kernel_name: "python3",
+				},
+				shell: { send: shellSend, close: vi.fn() },
+				control: { send: controlSend, close: vi.fn() },
+				start: async () => {},
+			},
+		);
+		const pending = manager.execute("while True: pass", { timeoutMs: 10 });
+		await waitForCalls(shellSend, 1);
+		await vi.advanceTimersByTimeAsync(10);
+		const internals = manager as unknown as {
+			activeExecution: { requestMsgId: string };
+			handleExecutionMessage: (incoming: object) => void;
+		};
+		internals.handleExecutionMessage({
+			header: { msg_type: "error" },
+			parent_header: { msg_id: internals.activeExecution.requestMsgId },
+			metadata: {},
+			content: { ename: "KeyboardInterrupt", evalue: "", traceback: [] },
+		});
+		internals.handleExecutionMessage({
+			header: { msg_type: "status" },
+			parent_header: { msg_id: internals.activeExecution.requestMsgId },
+			metadata: {},
+			content: { execution_state: "idle" },
+		});
+		await expect(pending).resolves.toMatchObject({ status: "timed_out" });
 		expect(controlSend).toHaveBeenCalled();
 	});
 

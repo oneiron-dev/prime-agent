@@ -261,6 +261,38 @@ describe("Coding Agent Tools", () => {
 			);
 		});
 
+		it("caps requested timeouts at the configured hard command deadline", async () => {
+			const operations: BashOperations = {
+				exec: async (_command, _cwd, { timeout }) => {
+					expect(timeout).toBe(2);
+					throw new Error("timeout:2");
+				},
+			};
+			const bash = createBashTool(testDir, { operations, commandTimeoutSeconds: 2 });
+			await expect(bash.execute("deadline", { command: "slow", timeout: 90 })).rejects.toThrow(
+				/Command timed out after 2 seconds and was killed by the hard deadline[\s\S]*MUST NOT be retried unchanged/,
+			);
+		});
+
+		it("rejects zero and negative requested timeouts", async () => {
+			for (const timeout of [0, -1]) {
+				await expect(bashTool.execute("invalid-timeout", { command: "echo no", timeout })).rejects.toThrow(
+					"timeout must be a positive number of seconds",
+				);
+			}
+		});
+
+		it("uses the hard command deadline when the model omits timeout", async () => {
+			const operations: BashOperations = {
+				exec: async (_command, _cwd, { timeout }) => {
+					expect(timeout).toBe(2);
+					return { exitCode: 0 };
+				},
+			};
+			const bash = createBashTool(testDir, { operations, commandTimeoutSeconds: 2 });
+			await bash.execute("deadline-default", { command: "fast" });
+		});
+
 		it("should include full output path for truncated timeout and abort errors", async () => {
 			for (const testCase of [
 				{ error: "timeout:5", expected: "Command timed out after 5 seconds" },
@@ -415,6 +447,36 @@ describe("Coding Agent Tools", () => {
 
 			expect(result.exitCode).toBe(0);
 			expect(Buffer.concat(chunks).toString("utf-8").trim()).toBe("from-local-ops");
+		});
+
+		it("forwards the configured hard ceiling to bash operations", async () => {
+			let seenTimeout: number | undefined;
+			const operations: BashOperations = {
+				exec: async (_command, _cwd, { timeout }) => {
+					seenTimeout = timeout;
+					return { exitCode: 0 };
+				},
+			};
+
+			await executeBashWithOperations("echo hi", testDir, operations, { timeout: 3 });
+
+			expect(seenTimeout).toBe(3);
+		});
+
+		it("returns an actionable timed-out result and kills the process tree", async () => {
+			const marker = join(testDir, "user-bash-descendant.txt");
+			const command = `sh -c 'sleep 30; echo orphan > ${marker}' & sleep 30`;
+
+			const result = await executeBashWithOperations(command, testDir, createLocalBashOperations(), { timeout: 1 });
+
+			expect(result.timedOut).toBe(true);
+			expect(result.cancelled).toBe(false);
+			expect(result.exitCode).toBeUndefined();
+			expect(result.output).toContain("Command timed out after 1 seconds");
+			expect(result.output).toContain("MUST NOT be retried unchanged");
+
+			await new Promise((resolve) => setTimeout(resolve, 1500));
+			expect(existsSync(marker)).toBe(false);
 		});
 
 		it("should preserve executeBash sanitization when using local bash operations", async () => {

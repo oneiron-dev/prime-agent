@@ -3941,7 +3941,7 @@ export class DaemonSupervisor {
 						worker,
 						activeSessionId,
 						new Error(`Snapshot ${begin.snapshotId} restarted before completion`),
-						true,
+						false,
 						begin.snapshotId,
 					);
 					return;
@@ -3963,7 +3963,7 @@ export class DaemonSupervisor {
 						worker,
 						activeSessionId,
 						new Error(`Snapshot ${begin.snapshotId} did not match the cached transfer`),
-						true,
+						false,
 						begin.snapshotId,
 					);
 					return;
@@ -4039,7 +4039,7 @@ export class DaemonSupervisor {
 					worker,
 					activeSessionId,
 					error instanceof Error ? error : new Error(String(error)),
-					true,
+					false,
 				);
 			}
 			return;
@@ -4078,7 +4078,7 @@ export class DaemonSupervisor {
 						worker,
 						activeSessionId,
 						error instanceof Error ? error : new Error(String(error)),
-						true,
+						false,
 						generation.transcript.snapshotId,
 					);
 				}
@@ -4135,7 +4135,7 @@ export class DaemonSupervisor {
 					worker,
 					activeSessionId,
 					error instanceof Error ? error : new Error(String(error)),
-					true,
+					false,
 					transcript.snapshotId,
 				);
 				return;

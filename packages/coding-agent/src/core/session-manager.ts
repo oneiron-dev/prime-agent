@@ -25,7 +25,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "fs";
-import { readdir, readFile, stat } from "fs/promises";
+import { open, readdir, readFile, stat } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
@@ -1155,10 +1155,24 @@ function extractOversizedMessageSummary(line: string): {
 	};
 }
 
+interface SessionInfoScanState {
+	header: SessionHeader;
+	messageCount: number;
+	firstMessage: string;
+	allMessagesText: string;
+	name: string | undefined;
+	state: SessionState | undefined;
+	agentStatus: AgentStatus | undefined;
+	lastActivityTime: number | undefined;
+}
+
 interface SessionInfoCacheEntry {
 	size: number;
 	mtimeMs: number;
+	ino: number;
+	fingerprint?: string;
 	info: SessionInfo | null;
+	state?: SessionInfoScanState;
 }
 
 const SESSION_INFO_SCAN_FAILED = Symbol("session-info-scan-failed");
@@ -1168,6 +1182,63 @@ const SESSION_INFO_SCAN_FAILED = Symbol("session-info-scan-failed");
 const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
 const sessionInfoReadsInFlight = new Map<string, Promise<SessionInfo | null>>();
 
+async function sessionPrefixFingerprint(filePath: string, size: number): Promise<string | undefined> {
+	if (size === 0) return "";
+	try {
+		const handle = await open(filePath, "r");
+		try {
+			const width = Math.min(4096, size);
+			const first = Buffer.alloc(width);
+			const last = Buffer.alloc(width);
+			if ((await handle.read(first, 0, width, 0)).bytesRead !== width) return undefined;
+			if ((await handle.read(last, 0, width, size - width)).bytesRead !== width) return undefined;
+			return `${first.toString("base64")}:${last.toString("base64")}`;
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+async function lastCompleteJsonlOffset(filePath: string, size: number): Promise<number | undefined> {
+	if (size === 0) return 0;
+	try {
+		const handle = await open(filePath, "r");
+		try {
+			let lastNewline = -1;
+			for (let end = size; end > 0; ) {
+				const width = Math.min(64 * 1024, end);
+				const start = end - width;
+				const chunk = Buffer.alloc(width);
+				if ((await handle.read(chunk, 0, width, start)).bytesRead !== width) return undefined;
+				const newline = chunk.lastIndexOf(0x0a);
+				if (newline !== -1) {
+					lastNewline = start + newline;
+					break;
+				}
+				end = start;
+			}
+			if (lastNewline === size - 1) return size;
+			const trailingLength = size - lastNewline - 1;
+			if (trailingLength > SESSION_LIST_PARSE_MAX_LINE_CHARS) return lastNewline + 1;
+			const trailing = Buffer.alloc(trailingLength);
+			if ((await handle.read(trailing, 0, trailingLength, lastNewline + 1)).bytesRead !== trailingLength)
+				return undefined;
+			try {
+				JSON.parse(trailing.toString("utf8"));
+				return size;
+			} catch {
+				return lastNewline + 1;
+			}
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return undefined;
+	}
+}
+
 async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null> {
 	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
@@ -1176,17 +1247,40 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 		return null;
 	}
 	const cached = sessionInfoCache.get(filePath);
-	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
-		return cached.info;
-	}
-	const result = await scanSessionInfo(filePath, stats);
-	if (result === SESSION_INFO_SCAN_FAILED) {
+	const completeSize = await lastCompleteJsonlOffset(filePath, Number(stats.size));
+	if (completeSize === undefined) return null;
+	if (cached && cached.size === completeSize && cached.mtimeMs === stats.mtimeMs) return cached.info;
+
+	// JSONL session logs append. Reuse metadata from the completed prefix; a rewrite,
+	// truncate, inode change, or incomplete prior suffix falls back to a full scan.
+	const canAppend =
+		cached?.state &&
+		cached.ino === stats.ino &&
+		completeSize > cached.size &&
+		cached.fingerprint !== undefined &&
+		cached.fingerprint === (await sessionPrefixFingerprint(filePath, cached.size));
+	const result = await scanSessionInfo(
+		filePath,
+		stats,
+		canAppend ? cached.state : undefined,
+		canAppend ? cached.size : 0,
+		completeSize,
+	);
+	if (result === SESSION_INFO_SCAN_FAILED) return null;
+	if (result === null) {
+		sessionInfoCache.set(filePath, { size: completeSize, mtimeMs: stats.mtimeMs, ino: stats.ino, info: null });
 		return null;
 	}
-	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info: result });
-	return result;
+	sessionInfoCache.set(filePath, {
+		size: completeSize,
+		mtimeMs: stats.mtimeMs,
+		ino: stats.ino,
+		fingerprint: await sessionPrefixFingerprint(filePath, completeSize),
+		info: result.info,
+		state: result.state,
+	});
+	return result.info;
 }
-
 export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
 	const inFlight = sessionInfoReadsInFlight.get(filePath);
 	if (inFlight) {
@@ -1207,18 +1301,21 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 async function scanSessionInfo(
 	filePath: string,
 	stats: Awaited<ReturnType<typeof stat>>,
-): Promise<SessionInfo | null | typeof SESSION_INFO_SCAN_FAILED> {
+	seed?: SessionInfoScanState,
+	start = 0,
+	end = Number(stats.size),
+): Promise<{ info: SessionInfo; state: SessionInfoScanState } | null | typeof SESSION_INFO_SCAN_FAILED> {
 	try {
-		let header: SessionHeader | undefined;
-		let messageCount = 0;
-		let firstMessage = "";
-		let allMessagesText = "";
-		let name: string | undefined;
-		let state: SessionState | undefined;
-		let agentStatus: AgentStatus | undefined;
-		let lastActivityTime: number | undefined;
+		let header: SessionHeader | undefined = seed?.header;
+		let messageCount = seed?.messageCount ?? 0;
+		let firstMessage = seed?.firstMessage ?? "";
+		let allMessagesText = seed?.allMessagesText ?? "";
+		let name: string | undefined = seed?.name;
+		let state: SessionState | undefined = seed?.state;
+		let agentStatus: AgentStatus | undefined = seed?.agentStatus;
+		let lastActivityTime: number | undefined = seed?.lastActivityTime;
 
-		for await (const lineBuffer of readLinesAsBuffers(filePath)) {
+		for await (const lineBuffer of readLinesAsBuffers(filePath, start, end - 1)) {
 			const line = lineBuffer.toString("utf8");
 			if (!line.trim()) continue;
 
@@ -1297,20 +1394,33 @@ async function scanSessionInfo(
 		const rlmDepth = resolveSessionRlmDepth(header, filePath);
 		const modified = getSessionModifiedDateFromLastActivity(lastActivityTime, header, stats.mtime);
 
-		return {
-			path: filePath,
-			id: header.id,
-			cwd,
+		const scanState: SessionInfoScanState = {
+			header,
+			messageCount,
+			firstMessage,
+			allMessagesText,
 			name,
 			state,
-			parentSessionPath,
-			rlmDepth,
-			created: new Date(header.timestamp),
-			modified,
-			messageCount,
-			firstMessage: firstMessage || "(no messages)",
-			allMessagesText,
 			agentStatus,
+			lastActivityTime,
+		};
+		return {
+			info: {
+				path: filePath,
+				id: header.id,
+				cwd,
+				name,
+				state,
+				parentSessionPath,
+				rlmDepth,
+				created: new Date(header.timestamp),
+				modified,
+				messageCount,
+				firstMessage: firstMessage || "(no messages)",
+				allMessagesText,
+				agentStatus,
+			},
+			state: scanState,
 		};
 	} catch {
 		return SESSION_INFO_SCAN_FAILED;

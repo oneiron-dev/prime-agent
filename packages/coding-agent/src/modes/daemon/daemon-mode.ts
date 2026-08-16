@@ -240,6 +240,15 @@ const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
+
+/** A transfer id is immutable: a new materialization must never reuse its predecessor's bytes. */
+export function createSnapshotTransferId(
+	activeSessionId: string,
+	eventGeneration: string,
+	lastEventSequence: number,
+): string {
+	return `${activeSessionId}-${eventGeneration}-${lastEventSequence}-${randomUUID()}`;
+}
 const CHILD_PASSIVATION_BATCH_SIZE = 32;
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
@@ -435,6 +444,8 @@ export function isTerminalRemoteAgentMessageError(error: unknown): error is Erro
 	);
 }
 
+const AGENT_FAMILY_ROSTER_TIMEOUT_MS = 5_000;
+
 export class AgentDaemon {
 	private server?: Server;
 	private shuttingDown = false;
@@ -459,6 +470,8 @@ export class AgentDaemon {
 	private readonly sessions = new Map<string, ActiveSessionState>();
 	private readonly sessionSnapshotLoads = new Map<ActiveSessionState, Promise<DaemonSessionSnapshot>>();
 	private readonly pendingPassiveRlmSubagentScans = new Map<boolean, Promise<PassiveRlmSubagent[]>>();
+	// A timed-out caller leaves this family scan running; later callers must join it.
+	private readonly agentFamilyRosterScans = new Map<string, Promise<AgentFamilyCatalogEntry[]>>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
 	/** Covers path resolution through publication in openingSessions, before the runtime promise exists. */
 	private readonly reservingSessionOpens = new Map<string, Promise<void>>();
@@ -1157,6 +1170,7 @@ export class AgentDaemon {
 	private async scanPassiveRlmSubagents(
 		savedRoots: SessionInfo[],
 		includeResident: boolean,
+		residentStates: Iterable<ActiveSessionState> = this.sessions.values(),
 	): Promise<PassiveRlmSubagent[]> {
 		const passive: PassiveRlmSubagent[] = [];
 		const visit = async (
@@ -1185,7 +1199,7 @@ export class AgentDaemon {
 			}
 		};
 		const residentRootPaths = new Set<string>();
-		for (const parentState of this.sessions.values()) {
+		for (const parentState of residentStates) {
 			const parentFile = parentState.runtime.session.sessionFile;
 			// An in-memory session cannot own a persisted registry.
 			if (!parentFile) continue;
@@ -3754,7 +3768,11 @@ export class AgentDaemon {
 					});
 				}
 				if (streamsSnapshot) {
-					const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+					const snapshotId = createSnapshotTransferId(
+						state.activeSessionId,
+						state.eventGeneration,
+						state.lastEventSequence,
+					);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
 						transcript = createSnapshotTranscriptChunks({
@@ -5148,10 +5166,30 @@ export class AgentDaemon {
 		};
 	}
 
-	private async createAgentFamilyCatalog(currentState?: ActiveSessionState): Promise<AgentFamilyCatalogEntry[]> {
+	private findResidentAgentFamilyRoot(current: ActiveSessionState): ActiveSessionState {
+		let root = current;
+		const seen = new Set<string>();
+		while (root.runtime.metadata.parentSessionId && !seen.has(root.activeSessionId)) {
+			seen.add(root.activeSessionId);
+			const parent = [...this.sessions.values()].find(
+				(state) => state.runtime.session.sessionId === root.runtime.metadata.parentSessionId,
+			);
+			if (!parent) break;
+			root = parent;
+		}
+		return root;
+	}
+
+	private async createAgentFamilyCatalog(
+		currentState?: ActiveSessionState,
+		includeSavedRoots = true,
+	): Promise<AgentFamilyCatalogEntry[]> {
 		const current =
 			currentState ?? [...this.sessions.values()].find((state) => !this.bindingSessions.has(state.activeSessionId));
-		const passiveRlmSubagents = await this.listPassiveRlmSubagents();
+		const familyRoot = current ? this.findResidentAgentFamilyRoot(current) : undefined;
+		const passiveRlmSubagents = familyRoot?.runtime.session.sessionManager
+			? await this.scanPassiveRlmSubagents([], true, [familyRoot])
+			: await this.listPassiveRlmSubagents();
 		const listed = current ? await this.createAgentMessageListResult(current, passiveRlmSubagents) : { agents: [] };
 		const remotePeers = new Set(this.remoteAgentPeers.values());
 		const localAgents = current
@@ -5160,21 +5198,25 @@ export class AgentDaemon {
 		const activePaths = new Set(
 			localAgents.flatMap((agent) => (agent.sessionPath ? [canonicalSessionPath(agent.sessionPath)] : [])),
 		);
-		const savedRoots = (await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir))
-			.filter(
-				(info) =>
-					(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&
-					!activePaths.has(canonicalSessionPath(info.path)),
-			)
-			.map(
-				(info): AgentFamilyCatalogEntry => ({
-					id: info.id,
-					...(info.name ? { name: info.name } : {}),
-					depth: info.rlmDepth ?? 0,
-					status: "inactive",
-					sessionPath: canonicalSessionPath(info.path),
-				}),
-			);
+		// A roster can only expose the caller's immediate family. Do not enumerate
+		// every saved root for it; the global catalog is retained for name safety.
+		const savedRoots = includeSavedRoots
+			? (await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir))
+					.filter(
+						(info) =>
+							(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&
+							!activePaths.has(canonicalSessionPath(info.path)),
+					)
+					.map(
+						(info): AgentFamilyCatalogEntry => ({
+							id: info.id,
+							...(info.name ? { name: info.name } : {}),
+							depth: info.rlmDepth ?? 0,
+							status: "inactive",
+							sessionPath: canonicalSessionPath(info.path),
+						}),
+					)
+			: [];
 		const byId = new Map<string, AgentFamilyCatalogEntry>(savedRoots.map((entry) => [entry.id, entry]));
 		const addAgent = (agent: AgentSessionMessageAgentSummary) => {
 			const depth = agent.rlmDepth ?? 0;
@@ -5211,11 +5253,48 @@ export class AgentDaemon {
 		return [...byId.values()];
 	}
 
+	private agentFamilyRosterKey(current: ActiveSessionState): string {
+		const root = this.findResidentAgentFamilyRoot(current);
+		return root.runtime.session.sessionFile
+			? canonicalSessionPath(root.runtime.session.sessionFile)
+			: root.runtime.session.sessionId;
+	}
+
+	private getAgentFamilyRosterCatalog(current: ActiveSessionState): Promise<AgentFamilyCatalogEntry[]> {
+		const key = this.agentFamilyRosterKey(current);
+		const pending = this.agentFamilyRosterScans.get(key);
+		if (pending) return pending;
+		let tracked!: Promise<AgentFamilyCatalogEntry[]>;
+		tracked = this.createAgentFamilyCatalog(current, false).finally(() => {
+			if (this.agentFamilyRosterScans.get(key) === tracked) this.agentFamilyRosterScans.delete(key);
+		});
+		this.agentFamilyRosterScans.set(key, tracked);
+		return tracked;
+	}
+
 	private async createAgentFamilyRoster(currentState: ActiveSessionState): Promise<AgentFamilyRosterResult> {
-		const catalog = await this.createAgentFamilyCatalog(currentState);
-		const current = catalog.find((entry) => entry.id === currentState.runtime.session.sessionId);
-		if (!current) throw new Error("Current agent is missing from the family catalog");
-		return buildAgentFamilyRoster(current, catalog);
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const catalog = await Promise.race([
+				this.getAgentFamilyRosterCatalog(currentState),
+				new Promise<never>((_, reject) => {
+					timeout = setTimeout(
+						() =>
+							reject(
+								new Error(
+									"Agent family roster is still refreshing. Do not retry the unchanged request; wait for it to finish.",
+								),
+							),
+						AGENT_FAMILY_ROSTER_TIMEOUT_MS,
+					);
+				}),
+			]);
+			const current = catalog.find((entry) => entry.id === currentState.runtime.session.sessionId);
+			if (!current) throw new Error("Current agent is missing from the family catalog");
+			return buildAgentFamilyRoster(current, catalog);
+		} finally {
+			if (timeout) clearTimeout(timeout);
+		}
 	}
 
 	private async assertFamilySessionNameAvailable(
@@ -6376,7 +6455,11 @@ export class AgentDaemon {
 		state: ActiveSessionState,
 		message: Extract<DaemonOutbound, { type: "session_replaced" }>,
 	): void {
-		const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+		const snapshotId = createSnapshotTransferId(
+			state.activeSessionId,
+			state.eventGeneration,
+			state.lastEventSequence,
+		);
 		// Mark before the registry read so later events queue behind this snapshot.
 		const snapshotSignal = markClientSnapshotStreaming(client, state.activeSessionId);
 		void this.prepareReplacementSnapshot(client, state, message, snapshotId, snapshotSignal).catch((error) => {
@@ -6574,7 +6657,11 @@ export class AgentDaemon {
 							),
 						});
 					}
-					const snapshotId = `${activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+					const snapshotId = createSnapshotTransferId(
+						activeSessionId,
+						state.eventGeneration,
+						state.lastEventSequence,
+					);
 					const snapshotSignal = markClientSnapshotStreaming(client, activeSessionId);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {

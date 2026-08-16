@@ -578,4 +578,25 @@ describe("SettingsManager", () => {
 			expect(manager.getTelemetryEnabled()).toBe(false);
 		});
 	});
+	describe("command timeout", () => {
+		it("uses the settings value before the environment override", () => {
+			const manager = SettingsManager.inMemory({ commandTimeoutSeconds: 17 });
+			expect(manager.getCommandTimeoutSeconds()).toBe(17);
+		});
+
+		it("ignores invalid owner timeout settings", () => {
+			expect(SettingsManager.inMemory({ commandTimeoutSeconds: 0 }).getCommandTimeoutSeconds()).toBeUndefined();
+		});
+
+		it("reads a positive owner environment override", () => {
+			const previous = process.env.PRIME_AGENT_COMMAND_TIMEOUT_SECONDS;
+			process.env.PRIME_AGENT_COMMAND_TIMEOUT_SECONDS = "19";
+			try {
+				expect(SettingsManager.inMemory().getCommandTimeoutSeconds()).toBe(19);
+			} finally {
+				if (previous === undefined) delete process.env.PRIME_AGENT_COMMAND_TIMEOUT_SECONDS;
+				else process.env.PRIME_AGENT_COMMAND_TIMEOUT_SECONDS = previous;
+			}
+		});
+	});
 });

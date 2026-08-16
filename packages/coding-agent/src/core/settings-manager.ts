@@ -144,6 +144,7 @@ export interface Settings {
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
+	commandTimeoutSeconds?: number; // Hard ceiling for agent bash commands and IPython user cells
 	quietStartup?: boolean;
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
 	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
@@ -962,6 +963,15 @@ export class SettingsManager {
 
 	getShellPath(): string | undefined {
 		return this.settings.shellPath;
+	}
+
+	getCommandTimeoutSeconds(): number | undefined {
+		const configured = this.settings.commandTimeoutSeconds;
+		if (configured !== undefined) {
+			return Number.isFinite(configured) && configured > 0 ? configured : undefined;
+		}
+		const fromEnv = Number(process.env.PRIME_AGENT_COMMAND_TIMEOUT_SECONDS);
+		return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : undefined;
 	}
 
 	setShellPath(path: string | undefined): void {

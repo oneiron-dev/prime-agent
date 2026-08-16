@@ -12,6 +12,7 @@ import {
 	compactOpenAIResponsesV2,
 	completeSimple,
 	createOpenAIResponsesCompactionMessage,
+	isContextOverflow,
 } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
@@ -31,13 +32,16 @@ import {
 } from "../session-manager.js";
 import type { CompactionMode } from "../settings-manager.js";
 import {
+	appendCompactionIntegrityNotices,
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
+	isCompactionIntegrityMarker,
+	MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
 	SUMMARIZATION_SYSTEM_PROMPT,
-	serializeConversation,
+	splitConversationForSummary,
 } from "./utils.js";
 
 // ============================================================================
@@ -120,11 +124,20 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 	return undefined;
 }
 
+const SYNTHETIC_COMPACTION_TYPES = new Set([
+	"heartbeat_prompt",
+	"ipython_state",
+	"ipython_state_restored",
+	"prime-agent.worker_recovery",
+]);
+
 function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | undefined {
-	if (entry.type === "compaction") {
-		return undefined;
-	}
-	return getMessageFromEntry(entry);
+	if (entry.type === "compaction") return undefined;
+	// Synthetic runtime notices are transient state, not conversational history.
+	if (entry.type === "custom_message" && SYNTHETIC_COMPACTION_TYPES.has(entry.customType)) return undefined;
+	const message = getMessageFromEntry(entry);
+	if (message?.role === "custom" && SYNTHETIC_COMPACTION_TYPES.has(message.customType)) return undefined;
+	return message;
 }
 
 /** Result from compact() - SessionManager adds uuid/parentUuid when saving */
@@ -356,6 +369,15 @@ export function estimateTokens(message: AgentMessage): number {
  * and will be kept.
  * BashExecutionMessage is treated like a user message (user-initiated context).
  */
+function isSyntheticCompactionEntry(entry: SessionEntry): boolean {
+	return entry.type === "custom_message" && SYNTHETIC_COMPACTION_TYPES.has(entry.customType);
+}
+
+function estimateEntryTokens(entry: SessionEntry): number {
+	const message = getMessageFromEntry(entry);
+	return message ? estimateTokens(message) : 0;
+}
+
 function findValidCutPoints(entries: SessionEntry[], startIndex: number, endIndex: number): number[] {
 	const cutPoints: number[] = [];
 	for (let i = startIndex; i < endIndex; i++) {
@@ -390,7 +412,7 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 		}
 
 		// branch_summary and custom_message are user-role messages, valid cut points
-		if (entry.type === "branch_summary" || entry.type === "custom_message") {
+		if (entry.type === "branch_summary" || (entry.type === "custom_message" && !isSyntheticCompactionEntry(entry))) {
 			cutPoints.push(i);
 		}
 	}
@@ -462,11 +484,9 @@ export function findCutPoint(
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry.type !== "message") continue;
-
-		// Estimate this message's size
-		const messageTokens = estimateTokens(entry.message);
-		accumulatedTokens += messageTokens;
+		// Include persisted custom messages: otherwise a giant synthetic state notice
+		// costs zero and can survive in the retained tail indefinitely.
+		accumulatedTokens += estimateEntryTokens(entry);
 
 		// Check if we've exceeded the budget
 		if (accumulatedTokens >= keepRecentTokens) {
@@ -485,7 +505,7 @@ export function findCutPoint(
 	while (cutIndex > startIndex) {
 		const prevEntry = entries[cutIndex - 1];
 		// Stop at session header or compaction boundaries
-		if (prevEntry.type === "compaction") {
+		if (prevEntry.type === "compaction" || isSyntheticCompactionEntry(prevEntry)) {
 			break;
 		}
 		if (prevEntry.type === "message") {
@@ -603,6 +623,113 @@ export function buildSummarizationPrompt(customInstructions?: string, previousSu
  * Generate a summary of the conversation using the LLM.
  * If previousSummary is provided, uses the update prompt to merge.
  */
+/** Largest transcript supplied to one request. Keeps room for framing and provider overhead. */
+const MAX_SUMMARY_REQUEST_BYTES = 1_000_000;
+const SUMMARY_REQUEST_OVERHEAD_BYTES = 16_384;
+
+function summaryRequestByteLimit(model: Model<any>, reserveTokens: number, maxTokens: number): number {
+	// One UTF-8 byte per available token is deliberately tokenizer-independent:
+	// CJK and emoji can consume roughly one token per byte, unlike chars/4.
+	// Framing/output reserves are removed before admitting transcript bytes.
+	const availableInputTokens = Math.max(0, model.contextWindow - reserveTokens - maxTokens);
+	return Math.max(1, Math.min(MAX_SUMMARY_REQUEST_BYTES, availableInputTokens - SUMMARY_REQUEST_OVERHEAD_BYTES));
+}
+
+function elideSummaryForRequest(summary: string, limit: number): string {
+	if (Buffer.byteLength(summary, "utf8") <= limit) return summary;
+	const marker = "\n[... prior summary elided for request safety ...]\n";
+	let keptChars = Math.max(1, Math.floor((limit - Buffer.byteLength(marker, "utf8")) / 8));
+	let result = "";
+	// JS slices are character based; reduce until the final UTF-8 request is exact-safe.
+	do {
+		result = `${summary.slice(0, keptChars)}${marker}${summary.slice(-keptChars)}`;
+		keptChars--;
+	} while (Buffer.byteLength(result, "utf8") > limit && keptChars > 0);
+	return result;
+}
+
+/**
+ * Prompt templates for one bounded rolling summarization pass. `initial` is used for
+ * the first chunk, `update` merges each later chunk into the rolling result, so a
+ * caller's own summary semantics survive chunking instead of collapsing to one format.
+ */
+interface RollingSummaryPrompts {
+	initial(): string;
+	update(previous: string): string;
+}
+
+interface RollingSummaryOptions {
+	messages: AgentMessage[];
+	model: Model<any>;
+	reserveTokens: number;
+	maxTokens: number;
+	apiKey: string;
+	prompts: RollingSummaryPrompts;
+	headers?: Record<string, string>;
+	signal?: AbortSignal;
+	thinkingLevel?: ThinkingLevel;
+	previousSummary?: string;
+	emptyResult: string;
+	failurePrefix: string;
+	/** Chunk ceiling for this pass; split-turn passes share the global budget. */
+	maxChunks?: number;
+}
+
+/**
+ * Single bounded summarization engine: complete-message chunking, exact UTF-8 preflight,
+ * capped request count, and deterministic integrity notices. Every summarization path
+ * goes through here so none can issue an unbounded single-shot request.
+ */
+async function runRollingSummary(options: RollingSummaryOptions): Promise<string> {
+	const { model, reserveTokens, maxTokens, apiKey, prompts, headers, signal, thinkingLevel } = options;
+	const requestLimit = summaryRequestByteLimit(model, reserveTokens, maxTokens);
+	const chunks = splitConversationForSummary(
+		convertToLlm(options.messages),
+		Math.max(1_024, Math.floor(requestLimit / 3)),
+		options.maxChunks,
+	);
+	let rollingSummary = options.previousSummary;
+	const integrityNotices: string[] = [];
+	for (const conversationText of chunks) {
+		// Program-generated notices are facts, not history: never pay a request for them.
+		if (isCompactionIntegrityMarker(conversationText)) {
+			integrityNotices.push(conversationText);
+			continue;
+		}
+		const instructions = rollingSummary ? prompts.update(rollingSummary) : prompts.initial();
+		const fixedBytes = Buffer.byteLength(
+			`<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`,
+			"utf8",
+		);
+		const availableSummaryBytes = Math.max(512, requestLimit - fixedBytes - 64);
+		const prior = rollingSummary ? elideSummaryForRequest(rollingSummary, availableSummaryBytes) : undefined;
+		let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
+		if (prior) promptText += `<previous-summary>\n${prior}\n</previous-summary>\n\n`;
+		promptText += instructions;
+		const bytes = Buffer.byteLength(promptText, "utf8");
+		if (bytes > requestLimit)
+			throw new Error(`Summary request exceeds safe UTF-8 byte budget (${bytes} > ${requestLimit})`);
+		const response = await completeSimple(
+			model,
+			{
+				systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+				messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
+			},
+			model.reasoning && thinkingLevel && thinkingLevel !== "off"
+				? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
+				: { maxTokens, signal, apiKey, headers },
+		);
+		if (response.stopReason === "error")
+			throw new Error(`${options.failurePrefix}: ${response.errorMessage || "Unknown error"}`);
+		rollingSummary = response.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map((c) => c.text)
+			.join("\n");
+	}
+	return appendCompactionIntegrityNotices(rollingSummary || options.emptyResult, integrityNotices);
+}
+
+/** Generate a summary with byte-bounded, rolling partwise compaction. */
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
@@ -613,52 +740,26 @@ export async function generateSummary(
 	customInstructions?: string,
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
+	maxChunks?: number,
 ): Promise<string> {
-	const maxTokens = Math.floor(0.8 * reserveTokens);
-
-	const basePrompt = buildSummarizationPrompt(customInstructions, previousSummary);
-
-	// Serialize conversation to text so model doesn't try to continue it
-	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
-	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
-
-	// Build the prompt with conversation wrapped in tags
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += basePrompt;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
-	const completionOptions =
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers };
-
-	const response = await completeSimple(
+	return runRollingSummary({
+		messages: currentMessages,
+		maxChunks,
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		completionOptions,
-	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	const textContent = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
-
-	return textContent;
+		reserveTokens,
+		maxTokens: Math.floor(0.8 * reserveTokens),
+		apiKey,
+		headers,
+		signal,
+		thinkingLevel,
+		previousSummary,
+		prompts: {
+			initial: () => buildSummarizationPrompt(customInstructions),
+			update: (previous) => buildSummarizationPrompt(customInstructions, previous),
+		},
+		emptyResult: "No compactable conversation content.",
+		failurePrefix: "Summarization failed",
+	});
 }
 
 // ============================================================================
@@ -679,6 +780,8 @@ export interface CompactionPreparation {
 	previousSummary?: string;
 	/** Opaque checkpoint from the previous remote compaction, for native replay. */
 	previousRemoteCompaction?: RemoteCompactionState;
+	previousRemoteTokensBefore?: number;
+	previousRemoteTimestamp?: string;
 	/** File operations extracted from messagesToSummarize */
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
@@ -704,12 +807,16 @@ export function prepareCompaction(
 
 	let previousSummary: string | undefined;
 	let previousRemoteCompaction: RemoteCompactionState | undefined;
+	let previousRemoteTokensBefore: number | undefined;
+	let previousRemoteTimestamp: string | undefined;
 	let boundaryStart = 0;
 	if (prevCompactionIndex >= 0 && !options.restartFromRoot) {
 		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
 		if (prevCompaction.mechanism === "remote") {
 			if (isValidRemoteCompactionState(prevCompaction.remoteCompaction)) {
 				previousRemoteCompaction = prevCompaction.remoteCompaction;
+				previousRemoteTokensBefore = prevCompaction.tokensBefore;
+				previousRemoteTimestamp = prevCompaction.timestamp;
 				const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
 				boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
 			}
@@ -779,6 +886,8 @@ export function prepareCompaction(
 		tokensBefore,
 		previousSummary,
 		previousRemoteCompaction,
+		previousRemoteTokensBefore,
+		previousRemoteTimestamp,
 		fileOps,
 		settings,
 	};
@@ -791,6 +900,26 @@ export function prepareCompaction(
 const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
 
 Summarize the prefix to provide context for the retained suffix:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix.`;
+
+const TURN_PREFIX_UPDATE_SUMMARIZATION_PROMPT = `The messages above are ADDITIONAL earlier messages from the SAME turn prefix already summarized in <previous-summary> tags. The SUFFIX (recent work) is retained separately.
+
+Update that prefix summary so it still explains the retained suffix. RULES:
+- PRESERVE existing information from the previous prefix summary
+- ADD new decisions and work found in these messages
+- PRESERVE exact file paths, function names, and error messages
+
+Keep this EXACT format:
 
 ## Original Request
 [What did the user ask for in this turn?]
@@ -834,7 +963,8 @@ export async function compact(
 	let summary: string;
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		// Generate both summaries in parallel
+		// Both passes run in parallel, so each gets half the global request ceiling:
+		// one compaction still issues at most MAX_SUMMARY_CHUNKS summarization requests.
 		const [historyResult, turnPrefixResult] = await Promise.all([
 			messagesToSummarize.length > 0
 				? generateSummary(
@@ -847,6 +977,7 @@ export async function compact(
 						customInstructions,
 						previousSummary,
 						thinkingLevel,
+						MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
 					)
 				: Promise.resolve("No prior history."),
 			generateTurnPrefixSummary(
@@ -857,6 +988,7 @@ export async function compact(
 				headers,
 				signal,
 				thinkingLevel,
+				MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
 			),
 		]);
 		// Merge into single summary
@@ -1006,6 +1138,66 @@ export function remoteCompactionCompatibilityError(model: Model<any>, mode: Comp
 	return `Remote compaction is not declared supported for ${model.provider}/${model.id} (${model.api})`;
 }
 
+/** Opaque remote checkpoints preserve input verbatim; never replay bulky synthetic state. */
+export function hasOversizedSyntheticRemoteCheckpoint(state: RemoteCompactionState, maxBytes = 16 * 1024): boolean {
+	const visit = (value: unknown, seen: Set<object>, depth: number): boolean => {
+		if (typeof value === "string")
+			return Buffer.byteLength(value, "utf8") > maxBytes && /<ipython_state(?:_restored)?|<heartbeat/i.test(value);
+		if (!value || typeof value !== "object" || depth > 8 || seen.has(value)) return false;
+		seen.add(value);
+		for (const child of Object.values(value)) if (visit(child, seen, depth + 1)) return true;
+		return false;
+	};
+	return state.items.some((item) => visit(item, new Set(), 0));
+}
+
+/** A remote checkpoint that barely reduced a near-window context must migrate locally. */
+export function isIneffectiveRemoteCompaction(
+	tokensBefore: number,
+	postTokens: number,
+	contextWindow: number,
+): boolean {
+	if (tokensBefore <= 0 || contextWindow <= 0) return false;
+	return postTokens >= contextWindow * 0.8 && 1 - postTokens / tokensBefore < 0.15;
+}
+
+export function shouldMigrateRemoteCheckpoint(
+	state: RemoteCompactionState,
+	tokensBefore: number,
+	firstPostTokens: number | undefined,
+	contextWindow: number,
+): boolean {
+	return (
+		hasOversizedSyntheticRemoteCheckpoint(state) ||
+		(firstPostTokens !== undefined && isIneffectiveRemoteCompaction(tokensBefore, firstPostTokens, contextWindow))
+	);
+}
+
+/** Outcome of inspecting the turns that followed a remote checkpoint. */
+export interface RemotePostCheckpointSample {
+	/** An explicit context overflow was reported; migrate without waiting for usage. */
+	overflow: boolean;
+	/** Context tokens of the first post-checkpoint turn carrying meaningful usage. */
+	postTokens?: number;
+}
+
+/**
+ * Pick the evidence that judges a remote checkpoint. A zero-usage generic error row
+ * proves nothing about checkpoint size, so it is skipped, but an explicit context
+ * overflow is decisive even with zero usage.
+ */
+export function sampleRemotePostCheckpointUsage(
+	messages: AssistantMessage[],
+	contextWindow: number,
+): RemotePostCheckpointSample {
+	for (const message of messages) {
+		if (isContextOverflow(message, contextWindow)) return { overflow: true };
+		const postTokens = calculateContextTokens(message.usage);
+		if (postTokens > 0) return { overflow: false, postTokens };
+	}
+	return { overflow: false };
+}
+
 export function canReplayRemoteCompaction(state: RemoteCompactionState, model: Model<any>): boolean {
 	return (
 		isValidRemoteCompactionState(state) &&
@@ -1134,33 +1326,23 @@ async function generateTurnPrefixSummary(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	maxChunks?: number,
 ): Promise<string> {
-	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
-	const response = await completeSimple(
+	return runRollingSummary({
+		messages,
+		maxChunks,
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
-	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	return response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
+		reserveTokens,
+		maxTokens: Math.floor(0.5 * reserveTokens), // Smaller budget for turn prefix
+		apiKey,
+		headers,
+		signal,
+		thinkingLevel,
+		prompts: {
+			initial: () => TURN_PREFIX_SUMMARIZATION_PROMPT,
+			update: () => TURN_PREFIX_UPDATE_SUMMARIZATION_PROMPT,
+		},
+		emptyResult: "No turn prefix content.",
+		failurePrefix: "Turn prefix summarization failed",
+	});
 }

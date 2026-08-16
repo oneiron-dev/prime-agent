@@ -3,6 +3,7 @@ import type { Api, Model, ServiceTier } from "@earendil-works/pi-ai";
 import type { AgentSession } from "./agent-session.js";
 import type { ToolDefinition } from "./extensions/index.js";
 import type { HostRequestHandler } from "./kernel/index.js";
+import type { ChildKernelCacheCleanupResult } from "./session-file-actions.js";
 
 export interface RlmRunRequest {
 	prompt: string;
@@ -36,6 +37,8 @@ export interface RlmListSubagentsResult {
 export interface RlmDeleteSubagentResult {
 	subagent: RlmSubagentRegistryEntry;
 	outcome?: "deleted" | "skipped_running";
+	/** Best-effort cache cleanup performed only after a successful child disposal. */
+	kernel_cache_cleanup?: ChildKernelCacheCleanupResult;
 }
 
 export interface RlmModelMatch {

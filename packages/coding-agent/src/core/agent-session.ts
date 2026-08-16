@@ -42,6 +42,7 @@ import type {
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	getLogger,
 	getResponsesCompactFallbackReason,
 	getResponsesRemoteCompactionV2FallbackReason,
 	getSupportedThinkingLevels,
@@ -120,7 +121,9 @@ import {
 	projectCompactionPreparationForExternalUse,
 	projectCompactionResultForExternalUse,
 	remoteCompactionCompatibilityError,
+	sampleRemotePostCheckpointUsage,
 	shouldCompact,
+	shouldMigrateRemoteCheckpoint,
 	shouldUseRemoteCompaction,
 	shouldUseRemoteCompactionV2,
 } from "./compaction/index.js";
@@ -261,6 +264,7 @@ import {
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
+import { type ChildKernelCacheCleanupResult, pruneDeletedChildKernelCaches } from "./session-file-actions.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
@@ -281,7 +285,7 @@ import {
 } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
-import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
+import { type BashOperations, createLocalBashOperations, DEFAULT_COMMAND_TIMEOUT_SECONDS } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
@@ -293,6 +297,8 @@ export type { SessionStats } from "./session-stats.js";
 export { type ParsedSkillBlock, parseSkillBlock } from "./skill-blocks.js";
 
 export type RlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
+
+const log = getLogger("coding-agent.agent-session");
 
 export interface RlmChildAgentActivity {
 	kind: "waiting" | "writing" | "executing";
@@ -979,6 +985,14 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 
 /** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+const KERNEL_STATE_NAME_LIMIT = 128;
+
+function summarizeKernelNames(names: string[], availability = "available via IPython"): string {
+	if (names.length <= KERNEL_STATE_NAME_LIMIT) return names.join(", ");
+	const head = Math.ceil(KERNEL_STATE_NAME_LIMIT / 2);
+	const tail = KERNEL_STATE_NAME_LIMIT - head;
+	return `${names.slice(0, head).join(", ")}, … (${names.length - head - tail} additional names ${availability}), ${names.slice(-tail).join(", ")}`;
+}
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 
 function noopRlmChildAbort(): void {}
@@ -6998,7 +7012,7 @@ export class AgentSession {
 			names === null
 				? ""
 				: names.length > 0
-					? ` These names are still defined: ${names.join(", ")}.`
+					? ` These names are still defined: ${summarizeKernelNames(names)}.`
 					: " You have not defined any names yet.";
 		const content = [
 			"<ipython_state>",
@@ -7035,7 +7049,7 @@ export class AgentSession {
 		const lines = ["<ipython_state_restored>"];
 		if (result.restored.length > 0) {
 			lines.push(
-				`Your IPython kernel state was revived from your previous session. These names are available again: ${result.restored.join(", ")}.`,
+				`Your IPython kernel state was revived from your previous session. These names are available again: ${summarizeKernelNames(result.restored)}.`,
 			);
 		} else {
 			lines.push(
@@ -7044,7 +7058,10 @@ export class AgentSession {
 		}
 		if (result.failed.length > 0) {
 			lines.push(
-				`These could not be restored and must be recreated if needed: ${result.failed.map((f) => f.name).join(", ")}.`,
+				`These could not be restored and must be recreated if needed: ${summarizeKernelNames(
+					result.failed.map((f) => f.name),
+					"not restored",
+				)}.`,
 			);
 		}
 		lines.push("</ipython_state_restored>");
@@ -7275,34 +7292,39 @@ export class AgentSession {
 				compactionResult.fallback = { from: "remote", reason: fallbackReason };
 			}
 		} else if (shouldUseRemoteCompaction(model, compactionMode)) {
-			try {
-				const remotePreparation =
-					preparation.previousRemoteCompaction &&
-					!canReplayRemoteCompaction(preparation.previousRemoteCompaction, model)
-						? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
-						: preparation;
-				if (!remotePreparation) {
-					throw new CompactionSkippedError("Session is too short to rebuild for remote compaction");
-				}
-				compactionResult = await compactRemote(
-					remotePreparation,
-					model as Model<"openai-responses">,
-					apiKey,
-					this.systemPrompt,
-					headers,
-					customInstructions,
-					signal,
-					this.sessionManager.getSessionId(),
-				);
-			} catch (error) {
-				const fallbackReason = getResponsesCompactFallbackReason(error);
-				if (!fallbackReason) throw error;
-				const localPreparation = preparation.previousRemoteCompaction
-					? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
-					: preparation;
-				if (!localPreparation) {
-					throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
-				}
+			const priorRemote = preparation.previousRemoteCompaction;
+			const remoteBoundaryTimestamp = preparation.previousRemoteTimestamp
+				? new Date(preparation.previousRemoteTimestamp).getTime()
+				: undefined;
+			const postCheckpointAssistants =
+				remoteBoundaryTimestamp === undefined
+					? []
+					: pathEntries
+							.filter(
+								(entry): entry is SessionMessageEntry =>
+									entry.type === "message" &&
+									entry.message.role === "assistant" &&
+									entry.message.timestamp > remoteBoundaryTimestamp &&
+									entry.message.provider === model.provider &&
+									entry.message.model === model.id,
+							)
+							.map((entry) => entry.message as AssistantMessage);
+			const postCheckpoint = sampleRemotePostCheckpointUsage(postCheckpointAssistants, model.contextWindow);
+			const forceLocal =
+				priorRemote &&
+				(postCheckpoint.overflow ||
+					shouldMigrateRemoteCheckpoint(
+						priorRemote,
+						preparation.previousRemoteTokensBefore ?? 0,
+						postCheckpoint.postTokens,
+						model.contextWindow,
+					));
+			if (forceLocal) {
+				const localPreparation = prepareCompaction(pathEntries, settings, { restartFromRoot: true });
+				if (!localPreparation)
+					throw new CompactionSkippedError(
+						"Session is too short to migrate ineffective remote compaction locally",
+					);
 				compactionResult = await compact(
 					localPreparation,
 					model,
@@ -7312,8 +7334,50 @@ export class AgentSession {
 					signal,
 					this.thinkingLevel,
 				);
-				compactionResult.fallback = { from: "remote", reason: fallbackReason };
-			}
+				compactionResult.fallback = {
+					from: "remote",
+					reason: "Remote checkpoint was ineffective or preserved oversized synthetic state",
+				};
+			} else
+				try {
+					const remotePreparation =
+						preparation.previousRemoteCompaction &&
+						!canReplayRemoteCompaction(preparation.previousRemoteCompaction, model)
+							? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+							: preparation;
+					if (!remotePreparation) {
+						throw new CompactionSkippedError("Session is too short to rebuild for remote compaction");
+					}
+					compactionResult = await compactRemote(
+						remotePreparation,
+						model as Model<"openai-responses">,
+						apiKey,
+						this.systemPrompt,
+						headers,
+						customInstructions,
+						signal,
+						this.sessionManager.getSessionId(),
+					);
+				} catch (error) {
+					const fallbackReason = getResponsesCompactFallbackReason(error);
+					if (!fallbackReason) throw error;
+					const localPreparation = preparation.previousRemoteCompaction
+						? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+						: preparation;
+					if (!localPreparation) {
+						throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
+					}
+					compactionResult = await compact(
+						localPreparation,
+						model,
+						apiKey,
+						headers,
+						customInstructions,
+						signal,
+						this.thinkingLevel,
+					);
+					compactionResult.fallback = { from: "remote", reason: fallbackReason };
+				}
 		} else {
 			const localPreparation = preparation.previousRemoteCompaction
 				? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
@@ -8791,6 +8855,7 @@ export class AgentSession {
 					provisioner: this._ipythonKernelProvisioner,
 					commandPrefix: this.settingsManager.getShellCommandPrefix(),
 					shellPath: this.settingsManager.getShellPath(),
+					commandTimeoutSeconds: this.settingsManager.getCommandTimeoutSeconds(),
 					onLateSentAgentMessage: (toolCallId, message) =>
 						this._recordLateIpythonSentAgentMessage(toolCallId, message),
 				},
@@ -9559,6 +9624,19 @@ export class AgentSession {
 		});
 	}
 
+	private async _pruneDeletedRlmChildKernelCaches(
+		subagent: RlmSubagentRegistryEntry,
+		session?: AgentSession,
+	): Promise<ChildKernelCacheCleanupResult> {
+		const sessionPath =
+			session?.sessionFile ??
+			(subagent.session_id ? join(subagent.session_dir, `${subagent.session_id}.jsonl`) : undefined);
+		if (!sessionPath) {
+			return { outcome: "skipped_invalid", files: 0, reason: "deleted child has no session file" };
+		}
+		return pruneDeletedChildKernelCaches(sessionPath);
+	}
+
 	private async _deleteResolvedRlmSubagent(subagent: RlmSubagentRegistryEntry): Promise<RlmDeleteSubagentResult> {
 		const childId = subagent.rlm_child_id;
 		const run = this._activeRlmChildRuns.get(childId);
@@ -9570,7 +9648,8 @@ export class AgentSession {
 			if (run.status === "error" && !liveSession && run.settled) {
 				this._deletedRlmChildIds.add(childId);
 				this._removeRlmSubagentTracking(childId, run);
-				return { subagent };
+				const cleanup = await this._pruneDeletedRlmChildKernelCaches(subagent, liveSession);
+				return cleanup.outcome === "not_found" ? { subagent } : { subagent, kernel_cache_cleanup: cleanup };
 			}
 			if (liveSession) {
 				try {
@@ -9592,7 +9671,8 @@ export class AgentSession {
 				}
 				this._deletedRlmChildIds.add(childId);
 				this._removeRlmSubagentTracking(childId, run);
-				return { subagent };
+				const cleanup = await this._pruneDeletedRlmChildKernelCaches(subagent, liveSession);
+				return cleanup.outcome === "not_found" ? { subagent } : { subagent, kernel_cache_cleanup: cleanup };
 			}
 
 			// Startup can be blocked in a host before it has a session to close. Admit
@@ -9618,7 +9698,8 @@ export class AgentSession {
 		}
 		this._deletedRlmChildIds.add(childId);
 		this._removeRlmSubagentTracking(childId);
-		return { subagent };
+		const cleanup = await this._pruneDeletedRlmChildKernelCaches(subagent, retained);
+		return cleanup.outcome === "not_found" ? { subagent } : { subagent, kernel_cache_cleanup: cleanup };
 	}
 
 	/**
@@ -10139,6 +10220,16 @@ export class AgentSession {
 				if (run.detachedDeletion && childRuntime) {
 					try {
 						await this._deleteRlmSubagentSession(run.id, childRuntime.session);
+						const cleanup = await this._pruneDeletedRlmChildKernelCaches(
+							run.detachedDeletion,
+							childRuntime.session,
+						);
+						if (cleanup.outcome === "failed") {
+							log.warn("deleted RLM child kernel cache cleanup failed", {
+								childId: run.id,
+								error: cleanup.error,
+							});
+						}
 					} catch {
 						if (!this._disposed && !this._disposing) {
 							this._rlmChildSessions.set(run.id, childRuntime.session);
@@ -10192,9 +10283,12 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
 
-		// Context overflow is handled by compaction, not retry
+		// Context overflow is handled by compaction, not retry. A bare post-start
+		// WebSocket close is similarly terminal: retrying an identical payload only
+		// amplifies an upstream rejection whose error frame was lost in transit.
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return false;
+		if (message.errorMessage.includes("WebSocket closed before response.completed")) return false;
 
 		if (this._isFauxProviderQueueExhausted(message)) {
 			return false;
@@ -10550,6 +10644,7 @@ export class AgentSession {
 				{
 					onChunk,
 					signal: this._bashAbortController.signal,
+					timeout: this.settingsManager.getCommandTimeoutSeconds() ?? DEFAULT_COMMAND_TIMEOUT_SECONDS,
 				},
 			);
 

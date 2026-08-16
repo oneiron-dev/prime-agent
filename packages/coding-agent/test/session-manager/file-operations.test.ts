@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 interface FileLinesModule {
 	readFirstLineSync(filePath: string, maxBytes?: number): string | undefined;
-	readLinesAsBuffers(filePath: string): AsyncGenerator<Buffer>;
+	readLinesAsBuffers(filePath: string, start?: number, end?: number): AsyncGenerator<Buffer>;
 }
 
 type ReadLinesAsBuffers = FileLinesModule["readLinesAsBuffers"];
@@ -254,6 +254,60 @@ describe("readSessionInfo", () => {
 		expect(sizeChanged?.messageCount).toBe(2);
 		expect(sizeChanged).not.toBe(mtimeChanged);
 		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledTimes(3);
+	});
+
+	it("reads only appended JSONL bytes after a large completed prefix", async () => {
+		const file = join(tempDir, "append-only.jsonl");
+		const header = JSON.stringify({
+			type: "session",
+			id: "append-only",
+			timestamp: "2025-01-01T00:00:00Z",
+			cwd: tempDir,
+		});
+		const largePrefix = `${header}\n${" ".repeat(2 * 1024 * 1024)}\n`;
+		writeFileSync(file, largePrefix);
+		await readSessionInfo(file);
+		fileLineMocks.readLinesAsBuffers.mockClear();
+		const start = statSync(file).size;
+		writeFileSync(
+			file,
+			`${largePrefix}${JSON.stringify({ type: "message", id: "tail", timestamp: "2025-01-01T00:00:01Z", message: { role: "user", content: "tail", timestamp: 1 } })}\n`,
+		);
+
+		await expect(readSessionInfo(file)).resolves.toMatchObject({ messageCount: 1, firstMessage: "tail" });
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledWith(file, start, expect.any(Number));
+	});
+
+	it("does not checkpoint a partial JSONL record and recovers it after completion", async () => {
+		const file = join(tempDir, "partial-record.jsonl");
+		const header = JSON.stringify({
+			type: "session",
+			id: "partial",
+			timestamp: "2025-01-01T00:00:00Z",
+			cwd: tempDir,
+		});
+		const completeMessage = JSON.stringify({
+			type: "message",
+			id: "message",
+			timestamp: "2025-01-01T00:00:01Z",
+			message: { role: "user", content: "recovered", timestamp: 1 },
+		});
+		writeFileSync(file, `${header}\n${completeMessage.slice(0, -8)}`);
+		await expect(readSessionInfo(file)).resolves.toMatchObject({ messageCount: 0, firstMessage: "(no messages)" });
+		writeFileSync(file, `${header}\n${completeMessage}\n`);
+		await expect(readSessionInfo(file)).resolves.toMatchObject({ messageCount: 1, firstMessage: "recovered" });
+	});
+
+	it("falls back to byte zero when a same-inode rewrite regrows beyond the cached size", async () => {
+		const file = join(tempDir, "rewritten.jsonl");
+		const original = createSessionContent("old");
+		writeFileSync(file, original);
+		await readSessionInfo(file);
+		fileLineMocks.readLinesAsBuffers.mockClear();
+		writeFileSync(file, `${createSessionContent("new")}${" ".repeat(original.length)}\n`);
+
+		await expect(readSessionInfo(file)).resolves.toMatchObject({ firstMessage: "new", messageCount: 1 });
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledWith(file, 0, expect.any(Number));
 	});
 
 	it("does not cache a transient stream failure and clears its concurrent flight", async () => {

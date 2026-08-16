@@ -130,6 +130,16 @@ export function getResponsesCompactFallbackReason(error: unknown): string | unde
 		}
 		return `HTTP ${status} compact endpoint temporarily unavailable`;
 	}
+	// The compact endpoint is unary HTTP (never WebSocket), so an oversized request here
+	// is a concrete reason to rebuild locally through the bounded partwise path.
+	if (
+		(status === 400 || status === 413 || status === 422) &&
+		/context_too_large|context[_ ]length[_ ]exceeded|message[_ ]too[_ ]big|request_too_large|total message size|too large/i.test(
+			`${code ?? ""} ${message}`,
+		)
+	) {
+		return `HTTP ${status} compact request too large`;
+	}
 	if (
 		(status === 400 || status === 422) &&
 		/(?:compact|compaction).*(?:not supported|unsupported|unavailable)|(?:model|endpoint|route).*(?:does not support|unsupported|unknown)/i.test(
