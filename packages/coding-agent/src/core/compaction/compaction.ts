@@ -33,6 +33,7 @@ import {
 	formatFileOperations,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
+	splitConversationForSummary,
 } from "./utils.js";
 
 // ============================================================================
@@ -115,11 +116,21 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 	return undefined;
 }
 
+const SYNTHETIC_COMPACTION_TYPES = new Set([
+	"heartbeat_prompt",
+	"ipython_state",
+	"ipython_state_restored",
+	"goal",
+	"worker_recovery",
+]);
+
 function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | undefined {
-	if (entry.type === "compaction") {
-		return undefined;
-	}
-	return getMessageFromEntry(entry);
+	if (entry.type === "compaction") return undefined;
+	// Synthetic runtime notices are transient state, not conversational history.
+	if (entry.type === "custom_message" && SYNTHETIC_COMPACTION_TYPES.has(entry.customType)) return undefined;
+	const message = getMessageFromEntry(entry);
+	if (message?.role === "custom" && SYNTHETIC_COMPACTION_TYPES.has(message.customType)) return undefined;
+	return message;
 }
 
 /** Result from compact() - SessionManager adds uuid/parentUuid when saving */
@@ -598,6 +609,17 @@ export function buildSummarizationPrompt(customInstructions?: string, previousSu
  * Generate a summary of the conversation using the LLM.
  * If previousSummary is provided, uses the update prompt to merge.
  */
+/** Largest transcript supplied to one request. Keeps room for framing and provider overhead. */
+const MAX_SUMMARY_REQUEST_BYTES = 1_000_000;
+
+function summaryInputByteBudget(model: Model<any>, reserveTokens: number, maxTokens: number): number {
+	// Four bytes/token deliberately overestimates common tokenizers. The hard cap also
+	// prevents pathological sessions from becoming a single giant provider request.
+	const tokenBudget = Math.max(4_096, model.contextWindow - reserveTokens - maxTokens) * 4;
+	return Math.max(4_096, Math.min(MAX_SUMMARY_REQUEST_BYTES, tokenBudget - 16_384));
+}
+
+/** Generate a summary with byte-bounded, rolling partwise compaction. */
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
@@ -610,50 +632,37 @@ export async function generateSummary(
 	thinkingLevel?: ThinkingLevel,
 ): Promise<string> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
-
-	const basePrompt = buildSummarizationPrompt(customInstructions, previousSummary);
-
-	// Serialize conversation to text so model doesn't try to continue it
-	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
-	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
-
-	// Build the prompt with conversation wrapped in tags
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += basePrompt;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
-	const completionOptions =
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers };
-
-	const response = await completeSimple(
-		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		completionOptions,
+	const basePrompt = buildSummarizationPrompt(customInstructions);
+	const chunks = splitConversationForSummary(
+		convertToLlm(currentMessages),
+		summaryInputByteBudget(model, reserveTokens, maxTokens),
 	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
+	let rollingSummary = previousSummary;
+	for (const conversationText of chunks) {
+		let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
+		if (rollingSummary) promptText += `<previous-summary>\n${rollingSummary}\n</previous-summary>\n\n`;
+		promptText += rollingSummary ? buildSummarizationPrompt(customInstructions, rollingSummary) : basePrompt;
+		const bytes = Buffer.byteLength(promptText, "utf8");
+		const limit = summaryInputByteBudget(model, reserveTokens, maxTokens) + 16_384;
+		if (bytes > limit) throw new Error(`Summary request exceeds safe UTF-8 byte budget (${bytes} > ${limit})`);
+		const response = await completeSimple(
+			model,
+			{
+				systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+				messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
+			},
+			model.reasoning && thinkingLevel && thinkingLevel !== "off"
+				? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
+				: { maxTokens, signal, apiKey, headers },
+		);
+		if (response.stopReason === "error")
+			throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
+		rollingSummary = response.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map((c) => c.text)
+			.join("\n");
 	}
-
-	const textContent = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
-
-	return textContent;
+	return rollingSummary || "No compactable conversation content.";
 }
 
 // ============================================================================

@@ -1,6 +1,6 @@
 import type { Message } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { serializeConversation } from "../src/core/compaction/utils.js";
+import { serializeConversation, splitConversationForSummary } from "../src/core/compaction/utils.js";
 
 describe("serializeConversation", () => {
 	it("should truncate long tool results", () => {
@@ -75,5 +75,42 @@ describe("serializeConversation", () => {
 
 		expect(result).not.toContain("truncated");
 		expect(result).toContain(longText);
+	});
+	it("splits serialized context at message boundaries and bounds tool arguments", () => {
+		const huge = "x".repeat(8_000);
+		const messages: Message[] = [
+			{ role: "user", content: "first", timestamp: 0 },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call", name: "write", arguments: { payload: huge } }],
+				api: "anthropic",
+				provider: "test",
+				model: "test",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 0,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call",
+				toolName: "write",
+				content: [{ type: "text", text: huge }],
+				isError: false,
+				timestamp: 0,
+			},
+			{ role: "user", content: "z".repeat(800), timestamp: 0 },
+			{ role: "user", content: "q".repeat(800), timestamp: 0 },
+		];
+		const chunks = splitConversationForSummary(messages, 1_000);
+		expect(chunks.length).toBeGreaterThan(1);
+		expect(chunks.every((chunk) => Buffer.byteLength(chunk, "utf8") <= 1_000)).toBe(true);
+		expect(chunks.join("\n")).not.toContain(huge);
 	});
 });
