@@ -352,4 +352,36 @@ describe("generic OpenAI Responses WebSocket transport", () => {
 		expect(headers["x-model-header"] ?? headers["X-Model-Header"]).toBe("from-user");
 		expect(headers.authorization ?? headers.Authorization).toBe("Bearer key");
 	});
+	it("preserves an upstream error event when the socket closes afterwards", async () => {
+		class ErrorThenCloseWebSocket extends MockWebSocket {
+			override send() {
+				queueMicrotask(() => {
+					this.message({
+						type: "error",
+						message: "context_too_large",
+						code: "context_too_large",
+					} as unknown as ResponseStreamEvent);
+					this.emit("close", { code: 1011, reason: "proxy close" });
+				});
+			}
+		}
+		setOpenAIResponsesWebSocketConstructorForTesting(ErrorThenCloseWebSocket);
+		await expect(request([])).rejects.toThrow("context_too_large");
+	});
+
+	it("reports typed bare closes with the server close code and reason", async () => {
+		class BareCloseWebSocket extends MockWebSocket {
+			override send() {
+				queueMicrotask(() => this.emit("close", { code: 1011, reason: "upstream rejected" }));
+			}
+		}
+		setOpenAIResponsesWebSocketConstructorForTesting(BareCloseWebSocket);
+		try {
+			await request([]);
+			throw new Error("expected close");
+		} catch (error) {
+			expect(error).toMatchObject({ name: "WebSocketTransportError" });
+			expect(String(error)).toContain("1011 upstream rejected");
+		}
+	});
 });

@@ -7177,15 +7177,17 @@ export class AgentSession {
 							entry.message.model === model.id,
 					)
 				: undefined;
-			const firstPostUsage = firstPostEntry ? (firstPostEntry.message as AssistantMessage).usage : undefined;
+			const firstPostAssistant = firstPostEntry?.message as AssistantMessage | undefined;
+			const firstPostUsage = firstPostAssistant?.usage;
 			const forceLocal =
 				priorRemote &&
-				shouldMigrateRemoteCheckpoint(
-					priorRemote,
-					preparation.previousRemoteTokensBefore ?? 0,
-					firstPostUsage ? calculateContextTokens(firstPostUsage) : undefined,
-					model.contextWindow,
-				);
+				((!!firstPostAssistant && isContextOverflow(firstPostAssistant, model.contextWindow)) ||
+					shouldMigrateRemoteCheckpoint(
+						priorRemote,
+						preparation.previousRemoteTokensBefore ?? 0,
+						firstPostUsage ? calculateContextTokens(firstPostUsage) : undefined,
+						model.contextWindow,
+					));
 			if (forceLocal) {
 				const localPreparation = prepareCompaction(pathEntries, settings, { restartFromRoot: true });
 				if (!localPreparation)
