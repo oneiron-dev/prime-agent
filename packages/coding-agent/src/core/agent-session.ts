@@ -255,6 +255,7 @@ import {
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
+import { type ChildKernelCacheCleanupResult, pruneDeletedChildKernelCaches } from "./session-file-actions.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
@@ -9493,6 +9494,19 @@ export class AgentSession {
 		});
 	}
 
+	private async _pruneDeletedRlmChildKernelCaches(
+		subagent: RlmSubagentRegistryEntry,
+		session?: AgentSession,
+	): Promise<ChildKernelCacheCleanupResult> {
+		const sessionPath =
+			session?.sessionFile ??
+			(subagent.session_id ? join(subagent.session_dir, `${subagent.session_id}.jsonl`) : undefined);
+		if (!sessionPath) {
+			return { outcome: "skipped_invalid", files: 0, reason: "deleted child has no session file" };
+		}
+		return pruneDeletedChildKernelCaches(sessionPath);
+	}
+
 	private async _deleteResolvedRlmSubagent(subagent: RlmSubagentRegistryEntry): Promise<RlmDeleteSubagentResult> {
 		const childId = subagent.rlm_child_id;
 		const run = this._activeRlmChildRuns.get(childId);
@@ -9504,7 +9518,8 @@ export class AgentSession {
 			if (run.status === "error" && !liveSession && run.settled) {
 				this._deletedRlmChildIds.add(childId);
 				this._removeRlmSubagentTracking(childId, run);
-				return { subagent };
+				const cleanup = await this._pruneDeletedRlmChildKernelCaches(subagent, liveSession);
+				return cleanup.outcome === "not_found" ? { subagent } : { subagent, kernel_cache_cleanup: cleanup };
 			}
 			if (liveSession) {
 				try {
@@ -9526,7 +9541,8 @@ export class AgentSession {
 				}
 				this._deletedRlmChildIds.add(childId);
 				this._removeRlmSubagentTracking(childId, run);
-				return { subagent };
+				const cleanup = await this._pruneDeletedRlmChildKernelCaches(subagent, liveSession);
+				return cleanup.outcome === "not_found" ? { subagent } : { subagent, kernel_cache_cleanup: cleanup };
 			}
 
 			// Startup can be blocked in a host before it has a session to close. Admit
@@ -9552,7 +9568,8 @@ export class AgentSession {
 		}
 		this._deletedRlmChildIds.add(childId);
 		this._removeRlmSubagentTracking(childId);
-		return { subagent };
+		const cleanup = await this._pruneDeletedRlmChildKernelCaches(subagent, retained);
+		return cleanup.outcome === "not_found" ? { subagent } : { subagent, kernel_cache_cleanup: cleanup };
 	}
 
 	/**
@@ -10073,6 +10090,13 @@ export class AgentSession {
 				if (run.detachedDeletion && childRuntime) {
 					try {
 						await this._deleteRlmSubagentSession(run.id, childRuntime.session);
+						const cleanup = await this._pruneDeletedRlmChildKernelCaches(
+							run.detachedDeletion,
+							childRuntime.session,
+						);
+						if (cleanup.outcome === "failed") {
+							console.warn(`Deleted RLM child ${run.id} kernel cache cleanup failed: ${cleanup.error}`);
+						}
 					} catch {
 						if (!this._disposed && !this._disposing) {
 							this._rlmChildSessions.set(run.id, childRuntime.session);
