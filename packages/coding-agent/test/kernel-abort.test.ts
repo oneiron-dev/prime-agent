@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AGENT_MESSAGE_DISPLAY_MIME, KernelManager, type KernelSentAgentMessage } from "../src/core/kernel/index.js";
+import {
+	AGENT_MESSAGE_DISPLAY_MIME,
+	KernelManager,
+	type KernelSentAgentMessage,
+	signalKernelProcessTree,
+} from "../src/core/kernel/index.js";
 
 async function waitForCalls(mock: { mock: { calls: unknown[][] } }, count: number): Promise<void> {
 	for (let i = 0; i < 20; i++) {
@@ -10,6 +15,18 @@ async function waitForCalls(mock: { mock: { calls: unknown[][] } }, count: numbe
 	}
 	expect(mock.mock.calls.length).toBeGreaterThanOrEqual(count);
 }
+
+describe("kernel process-tree signaling", () => {
+	it("signals the owned process group with the requested graceful signal", () => {
+		const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+		try {
+			signalKernelProcessTree(4321, "SIGTERM");
+			expect(kill).toHaveBeenCalledWith(-4321, "SIGTERM");
+		} finally {
+			kill.mockRestore();
+		}
+	});
+});
 
 describe("KernelManager abort handling", () => {
 	afterEach(() => {

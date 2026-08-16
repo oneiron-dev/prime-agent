@@ -687,7 +687,7 @@ export function createIpythonToolDefinition(
 					text += (text ? "\n" : "") + r.error.traceback.join("\n");
 				}
 				if (r.status === "timed_out") {
-					const timeoutNotice = `IPython cell was killed after reaching the ${provisioner.commandTimeoutMs / 1000} second hard deadline. MUST NOT be retried unchanged; decompose or rewrite it into bounded phases that report progress.`;
+					const timeoutNotice = `IPython cell deadline reached after ${provisioner.commandTimeoutMs / 1000} seconds; it was interrupted, and the kernel was replaced only if it ignored the grace period. MUST NOT be retried unchanged; decompose or rewrite it into bounded phases that report progress.`;
 					text = text ? `${text}\n\n${timeoutNotice}` : timeoutNotice;
 				}
 				if (kernelRestarted) {

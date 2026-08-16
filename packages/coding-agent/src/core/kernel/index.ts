@@ -8,7 +8,6 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
-import { killProcessTree } from "../../utils/shell.js";
 import { ensureKernelPython, type KernelBootstrapProgressHandler, type KernelPythonSkill } from "./bootstrap.js";
 import { ForkServerUnavailable, forkKernel, isForkServerEnabled } from "./fork-server.js";
 import {
@@ -237,6 +236,19 @@ function parseSentAgentMessage(payload: unknown): KernelSentAgentMessage | undef
 			...(typeof sessionName === "string" ? { sessionName } : {}),
 		},
 	};
+}
+
+/** Signal an owned detached/forked kernel process group, falling back to its leader. */
+export function signalKernelProcessTree(pid: number, signal: NodeJS.Signals): void {
+	if (process.platform === "win32") {
+		process.kill(pid, signal);
+		return;
+	}
+	try {
+		process.kill(-pid, signal);
+	} catch {
+		process.kill(pid, signal);
+	}
 }
 
 function createKernelStartupAbortError(): Error {
@@ -1346,16 +1358,14 @@ export class KernelManager {
 		this.control = undefined;
 		this.iopubPumpPromise = undefined;
 		try {
-			if (this.kernel) {
-				if (this.kernel.pid) {
-					killProcessTree(this.kernel.pid);
-				} else {
-					this.kernel.kill(killSignal);
-				}
+			if (this.kernel?.pid) {
+				signalKernelProcessTree(this.kernel.pid, killSignal);
+			} else if (this.kernel) {
+				this.kernel.kill(killSignal);
 			} else if (this.kernelPid !== undefined && !this.forkedKernelDied()) {
-				// Only signal a forked kernel confirmed still alive: a dead pid may have
-				// been recycled by the OS, and a kill would then hit an unrelated process.
-				process.kill(this.kernelPid, killSignal);
+				// Forkserver children call setsid(), so their owned descendants share this group.
+				// Check liveness before signaling: a recycled PID must never be targeted.
+				signalKernelProcessTree(this.kernelPid, killSignal);
 			}
 		} catch {
 			// Kernel already exited.
