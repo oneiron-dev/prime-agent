@@ -449,6 +449,36 @@ describe("Coding Agent Tools", () => {
 			expect(Buffer.concat(chunks).toString("utf-8").trim()).toBe("from-local-ops");
 		});
 
+		it("forwards the configured hard ceiling to bash operations", async () => {
+			let seenTimeout: number | undefined;
+			const operations: BashOperations = {
+				exec: async (_command, _cwd, { timeout }) => {
+					seenTimeout = timeout;
+					return { exitCode: 0 };
+				},
+			};
+
+			await executeBashWithOperations("echo hi", testDir, operations, { timeout: 3 });
+
+			expect(seenTimeout).toBe(3);
+		});
+
+		it("returns an actionable timed-out result and kills the process tree", async () => {
+			const marker = join(testDir, "user-bash-descendant.txt");
+			const command = `sh -c 'sleep 30; echo orphan > ${marker}' & sleep 30`;
+
+			const result = await executeBashWithOperations(command, testDir, createLocalBashOperations(), { timeout: 1 });
+
+			expect(result.timedOut).toBe(true);
+			expect(result.cancelled).toBe(false);
+			expect(result.exitCode).toBeUndefined();
+			expect(result.output).toContain("Command timed out after 1 seconds");
+			expect(result.output).toContain("MUST NOT be retried unchanged");
+
+			await new Promise((resolve) => setTimeout(resolve, 1500));
+			expect(existsSync(marker)).toBe(false);
+		});
+
 		it("should preserve executeBash sanitization when using local bash operations", async () => {
 			const result = await executeBashWithOperations(
 				"printf '\\033[31mred\\033[0m\\r\\n'",

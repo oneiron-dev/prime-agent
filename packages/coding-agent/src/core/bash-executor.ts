@@ -24,6 +24,8 @@ export interface BashExecutorOptions {
 	onChunk?: (chunk: string) => void;
 	/** AbortSignal for cancellation */
 	signal?: AbortSignal;
+	/** Hard ceiling in seconds for this command. Omitted means no executor-imposed cap. */
+	timeout?: number;
 }
 
 export interface BashResult {
@@ -33,6 +35,8 @@ export interface BashResult {
 	exitCode: number | undefined;
 	/** Whether the command was cancelled via signal */
 	cancelled: boolean;
+	/** Whether the command was killed by its hard deadline */
+	timedOut?: boolean;
 	/** Whether the output was truncated */
 	truncated: boolean;
 	/** Path to temp file containing full output (if output exceeded truncation threshold) */
@@ -108,6 +112,7 @@ export async function executeBashWithOperations(
 		const result = await operations.exec(command, cwd, {
 			onData,
 			signal: options?.signal,
+			timeout: options?.timeout,
 		});
 
 		const fullOutput = outputChunks.join("");
@@ -142,6 +147,28 @@ export async function executeBashWithOperations(
 				output: truncationResult.truncated ? truncationResult.content : fullOutput,
 				exitCode: undefined,
 				cancelled: true,
+				truncated: truncationResult.truncated,
+				fullOutputPath: tempFilePath,
+			};
+		}
+
+		if (err instanceof Error && err.message.startsWith("timeout:")) {
+			const timeoutSeconds = err.message.slice("timeout:".length);
+			const fullOutput = outputChunks.join("");
+			const truncationResult = truncateTail(fullOutput);
+			if (truncationResult.truncated) {
+				ensureTempFile();
+			}
+			if (tempFileStream) {
+				tempFileStream.end();
+			}
+			const output = truncationResult.truncated ? truncationResult.content : fullOutput;
+			const notice = `Command timed out after ${timeoutSeconds} seconds and its process tree was killed. MUST NOT be retried unchanged; decompose or rewrite it into bounded phases that report progress.`;
+			return {
+				output: output ? `${output}\n${notice}` : notice,
+				exitCode: undefined,
+				cancelled: false,
+				timedOut: true,
 				truncated: truncationResult.truncated,
 				fullOutputPath: tempFilePath,
 			};

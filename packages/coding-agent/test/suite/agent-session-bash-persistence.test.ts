@@ -105,6 +105,38 @@ describe("AgentSession bash and persistence characterization", () => {
 		expect(harness.session.messages[harness.session.messages.length - 1]?.role).toBe("bashExecution");
 	});
 
+	it("applies the configured command ceiling to user bash execution", async () => {
+		const harness = await createHarness({ settings: { commandTimeoutSeconds: 4 } });
+		harnesses.push(harness);
+		let seenTimeout: number | undefined;
+		const operations: BashOperations = {
+			exec: async (_command, _cwd, options) => {
+				seenTimeout = options.timeout;
+				return { exitCode: 0 };
+			},
+		};
+
+		await harness.session.executeBash("echo hi", undefined, { operations });
+
+		expect(seenTimeout).toBe(4);
+	});
+
+	it("defaults user bash to the 30 minute hard ceiling", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let seenTimeout: number | undefined;
+		const operations: BashOperations = {
+			exec: async (_command, _cwd, options) => {
+				seenTimeout = options.timeout;
+				return { exitCode: 0 };
+			},
+		};
+
+		await harness.session.executeBash("echo hi", undefined, { operations });
+
+		expect(seenTimeout).toBe(1800);
+	});
+
 	it("cancels running bash commands with abortBash", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

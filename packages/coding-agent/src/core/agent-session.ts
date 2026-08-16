@@ -277,7 +277,7 @@ import {
 } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
-import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
+import { type BashOperations, createLocalBashOperations, DEFAULT_COMMAND_TIMEOUT_SECONDS } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
@@ -10517,6 +10517,7 @@ export class AgentSession {
 				{
 					onChunk,
 					signal: this._bashAbortController.signal,
+					timeout: this.settingsManager.getCommandTimeoutSeconds() ?? DEFAULT_COMMAND_TIMEOUT_SECONDS,
 				},
 			);
 
