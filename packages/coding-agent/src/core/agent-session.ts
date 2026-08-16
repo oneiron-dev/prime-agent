@@ -974,10 +974,11 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const KERNEL_STATE_NAME_LIMIT = 128;
 
-function summarizeKernelNames(names: string[]): string {
-	const shown = names.slice(0, KERNEL_STATE_NAME_LIMIT);
-	const omitted = names.length - shown.length;
-	return `${shown.join(", ")}${omitted > 0 ? `, … (${omitted} additional names available via IPython)` : ""}`;
+function summarizeKernelNames(names: string[], availability = "available via IPython"): string {
+	if (names.length <= KERNEL_STATE_NAME_LIMIT) return names.join(", ");
+	const head = Math.ceil(KERNEL_STATE_NAME_LIMIT / 2);
+	const tail = KERNEL_STATE_NAME_LIMIT - head;
+	return `${names.slice(0, head).join(", ")}, … (${names.length - head - tail} additional names ${availability}), ${names.slice(-tail).join(", ")}`;
 }
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 
@@ -6968,7 +6969,10 @@ export class AgentSession {
 		}
 		if (result.failed.length > 0) {
 			lines.push(
-				`These could not be restored and must be recreated if needed: ${summarizeKernelNames(result.failed.map((f) => f.name))}.`,
+				`These could not be restored and must be recreated if needed: ${summarizeKernelNames(
+					result.failed.map((f) => f.name),
+					"not restored",
+				)}.`,
 			);
 		}
 		lines.push("</ipython_state_restored>");

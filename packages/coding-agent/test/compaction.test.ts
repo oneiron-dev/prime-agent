@@ -604,4 +604,38 @@ describe.skipIf(!process.env.ANTHROPIC_OAUTH_TOKEN)("LLM summarization", () => {
 		console.log("Original messages:", loaded.messages.length);
 		console.log("After compaction:", reloaded.messages.length);
 	}, 60000);
+	describe("synthetic state retention", () => {
+		it("does not retain an oversized IPython state notice when cutting at the next user boundary", () => {
+			const entries = [
+				{
+					type: "message",
+					id: "old",
+					parentId: null,
+					timestamp: "2026-01-01T00:00:00.000Z",
+					message: createUserMessage("old request"),
+				},
+				{
+					type: "custom_message",
+					id: "state",
+					parentId: "old",
+					timestamp: "2026-01-01T00:00:01.000Z",
+					customType: "ipython_state",
+					content: "x".repeat(300_000),
+					display: false,
+				},
+				{
+					type: "message",
+					id: "recent",
+					parentId: "state",
+					timestamp: "2026-01-01T00:00:02.000Z",
+					message: createUserMessage("recent request"),
+				},
+			] as SessionEntry[];
+			const cut = findCutPoint(entries, 0, entries.length, 1);
+			expect(cut.firstKeptEntryIndex).toBe(2);
+			const preparation = prepareCompaction(entries, { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 1 });
+			expect(preparation?.messagesToSummarize.some((message) => message.role === "custom")).toBe(false);
+			expect(preparation?.firstKeptEntryId).toBe("recent");
+		});
+	});
 });

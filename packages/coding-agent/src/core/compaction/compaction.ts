@@ -120,8 +120,7 @@ const SYNTHETIC_COMPACTION_TYPES = new Set([
 	"heartbeat_prompt",
 	"ipython_state",
 	"ipython_state_restored",
-	"goal",
-	"worker_recovery",
+	"prime-agent.worker_recovery",
 ]);
 
 function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | undefined {
@@ -362,6 +361,15 @@ export function estimateTokens(message: AgentMessage): number {
  * and will be kept.
  * BashExecutionMessage is treated like a user message (user-initiated context).
  */
+function isSyntheticCompactionEntry(entry: SessionEntry): boolean {
+	return entry.type === "custom_message" && SYNTHETIC_COMPACTION_TYPES.has(entry.customType);
+}
+
+function estimateEntryTokens(entry: SessionEntry): number {
+	const message = getMessageFromEntry(entry);
+	return message ? estimateTokens(message) : 0;
+}
+
 function findValidCutPoints(entries: SessionEntry[], startIndex: number, endIndex: number): number[] {
 	const cutPoints: number[] = [];
 	for (let i = startIndex; i < endIndex; i++) {
@@ -396,7 +404,7 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 		}
 
 		// branch_summary and custom_message are user-role messages, valid cut points
-		if (entry.type === "branch_summary" || entry.type === "custom_message") {
+		if (entry.type === "branch_summary" || (entry.type === "custom_message" && !isSyntheticCompactionEntry(entry))) {
 			cutPoints.push(i);
 		}
 	}
@@ -468,11 +476,9 @@ export function findCutPoint(
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry.type !== "message") continue;
-
-		// Estimate this message's size
-		const messageTokens = estimateTokens(entry.message);
-		accumulatedTokens += messageTokens;
+		// Include persisted custom messages: otherwise a giant synthetic state notice
+		// costs zero and can survive in the retained tail indefinitely.
+		accumulatedTokens += estimateEntryTokens(entry);
 
 		// Check if we've exceeded the budget
 		if (accumulatedTokens >= keepRecentTokens) {
@@ -611,12 +617,19 @@ export function buildSummarizationPrompt(customInstructions?: string, previousSu
  */
 /** Largest transcript supplied to one request. Keeps room for framing and provider overhead. */
 const MAX_SUMMARY_REQUEST_BYTES = 1_000_000;
+const SUMMARY_REQUEST_OVERHEAD_BYTES = 16_384;
 
-function summaryInputByteBudget(model: Model<any>, reserveTokens: number, maxTokens: number): number {
-	// Four bytes/token deliberately overestimates common tokenizers. The hard cap also
-	// prevents pathological sessions from becoming a single giant provider request.
-	const tokenBudget = Math.max(4_096, model.contextWindow - reserveTokens - maxTokens) * 4;
-	return Math.max(4_096, Math.min(MAX_SUMMARY_REQUEST_BYTES, tokenBudget - 16_384));
+function summaryRequestByteLimit(model: Model<any>, reserveTokens: number, maxTokens: number): number {
+	// Reserve output tokens, framing and a provider-tokenizer safety margin before
+	// accepting any UTF-8 input. This is intentionally below the nominal window.
+	const tokenBytes = Math.max(4_096, model.contextWindow - reserveTokens - maxTokens) * 4;
+	return Math.max(4_096, Math.min(MAX_SUMMARY_REQUEST_BYTES, tokenBytes - SUMMARY_REQUEST_OVERHEAD_BYTES));
+}
+
+function elideSummaryForRequest(summary: string, limit: number): string {
+	if (Buffer.byteLength(summary, "utf8") <= limit) return summary;
+	const kept = Math.max(256, Math.floor(limit / 2));
+	return `${summary.slice(0, kept)}\n[... prior summary elided for request safety ...]\n${summary.slice(-kept)}`;
 }
 
 /** Generate a summary with byte-bounded, rolling partwise compaction. */
@@ -632,19 +645,28 @@ export async function generateSummary(
 	thinkingLevel?: ThinkingLevel,
 ): Promise<string> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
-	const basePrompt = buildSummarizationPrompt(customInstructions);
+	const requestLimit = summaryRequestByteLimit(model, reserveTokens, maxTokens);
 	const chunks = splitConversationForSummary(
 		convertToLlm(currentMessages),
-		summaryInputByteBudget(model, reserveTokens, maxTokens),
+		Math.max(1_024, Math.floor(requestLimit / 3)),
 	);
 	let rollingSummary = previousSummary;
 	for (const conversationText of chunks) {
+		const instructions = rollingSummary
+			? buildSummarizationPrompt(customInstructions, rollingSummary)
+			: buildSummarizationPrompt(customInstructions);
+		const fixedBytes = Buffer.byteLength(
+			`<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`,
+			"utf8",
+		);
+		const availableSummaryBytes = Math.max(512, requestLimit - fixedBytes - 64);
+		const prior = rollingSummary ? elideSummaryForRequest(rollingSummary, availableSummaryBytes) : undefined;
 		let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-		if (rollingSummary) promptText += `<previous-summary>\n${rollingSummary}\n</previous-summary>\n\n`;
-		promptText += rollingSummary ? buildSummarizationPrompt(customInstructions, rollingSummary) : basePrompt;
+		if (prior) promptText += `<previous-summary>\n${prior}\n</previous-summary>\n\n`;
+		promptText += instructions;
 		const bytes = Buffer.byteLength(promptText, "utf8");
-		const limit = summaryInputByteBudget(model, reserveTokens, maxTokens) + 16_384;
-		if (bytes > limit) throw new Error(`Summary request exceeds safe UTF-8 byte budget (${bytes} > ${limit})`);
+		if (bytes > requestLimit)
+			throw new Error(`Summary request exceeds safe UTF-8 byte budget (${bytes} > ${requestLimit})`);
 		const response = await completeSimple(
 			model,
 			{

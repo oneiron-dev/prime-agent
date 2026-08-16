@@ -101,9 +101,12 @@ function truncateForSummary(text: string, maxChars: number): string {
  * reasonable token budgets. Full content is not needed for summarization.
  */
 const TOOL_ARGUMENT_MAX_CHARS = 2_000;
+const ORDINARY_MESSAGE_MAX_CHARS = 64 * 1024;
 
 function boundedText(text: string, maxChars: number): string {
-	return truncateForSummary(text, maxChars);
+	if (text.length <= maxChars) return text;
+	const kept = Math.floor((maxChars - 80) / 2);
+	return `${text.slice(0, kept)}\n\n[... ${text.length - kept * 2} characters elided ...]\n\n${text.slice(-kept)}`;
 }
 
 /** Serialize one message. Tool inputs and outputs are bounded independently. */
@@ -116,16 +119,16 @@ function serializeMessageForSummary(msg: Message, bounded = false): string | und
 						.filter((c): c is { type: "text"; text: string } => c.type === "text")
 						.map((c) => c.text)
 						.join("");
-		return content ? `[User]: ${bounded ? boundedText(content, TOOL_ARGUMENT_MAX_CHARS) : content}` : undefined;
+		return content ? `[User]: ${bounded ? boundedText(content, ORDINARY_MESSAGE_MAX_CHARS) : content}` : undefined;
 	}
 	if (msg.role === "assistant") {
 		const parts: string[] = [];
 		for (const block of msg.content) {
 			if (block.type === "text")
-				parts.push(`[Assistant]: ${bounded ? boundedText(block.text, TOOL_ARGUMENT_MAX_CHARS) : block.text}`);
+				parts.push(`[Assistant]: ${bounded ? boundedText(block.text, ORDINARY_MESSAGE_MAX_CHARS) : block.text}`);
 			else if (block.type === "thinking")
 				parts.push(
-					`[Assistant thinking]: ${bounded ? boundedText(block.thinking, TOOL_ARGUMENT_MAX_CHARS) : block.thinking}`,
+					`[Assistant thinking]: ${bounded ? boundedText(block.thinking, ORDINARY_MESSAGE_MAX_CHARS) : block.thinking}`,
 				);
 			else if (block.type === "toolCall")
 				parts.push(
@@ -139,7 +142,7 @@ function serializeMessageForSummary(msg: Message, bounded = false): string | und
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
 			.map((c) => c.text)
 			.join("");
-		return content ? `[Tool result]: ${boundedText(content, TOOL_RESULT_MAX_CHARS)}` : undefined;
+		return content ? `[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}` : undefined;
 	}
 	return undefined;
 }
