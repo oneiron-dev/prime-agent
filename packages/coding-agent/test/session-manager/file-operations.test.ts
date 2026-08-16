@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 interface FileLinesModule {
 	readFirstLineSync(filePath: string, maxBytes?: number): string | undefined;
-	readLinesAsBuffers(filePath: string): AsyncGenerator<Buffer>;
+	readLinesAsBuffers(filePath: string, start?: number): AsyncGenerator<Buffer>;
 }
 
 type ReadLinesAsBuffers = FileLinesModule["readLinesAsBuffers"];
@@ -254,6 +254,28 @@ describe("readSessionInfo", () => {
 		expect(sizeChanged?.messageCount).toBe(2);
 		expect(sizeChanged).not.toBe(mtimeChanged);
 		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledTimes(3);
+	});
+
+	it("reads only appended JSONL bytes after a large completed prefix", async () => {
+		const file = join(tempDir, "append-only.jsonl");
+		const header = JSON.stringify({
+			type: "session",
+			id: "append-only",
+			timestamp: "2025-01-01T00:00:00Z",
+			cwd: tempDir,
+		});
+		const largePrefix = `${header}\n${" ".repeat(2 * 1024 * 1024)}\n`;
+		writeFileSync(file, largePrefix);
+		await readSessionInfo(file);
+		fileLineMocks.readLinesAsBuffers.mockClear();
+		const start = statSync(file).size;
+		writeFileSync(
+			file,
+			`${largePrefix}${JSON.stringify({ type: "message", id: "tail", timestamp: "2025-01-01T00:00:01Z", message: { role: "user", content: "tail", timestamp: 1 } })}\n`,
+		);
+
+		await expect(readSessionInfo(file)).resolves.toMatchObject({ messageCount: 1, firstMessage: "tail" });
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledWith(file, start);
 	});
 
 	it("does not cache a transient stream failure and clears its concurrent flight", async () => {

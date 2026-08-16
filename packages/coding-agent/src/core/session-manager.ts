@@ -25,7 +25,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "fs";
-import { readdir, readFile, stat } from "fs/promises";
+import { open, readdir, readFile, stat } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
@@ -1155,10 +1155,23 @@ function extractOversizedMessageSummary(line: string): {
 	};
 }
 
+interface SessionInfoScanState {
+	header: SessionHeader;
+	messageCount: number;
+	firstMessage: string;
+	allMessagesText: string;
+	name: string | undefined;
+	state: SessionState | undefined;
+	agentStatus: AgentStatus | undefined;
+	lastActivityTime: number | undefined;
+}
+
 interface SessionInfoCacheEntry {
 	size: number;
 	mtimeMs: number;
+	ino: number;
 	info: SessionInfo | null;
+	state?: SessionInfoScanState;
 }
 
 const SESSION_INFO_SCAN_FAILED = Symbol("session-info-scan-failed");
@@ -1168,6 +1181,21 @@ const SESSION_INFO_SCAN_FAILED = Symbol("session-info-scan-failed");
 const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
 const sessionInfoReadsInFlight = new Map<string, Promise<SessionInfo | null>>();
 
+async function endsWithNewline(filePath: string, size: number): Promise<boolean> {
+	if (size === 0) return true;
+	try {
+		const handle = await open(filePath, "r");
+		try {
+			const byte = Buffer.alloc(1);
+			return (await handle.read(byte, 0, 1, size - 1)).bytesRead === 1 && byte[0] === 0x0a;
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return false;
+	}
+}
+
 async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null> {
 	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
@@ -1176,17 +1204,35 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 		return null;
 	}
 	const cached = sessionInfoCache.get(filePath);
-	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
-		return cached.info;
-	}
-	const result = await scanSessionInfo(filePath, stats);
-	if (result === SESSION_INFO_SCAN_FAILED) {
+	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) return cached.info;
+
+	// JSONL session logs append. Reuse metadata from the completed prefix; a rewrite,
+	// truncate, inode change, or incomplete prior suffix falls back to a full scan.
+	const canAppend =
+		cached?.state &&
+		cached.ino === stats.ino &&
+		stats.size > cached.size &&
+		(await endsWithNewline(filePath, cached.size));
+	const result = await scanSessionInfo(
+		filePath,
+		stats,
+		canAppend ? cached.state : undefined,
+		canAppend ? cached.size : 0,
+	);
+	if (result === SESSION_INFO_SCAN_FAILED) return null;
+	if (result === null) {
+		sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, ino: stats.ino, info: null });
 		return null;
 	}
-	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info: result });
-	return result;
+	sessionInfoCache.set(filePath, {
+		size: stats.size,
+		mtimeMs: stats.mtimeMs,
+		ino: stats.ino,
+		info: result.info,
+		state: result.state,
+	});
+	return result.info;
 }
-
 export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
 	const inFlight = sessionInfoReadsInFlight.get(filePath);
 	if (inFlight) {
@@ -1207,18 +1253,20 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 async function scanSessionInfo(
 	filePath: string,
 	stats: Awaited<ReturnType<typeof stat>>,
-): Promise<SessionInfo | null | typeof SESSION_INFO_SCAN_FAILED> {
+	seed?: SessionInfoScanState,
+	start = 0,
+): Promise<{ info: SessionInfo; state: SessionInfoScanState } | null | typeof SESSION_INFO_SCAN_FAILED> {
 	try {
-		let header: SessionHeader | undefined;
-		let messageCount = 0;
-		let firstMessage = "";
-		let allMessagesText = "";
-		let name: string | undefined;
-		let state: SessionState | undefined;
-		let agentStatus: AgentStatus | undefined;
-		let lastActivityTime: number | undefined;
+		let header: SessionHeader | undefined = seed?.header;
+		let messageCount = seed?.messageCount ?? 0;
+		let firstMessage = seed?.firstMessage ?? "";
+		let allMessagesText = seed?.allMessagesText ?? "";
+		let name: string | undefined = seed?.name;
+		let state: SessionState | undefined = seed?.state;
+		let agentStatus: AgentStatus | undefined = seed?.agentStatus;
+		let lastActivityTime: number | undefined = seed?.lastActivityTime;
 
-		for await (const lineBuffer of readLinesAsBuffers(filePath)) {
+		for await (const lineBuffer of readLinesAsBuffers(filePath, start)) {
 			const line = lineBuffer.toString("utf8");
 			if (!line.trim()) continue;
 
@@ -1297,20 +1345,33 @@ async function scanSessionInfo(
 		const rlmDepth = resolveSessionRlmDepth(header, filePath);
 		const modified = getSessionModifiedDateFromLastActivity(lastActivityTime, header, stats.mtime);
 
-		return {
-			path: filePath,
-			id: header.id,
-			cwd,
+		const scanState: SessionInfoScanState = {
+			header,
+			messageCount,
+			firstMessage,
+			allMessagesText,
 			name,
 			state,
-			parentSessionPath,
-			rlmDepth,
-			created: new Date(header.timestamp),
-			modified,
-			messageCount,
-			firstMessage: firstMessage || "(no messages)",
-			allMessagesText,
 			agentStatus,
+			lastActivityTime,
+		};
+		return {
+			info: {
+				path: filePath,
+				id: header.id,
+				cwd,
+				name,
+				state,
+				parentSessionPath,
+				rlmDepth,
+				created: new Date(header.timestamp),
+				modified,
+				messageCount,
+				firstMessage: firstMessage || "(no messages)",
+				allMessagesText,
+				agentStatus,
+			},
+			state: scanState,
 		};
 	} catch {
 		return SESSION_INFO_SCAN_FAILED;

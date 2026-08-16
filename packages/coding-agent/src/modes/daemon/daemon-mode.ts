@@ -434,6 +434,8 @@ export function isTerminalRemoteAgentMessageError(error: unknown): error is Erro
 	);
 }
 
+const AGENT_FAMILY_ROSTER_TIMEOUT_MS = 5_000;
+
 export class AgentDaemon {
 	private server?: Server;
 	private shuttingDown = false;
@@ -1156,6 +1158,7 @@ export class AgentDaemon {
 	private async scanPassiveRlmSubagents(
 		savedRoots: SessionInfo[],
 		includeResident: boolean,
+		residentStates: Iterable<ActiveSessionState> = this.sessions.values(),
 	): Promise<PassiveRlmSubagent[]> {
 		const passive: PassiveRlmSubagent[] = [];
 		const visit = async (
@@ -1184,7 +1187,7 @@ export class AgentDaemon {
 			}
 		};
 		const residentRootPaths = new Set<string>();
-		for (const parentState of this.sessions.values()) {
+		for (const parentState of residentStates) {
 			const parentFile = parentState.runtime.session.sessionFile;
 			// An in-memory session cannot own a persisted registry.
 			if (!parentFile) continue;
@@ -5136,10 +5139,15 @@ export class AgentDaemon {
 		};
 	}
 
-	private async createAgentFamilyCatalog(currentState?: ActiveSessionState): Promise<AgentFamilyCatalogEntry[]> {
+	private async createAgentFamilyCatalog(
+		currentState?: ActiveSessionState,
+		includeSavedRoots = true,
+	): Promise<AgentFamilyCatalogEntry[]> {
 		const current =
 			currentState ?? [...this.sessions.values()].find((state) => !this.bindingSessions.has(state.activeSessionId));
-		const passiveRlmSubagents = await this.listPassiveRlmSubagents();
+		const passiveRlmSubagents = current?.runtime.session.sessionManager
+			? await this.scanPassiveRlmSubagents([], false, [current])
+			: await this.listPassiveRlmSubagents();
 		const listed = current ? await this.createAgentMessageListResult(current, passiveRlmSubagents) : { agents: [] };
 		const remotePeers = new Set(this.remoteAgentPeers.values());
 		const localAgents = current
@@ -5148,21 +5156,25 @@ export class AgentDaemon {
 		const activePaths = new Set(
 			localAgents.flatMap((agent) => (agent.sessionPath ? [canonicalSessionPath(agent.sessionPath)] : [])),
 		);
-		const savedRoots = (await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir))
-			.filter(
-				(info) =>
-					(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&
-					!activePaths.has(canonicalSessionPath(info.path)),
-			)
-			.map(
-				(info): AgentFamilyCatalogEntry => ({
-					id: info.id,
-					...(info.name ? { name: info.name } : {}),
-					depth: info.rlmDepth ?? 0,
-					status: "inactive",
-					sessionPath: canonicalSessionPath(info.path),
-				}),
-			);
+		// A roster can only expose the caller's immediate family. Do not enumerate
+		// every saved root for it; the global catalog is retained for name safety.
+		const savedRoots = includeSavedRoots
+			? (await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir))
+					.filter(
+						(info) =>
+							(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&
+							!activePaths.has(canonicalSessionPath(info.path)),
+					)
+					.map(
+						(info): AgentFamilyCatalogEntry => ({
+							id: info.id,
+							...(info.name ? { name: info.name } : {}),
+							depth: info.rlmDepth ?? 0,
+							status: "inactive",
+							sessionPath: canonicalSessionPath(info.path),
+						}),
+					)
+			: [];
 		const byId = new Map<string, AgentFamilyCatalogEntry>(savedRoots.map((entry) => [entry.id, entry]));
 		const addAgent = (agent: AgentSessionMessageAgentSummary) => {
 			const depth = agent.rlmDepth ?? 0;
@@ -5200,10 +5212,28 @@ export class AgentDaemon {
 	}
 
 	private async createAgentFamilyRoster(currentState: ActiveSessionState): Promise<AgentFamilyRosterResult> {
-		const catalog = await this.createAgentFamilyCatalog(currentState);
-		const current = catalog.find((entry) => entry.id === currentState.runtime.session.sessionId);
-		if (!current) throw new Error("Current agent is missing from the family catalog");
-		return buildAgentFamilyRoster(current, catalog);
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const catalog = await Promise.race([
+				this.createAgentFamilyCatalog(currentState, false),
+				new Promise<never>((_, reject) => {
+					timeout = setTimeout(
+						() =>
+							reject(
+								new Error(
+									"Agent family roster timed out; wait for the current scan to finish before retrying.",
+								),
+							),
+						AGENT_FAMILY_ROSTER_TIMEOUT_MS,
+					);
+				}),
+			]);
+			const current = catalog.find((entry) => entry.id === currentState.runtime.session.sessionId);
+			if (!current) throw new Error("Current agent is missing from the family catalog");
+			return buildAgentFamilyRoster(current, catalog);
+		} finally {
+			if (timeout) clearTimeout(timeout);
+		}
 	}
 
 	private async assertFamilySessionNameAvailable(
