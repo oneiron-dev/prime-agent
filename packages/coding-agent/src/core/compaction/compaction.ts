@@ -712,6 +712,8 @@ export interface CompactionPreparation {
 	previousSummary?: string;
 	/** Opaque checkpoint from the previous remote compaction, for native replay. */
 	previousRemoteCompaction?: RemoteCompactionState;
+	previousRemoteTokensBefore?: number;
+	previousRemoteTimestamp?: string;
 	/** File operations extracted from messagesToSummarize */
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
@@ -737,12 +739,16 @@ export function prepareCompaction(
 
 	let previousSummary: string | undefined;
 	let previousRemoteCompaction: RemoteCompactionState | undefined;
+	let previousRemoteTokensBefore: number | undefined;
+	let previousRemoteTimestamp: string | undefined;
 	let boundaryStart = 0;
 	if (prevCompactionIndex >= 0 && !options.restartFromRoot) {
 		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
 		if (prevCompaction.mechanism === "remote") {
 			if (isValidRemoteCompactionState(prevCompaction.remoteCompaction)) {
 				previousRemoteCompaction = prevCompaction.remoteCompaction;
+				previousRemoteTokensBefore = prevCompaction.tokensBefore;
+				previousRemoteTimestamp = prevCompaction.timestamp;
 				const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
 				boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
 			}
@@ -812,6 +818,8 @@ export function prepareCompaction(
 		tokensBefore,
 		previousSummary,
 		previousRemoteCompaction,
+		previousRemoteTokensBefore,
+		previousRemoteTimestamp,
 		fileOps,
 		settings,
 	};
@@ -938,12 +946,15 @@ export function remoteCompactionCompatibilityError(model: Model<any>, mode: Comp
 
 /** Opaque remote checkpoints preserve input verbatim; never replay bulky synthetic state. */
 export function hasOversizedSyntheticRemoteCheckpoint(state: RemoteCompactionState, maxBytes = 16 * 1024): boolean {
-	for (const item of state.items) {
-		const text = JSON.stringify(item);
-		if (Buffer.byteLength(text, "utf8") > maxBytes && /<ipython_state(?:_restored)?|<heartbeat/i.test(text))
-			return true;
-	}
-	return false;
+	const visit = (value: unknown, seen: Set<object>, depth: number): boolean => {
+		if (typeof value === "string")
+			return Buffer.byteLength(value, "utf8") > maxBytes && /<ipython_state(?:_restored)?|<heartbeat/i.test(value);
+		if (!value || typeof value !== "object" || depth > 8 || seen.has(value)) return false;
+		seen.add(value);
+		for (const child of Object.values(value)) if (visit(child, seen, depth + 1)) return true;
+		return false;
+	};
+	return state.items.some((item) => visit(item, new Set(), 0));
 }
 
 /** A remote checkpoint that barely reduced a near-window context must migrate locally. */
@@ -953,8 +964,19 @@ export function isIneffectiveRemoteCompaction(
 	contextWindow: number,
 ): boolean {
 	if (tokensBefore <= 0 || contextWindow <= 0) return false;
-	const reduction = 1 - postTokens / tokensBefore;
-	return postTokens >= contextWindow * 0.8 && reduction < 0.15;
+	return postTokens >= contextWindow * 0.8 && 1 - postTokens / tokensBefore < 0.15;
+}
+
+export function shouldMigrateRemoteCheckpoint(
+	state: RemoteCompactionState,
+	tokensBefore: number,
+	firstPostTokens: number | undefined,
+	contextWindow: number,
+): boolean {
+	return (
+		hasOversizedSyntheticRemoteCheckpoint(state) ||
+		(firstPostTokens !== undefined && isIneffectiveRemoteCompaction(tokensBefore, firstPostTokens, contextWindow))
+	);
 }
 
 export function canReplayRemoteCompaction(state: RemoteCompactionState, model: Model<any>): boolean {

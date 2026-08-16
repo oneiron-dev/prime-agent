@@ -114,14 +114,12 @@ import {
 	compactRemote,
 	estimateContextTokens,
 	generateBranchSummary,
-	getLastAssistantUsage,
-	hasOversizedSyntheticRemoteCheckpoint,
-	isIneffectiveRemoteCompaction,
 	prepareCompaction,
 	projectCompactionPreparationForExternalUse,
 	projectCompactionResultForExternalUse,
 	remoteCompactionCompatibilityError,
 	shouldCompact,
+	shouldMigrateRemoteCheckpoint,
 	shouldUseRemoteCompaction,
 } from "./compaction/index.js";
 import {
@@ -7169,16 +7167,24 @@ export class AgentSession {
 			};
 		} else if (shouldUseRemoteCompaction(model, compactionMode)) {
 			const priorRemote = preparation.previousRemoteCompaction;
-			const latestUsage = getLastAssistantUsage(pathEntries);
+			const firstPostUsage = preparation.previousRemoteTimestamp
+				? pathEntries.find(
+						(entry) =>
+							entry.type === "message" &&
+							entry.message.role === "assistant" &&
+							entry.message.timestamp > new Date(preparation.previousRemoteTimestamp!).getTime() &&
+							entry.message.provider === model.provider &&
+							entry.message.model === model.id,
+					)?.message.usage
+				: undefined;
 			const forceLocal =
 				priorRemote &&
-				(hasOversizedSyntheticRemoteCheckpoint(priorRemote) ||
-					(latestUsage !== undefined &&
-						isIneffectiveRemoteCompaction(
-							preparation.tokensBefore,
-							calculateContextTokens(latestUsage),
-							model.contextWindow,
-						)));
+				shouldMigrateRemoteCheckpoint(
+					priorRemote,
+					preparation.previousRemoteTokensBefore ?? 0,
+					firstPostUsage ? calculateContextTokens(firstPostUsage) : undefined,
+					model.contextWindow,
+				);
 			if (forceLocal) {
 				const localPreparation = prepareCompaction(pathEntries, settings, { restartFromRoot: true });
 				if (!localPreparation)

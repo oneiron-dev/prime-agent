@@ -6,6 +6,7 @@ import {
 	hasOversizedSyntheticRemoteCheckpoint,
 	isIneffectiveRemoteCompaction,
 	prepareCompaction,
+	shouldMigrateRemoteCheckpoint,
 	shouldUseRemoteCompaction,
 } from "../../src/core/compaction/compaction.js";
 import { convertToLlm } from "../../src/core/messages.js";
@@ -386,5 +387,7 @@ describe("remote compaction session replay", () => {
 		expect(hasOversizedSyntheticRemoteCheckpoint(state)).toBe(true);
 		expect(isIneffectiveRemoteCompaction(370_512, 341_945, 400_000)).toBe(true);
 		expect(isIneffectiveRemoteCompaction(370_512, 180_000, 400_000)).toBe(false);
+		expect(shouldMigrateRemoteCheckpoint(remoteState, 370_512, 341_945, 400_000)).toBe(true);
+		expect(shouldMigrateRemoteCheckpoint(remoteState, 370_512, 180_000, 400_000)).toBe(false);
 	});
 });
