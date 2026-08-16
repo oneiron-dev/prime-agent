@@ -26,11 +26,13 @@ import {
 } from "../session-manager.js";
 import type { CompactionMode } from "../settings-manager.js";
 import {
+	appendCompactionIntegrityNotices,
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
+	isCompactionIntegrityMarker,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
 	splitConversationForSummary,
@@ -659,7 +661,13 @@ export async function generateSummary(
 		Math.max(1_024, Math.floor(requestLimit / 3)),
 	);
 	let rollingSummary = previousSummary;
+	const integrityNotices: string[] = [];
 	for (const conversationText of chunks) {
+		// Program-generated notices are facts, not history: never pay a request for them.
+		if (isCompactionIntegrityMarker(conversationText)) {
+			integrityNotices.push(conversationText);
+			continue;
+		}
 		const instructions = rollingSummary
 			? buildSummarizationPrompt(customInstructions, rollingSummary)
 			: buildSummarizationPrompt(customInstructions);
@@ -692,7 +700,7 @@ export async function generateSummary(
 			.map((c) => c.text)
 			.join("\n");
 	}
-	return rollingSummary || "No compactable conversation content.";
+	return appendCompactionIntegrityNotices(rollingSummary || "No compactable conversation content.", integrityNotices);
 }
 
 // ============================================================================

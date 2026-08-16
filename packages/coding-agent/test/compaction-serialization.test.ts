@@ -1,6 +1,8 @@
 import type { Message } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import {
+	appendCompactionIntegrityNotices,
+	isCompactionIntegrityMarker,
 	MAX_SUMMARY_CHUNKS,
 	serializeConversation,
 	splitConversationForSummary,
@@ -145,5 +147,28 @@ describe("serializeConversation", () => {
 		expect(marker).toContain("Omitted middle chunks: 169");
 		expect(marker).toMatch(/SHA-256 of omitted chunks: [0-9a-f]{64}/);
 		expect(splitConversationForSummary(messages, 1_000)).toEqual(chunks);
+	});
+	it("keeps the integrity notice out of provider calls but inside the final summary", () => {
+		const messages: Message[] = Array.from({ length: 200 }, (_unused, index) => ({
+			role: "user" as const,
+			content: `message-${index}-${"a".repeat(900)}`,
+			timestamp: index,
+		}));
+		const chunks = splitConversationForSummary(messages, 1_000);
+		expect(chunks.length).toBe(MAX_SUMMARY_CHUNKS);
+
+		const markers = chunks.filter(isCompactionIntegrityMarker);
+		const summarizable = chunks.filter((chunk) => !isCompactionIntegrityMarker(chunk));
+		expect(markers).toHaveLength(1);
+		expect(summarizable).toHaveLength(MAX_SUMMARY_CHUNKS - 1);
+		expect(summarizable.length).toBeLessThanOrEqual(31);
+
+		const finalSummary = appendCompactionIntegrityNotices("## Goal\nmodel summary without the notice", markers);
+		expect(finalSummary).toContain("## Goal");
+		expect(finalSummary).toContain(markers[0]!);
+		expect(finalSummary).toContain("Omitted middle chunks: 169");
+		expect(finalSummary).toMatch(/SHA-256 of omitted chunks: [0-9a-f]{64}/);
+		expect(appendCompactionIntegrityNotices("## Goal\nmodel summary without the notice", markers)).toBe(finalSummary);
+		expect(appendCompactionIntegrityNotices("only summary", [])).toBe("only summary");
 	});
 });

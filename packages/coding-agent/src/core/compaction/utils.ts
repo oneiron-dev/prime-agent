@@ -180,6 +180,24 @@ export function splitConversationForSummary(messages: Message[], maxBytes: numbe
 	return capSummaryChunks(chunks);
 }
 
+/** Deterministic first line of the middle-elision notice; never model-generated. */
+export const COMPACTION_INTEGRITY_MARKER_PREFIX = "[Compaction integrity marker]";
+
+/** True when a chunk is a program-generated notice, not conversation to summarize. */
+export function isCompactionIntegrityMarker(chunk: string): boolean {
+	return chunk.startsWith(COMPACTION_INTEGRITY_MARKER_PREFIX);
+}
+
+/**
+ * Append program-generated integrity notices verbatim so the omitted-history record
+ * survives regardless of what the summarization model chose to echo.
+ */
+export function appendCompactionIntegrityNotices(summary: string, notices: string[]): string {
+	if (notices.length === 0) return summary;
+	const block = notices.join("\n\n");
+	return summary ? `${summary}\n\n${block}` : block;
+}
+
 /** Hard ceiling on summarization requests per compaction, bounding cost and latency. */
 export const MAX_SUMMARY_CHUNKS = 32;
 const HEAD_SUMMARY_CHUNKS = 2;
@@ -200,7 +218,7 @@ function capSummaryChunks(chunks: string[]): string[] {
 		omittedBytes += Buffer.byteLength(omittedChunk, "utf8");
 	}
 	const marker = [
-		"[Compaction integrity marker]",
+		COMPACTION_INTEGRITY_MARKER_PREFIX,
 		`Omitted middle chunks: ${omitted.length}`,
 		`Omitted UTF-8 bytes: ${omittedBytes}`,
 		`SHA-256 of omitted chunks: ${hash.digest("hex")}`,
