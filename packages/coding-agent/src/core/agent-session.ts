@@ -7167,16 +7167,17 @@ export class AgentSession {
 			};
 		} else if (shouldUseRemoteCompaction(model, compactionMode)) {
 			const priorRemote = preparation.previousRemoteCompaction;
-			const firstPostUsage = preparation.previousRemoteTimestamp
+			const firstPostEntry = preparation.previousRemoteTimestamp
 				? pathEntries.find(
-						(entry) =>
+						(entry): entry is SessionMessageEntry =>
 							entry.type === "message" &&
 							entry.message.role === "assistant" &&
 							entry.message.timestamp > new Date(preparation.previousRemoteTimestamp!).getTime() &&
 							entry.message.provider === model.provider &&
 							entry.message.model === model.id,
-					)?.message.usage
+					)
 				: undefined;
+			const firstPostUsage = firstPostEntry ? (firstPostEntry.message as AssistantMessage).usage : undefined;
 			const forceLocal =
 				priorRemote &&
 				shouldMigrateRemoteCheckpoint(
