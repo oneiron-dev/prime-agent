@@ -61,17 +61,28 @@ export async function pruneDeletedChildKernelCaches(sessionPath: string): Promis
 			return { outcome: "skipped_invalid", files: 0, reason: "artifact path is non-canonical" };
 		}
 
-		let files = 0;
+		const cachePaths: string[] = [];
+		// Validate the entire fixed set before unlinking either cache file.
 		for (const fileName of CHILD_KERNEL_CACHE_FILES) {
 			const cachePath = join(artifactDir, fileName);
 			if (!isContained(cachePath, artifactDir)) {
-				return { outcome: "skipped_invalid", files, reason: "cache path escapes artifact directory" };
+				return { outcome: "skipped_invalid", files: 0, reason: "cache path escapes artifact directory" };
 			}
 			try {
 				const stat = lstatSync(cachePath);
 				if (stat.isSymbolicLink() || !stat.isFile()) {
-					return { outcome: "skipped_invalid", files, reason: `cache file is not a regular file: ${fileName}` };
+					return { outcome: "skipped_invalid", files: 0, reason: `cache file is not a regular file: ${fileName}` };
 				}
+				cachePaths.push(cachePath);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+				return { outcome: "failed", files: 0, error: error instanceof Error ? error.message : String(error) };
+			}
+		}
+
+		let files = 0;
+		for (const cachePath of cachePaths) {
+			try {
 				await unlink(cachePath);
 				files += 1;
 			} catch (error) {

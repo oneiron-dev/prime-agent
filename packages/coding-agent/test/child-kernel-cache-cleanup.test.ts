@@ -65,6 +65,19 @@ describe("pruneDeletedChildKernelCaches", () => {
 		expect(existsSync(join(artifactDir, "kernel-state.json"))).toBe(true);
 	});
 
+	it("preflights both cache files before rejecting a second-file symlink", async () => {
+		const outside = join(root, "outside.json");
+		writeFileSync(outside, "keep");
+		rmSync(join(artifactDir, "kernel-state.json"));
+		symlinkSync(outside, join(artifactDir, "kernel-state.json"));
+		await expect(pruneDeletedChildKernelCaches(sessionPath)).resolves.toMatchObject({
+			outcome: "skipped_invalid",
+			files: 0,
+		});
+		expect(existsSync(join(artifactDir, "kernel-state.dill"))).toBe(true);
+		expect(existsSync(outside)).toBe(true);
+	});
+
 	it("skips non-canonical session paths", async () => {
 		const alias = join(root, "alias");
 		symlinkSync(join(root, "parent", "sub-child"), alias);

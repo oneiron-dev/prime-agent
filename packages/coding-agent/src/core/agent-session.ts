@@ -42,6 +42,7 @@ import type {
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	getLogger,
 	getResponsesCompactFallbackReason,
 	getSupportedThinkingLevels,
 	isContextOverflow,
@@ -288,6 +289,8 @@ export type { SessionStats } from "./session-stats.js";
 export { type ParsedSkillBlock, parseSkillBlock } from "./skill-blocks.js";
 
 export type RlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
+
+const log = getLogger("coding-agent.agent-session");
 
 export interface RlmChildAgentActivity {
 	kind: "waiting" | "writing" | "executing";
@@ -10095,7 +10098,10 @@ export class AgentSession {
 							childRuntime.session,
 						);
 						if (cleanup.outcome === "failed") {
-							console.warn(`Deleted RLM child ${run.id} kernel cache cleanup failed: ${cleanup.error}`);
+							log.warn("deleted RLM child kernel cache cleanup failed", {
+								childId: run.id,
+								error: cleanup.error,
+							});
 						}
 					} catch {
 						if (!this._disposed && !this._disposing) {
