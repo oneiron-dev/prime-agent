@@ -113,4 +113,18 @@ describe("serializeConversation", () => {
 		expect(chunks.every((chunk) => Buffer.byteLength(chunk, "utf8") <= 1_000)).toBe(true);
 		expect(chunks.join("\n")).not.toContain(huge);
 	});
+	it("keeps CJK, emoji, and an 18MB transcript finite under UTF-8 byte chunking", () => {
+		const adversarial = "漢字😀".repeat(300_000);
+		const chunks = splitConversationForSummary([{ role: "user", content: adversarial, timestamp: 0 }], 64 * 1024);
+		expect(chunks).toHaveLength(1);
+		expect(Buffer.byteLength(chunks[0]!, "utf8")).toBeLessThanOrEqual(64 * 1024);
+		expect(chunks[0]).toContain("Elided oversized");
+		const huge = splitConversationForSummary(
+			[{ role: "user", content: "x".repeat(18_950_049), timestamp: 0 }],
+			64 * 1024,
+		);
+		expect(huge).toHaveLength(1);
+		expect(huge[0]).not.toBe("");
+		expect(Buffer.byteLength(huge[0]!, "utf8")).toBeLessThanOrEqual(64 * 1024);
+	});
 });

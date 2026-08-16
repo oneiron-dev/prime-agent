@@ -620,10 +620,11 @@ const MAX_SUMMARY_REQUEST_BYTES = 1_000_000;
 const SUMMARY_REQUEST_OVERHEAD_BYTES = 16_384;
 
 function summaryRequestByteLimit(model: Model<any>, reserveTokens: number, maxTokens: number): number {
-	// Reserve output tokens, framing and a provider-tokenizer safety margin before
-	// accepting any UTF-8 input. This is intentionally below the nominal window.
-	const tokenBytes = Math.max(4_096, model.contextWindow - reserveTokens - maxTokens) * 4;
-	return Math.max(4_096, Math.min(MAX_SUMMARY_REQUEST_BYTES, tokenBytes - SUMMARY_REQUEST_OVERHEAD_BYTES));
+	// One UTF-8 byte per available token is deliberately tokenizer-independent:
+	// CJK and emoji can consume roughly one token per byte, unlike chars/4.
+	// Framing/output reserves are removed before admitting transcript bytes.
+	const availableInputTokens = Math.max(0, model.contextWindow - reserveTokens - maxTokens);
+	return Math.max(1, Math.min(MAX_SUMMARY_REQUEST_BYTES, availableInputTokens - SUMMARY_REQUEST_OVERHEAD_BYTES));
 }
 
 function elideSummaryForRequest(summary: string, limit: number): string {
