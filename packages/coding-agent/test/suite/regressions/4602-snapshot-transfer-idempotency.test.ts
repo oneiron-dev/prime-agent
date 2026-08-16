@@ -414,7 +414,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
 		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
 		expect(streamSnapshot).not.toHaveBeenCalled();
-		expect(close).toHaveBeenCalledOnce();
+		expect(close).not.toHaveBeenCalled();
 	});
 
 	it("holds catch-up behind duplicate validation and rejects it on mismatch", async () => {
@@ -477,7 +477,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(streamSnapshot).not.toHaveBeenCalled();
 		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
 		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
-		expect(close).toHaveBeenCalledOnce();
+		expect(close).not.toHaveBeenCalled();
 	});
 
 	it("rejects a quarantined catch-up before intentional worker stop", async () => {
@@ -602,18 +602,18 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		internals.handleWorkerFrame(reentrant.worker, frame(frames.begin));
 		internals.handleWorkerFrame(reentrant.worker, frame(frames.begin));
 		await new Promise<void>((resolve) => setImmediate(resolve));
-		expect(reentrant.close).toHaveBeenCalledOnce();
+		expect(reentrant.close).not.toHaveBeenCalled();
 		expect(reentrant.worker.transcriptCaches.has(activeSessionId)).toBe(false);
-		expect(reentrant.worker.client).toBeUndefined();
-		expect(reentrant.worker.descriptor.lifecycle).toBe("recovering");
-		expect(recoverWorker).toHaveBeenCalledWith(reentrant.worker);
+		expect(reentrant.worker.client).toBeDefined();
+		expect(reentrant.worker.descriptor.lifecycle).toBe("ready");
+		expect(recoverWorker).not.toHaveBeenCalled();
 
 		const completed = workerHarness();
 		for (const message of [frames.begin, frames.chunk, frames.end]) {
 			internals.handleWorkerFrame(completed.worker, frame(message));
 		}
 		internals.handleWorkerFrame(completed.worker, frame({ ...frames.begin, messageCount: 2 }));
-		expect(completed.close).toHaveBeenCalledOnce();
+		expect(completed.close).not.toHaveBeenCalled();
 		expect(completed.worker.transcriptCaches.has(activeSessionId)).toBe(false);
 
 		const mismatchedEnd = workerHarness();
@@ -621,7 +621,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			internals.handleWorkerFrame(mismatchedEnd.worker, frame(message));
 		}
 		internals.handleWorkerFrame(mismatchedEnd.worker, frame({ ...frames.end, lastEventSequence: 2 }));
-		expect(mismatchedEnd.close).toHaveBeenCalledOnce();
+		expect(mismatchedEnd.close).not.toHaveBeenCalled();
 		expect(mismatchedEnd.worker.transcriptCaches.has(activeSessionId)).toBe(false);
 
 		const replaced = workerHarness();
