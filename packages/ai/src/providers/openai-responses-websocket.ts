@@ -259,7 +259,11 @@ async function* events(socket: Socket, signal?: AbortSignal): AsyncGenerator<Res
 		notify();
 	};
 	const onClose: Listener = (event) => {
-		if (!completed) failure = errorFromEvent(event, "WebSocket closed before response.completed");
+		if (!completed && !failure) {
+			const closeError = errorFromEvent(event, "WebSocket closed before response.completed");
+			closeError.name = "WebSocketTransportError";
+			failure = closeError;
+		}
 		done = true;
 		notify();
 	};

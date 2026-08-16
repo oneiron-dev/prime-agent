@@ -10083,9 +10083,12 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
 
-		// Context overflow is handled by compaction, not retry
+		// Context overflow is handled by compaction, not retry. A bare post-start
+		// WebSocket close is similarly terminal: retrying an identical payload only
+		// amplifies an upstream rejection whose error frame was lost in transit.
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return false;
+		if (message.errorMessage.includes("WebSocket closed before response.completed")) return false;
 
 		if (this._isFauxProviderQueueExhausted(message)) {
 			return false;
