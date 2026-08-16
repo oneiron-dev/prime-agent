@@ -7,7 +7,12 @@
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
-import { compactOpenAIResponses, completeSimple, createOpenAIResponsesCompactionMessage } from "@earendil-works/pi-ai";
+import {
+	compactOpenAIResponses,
+	completeSimple,
+	createOpenAIResponsesCompactionMessage,
+	isContextOverflow,
+} from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -33,8 +38,8 @@ import {
 	type FileOperations,
 	formatFileOperations,
 	isCompactionIntegrityMarker,
+	MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
 	SUMMARIZATION_SYSTEM_PROMPT,
-	serializeConversation,
 	splitConversationForSummary,
 } from "./utils.js";
 
@@ -642,25 +647,47 @@ function elideSummaryForRequest(summary: string, limit: number): string {
 	return result;
 }
 
-/** Generate a summary with byte-bounded, rolling partwise compaction. */
-export async function generateSummary(
-	currentMessages: AgentMessage[],
-	model: Model<any>,
-	reserveTokens: number,
-	apiKey: string,
-	headers?: Record<string, string>,
-	signal?: AbortSignal,
-	customInstructions?: string,
-	previousSummary?: string,
-	thinkingLevel?: ThinkingLevel,
-): Promise<string> {
-	const maxTokens = Math.floor(0.8 * reserveTokens);
+/**
+ * Prompt templates for one bounded rolling summarization pass. `initial` is used for
+ * the first chunk, `update` merges each later chunk into the rolling result, so a
+ * caller's own summary semantics survive chunking instead of collapsing to one format.
+ */
+interface RollingSummaryPrompts {
+	initial(): string;
+	update(previous: string): string;
+}
+
+interface RollingSummaryOptions {
+	messages: AgentMessage[];
+	model: Model<any>;
+	reserveTokens: number;
+	maxTokens: number;
+	apiKey: string;
+	prompts: RollingSummaryPrompts;
+	headers?: Record<string, string>;
+	signal?: AbortSignal;
+	thinkingLevel?: ThinkingLevel;
+	previousSummary?: string;
+	emptyResult: string;
+	failurePrefix: string;
+	/** Chunk ceiling for this pass; split-turn passes share the global budget. */
+	maxChunks?: number;
+}
+
+/**
+ * Single bounded summarization engine: complete-message chunking, exact UTF-8 preflight,
+ * capped request count, and deterministic integrity notices. Every summarization path
+ * goes through here so none can issue an unbounded single-shot request.
+ */
+async function runRollingSummary(options: RollingSummaryOptions): Promise<string> {
+	const { model, reserveTokens, maxTokens, apiKey, prompts, headers, signal, thinkingLevel } = options;
 	const requestLimit = summaryRequestByteLimit(model, reserveTokens, maxTokens);
 	const chunks = splitConversationForSummary(
-		convertToLlm(currentMessages),
+		convertToLlm(options.messages),
 		Math.max(1_024, Math.floor(requestLimit / 3)),
+		options.maxChunks,
 	);
-	let rollingSummary = previousSummary;
+	let rollingSummary = options.previousSummary;
 	const integrityNotices: string[] = [];
 	for (const conversationText of chunks) {
 		// Program-generated notices are facts, not history: never pay a request for them.
@@ -668,9 +695,7 @@ export async function generateSummary(
 			integrityNotices.push(conversationText);
 			continue;
 		}
-		const instructions = rollingSummary
-			? buildSummarizationPrompt(customInstructions, rollingSummary)
-			: buildSummarizationPrompt(customInstructions);
+		const instructions = rollingSummary ? prompts.update(rollingSummary) : prompts.initial();
 		const fixedBytes = Buffer.byteLength(
 			`<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`,
 			"utf8",
@@ -694,13 +719,46 @@ export async function generateSummary(
 				: { maxTokens, signal, apiKey, headers },
 		);
 		if (response.stopReason === "error")
-			throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
+			throw new Error(`${options.failurePrefix}: ${response.errorMessage || "Unknown error"}`);
 		rollingSummary = response.content
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
 			.map((c) => c.text)
 			.join("\n");
 	}
-	return appendCompactionIntegrityNotices(rollingSummary || "No compactable conversation content.", integrityNotices);
+	return appendCompactionIntegrityNotices(rollingSummary || options.emptyResult, integrityNotices);
+}
+
+/** Generate a summary with byte-bounded, rolling partwise compaction. */
+export async function generateSummary(
+	currentMessages: AgentMessage[],
+	model: Model<any>,
+	reserveTokens: number,
+	apiKey: string,
+	headers?: Record<string, string>,
+	signal?: AbortSignal,
+	customInstructions?: string,
+	previousSummary?: string,
+	thinkingLevel?: ThinkingLevel,
+	maxChunks?: number,
+): Promise<string> {
+	return runRollingSummary({
+		messages: currentMessages,
+		maxChunks,
+		model,
+		reserveTokens,
+		maxTokens: Math.floor(0.8 * reserveTokens),
+		apiKey,
+		headers,
+		signal,
+		thinkingLevel,
+		previousSummary,
+		prompts: {
+			initial: () => buildSummarizationPrompt(customInstructions),
+			update: (previous) => buildSummarizationPrompt(customInstructions, previous),
+		},
+		emptyResult: "No compactable conversation content.",
+		failurePrefix: "Summarization failed",
+	});
 }
 
 // ============================================================================
@@ -853,6 +911,26 @@ Summarize the prefix to provide context for the retained suffix:
 
 Be concise. Focus on what's needed to understand the kept suffix.`;
 
+const TURN_PREFIX_UPDATE_SUMMARIZATION_PROMPT = `The messages above are ADDITIONAL earlier messages from the SAME turn prefix already summarized in <previous-summary> tags. The SUFFIX (recent work) is retained separately.
+
+Update that prefix summary so it still explains the retained suffix. RULES:
+- PRESERVE existing information from the previous prefix summary
+- ADD new decisions and work found in these messages
+- PRESERVE exact file paths, function names, and error messages
+
+Keep this EXACT format:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix.`;
+
 /**
  * Generate summaries for compaction using prepared data.
  * Returns CompactionResult - SessionManager adds uuid/parentUuid when saving.
@@ -884,7 +962,8 @@ export async function compact(
 	let summary: string;
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		// Generate both summaries in parallel
+		// Both passes run in parallel, so each gets half the global request ceiling:
+		// one compaction still issues at most MAX_SUMMARY_CHUNKS summarization requests.
 		const [historyResult, turnPrefixResult] = await Promise.all([
 			messagesToSummarize.length > 0
 				? generateSummary(
@@ -897,6 +976,7 @@ export async function compact(
 						customInstructions,
 						previousSummary,
 						thinkingLevel,
+						MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
 					)
 				: Promise.resolve("No prior history."),
 			generateTurnPrefixSummary(
@@ -907,6 +987,7 @@ export async function compact(
 				headers,
 				signal,
 				thinkingLevel,
+				MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
 			),
 		]);
 		// Merge into single summary
@@ -988,6 +1069,31 @@ export function shouldMigrateRemoteCheckpoint(
 	);
 }
 
+/** Outcome of inspecting the turns that followed a remote checkpoint. */
+export interface RemotePostCheckpointSample {
+	/** An explicit context overflow was reported; migrate without waiting for usage. */
+	overflow: boolean;
+	/** Context tokens of the first post-checkpoint turn carrying meaningful usage. */
+	postTokens?: number;
+}
+
+/**
+ * Pick the evidence that judges a remote checkpoint. A zero-usage generic error row
+ * proves nothing about checkpoint size, so it is skipped, but an explicit context
+ * overflow is decisive even with zero usage.
+ */
+export function sampleRemotePostCheckpointUsage(
+	messages: AssistantMessage[],
+	contextWindow: number,
+): RemotePostCheckpointSample {
+	for (const message of messages) {
+		if (isContextOverflow(message, contextWindow)) return { overflow: true };
+		const postTokens = calculateContextTokens(message.usage);
+		if (postTokens > 0) return { overflow: false, postTokens };
+	}
+	return { overflow: false };
+}
+
 export function canReplayRemoteCompaction(state: RemoteCompactionState, model: Model<any>): boolean {
 	return (
 		isValidRemoteCompactionState(state) &&
@@ -1064,33 +1170,23 @@ async function generateTurnPrefixSummary(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	maxChunks?: number,
 ): Promise<string> {
-	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
-	const response = await completeSimple(
+	return runRollingSummary({
+		messages,
+		maxChunks,
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
-	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	return response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
+		reserveTokens,
+		maxTokens: Math.floor(0.5 * reserveTokens), // Smaller budget for turn prefix
+		apiKey,
+		headers,
+		signal,
+		thinkingLevel,
+		prompts: {
+			initial: () => TURN_PREFIX_SUMMARIZATION_PROMPT,
+			update: () => TURN_PREFIX_UPDATE_SUMMARIZATION_PROMPT,
+		},
+		emptyResult: "No turn prefix content.",
+		failurePrefix: "Turn prefix summarization failed",
+	});
 }

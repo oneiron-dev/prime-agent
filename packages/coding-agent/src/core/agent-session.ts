@@ -119,6 +119,7 @@ import {
 	projectCompactionPreparationForExternalUse,
 	projectCompactionResultForExternalUse,
 	remoteCompactionCompatibilityError,
+	sampleRemotePostCheckpointUsage,
 	shouldCompact,
 	shouldMigrateRemoteCheckpoint,
 	shouldUseRemoteCompaction,
@@ -7171,25 +7172,30 @@ export class AgentSession {
 			};
 		} else if (shouldUseRemoteCompaction(model, compactionMode)) {
 			const priorRemote = preparation.previousRemoteCompaction;
-			const firstPostEntry = preparation.previousRemoteTimestamp
-				? pathEntries.find(
-						(entry): entry is SessionMessageEntry =>
-							entry.type === "message" &&
-							entry.message.role === "assistant" &&
-							entry.message.timestamp > new Date(preparation.previousRemoteTimestamp!).getTime() &&
-							entry.message.provider === model.provider &&
-							entry.message.model === model.id,
-					)
+			const remoteBoundaryTimestamp = preparation.previousRemoteTimestamp
+				? new Date(preparation.previousRemoteTimestamp).getTime()
 				: undefined;
-			const firstPostAssistant = firstPostEntry?.message as AssistantMessage | undefined;
-			const firstPostUsage = firstPostAssistant?.usage;
+			const postCheckpointAssistants =
+				remoteBoundaryTimestamp === undefined
+					? []
+					: pathEntries
+							.filter(
+								(entry): entry is SessionMessageEntry =>
+									entry.type === "message" &&
+									entry.message.role === "assistant" &&
+									entry.message.timestamp > remoteBoundaryTimestamp &&
+									entry.message.provider === model.provider &&
+									entry.message.model === model.id,
+							)
+							.map((entry) => entry.message as AssistantMessage);
+			const postCheckpoint = sampleRemotePostCheckpointUsage(postCheckpointAssistants, model.contextWindow);
 			const forceLocal =
 				priorRemote &&
-				((!!firstPostAssistant && isContextOverflow(firstPostAssistant, model.contextWindow)) ||
+				(postCheckpoint.overflow ||
 					shouldMigrateRemoteCheckpoint(
 						priorRemote,
 						preparation.previousRemoteTokensBefore ?? 0,
-						firstPostUsage ? calculateContextTokens(firstPostUsage) : undefined,
+						postCheckpoint.postTokens,
 						model.contextWindow,
 					));
 			if (forceLocal) {

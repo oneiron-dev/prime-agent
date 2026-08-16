@@ -160,7 +160,11 @@ export function serializeConversation(messages: Message[]): string {
  * Split a transcript only between complete messages. Oversized individual messages
  * are deterministically elided, so a provider request can never exceed its byte cap.
  */
-export function splitConversationForSummary(messages: Message[], maxBytes: number): string[] {
+export function splitConversationForSummary(
+	messages: Message[],
+	maxBytes: number,
+	maxChunks: number = MAX_SUMMARY_CHUNKS,
+): string[] {
 	if (maxBytes <= 0) throw new Error("Summary byte budget must be positive");
 	const chunks: string[] = [];
 	let chunk = "";
@@ -177,7 +181,7 @@ export function splitConversationForSummary(messages: Message[], maxBytes: numbe
 		} else chunk = candidate;
 	}
 	if (chunk) chunks.push(chunk);
-	return capSummaryChunks(chunks);
+	return capSummaryChunks(chunks, maxChunks);
 }
 
 /** Deterministic first line of the middle-elision notice; never model-generated. */
@@ -198,8 +202,14 @@ export function appendCompactionIntegrityNotices(summary: string, notices: strin
 	return summary ? `${summary}\n\n${block}` : block;
 }
 
-/** Hard ceiling on summarization requests per compaction, bounding cost and latency. */
+/** Hard ceiling on summarization requests for one compaction, bounding cost and latency. */
 export const MAX_SUMMARY_CHUNKS = 32;
+/**
+ * Split-turn compaction summarizes history and turn prefix in parallel. Each side gets
+ * half the global ceiling so one compaction still cannot exceed MAX_SUMMARY_CHUNKS
+ * summarization requests in total.
+ */
+export const MAX_SPLIT_SIDE_SUMMARY_CHUNKS = MAX_SUMMARY_CHUNKS / 2;
 const HEAD_SUMMARY_CHUNKS = 2;
 
 /**
@@ -207,9 +217,9 @@ const HEAD_SUMMARY_CHUNKS = 2;
  * than MAX_SUMMARY_CHUNKS requests keeps its opening and its most recent chunks, and
  * replaces the middle with a verifiable integrity marker.
  */
-function capSummaryChunks(chunks: string[]): string[] {
-	if (chunks.length <= MAX_SUMMARY_CHUNKS) return chunks;
-	const tailCount = MAX_SUMMARY_CHUNKS - HEAD_SUMMARY_CHUNKS - 1;
+function capSummaryChunks(chunks: string[], maxChunks: number): string[] {
+	if (chunks.length <= maxChunks) return chunks;
+	const tailCount = maxChunks - HEAD_SUMMARY_CHUNKS - 1;
 	const omitted = chunks.slice(HEAD_SUMMARY_CHUNKS, chunks.length - tailCount);
 	const hash = createHash("sha256");
 	let omittedBytes = 0;
@@ -223,7 +233,7 @@ function capSummaryChunks(chunks: string[]): string[] {
 		`Omitted UTF-8 bytes: ${omittedBytes}`,
 		`SHA-256 of omitted chunks: ${hash.digest("hex")}`,
 		"This middle history was not summarized because the session exceeded the maximum",
-		`of ${MAX_SUMMARY_CHUNKS} summarization requests. Treat it as permanently lost detail.`,
+		`of ${maxChunks} summarization requests. Treat it as permanently lost detail.`,
 	].join("\n");
 	return [...chunks.slice(0, HEAD_SUMMARY_CHUNKS), marker, ...chunks.slice(chunks.length - tailCount)];
 }

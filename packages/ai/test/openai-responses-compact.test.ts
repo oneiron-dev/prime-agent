@@ -117,6 +117,35 @@ describe("OpenAI Responses remote compaction", () => {
 		).toBeUndefined();
 	});
 
+	it("treats an oversized unary compact request as a local fallback reason", () => {
+		// The compact endpoint is unary HTTP, so these are the only shapes an
+		// over-window compact can take; WebSocketTransportError is impossible here.
+		expect(
+			getResponsesCompactFallbackReason(
+				Object.assign(new Error("invalid_request_error"), { status: 400, code: "context_too_large" }),
+			),
+		).toBe("HTTP 400 compact request too large");
+		expect(
+			getResponsesCompactFallbackReason(
+				Object.assign(new Error("total message size exceeds the limit"), { status: 400 }),
+			),
+		).toBe("HTTP 400 compact request too large");
+		expect(getResponsesCompactFallbackReason(Object.assign(new Error("message_too_big"), { status: 413 }))).toBe(
+			"HTTP 413 compact request too large",
+		);
+		expect(getResponsesCompactFallbackReason(Object.assign(new Error("request_too_large"), { status: 422 }))).toBe(
+			"HTTP 422 compact request too large",
+		);
+		// A bare transport close is not a compact-endpoint condition and must not map here.
+		expect(
+			getResponsesCompactFallbackReason(
+				Object.assign(new Error("WebSocket closed before response.completed"), {
+					name: "WebSocketTransportError",
+				}),
+			),
+		).toBeUndefined();
+	});
+
 	const compactionSummaryItem = {
 		type: "compaction_summary",
 		id: "cmp_summary_1",

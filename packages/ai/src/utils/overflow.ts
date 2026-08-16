@@ -45,6 +45,7 @@ const OVERFLOW_PATTERNS = [
 	/too large for model with \d+ maximum context length/i, // Mistral
 	/model_context_window_exceeded/i, // z.ai non-standard finish_reason surfaced as error text
 	/prompt too long; exceeded (?:max )?context length/i, // Ollama explicit overflow error
+	/context_too_large/i, // OpenAI Responses / chatgpt-codex upstream rejection code
 	/context[_ ]length[_ ]exceeded/i, // Generic fallback
 	/too many tokens/i, // Generic fallback
 	/token limit exceeded/i, // Generic fallback
