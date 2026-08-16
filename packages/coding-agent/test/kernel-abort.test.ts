@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
+	isSameLinuxProcessIdentity,
 	KernelManager,
 	type KernelSentAgentMessage,
+	readLinuxProcessStartTime,
 	signalKernelProcessTree,
 } from "../src/core/kernel/index.js";
 
@@ -17,6 +19,13 @@ async function waitForCalls(mock: { mock: { calls: unknown[][] } }, count: numbe
 }
 
 describe("kernel process-tree signaling", () => {
+	it("rejects a recycled Linux PID whose starttime differs", () => {
+		if (process.platform !== "linux") return;
+		const startTime = readLinuxProcessStartTime(process.pid);
+		expect(startTime).toBeDefined();
+		expect(isSameLinuxProcessIdentity(process.pid, `${startTime}x`)).toBe(false);
+	});
+
 	it("signals the owned process group with the requested graceful signal", () => {
 		const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
 		try {

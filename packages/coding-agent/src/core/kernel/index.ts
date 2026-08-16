@@ -251,6 +251,27 @@ export function signalKernelProcessTree(pid: number, signal: NodeJS.Signals): vo
 	}
 }
 
+/** Linux PID identity is `(pid, /proc/<pid>/stat starttime)`, not PID alone. */
+export function readLinuxProcessStartTime(pid: number): string | undefined {
+	if (process.platform !== "linux") return undefined;
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const closeParen = stat.lastIndexOf(")");
+		if (closeParen === -1) return undefined;
+		// Fields after `comm` begin at field 3; starttime is field 22, index 19 here.
+		return stat
+			.slice(closeParen + 2)
+			.trim()
+			.split(/\s+/)[19];
+	} catch {
+		return undefined;
+	}
+}
+
+export function isSameLinuxProcessIdentity(pid: number, startTime: string | undefined): boolean {
+	return startTime !== undefined && readLinuxProcessStartTime(pid) === startTime;
+}
+
 function createKernelStartupAbortError(): Error {
 	return new Error("Kernel startup aborted");
 }
@@ -543,6 +564,8 @@ export class KernelManager {
 	// Set instead of `kernel` when the kernel was forked from the forkserver: it is
 	// not a direct child, so it has no ChildProcess handle and is killed by pid.
 	private kernelPid?: number;
+	/** Linux starttime captured at fork admission; prevents PID-reuse signals. */
+	private kernelStartTime?: string;
 	/** Polls a forked kernel's pid for death (no "exit" event on a non-child). */
 	private forkedLivenessTimer?: ReturnType<typeof globalThis.setInterval>;
 	private shell?: Dealer;
@@ -646,11 +669,16 @@ export class KernelManager {
 					// inherited env snapshot may be stale by fork time).
 					env: this.options.env ? { ...process.env, ...this.options.env } : { ...process.env },
 				});
+				this.kernelStartTime = readLinuxProcessStartTime(this.kernelPid);
+				if (process.platform === "linux" && this.kernelStartTime === undefined) {
+					throw new ForkServerUnavailable("could not pin forked kernel process identity");
+				}
 				forked = true;
 			} catch (err) {
 				if (!(err instanceof ForkServerUnavailable)) throw err;
 				this.appendKernelDiagnostic(`forkserver unavailable, spawning directly: ${err.message}`);
 				this.kernelPid = undefined;
+				this.kernelStartTime = undefined;
 				// A fork request that times out or loses its pid reply may still have
 				// forked a child that binds the ports in this connection file. Mint a
 				// fresh connection for the direct spawn so a possible orphan can never
@@ -755,12 +783,13 @@ export class KernelManager {
 	// pid so a dead child fails fast instead of burning the full resolve timeout.
 	private forkedKernelDied(): boolean {
 		if (this.kernelPid === undefined) return false;
+		if (process.platform === "linux") {
+			return !isSameLinuxProcessIdentity(this.kernelPid, this.kernelStartTime);
+		}
 		try {
 			process.kill(this.kernelPid, 0);
 			return false;
 		} catch (error) {
-			// EPERM means the pid exists but isn't signalable by us — still alive.
-			// Only ESRCH (no such process) is genuine death.
 			return !(error instanceof Error && (error as NodeJS.ErrnoException).code === "EPERM");
 		}
 	}
@@ -1372,6 +1401,7 @@ export class KernelManager {
 		}
 		this.kernel = undefined;
 		this.kernelPid = undefined;
+		this.kernelStartTime = undefined;
 		this.connection = undefined;
 		if (this.tempDir) {
 			try {
