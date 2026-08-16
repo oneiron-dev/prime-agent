@@ -3,7 +3,7 @@ import { PassThrough } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it, vi } from "vitest";
 import type { ActiveSessionState, DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
-import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
+import { AgentDaemon, createSnapshotTransferId } from "../../../src/modes/daemon/daemon-mode.js";
 import {
 	DAEMON_PROTOCOL_INFO,
 	type DaemonAttachResult,
@@ -171,6 +171,13 @@ function snapshotFrames(messages: AgentMessage[]) {
 }
 
 describe("ENG-4602 snapshot transfer containment", () => {
+	it("gives materializations at the same cursor distinct immutable transfer ids", () => {
+		const first = createSnapshotTransferId(activeSessionId, "generation-4602", 1);
+		const changedSnapshot = createSnapshotTransferId(activeSessionId, "generation-4602", 1);
+		expect(first).not.toBe(changedSnapshot);
+		expect(first).toMatch(new RegExp(`^${activeSessionId}-generation-4602-1-`));
+	});
+
 	it("observes the deferred attach snapshot promise", async () => {
 		const daemon = new AgentDaemon("/tmp/eng-4602-worker.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },

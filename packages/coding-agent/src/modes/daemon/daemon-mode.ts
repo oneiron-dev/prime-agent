@@ -240,6 +240,15 @@ const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
+
+/** A transfer id is immutable: a new materialization must never reuse its predecessor's bytes. */
+export function createSnapshotTransferId(
+	activeSessionId: string,
+	eventGeneration: string,
+	lastEventSequence: number,
+): string {
+	return `${activeSessionId}-${eventGeneration}-${lastEventSequence}-${randomUUID()}`;
+}
 const CHILD_PASSIVATION_BATCH_SIZE = 32;
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
@@ -3758,7 +3767,11 @@ export class AgentDaemon {
 					});
 				}
 				if (streamsSnapshot) {
-					const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+					const snapshotId = createSnapshotTransferId(
+						state.activeSessionId,
+						state.eventGeneration,
+						state.lastEventSequence,
+					);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
 						transcript = createSnapshotTranscriptChunks({
@@ -6430,7 +6443,11 @@ export class AgentDaemon {
 		state: ActiveSessionState,
 		message: Extract<DaemonOutbound, { type: "session_replaced" }>,
 	): void {
-		const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+		const snapshotId = createSnapshotTransferId(
+			state.activeSessionId,
+			state.eventGeneration,
+			state.lastEventSequence,
+		);
 		// Mark before the registry read so later events queue behind this snapshot.
 		const snapshotSignal = markClientSnapshotStreaming(client, state.activeSessionId);
 		void this.prepareReplacementSnapshot(client, state, message, snapshotId, snapshotSignal).catch((error) => {
@@ -6628,7 +6645,11 @@ export class AgentDaemon {
 							),
 						});
 					}
-					const snapshotId = `${activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+					const snapshotId = createSnapshotTransferId(
+						activeSessionId,
+						state.eventGeneration,
+						state.lastEventSequence,
+					);
 					const snapshotSignal = markClientSnapshotStreaming(client, activeSessionId);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
