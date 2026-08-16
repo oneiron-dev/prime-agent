@@ -278,6 +278,26 @@ describe("readSessionInfo", () => {
 		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledWith(file, start, expect.any(Number));
 	});
 
+	it("does not checkpoint a partial JSONL record and recovers it after completion", async () => {
+		const file = join(tempDir, "partial-record.jsonl");
+		const header = JSON.stringify({
+			type: "session",
+			id: "partial",
+			timestamp: "2025-01-01T00:00:00Z",
+			cwd: tempDir,
+		});
+		const completeMessage = JSON.stringify({
+			type: "message",
+			id: "message",
+			timestamp: "2025-01-01T00:00:01Z",
+			message: { role: "user", content: "recovered", timestamp: 1 },
+		});
+		writeFileSync(file, `${header}\n${completeMessage.slice(0, -8)}`);
+		await expect(readSessionInfo(file)).resolves.toMatchObject({ messageCount: 0, firstMessage: "(no messages)" });
+		writeFileSync(file, `${header}\n${completeMessage}\n`);
+		await expect(readSessionInfo(file)).resolves.toMatchObject({ messageCount: 1, firstMessage: "recovered" });
+	});
+
 	it("falls back to byte zero when a same-inode rewrite regrows beyond the cached size", async () => {
 		const file = join(tempDir, "rewritten.jsonl");
 		const original = createSessionContent("old");
