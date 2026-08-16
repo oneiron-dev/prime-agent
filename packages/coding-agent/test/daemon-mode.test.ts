@@ -588,6 +588,43 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("single-flights a timed-out family roster scan without encouraging unchanged retries", async () => {
+		vi.useFakeTimers();
+		try {
+			const daemon = new AgentDaemon("/tmp/prime-agent-roster-single-flight.sock", {
+				defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+				createRuntime: vi.fn(),
+			});
+			const current = makeState("roster-current");
+			current.runtime = {
+				...current.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: { ...current.runtime.session, sessionId: "roster-session", rlmDepth: 0 },
+			} as never;
+			let resolveCatalog!: (value: Array<{ id: string; depth: number; status: "idle" }>) => void;
+			const catalog = new Promise<Array<{ id: string; depth: number; status: "idle" }>>((resolve) => {
+				resolveCatalog = resolve;
+			});
+			const internals = daemon as unknown as {
+				createAgentFamilyCatalog: ReturnType<typeof vi.fn>;
+				createAgentFamilyRoster(state: ActiveSessionState): Promise<unknown>;
+			};
+			internals.createAgentFamilyCatalog = vi.fn(() => catalog);
+			const first = internals.createAgentFamilyRoster(current);
+			const second = internals.createAgentFamilyRoster(current);
+			const firstResult = expect(first).rejects.toThrow("Do not retry the unchanged request");
+			const secondResult = expect(second).rejects.toThrow("Do not retry the unchanged request");
+			await vi.advanceTimersByTimeAsync(5_000);
+			await firstResult;
+			await secondResult;
+			expect(internals.createAgentFamilyCatalog).toHaveBeenCalledOnce();
+			resolveCatalog([{ id: "roster-session", depth: 0, status: "idle" }]);
+			await Promise.resolve();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("canonicalizes symlinked paths in the family catalog and name reservations", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-family-catalog-paths-"));
 		try {

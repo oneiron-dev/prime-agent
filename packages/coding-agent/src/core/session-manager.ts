@@ -1170,6 +1170,7 @@ interface SessionInfoCacheEntry {
 	size: number;
 	mtimeMs: number;
 	ino: number;
+	fingerprint?: string;
 	info: SessionInfo | null;
 	state?: SessionInfoScanState;
 }
@@ -1181,18 +1182,22 @@ const SESSION_INFO_SCAN_FAILED = Symbol("session-info-scan-failed");
 const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
 const sessionInfoReadsInFlight = new Map<string, Promise<SessionInfo | null>>();
 
-async function endsWithNewline(filePath: string, size: number): Promise<boolean> {
-	if (size === 0) return true;
+async function sessionPrefixFingerprint(filePath: string, size: number): Promise<string | undefined> {
+	if (size === 0) return "";
 	try {
 		const handle = await open(filePath, "r");
 		try {
-			const byte = Buffer.alloc(1);
-			return (await handle.read(byte, 0, 1, size - 1)).bytesRead === 1 && byte[0] === 0x0a;
+			const width = Math.min(4096, size);
+			const first = Buffer.alloc(width);
+			const last = Buffer.alloc(width);
+			if ((await handle.read(first, 0, width, 0)).bytesRead !== width) return undefined;
+			if ((await handle.read(last, 0, width, size - width)).bytesRead !== width) return undefined;
+			return `${first.toString("base64")}:${last.toString("base64")}`;
 		} finally {
 			await handle.close();
 		}
 	} catch {
-		return false;
+		return undefined;
 	}
 }
 
@@ -1212,7 +1217,8 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 		cached?.state &&
 		cached.ino === stats.ino &&
 		stats.size > cached.size &&
-		(await endsWithNewline(filePath, cached.size));
+		cached.fingerprint !== undefined &&
+		cached.fingerprint === (await sessionPrefixFingerprint(filePath, cached.size));
 	const result = await scanSessionInfo(
 		filePath,
 		stats,
@@ -1228,6 +1234,7 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 		size: stats.size,
 		mtimeMs: stats.mtimeMs,
 		ino: stats.ino,
+		fingerprint: await sessionPrefixFingerprint(filePath, stats.size),
 		info: result.info,
 		state: result.state,
 	});
@@ -1266,7 +1273,7 @@ async function scanSessionInfo(
 		let agentStatus: AgentStatus | undefined = seed?.agentStatus;
 		let lastActivityTime: number | undefined = seed?.lastActivityTime;
 
-		for await (const lineBuffer of readLinesAsBuffers(filePath, start)) {
+		for await (const lineBuffer of readLinesAsBuffers(filePath, start, Number(stats.size) - 1)) {
 			const line = lineBuffer.toString("utf8");
 			if (!line.trim()) continue;
 

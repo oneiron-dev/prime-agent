@@ -460,6 +460,8 @@ export class AgentDaemon {
 	private readonly sessions = new Map<string, ActiveSessionState>();
 	private readonly sessionSnapshotLoads = new Map<ActiveSessionState, Promise<DaemonSessionSnapshot>>();
 	private readonly pendingPassiveRlmSubagentScans = new Map<boolean, Promise<PassiveRlmSubagent[]>>();
+	// A timed-out caller leaves this family scan running; later callers must join it.
+	private readonly agentFamilyRosterScans = new Map<string, Promise<AgentFamilyCatalogEntry[]>>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
 	/** Covers path resolution through publication in openingSessions, before the runtime promise exists. */
 	private readonly reservingSessionOpens = new Map<string, Promise<void>>();
@@ -5139,14 +5141,29 @@ export class AgentDaemon {
 		};
 	}
 
+	private findResidentAgentFamilyRoot(current: ActiveSessionState): ActiveSessionState {
+		let root = current;
+		const seen = new Set<string>();
+		while (root.runtime.metadata.parentSessionId && !seen.has(root.activeSessionId)) {
+			seen.add(root.activeSessionId);
+			const parent = [...this.sessions.values()].find(
+				(state) => state.runtime.session.sessionId === root.runtime.metadata.parentSessionId,
+			);
+			if (!parent) break;
+			root = parent;
+		}
+		return root;
+	}
+
 	private async createAgentFamilyCatalog(
 		currentState?: ActiveSessionState,
 		includeSavedRoots = true,
 	): Promise<AgentFamilyCatalogEntry[]> {
 		const current =
 			currentState ?? [...this.sessions.values()].find((state) => !this.bindingSessions.has(state.activeSessionId));
-		const passiveRlmSubagents = current?.runtime.session.sessionManager
-			? await this.scanPassiveRlmSubagents([], false, [current])
+		const familyRoot = current ? this.findResidentAgentFamilyRoot(current) : undefined;
+		const passiveRlmSubagents = familyRoot?.runtime.session.sessionManager
+			? await this.scanPassiveRlmSubagents([], true, [familyRoot])
 			: await this.listPassiveRlmSubagents();
 		const listed = current ? await this.createAgentMessageListResult(current, passiveRlmSubagents) : { agents: [] };
 		const remotePeers = new Set(this.remoteAgentPeers.values());
@@ -5211,17 +5228,36 @@ export class AgentDaemon {
 		return [...byId.values()];
 	}
 
+	private agentFamilyRosterKey(current: ActiveSessionState): string {
+		const root = this.findResidentAgentFamilyRoot(current);
+		return root.runtime.session.sessionFile
+			? canonicalSessionPath(root.runtime.session.sessionFile)
+			: root.runtime.session.sessionId;
+	}
+
+	private getAgentFamilyRosterCatalog(current: ActiveSessionState): Promise<AgentFamilyCatalogEntry[]> {
+		const key = this.agentFamilyRosterKey(current);
+		const pending = this.agentFamilyRosterScans.get(key);
+		if (pending) return pending;
+		let tracked!: Promise<AgentFamilyCatalogEntry[]>;
+		tracked = this.createAgentFamilyCatalog(current, false).finally(() => {
+			if (this.agentFamilyRosterScans.get(key) === tracked) this.agentFamilyRosterScans.delete(key);
+		});
+		this.agentFamilyRosterScans.set(key, tracked);
+		return tracked;
+	}
+
 	private async createAgentFamilyRoster(currentState: ActiveSessionState): Promise<AgentFamilyRosterResult> {
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		try {
 			const catalog = await Promise.race([
-				this.createAgentFamilyCatalog(currentState, false),
+				this.getAgentFamilyRosterCatalog(currentState),
 				new Promise<never>((_, reject) => {
 					timeout = setTimeout(
 						() =>
 							reject(
 								new Error(
-									"Agent family roster timed out; wait for the current scan to finish before retrying.",
+									"Agent family roster is still refreshing. Do not retry the unchanged request; wait for it to finish.",
 								),
 							),
 						AGENT_FAMILY_ROSTER_TIMEOUT_MS,

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 interface FileLinesModule {
 	readFirstLineSync(filePath: string, maxBytes?: number): string | undefined;
-	readLinesAsBuffers(filePath: string, start?: number): AsyncGenerator<Buffer>;
+	readLinesAsBuffers(filePath: string, start?: number, end?: number): AsyncGenerator<Buffer>;
 }
 
 type ReadLinesAsBuffers = FileLinesModule["readLinesAsBuffers"];
@@ -275,7 +275,19 @@ describe("readSessionInfo", () => {
 		);
 
 		await expect(readSessionInfo(file)).resolves.toMatchObject({ messageCount: 1, firstMessage: "tail" });
-		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledWith(file, start);
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledWith(file, start, expect.any(Number));
+	});
+
+	it("falls back to byte zero when a same-inode rewrite regrows beyond the cached size", async () => {
+		const file = join(tempDir, "rewritten.jsonl");
+		const original = createSessionContent("old");
+		writeFileSync(file, original);
+		await readSessionInfo(file);
+		fileLineMocks.readLinesAsBuffers.mockClear();
+		writeFileSync(file, `${createSessionContent("new")}${" ".repeat(original.length)}\n`);
+
+		await expect(readSessionInfo(file)).resolves.toMatchObject({ firstMessage: "new", messageCount: 1 });
+		expect(fileLineMocks.readLinesAsBuffers).toHaveBeenCalledWith(file, 0, expect.any(Number));
 	});
 
 	it("does not cache a transient stream failure and clears its concurrent flight", async () => {
