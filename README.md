@@ -9,14 +9,13 @@
 </p>
 
 <h3 align="center">
-Prime Agent: A Self-Improving RLM Agent
+Prime Agent: A Self-Improving RLM Harness
 </h3>
 
 <p align="center">
   <a href="packages/coding-agent/docs/index.md">Documentation</a> &bull;
   <a href="https://github.com/PrimeIntellect-ai/verifiers">Verifiers</a> &bull;
-  <a href="https://github.com/PrimeIntellect-ai/prime-rl">PRIME-RL</a> &bull;
-  <a href="https://github.com/badlogic/pi-mono">pi-mono</a>
+  <a href="https://github.com/PrimeIntellect-ai/prime-rl">PRIME-RL</a>
 </p>
 
 <p align="center">
@@ -25,6 +24,15 @@ Prime Agent: A Self-Improving RLM Agent
   </a>
   <a href="https://github.com/PrimeIntellect-ai/prime-agent/actions/workflows/build-binaries.yml">
     <img src="https://github.com/PrimeIntellect-ai/prime-agent/actions/workflows/build-binaries.yml/badge.svg" alt="Build Binaries" />
+  </a>
+  <a href="https://arxiv.org/abs/2608.23552">
+    <img src="https://img.shields.io/badge/arXiv-2608.23552-b31b1b.svg" alt="arXiv" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://trendshift.io/repositories/104249?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-104249" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/repositories/104249" alt="PrimeIntellect-ai%2Fprime-agent | Trendshift" width="250" height="55" />
   </a>
 </p>
 
@@ -70,7 +78,7 @@ Useful commands:
 ```bash
 prime-agent agents                   # Browse running, idle, and saved sessions
 prime-agent attach <agent>           # Reattach to a running session
-prime-agent --resume <path|id>       # Resume a saved session
+prime-agent --resume [path|id]       # Browse sessions or resume one directly
 prime-agent status                   # Inspect background service state
 prime-agent doctor [--fix]           # Inspect or repair background services
 prime-agent update [--force]         # Update Prime Agent
@@ -99,6 +107,12 @@ Prime Agent is built for long-running work, especially for evaluations in resear
 - [Architecture overview](packages/coding-agent/docs/architecture.md) — daemon, worker, kernel, and persistence boundaries
 - [Development](packages/coding-agent/docs/development.md) — build and run from source
 
+## Contributing
+
+Start with a GitHub Discussion for [general questions](https://github.com/PrimeIntellect-ai/prime-agent/discussions/categories/general), [bug reports](https://github.com/PrimeIntellect-ai/prime-agent/discussions/categories/bug-reports), and [feature requests](https://github.com/PrimeIntellect-ai/prime-agent/discussions/categories/feature-requests). Maintainers promote accepted work into Issues, and pull requests are reviewed from maintainers and vouched contributors.
+
+Read the [contribution guidelines](CONTRIBUTING.md) for the full process. Report security vulnerabilities privately by following the [security policy](SECURITY.md).
+
 ## Acknowledgements
 
 Our agent and TUI is built on top of [`pi`](https://github.com/earendil-works/pi). We thank the authors of `pi` for their valuable work.
@@ -106,3 +120,18 @@ Our agent and TUI is built on top of [`pi`](https://github.com/earendil-works/pi
 ## License
 
 Prime Agent is fully open source and released under the [MIT License](LICENSE).
+
+## Citation
+
+If you use this codebase in your research, please cite Prime Agent:
+
+```bibtex
+@article{karten2026prime,
+  title={Prime Agent: A Self-Improving RLM Harness},
+  author={Karten, Seth and Zhang, Alex L. and Thomas, Kevin and Müller, Sebastian and Bakouch, Elie and Auras, Daniel and Senghaas, Mika and Obeid, Fares and Dunas, Konstantin and Hagemann, Johannes and Jaghouar, Sami},
+  journal={arXiv preprint arXiv:2608.23552},
+  year={2026}
+}
+```
+
+Available at [https://arxiv.org/abs/2608.23552](https://arxiv.org/abs/2608.23552).

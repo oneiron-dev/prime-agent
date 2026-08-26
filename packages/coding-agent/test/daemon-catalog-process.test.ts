@@ -134,7 +134,7 @@ describe("daemon catalog list IPC", () => {
 	});
 });
 
-describe("daemon catalog selector resolution", () => {
+describe("daemon catalog saved sibling fallback", () => {
 	it("reads only a saved child's persisted sibling set", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-siblings-"));
 		const sessionDir = join(root, "sessions");
@@ -197,7 +197,9 @@ describe("daemon catalog selector resolution", () => {
 			expect.objectContaining({ id: second.getSessionId(), name: "second" }),
 		]);
 	});
+});
 
+describe("daemon catalog selector resolution", () => {
 	it("treats an exact name colliding with another session id prefix as ambiguous", () => {
 		const sessions = [
 			session("named-session-id", "target", "/tmp/by-name.jsonl"),

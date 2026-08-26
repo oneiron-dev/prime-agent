@@ -3,6 +3,7 @@ import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { rm, unlink } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { canonicalSessionPath } from "./session-lease.js";
+import { getSessionArtifactPathForFile } from "./session-manager.js";
 
 export type DeleteSessionFileResult = { ok: true; method: "trash" | "unlink" } | { ok: false; error: string };
 
@@ -102,11 +103,10 @@ export async function pruneDeletedChildKernelCaches(sessionPath: string): Promis
  * `<dirname(sessionDir)>/session-artifacts/<id>`.
  * Only invoked on delete, never on deactivation.
  */
-async function deleteSessionArtifacts(sessionPath: string): Promise<void> {
-	const sessionId = basename(sessionPath).replace(/\.jsonl$/, "");
-	if (!sessionId) return;
-	const artifactDir = join(dirname(dirname(sessionPath)), "session-artifacts", sessionId);
-	await rm(artifactDir, { recursive: true, force: true });
+export async function deleteSessionArtifacts(sessionPath: string): Promise<void> {
+	// A degenerate name (".jsonl") would resolve to the artifacts root itself.
+	if (!basename(sessionPath).replace(/\.jsonl$/, "")) return;
+	await rm(getSessionArtifactPathForFile(sessionPath), { recursive: true, force: true });
 }
 
 /** Remove the session `.jsonl`, trying the `trash` CLI first, then falling back to unlink. */

@@ -4,11 +4,12 @@ import type { AgentSession } from "./agent-session.js";
 import type { ToolDefinition } from "./extensions/index.js";
 import type { HostRequestHandler } from "./kernel/index.js";
 import type { ChildKernelCacheCleanupResult } from "./session-file-actions.js";
+import { THINKING_LEVELS } from "./thinking-levels.js";
 
+/** Request emitted by `rlm.run`; cellSourceCode preserves the spawning cell for display. */
 export interface RlmRunRequest {
 	prompt: string;
 	kwargs: Record<string, unknown>;
-	/** Source of the IPython cell that issued this rlm.run call, when available. */
 	cellSourceCode?: string;
 }
 
@@ -61,19 +62,6 @@ const RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH = 64;
 export const DEFAULT_RLM_MODEL_SEARCH_LIMIT = 8;
 export const MAX_RLM_MODEL_SEARCH_LIMIT = 20;
 
-const RLM_REASONING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
-/** Validate an explicit per-child reasoning override. */
-export function normalizeRequestedRlmSubagentReasoning(value: unknown): ThinkingLevel | undefined {
-	if (value === undefined) {
-		return undefined;
-	}
-	if (typeof value !== "string" || !RLM_REASONING_LEVELS.includes(value as ThinkingLevel)) {
-		throw new Error("rlm.run reasoning must be a Prime ThinkingLevel string");
-	}
-	return value as ThinkingLevel;
-}
-
 /** Validate and normalize an orchestrator-supplied subagent session name. */
 export function normalizeRequestedRlmSubagentSessionName(value: unknown): string | undefined {
 	if (value === undefined) {
@@ -92,7 +80,82 @@ export function normalizeRequestedRlmSubagentSessionName(value: unknown): string
 	return name;
 }
 
-/** Validate and normalize an orchestrator-supplied subagent model reference. */
+const RLM_REASONING_LEVEL_ERROR = "rlm.run reasoning must be a Prime ThinkingLevel string";
+
+/**
+ * Strictly validate an explicit reasoning level. Levels are exact-match only: no
+ * trimming and no case folding, so a caller cannot accidentally spawn at an
+ * unintended level through a typo that happens to normalize. Error wording stays
+ * byte-identical per kwarg spelling, so existing callers of either keep the exact
+ * messages they were written against.
+ */
+function normalizeRequestedRlmSubagentLevel(
+	value: unknown,
+	kwarg: "reasoning" | "thinking",
+): ThinkingLevel | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	if (typeof value !== "string") {
+		throw new Error(kwarg === "thinking" ? "rlm.run thinking must be a string" : RLM_REASONING_LEVEL_ERROR);
+	}
+	if (!THINKING_LEVELS.includes(value as ThinkingLevel)) {
+		throw new Error(
+			kwarg === "thinking"
+				? `rlm.run thinking must be one of: ${THINKING_LEVELS.join(", ")}`
+				: RLM_REASONING_LEVEL_ERROR,
+		);
+	}
+	return value as ThinkingLevel;
+}
+
+/** Validate an explicit per-child reasoning override (canonical `reasoning=`). */
+export function normalizeRequestedRlmSubagentReasoning(value: unknown): ThinkingLevel | undefined {
+	return normalizeRequestedRlmSubagentLevel(value, "reasoning");
+}
+
+/** Validate the upstream `thinking=` spelling of the same override. */
+export function normalizeRequestedRlmSubagentThinkingLevel(value: unknown): ThinkingLevel | undefined {
+	return normalizeRequestedRlmSubagentLevel(value, "thinking");
+}
+
+export interface RequestedRlmSubagentThinkingLevel {
+	level: ThinkingLevel;
+	/** Which kwarg spelling the orchestrator used, so errors stay faithful to the call. */
+	kwarg: "reasoning" | "thinking";
+}
+
+/**
+ * Accept the canonical `reasoning=` kwarg and the upstream `thinking=` alias through the
+ * same strict validator, normalizing both to one internal thinking level. Conflicting
+ * explicit values are rejected instead of silently preferring one spelling.
+ */
+export function resolveRequestedRlmSubagentThinkingLevel(
+	rawReasoning: unknown,
+	rawThinking: unknown,
+): RequestedRlmSubagentThinkingLevel | undefined {
+	const reasoning = normalizeRequestedRlmSubagentReasoning(rawReasoning);
+	const thinking = normalizeRequestedRlmSubagentThinkingLevel(rawThinking);
+	if (reasoning !== undefined && thinking !== undefined && reasoning !== thinking) {
+		throw new Error(
+			`rlm.run reasoning "${reasoning}" conflicts with thinking "${thinking}"; pass only one of reasoning/thinking`,
+		);
+	}
+	if (reasoning !== undefined) return { level: reasoning, kwarg: "reasoning" };
+	if (thinking !== undefined) return { level: thinking, kwarg: "thinking" };
+	return undefined;
+}
+
+/** Error text for an explicit level the resolved child model cannot serve. */
+export function formatUnsupportedRlmSubagentThinkingLevelError(
+	requested: RequestedRlmSubagentThinkingLevel,
+	modelSelector: string,
+	supported: readonly ThinkingLevel[],
+): string {
+	const subject = requested.kwarg === "reasoning" ? "Requested subagent reasoning" : "Requested thinking level";
+	return `${subject} "${requested.level}" is not supported by model "${modelSelector}"; supported levels: ${supported.join(", ")}`;
+}
+
 export function normalizeRequestedRlmSubagentModel(value: unknown): string | undefined {
 	if (value === undefined) {
 		return undefined;
@@ -164,7 +227,7 @@ export function findRlmModelMatches(query: string, models: Model<Api>[], limit: 
 		}));
 }
 
-/** Adapt an RlmRunHandler into the typed "rlm.run" handler for the kernel host bridge. */
+/** Adapt an RlmRunHandler into the typed `rlm.run` kernel host handler. */
 export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHandler {
 	return async (payload) => {
 		if (typeof payload.prompt !== "string") {
@@ -195,7 +258,7 @@ export function createRlmFindModelsHostHandler(handler: RlmFindModelsHandler): H
 	};
 }
 
-/** Expose the current parent session's RLM child registry to its kernel. */
+/** Expose the current parent session's direct RLM child registry to its kernel. */
 export function createRlmListSubagentsHostHandler(handler: RlmListSubagentsHandler): HostRequestHandler {
 	return async () => {
 		const { subagents } = await handler();

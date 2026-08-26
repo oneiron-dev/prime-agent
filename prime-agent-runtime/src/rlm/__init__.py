@@ -137,14 +137,21 @@ async def host_request(request_type: str, payload: dict[str, Any] | None = None)
     comm.on_msg(_on_msg)
     # request_type goes last so a payload "type" key cannot reroute the request.
     comm.open(data={**(payload or {}), "type": request_type})
-    return await future
+    try:
+        return await future
+    finally:
+        if not future.done():
+            future.cancel()
+        comm.close()
 
 
 async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
     """Spawn a recursive Prime Agent child and return once its task is admitted.
 
     ``model`` selects a child with an exact ``provider/model`` selector.
-    ``reasoning`` selects a supported Prime ThinkingLevel for that child.
+    ``reasoning`` selects a supported Prime ThinkingLevel for that child; it defaults to
+    the parent level and levels invalid for the resolved model fail the spawn.
+    ``thinking`` is accepted as an alias; passing both with different levels fails.
     """
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")

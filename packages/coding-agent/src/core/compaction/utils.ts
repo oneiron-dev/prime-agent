@@ -5,11 +5,6 @@
 import { createHash } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
-
-// ============================================================================
-// File Operation Tracking
-// ============================================================================
-
 export interface FileOperations {
 	read: Set<string>;
 	written: Set<string>;
@@ -75,11 +70,6 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 	if (sections.length === 0) return "";
 	return `\n\n${sections.join("\n\n")}`;
 }
-
-// ============================================================================
-// Message Serialization
-// ============================================================================
-
 /** Maximum characters for a tool result in serialized summaries. */
 const TOOL_RESULT_MAX_CHARS = 2000;
 
@@ -237,11 +227,6 @@ function capSummaryChunks(chunks: string[], maxChunks: number): string[] {
 	].join("\n");
 	return [...chunks.slice(0, HEAD_SUMMARY_CHUNKS), marker, ...chunks.slice(chunks.length - tailCount)];
 }
-
-// ============================================================================
-// Summarization System Prompt
-// ============================================================================
-
 export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.
 
 Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;

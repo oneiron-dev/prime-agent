@@ -43,11 +43,6 @@ import {
 	SUMMARIZATION_SYSTEM_PROMPT,
 	splitConversationForSummary,
 } from "./utils.js";
-
-// ============================================================================
-// File Operation Tracking
-// ============================================================================
-
 /** Details stored in CompactionEntry.details for file tracking */
 export interface CompactionDetails {
 	readFiles: string[];
@@ -57,14 +52,13 @@ export interface CompactionDetails {
 /**
  * Extract file operations from messages and previous compaction entries.
  */
+/** Preserve file operations recorded by prior compactions and current tool calls. */
 function extractFileOperations(
 	messages: AgentMessage[],
 	entries: SessionEntry[],
 	prevCompactionIndex: number,
 ): FileOperations {
 	const fileOps = createFileOps();
-
-	// Collect from previous compaction's details (if pi-generated)
 	if (prevCompactionIndex >= 0) {
 		const prevCompaction = entries[prevCompactionIndex] as CompactionEntry;
 		if (!prevCompaction.fromHook && prevCompaction.details) {
@@ -78,19 +72,12 @@ function extractFileOperations(
 			}
 		}
 	}
-
-	// Extract from tool calls in messages
 	for (const msg of messages) {
 		extractFileOpsFromMessage(msg, fileOps);
 	}
 
 	return fileOps;
 }
-
-// ============================================================================
-// Message Extraction
-// ============================================================================
-
 /**
  * Extract AgentMessage from an entry if it produces one.
  * Returns undefined for entries that don't contribute to LLM context.
@@ -170,11 +157,6 @@ export function projectCompactionPreparationForExternalUse(preparation: Compacti
 		turnPrefixMessages: projectAgentMessagesForExternalUse(preparation.turnPrefixMessages),
 	};
 }
-
-// ============================================================================
-// Types
-// ============================================================================
-
 export const COMPACT_SKILL_NAME = "compact";
 
 export interface CompactionSettings {
@@ -190,11 +172,6 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
 };
-
-// ============================================================================
-// Token calculation
-// ============================================================================
-
 /**
  * Calculate total context tokens from usage.
  * Uses the native totalTokens field when available, falls back to computing from components.
@@ -291,11 +268,6 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 	if (contextWindow <= 0) return false;
 	return contextTokens > contextWindow - settings.reserveTokens;
 }
-
-// ============================================================================
-// Cut point detection
-// ============================================================================
-
 /**
  * Estimate token count for a message using chars/4 heuristic.
  * This is conservative (overestimates tokens).
@@ -411,7 +383,9 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 				break;
 		}
 
-		// branch_summary and custom_message are user-role messages, valid cut points
+		// branch_summary and custom_message are user-role turn boundaries, and so valid
+		// cut points. Synthetic compaction entries are not: cutting there would drop the
+		// summary they belong to.
 		if (entry.type === "branch_summary" || (entry.type === "custom_message" && !isSyntheticCompactionEntry(entry))) {
 			cutPoints.push(i);
 		}
@@ -427,7 +401,6 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 export function findTurnStartIndex(entries: SessionEntry[], entryIndex: number, startIndex: number): number {
 	for (let i = entryIndex; i >= startIndex; i--) {
 		const entry = entries[i];
-		// branch_summary and custom_message are user-role messages, can start a turn
 		if (entry.type === "branch_summary" || entry.type === "custom_message") {
 			return i;
 		}
@@ -477,8 +450,6 @@ export function findCutPoint(
 	if (cutPoints.length === 0) {
 		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
 	}
-
-	// Walk backwards from newest, accumulating estimated message sizes
 	let accumulatedTokens = 0;
 	let cutIndex = cutPoints[0]; // Default: keep from first message (not header)
 
@@ -490,7 +461,6 @@ export function findCutPoint(
 
 		// Check if we've exceeded the budget
 		if (accumulatedTokens >= keepRecentTokens) {
-			// Find the closest valid cut point at or after this entry
 			for (let c = 0; c < cutPoints.length; c++) {
 				if (cutPoints[c] >= i) {
 					cutIndex = cutPoints[c];
@@ -500,8 +470,6 @@ export function findCutPoint(
 			break;
 		}
 	}
-
-	// Scan backwards from cutIndex to include any non-message entries (bash, settings, etc.)
 	while (cutIndex > startIndex) {
 		const prevEntry = entries[cutIndex - 1];
 		// Stop at session header or compaction boundaries
@@ -509,16 +477,13 @@ export function findCutPoint(
 			break;
 		}
 		if (prevEntry.type === "message") {
-			// Stop if we hit any message
 			break;
 		}
-		// Include this non-message entry (bash, settings change, etc.)
 		cutIndex--;
 	}
-
-	// Determine if this is a split turn
 	const cutEntry = entries[cutIndex];
 	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
+	// A cut in a non-user turn requires a prefix summary.
 	const turnStartIndex = isUserMessage ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
 
 	return {
@@ -527,11 +492,6 @@ export function findCutPoint(
 		isSplitTurn: !isUserMessage && turnStartIndex !== -1,
 	};
 }
-
-// ============================================================================
-// Summarization
-// ============================================================================
-
 const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
 Use this EXACT format:
@@ -761,11 +721,6 @@ export async function generateSummary(
 		failurePrefix: "Summarization failed",
 	});
 }
-
-// ============================================================================
-// Compaction Preparation (for extensions)
-// ============================================================================
-
 export interface CompactionPreparation {
 	/** UUID of first entry to keep */
 	firstKeptEntryId: string;
@@ -831,8 +786,6 @@ export function prepareCompaction(
 	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
 
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
-
-	// Get UUID of first kept entry
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
 	if (!firstKeptEntry?.id) {
 		return undefined; // Session needs migration
@@ -840,15 +793,11 @@ export function prepareCompaction(
 	const firstKeptEntryId = firstKeptEntry.id;
 
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
-
-	// Messages to summarize (will be discarded after summary)
 	const messagesToSummarize: AgentMessage[] = [];
 	for (let i = boundaryStart; i < historyEnd; i++) {
 		const msg = getMessageFromEntryForCompaction(pathEntries[i]);
 		if (msg) messagesToSummarize.push(msg);
 	}
-
-	// Messages for turn prefix summary (if splitting a turn)
 	const turnPrefixMessages: AgentMessage[] = [];
 	if (cutPoint.isSplitTurn) {
 		for (let i = cutPoint.turnStartIndex; i < cutPoint.firstKeptEntryIndex; i++) {
@@ -867,11 +816,8 @@ export function prepareCompaction(
 	) {
 		return undefined;
 	}
-
-	// Extract file operations from messages and previous compaction
 	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
-
-	// Also extract file ops from turn prefix if splitting
+	// Split turns retain their suffix, but their prefix file operations still belong in the summary.
 	if (cutPoint.isSplitTurn) {
 		for (const msg of turnPrefixMessages) {
 			extractFileOpsFromMessage(msg, fileOps);
@@ -892,11 +838,6 @@ export function prepareCompaction(
 		settings,
 	};
 }
-
-// ============================================================================
-// Main compaction function
-// ============================================================================
-
 const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
 
 Summarize the prefix to provide context for the retained suffix:
@@ -958,8 +899,6 @@ export async function compact(
 		fileOps,
 		settings,
 	} = preparation;
-
-	// Generate summaries (can be parallel if both needed) and merge into one
 	let summary: string;
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
@@ -991,10 +930,8 @@ export async function compact(
 				MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
 			),
 		]);
-		// Merge into single summary
 		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
 	} else {
-		// Just generate history summary
 		summary = await generateSummary(
 			messagesToSummarize,
 			model,
@@ -1007,8 +944,6 @@ export async function compact(
 			thinkingLevel,
 		);
 	}
-
-	// Compute file lists and append to summary
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
 

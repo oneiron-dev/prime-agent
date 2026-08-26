@@ -1,0 +1,13 @@
+- Added V2-first remote compaction selection with opaque checkpoint replay and retained user-only plaintext with live prompts re-injected; runtime model grants remain separate.
+- Fixed local compaction failures caused by unclassified nested OpenAI Responses WebSocket errors; compaction keeps the model-selected transport, including WebSockets for `cpa-r` routes.
+- Fixed Agents View failing to resume saved sessions when the daemon's original working directory no longer exists.
+- Added configurable Agents View pinning and in-section session reordering, persisted per local profile and machine.
+- Fixed Up and Down Arrow navigation in Agents View to wrap cyclically across selectable sessions.
+- Added strict per-child `model=` and `reasoning=` selection to `rlm()`, preserving inheritance when omitted and rejecting explicit reasoning levels unsupported by the selected child model. `thinking=` is accepted as an alias for `reasoning=`; passing both with different levels fails the spawn.
+- Added configurable provider-native Responses compaction with durable branch-aware replay and local fallback for declared compatible models.
+- Added capability-gated generic Responses WebSocket transport, while keeping unary remote compaction on HTTP.
+- Fixed chunked session snapshots advertising the session summary's message count instead of the count the transcript actually carries, which failed attach with "Snapshot ... contained N of N+1 messages" when the snapshot omitted a message the summary still counted.
+- Fixed large RLM trees becoming unresponsive by coalescing session, passive-tree, and attach snapshot reads; suppressing duplicate idle-status writes; passivating completed children in bounded bursts; and bounding targeted root-worker stops.
+- Fixed explicit attach failing when a busy session worker transiently delays the active-agent state lookup beyond three seconds.
+- Fixed custom prerelease builds showing an update notice for the official stable release with the same version number, which would have replaced the custom build.
+- Fixed a successful RLM quiescence wait emitting an unhandled "RLM quiescence wait cancelled" rejection after it returned, while preserving descendant cancellation propagation from a failing barrier.

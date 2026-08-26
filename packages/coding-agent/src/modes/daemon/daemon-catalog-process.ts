@@ -66,6 +66,12 @@ interface SavedRlmSubagentRegistryEntry {
 	status?: unknown;
 }
 
+/**
+ * Same-parent sibling set for a session that has no live worker, read from the
+ * parent's persisted subagent registry. The daemon's live topology authority is
+ * `RlmSpawnLedger`; this stays as the compatibility path for saved/passive
+ * sessions and pre-ledger session trees.
+ */
 export async function listSavedSessionSiblings(sessionPath: string): Promise<SessionInfo[]> {
 	const target = await readSessionInfo(sessionPath);
 	if (!target) throw new Error(`Session not found: ${sessionPath}`);
@@ -105,14 +111,10 @@ export async function listSavedSessionSiblings(sessionPath: string): Promise<Ses
 	);
 }
 
-/** @internal Exported to pin catalog selector semantics without spawning a catalog process. */
 export function resolveCatalogSessionMatch(
 	sessions: readonly SessionInfo[],
 	selector: string,
 ): SessionInfo | undefined {
-	// Deliberate broadening for create/resume as well as a2a wake: exact names
-	// participate alongside id prefixes. Therefore a name that collides with an
-	// id prefix is now ambiguous instead of the id-prefix match winning.
 	const matches = sessions.filter((session) => session.id.startsWith(selector) || session.name === selector);
 	if (matches.length > 1) {
 		throw new Error(`Ambiguous session selector "${selector}"`);

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -25,7 +25,10 @@ function createChild(): void {
 
 describe("pruneDeletedChildKernelCaches", () => {
 	beforeEach(() => {
-		root = mkdtempSync(join(tmpdir(), "prime-agent-child-cache-"));
+		// Cleanup fails closed on non-canonical session paths, so the fixture must be
+		// canonical: on macOS `tmpdir()` is the `/var` -> `/private/var` alias. The
+		// alias-rejection behavior itself is covered by the symlink cases below.
+		root = mkdtempSync(join(realpathSync(tmpdir()), "prime-agent-child-cache-"));
 		createChild();
 	});
 	afterEach(() => {

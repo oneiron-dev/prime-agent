@@ -12,6 +12,7 @@ import {
 	resolvePrimeAgentTracesBaseUrl,
 } from "./prime-inference-auth.js";
 import {
+	getSessionArtifactsRoot,
 	projectSessionEntryForExternalUse,
 	type SessionEntry,
 	type SessionHeader,
@@ -562,7 +563,7 @@ async function findSessionFilesUnder(root: string, files: Set<string>): Promise<
 
 export async function findAgentTraceFiles(sessionDir: string = getSessionsDir()): Promise<string[]> {
 	const files = new Set<string>();
-	const roots = new Set([resolve(sessionDir), resolve(dirname(sessionDir), "session-artifacts")]);
+	const roots = new Set([resolve(sessionDir), resolve(getSessionArtifactsRoot(sessionDir))]);
 	await Promise.all([...roots].map((root) => findSessionFilesUnder(root, files)));
 	return [...files].sort();
 }
