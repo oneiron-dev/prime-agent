@@ -326,6 +326,9 @@ describe("#502 unified session view regressions", () => {
 			isPendingDeleteRow: () => false,
 			setStatusMessage: vi.fn(),
 			finish,
+			getSelectedSessionRow(this: { rows: unknown[]; selectedIndex: number }) {
+				return privateMethod<(this: typeof harness) => unknown>("getSelectedSessionRow").call(harness);
+			},
 		};
 
 		privateMethod<(this: typeof harness) => void>("openSelected").call(harness);
@@ -427,6 +430,9 @@ describe("#502 unified session view regressions", () => {
 				{ identity: "match", identityAliases: [], section: "idle", searchableText: "needle session" },
 				{ identity: "other", identityAliases: [], section: "idle", searchableText: "other session" },
 			],
+			getActiveSearchQuery() {
+				return privateMethod<(this: typeof harness) => string>("getActiveSearchQuery").call(harness);
+			},
 		};
 
 		const filtered =

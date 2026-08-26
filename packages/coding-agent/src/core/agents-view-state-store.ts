@@ -13,11 +13,13 @@ import {
 import { dirname } from "node:path";
 import { lockSync } from "proper-lockfile";
 import { appendRotatingLog, getAgentLogPath, getAgentsViewStatePath } from "../config.js";
+import { AGENTS_VIEW_SECTIONS, type AgentsViewSection } from "../modes/agents-view/agents-view-state.js";
 
 export const AGENTS_VIEW_STATE_VERSION = 1;
 export type AgentsViewManualOrder = Record<string, string[]>;
 export type AgentsViewStateOperation =
 	| { type: "setPin"; sessionId: string; pinned: boolean }
+	| { type: "setSectionCollapsed"; section: AgentsViewSection; collapsed: boolean }
 	| {
 			group: string;
 			type: "placePeer";
@@ -31,6 +33,8 @@ export interface AgentsViewState {
 	version: 1;
 	pinnedRootSessionIds: string[];
 	manualOrder: AgentsViewManualOrder;
+	/** Sections the user collapsed. Absent in files written before the feature. */
+	collapsedSections: AgentsViewSection[];
 }
 export interface AgentsViewStateResult {
 	state: AgentsViewState;
@@ -44,6 +48,7 @@ const empty = (): AgentsViewState => ({
 	version: 1,
 	pinnedRootSessionIds: [],
 	manualOrder: Object.create(null) as AgentsViewManualOrder,
+	collapsedSections: [],
 });
 
 function report(message: string, cause?: unknown): Error {
@@ -74,7 +79,19 @@ function normalize(value: unknown): AgentsViewState {
 			if (ids.length > 0) manualOrder[key] = ids;
 		}
 	}
-	return { version: 1, pinnedRootSessionIds: strings(input.pinnedRootSessionIds), manualOrder };
+	return {
+		version: 1,
+		pinnedRootSessionIds: strings(input.pinnedRootSessionIds),
+		manualOrder,
+		collapsedSections: sections(input.collapsedSections),
+	};
+}
+
+// Only known section names survive, written in canonical order, so an unknown
+// or malformed entry can never make a section unreachable.
+function sections(value: unknown): AgentsViewSection[] {
+	const requested = new Set(strings(value));
+	return AGENTS_VIEW_SECTIONS.filter((section) => requested.has(section));
 }
 
 const defaultCoordination: AgentsViewStateCoordination = {
@@ -179,6 +196,13 @@ export class AgentsViewStateStore {
 							if (operation.pinned) pins.add(operation.sessionId);
 							else pins.delete(operation.sessionId);
 							state.pinnedRootSessionIds = [...pins];
+							break;
+						}
+						case "setSectionCollapsed": {
+							const collapsed = new Set(state.collapsedSections);
+							if (operation.collapsed) collapsed.add(operation.section);
+							else collapsed.delete(operation.section);
+							state.collapsedSections = [...collapsed];
 							break;
 						}
 						case "placePeer": {

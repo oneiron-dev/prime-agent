@@ -72,11 +72,15 @@ import {
 	type AgentsViewScopeFrame,
 	type AgentsViewScopeKey,
 	type AgentsViewSection,
+	type AgentsViewSectionHeadingRow,
 	type AgentsViewSelectionKey,
+	type AgentsViewSessionRow,
 	buildAgentsViewRows,
+	buildAgentsViewSectionRows,
 	buildUnifiedSessionIndex,
 	createUnattachableChildOpenResult,
 	filterUnifiedSessions,
+	formatAgentsViewSectionHeadingLabel,
 	formatHeartbeatBadge,
 	getAgentsViewReorderGroup,
 	getAgentsViewSelectionKey,
@@ -84,17 +88,21 @@ import {
 	getAgentsViewSummaryIdentity as getSummaryIdentity,
 	getUnifiedSessionAncestorSessionIds,
 	hasUnifiedSessionChildren,
+	isAgentsViewSectionHeadingRow,
+	isAgentsViewSessionRow,
 	isSubagentSummary,
 	migrateAgentsViewIdentitySet,
 	reconcileUnifiedSessions,
 	resolveAgentsViewLeftResult,
 	resolveAgentsViewScopeFrames,
+	resolveAgentsViewSelectionIndex,
 	resolveAgentsViewSelectionState,
 	scopeToSessionSubtree,
 	sectionTitle,
 	shouldApplyScopeResolution,
 	shouldShowAgentsViewSession,
 	summaryForUnifiedRecord,
+	toggleAgentsViewCollapsedSection,
 	transitionAgentsViewScope,
 	type UnifiedSessionIndex,
 	type UnifiedSessionRecord,
@@ -177,6 +185,7 @@ export type AgentsViewPersistentState = {
 	heartbeats?: AgentConnectionHeartbeat[];
 	pinnedRootSessionIds?: string[];
 	manualOrder?: AgentsViewManualOrder;
+	collapsedSections?: AgentsViewSection[];
 	pendingAgentsViewStateOperations?: AgentsViewStateOperation[];
 };
 
@@ -652,7 +661,10 @@ export class AgentsViewMode implements Component, Focusable {
 	private deleteConfirmExpiresAt = 0;
 	private deleteConfirmTimer: ReturnType<typeof setTimeout> | undefined;
 	private workingIconFrame = 0;
+	/** Display list including section headings; the only cursor and render source. */
 	private rows: AgentsViewRow[] = [];
+	/** Session rows before collapse; counts and lookups must ignore collapse. */
+	private sessionRows: AgentsViewSessionRow[] = [];
 	private lastListedSummaries: SessionSummary[] = [];
 	private lastVisibleSummaries: SessionSummary[] = [];
 	private savedSessions: AgentConnectionSavedSessionInfo[] = [];
@@ -884,7 +896,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.heartbeatPollTimer = setInterval(() => void this.refreshHeartbeats(), HEARTBEAT_POLL_INTERVAL_MS);
 		this.heartbeatPollTimer.unref?.();
 		this.animationTimer = setInterval(() => {
-			if (!this.rows.some((row) => row.activitySection === "running")) return;
+			if (!this.sessionRows.some((row) => row.activitySection === "running")) return;
 			this.workingIconFrame += 1;
 			this.ui.requestRender();
 		}, WORKING_ICON_INTERVAL_MS);
@@ -941,7 +953,11 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.open")) {
 			if (this.editor.getText().length === 0 || this.isSearchCursorAtEnd()) {
-				this.openSelected();
+				// On a heading, Right reveals a collapsed section and is otherwise inert;
+				// session rows keep their existing drill-in behavior.
+				const selectedRow = this.rows[this.selectedIndex];
+				if (selectedRow && isAgentsViewSectionHeadingRow(selectedRow)) this.expandSelectedSection();
+				else this.openSelected();
 				return;
 			}
 		}
@@ -1083,6 +1099,7 @@ export class AgentsViewMode implements Component, Focusable {
 		if (!durableState.persistenceError) {
 			this.persistentState.pinnedRootSessionIds = durableState.state.pinnedRootSessionIds;
 			this.persistentState.manualOrder = durableState.state.manualOrder;
+			this.persistentState.collapsedSections = durableState.state.collapsedSections;
 			this.agentsViewStateDirty = false;
 			return true;
 		}
@@ -1114,8 +1131,9 @@ export class AgentsViewMode implements Component, Focusable {
 		const group = getAgentsViewReorderGroup(row);
 		if (!group) return;
 		const visiblePeers = this.rows.filter(
-			(candidate) =>
+			(candidate): candidate is AgentsViewSessionRow =>
 				candidate.selectable &&
+				isAgentsViewSessionRow(candidate) &&
 				candidate.displaySection === row.displaySection &&
 				getAgentsViewReorderGroup(candidate) === group,
 		);
@@ -1274,13 +1292,20 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		this.persistentState.pinnedRootSessionIds = result.state.pinnedRootSessionIds;
 		this.persistentState.manualOrder = result.state.manualOrder;
+		this.persistentState.collapsedSections = result.state.collapsedSections;
 		this.agentsViewStateDirty = false;
 		return true;
 	}
 
 	private flushAgentsViewStateOperations(): boolean {
 		const pending = this.persistentState.pendingAgentsViewStateOperations ?? [];
-		let finalState: { pinnedRootSessionIds: string[]; manualOrder: AgentsViewManualOrder } | undefined;
+		let finalState:
+			| {
+					pinnedRootSessionIds: string[];
+					manualOrder: AgentsViewManualOrder;
+					collapsedSections: AgentsViewSection[];
+			  }
+			| undefined;
 		while (pending.length > 0) {
 			const result = this.stateStore.apply(pending[0]!);
 			if (result.persistenceError) {
@@ -1293,6 +1318,7 @@ export class AgentsViewMode implements Component, Focusable {
 		if (finalState) {
 			this.persistentState.pinnedRootSessionIds = finalState.pinnedRootSessionIds;
 			this.persistentState.manualOrder = finalState.manualOrder;
+			this.persistentState.collapsedSections = finalState.collapsedSections;
 		}
 		this.agentsViewStateDirty = false;
 		return true;
@@ -1383,7 +1409,7 @@ export class AgentsViewMode implements Component, Focusable {
 		let added = true;
 		while (added) {
 			added = false;
-			for (const row of this.rows) {
+			for (const row of this.sessionRows) {
 				if (wanted.has(row.summary.sessionId) && !this.expandedSubagentParents.has(row.identity)) {
 					this.expandedSubagentParents.add(row.identity);
 					added = true;
@@ -1410,7 +1436,7 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
-		const query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
+		const query = this.getActiveSearchQuery();
 		return filterUnifiedSessions(this.scopedRecords, (text) => matchesSearchText(text, query));
 	}
 
@@ -1424,20 +1450,61 @@ export class AgentsViewMode implements Component, Focusable {
 	/** Rebuild rows from the last fetched summaries, keeping selection on the same row. */
 	private rebuildRows(): void {
 		const selectedIdentity = this.rows[this.selectedIndex]?.identity;
-		this.rows = buildAgentsViewRows(
+		// A pending anchor means the visible row is only a placeholder for a session
+		// the view still wants. Keeping that placeholder would strand the selection,
+		// so re-resolve instead: clearing a search can make the wanted row visible.
+		const anchorPending = this.selectionAnchorPending;
+		this.sessionRows = buildAgentsViewRows(
 			this.getFilteredRecords(),
 			this.expandedSubagentParents,
 			this.programShownParents,
 			this.scopeKey,
 			this.getRowBuildOptions(),
 		);
+		this.rebuildSectionRows();
 		const index =
-			selectedIdentity === undefined ? -1 : this.rows.findIndex((row) => row.identity === selectedIdentity);
+			anchorPending || selectedIdentity === undefined
+				? -1
+				: this.rows.findIndex((row) => row.identity === selectedIdentity);
 		if (index >= 0) {
 			this.selectedIndex = index;
 		} else {
 			this.restoreSelection();
 		}
+	}
+
+	/**
+	 * Compose the display list from the current session rows and collapse state.
+	 * Section headings are always present, including when every section is empty,
+	 * so the sections stay navigable and collapsible on an empty roster. The one
+	 * exception is a search that matches nothing: that keeps the pre-existing
+	 * single-line notice instead of four empty sections.
+	 */
+	private rebuildSectionRows(): void {
+		this.rows = this.hasNoSearchMatches()
+			? []
+			: buildAgentsViewSectionRows(this.sessionRows, {
+					collapsedSections: this.getCollapsedSectionsForDisplay(),
+				});
+	}
+
+	/** An active query that filtered the roster down to nothing. */
+	private hasNoSearchMatches(): boolean {
+		return this.sessionRows.length === 0 && this.getActiveSearchQuery().trim().length > 0;
+	}
+
+	/**
+	 * A nonempty search must reveal matches inside collapsed sections. That
+	 * reveal is display-only: the saved preference is never written on this path,
+	 * so clearing the query restores the user's collapse.
+	 */
+	private getCollapsedSectionsForDisplay(): ReadonlySet<AgentsViewSection> {
+		if (this.getActiveSearchQuery().trim().length > 0) return new Set<AgentsViewSection>();
+		return new Set(this.persistentState.collapsedSections ?? []);
+	}
+
+	private getActiveSearchQuery(): string {
+		return this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
 	}
 
 	private async submit(value: string, delivery: "steer" | "followUp" = "steer"): Promise<void> {
@@ -1507,11 +1574,20 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private openSelected(): void {
 		const row = this.rows[this.selectedIndex];
-		if (!row?.selectable || this.isPendingDeleteRow(row)) {
+		if (!row?.selectable) {
 			return;
 		}
+		// The waiting guard runs before any row action: while an anchor is pending the
+		// selected row is only a placeholder, so acting on it would discard the anchor.
 		if (this.selectionAnchorPending) {
 			this.setStatusMessage("Waiting for the selected session to load");
+			return;
+		}
+		if (isAgentsViewSectionHeadingRow(row)) {
+			this.toggleSectionCollapsed(row.section);
+			return;
+		}
+		if (this.isPendingDeleteRow(row)) {
 			return;
 		}
 		if (row.kind === "subagent-summary") {
@@ -1537,7 +1613,47 @@ export class AgentsViewMode implements Component, Focusable {
 		});
 	}
 
-	private toggleSubagentList(row: AgentsViewRow): void {
+	/**
+	 * Right on a heading only ever reveals. Collapsing stays on Enter, so Right
+	 * cannot hide rows by surprise and Left keeps its scope-back meaning.
+	 */
+	private expandSelectedSection(): void {
+		const row = this.rows[this.selectedIndex];
+		if (!row || !isAgentsViewSectionHeadingRow(row) || !row.collapsed) return;
+		// Same waiting guard as Enter, so Right cannot erase a pending anchor either.
+		if (this.selectionAnchorPending) {
+			this.setStatusMessage("Waiting for the selected session to load");
+			return;
+		}
+		this.toggleSectionCollapsed(row.section);
+	}
+
+	/**
+	 * Collapse or expand a section. Selection stays on the heading: its identity
+	 * is stable, so the rebuild restores it through the usual identity lookup.
+	 *
+	 * A search force-reveals every section, so collapse is meaningless while one is
+	 * active and writing it would silently change the saved preference behind a view
+	 * the user cannot see. Blocked, with the hints saying so.
+	 */
+	private toggleSectionCollapsed(section: AgentsViewSection): void {
+		if (this.getActiveSearchQuery().trim().length > 0) {
+			this.setStatusMessage("Clear the search to collapse or expand sections");
+			return;
+		}
+		const collapsedSections = toggleAgentsViewCollapsedSection(this.persistentState.collapsedSections ?? [], section);
+		this.persistentState.collapsedSections = collapsedSections;
+		this.applyAgentsViewStateOperation?.({
+			type: "setSectionCollapsed",
+			section,
+			collapsed: collapsedSections.includes(section),
+		});
+		this.rebuildRows();
+		this.syncSelectedRowState();
+		this.ui.requestRender();
+	}
+
+	private toggleSubagentList(row: AgentsViewSessionRow): void {
 		if (!row.parentIdentity) {
 			return;
 		}
@@ -1561,7 +1677,8 @@ export class AgentsViewMode implements Component, Focusable {
 	 */
 	private cycleProgramForSelected(): void {
 		const row = this.rows[this.selectedIndex];
-		if (!row) {
+		// Section headings own no spawn program.
+		if (!row || !isAgentsViewSessionRow(row)) {
 			return;
 		}
 		const target = row.kind === "agent" ? row.identity : row.parentIdentity;
@@ -1586,7 +1703,7 @@ export class AgentsViewMode implements Component, Focusable {
 
 	/** Whether any subagent under the given agent identity carries spawn code. */
 	private targetHasSpawnCode(target: string): boolean {
-		for (const row of this.rows) {
+		for (const row of this.sessionRows) {
 			if (row.parentIdentity !== target) {
 				continue;
 			}
@@ -1603,14 +1720,14 @@ export class AgentsViewMode implements Component, Focusable {
 	/** True when the selected row exposes the "show program" affordance. */
 	private selectedRowCanShowProgram(): boolean {
 		const row = this.rows[this.selectedIndex];
-		if (!row) {
+		if (!row || !isAgentsViewSessionRow(row)) {
 			return false;
 		}
 		const target = row.kind === "agent" ? row.identity : row.parentIdentity;
 		return target !== undefined && this.targetHasSpawnCode(target);
 	}
 
-	private openSelectedSubagent(row: AgentsViewRow): void {
+	private openSelectedSubagent(row: AgentsViewSessionRow): void {
 		const expandedAncestorSessionIds = this.collectSubagentAncestorSessionIds(row);
 		if (row.summary.activeSessionId || row.summary.sessionFile) {
 			this.finish({
@@ -1641,11 +1758,11 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	/** Session ids of every ancestor of a subagent row, root-most first. */
-	private collectSubagentAncestorSessionIds(row: AgentsViewRow): string[] {
+	private collectSubagentAncestorSessionIds(row: AgentsViewSessionRow): string[] {
 		const ancestors: string[] = [];
 		let parentIdentity = row.parentIdentity;
 		while (parentIdentity !== undefined) {
-			const parent = this.rows.find((candidate) => candidate.identity === parentIdentity);
+			const parent = this.sessionRows.find((candidate) => candidate.identity === parentIdentity);
 			if (!parent) {
 				break;
 			}
@@ -1659,11 +1776,11 @@ export class AgentsViewMode implements Component, Focusable {
 	 * The whole subagent tree belongs to the root agent's session, so nested
 	 * subagents also resolve to their top-level ancestor.
 	 */
-	private findSubagentRootRow(row: AgentsViewRow): AgentsViewRow | undefined {
-		let root = this.rows.find((candidate) => candidate.identity === row.parentIdentity);
+	private findSubagentRootRow(row: AgentsViewSessionRow): AgentsViewSessionRow | undefined {
+		let root = this.sessionRows.find((candidate) => candidate.identity === row.parentIdentity);
 		while (root && root.kind !== "agent") {
 			const parentIdentity = root.parentIdentity;
-			root = this.rows.find((candidate) => candidate.identity === parentIdentity);
+			root = this.sessionRows.find((candidate) => candidate.identity === parentIdentity);
 		}
 		return root;
 	}
@@ -1819,7 +1936,8 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private findSummaryByActiveSessionId(activeSessionId: string): SessionSummary | undefined {
-		return this.rows.find((row) => (row.summary.activeSessionId ?? row.summary.id) === activeSessionId)?.summary;
+		return this.sessionRows.find((row) => (row.summary.activeSessionId ?? row.summary.id) === activeSessionId)
+			?.summary;
 	}
 
 	private renderReplyHeaderLine(): string | undefined {
@@ -2073,7 +2191,7 @@ export class AgentsViewMode implements Component, Focusable {
 		await this.stopAgentForDeletion(row);
 	}
 
-	private async handleKillSubagentSelected(row: AgentsViewRow): Promise<void> {
+	private async handleKillSubagentSelected(row: AgentsViewSessionRow): Promise<void> {
 		const identity = getSummaryIdentity(row.summary);
 		if (this.pendingKillSubagent?.identity === identity && this.isDeleteConfirmationVisible()) {
 			const pending = this.pendingKillSubagent;
@@ -2091,7 +2209,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.showDeleteConfirmation();
 	}
 
-	private async killSubagent(pending: PendingKillSubagent, currentRow: AgentsViewRow): Promise<void> {
+	private async killSubagent(pending: PendingKillSubagent, currentRow: AgentsViewSessionRow): Promise<void> {
 		const running = currentRow.activitySection === "running";
 		const client = this.requireClient();
 		this.setStatusMessage(running ? "Stopping subagent..." : "Deleting subagent...");
@@ -2145,7 +2263,7 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	private async stopAgentForDeletion(row: AgentsViewRow): Promise<void> {
+	private async stopAgentForDeletion(row: AgentsViewSessionRow): Promise<void> {
 		const identity = getSummaryIdentity(row.summary);
 		const activeSessionId = row.summary.activeSessionId;
 		if (!activeSessionId) {
@@ -2346,7 +2464,7 @@ export class AgentsViewMode implements Component, Focusable {
 			}
 		}
 		this.scopedRecords = scopeToSessionSubtree(this.unifiedRecords, this.scopeKey, this.unifiedIndex);
-		this.rows = buildAgentsViewRows(
+		this.sessionRows = buildAgentsViewRows(
 			this.getFilteredRecords(),
 			this.expandedSubagentParents,
 			this.programShownParents,
@@ -2356,6 +2474,7 @@ export class AgentsViewMode implements Component, Focusable {
 				manualOrder: this.persistentState.manualOrder ?? {},
 			},
 		);
+		this.rebuildSectionRows();
 		this.applyPendingAncestorExpansion();
 		this.restoreSelection();
 		this.ui.requestRender();
@@ -2473,8 +2592,14 @@ export class AgentsViewMode implements Component, Focusable {
 		// Unblock the fallback row, but keep the anchor identities: a later poll
 		// can still deliver the intended session and re-anchor selection to it.
 		this.selectionAnchorPending = false;
+		const row = this.getSelectedSessionRow();
+		this.selectedActiveSessionId = row ? (row.summary.activeSessionId ?? row.summary.id) : undefined;
+	}
+
+	/** The selected row when it is a session; undefined on a section heading. */
+	private getSelectedSessionRow(): AgentsViewSessionRow | undefined {
 		const row = this.rows[this.selectedIndex];
-		this.selectedActiveSessionId = row?.selectable ? (row.summary.activeSessionId ?? row.summary.id) : undefined;
+		return row?.selectable && isAgentsViewSessionRow(row) ? row : undefined;
 	}
 
 	private restoreSelection(): void {
@@ -2483,29 +2608,46 @@ export class AgentsViewMode implements Component, Focusable {
 			this.selectedActiveSessionId = undefined;
 			return;
 		}
-		const resolution = resolveAgentsViewSelectionState(
-			this.rows,
-			this.selectedIndex,
-			this.selectedRowIdentity ?? this.persistentState.selectedRowIdentity,
-			this.selectedSessionKey ?? this.persistentState.selectedSessionKey,
-		);
+		const identity = this.selectedRowIdentity ?? this.persistentState.selectedRowIdentity;
+		const key = this.selectedSessionKey ?? this.persistentState.selectedSessionKey;
+		const resolution = resolveAgentsViewSelectionState(this.rows, this.selectedIndex, identity, key);
 		this.selectedIndex = resolution.index;
 		if (resolution.resolved) {
 			this.syncSelectedRowState();
 			return;
 		}
-		this.selectionAnchorPending = Boolean(
-			this.selectedRowIdentity ??
-				this.persistentState.selectedRowIdentity ??
-				this.selectedSessionKey ??
-				this.persistentState.selectedSessionKey,
-		);
+		// The wanted session may exist but be hidden by its section's collapse rather
+		// than missing from the catalog. That is not a pending load, so land on its own
+		// heading as a deliberate selection instead of stranding a placeholder.
+		const headingIndex = this.findCollapsedSectionHeadingIndexForSelection(identity, key);
+		if (headingIndex >= 0) {
+			this.selectedIndex = headingIndex;
+			this.syncSelectedRowState();
+			return;
+		}
+		this.selectionAnchorPending = Boolean(identity ?? key);
 		// Catalogs stream independently. Show a temporary fallback row without
 		// replacing the source-session anchor before its daemon row arrives.
-		const fallback = this.rows[this.selectedIndex];
-		this.selectedActiveSessionId = fallback?.selectable
-			? (fallback.summary.activeSessionId ?? fallback.summary.id)
-			: undefined;
+		const fallback = this.getSelectedSessionRow();
+		this.selectedActiveSessionId = fallback ? (fallback.summary.activeSessionId ?? fallback.summary.id) : undefined;
+	}
+
+	/**
+	 * Index of the heading owning a wanted session that the display list hides only
+	 * because its section is collapsed. Returns -1 when the session is genuinely
+	 * absent, so real catalog streaming still yields a pending anchor.
+	 */
+	private findCollapsedSectionHeadingIndexForSelection(
+		identity: string | undefined,
+		key: AgentsViewSelectionKey | undefined,
+	): number {
+		if (identity === undefined && key === undefined) return -1;
+		const hiddenIndex = resolveAgentsViewSelectionIndex(this.sessionRows, identity, key);
+		const hidden = hiddenIndex >= 0 ? this.sessionRows[hiddenIndex] : undefined;
+		if (!hidden) return -1;
+		return this.rows.findIndex(
+			(row) => isAgentsViewSectionHeadingRow(row) && row.collapsed && row.section === hidden.displaySection,
+		);
 	}
 
 	private getSelectableRowIndexes(): number[] {
@@ -2514,10 +2656,14 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private syncSelectedRowState(): void {
 		this.selectionAnchorPending = false;
-		const row = this.rows[this.selectedIndex];
-		this.selectedActiveSessionId = row?.selectable ? (row.summary.activeSessionId ?? row.summary.id) : undefined;
-		this.selectedRowIdentity = getSelectedRowIdentity(row);
-		this.selectedSessionKey = row?.selectable ? getAgentsViewSelectionKey(row.summary) : undefined;
+		// A heading keeps its stable identity for restore but carries no session
+		// key, so session-scoped state clears while it is selected.
+		const sessionRow = this.getSelectedSessionRow();
+		this.selectedActiveSessionId = sessionRow
+			? (sessionRow.summary.activeSessionId ?? sessionRow.summary.id)
+			: undefined;
+		this.selectedRowIdentity = getSelectedRowIdentity(this.rows[this.selectedIndex]);
+		this.selectedSessionKey = sessionRow ? getAgentsViewSelectionKey(sessionRow.summary) : undefined;
 		this.persistentState.selectedRowIdentity = this.selectedRowIdentity;
 		this.persistentState.selectedSessionKey = this.selectedSessionKey;
 	}
@@ -2649,7 +2795,8 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private getAgentCountsText(): string {
-		const counts = countRowsBySection(this.rows);
+		// Counts describe the roster, so collapse must not change them.
+		const counts = countRowsBySection(this.sessionRows);
 		return `${counts.pinned} pinned, ${counts.running} running, ${counts.idle} idle, ${counts.inactive} inactive`;
 	}
 
@@ -2657,6 +2804,8 @@ export class AgentsViewMode implements Component, Focusable {
 		if (maxRows <= 0) {
 			return [];
 		}
+		// Only a search that matched nothing collapses to the single-line notice;
+		// an empty roster still renders its four sections.
 		if (this.rows.length === 0) {
 			return [theme.bold(sectionTitle("running")), theme.fg("dim", "  No sessions match your search.")].slice(
 				0,
@@ -2688,9 +2837,6 @@ export class AgentsViewMode implements Component, Focusable {
 			if (item.type === "spacer") {
 				return "";
 			}
-			if (item.type === "heading") {
-				return theme.bold(sectionTitle(item.section));
-			}
 			if (item.type === "empty") {
 				return theme.fg("dim", "  No agents");
 			}
@@ -2707,6 +2853,9 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private renderRow(row: AgentsViewRow, width: number): string {
 		const selected = row.selectable && row.identity === this.rows[this.selectedIndex]?.identity;
+		if (isAgentsViewSectionHeadingRow(row)) {
+			return this.renderSectionHeadingRow(row, width, selected);
+		}
 		if (row.kind === "subagent-code") {
 			return this.renderCodeRow(row);
 		}
@@ -2763,10 +2912,20 @@ export class AgentsViewMode implements Component, Focusable {
 		return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
 	}
 
+	/**
+	 * An expanded heading reads as a clean bold title. A collapsed one appends its
+	 * section count so the hidden agents stay discoverable without a caret.
+	 */
+	private renderSectionHeadingRow(row: AgentsViewSectionHeadingRow, width: number, selected: boolean): string {
+		const label = theme.bold(formatAgentsViewSectionHeadingLabel(row));
+		const line = padLine(truncateToWidth(label, width, ""), width);
+		return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
+	}
+
 	// Spawn-code rows are read-only context. They render deemphasized — muted
 	// text on a panel background (applied in finalizeRenderedLine) so the program
 	// reads as one quiet segmented block rather than competing with agent rows.
-	private renderCodeRow(row: AgentsViewRow): string {
+	private renderCodeRow(row: AgentsViewSessionRow): string {
 		const indent = "  ".repeat(row.depth);
 		const body = theme.fg("muted", row.code || " ");
 		return `${CODE_ROW_MARKER}${indent}  ${body}`;
@@ -2798,13 +2957,13 @@ export class AgentsViewMode implements Component, Focusable {
 		return padded.split("\x1b[0m").map(applySelectionBg).join("\x1b[0m");
 	}
 
-	private isPendingDeleteRow(row: AgentsViewRow): boolean {
+	private isPendingDeleteRow(row: AgentsViewSessionRow): boolean {
 		return (
 			getSummaryIdentity(row.summary) === this.pendingDeleteAgent?.identity && this.isDeleteConfirmationVisible()
 		);
 	}
 
-	private isPendingKillSubagentRow(row: AgentsViewRow): boolean {
+	private isPendingKillSubagentRow(row: AgentsViewSessionRow): boolean {
 		return (
 			getSummaryIdentity(row.summary) === this.pendingKillSubagent?.identity && this.isDeleteConfirmationVisible()
 		);
@@ -2844,17 +3003,37 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		// Replying is reserved for top-level agents; subagents can be stopped or deleted.
 		const selectedRow = this.rows[this.selectedIndex];
+		const selectedHeading = selectedRow !== undefined && isAgentsViewSectionHeadingRow(selectedRow);
+		// Search force-reveals every section, so collapse is unavailable; say that
+		// rather than advertising a key that will refuse.
+		const collapseBlockedBySearch = selectedHeading && this.getActiveSearchQuery().trim().length > 0;
 		const selectedAgent = selectedRow?.kind === "agent";
 		const selectedSubagent = selectedRow?.kind === "subagent";
 		const selectedSummary = selectedRow?.kind === "subagent-summary";
 		const hints = [
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
-			`${keyText("app.agents.reorderUp")}/${keyText("app.agents.reorderDown")} reorder`,
-			`${keyText("app.agents.togglePin")} ${(selectedRow?.kind === "agent" || selectedRow?.kind === "subagent" || selectedRow?.kind === "subagent-summary") && (this.persistentState.pinnedRootSessionIds ?? []).includes(selectedRow.rootSessionId) ? "unpin" : "pin"}`,
-			selectedSummary
-				? `${keyText("tui.select.confirm")} ${selectedRow?.expanded ? "collapse" : "expand"}`
-				: `${keyText("tui.select.confirm")} open`,
-			selectedSummary ? undefined : `${keyText("app.agents.open")} open`,
+			selectedHeading
+				? undefined
+				: `${keyText("app.agents.reorderUp")}/${keyText("app.agents.reorderDown")} reorder`,
+			selectedHeading
+				? undefined
+				: `${keyText("app.agents.togglePin")} ${(selectedRow?.kind === "agent" || selectedRow?.kind === "subagent" || selectedRow?.kind === "subagent-summary") && (this.persistentState.pinnedRootSessionIds ?? []).includes(selectedRow.rootSessionId) ? "unpin" : "pin"}`,
+			collapseBlockedBySearch
+				? "sections stay open while searching"
+				: selectedHeading
+					? `${keyText("tui.select.confirm")} ${selectedRow.collapsed ? "expand" : "collapse"} section`
+					: selectedSummary
+						? `${keyText("tui.select.confirm")} ${selectedRow?.expanded ? "collapse" : "expand"}`
+						: `${keyText("tui.select.confirm")} open`,
+			collapseBlockedBySearch
+				? undefined
+				: selectedHeading
+					? selectedRow.collapsed
+						? `${keyText("app.agents.open")} expand section`
+						: undefined
+					: selectedSummary
+						? undefined
+						: `${keyText("app.agents.open")} open`,
 			selectedAgent
 				? `${keyText("app.agents.reply")} ${selectedRow?.activitySection === "inactive" ? "resume" : "reply"}`
 				: undefined,
@@ -2900,11 +3079,11 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private getSplashModelId(): string | undefined {
-		return this.rows[this.selectedIndex]?.summary.model?.id ?? this.options.startupModelId;
+		return this.getSelectedSessionRow()?.summary.model?.id ?? this.options.startupModelId;
 	}
 
 	private getSplashCwd(): string {
-		return this.rows[this.selectedIndex]?.summary.cwd ?? this.options.uiServices.getInitialCwd();
+		return this.getSelectedSessionRow()?.summary.cwd ?? this.options.uiServices.getInitialCwd();
 	}
 
 	private getRowIcon(section: "running" | "idle" | "inactive"): string {
@@ -2938,36 +3117,33 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 }
 
-type DisplayItem =
-	| { type: "spacer" }
-	| { type: "heading"; section: AgentsViewSection }
-	| { type: "empty"; section: AgentsViewSection }
-	| { type: "row"; row: AgentsViewRow };
+type DisplayItem = { type: "spacer" } | { type: "empty" } | { type: "row"; row: AgentsViewRow };
 
+/**
+ * Headings are real rows, so this pass only adds non-selectable chrome: a blank
+ * line between sections and the `No agents` placeholder for an expanded section
+ * with nothing in it. A collapsed section shows neither its rows nor that line.
+ */
 function buildDisplayItems(rows: readonly AgentsViewRow[]): DisplayItem[] {
 	const items: DisplayItem[] = [];
-	const sections: AgentsViewSection[] = ["pinned", "running", "idle", "inactive"];
-	for (const [index, section] of sections.entries()) {
-		if (index > 0) items.push({ type: "spacer" });
-		items.push({ type: "heading", section });
-		const sectionRows = getDisplayRowsForSection(rows, section);
-		if (sectionRows.length === 0) items.push({ type: "empty", section });
-		else for (const row of sectionRows) items.push({ type: "row", row });
+	for (const [index, row] of rows.entries()) {
+		const heading = isAgentsViewSectionHeadingRow(row) ? row : undefined;
+		if (heading && index > 0) items.push({ type: "spacer" });
+		items.push({ type: "row", row });
+		if (heading && !heading.collapsed && heading.count === 0 && !hasFollowingSessionRow(rows, index)) {
+			items.push({ type: "empty" });
+		}
 	}
 	return items;
 }
 
-function getDisplayRowsForSection(rows: readonly AgentsViewRow[], section: AgentsViewSection): AgentsViewRow[] {
-	const result: AgentsViewRow[] = [];
-	let include = false;
-	for (const row of rows) {
-		if (row.depth === 0) include = row.displaySection === section;
-		if (include) result.push(row);
-	}
-	return result;
+/** True when the row after a heading belongs to that heading's section. */
+function hasFollowingSessionRow(rows: readonly AgentsViewRow[], headingIndex: number): boolean {
+	const next = rows[headingIndex + 1];
+	return next !== undefined && isAgentsViewSessionRow(next);
 }
 
-function countRowsBySection(rows: readonly AgentsViewRow[]): Record<AgentsViewSection, number> {
+function countRowsBySection(rows: readonly AgentsViewSessionRow[]): Record<AgentsViewSection, number> {
 	const agents = rows.filter((row) => row.kind === "agent");
 	return {
 		pinned: agents.filter((row) => row.displaySection === "pinned").length,
@@ -2981,7 +3157,7 @@ function getSelectedRowIdentity(row: AgentsViewRow | undefined): string | undefi
 	return row?.identity;
 }
 
-function rowHasSpawnCode(row: AgentsViewRow): boolean {
+function rowHasSpawnCode(row: AgentsViewSessionRow): boolean {
 	const code = row.summary.spawnCode;
 	return typeof code === "string" && code.trim().length > 0;
 }
@@ -2992,7 +3168,7 @@ function isRunningSessionSummary(summary: SessionSummary): boolean {
 
 // Explicit session names read bold so they stand out from fallback titles
 // (first prompt, cwd, ids); the "(no messages)" placeholder reads italic.
-function styleRowTitle(row: AgentsViewRow): string {
+function styleRowTitle(row: AgentsViewSessionRow): string {
 	if (row.summary.sessionName?.replace(/\s+/g, " ").trim()) {
 		return theme.bold(row.title);
 	}

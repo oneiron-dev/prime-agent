@@ -63,13 +63,17 @@ export interface UnattachableChildOpenResult {
 	statusMessage: string;
 }
 
-export type AgentsViewRowKind = "agent" | "subagent-summary" | "subagent" | "subagent-code";
+export type AgentsViewSessionRowKind = "agent" | "subagent-summary" | "subagent" | "subagent-code";
+export type AgentsViewRowKind = "section-heading" | AgentsViewSessionRowKind;
+
+/** Section order used by headings, ranking, and collapse persistence. */
+export const AGENTS_VIEW_SECTIONS: readonly AgentsViewSection[] = ["pinned", "running", "idle", "inactive"];
 
 // Hard cap on spawn-code lines shown so a large program never floods the view.
 const MAX_SPAWN_CODE_LINES = 10;
 
-export interface AgentsViewRow {
-	kind: AgentsViewRowKind;
+export interface AgentsViewSessionRow {
+	kind: AgentsViewSessionRowKind;
 	/** Live activity drives status presentation. */
 	activitySection: AgentsViewActivitySection;
 	/** @deprecated Use activitySection for live status. */
@@ -100,6 +104,112 @@ export interface AgentsViewRow {
 	/** Merged durable/live source data for unified rows. */
 	record?: UnifiedSessionRecord;
 	heartbeat?: UnifiedSessionHeartbeat;
+}
+
+/**
+ * A section heading is a first-class selectable row rather than a render-time
+ * decoration, so Up/Down, selection restore, and Enter all treat it like any
+ * other row without a second cursor. It carries no SessionSummary: heading
+ * selection must never reach session actions or daemon commands.
+ */
+export interface AgentsViewSectionHeadingRow {
+	kind: "section-heading";
+	section: AgentsViewSection;
+	/** Mirrors `section` so section-scoped row filters keep working uniformly. */
+	displaySection: AgentsViewDisplaySection;
+	/** Clean section title; the count is presentation, not part of the title. */
+	title: string;
+	/** Session rows in this section before collapse, so a collapsed count stays true. */
+	count: number;
+	collapsed: boolean;
+	depth: 0;
+	selectable: true;
+	identity: string;
+}
+
+export type AgentsViewRow = AgentsViewSessionRow | AgentsViewSectionHeadingRow;
+
+export function isAgentsViewSessionRow(row: AgentsViewRow): row is AgentsViewSessionRow {
+	return row.kind !== "section-heading";
+}
+
+export function isAgentsViewSectionHeadingRow(row: AgentsViewRow): row is AgentsViewSectionHeadingRow {
+	return row.kind === "section-heading";
+}
+
+export function getAgentsViewSectionHeadingIdentity(section: AgentsViewSection): string {
+	return `section:${section}`;
+}
+
+/**
+ * Collapsed headings carry their section size so the hidden content stays
+ * discoverable; expanded headings read as a plain title.
+ */
+export function formatAgentsViewSectionHeadingLabel(row: AgentsViewSectionHeadingRow): string {
+	return row.collapsed ? `${row.title} ${row.count}` : row.title;
+}
+
+export interface AgentsViewSectionRowOptions {
+	collapsedSections?: ReadonlySet<AgentsViewSection>;
+}
+
+/**
+ * Compose the display list from built session rows: one heading per section in
+ * canonical order, followed by that section's rows when it is expanded. Counts
+ * always come from the unfiltered session rows so a collapsed section reports
+ * its real size.
+ */
+export function buildAgentsViewSectionRows(
+	sessionRows: readonly AgentsViewSessionRow[],
+	options: AgentsViewSectionRowOptions = {},
+): AgentsViewRow[] {
+	const collapsedSections = options.collapsedSections ?? new Set<AgentsViewSection>();
+	const rows: AgentsViewRow[] = [];
+	for (const section of AGENTS_VIEW_SECTIONS) {
+		const sectionRows = getAgentsViewSectionRows(sessionRows, section);
+		const collapsed = collapsedSections.has(section);
+		rows.push({
+			kind: "section-heading",
+			section,
+			displaySection: section,
+			title: sectionTitle(section),
+			count: sectionRows.filter((row) => row.kind === "agent" && row.depth === 0).length,
+			collapsed,
+			depth: 0,
+			selectable: true,
+			identity: getAgentsViewSectionHeadingIdentity(section),
+		});
+		if (!collapsed) rows.push(...sectionRows);
+	}
+	return rows;
+}
+
+/**
+ * Flip one section's collapse state, keeping the canonical section order so the
+ * persisted value and the in-memory value always agree.
+ */
+export function toggleAgentsViewCollapsedSection(
+	collapsedSections: readonly AgentsViewSection[],
+	section: AgentsViewSection,
+): AgentsViewSection[] {
+	const collapsed = new Set(collapsedSections);
+	if (collapsed.has(section)) collapsed.delete(section);
+	else collapsed.add(section);
+	return AGENTS_VIEW_SECTIONS.filter((candidate) => collapsed.has(candidate));
+}
+
+/** Rows belonging to one section, including the nested rows under its roots. */
+export function getAgentsViewSectionRows(
+	rows: readonly AgentsViewSessionRow[],
+	section: AgentsViewSection,
+): AgentsViewSessionRow[] {
+	const result: AgentsViewSessionRow[] = [];
+	let include = false;
+	for (const row of rows) {
+		if (row.depth === 0) include = row.displaySection === section;
+		if (include) result.push(row);
+	}
+	return result;
 }
 
 export function classifyAgentsViewSession(summary: SessionSummary): AgentsViewActivitySection {
@@ -590,9 +700,15 @@ export function resolveAgentsViewSelectionIndex(
 	identity: string | undefined,
 	key: AgentsViewSelectionKey | undefined,
 ): number {
-	const findSelectable = (predicate: (row: AgentsViewRow) => boolean): number =>
-		rows.findIndex((row) => row.selectable && predicate(row));
+	const findSelectable = (predicate: (row: AgentsViewSessionRow) => boolean): number =>
+		rows.findIndex((row) => row.selectable && isAgentsViewSessionRow(row) && predicate(row));
 
+	// Heading identities are stable and carry no session key, so they resolve
+	// first and never fall through to the session-key fallbacks.
+	if (identity !== undefined) {
+		const headingIndex = rows.findIndex((row) => isAgentsViewSectionHeadingRow(row) && row.identity === identity);
+		if (headingIndex >= 0) return headingIndex;
+	}
 	if (identity !== undefined) {
 		const index = findSelectable((row) => row.identity === identity);
 		// Synthetic nested rows deliberately reuse their parent's session key, so
@@ -635,8 +751,17 @@ export function resolveAgentsViewSelectionState(
 	if (rows.length === 0) return { index: 0, resolved: false };
 	const resolvedIndex = resolveAgentsViewSelectionIndex(rows, identity, key);
 	if (resolvedIndex >= 0) return { index: resolvedIndex, resolved: true };
+	const firstSession = rows.findIndex((row) => row.selectable && isAgentsViewSessionRow(row));
+	// A first view has nothing to restore. Headings are selectable and sit at
+	// index 0, so without this the cursor would park on Pinned instead of the
+	// first session, changing the pre-heading default.
+	if (identity === undefined && key === undefined && firstSession >= 0) {
+		return { index: firstSession, resolved: false };
+	}
 	const boundedIndex = Math.max(0, Math.min(currentIndex, rows.length - 1));
 	if (rows[boundedIndex]?.selectable) return { index: boundedIndex, resolved: false };
+	// A vanished session falls back to a session row before a heading.
+	if (firstSession >= 0) return { index: firstSession, resolved: false };
 	const firstSelectable = rows.findIndex((row) => row.selectable);
 	return { index: firstSelectable >= 0 ? firstSelectable : 0, resolved: false };
 }
@@ -652,7 +777,7 @@ export function buildAgentsViewRows(
 	programShownParents: ReadonlySet<string> = new Set(),
 	scope?: AgentsViewScopeKey,
 	options: AgentsViewRowBuildOptions = {},
-): AgentsViewRow[] {
+): AgentsViewSessionRow[] {
 	const manualOrder = options.manualOrder ?? {};
 	const pinnedRootSessionIds = options.pinnedRootSessionIds ?? new Set<string>();
 	const inputs = summariesOrRecords.map((input) =>
@@ -720,7 +845,7 @@ export function buildAgentsViewRows(
 		for (const child of childrenByParent.get(row) ?? []) setRoot(child, root);
 	};
 	for (const root of roots) setRoot(root, root);
-	const flattened: AgentsViewRow[] = [];
+	const flattened: AgentsViewSessionRow[] = [];
 	const emit = (row: MutableAgentsViewRow, depth: number): void => {
 		row.depth = depth;
 		flattened.push(row);
@@ -771,15 +896,15 @@ function propagateHeartbeatStateToAncestors(
 	}
 }
 
-type MutableAgentsViewRow = AgentsViewRow;
+type MutableAgentsViewRow = AgentsViewSessionRow;
 
 function createSubagentSummaryRow(
-	parent: AgentsViewRow,
-	children: readonly AgentsViewRow[],
+	parent: AgentsViewSessionRow,
+	children: readonly AgentsViewSessionRow[],
 	depth: number,
 	hasSpawnCode: boolean,
 	expanded: boolean,
-): AgentsViewRow {
+): AgentsViewSessionRow {
 	const totalCount = children.length;
 	const running = parent.runningSubagentCount;
 	const heartbeatCount = children.filter(
@@ -848,12 +973,12 @@ function groupChildrenBySpawnCode(children: readonly MutableAgentsViewRow[]): Sp
 }
 
 function buildSpawnCodeRows(
-	parent: AgentsViewRow,
+	parent: AgentsViewSessionRow,
 	spawnCode: string,
 	depth: number,
 	groupIndex: number,
-): AgentsViewRow[] {
-	const makeRow = (code: string, lineIndex: string): AgentsViewRow => ({
+): AgentsViewSessionRow[] {
+	const makeRow = (code: string, lineIndex: string): AgentsViewSessionRow => ({
 		kind: "subagent-code",
 		activitySection: parent.activitySection,
 		section: parent.section,
@@ -885,13 +1010,19 @@ function buildSpawnCodeRows(
 }
 
 export function getAgentsViewReorderGroup(row: AgentsViewRow): string | undefined {
+	// Section headings are not reorderable peers of any session group.
+	if (!isAgentsViewSessionRow(row)) return undefined;
 	if (row.kind === "agent" && row.depth === 0) return "roots";
 	if (row.kind === "subagent" && row.parentSessionId)
 		return `children:${row.parentSessionId}:${row.summary.spawnCode ?? ""}`;
 	return undefined;
 }
 
-function compareAgentsViewRows(a: AgentsViewRow, b: AgentsViewRow, manualOrder: AgentsViewManualOrder = {}): number {
+function compareAgentsViewRows(
+	a: AgentsViewSessionRow,
+	b: AgentsViewSessionRow,
+	manualOrder: AgentsViewManualOrder = {},
+): number {
 	const sectionDiff = sectionRank(a.displaySection) - sectionRank(b.displaySection);
 	if (sectionDiff !== 0) return sectionDiff;
 	const group = getAgentsViewReorderGroup(a);

@@ -1,0 +1,1 @@
+- Added collapsible Pinned, Running, Idle, and Inactive sections to Agents View: section headings are selectable rows, Enter collapses or expands the selected section, a collapsed heading shows its agent count, and the choice persists across Agents View sessions while a search still reveals matches inside collapsed sections.

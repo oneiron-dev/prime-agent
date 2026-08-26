@@ -91,6 +91,35 @@ describe("AgentsViewStateStore", () => {
 		expect(store.load().state.pinnedRootSessionIds).toEqual(["before"]);
 	});
 
+	test("round-trips collapsed sections additively and drops unknown section names", () => {
+		const path = statePath(),
+			store = new AgentsViewStateStore(path);
+		expect(store.load().state.collapsedSections).toEqual([]);
+		store.apply({ type: "setSectionCollapsed", section: "inactive", collapsed: true });
+		store.apply({ type: "setSectionCollapsed", section: "pinned", collapsed: true });
+		// Canonical section order, not insertion order.
+		expect(store.load().state.collapsedSections).toEqual(["pinned", "inactive"]);
+		store.apply({ type: "setSectionCollapsed", section: "pinned", collapsed: false });
+		expect(store.load().state.collapsedSections).toEqual(["inactive"]);
+		// Pins and manual order are untouched by a collapse change.
+		store.apply({ type: "setPin", sessionId: "kept", pinned: true });
+		expect(store.load().state.pinnedRootSessionIds).toEqual(["kept"]);
+		expect(store.load().state.collapsedSections).toEqual(["inactive"]);
+	});
+
+	test("reads a v1 file without collapsedSections as fully expanded and ignores invalid entries", () => {
+		const path = statePath(),
+			store = new AgentsViewStateStore(path);
+		writeFileSync(path, '{"version":1,"pinnedRootSessionIds":["a"],"manualOrder":{}}');
+		expect(store.load().state.collapsedSections).toEqual([]);
+		expect(store.load().state.pinnedRootSessionIds).toEqual(["a"]);
+		writeFileSync(
+			path,
+			'{"version":1,"pinnedRootSessionIds":[],"manualOrder":{},"collapsedSections":["idle","bogus","idle",7]}',
+		);
+		expect(store.load().state.collapsedSections).toEqual(["idle"]);
+	});
+
 	test("writes parsable private state, creates a private parent, and leaves no lock or temp", () => {
 		const path = join(mkdtempSync(join(tmpdir(), "agents-view-state-")), "nested", "state.json"),
 			store = new AgentsViewStateStore(path);

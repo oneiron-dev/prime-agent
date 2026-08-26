@@ -19,6 +19,8 @@ import {
 import {
 	type AgentsViewRow,
 	buildAgentsViewRows,
+	buildAgentsViewSectionRows,
+	isAgentsViewSectionHeadingRow,
 	resolveAgentsViewLeftResult,
 } from "../src/modes/agents-view/agents-view-state.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
@@ -119,34 +121,83 @@ describe("AgentsViewMode", () => {
 		expect(self.selectedIndex).toBe(4);
 	});
 
-	it("wraps normal navigation across selectable pinned and nested rows", () => {
+	it("wraps normal navigation across selectable section headings and nested rows", () => {
+		// Real rows, so section headings participate as genuine selectable members
+		// and spawn-code rows remain skipped.
+		const pinnedAgent = summary({ id: "pinned-active", activeSessionId: "pinned-active", sessionId: "pinned" });
+		const root = summary({ id: "root-active", activeSessionId: "root-active", sessionId: "root" });
+		const child = summary({
+			id: "child-active",
+			activeSessionId: "child-active",
+			sessionId: "child",
+			runtimeKind: "subagent",
+			parentSessionId: "root",
+			parentActiveSessionId: "root-active",
+			spawnCode: "await rlm('child')",
+		});
+		const options = { pinnedRootSessionIds: new Set(["pinned"]) };
+		const probe = buildAgentsViewRows([pinnedAgent, root, child], new Set(), new Set(), undefined, options);
+		const rootIdentity = probe.find((row) => row.sessionId === "root")!.identity;
+		const rows = buildAgentsViewSectionRows(
+			buildAgentsViewRows(
+				[pinnedAgent, root, child],
+				new Set([rootIdentity]),
+				new Set([rootIdentity]),
+				undefined,
+				options,
+			),
+		);
 		const self = {
-			rows: [
-				{ kind: "heading", selectable: false, identity: "pinned-heading" },
-				{ kind: "agent", selectable: true, identity: "pinned-agent" },
-				{ kind: "heading", selectable: false, identity: "running-heading" },
-				{ kind: "agent", selectable: true, identity: "filtered-agent" },
-				{ kind: "code", selectable: false, identity: "spawn-code" },
-				{ kind: "subagent", selectable: true, identity: "nested-agent" },
-			],
-			selectedIndex: 5,
+			rows,
+			selectedIndex: 0,
 			replyTarget: undefined,
 			getSelectableRowIndexes() {
-				return this.rows.flatMap((row, index) => (row.selectable ? [index] : []));
+				return invoke("getSelectableRowIndexes", self) as number[];
 			},
 			syncSelectedRowState: vi.fn(),
 			clearDeleteConfirmation: vi.fn(),
 			ui: { requestRender: vi.fn() },
 		};
+		const kindAt = () => rows[self.selectedIndex]?.kind;
+		const sectionAt = () => {
+			const row = rows[self.selectedIndex];
+			return row && isAgentsViewSectionHeadingRow(row) ? row.section : undefined;
+		};
+		const lastSelectable = self.getSelectableRowIndexes().at(-1)!;
 
+		// A fresh cursor on the Pinned heading walks onto its agent, then onto the
+		// intervening Running and Idle headings.
+		expect(sectionAt()).toBe("pinned");
 		invoke("moveSelection", self, 1, { wrap: true });
-		expect(self.selectedIndex).toBe(1);
+		expect(kindAt()).toBe("agent");
+		invoke("moveSelection", self, 1, { wrap: true });
+		expect(sectionAt()).toBe("running");
+		invoke("moveSelection", self, 1, { wrap: true });
+		expect(sectionAt()).toBe("idle");
 
+		// Down from the last selectable row wraps to the first Pinned heading.
+		self.selectedIndex = lastSelectable;
+		expect(sectionAt()).toBe("inactive");
+		invoke("moveSelection", self, 1, { wrap: true });
+		expect(self.selectedIndex).toBe(0);
+		expect(sectionAt()).toBe("pinned");
+
+		// Up from the first heading wraps back to that last selectable row.
 		invoke("moveSelection", self, -1, { wrap: true });
-		expect(self.selectedIndex).toBe(5);
-		expect(self.syncSelectedRowState).toHaveBeenCalledTimes(2);
-		expect(self.clearDeleteConfirmation).toHaveBeenCalledTimes(2);
-		expect(self.ui.requestRender).toHaveBeenCalledTimes(2);
+		expect(self.selectedIndex).toBe(lastSelectable);
+
+		// Session and nested behavior is unchanged: the subagent row and its
+		// summary row stay reachable and read-only spawn-code rows are skipped.
+		const visited = new Set<string>();
+		self.selectedIndex = 0;
+		for (let step = 0; step < rows.length; step++) {
+			visited.add(kindAt() as string);
+			invoke("moveSelection", self, 1, { wrap: true });
+		}
+		expect(visited).toContain("subagent");
+		expect(visited).toContain("subagent-summary");
+		expect(visited).not.toContain("subagent-code");
+		expect(rows.some((row) => row.kind === "subagent-code")).toBe(true);
 	});
 
 	it("re-resolves subagent state before choosing stop or delete intent", async () => {
@@ -162,24 +213,28 @@ describe("AgentsViewMode", () => {
 			data: command.type === "cancel_rlm_child" ? { cancelled: false } : { deleted: true },
 		}));
 		const client = { request, supportsServerCapability: vi.fn(() => true) };
+		// Ancestry resolves from the pre-collapse session rows, so both views share
+		// the same array here.
+		const rows = [
+			{
+				kind: "subagent",
+				section: "running",
+				summary: child,
+				selectable: true,
+				identity: "child-row",
+				parentIdentity: "root-row",
+			},
+			{
+				kind: "agent",
+				section: "idle",
+				summary: summary({ id: "root-active", activeSessionId: "root-active", sessionId: "root-session" }),
+				selectable: true,
+				identity: "root-row",
+			},
+		];
 		const self = {
-			rows: [
-				{
-					kind: "subagent",
-					section: "running",
-					summary: child,
-					selectable: true,
-					identity: "child-row",
-					parentIdentity: "root-row",
-				},
-				{
-					kind: "agent",
-					section: "idle",
-					summary: summary({ id: "root-active", activeSessionId: "root-active", sessionId: "root-session" }),
-					selectable: true,
-					identity: "root-row",
-				},
-			],
+			rows,
+			sessionRows: rows,
 			selectedIndex: 0,
 			pendingDeleteAgent: undefined,
 			pendingKillSubagent: undefined,
@@ -509,6 +564,10 @@ describe("AgentsViewMode", () => {
 			ui: { requestRender: vi.fn() },
 			setStatusMessage: vi.fn(),
 			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			getActiveSearchQuery: () => "",
+			getCollapsedSectionsForDisplay: () => new Set(),
+			rebuildSectionRows: () => invoke("rebuildSectionRows", self),
+			hasNoSearchMatches: () => invoke("hasNoSearchMatches", self) as boolean,
 		});
 		self.reconcileCatalogs = () => invoke("reconcileCatalogs", self);
 		invoke("reconcileCatalogs", self);
@@ -564,6 +623,10 @@ describe("AgentsViewMode", () => {
 			ui: { requestRender: vi.fn() },
 			setStatusMessage: vi.fn(),
 			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			getActiveSearchQuery: () => "",
+			getCollapsedSectionsForDisplay: () => new Set(),
+			rebuildSectionRows: () => invoke("rebuildSectionRows", self),
+			hasNoSearchMatches: () => invoke("hasNoSearchMatches", self) as boolean,
 		};
 		invoke("reconcileCatalogs", self);
 		expect(persistentState.scopeRootSummary).toMatchObject({ sessionId: root.sessionId });
@@ -651,6 +714,10 @@ describe("AgentsViewMode", () => {
 				ui: { requestRender: vi.fn() },
 				setStatusMessage: vi.fn(),
 				withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+				getActiveSearchQuery: () => "",
+				getCollapsedSectionsForDisplay: () => new Set(),
+				rebuildSectionRows: () => invoke("rebuildSectionRows", self),
+				hasNoSearchMatches: () => invoke("hasNoSearchMatches", self) as boolean,
 			};
 			invoke("reconcileCatalogs", self);
 			if (expand) {
