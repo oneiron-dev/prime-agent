@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const defaultOutputDir = join(root, "packages", "coding-agent", "release");
 const defaultBaseUrl = process.env.PRIME_AGENT_DOWNLOAD_BASE_URL;
+const defaultTarballBaseUrl = process.env.PRIME_AGENT_TARBALL_BASE_URL;
 const publicPackageName = process.env.PRIME_AGENT_PACKAGE_NAME || "prime-agent";
 const publicCommandName = process.env.PRIME_AGENT_CMD || "prime-agent";
 const releaseChannels = new Set(["stable", "beta"]);
@@ -32,6 +33,7 @@ const releasePackages = [
 function parseArgs(args) {
 	const parsed = {
 		baseUrl: defaultBaseUrl,
+		tarballBaseUrl: defaultTarballBaseUrl,
 		channel: "stable",
 		outDir: defaultOutputDir,
 		version: undefined,
@@ -53,6 +55,13 @@ function parseArgs(args) {
 				const value = args[i + 1];
 				if (!value) throw new Error("--base-url requires a value");
 				parsed.baseUrl = value;
+				i += 1;
+				break;
+			}
+			case "--tarball-base-url": {
+				const value = args[i + 1];
+				if (!value) throw new Error("--tarball-base-url requires a value");
+				parsed.tarballBaseUrl = value;
 				i += 1;
 				break;
 			}
@@ -80,18 +89,23 @@ function parseArgs(args) {
 		}
 	}
 
-	if (!parsed.baseUrl) {
-		throw new Error("--base-url or PRIME_AGENT_DOWNLOAD_BASE_URL is required");
+	if (!parsed.baseUrl && !parsed.tarballBaseUrl) {
+		throw new Error(
+			"--base-url, --tarball-base-url, PRIME_AGENT_DOWNLOAD_BASE_URL, or PRIME_AGENT_TARBALL_BASE_URL is required",
+		);
 	}
 
-	parsed.baseUrl = parsed.baseUrl.replace(/\/+$/, "");
+	if (parsed.baseUrl) parsed.baseUrl = parsed.baseUrl.replace(/\/+$/, "");
+	if (parsed.tarballBaseUrl) parsed.tarballBaseUrl = parsed.tarballBaseUrl.replace(/\/+$/, "");
 	return parsed;
 }
 
 function printHelp() {
-	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--channel stable|beta] [--version x.y.z] [--out-dir path]
+	console.log(`Usage: node scripts/pack-prime-agent-release.mjs (--base-url url | --tarball-base-url url) [--channel stable|beta] [--version x.y.z] [--out-dir path]
 
-Creates private npm tarballs for R2 distribution:
+Creates npm release tarballs. --base-url uses the standard <base>/releases/v<version>/ layout;
+--tarball-base-url points directly at the directory containing the release assets (for example,
+a GitHub Releases download URL):
 
   <out-dir>/artifacts/prime-agent-<version>.tgz
   <out-dir>/artifacts/prime-agent-ai-<version>.tgz
@@ -152,7 +166,8 @@ function npmTarballName(packageName, version) {
 	return `${packageName.replace(/^@/, "").replace("/", "-")}-${version}.tgz`;
 }
 
-function releaseTarballUrl(baseUrl, version, tarballFile) {
+function releaseTarballUrl(baseUrl, tarballBaseUrl, version, tarballFile) {
+	if (tarballBaseUrl) return `${tarballBaseUrl}/${tarballFile}`;
 	return `${baseUrl}/releases/v${version}/${tarballFile}`;
 }
 
@@ -268,7 +283,10 @@ function main() {
 		if (releasePackage.packageDir === "coding-agent") continue;
 		const sourcePackageName = sourcePackageNames.get(releasePackage.packageDir);
 		const artifactFile = artifactFiles.get(releasePackage.packageDir);
-		internalPackageUrls.set(sourcePackageName, releaseTarballUrl(args.baseUrl, releaseVersion, artifactFile));
+		internalPackageUrls.set(
+			sourcePackageName,
+			releaseTarballUrl(args.baseUrl, args.tarballBaseUrl, releaseVersion, artifactFile),
+		);
 	}
 
 	const stagingRoot = join(args.outDir, "packages");
