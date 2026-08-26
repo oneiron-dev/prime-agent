@@ -755,16 +755,16 @@ export class KernelManager {
 					// No JPY_PARENT_PID: forked children watch the forkserver by getppid().
 					env: { ...process.env, ...this.options.env },
 				});
+				if (this.startStale(generation)) {
+					// Nobody owns this kernel; the protocol kill is id-keyed and safe.
+					void handle.kill("TERM").catch(() => {});
+					throw new Error("Kernel start superseded");
+				}
 				const startTime = readLinuxProcessStartTime(handle.pid);
 				if (process.platform === "linux" && startTime === undefined) {
 					// Without a pinned identity a later group kill could hit a recycled pid.
 					void handle.kill("TERM").catch(() => {});
 					throw new ForkServerUnavailable("could not pin forked kernel process identity");
-				}
-				if (this.startStale(generation)) {
-					// Nobody owns this kernel; the protocol kill is id-keyed and safe.
-					void handle.kill("TERM").catch(() => {});
-					throw new Error("Kernel start superseded");
 				}
 				this.forkedKernel = handle;
 				this.forkedKernelStartTime = startTime;

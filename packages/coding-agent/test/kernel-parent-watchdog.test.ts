@@ -28,6 +28,30 @@ afterAll(() => {
 	else process.env.PRIME_AGENT_KERNEL_FORKSERVER = savedForkFlag;
 });
 
+const pinnableChildDisposers: Array<() => void> = [];
+
+// A real, live child process whose pid passes the Linux fail-closed admission pin
+// (`/proc/<pid>/stat` must be readable). Mocked fork handles must therefore carry
+// this pid rather than a fabricated one.
+function spawnPinnableChildPid(): number {
+	const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)"], {
+		// Own process group on POSIX, mirroring the forked kernel's setsid(): the legitimate
+		// post-"signaled" group sweep then lands on the fixture's group alone.
+		detached: process.platform !== "win32",
+		stdio: "ignore",
+	});
+	if (child.pid === undefined) throw new Error("pinnable child spawn failed");
+	const pid = child.pid;
+	pinnableChildDisposers.push(() => {
+		try {
+			child.kill("SIGKILL");
+		} catch {
+			// Already reaped.
+		}
+	});
+	return pid;
+}
+
 function writeFakePython(script: string[]): string {
 	const python = join(tempDir, "python");
 	writeFileSync(python, script.join("\n"));
@@ -54,6 +78,9 @@ describe("kernel parent watchdog", () => {
 	});
 
 	afterEach(() => {
+		// Test spies are restored in each test's own finally, which runs first, so
+		// these disposal signals are never observed by a test's process.kill spy.
+		while (pinnableChildDisposers.length) pinnableChildDisposers.pop()?.();
 		forkEnabledMock.mockReturnValue(false);
 		forkKernelMock.mockReset();
 		if (savedJournalPath === undefined) delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
@@ -94,9 +121,10 @@ describe("kernel parent watchdog", () => {
 		const journalPath = join(tempDir, "orphans.jsonl");
 		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = journalPath;
 		forkEnabledMock.mockReturnValue(true);
+		const forkedPid = spawnPinnableChildPid();
 		const killMock = vi.fn(async (): Promise<"signaled"> => "signaled");
 		forkKernelMock.mockResolvedValue({
-			pid: 999999,
+			pid: forkedPid,
 			isAlive: async () => false,
 			kill: killMock,
 		});
@@ -115,8 +143,8 @@ describe("kernel parent watchdog", () => {
 			expect(killMock).toHaveBeenCalledWith("TERM");
 			const records = readJournalRecords(journalPath);
 			expect(records).toHaveLength(2);
-			expect(records[0]).toMatchObject({ pid: 999999, active: true });
-			expect(records[1]).toMatchObject({ pid: 999999, active: false });
+			expect(records[0]).toMatchObject({ pid: forkedPid, active: true });
+			expect(records[1]).toMatchObject({ pid: forkedPid, active: false });
 		});
 	});
 
@@ -124,9 +152,10 @@ describe("kernel parent watchdog", () => {
 		const journalPath = join(tempDir, "orphans.jsonl");
 		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = journalPath;
 		forkEnabledMock.mockReturnValue(true);
+		const forkedPid = spawnPinnableChildPid();
 		const killMock = vi.fn(async (): Promise<"already-exited"> => "already-exited");
 		forkKernelMock.mockResolvedValue({
-			pid: 999999,
+			pid: forkedPid,
 			isAlive: async () => false,
 			kill: killMock,
 		});
@@ -145,18 +174,19 @@ describe("kernel parent watchdog", () => {
 		await new Promise((resolve) => setTimeout(resolve, 200));
 		const records = readJournalRecords(journalPath);
 		expect(records).toHaveLength(1);
-		expect(records[0]).toMatchObject({ pid: 999999, active: true });
+		expect(records[0]).toMatchObject({ pid: forkedPid, active: true });
 	});
 
 	it("leaves the journal record active and never signals the pid when the kill is unconfirmed", async () => {
 		const journalPath = join(tempDir, "orphans.jsonl");
 		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = journalPath;
 		forkEnabledMock.mockReturnValue(true);
+		const forkedPid = spawnPinnableChildPid();
 		const killMock = vi.fn(async (): Promise<never> => {
 			throw new ForkServerUnavailable("dead");
 		});
 		forkKernelMock.mockResolvedValue({
-			pid: 999999,
+			pid: forkedPid,
 			isAlive: async () => {
 				throw new ForkServerUnavailable("dead");
 			},
@@ -174,8 +204,8 @@ describe("kernel parent watchdog", () => {
 			await new Promise((resolve) => setTimeout(resolve, 200));
 			const records = readJournalRecords(journalPath);
 			expect(records).toHaveLength(1);
-			expect(records[0]).toMatchObject({ pid: 999999, active: true });
-			expect(killSpy.mock.calls.some((call) => call[0] === 999999)).toBe(false);
+			expect(records[0]).toMatchObject({ pid: forkedPid, active: true });
+			expect(killSpy.mock.calls.some((call) => call[0] === forkedPid)).toBe(false);
 		} finally {
 			killSpy.mockRestore();
 			errorSpy.mockRestore();
@@ -205,9 +235,10 @@ describe("kernel parent watchdog", () => {
 
 	it("maps SIGKILL to the forkserver KILL signal", async () => {
 		forkEnabledMock.mockReturnValue(true);
+		const forkedPid = spawnPinnableChildPid();
 		const isAliveMock = vi.fn(async () => true);
 		const killMock = vi.fn(async (): Promise<"signaled"> => "signaled");
-		forkKernelMock.mockResolvedValue({ pid: 999999, isAlive: isAliveMock, kill: killMock });
+		forkKernelMock.mockResolvedValue({ pid: forkedPid, isAlive: isAliveMock, kill: killMock });
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		const manager = new KernelManager({ python: "/nonexistent/python", cwd: tempDir });
 
