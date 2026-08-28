@@ -1,3 +1,6 @@
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -12,6 +15,8 @@ import {
 } from "../src/core/kernel/state-snapshot.js";
 
 const MARKER = "__PRIME_AGENT_KERNEL_STATE__";
+const PYTHON = process.env.PRIME_AGENT_TEST_PYTHON ?? "python3";
+const pythonHasDill = spawnSync(PYTHON, ["-c", "import dill"], { stdio: "ignore" }).status === 0;
 
 describe("kernel state snapshot paths", () => {
 	it("places snapshot + manifest inside the session artifact directory", () => {
@@ -95,10 +100,12 @@ describe("buildSnapshotCode", () => {
 		expect(code).toContain(String(DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES));
 	});
 
-	it("uses dill, an atomic write, and skips internal handles", () => {
+	it("uses dill, an atomic write, and rejects file-handle reducers", () => {
 		expect(code).toContain("import dill");
 		expect(code).toContain("os.replace");
 		expect(code).toContain("except _b.KeyboardInterrupt");
+		expect(code).toContain("io.IOBase");
+		expect(code).toContain('b"_create_filehandle"');
 		expect(code).toContain('"rlm"');
 		expect(code).toContain(`print(${JSON.stringify(MARKER)}`);
 	});
@@ -107,9 +114,69 @@ describe("buildSnapshotCode", () => {
 describe("buildRestoreCode", () => {
 	const code = buildRestoreCode("/state/sess.dill");
 
-	it("embeds the input path and no-ops when the file is missing", () => {
+	it("embeds the input path and rejects legacy file handles before dill.loads", () => {
 		expect(code).toContain('"/state/sess.dill"');
 		expect(code).toContain("os.path.exists");
-		expect(code).toContain("dill.loads");
+		expect(code).toContain('b"_create_filehandle"');
+		expect(code.indexOf('b"_create_filehandle"')).toBeLessThan(code.indexOf("dill.loads"));
+	});
+});
+
+describe.skipIf(!pythonHasDill)("file-handle snapshot safety regression", () => {
+	it("skips and purges a closed write handle without changing its target", () => {
+		const dir = mkdtempSync(join(tmpdir(), "prime-snapshot-handle-"));
+		try {
+			const target = join(dir, "durable.txt");
+			const snapshot = join(dir, "kernel-state.dill");
+			const manifest = join(dir, "kernel-state.json");
+			const python = `
+f = open(${JSON.stringify(target)}, "w")
+f.write("SURVIVE")
+f.close()
+safe_value = 42
+${buildSnapshotCode(snapshot, manifest, DEFAULT_SNAPSHOT_MAX_BYTES)}
+`;
+			const stdout = execFileSync(PYTHON, ["-c", python], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+			const result = parseSnapshotResult(stdout, snapshot);
+			expect(result?.saved).toContain("safe_value");
+			expect(result?.saved).not.toContain("f");
+			expect(result?.skipped).toContainEqual({ name: "f", reason: "unsafe file handle (io.IOBase)" });
+			expect(readFileSync(target, "utf8")).toBe("SURVIVE");
+			const manifestData = JSON.parse(readFileSync(manifest, "utf8"));
+			expect(manifestData.version).toBe(2);
+			expect(manifestData.purgedFileHandles).toEqual(["f"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a legacy closed write-handle blob before it can truncate", () => {
+		const dir = mkdtempSync(join(tmpdir(), "prime-restore-handle-"));
+		try {
+			const target = join(dir, "durable.txt");
+			const snapshot = join(dir, "kernel-state.dill");
+			writeFileSync(target, "SURVIVE");
+			const setup = `
+import dill
+from pathlib import Path
+_target = Path(${JSON.stringify(target)})
+_legacy = open(_target, "w")
+_legacy.close()
+_target.write_text("SURVIVE")
+with open(${JSON.stringify(snapshot)}, "wb") as _fh:
+    dill.dump({"legacy_write": dill.dumps(_legacy), "safe_value": dill.dumps(42)}, _fh)
+${buildRestoreCode(snapshot)}
+`;
+			const stdout = execFileSync(PYTHON, ["-c", setup], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+			const result = parseRestoreResult(stdout, snapshot);
+			expect(result?.restored).toEqual(["safe_value"]);
+			expect(result?.failed).toContainEqual({
+				name: "legacy_write",
+				reason: "unsafe legacy dill file-handle reducer rejected",
+			});
+			expect(readFileSync(target, "utf8")).toBe("SURVIVE");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

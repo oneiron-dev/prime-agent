@@ -68,7 +68,7 @@ export function buildSnapshotCode(
 	// working even when the user namespace shadows names like list/open/print/len.
 	return `
 def _prime_agent_snapshot_state():
-    import builtins as _b, io, json, os, sys, datetime
+    import builtins as _b, io, json, os, sys, datetime, pickletools
     try:
         import dill
     except _b.Exception as _err:
@@ -100,9 +100,31 @@ def _prime_agent_snapshot_state():
                 raise SnapshotSizeLimitExceeded()
             return io.BytesIO.write(self, chunk)
 
+    def has_filehandle_reducer(blob):
+        if b"_create_filehandle" not in blob:
+            return False
+        strings = []
+        try:
+            for opcode, arg, _pos in pickletools.genops(blob):
+                if opcode.name == "GLOBAL":
+                    if arg == "dill._dill _create_filehandle":
+                        return True
+                elif opcode.name in {"UNICODE", "BINUNICODE", "SHORT_BINUNICODE", "BINUNICODE8"}:
+                    strings.append(arg)
+                    if _b.len(strings) > 2:
+                        strings.pop(0)
+                elif opcode.name == "STACK_GLOBAL" and strings == ["dill._dill", "_create_filehandle"]:
+                    return True
+        except _b.Exception:
+            # A blob containing the reducer name but failing safe disassembly is
+            # not eligible for restoration.
+            return True
+        return False
+
     payload = {}
     skipped = []
     oversized = []
+    unsafe_handles = []
     total = 0
     identify_oversized = ${pruneOversized ? "True" : "False"}
     for name in _b.list(ns.keys()):
@@ -112,6 +134,13 @@ def _prime_agent_snapshot_state():
         if name.startswith("_") or name in hidden or name in always_skip:
             continue
         value = ns[name]
+        # dill can serialize even a CLOSED file handle and revive it through
+        # _create_filehandle. A write-mode handle reopens with O_TRUNC. File
+        # handles are ephemeral runtime resources, never durable user state.
+        if _b.isinstance(value, io.IOBase):
+            skipped.append({"name": name, "reason": "unsafe file handle (io.IOBase)"})
+            unsafe_handles.append(name)
+            continue
         remaining = ${maxBytes} - total
         buffer_limit = ${maxVariableBytes} if identify_oversized else _b.min(${maxVariableBytes}, remaining)
         buffer = SnapshotBuffer(buffer_limit)
@@ -119,6 +148,11 @@ def _prime_agent_snapshot_state():
         try:
             dill.dump(value, buffer)
             blob = buffer.getvalue()
+            # Reject nested or custom-reduced file handles too. New snapshots
+            # never persist _create_filehandle in any mode.
+            if has_filehandle_reducer(blob):
+                skipped.append({"name": name, "reason": "unsafe dill file-handle reducer"})
+                continue
         except SnapshotSizeLimitExceeded:
             if not identify_oversized and remaining < ${maxVariableBytes}:
                 skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
@@ -153,10 +187,11 @@ def _prime_agent_snapshot_state():
     saved = _b.sorted(payload.keys())
     pruned = _b.sorted(name for name in oversized if name in ns) if ${pruneOversized ? "True" : "False"} else []
     manifest = {
-        "version": 1,
+        "version": 2,
         "savedNames": saved,
         "skipped": skipped,
         "pruned": pruned,
+        "purgedFileHandles": _b.sorted(unsafe_handles),
         "bytes": bytes_written,
         "pythonVersion": sys.version.split()[0],
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -166,26 +201,27 @@ def _prime_agent_snapshot_state():
             json.dump(manifest, fh)
     except _b.Exception:
         pass
-    pruned_ids = {_b.id(ns[name]) for name in pruned}
+    purge_names = _b.sorted(_b.set(pruned + unsafe_handles))
+    purge_ids = {_b.id(ns[name]) for name in purge_names if name in ns}
     while True:
         try:
-            for name in pruned:
+            for name in purge_names:
                 if name in ns:
                     del ns[name]
             output_cache = ns.get("Out")
             if _b.isinstance(output_cache, _b.dict):
                 for key in _b.list(output_cache.keys()):
-                    if _b.id(output_cache[key]) in pruned_ids:
+                    if _b.id(output_cache[key]) in purge_ids:
                         del output_cache[key]
             for name in hidden:
-                if name in ns and _b.id(ns[name]) in pruned_ids:
+                if name in ns and _b.id(ns[name]) in purge_ids:
                     del ns[name]
             break
         except _b.KeyboardInterrupt:
             # Deletion is idempotent. Finish the short critical section so a
             # snapshot timeout cannot leave only some purge candidates live.
             continue
-    _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"saved": saved, "skipped": skipped, "pruned": pruned, "bytes": bytes_written}))
+    _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"saved": saved, "skipped": skipped, "pruned": pruned, "purgedFileHandles": _b.sorted(unsafe_handles), "bytes": bytes_written}))
 
 
 try:
@@ -205,7 +241,7 @@ export function buildRestoreCode(inPath: string): string {
 	// (list/open/print/…) can't break the restore path.
 	return `
 def _prime_agent_restore_state():
-    import builtins as _b, json, os, sys
+    import builtins as _b, json, os, sys, pickletools
     if not os.path.exists(${pyStr(inPath)}):
         _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": [], "failed": []}))
         return
@@ -232,9 +268,38 @@ def _prime_agent_restore_state():
         ip = None
     ns = ip.user_ns if ip is not None else _b.globals()
 
+    def has_filehandle_reducer(blob):
+        if b"_create_filehandle" not in blob:
+            return False
+        strings = []
+        try:
+            for opcode, arg, _pos in pickletools.genops(blob):
+                if opcode.name == "GLOBAL":
+                    if arg == "dill._dill _create_filehandle":
+                        return True
+                elif opcode.name in {"UNICODE", "BINUNICODE", "SHORT_BINUNICODE", "BINUNICODE8"}:
+                    strings.append(arg)
+                    if _b.len(strings) > 2:
+                        strings.pop(0)
+                elif opcode.name == "STACK_GLOBAL" and strings == ["dill._dill", "_create_filehandle"]:
+                    return True
+        except _b.Exception:
+            return True
+        return False
+
     restored = []
     failed = []
     for name, blob in payload.items():
+        if not _b.isinstance(blob, (_b.bytes, _b.bytearray)):
+            failed.append({"name": name, "reason": "corrupt snapshot variable: not bytes"})
+            continue
+        # Legacy dill snapshots may reduce file handles through
+        # dill._dill._create_filehandle. Never execute that reducer: write,
+        # append, create, and update modes can mutate/truncate durable files;
+        # read handles are ephemeral and do not belong in revived state either.
+        if has_filehandle_reducer(blob):
+            failed.append({"name": name, "reason": "unsafe legacy dill file-handle reducer rejected"})
+            continue
         try:
             ns[name] = dill.loads(blob)
             restored.append(name)
