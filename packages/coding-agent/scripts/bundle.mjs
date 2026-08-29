@@ -16,6 +16,7 @@ import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { verifyBundledStateSnapshot } from "./verify-bundled-state-snapshot.mjs";
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const outdir = join(packageDir, "dist", "bundle");
@@ -48,5 +49,8 @@ await build({
 	logLevel: "warning",
 });
 
+const snapshotVerification = verifyBundledStateSnapshot(outdir);
 chmodSync(join(outdir, "cli.js"), 0o755);
-console.log("bundled dist/cli.js -> dist/bundle/");
+console.log(
+	`bundled dist/cli.js -> dist/bundle/ (state snapshot v2 verified in ${snapshotVerification.chunks.join(", ")})`,
+);
