@@ -7,10 +7,16 @@
 // GPU tensor, …) is skipped and reported rather than aborting the whole snapshot.
 import { join } from "node:path";
 
-/** Default ceiling on a snapshot payload. Over-cap variables are skipped + reported. */
-export const DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024;
+/**
+ * Default ceiling on a snapshot payload.
+ *
+ * A long-running controller can accumulate thousands of individually-small
+ * scratch values. Keep the aggregate bounded so one retained session cannot
+ * turn compaction/restore into host-wide memory pressure.
+ */
+export const DEFAULT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
 /** Default ceiling for one serialized variable. */
-export const DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024;
+export const DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 8 * 1024 * 1024;
 
 /** Base filename for the kernel snapshot within a session's artifact directory. */
 const KERNEL_STATE_BASENAME = "kernel-state";
@@ -23,7 +29,7 @@ export interface SnapshotResult {
 	saved: string[];
 	/** Names that could not be serialized, with a short reason. */
 	skipped: { name: string; reason: string }[];
-	/** Oversized live variables removed by an explicit compaction snapshot. */
+	/** Live variables outside the bounded snapshot budget, removed by explicit compaction. */
 	pruned?: string[];
 	/** Payload size on disk, in bytes. */
 	bytes: number;
@@ -68,7 +74,7 @@ export function buildSnapshotCode(
 	// working even when the user namespace shadows names like list/open/print/len.
 	return `
 def _prime_agent_snapshot_state():
-    import builtins as _b, io, json, os, sys, datetime, pickletools
+    import builtins as _b, gc, io, json, os, sys, datetime, pickletools, types
     try:
         import dill
     except _b.Exception as _err:
@@ -127,12 +133,21 @@ def _prime_agent_snapshot_state():
     unsafe_handles = []
     total = 0
     identify_oversized = ${pruneOversized ? "True" : "False"}
-    for name in _b.list(ns.keys()):
-        # Skip internals (dunder/underscore), IPython-injected names, and live
-        # handles. A name matching a builtin (e.g. "list") is a user shadow worth
-        # keeping — builtins themselves are not enumerated as user_ns keys.
-        if name.startswith("_") or name in hidden or name in always_skip:
-            continue
+    candidate_names = [
+        name for name in _b.list(ns.keys())
+        if not name.startswith("_") and name not in hidden and name not in always_skip
+    ]
+    # Keep imports and helpers first. For data, prefer the newest top-level
+    # bindings: Python dict insertion order is the only recency signal the
+    # namespace has, and recent values are most likely to drive the next turn.
+    stable_names = [
+        name for name in candidate_names
+        if _b.isinstance(ns[name], types.ModuleType) or _b.callable(ns[name])
+    ]
+    stable_name_set = _b.set(stable_names)
+    data_names = [name for name in candidate_names if name not in stable_name_set]
+    candidate_names = stable_names + _b.list(_b.reversed(data_names))
+    for name in candidate_names:
         value = ns[name]
         # dill can serialize even a CLOSED file handle and revive it through
         # _create_filehandle. A write-mode handle reopens with O_TRUNC. File
@@ -142,7 +157,12 @@ def _prime_agent_snapshot_state():
             unsafe_handles.append(name)
             continue
         remaining = ${maxBytes} - total
-        buffer_limit = ${maxVariableBytes} if identify_oversized else _b.min(${maxVariableBytes}, remaining)
+        if remaining <= 0:
+            skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
+            if identify_oversized:
+                oversized.append(name)
+            continue
+        buffer_limit = _b.min(${maxVariableBytes}, remaining)
         buffer = SnapshotBuffer(buffer_limit)
         # Modules are pickled by reference and re-imported on restore.
         try:
@@ -154,17 +174,17 @@ def _prime_agent_snapshot_state():
                 skipped.append({"name": name, "reason": "unsafe dill file-handle reducer"})
                 continue
         except SnapshotSizeLimitExceeded:
-            if not identify_oversized and remaining < ${maxVariableBytes}:
-                skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
-            else:
-                skipped.append({"name": name, "reason": "exceeds per-variable snapshot size cap"})
+            reason = (
+                "exceeds aggregate snapshot size cap"
+                if remaining < ${maxVariableBytes}
+                else "exceeds per-variable snapshot size cap"
+            )
+            skipped.append({"name": name, "reason": reason})
+            if identify_oversized:
                 oversized.append(name)
             continue
         except _b.Exception as _err:
             skipped.append({"name": name, "reason": _b.type(_err).__name__ + ": " + _b.str(_err)[:200]})
-            continue
-        if total + _b.len(blob) > ${maxBytes}:
-            skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
             continue
         payload[name] = blob
         total += _b.len(blob)
@@ -216,6 +236,7 @@ def _prime_agent_snapshot_state():
             for name in hidden:
                 if name in ns and _b.id(ns[name]) in purge_ids:
                     del ns[name]
+            gc.collect()
             break
         except _b.KeyboardInterrupt:
             # Deletion is idempotent. Finish the short critical section so a

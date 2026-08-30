@@ -9,7 +9,9 @@ const marker = "// dist/core/kernel/state-snapshot.js";
 
 function patchedSection(): string {
 	return `${marker}
-import builtins as _b, io, json, os, sys, datetime, pickletools
+import builtins as _b, gc, io, json, os, sys, datetime, pickletools, types
+candidate_names = stable_names + _b.list(_b.reversed(data_names))
+gc.collect()
 if _b.isinstance(value, io.IOBase):
 b"_create_filehandle"
 "version": 2

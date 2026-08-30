@@ -151,7 +151,7 @@ describeIfKernel("kernel state snapshot round-trip (real kernel)", { tags: ["ker
 		}
 	}, 60_000);
 
-	it("caps each variable without reducing the aggregate snapshot budget", async () => {
+	it("compaction prunes per-variable and aggregate overflow while preserving recent state", async () => {
 		const boundedDir = mkdtempSync(join(tmpdir(), "prime-agent-state-bounded-"));
 		const manager = new KernelManager({
 			python: python as string,
@@ -180,25 +180,24 @@ late_small = "d" * 1_000`);
 
 			const snapshot = await manager.snapshotState();
 			expect(snapshot?.skipped.map(({ name }) => name)).toEqual(
-				expect.arrayContaining(["large_records", "large_text", "aggregate_only"]),
+				expect.arrayContaining(["large_records", "large_text", "small_text_one"]),
 			);
-			expect(snapshot?.saved).toEqual(expect.arrayContaining(["small_text_one", "small_text_two", "late_small"]));
+			expect(snapshot?.saved).toEqual(expect.arrayContaining(["small_text_two", "aggregate_only", "late_small"]));
 			expect(await manager.listNamespaceNames()).toEqual(expect.arrayContaining(["large_records", "large_text"]));
+			const count = await manager.execute("print(pickle_count)");
+			expect(Number(count.stdout.trim())).toBeLessThan(100_000);
 
 			const compacted = await manager.pruneOversizedVariables();
-			expect(compacted?.pruned).toEqual(expect.arrayContaining(["large_records", "large_text"]));
+			expect(compacted?.pruned).toEqual(expect.arrayContaining(["large_records", "large_text", "small_text_one"]));
 			const remaining = await manager.listNamespaceNames();
-			expect(remaining).toEqual(
-				expect.arrayContaining(["small_text_one", "small_text_two", "aggregate_only", "late_small"]),
-			);
+			expect(remaining).toEqual(expect.arrayContaining(["small_text_two", "aggregate_only", "late_small"]));
 			expect(remaining).not.toContain("large_records");
 			expect(remaining).not.toContain("large_text");
+			expect(remaining).not.toContain("small_text_one");
 			const outputCache = await manager.execute(
 				"print(any(isinstance(value, str) and len(value) == 16_384 for value in Out.values()))",
 			);
 			expect(outputCache.stdout.trim()).toBe("False");
-			const count = await manager.execute("print(pickle_count)");
-			expect(Number(count.stdout.trim())).toBeLessThan(100_000);
 		} finally {
 			await manager.dispose();
 			rmSync(boundedDir, { recursive: true, force: true });

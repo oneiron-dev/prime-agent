@@ -7267,7 +7267,7 @@ export class AgentSession {
 					: " You have not defined any names yet.";
 		const prunedDetail =
 			pruned && pruned.length > 0
-				? ` Variables above the per-variable snapshot limit were removed: ${pruned.join(", ")}.`
+				? ` Variables outside the bounded kernel snapshot budget were removed: ${pruned.join(", ")}.`
 				: "";
 		const content = [
 			"<ipython_state>",
