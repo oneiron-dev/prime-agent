@@ -1,4 +1,4 @@
-import OpenAI from "openai";
+import type OpenAI from "openai";
 import type {
 	ResponseCreateParamsStreaming,
 	ResponseInputItem,
@@ -139,7 +139,11 @@ async function collect(events: AsyncIterable<ResponseStreamEvent>): Promise<Open
 	}
 	throw new Error("Remote Compaction V2 stream ended before response.completed");
 }
-function createClient(model: Model<"openai-responses">, options: OpenAIResponsesRemoteCompactionV2Options): OpenAI {
+async function createClient(
+	model: Model<"openai-responses">,
+	options: OpenAIResponsesRemoteCompactionV2Options,
+): Promise<OpenAI> {
+	const { default: OpenAI } = await import("openai");
 	const headers = buildHeaders(model, options);
 	const defaultHeaders =
 		model.provider === "cloudflare-ai-gateway"
@@ -208,7 +212,7 @@ export async function compactOpenAIResponsesV2(
 			if (started) throw error;
 		}
 	}
-	const client = createClient(model, options);
+	const client = await createClient(model, options);
 	const requestOptions = {
 		...(options.signal ? { signal: options.signal } : {}),
 		...(options.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),

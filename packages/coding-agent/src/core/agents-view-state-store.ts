@@ -160,12 +160,16 @@ function writeState(path: string, state: AgentsViewState): void {
 			} finally {
 				closeSync(dir);
 			}
-		} catch {}
+		} catch {
+			// Directory fsync is best-effort on filesystems that reject opening or syncing directories.
+		}
 	} finally {
 		if (fd !== undefined) closeSync(fd);
 		try {
 			unlinkSync(temp);
-		} catch {}
+		} catch {
+			// Atomic rename or prior cleanup may already have removed the temporary file.
+		}
 	}
 }
 

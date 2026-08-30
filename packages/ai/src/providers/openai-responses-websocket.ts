@@ -83,7 +83,9 @@ let nextGeneration = 0;
 function close(socket: Socket, reason = "done") {
 	try {
 		socket.close(1000, reason);
-	} catch {}
+	} catch {
+		// Closing is idempotent and may race a remote close; there is no recovery action.
+	}
 }
 export function closeOpenAIResponsesWebSocketSessions(sessionId?: string): void {
 	const entries = sessionId ? [[sessionId, cache.get(sessionId)] as const] : [...cache.entries()];

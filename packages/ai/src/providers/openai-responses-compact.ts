@@ -1,4 +1,4 @@
-import OpenAI from "openai";
+import type OpenAI from "openai";
 import type { ResponseCompactParams, ResponseInputItem } from "openai/resources/responses/responses.js";
 import type { Context, Model, OpenAIResponsesCompactionItem, OpenAIResponsesCompactionMessage } from "../types.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
@@ -53,7 +53,8 @@ function cloneCompactionItems(output: unknown): OpenAIResponsesCompactionItem[] 
 	return cloned as OpenAIResponsesCompactionItem[];
 }
 
-function createClient(model: Model<"openai-responses">, options: OpenAIResponsesCompactOptions): OpenAI {
+async function createClient(model: Model<"openai-responses">, options: OpenAIResponsesCompactOptions): Promise<OpenAI> {
+	const { default: OpenAI } = await import("openai");
 	const headers: Record<string, string> = { ...model.headers, ...options.headers };
 	if (options.sessionId) {
 		if (model.compat?.sendSessionIdHeader !== false) {
@@ -111,7 +112,7 @@ export async function compactOpenAIResponses(
 		...(options.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 		...(options.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
 	};
-	const client = createClient(model, options);
+	const client = await createClient(model, options);
 	const { data } = await client.responses.compact(params, requestOptions).withResponse();
 	return { items: cloneCompactionItems(data.output) };
 }

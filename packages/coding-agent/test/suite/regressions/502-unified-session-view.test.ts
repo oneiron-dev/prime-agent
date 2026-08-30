@@ -444,6 +444,7 @@ describe("#502 unified session view regressions", () => {
 		const inactive = {
 			kind: "agent" as const,
 			section: "inactive" as const,
+			activitySection: "inactive" as const,
 			summary: {
 				...summary("archived"),
 				activeSessionId: undefined,
