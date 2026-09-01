@@ -79,6 +79,7 @@ import {
 	type AgentHeartbeatDeliveryMode,
 	type AgentHeartbeatManagementAction,
 	type AgentHeartbeatUpdateAction,
+	type AgentRlmHeartbeatCancellationReceipt,
 	DEFAULT_HEARTBEAT_SCHEDULE,
 	isHeartbeatCronJob,
 	normalizeHeartbeatDeliveryMode,
@@ -1986,13 +1987,16 @@ export class AgentDaemon {
 		return job;
 	}
 
-	private deleteRlmHeartbeatForState(state: ActiveSessionState, id: string): AgentCronJob | undefined {
-		const job = this.cronStore.deleteRlmHeartbeat(state.activeSessionId, id);
-		if (job) {
-			this.removeQueuedHeartbeatFollowUp(state, job);
+	private deleteRlmHeartbeatForState(
+		state: ActiveSessionState,
+		id: string,
+	): AgentRlmHeartbeatCancellationReceipt | undefined {
+		const cancellation = this.cronStore.deleteRlmHeartbeat(state.activeSessionId, id);
+		if (cancellation) {
+			state.runtime.session.removeQueuedFollowUp(`heartbeat:${cancellation.id}`);
 			this.cronScheduler.wake();
 		}
-		return job;
+		return cancellation;
 	}
 
 	private listHeartbeats(): AgentConnectionHeartbeat[] {

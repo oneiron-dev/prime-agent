@@ -26,6 +26,20 @@ export type AgentRlmHeartbeatStatusUpdate = "pause" | "resume";
  */
 export type AgentHeartbeatDeliveryMode = "steer" | "follow_up";
 
+/** Immutable proof that an agent-owned RLM heartbeat was cancelled. */
+export interface AgentRlmHeartbeatCancellationReceipt {
+	readonly id: string;
+	readonly source: "rlm_heartbeat";
+	readonly status: "cancelled";
+	readonly ownerActiveSessionId: string;
+	readonly ownerSessionId: string;
+	readonly ownerSessionFile: string;
+	readonly ownerRuntimeKind?: AgentCronJobRuntimeKind;
+	readonly runCount: number;
+	readonly lastRunAt?: string;
+	readonly cancelledAt: string;
+}
+
 export interface AgentCronSchedule {
 	kind: AgentCronScheduleKind;
 	expression: string;
@@ -53,6 +67,7 @@ export interface AgentCronJob {
 	lastSkippedAt?: string;
 	lastError?: string;
 	runCount: number;
+	cancellationReceipt?: AgentRlmHeartbeatCancellationReceipt;
 }
 
 export interface CreateAgentCronJobInput {
@@ -140,7 +155,7 @@ export interface AgentRlmHeartbeatController {
 		status?: AgentRlmHeartbeatStatusUpdate;
 		deliveryMode?: AgentHeartbeatDeliveryMode;
 	}): AgentCronJob | undefined;
-	deleteRlmHeartbeat(id: string): AgentCronJob | undefined;
+	deleteRlmHeartbeat(id: string): AgentRlmHeartbeatCancellationReceipt | undefined;
 }
 
 function heartbeatCatalogSignature(jobs: readonly AgentCronJob[]): string {
@@ -465,19 +480,39 @@ export class AgentCronJobStore {
 		return updated;
 	}
 
-	deleteRlmHeartbeat(activeSessionId: string, id: string, now = new Date()): AgentCronJob | undefined {
-		let deleted: AgentCronJob | undefined;
-		const jobs = this.readJobs().map((job) => {
-			if (job.id !== id || job.activeSessionId !== activeSessionId || job.source !== "rlm_heartbeat") {
-				return job;
-			}
-			deleted = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
-			return deleted;
+	deleteRlmHeartbeat(
+		activeSessionId: string,
+		id: string,
+		now = new Date(),
+	): AgentRlmHeartbeatCancellationReceipt | undefined {
+		let receipt: AgentRlmHeartbeatCancellationReceipt | undefined;
+		this.mutateStates((state) => {
+			state.jobs = state.jobs.map((job) => {
+				if (job.id !== id || job.activeSessionId !== activeSessionId || job.source !== "rlm_heartbeat") {
+					return job;
+				}
+				if (job.status === "cancelled") {
+					if (job.cancellationReceipt) {
+						receipt = job.cancellationReceipt;
+						return job;
+					}
+					const cancellationReceipt = createRlmHeartbeatCancellationReceipt(
+						job,
+						Number.isFinite(Date.parse(job.updatedAt)) ? job.updatedAt : now.toISOString(),
+					);
+					receipt = cancellationReceipt;
+					return { ...job, cancellationReceipt };
+				}
+				if (job.status === "completed") {
+					return job;
+				}
+				const cancelled = cancelCronJob(job, now);
+				receipt = cancelled.cancellationReceipt;
+				return cancelled;
+			});
+			return [];
 		});
-		if (deleted) {
-			this.writeJobs(jobs);
-		}
-		return deleted;
+		return receipt;
 	}
 
 	cancelRlmHeartbeatsForSession(activeSessionId: string, now = new Date()): AgentCronJob[] {
@@ -490,7 +525,7 @@ export class AgentCronJobStore {
 			) {
 				return job;
 			}
-			const cancelledJob = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+			const cancelledJob = cancelCronJob(job, now);
 			cancelled.push(cancelledJob);
 			return cancelledJob;
 		});
@@ -514,7 +549,7 @@ export class AgentCronJobStore {
 			if (!matches || (job.status !== "active" && job.status !== "paused")) {
 				return job;
 			}
-			const cancelledJob = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+			const cancelledJob = cancelCronJob(job, now);
 			cancelled.push(cancelledJob);
 			return cancelledJob;
 		});
@@ -598,7 +633,7 @@ export class AgentCronJobStore {
 				return updated;
 			}
 			if (action === "stop") {
-				updated = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+				updated = cancelCronJob(job, now);
 				return updated;
 			}
 			const nextRunAt = nextRunAtForSchedule(job.schedule, now);
@@ -625,7 +660,7 @@ export class AgentCronJobStore {
 			if (job.id !== id || job.status === "cancelled") {
 				return job;
 			}
-			cancelled = { ...job, status: "cancelled", nextRunAt: undefined, updatedAt: now.toISOString() };
+			cancelled = cancelCronJob(job, now);
 			return cancelled;
 		});
 		if (cancelled) {
@@ -907,7 +942,7 @@ export function migrateLegacyCronJobsToSessionArtifacts(
 		) {
 			return job;
 		}
-		return withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+		return cancelCronJob(job, now);
 	});
 	if (jobs.length === 0) {
 		return 0;
@@ -1675,6 +1710,38 @@ function normalizeOptionalLabel(label: string | undefined): string | undefined {
 	return trimmed ? trimmed : undefined;
 }
 
+function createRlmHeartbeatCancellationReceipt(
+	job: AgentCronJob,
+	cancelledAt: string,
+): AgentRlmHeartbeatCancellationReceipt {
+	return {
+		id: job.id,
+		source: "rlm_heartbeat",
+		status: "cancelled",
+		ownerActiveSessionId: job.activeSessionId,
+		ownerSessionId: job.sessionId,
+		ownerSessionFile: job.sessionFile,
+		...(job.runtimeKind ? { ownerRuntimeKind: job.runtimeKind } : {}),
+		runCount: job.runCount,
+		...(job.lastRunAt ? { lastRunAt: job.lastRunAt } : {}),
+		cancelledAt,
+	};
+}
+
+function cancelCronJob(job: AgentCronJob, now: Date): AgentCronJob {
+	const cancelledAt = now.toISOString();
+	const cancellationReceipt =
+		job.source === "rlm_heartbeat"
+			? (job.cancellationReceipt ?? createRlmHeartbeatCancellationReceipt(job, cancelledAt))
+			: job.cancellationReceipt;
+	return withoutNextRunAt({
+		...job,
+		status: "cancelled",
+		updatedAt: cancelledAt,
+		...(cancellationReceipt ? { cancellationReceipt } : {}),
+	});
+}
+
 function withoutNextRunAt(job: AgentCronJob): AgentCronJob {
 	const { nextRunAt: _nextRunAt, ...rest } = job;
 	return rest;
@@ -1717,7 +1784,33 @@ function isAgentCronJob(value: unknown): value is AgentCronJob {
 		typeof candidate.schedule.expression === "string" &&
 		typeof candidate.createdAt === "string" &&
 		typeof candidate.updatedAt === "string" &&
-		typeof candidate.runCount === "number"
+		typeof candidate.runCount === "number" &&
+		(candidate.cancellationReceipt === undefined ||
+			(candidate.status === "cancelled" &&
+				candidate.source === "rlm_heartbeat" &&
+				isAgentRlmHeartbeatCancellationReceipt(candidate.cancellationReceipt) &&
+				candidate.cancellationReceipt.id === candidate.id))
+	);
+}
+
+function isAgentRlmHeartbeatCancellationReceipt(value: unknown): value is AgentRlmHeartbeatCancellationReceipt {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as Partial<AgentRlmHeartbeatCancellationReceipt>;
+	return (
+		typeof candidate.id === "string" &&
+		candidate.source === "rlm_heartbeat" &&
+		candidate.status === "cancelled" &&
+		typeof candidate.ownerActiveSessionId === "string" &&
+		typeof candidate.ownerSessionId === "string" &&
+		typeof candidate.ownerSessionFile === "string" &&
+		(candidate.ownerRuntimeKind === undefined ||
+			candidate.ownerRuntimeKind === "top-level" ||
+			candidate.ownerRuntimeKind === "subagent") &&
+		typeof candidate.runCount === "number" &&
+		(candidate.lastRunAt === undefined || typeof candidate.lastRunAt === "string") &&
+		typeof candidate.cancelledAt === "string"
 	);
 }
 

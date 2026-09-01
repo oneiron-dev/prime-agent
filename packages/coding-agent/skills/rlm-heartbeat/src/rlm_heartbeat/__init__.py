@@ -96,7 +96,11 @@ async def update(
 
 
 async def delete(id: str) -> dict[str, Any]:
-    """Cancel one internal RLM heartbeat for the current agent session."""
+    """Cancel one internal RLM heartbeat and return its immutable receipt."""
     if not isinstance(id, str):
         raise TypeError(f"id must be str, got {type(id).__name__}")
-    return await host_request("rlm_heartbeat.delete", {"id": id})
+    response = await host_request("rlm_heartbeat.delete", {"id": id})
+    cancellation = response.get("cancellation") if isinstance(response, dict) else None
+    if not isinstance(cancellation, dict):
+        raise RuntimeError("heartbeat host did not return a cancellation receipt")
+    return cancellation

@@ -125,7 +125,12 @@ import {
 	loadContextTreeChildFromDisk,
 	loadContextTreeChildrenFromDisk,
 } from "./context-tree.js";
-import type { AgentCronJob, AgentRlmHeartbeatController, AgentRlmHeartbeatStatusUpdate } from "./cron-jobs.js";
+import type {
+	AgentCronJob,
+	AgentRlmHeartbeatCancellationReceipt,
+	AgentRlmHeartbeatController,
+	AgentRlmHeartbeatStatusUpdate,
+} from "./cron-jobs.js";
 import { normalizeHeartbeatDeliveryMode } from "./cron-jobs.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
@@ -3194,9 +3199,12 @@ export class AgentSession {
 				if (typeof payload.id !== "string") {
 					throw new Error("rlm_heartbeat.delete id must be a string");
 				}
-				const heartbeat = controller.deleteRlmHeartbeat(payload.id);
+				const cancellation = controller.deleteRlmHeartbeat(payload.id);
+				if (!cancellation) {
+					throw new Error("RLM heartbeat was not found for this session");
+				}
 				return {
-					heartbeat: heartbeat ? rlmHeartbeatHostResponse(heartbeat) : null,
+					cancellation: rlmHeartbeatCancellationHostResponse(cancellation),
 				};
 			}
 			default:
@@ -12210,6 +12218,23 @@ function isRlmHeartbeatStatusUpdate(value: unknown): value is AgentRlmHeartbeatS
 	return value === "pause" || value === "resume";
 }
 
+function rlmHeartbeatCancellationHostResponse(receipt: AgentRlmHeartbeatCancellationReceipt): Record<string, unknown> {
+	return {
+		id: receipt.id,
+		source: receipt.source,
+		status: receipt.status,
+		owner: {
+			active_session_id: receipt.ownerActiveSessionId,
+			session_id: receipt.ownerSessionId,
+			session_file: receipt.ownerSessionFile,
+			runtime_kind: receipt.ownerRuntimeKind ?? null,
+		},
+		run_count: receipt.runCount,
+		last_run: receipt.lastRunAt ?? null,
+		cancelled_at: receipt.cancelledAt,
+	};
+}
+
 function rlmHeartbeatHostResponse(job: AgentCronJob): Record<string, unknown> {
 	return {
 		id: job.id,
@@ -12224,5 +12249,8 @@ function rlmHeartbeatHostResponse(job: AgentCronJob): Record<string, unknown> {
 		last_run_at: job.lastRunAt ?? null,
 		last_error: job.lastError ?? null,
 		run_count: job.runCount,
+		...(job.cancellationReceipt
+			? { cancellation: rlmHeartbeatCancellationHostResponse(job.cancellationReceipt) }
+			: {}),
 	};
 }

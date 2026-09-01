@@ -77,11 +77,19 @@ describe("RLM heartbeat skill over the kernel host bridge", () => {
 				"rlm_heartbeat.delete": async (payload) => {
 					requests.push({ type: "rlm_heartbeat.delete", payload });
 					return {
-						heartbeat: {
+						cancellation: {
 							id: payload.id,
+							source: "rlm_heartbeat",
 							status: "cancelled",
-							label: "tests",
-							instruction: "check tests",
+							owner: {
+								active_session_id: "child-active-1",
+								session_id: "child-session-1",
+								session_file: "/tmp/child-session.jsonl",
+								runtime_kind: "subagent",
+							},
+							run_count: 0,
+							last_run: null,
+							cancelled_at: "2026-01-01T12:40:00.000Z",
 						},
 					};
 				},
@@ -99,7 +107,7 @@ print(json.dumps({
     "created": created["heartbeat"],
     "listed": listed["heartbeats"],
     "updated": updated["heartbeat"],
-    "deleted": deleted["heartbeat"],
+    "deleted": deleted,
 }, sort_keys=True))
 `);
 
@@ -108,7 +116,14 @@ print(json.dumps({
 			created: { id: "job-1", status: "active", label: "tests", instruction: "check tests" },
 			listed: [{ id: "job-1", status: "active", label: "tests", instruction: "check tests" }],
 			updated: { id: "job-1", status: "paused" },
-			deleted: { id: "job-1", status: "cancelled" },
+			deleted: {
+				id: "job-1",
+				status: "cancelled",
+				owner: { session_id: "child-session-1", runtime_kind: "subagent" },
+				run_count: 0,
+				last_run: null,
+				cancelled_at: "2026-01-01T12:40:00.000Z",
+			},
 		});
 		expect(requests.map((request) => request.type)).toEqual([
 			"rlm_heartbeat.create",
@@ -126,6 +141,26 @@ print(json.dumps({
 		expect(requests[1].payload).toMatchObject({ type: "rlm_heartbeat.list", include_inactive: true });
 		expect(requests[2].payload).toMatchObject({ type: "rlm_heartbeat.update", id: "job-1", status: "pause" });
 		expect(requests[3].payload).toMatchObject({ type: "rlm_heartbeat.delete", id: "job-1" });
+	});
+
+	it("fails closed instead of accepting the old heartbeat=None delete result", async () => {
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledRlmHeartbeatSkill()],
+			hostHandlers: {
+				"rlm_heartbeat.delete": async () => ({ heartbeat: null }),
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+try:
+    await rlm_heartbeat.delete("job-1")
+except RuntimeError as error:
+    print(f"RuntimeError: {error}")
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout.trim()).toBe("RuntimeError: heartbeat host did not return a cancellation receipt");
 	});
 
 	it("surfaces missing host handlers as Python exceptions", async () => {

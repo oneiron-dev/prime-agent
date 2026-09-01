@@ -1,0 +1,1 @@
+- Added durable cancellation receipts for agent-owned RLM heartbeat deletion.

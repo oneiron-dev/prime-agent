@@ -32,7 +32,11 @@ await rlm_heartbeat.delete("job-id")
   status=None, delivery_mode=None)` — update one RLM heartbeat by id. `status`
   may be `"pause"` or `"resume"`; `delivery_mode` may be `"steer"` or
   `"follow_up"`.
-- `await rlm_heartbeat.delete(id)` — cancel one RLM heartbeat by id.
+- `await rlm_heartbeat.delete(id)` — cancel one RLM heartbeat by id and return
+  its immutable cancellation receipt. The receipt contains the heartbeat id,
+  prior owner/session identity, `status="cancelled"`, `run_count`, `last_run`,
+  and `cancelled_at`. Repeating the delete from the same owner returns the same
+  persisted receipt. Unknown or unowned ids raise an error.
 
 ## Delivery mode
 
