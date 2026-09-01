@@ -103,9 +103,11 @@ import {
 	canReplayRemoteCompaction,
 	collectEntriesForBranchSummary,
 	compact,
+	compactMapReduce,
 	compactRemote,
 	compactRemoteV2,
 	estimateContextTokens,
+	extractRemoteCompactionDigest,
 	generateBranchSummary,
 	prepareCompaction,
 	projectCompactionPreparationForExternalUse,
@@ -6152,6 +6154,12 @@ export class AgentSession {
 						skipAbort: true,
 					});
 					break;
+				case "compact-deep":
+					await this.compact(input.command.args || undefined, {
+						skipAbort: true,
+						deep: true,
+					});
+					break;
 				case "refine": {
 					let result: RefinementResult;
 					try {
@@ -7468,7 +7476,10 @@ export class AgentSession {
 		this.settingsManager.setFollowUpMode(mode);
 	}
 
-	async compact(customInstructions?: string, options: { skipAbort?: boolean } = {}): Promise<CompactionResult> {
+	async compact(
+		customInstructions?: string,
+		options: { skipAbort?: boolean; deep?: boolean } = {},
+	): Promise<CompactionResult> {
 		if (options.skipAbort && this.isStreaming) {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
@@ -7500,6 +7511,7 @@ export class AgentSession {
 				apiKey,
 				headers,
 				customInstructions,
+				deep: options.deep === true,
 				signal: this._compactionAbortController.signal,
 			});
 
@@ -7568,13 +7580,14 @@ export class AgentSession {
 		apiKey: string;
 		headers?: Record<string, string>;
 		customInstructions?: string;
+		deep?: boolean;
 		signal: AbortSignal;
 	}): Promise<CompactionResult> {
-		const { model, apiKey, headers, customInstructions, signal } = options;
+		const { model, apiKey, headers, customInstructions, deep, signal } = options;
 		const pathEntries = this.sessionManager.getBranch();
 		const settings = this.settingsManager.getCompactionSettings();
 
-		const preparation = prepareCompaction(pathEntries, settings);
+		const preparation = prepareCompaction(pathEntries, settings, deep === true ? { restartFromRoot: true } : {});
 		if (!preparation) {
 			const lastEntry = pathEntries[pathEntries.length - 1];
 			if (lastEntry?.type === "compaction") {
@@ -7606,9 +7619,8 @@ export class AgentSession {
 		}
 
 		const compactionMode = settings.mode ?? "auto";
-		const compatibilityError = extensionCompaction
-			? undefined
-			: remoteCompactionCompatibilityError(model, compactionMode);
+		const compatibilityError =
+			extensionCompaction || deep ? undefined : remoteCompactionCompatibilityError(model, compactionMode);
 		if (compatibilityError) {
 			throw new CompactionSkippedError(compatibilityError);
 		}
@@ -7620,6 +7632,18 @@ export class AgentSession {
 				mechanism: "extension",
 				remoteCompaction: undefined,
 			};
+		} else if (deep) {
+			// Deep compaction is explicitly local map-reduce over the whole history:
+			// remote replay/migration logic does not apply.
+			compactionResult = await compactMapReduce(
+				preparation,
+				model,
+				apiKey,
+				headers,
+				customInstructions,
+				signal,
+				this.thinkingLevel,
+			);
 		} else if (shouldUseRemoteCompactionV2(model, compactionMode)) {
 			try {
 				const remotePreparation =
@@ -7642,9 +7666,11 @@ export class AgentSession {
 			} catch (error) {
 				const fallbackReason = getResponsesRemoteCompactionV2FallbackReason(error);
 				if (!fallbackReason) throw error;
-				const localPreparation = preparation.previousRemoteCompaction
-					? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
-					: preparation;
+				const localPreparation =
+					preparation.previousRemoteCompaction &&
+					!extractRemoteCompactionDigest(preparation.previousRemoteCompaction)
+						? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+						: preparation;
 				if (!localPreparation)
 					throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
 				compactionResult = await compact(
@@ -7728,9 +7754,11 @@ export class AgentSession {
 				} catch (error) {
 					const fallbackReason = getResponsesCompactFallbackReason(error);
 					if (!fallbackReason) throw error;
-					const localPreparation = preparation.previousRemoteCompaction
-						? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
-						: preparation;
+					const localPreparation =
+						preparation.previousRemoteCompaction &&
+						!extractRemoteCompactionDigest(preparation.previousRemoteCompaction)
+							? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+							: preparation;
 					if (!localPreparation) {
 						throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
 					}
@@ -7746,9 +7774,13 @@ export class AgentSession {
 					compactionResult.fallback = { from: "remote", reason: fallbackReason };
 				}
 		} else {
-			const localPreparation = preparation.previousRemoteCompaction
-				? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
-				: preparation;
+			// A prior remote checkpoint the local path cannot replay natively is
+			// bridged as digest text inside compact(); only a checkpoint with no
+			// readable digest justifies re-summarizing from the session root.
+			const localPreparation =
+				preparation.previousRemoteCompaction && !extractRemoteCompactionDigest(preparation.previousRemoteCompaction)
+					? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+					: preparation;
 			if (!localPreparation) {
 				throw new CompactionSkippedError("Session is too short to compact locally");
 			}

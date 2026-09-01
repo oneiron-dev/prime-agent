@@ -47,6 +47,8 @@ import {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/** Provenance when produced by deep map-reduce compaction. */
+	mapReduce?: { chunks: number; partialSummaries: number; mergePasses: number };
 }
 
 /**
@@ -268,6 +270,40 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 	if (contextWindow <= 0) return false;
 	return contextTokens > contextWindow - settings.reserveTokens;
 }
+/**
+ * Extract the readable digest text from a provider-native (remote) compaction
+ * checkpoint. Remote checkpoints carry their carried-forward state as ordinary
+ * message items plus an encrypted checkpoint marker; the marker is skipped and
+ * the message text is returned. Returns undefined when nothing readable exists,
+ * so callers can fall back to a full from-root re-summarization.
+ */
+export function extractRemoteCompactionDigest(state: RemoteCompactionState): string | undefined {
+	const parts: string[] = [];
+	for (const item of state.items) {
+		if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+		const record = item as Record<string, unknown>;
+		if (record.type !== "message") continue;
+		const content = record.content;
+		if (typeof content === "string") {
+			if (content.trim()) parts.push(content);
+			continue;
+		}
+		if (!Array.isArray(content)) continue;
+		const text = content
+			.map((block) => {
+				if (typeof block !== "object" || block === null || Array.isArray(block)) return "";
+				const b = block as Record<string, unknown>;
+				if (typeof b.text !== "string") return "";
+				return b.type === "input_text" || b.type === "output_text" || b.type === "text" ? b.text : "";
+			})
+			.filter((t) => t.length > 0)
+			.join("\n");
+		if (text.trim()) parts.push(text);
+	}
+	const digest = parts.join("\n\n").trim();
+	return digest.length > 0 ? digest : undefined;
+}
+
 /**
  * Estimate token count for a message using chars/4 heuristic.
  * This is conservative (overestimates tokens).
@@ -896,10 +932,34 @@ export async function compact(
 		isSplitTurn,
 		tokensBefore,
 		previousSummary,
+		previousRemoteCompaction,
+		previousRemoteTimestamp,
 		fileOps,
 		settings,
 	} = preparation;
 	let summary: string;
+
+	// Continuity bridge: a prior provider-native checkpoint that the active model
+	// cannot replay natively is carried forward as digest text instead of being
+	// silently dropped or expensively re-summarized from the session root.
+	let effectivePreviousSummary = previousSummary;
+	let continuityNote: string | undefined;
+	if (!effectivePreviousSummary && previousRemoteCompaction) {
+		const checkpointAt = previousRemoteTimestamp ?? "unknown time";
+		const digest = extractRemoteCompactionDigest(previousRemoteCompaction);
+		if (digest) {
+			effectivePreviousSummary = digest;
+			continuityNote =
+				`[Compaction continuity] Prior provider-native checkpoint from ${checkpointAt} ` +
+				`(${previousRemoteCompaction.provider}/${previousRemoteCompaction.modelId}) was carried ` +
+				"forward as text because the active model cannot replay it natively.";
+		} else {
+			continuityNote =
+				`[Compaction continuity warning] Prior provider-native checkpoint from ${checkpointAt} ` +
+				"had no readable digest and was not carried forward. This summary covers only messages " +
+				"after that checkpoint; re-read durable project state before relying on older details.";
+		}
+	}
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
 		// Both passes run in parallel, so each gets half the global request ceiling:
@@ -914,7 +974,7 @@ export async function compact(
 						headers,
 						signal,
 						customInstructions,
-						previousSummary,
+						effectivePreviousSummary,
 						thinkingLevel,
 						MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
 					)
@@ -940,12 +1000,13 @@ export async function compact(
 			headers,
 			signal,
 			customInstructions,
-			previousSummary,
+			effectivePreviousSummary,
 			thinkingLevel,
 		);
 	}
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
+	if (continuityNote) summary += `\n\n${continuityNote}`;
 
 	if (!firstKeptEntryId) {
 		throw new Error("First kept entry has no UUID - session may need migration");
@@ -956,6 +1017,191 @@ export async function compact(
 		firstKeptEntryId,
 		tokensBefore,
 		details: { readFiles, modifiedFiles } as CompactionDetails,
+		mechanism: "local",
+	};
+}
+
+/** Hard ceiling on chunk summarization requests for one deep compaction. */
+export const MAP_REDUCE_MAX_CHUNKS = 256;
+
+const MAP_REDUCE_CHUNK_PROMPT = `This is one consecutive part of a long AI coding-assistant session history, provided inside <conversation> tags. Summarize THIS part densely and self-contained: key decisions, exact identifiers (paths, SHAs, PRs, ticket IDs, agent/child names, error texts), current state at the end of the part, and unresolved items. Do not reference other parts; a later pass merges the parts. Preserve verbatim anything that looks load-bearing.`;
+
+const MAP_REDUCE_MERGE_PROMPT = `The partial summaries above cover consecutive parts of one AI coding-assistant session, in chronological order. Merge them into ONE summary following the required section format. Reconcile duplicates, keep the newest state when parts conflict, drop narration of the merging process itself, and preserve exact identifiers (paths, SHAs, PRs, ticket IDs, agent/child names, error texts).`;
+
+async function completeSummaryText(
+	model: Model<any>,
+	promptText: string,
+	requestLimit: number,
+	maxTokens: number,
+	apiKey: string,
+	headers: Record<string, string> | undefined,
+	signal: AbortSignal | undefined,
+	thinkingLevel: ThinkingLevel | undefined,
+	failurePrefix: string,
+): Promise<string> {
+	const bytes = Buffer.byteLength(promptText, "utf8");
+	if (bytes > requestLimit)
+		throw new Error(`${failurePrefix}: request exceeds safe UTF-8 byte budget (${bytes} > ${requestLimit})`);
+	const response = await completeSimple(
+		model,
+		{
+			systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+			messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
+		},
+		model.reasoning && thinkingLevel && thinkingLevel !== "off"
+			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
+			: { maxTokens, signal, apiKey, headers },
+	);
+	if (response.stopReason === "error")
+		throw new Error(`${failurePrefix}: ${response.errorMessage || "Unknown error"}`);
+	return response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join("\n");
+}
+
+/**
+ * Deep map-reduce compaction over the whole prepared history (callers build the
+ * preparation with restartFromRoot). Unlike the rolling summary, every chunk is
+ * summarized independently and partial summaries are merged hierarchically, so
+ * histories far beyond MAX_SUMMARY_CHUNKS keep their middle detail. Each request
+ * stays within the same byte budget as ordinary compaction.
+ */
+export async function compactMapReduce(
+	preparation: CompactionPreparation,
+	model: Model<any>,
+	apiKey: string,
+	headers?: Record<string, string>,
+	customInstructions?: string,
+	signal?: AbortSignal,
+	thinkingLevel?: ThinkingLevel,
+): Promise<CompactionResult> {
+	const { firstKeptEntryId, messagesToSummarize, turnPrefixMessages, tokensBefore, fileOps, settings } = preparation;
+	const reserveTokens = settings.reserveTokens;
+	const maxTokens = Math.floor(0.8 * reserveTokens);
+	const requestLimit = summaryRequestByteLimit(model, reserveTokens, maxTokens);
+	const chunkBudget = Math.max(1_024, Math.floor(requestLimit / 3));
+	const llmMessages = convertToLlm([...messagesToSummarize, ...turnPrefixMessages]);
+	const chunks = splitConversationForSummary(llmMessages, chunkBudget, MAP_REDUCE_MAX_CHUNKS);
+
+	const customBlock = customInstructions
+		? `\n\n<user-instructions>\nThe user provided these instructions for this summary. Follow them with high priority: emphasize what they ask to focus on, and preserve verbatim anything they ask to remember.\n${customInstructions}\n</user-instructions>`
+		: "";
+
+	// MAP: one independent dense summary per chunk. Integrity markers are program
+	// facts, not history: carried verbatim, never summarized.
+	const partials: string[] = [];
+	for (let index = 0; index < chunks.length; index++) {
+		const chunk = chunks[index];
+		if (isCompactionIntegrityMarker(chunk)) {
+			partials.push(chunk);
+			continue;
+		}
+		const promptText =
+			`<conversation>\n${chunk}\n</conversation>\n\n` +
+			`Part ${index + 1} of ${chunks.length}. ${MAP_REDUCE_CHUNK_PROMPT}${customBlock}`;
+		partials.push(
+			await completeSummaryText(
+				model,
+				promptText,
+				requestLimit,
+				maxTokens,
+				apiKey,
+				headers,
+				signal,
+				thinkingLevel,
+				`Map-reduce chunk ${index + 1} summarization failed`,
+			),
+		);
+	}
+
+	// REDUCE: hierarchically merge partials until one summary remains.
+	const mergeInstructions = `${MAP_REDUCE_MERGE_PROMPT}${customBlock}\n\n${buildSummarizationPrompt(customInstructions)}`;
+	const mergeBudget = Math.max(1_024, Math.floor(requestLimit / 2));
+	let level = partials;
+	let mergePasses = 0;
+	while (level.length > 1 && mergePasses < 10) {
+		mergePasses++;
+		const groups: string[][] = [];
+		let group: string[] = [];
+		let groupBytes = 0;
+		for (const partial of level) {
+			const bytes = Buffer.byteLength(partial, "utf8");
+			if (group.length > 0 && groupBytes + bytes > mergeBudget) {
+				groups.push(group);
+				group = [];
+				groupBytes = 0;
+			}
+			group.push(partial);
+			groupBytes += bytes;
+		}
+		if (group.length > 0) groups.push(group);
+		if (groups.length === level.length) {
+			// No grouping progress: every partial nearly fills the budget. Elide each
+			// to half budget so the next pass can always merge at least pairs.
+			level = level.map((partial) => elideSummaryForRequest(partial, Math.floor(mergeBudget / 2)));
+			continue;
+		}
+		const next: string[] = [];
+		for (const mergeGroup of groups) {
+			if (mergeGroup.length === 1) {
+				next.push(mergeGroup[0]);
+				continue;
+			}
+			const joined = mergeGroup
+				.map((partial, i) => `<partial-summary index="${i + 1}">\n${partial}\n</partial-summary>`)
+				.join("\n\n");
+			next.push(
+				await completeSummaryText(
+					model,
+					`${joined}\n\n${mergeInstructions}`,
+					requestLimit,
+					maxTokens,
+					apiKey,
+					headers,
+					signal,
+					thinkingLevel,
+					"Map-reduce merge failed",
+				),
+			);
+		}
+		level = next;
+	}
+	if (level.length > 1) {
+		// Merge-pass ceiling: deterministic final merge with elided inputs rather than
+		// another model round that cannot shrink further.
+		const elided = level.map((partial) => elideSummaryForRequest(partial, Math.floor(mergeBudget / level.length)));
+		level = [
+			await completeSummaryText(
+				model,
+				`${elided.map((partial, i) => `<partial-summary index="${i + 1}">\n${partial}\n</partial-summary>`).join("\n\n")}\n\n${mergeInstructions}`,
+				requestLimit,
+				maxTokens,
+				apiKey,
+				headers,
+				signal,
+				thinkingLevel,
+				"Map-reduce final merge failed",
+			),
+		];
+	}
+
+	if (!firstKeptEntryId) {
+		throw new Error("First kept entry has no UUID - session may need migration");
+	}
+	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
+	let summary = level[0] || "No compactable conversation content.";
+	summary += formatFileOperations(readFiles, modifiedFiles);
+	summary += `\n\n[Deep map-reduce compaction: ${chunks.length} chunk(s), ${partials.length} partial summar${partials.length === 1 ? "y" : "ies"}, ${mergePasses} merge pass(es).]`;
+	return {
+		summary,
+		firstKeptEntryId,
+		tokensBefore,
+		details: {
+			readFiles,
+			modifiedFiles,
+			mapReduce: { chunks: chunks.length, partialSummaries: partials.length, mergePasses },
+		},
 		mechanism: "local",
 	};
 }
