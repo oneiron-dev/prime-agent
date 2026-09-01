@@ -9,7 +9,9 @@ import type { SessionActionSnapshot } from "../../core/session-action-store.js";
 import type { AgentTaskState, SessionInfo } from "../../core/session-manager.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
 import type { ActiveSessionState } from "./active-session-state.js";
-import { type AgentRosterStatus, classifyAgentStatus } from "./agent-roster.js";
+import { type AgentRosterStatus, isSessionSummaryBusy } from "./agent-roster.js";
+
+export { classifySessionRosterStatus, isSessionSummaryBusy } from "./agent-roster.js";
 
 // Durable lifecycle; decides agents-view visibility. Only "live" is shown.
 // "draft" = no message sent yet (discarded on close); "archived" = ctrl+x'd,
@@ -55,6 +57,8 @@ export interface SessionSummary {
 	/** True while the agent is streaming with tool calls pending; drives the "running tools" label. */
 	isRunningTools?: boolean;
 	attachedClients: number;
+	/** Clients attached over the direct worker transport; the supervisor adds these to its own count. */
+	directAttachedClients?: number;
 	messageCount: number;
 	unfinishedActionCount?: number;
 	sessionActions: SessionActionSnapshot;
@@ -76,6 +80,10 @@ export interface SessionSummary {
 	summary?: string;
 	/** Completion verdict for an idle session; absent while working or unjudged. */
 	taskState?: AgentTaskState;
+	rosterStatus?: AgentRosterStatus;
+	statusLabel?: "queued" | "recovering" | "failed";
+	/** Set while the owning worker has been silent past the staleness threshold. */
+	lastHeardFromAt?: string;
 	/** Resident session-host process state, populated by the global supervisor. */
 	workerState?: "starting" | "ready" | "recovering" | "stopping" | "failed";
 	/** Diagnostic process identity; clients must not use this as a stable session identifier. */
@@ -100,17 +108,29 @@ export function resolveAttachModelFallbackMessage(
 	return summary.model ? undefined : startupModelFallbackMessage;
 }
 
-export function classifySessionRosterStatus(summary: SessionSummary): AgentRosterStatus {
-	return classifyAgentStatus({
-		resident: !!summary.activeSessionId,
-		queuedChild: false,
-		busy: summary.activity === "working" || isSessionSummaryBusy(summary),
-		hasActiveHeartbeat: summary.hasActiveHeartbeat === true,
-	});
-}
-
-export function isSessionSummaryBusy(summary: SessionSummary): boolean {
-	return summary.isSessionActive || summary.hasRunningRlmChildren === true;
+export function scheduledJobRegistrations(scheduledJobs: readonly AgentCronJob[]): {
+	activeHeartbeatSessionIds: Set<string>;
+	heartbeatSessionIds: Set<string>;
+	cronSessionIds: Set<string>;
+	heartbeatSessionFiles: Set<string>;
+	cronSessionFiles: Set<string>;
+} {
+	const activeHeartbeatSessionIds = new Set<string>();
+	const heartbeatSessionIds = new Set<string>();
+	const cronSessionIds = new Set<string>();
+	const heartbeatSessionFiles = new Set<string>();
+	const cronSessionFiles = new Set<string>();
+	for (const job of scheduledJobs) {
+		const heartbeat = isHeartbeatCronJob(job);
+		if (heartbeat && job.status === "active") activeHeartbeatSessionIds.add(job.activeSessionId);
+		// A paused heartbeat cannot fire, so unlike a live heartbeat (or a registered
+		// cron job) it must not silently pin a worker forever.
+		const registered = heartbeat ? job.status === "active" : job.status === "active" || job.status === "paused";
+		if (!registered) continue;
+		(heartbeat ? heartbeatSessionIds : cronSessionIds).add(job.activeSessionId);
+		(heartbeat ? heartbeatSessionFiles : cronSessionFiles).add(resolve(job.sessionFile));
+	}
+	return { activeHeartbeatSessionIds, heartbeatSessionIds, cronSessionIds, heartbeatSessionFiles, cronSessionFiles };
 }
 
 /** Naming signals intent to return, so named sessions are exempt even when empty. */
@@ -130,23 +150,13 @@ export function buildSessionList(
 	scheduledJobs: readonly AgentCronJob[] = [],
 ): SessionSummary[] {
 	const activeBySessionFile = new Map<string, ActiveSessionState>();
-	const heartbeatSessionIds = new Set<string>();
-	const registeredHeartbeatSessionIds = new Set<string>();
-	const registeredCronSessionIds = new Set<string>();
-	const registeredHeartbeatSessionFiles = new Set<string>();
-	const registeredCronSessionFiles = new Set<string>();
-	for (const job of scheduledJobs) {
-		const heartbeat = isHeartbeatCronJob(job);
-		if (heartbeat && job.status === "active") heartbeatSessionIds.add(job.activeSessionId);
-		// A paused heartbeat cannot fire, so unlike a live heartbeat (or a registered
-		// cron job) it must not silently pin a worker forever.
-		const registered = heartbeat ? job.status === "active" : job.status === "active" || job.status === "paused";
-		if (!registered) continue;
-		const ids = heartbeat ? registeredHeartbeatSessionIds : registeredCronSessionIds;
-		const files = heartbeat ? registeredHeartbeatSessionFiles : registeredCronSessionFiles;
-		ids.add(job.activeSessionId);
-		files.add(resolve(job.sessionFile));
-	}
+	const {
+		activeHeartbeatSessionIds: heartbeatSessionIds,
+		heartbeatSessionIds: registeredHeartbeatSessionIds,
+		cronSessionIds: registeredCronSessionIds,
+		heartbeatSessionFiles: registeredHeartbeatSessionFiles,
+		cronSessionFiles: registeredCronSessionFiles,
+	} = scheduledJobRegistrations(scheduledJobs);
 
 	for (const activeSession of activeSessions) {
 		const sessionFile = activeSession.runtime.session.sessionFile;
@@ -222,6 +232,9 @@ export function summaryForActiveSession(
 		}
 	}
 
+	const directAttachedClients = [...activeSession.clients].filter(
+		(client) => client.authenticationRole === "session_client",
+	).length;
 	return {
 		id: activeSession.activeSessionId,
 		lifecycle: activeLifecycleForSession(activeSession),
@@ -247,6 +260,7 @@ export function summaryForActiveSession(
 		hasRunningRlmChildren: session.hasRunningRlmChildren(),
 		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
 		attachedClients: activeSession.clients.size,
+		...(directAttachedClients > 0 ? { directAttachedClients } : {}),
 		messageCount: session.messages.length,
 		unfinishedActionCount: session.unfinishedActionCount,
 		sessionActions: session.getSessionActionSnapshot(),
