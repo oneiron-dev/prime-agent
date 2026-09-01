@@ -67,8 +67,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
 // Revision 23 lets workers query the supervisor agent roster on demand.
-export const DAEMON_SCHEMA_REVISION = 23;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-649fe649d15e";
+// Revision 24 lets follow_up address a retained session by durable identity.
+export const DAEMON_SCHEMA_REVISION = 24;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-24-7c80cb37c948";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -113,7 +114,46 @@ export type DaemonServerCapability =
 	| "rlm_quiescence_barrier"
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
-	| "acp_mcp_servers";
+	| "acp_mcp_servers"
+	// The daemon honors follow_up.stableTarget: a follow-up may be addressed by
+	// durable session identity (sessionId and/or sessionFile) instead of an
+	// ephemeral activeSessionId, so a retained-but-passivated RLM child whose
+	// old active id is gone is still reachable in the follow-up lane. Clients
+	// must check before sending; an unchecked send is refused by DaemonClient
+	// rather than silently downgraded to an active-id-only request.
+	| "stable_target_follow_up";
+
+/**
+ * Durable coordinates of a follow-up target.
+ *
+ * At least one field is required. When both are supplied they are conjunctive:
+ * the daemon delivers only to a session whose durable id AND session file both
+ * describe the same target, and never guesses a root, Board, newest row, or any
+ * other session when they disagree.
+ */
+export interface DaemonStableSessionTarget {
+	/** The session's own durable id, not an ephemeral activeSessionId. */
+	sessionId?: string;
+	/** The session's canonical jsonl path. */
+	sessionFile?: string;
+}
+
+/** Why a stable follow-up target was refused. Never an opaque success. */
+export type DaemonStableTargetFailureReason =
+	/** Neither durable coordinate was supplied. */
+	| "missing_identity"
+	/** A coordinate was malformed, or the matched row lacks durable metadata. */
+	| "invalid_target"
+	/** The durable id and session file describe different sessions. */
+	| "identity_mismatch"
+	/** No retained session carries these coordinates (absent or deleted). */
+	| "not_found"
+	/** More than one retained session carries these coordinates. */
+	| "ambiguous"
+	/** The target is a root/Board session, which this lane never addresses. */
+	| "unsupported_target"
+	/** The owning worker or session is stopping, closing, or not connected. */
+	| "target_unavailable";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -158,6 +198,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_quiescence_barrier",
 	"session_input_pause",
 	"acp_mcp_servers",
+	"stable_target_follow_up",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -478,6 +519,14 @@ export type DaemonCommand =
 			agentMessageId?: string;
 			customMessage?: CustomMessage;
 			prefixMessages?: CustomMessage[];
+			/**
+			 * Address the follow-up by durable identity instead of by the
+			 * ephemeral `activeSessionId`, which a passivated retained child no
+			 * longer owns. Present only for callers holding the negotiated
+			 * `stable_target_follow_up` capability; `activeSessionId` is then a
+			 * legacy/diagnostic hint and is not used for routing.
+			 */
+			stableTarget?: DaemonStableSessionTarget;
 	  }
 	| { id?: string; type: "restore_next_turn"; activeSessionId: string; messages: CustomMessage[] }
 	| { id?: string; type: "restore_actions"; activeSessionId: string; snapshot: SessionActionRecoverySnapshot }
@@ -714,6 +763,43 @@ const SESSION_INPUT_PAUSE_COMMAND = {
 	capability: "session_input_pause",
 } as const;
 const AGENT_PEER_LIST_COMMAND = { minProtocol: 7, minSchemaRevision: 23 } as const;
+// follow_up itself stays SESSION_INPUT_ADMISSION_COMMAND: adding the optional
+// stableTarget field is backward-compatible on the wire, and only a command
+// that actually carries it requires the negotiated capability below.
+const STABLE_TARGET_FOLLOW_UP_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 24,
+	capability: "stable_target_follow_up",
+} as const;
+
+/**
+ * The single requirement a peer must prove before a stable-target follow-up may
+ * be sent to it. Exported so the supervisor can hold an adopted session worker
+ * to exactly the same bar the client applies to the daemon, rather than reading
+ * its own capability and assuming the worker matches.
+ */
+export const DAEMON_STABLE_TARGET_FOLLOW_UP_COMPATIBILITY =
+	STABLE_TARGET_FOLLOW_UP_COMMAND satisfies DaemonCommandCompatibility;
+
+/**
+ * Whether a peer's own `daemon_hello` proves it implements a wire requirement.
+ *
+ * Fail-closed by construction: an absent hello, an absent schema revision, or an
+ * absent capability list never satisfies a requirement, so a peer is only
+ * credited with a feature it actually advertised for itself.
+ */
+export function daemonHelloMeetsCompatibility(
+	hello: Extract<DaemonOutbound, { type: "daemon_hello" }> | undefined,
+	compatibility: DaemonCommandCompatibility,
+): boolean {
+	return (
+		hello !== undefined &&
+		hello.protocol.version >= compatibility.minProtocol &&
+		(compatibility.minSchemaRevision === undefined ||
+			(hello.schemaRevision ?? 0) >= compatibility.minSchemaRevision) &&
+		(compatibility.capability === undefined || hello.serverCapabilities?.includes(compatibility.capability) === true)
+	);
+}
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -839,6 +925,9 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	if (command.type === "cancel_prompt_admission" && command.cancelOwned === true) {
 		requirements.push(OWNED_PROMPT_CANCELLATION_COMMAND);
 	}
+	if (command.type === "follow_up" && command.stableTarget !== undefined) {
+		requirements.push(STABLE_TARGET_FOLLOW_UP_COMMAND);
+	}
 	return [...requirements, DAEMON_COMMAND_COMPATIBILITY[command.type]];
 }
 
@@ -857,7 +946,13 @@ export type DaemonErrorInfo =
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
-	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
+	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId }
+	| {
+			code: "stable_follow_up_target";
+			reason: DaemonStableTargetFailureReason;
+			/** Echo of the refused coordinates, so a caller never has to guess what was rejected. */
+			target: DaemonStableSessionTarget;
+	  };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
 export type DaemonClosingReason = "shutdown" | "update";

@@ -17,7 +17,7 @@ type DaemonWorkerAuthentication = Omit<Extract<DaemonWorkerCommand, { type: "wor
 
 export type DaemonWorkerFrameListener = (frame: PrivateFrame<DaemonWorkerFrameHeader>) => void;
 export type DaemonWorkerCloseListener = (error: Error) => void;
-type DaemonHello = Extract<DaemonOutbound, { type: "daemon_hello" }>;
+export type DaemonHello = Extract<DaemonOutbound, { type: "daemon_hello" }>;
 
 export class DaemonWorkerClient {
 	private socket?: Socket;
@@ -76,6 +76,15 @@ export class DaemonWorkerClient {
 
 		socket.on("error", (error) => this.notifyClosed(socket, error));
 		socket.on("close", () => this.notifyClosed(socket, new Error("Daemon worker socket closed")));
+	}
+
+	/**
+	 * The greeting this worker sent on this connection, retained as the worker's
+	 * own capability proof. Bound to the connection, so a reconnect can never
+	 * carry a previous process's claim forward.
+	 */
+	get helloMessage(): DaemonHello | undefined {
+		return this.hello;
 	}
 
 	waitForHello(timeoutMs = 3000): Promise<DaemonHello> {

@@ -253,6 +253,35 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("owned_prompt_cancellation");
 	});
 
+	it("capability-gates only the follow_up commands that carry a stable target", () => {
+		const active: DaemonCommand = { type: "follow_up", activeSessionId: "active-1", message: "go" };
+		const stable: DaemonCommand = {
+			type: "follow_up",
+			activeSessionId: "stale-active-1",
+			message: "go",
+			queueKey: "w6-terminal:abc",
+			stableTarget: { sessionId: "01a0-child", sessionFile: "/sessions/sub-1/child.jsonl" },
+		};
+
+		// Backward-compatible: an ordinary active follow_up keeps exactly the
+		// requirements it had before stable targeting existed, so old daemons and
+		// old clients stay interoperable on that path.
+		expect(getDaemonCommandCompatibilities(active)).toEqual([DAEMON_COMMAND_COMPATIBILITY.follow_up]);
+		expect(DAEMON_COMMAND_COMPATIBILITY.follow_up).toEqual({
+			minProtocol: 7,
+			capability: "session_input_admission",
+		});
+		// Capability-gated: carrying stableTarget adds a negotiated requirement, so
+		// a daemon without it refuses the request instead of silently ignoring the
+		// field and delivering nowhere.
+		expect(getDaemonCommandCompatibilities(stable)).toEqual([
+			{ minProtocol: 7, minSchemaRevision: 24, capability: "stable_target_follow_up" },
+			DAEMON_COMMAND_COMPATIBILITY.follow_up,
+		]);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("stable_target_follow_up");
+		expect(DAEMON_SCHEMA_REVISION).toBeGreaterThanOrEqual(24);
+	});
+
 	it("gates honest worker-state reporting at its introducing schema revision", () => {
 		// Revision 16 adds the "stopping" workerState and stops reporting
 		// disconnected workers as "ready". The field is optional and old clients

@@ -2,8 +2,12 @@ import { MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { DaemonErrorInfo, DaemonResponse } from "./daemon-protocol.js";
+import { StableFollowUpTargetError } from "./daemon-stable-target.js";
 
 export function serializeDaemonError(error: unknown): DaemonErrorInfo | undefined {
+	if (error instanceof StableFollowUpTargetError) {
+		return { code: "stable_follow_up_target", reason: error.reason, target: error.target };
+	}
 	if (error instanceof MissingSessionCwdError) {
 		return { code: "missing_session_cwd", issue: error.issue };
 	}
@@ -20,6 +24,20 @@ export function serializeDaemonError(error: unknown): DaemonErrorInfo | undefine
 	return undefined;
 }
 
+export class DaemonSessionCreateError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "DaemonSessionCreateError";
+	}
+}
+
+/** Wraps untyped create failures so the CLI prints one line instead of rethrowing. */
+export function deserializeDaemonCreateError(response: Extract<DaemonResponse, { success: false }>): Error {
+	const error = deserializeDaemonError(response);
+	if (response.errorInfo) return error;
+	return new DaemonSessionCreateError(error.message);
+}
+
 export function deserializeDaemonError(response: Extract<DaemonResponse, { success: false }>): Error {
 	const { errorInfo } = response;
 	if (errorInfo?.code === "missing_session_cwd") {
@@ -30,6 +48,9 @@ export function deserializeDaemonError(response: Extract<DaemonResponse, { succe
 	}
 	if (errorInfo?.code === "session_already_active") {
 		return new SessionAlreadyActiveError(errorInfo.sessionPath, errorInfo.activeSessionId);
+	}
+	if (errorInfo?.code === "stable_follow_up_target") {
+		return new StableFollowUpTargetError(errorInfo.reason, errorInfo.target, response.error);
 	}
 	return new Error(response.error);
 }

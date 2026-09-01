@@ -17,6 +17,7 @@ import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSI
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { type AgentsViewStateOperation, AgentsViewStateStore } from "../../core/agents-view-state-store.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
+import { SessionAlreadyActiveError } from "../../core/session-lease.js";
 import { SessionManager } from "../../core/session-manager.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
@@ -30,6 +31,7 @@ import { ensureTool } from "../../utils/tools-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
+import { deserializeDaemonError } from "../daemon/daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	type DaemonClosingReason,
@@ -392,8 +394,8 @@ async function openAgentsViewSession(
 
 /**
  * Resume a saved session file into the daemon and return the live summary.
- * The daemon's create-with-sessionPath is idempotent for this client: an
- * already-resident session is reused instead of resumed twice.
+ * An already-resident conflict carrying its active id redirects this open
+ * cycle to that runtime instead of resuming the file twice.
  */
 async function resumeSavedAgentsViewSession(
 	client: DaemonClient,
@@ -404,17 +406,33 @@ async function resumeSavedAgentsViewSession(
 		throw new Error("Cannot resume a session without a saved session file");
 	}
 	const { overrideCwd, notice } = resolveAgentsViewOpenCwd(summary, config.cwd);
-	const response = await client.request({
-		type: "create",
-		config: createAgentsViewResumeConfig(config, overrideCwd),
-		sessionPath: summary.sessionFile,
-	});
-	const createdSummary = expectSessionSummary(requireDaemonData(response));
-	return {
-		summary: createdSummary,
-		activeSessionId: getRequiredActiveSessionId(createdSummary),
-		cwdFallbackNotice: notice,
-	};
+	try {
+		const response = await client.request({
+			type: "create",
+			config: createAgentsViewResumeConfig(config, overrideCwd),
+			sessionPath: summary.sessionFile,
+		});
+		const createdSummary = expectSessionSummary(requireDaemonData(response));
+		return {
+			summary: createdSummary,
+			activeSessionId: getRequiredActiveSessionId(createdSummary),
+			cwdFallbackNotice: notice,
+		};
+	} catch (error) {
+		if (!(error instanceof SessionAlreadyActiveError) || !error.activeSessionId) {
+			throw error;
+		}
+		return {
+			summary: {
+				...summary,
+				id: error.activeSessionId,
+				activeSessionId: error.activeSessionId,
+				lifecycle: "live",
+			},
+			activeSessionId: error.activeSessionId,
+			cwdFallbackNotice: notice,
+		};
+	}
 }
 
 async function connectAgentsViewDaemonClient(socketPath: string): Promise<DaemonClient> {
@@ -3225,7 +3243,7 @@ function parseSessionTimestamp(value: string | undefined): number | undefined {
 
 function requireDaemonData(response: DaemonResponse): unknown {
 	if (!response.success) {
-		throw new Error(response.error);
+		throw deserializeDaemonError(response);
 	}
 	return response.data;
 }

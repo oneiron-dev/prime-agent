@@ -667,9 +667,11 @@ describe("generic OpenAI Responses WebSocket transport", () => {
 		closeOpenAIResponsesWebSocketSessions();
 		ManualSocket.pendingOpens[0]!();
 		await flush();
+		// Late provider events cannot revive a request whose owning session was disposed.
 		complete(ManualSocket.instances[0]!, "ephemeral");
-		await pending;
+		await expect(pending).rejects.toMatchObject({ name: "AbortError" });
 		expect(ManualSocket.instances[0]!.closed).toBe(true);
+		expect(ManualSocket.instances[0]!.sent).toHaveLength(0);
 		const next = concurrentRequest(new Headers({ Authorization: "Bearer pending" }), "next");
 		await flush();
 		expect(ManualSocket.instances).toHaveLength(2);

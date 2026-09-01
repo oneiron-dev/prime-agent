@@ -440,6 +440,50 @@ describe("compaction continuation", () => {
 		expect(harness.session.goalState.continuationsUsed).toBe(1);
 	});
 
+	// Disposing a session while a provider compaction is still in flight must settle it.
+	// A stalled provider response never has to answer, so disposal itself must cancel.
+	it("settles an in-flight compaction when the session is disposed and stops compacting", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { enabled: true, reserveTokens: 1000 } },
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SessionInternals;
+		let deliveredSignal: AbortSignal | undefined;
+		vi.spyOn(internals, "_performCompaction").mockImplementation(
+			({ signal }) =>
+				new Promise((_resolve, reject) => {
+					deliveredSignal = signal;
+					signal.addEventListener("abort", () => {
+						const error = new Error("Request was aborted");
+						error.name = "AbortError";
+						reject(error);
+					});
+				}),
+		);
+
+		const settled = harness.session.compact().then(
+			() => "resolved" as const,
+			(error: unknown) => error,
+		);
+		const startedAt = Date.now();
+		while (!deliveredSignal && Date.now() - startedAt < 2000) await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(deliveredSignal, "compaction never reached the provider").toBeDefined();
+		expect(harness.session.isCompacting).toBe(true);
+
+		harness.session.dispose();
+
+		const DEADLINE = Symbol("deadline");
+		const outcome = await Promise.race([
+			settled,
+			new Promise((resolve) => setTimeout(() => resolve(DEADLINE), 1000)),
+		]);
+		expect(outcome, "the disposed session's compaction never settled").not.toBe(DEADLINE);
+		expect(outcome).toMatchObject({ name: "AbortError" });
+		expect(deliveredSignal!.aborted).toBe(true);
+		expect(harness.session.isCompacting).toBe(false);
+	});
+
 	// A stale marker (continuation already consumed, goal completed) must not be rolled back.
 	it("keeps completed-goal bookkeeping when a later threshold compaction is cancelled", async () => {
 		const sessionRef: { current?: AgentSession } = {};

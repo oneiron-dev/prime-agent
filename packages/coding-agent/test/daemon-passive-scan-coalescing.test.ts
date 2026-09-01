@@ -57,14 +57,46 @@ describe("AgentDaemon passive RLM scan coalescing", () => {
 			return [];
 		});
 
-		const first = internals.listPassiveRlmSubagents([]);
-		const second = internals.listPassiveRlmSubagents([]);
+		// A *non-empty* saved-root list is explicit caller input: it names the
+		// roots to walk, so it is never answered from the whole-daemon scan.
+		const first = internals.listPassiveRlmSubagents(savedRoots("root-1"));
+		const second = internals.listPassiveRlmSubagents(savedRoots("root-2"));
 		await scansStarted.promise;
 		const scansBeforeRelease = scanCount;
 		releaseScans.resolve();
 		await Promise.all([first, second]);
 
 		expect(scansBeforeRelease).toBe(2);
+	});
+
+	it("treats an empty saved-root list as no input and joins the background scan", async () => {
+		const internals = createDaemonInternals();
+		const releaseScan = deferred();
+		let scanCount = 0;
+		let observedRoots: SessionInfo[] | undefined;
+		internals.scanPassiveRlmSubagents = vi.fn(async (roots: SessionInfo[]) => {
+			scanCount++;
+			observedRoots = roots;
+			await releaseScan.promise;
+			return [{ entry: { childId: "child-1" } }];
+		});
+
+		// An empty list carries no roots to scan. Scanning it literally would walk
+		// nothing and report an empty result, which reads downstream as "this child
+		// does not exist" — so it must coalesce onto the whole-daemon scan instead.
+		const explicitEmpty = internals.listPassiveRlmSubagents([]);
+		const defaultScan = internals.listPassiveRlmSubagents();
+		const alsoEmpty = internals.listPassiveRlmSubagents([]);
+		releaseScan.resolve();
+		const results = await Promise.all([explicitEmpty, defaultScan, alsoEmpty]);
+
+		expect(scanCount).toBe(1);
+		expect(observedRoots).toEqual([]);
+		for (const rows of results) {
+			expect(rows.map(({ entry }) => entry.childId)).toEqual(["child-1"]);
+		}
+		// Each caller still gets its own array, so one caller cannot mutate another's.
+		expect(results[0]).not.toBe(results[1]);
 	});
 
 	it("clears a failed default traversal before the next call", async () => {
@@ -101,6 +133,11 @@ describe("AgentDaemon passive RLM scan coalescing", () => {
 		expect(scanCount).toBe(2);
 	});
 });
+
+/** Minimal saved-root rows; the scan itself is stubbed in these tests. */
+function savedRoots(...ids: string[]): SessionInfo[] {
+	return ids.map((id) => ({ id, path: `/tmp/${id}.jsonl` }) as unknown as SessionInfo);
+}
 
 function createDaemonInternals(): DaemonInternals {
 	return new AgentDaemon("/tmp/unused-passive-scan-coalescing.sock", {

@@ -63,8 +63,11 @@ export interface ThinkingBudgetsSettings {
 	high?: number;
 }
 
+export type MermaidRenderingMode = "off" | "final" | "streaming";
+
 export interface MarkdownSettings {
 	codeBlockIndent?: string; // default: "  "
+	mermaid?: MermaidRenderingMode; // default: "streaming"
 }
 
 export interface BundledSkillsSettings {
@@ -464,6 +467,13 @@ export class SettingsManager {
 			(typeof settings.telemetry !== "object" || settings.telemetry === null || Array.isArray(settings.telemetry))
 		) {
 			delete settings.telemetry;
+		}
+
+		if (
+			settings.markdown !== undefined &&
+			(typeof settings.markdown !== "object" || settings.markdown === null || Array.isArray(settings.markdown))
+		) {
+			delete settings.markdown;
 		}
 
 		return settings as Settings;
@@ -1304,6 +1314,18 @@ export class SettingsManager {
 
 	getCodeBlockIndent(): string {
 		return this.settings.markdown?.codeBlockIndent ?? "  ";
+	}
+
+	getMermaidRenderingMode(): MermaidRenderingMode {
+		const mode = this.settings.markdown?.mermaid;
+		return mode === "off" || mode === "final" ? mode : "streaming";
+	}
+
+	setMermaidRenderingMode(mode: MermaidRenderingMode): void {
+		this.globalSettings.markdown ??= {};
+		this.globalSettings.markdown.mermaid = mode;
+		this.markModified("markdown", "mermaid");
+		this.save();
 	}
 
 	getWarnings(): WarningSettings {

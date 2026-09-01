@@ -79,6 +79,52 @@ function stream(items: unknown[]) {
 		.map((item) => `event: ${(item as { type?: string }).type ?? "message"}\ndata: ${JSON.stringify(item)}\n\n`)
 		.join("");
 }
+
+const DEADLINE = Symbol("deadline");
+/** Bounded settlement probe: a lifecycle defect must fail as "never settled", never as a hung test. */
+function deadline(ms: number): Promise<typeof DEADLINE> {
+	return new Promise((resolve) => setTimeout(() => resolve(DEADLINE), ms));
+}
+async function flushMicrotasks() {
+	for (let i = 0; i < 8; i++) await Promise.resolve();
+}
+/** A context whose last exchange is a tool call answered by its tool result. */
+function postToolContext() {
+	return {
+		systemPrompt: "system",
+		messages: [
+			{ role: "user" as const, content: "old", timestamp: 1 },
+			{
+				role: "assistant" as const,
+				content: [
+					{ type: "text" as const, text: "assistant-text" },
+					{ type: "toolCall" as const, id: "call_1|fc_1", name: "probe", arguments: { value: 1 } },
+				],
+				api: "openai-responses" as const,
+				provider: "cpa-r",
+				model: "sol",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse" as const,
+				timestamp: 2,
+			},
+			{
+				role: "toolResult" as const,
+				toolCallId: "call_1|fc_1",
+				toolName: "probe",
+				content: [{ type: "text" as const, text: "tool-output" }],
+				isError: false,
+				timestamp: 3,
+			},
+		],
+	};
+}
 describe("Codex Remote Compaction V2", () => {
 	it("uses streaming /responses with the trigger and preserves opaque fields", async () => {
 		const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -364,6 +410,124 @@ describe("Codex Remote Compaction V2", () => {
 			),
 		).rejects.toMatchObject({ name: "AbortError" });
 		expect(fetch).not.toHaveBeenCalled();
+	});
+
+	it("aborts a stalled post-tool response and releases its session socket", async () => {
+		// The provider answers the tool round-trip and then stalls: no response.completed,
+		// no response.failed, and no EOF. Only session disposal can settle this collector.
+		class StalledPostToolSocket extends V2MockWebSocket {
+			override send(data: string) {
+				this.sent.push(JSON.parse(data));
+				queueMicrotask(() => {
+					this.emit("message", {
+						data: JSON.stringify({ type: "response.created", response: { id: "stalled" } }),
+					});
+					this.emit("message", {
+						data: JSON.stringify({
+							type: "response.output_item.done",
+							item: {
+								type: "function_call",
+								id: "fc_1",
+								call_id: "call_1|fc_1",
+								name: "probe",
+								arguments: "{}",
+							},
+						}),
+					});
+				});
+			}
+		}
+		setOpenAIResponsesWebSocketConstructorForTesting(StalledPostToolSocket as never);
+		const fetch = vi.fn();
+		vi.stubGlobal("fetch", fetch);
+		const controller = new AbortController();
+		const promise = compactOpenAIResponsesV2(model, postToolContext(), {
+			apiKey: "key",
+			sessionId: "stalled-post-tool",
+			transport: "websocket",
+			signal: controller.signal,
+		});
+		const settled = promise.then(
+			() => "resolved" as const,
+			(error: unknown) => error,
+		);
+		await flushMicrotasks();
+		const socket = V2MockWebSocket.instances[0]!;
+		expect(socket.sent).toHaveLength(1);
+		expect(JSON.stringify(socket.sent[0]!.input)).toContain("tool-output");
+		expect((socket.sent[0]!.input as unknown[]).at(-1)).toEqual({ type: "compaction_trigger" });
+		expect(socket.readyState).toBe(1);
+
+		// Dispose the exact owning session while the stalled response is still in flight.
+		closeOpenAIResponsesWebSocketSessions("stalled-post-tool");
+
+		const outcome = await Promise.race([settled, deadline(500)]);
+		expect(outcome, "the disposed session's compaction collector never settled").not.toBe(DEADLINE);
+		expect(outcome).toMatchObject({ name: "AbortError" });
+		// The abort reached the collector through session ownership, not the caller's signal.
+		expect(controller.signal.aborted).toBe(false);
+		// No SSE/provider replay after the tool event.
+		expect(fetch).not.toHaveBeenCalled();
+		expect(socket.readyState).toBe(3);
+
+		// The claim, cache entry, and socket were released: the next compaction builds a fresh socket.
+		setOpenAIResponsesWebSocketConstructorForTesting(V2MockWebSocket as never);
+		await expect(
+			compactOpenAIResponsesV2(
+				model,
+				{ messages: [] },
+				{
+					apiKey: "key",
+					sessionId: "stalled-post-tool",
+					transport: "websocket",
+				},
+			),
+		).resolves.toMatchObject({ items: [checkpoint] });
+		expect(V2MockWebSocket.instances).toHaveLength(2);
+		expect(V2MockWebSocket.instances[1]).not.toBe(socket);
+	});
+
+	it("distinguishes a provider EOF after a tool event from session disposal", async () => {
+		class EofAfterToolSocket extends V2MockWebSocket {
+			override send(data: string) {
+				this.sent.push(JSON.parse(data));
+				queueMicrotask(() => {
+					this.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "eof" } }) });
+					this.emit("message", {
+						data: JSON.stringify({
+							type: "response.output_item.done",
+							item: {
+								type: "function_call",
+								id: "fc_1",
+								call_id: "call_1|fc_1",
+								name: "probe",
+								arguments: "{}",
+							},
+						}),
+					});
+					this.emit("close", { code: 1006, reason: "upstream vanished" });
+				});
+			}
+		}
+		setOpenAIResponsesWebSocketConstructorForTesting(EofAfterToolSocket as never);
+		const fetch = vi.fn();
+		vi.stubGlobal("fetch", fetch);
+		const outcome = await Promise.race([
+			compactOpenAIResponsesV2(model, postToolContext(), {
+				apiKey: "key",
+				sessionId: "eof-post-tool",
+				transport: "websocket",
+			}).then(
+				() => "resolved" as const,
+				(error: unknown) => error,
+			),
+			deadline(500),
+		]);
+		expect(outcome, "the provider EOF never settled the collector").not.toBe(DEADLINE);
+		// Provider EOF stays a transport failure; it is never canonicalized as a session abort.
+		expect(outcome).toMatchObject({ name: "WebSocketTransportError" });
+		expect(fetch).not.toHaveBeenCalled();
+		expect(V2MockWebSocket.instances[0]!.readyState).toBe(3);
 	});
 
 	it("rejects an SSE result when abort follows terminal stream completion", async () => {

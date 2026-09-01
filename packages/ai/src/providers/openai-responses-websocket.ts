@@ -1,4 +1,5 @@
 import type { ResponseInput, ResponseStreamEvent } from "openai/resources/responses/responses.js";
+import { getLogger } from "../log.js";
 import { registerSessionResourceCleanup } from "../session-resources.js";
 import type { Api, AssistantMessage, Model } from "../types.js";
 import type { AssistantMessageEventStream } from "../utils/event-stream.js";
@@ -10,6 +11,8 @@ import {
 } from "./openai-responses-shared.js";
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
+// Lifecycle-only diagnostics: identifiers and event names, never credentials, URLs, or payloads.
+const log = getLogger("ai.openai-responses-websocket");
 type Listener = (event: unknown) => void;
 interface Socket {
 	readyState?: number;
@@ -80,6 +83,23 @@ interface Claim {
 const claims = new Map<string, Claim>();
 let nextGeneration = 0;
 
+/**
+ * Every in-flight request owned by a session. Disposal must abort these collectors
+ * itself: closing a socket only *requests* an EOF, and a provider that stalls after a
+ * tool result never has to send one, so a reader waiting on transport events alone can
+ * outlive the session that owns it.
+ */
+interface OwnedRequest {
+	readonly requestId: string;
+	readonly sessionId: string | undefined;
+	readonly compactionId: string | undefined;
+	readonly controller: AbortController;
+	socket: Socket | undefined;
+	release(): void;
+}
+const owned = new Set<OwnedRequest>();
+let nextRequestId = 0;
+
 function close(socket: Socket, reason = "done") {
 	try {
 		socket.close(1000, reason);
@@ -88,6 +108,19 @@ function close(socket: Socket, reason = "done") {
 	}
 }
 export function closeOpenAIResponsesWebSocketSessions(sessionId?: string): void {
+	// Ownership first: settle the collectors this session owns, then release its transport state.
+	for (const request of [...owned]) {
+		if (sessionId !== undefined && request.sessionId !== sessionId) continue;
+		if (!request.controller.signal.aborted) request.controller.abort(createSessionDisposedError());
+		if (request.socket) close(request.socket, "session_cleanup");
+		log.debug("websocket lifecycle", {
+			event: "abort",
+			cause: "session_disposed",
+			requestId: request.requestId,
+			sessionId: request.sessionId,
+			compactionId: request.compactionId,
+		});
+	}
 	const entries = sessionId ? [[sessionId, cache.get(sessionId)] as const] : [...cache.entries()];
 	if (sessionId) claims.delete(sessionId);
 	else claims.clear();
@@ -96,6 +129,7 @@ export function closeOpenAIResponsesWebSocketSessions(sessionId?: string): void 
 		if (entry.timer) clearTimeout(entry.timer);
 		close(entry.socket, "session_cleanup");
 		cache.delete(id);
+		log.debug("websocket lifecycle", { event: "close", cause: "session_cleanup", sessionId: id });
 	}
 }
 registerSessionResourceCleanup(closeOpenAIResponsesWebSocketSessions);
@@ -116,6 +150,60 @@ function createAbortError(): Error {
 	error.name = "AbortError";
 	return error;
 }
+/** Session disposal is a cancellation, distinguishable from a provider EOF or a caller abort. */
+function createSessionDisposedError(): Error {
+	const error = new Error("OpenAI Responses WebSocket session was disposed") as Error & { code?: string };
+	error.name = "AbortError";
+	error.code = "session_disposed";
+	return error;
+}
+export function isOpenAIResponsesWebSocketSessionDisposedError(value: unknown): boolean {
+	return value instanceof Error && (value as { code?: unknown }).code === "session_disposed";
+}
+/** Only our own tagged disposal reason is adopted; any other reason stays the canonical abort error. */
+function abortErrorFor(signal?: AbortSignal): Error {
+	const reason = signal?.reason;
+	return isOpenAIResponsesWebSocketSessionDisposedError(reason) ? (reason as Error) : createAbortError();
+}
+/**
+ * Registers a session-owned request and returns the signal every stage must use. The
+ * returned signal aborts on the caller's abort *and* on disposal of the owning session.
+ */
+function beginOwnedRequest(args: {
+	sessionId?: string;
+	compactionId?: string;
+	signal?: AbortSignal;
+}): OwnedRequest & { signal: AbortSignal } {
+	const controller = new AbortController();
+	const forward = () => {
+		if (!controller.signal.aborted) controller.abort();
+	};
+	const request: OwnedRequest & { signal: AbortSignal } = {
+		requestId: `wsreq_${++nextRequestId}`,
+		sessionId: args.sessionId,
+		compactionId: args.compactionId,
+		controller,
+		signal: controller.signal,
+		socket: undefined,
+		release: () => {
+			args.signal?.removeEventListener("abort", forward);
+			owned.delete(request);
+		},
+	};
+	owned.add(request);
+	if (args.signal?.aborted) forward();
+	else args.signal?.addEventListener("abort", forward);
+	return request;
+}
+function logLifecycle(request: OwnedRequest, event: string, fields?: Record<string, unknown>): void {
+	log.debug("websocket lifecycle", {
+		...fields,
+		event,
+		requestId: request.requestId,
+		sessionId: request.sessionId,
+		compactionId: request.compactionId,
+	});
+}
 function errorFromEvent(event: unknown, fallback: string): Error {
 	if (event && typeof event === "object") {
 		const message = "message" in event ? (event as { message?: unknown }).message : undefined;
@@ -128,9 +216,9 @@ function errorFromEvent(event: unknown, fallback: string): Error {
 	return new Error(fallback);
 }
 async function connect(url: string, headers: Headers, signal?: AbortSignal): Promise<Socket> {
-	if (signal?.aborted) throw createAbortError();
+	if (signal?.aborted) throw abortErrorFor(signal);
 	const Ctor = await loadAuthenticatedSocketConstructor();
-	if (signal?.aborted) throw createAbortError();
+	if (signal?.aborted) throw abortErrorFor(signal);
 	if (!Ctor) throw new Error("Authenticated WebSocket transport is not available in this runtime");
 	return new Promise((resolve, reject) => {
 		let socket: Socket;
@@ -164,7 +252,7 @@ async function connect(url: string, headers: Headers, signal?: AbortSignal): Pro
 			settled = true;
 			cleanup();
 			close(socket, "aborted");
-			reject(createAbortError());
+			reject(abortErrorFor(signal));
 		};
 		try {
 			socket = new Ctor(url, { headers: headersToRecord(headers) });
@@ -189,7 +277,7 @@ function expire(sessionId: string, entry: Entry) {
 	}, CACHE_TTL_MS);
 }
 async function acquire(url: string, headers: Headers, sessionId: string | undefined, signal?: AbortSignal) {
-	if (signal?.aborted) throw createAbortError();
+	if (signal?.aborted) throw abortErrorFor(signal);
 	const identity = connectionIdentity(url, headers);
 	if (!sessionId) {
 		const socket = await connect(url, headers, signal);
@@ -334,7 +422,7 @@ async function* events(socket: Socket, signal?: AbortSignal, send?: () => void):
 		notify();
 	};
 	const onAbort = () => {
-		failure = createAbortError();
+		failure = abortErrorFor(signal);
 		done = true;
 		notify();
 	};
@@ -343,7 +431,7 @@ async function* events(socket: Socket, signal?: AbortSignal, send?: () => void):
 	socket.addEventListener("close", onClose);
 	signal?.addEventListener("abort", onAbort);
 	if (signal?.aborted) {
-		failure = createAbortError();
+		failure = abortErrorFor(signal);
 		done = true;
 	}
 	try {
@@ -400,41 +488,64 @@ export async function collectOpenAIResponsesWebSocketEvents(args: {
 	headers: Headers;
 	body: RequestBody;
 	sessionId?: string;
+	compactionId?: string;
 	signal?: AbortSignal;
 	onOpen?(): void | Promise<void>;
 	onFirstEvent?(): void;
 	onEvent(event: ResponseStreamEvent): void | Promise<void>;
 }): Promise<void> {
-	const acquired = await acquire(args.url, args.headers, args.sessionId, args.signal);
+	const owner = beginOwnedRequest(args);
+	logLifecycle(owner, "acquire", { kind: "collect" });
+	let acquired: Awaited<ReturnType<typeof acquire>>;
+	try {
+		acquired = await acquire(args.url, args.headers, args.sessionId, owner.signal);
+	} catch (error) {
+		logLifecycle(owner, "error", { kind: "collect", phase: "acquire" });
+		owner.release();
+		throw error;
+	}
+	// Disposal can now reach this socket even when it never entered the session cache.
+	owner.socket = acquired.socket;
+	logLifecycle(owner, "create", { kind: "collect", reused: acquired.reused });
 	let keep = true;
 	try {
 		// A V2 trigger is a full replacement request, never a generation continuation.
 		if (acquired.entry) acquired.entry.continuation = undefined;
 		await args.onOpen?.();
-		if (args.signal?.aborted) {
+		if (owner.signal.aborted) {
 			keep = false;
-			throw createAbortError();
+			throw abortErrorFor(owner.signal);
 		}
 		// Remote compaction V2 must always send the complete request, never a cached delta.
 		let first = true;
-		for await (const event of events(acquired.socket, args.signal, () =>
+		for await (const event of events(acquired.socket, owner.signal, () =>
 			acquired.socket.send(JSON.stringify({ type: "response.create", ...args.body })),
 		)) {
 			if (first) {
 				first = false;
+				logLifecycle(owner, "first_event", { kind: "collect" });
 				args.onFirstEvent?.();
 			}
 			await args.onEvent(event);
 		}
-		if (args.signal?.aborted) {
+		if (owner.signal.aborted) {
 			keep = false;
-			throw createAbortError();
+			throw abortErrorFor(owner.signal);
 		}
+		logLifecycle(owner, "terminal", { kind: "collect", outcome: "completed" });
 	} catch (error) {
 		keep = false;
+		logLifecycle(owner, "terminal", {
+			kind: "collect",
+			outcome: owner.signal.aborted ? "aborted" : "error",
+			errorName: error instanceof Error ? error.name : "unknown",
+		});
 		throw error;
 	} finally {
+		// Ordering is fixed: transport state first, then ownership.
 		acquired.release(keep);
+		owner.release();
+		logLifecycle(owner, "release", { kind: "collect", kept: keep });
 	}
 }
 
@@ -458,32 +569,45 @@ export async function processOpenAIResponsesWebSocket<TApi extends Api>(args: {
 	onFirstEvent(): void;
 	onOpen?(): void | Promise<void>;
 }): Promise<void> {
-	const acquired = await acquire(args.url, args.headers, args.sessionId, args.signal);
+	const owner = beginOwnedRequest(args);
+	logLifecycle(owner, "acquire", { kind: "stream" });
+	let acquired: Awaited<ReturnType<typeof acquire>>;
+	try {
+		acquired = await acquire(args.url, args.headers, args.sessionId, owner.signal);
+	} catch (error) {
+		logLifecycle(owner, "error", { kind: "stream", phase: "acquire" });
+		owner.release();
+		throw error;
+	}
+	// Disposal can now reach this socket even when it never entered the session cache.
+	owner.socket = acquired.socket;
+	logLifecycle(owner, "create", { kind: "stream", reused: acquired.reused });
 	let keep = true;
 	const delta = args.cached && acquired.entry ? cachedBody(acquired.entry, args.body) : undefined;
 	const request = delta ?? args.body;
 	try {
 		await args.onOpen?.();
-		if (args.signal?.aborted) {
+		if (owner.signal.aborted) {
 			keep = false;
-			throw createAbortError();
+			throw abortErrorFor(owner.signal);
 		}
 		let first = true;
 		const marked = (async function* () {
-			for await (const event of events(acquired.socket, args.signal, () =>
+			for await (const event of events(acquired.socket, owner.signal, () =>
 				acquired.socket.send(JSON.stringify({ type: "response.create", ...request })),
 			)) {
 				if (first) {
 					first = false;
+					logLifecycle(owner, "first_event", { kind: "stream" });
 					args.onFirstEvent();
 				}
 				yield event;
 			}
 		})();
 		await processResponsesStream(marked, args.output, args.stream, args.model, args.streamOptions);
-		if (args.signal?.aborted) {
+		if (owner.signal.aborted) {
 			keep = false;
-			throw createAbortError();
+			throw abortErrorFor(owner.signal);
 		} else if (args.cached && acquired.entry && args.output.responseId)
 			acquired.entry.continuation = {
 				body: args.body,
@@ -494,11 +618,20 @@ export async function processOpenAIResponsesWebSocket<TApi extends Api>(args: {
 					new Set(["openai", "openai-codex", "opencode"]),
 				).filter((item) => item.type !== "function_call_output"),
 			};
+		logLifecycle(owner, "terminal", { kind: "stream", outcome: "completed" });
 	} catch (error) {
 		if (acquired.entry) acquired.entry.continuation = undefined;
 		keep = false;
+		logLifecycle(owner, "terminal", {
+			kind: "stream",
+			outcome: owner.signal.aborted ? "aborted" : "error",
+			errorName: error instanceof Error ? error.name : "unknown",
+		});
 		throw error;
 	} finally {
+		// Ordering is fixed: transport state first, then ownership.
 		acquired.release(keep);
+		owner.release();
+		logLifecycle(owner, "release", { kind: "stream", kept: keep });
 	}
 }

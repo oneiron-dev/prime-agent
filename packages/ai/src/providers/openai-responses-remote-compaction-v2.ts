@@ -4,6 +4,7 @@ import type {
 	ResponseInputItem,
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
+import { getLogger } from "../log.js";
 import type { Context, Model, OpenAIResponsesCompactionItem } from "../types.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { convertResponsesMessages } from "./openai-responses-shared.js";
@@ -15,6 +16,9 @@ import {
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 const COMPACTION_TRIGGER = { type: "compaction_trigger" } as const;
+// Lifecycle-only diagnostics: identifiers and outcomes, never credentials, URLs, or payloads.
+const log = getLogger("ai.openai-responses-remote-compaction-v2");
+let nextCompactionId = 0;
 
 export interface OpenAIResponsesRemoteCompactionV2Options {
 	apiKey: string;
@@ -174,6 +178,12 @@ export async function compactOpenAIResponsesV2(
 			model.compat?.supportsWebSocket === true &&
 			(await hasAuthenticatedOpenAIResponsesWebSocketRuntime()));
 	const headers = buildHeaders(model, options);
+	const compactionId = `cmp_${++nextCompactionId}`;
+	log.debug("remote compaction v2 start", {
+		compactionId,
+		sessionId: options.sessionId,
+		transport: useWebSocket ? "websocket" : "sse",
+	});
 	if (useWebSocket) {
 		const websocketHeaders = new Headers(headers);
 		websocketHeaders.set("Authorization", `Bearer ${options.apiKey}`);
@@ -185,6 +195,7 @@ export async function compactOpenAIResponsesV2(
 				headers: websocketHeaders,
 				body: params as typeof params & { [key: string]: unknown },
 				sessionId: options.sessionId,
+				compactionId,
 				signal: options.signal,
 				onFirstEvent: () => {
 					started = true;
@@ -206,10 +217,22 @@ export async function compactOpenAIResponsesV2(
 				},
 			});
 			if (options.signal?.aborted) throw createAbortError();
+			log.debug("remote compaction v2 returned", { compactionId, sessionId: options.sessionId, outcome: "ok" });
 			return { items: checkpoints, input: (params.input ?? []).slice(0, -1) as ResponseInputItem[] };
 		} catch (error) {
+			const aborted = options.signal?.aborted === true || (error instanceof Error && error.name === "AbortError");
+			log.debug("remote compaction v2 threw", {
+				compactionId,
+				sessionId: options.sessionId,
+				outcome: aborted ? "aborted" : "error",
+				started,
+				errorName: error instanceof Error ? error.name : "unknown",
+				fallback: !aborted && !started,
+			});
 			if (options.signal?.aborted) throw createAbortError();
-			if (started) throw error;
+			// A cancellation — caller abort or disposal of the owning session — is terminal.
+			// Replaying it over SSE would resend tool effects the cancelled session no longer owns.
+			if (aborted || started) throw error;
 		}
 	}
 	const client = await createClient(model, options);
@@ -222,8 +245,15 @@ export async function compactOpenAIResponsesV2(
 		const { data } = await client.responses.create(params, requestOptions).withResponse();
 		const items = await collect(data);
 		if (options.signal?.aborted) throw createAbortError();
+		log.debug("remote compaction v2 returned", { compactionId, sessionId: options.sessionId, outcome: "ok" });
 		return { items, input: (params.input ?? []).slice(0, -1) as ResponseInputItem[] };
 	} catch (error) {
+		log.debug("remote compaction v2 threw", {
+			compactionId,
+			sessionId: options.sessionId,
+			outcome: options.signal?.aborted ? "aborted" : "error",
+			errorName: error instanceof Error ? error.name : "unknown",
+		});
 		// The OpenAI SDK wraps AbortError as APIUserAbortError without preserving
 		// its name. Keep cancellation recognizable to AgentSession and callers.
 		if (options.signal?.aborted) throw createAbortError();

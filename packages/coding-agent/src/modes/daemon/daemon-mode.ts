@@ -150,6 +150,7 @@ import {
 	type DaemonResponse,
 	type DaemonSessionClosedReason,
 	type DaemonSessionSnapshot,
+	type DaemonStableSessionTarget,
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartSession,
 	failure,
@@ -180,6 +181,13 @@ import {
 	prepareDaemonSocketPath,
 	restrictDaemonSocketPath,
 } from "./daemon-socket.js";
+import {
+	assertStableFollowUpTargetUsable,
+	isStableTargetIdentityMismatch,
+	matchesStableSessionTarget,
+	normalizeStableSessionTarget,
+	StableFollowUpTargetError,
+} from "./daemon-stable-target.js";
 import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
@@ -1224,7 +1232,7 @@ export class AgentDaemon {
 	 * in-flight walk instead of each re-reading the ledger and every child header.
 	 */
 	private listPassiveRlmSubagents(savedRoots?: SessionInfo[], includeResident = false): Promise<PassiveRlmSubagent[]> {
-		if (savedRoots !== undefined) {
+		if (savedRoots && savedRoots.length > 0) {
 			return this.scanPassiveRlmSubagents(savedRoots, includeResident);
 		}
 
@@ -2307,6 +2315,92 @@ export class AgentDaemon {
 			if (error instanceof AmbiguousActiveSessionError) throw error;
 			throw lookupError;
 		}
+	}
+
+	/**
+	 * Resolve a `follow_up` addressed by durable session identity.
+	 *
+	 * Conjunctive whenever both coordinates are supplied, so a reminder can never
+	 * land on a session whose durable id and session file disagree. A resident
+	 * match wins; otherwise the retained-but-passivated child is discovered and
+	 * hydrated through the same passive-subagent seam attach and agent messaging
+	 * already use, which keeps path-keyed open protection intact and never
+	 * launches an arbitrary saved file as a new root. The caller then takes the
+	 * ordinary waking `followUp` path, so the child's input pump resumes exactly
+	 * as it does for an active follow-up.
+	 *
+	 * Every refusal is a typed StableFollowUpTargetError: no root, Board, newest
+	 * row, or neighbouring session is ever substituted for the named target.
+	 */
+	private async resolveStableFollowUpTargetState(
+		requestedTarget: DaemonStableSessionTarget,
+	): Promise<ActiveSessionState> {
+		const target = normalizeStableSessionTarget(requestedTarget);
+		const resident = [...this.sessions.values()].filter((state) =>
+			matchesStableSessionTarget(
+				{
+					sessionId: state.runtime.session.sessionId,
+					sessionFile: state.runtime.session.sessionFile,
+				},
+				target,
+			),
+		);
+		if (resident.length > 1) {
+			throw new StableFollowUpTargetError(
+				"ambiguous",
+				target,
+				`Stable follow-up target matches ${resident.length} resident sessions`,
+			);
+		}
+		const residentState = resident[0];
+		if (residentState) {
+			assertStableFollowUpTargetUsable(summaryForActiveSession(residentState), target);
+			if (this.closingSessions.has(residentState.activeSessionId)) {
+				throw new StableFollowUpTargetError(
+					"target_unavailable",
+					target,
+					`Active session ${residentState.activeSessionId} is closing`,
+				);
+			}
+			return this.waitForBoundSession(residentState);
+		}
+
+		const passiveCandidates = [...(await this.passiveRlmSubagentsByPath()).values()];
+		const matches = passiveCandidates.filter((passive) =>
+			matchesStableSessionTarget({ sessionId: passive.info.id, sessionFile: passive.entry.sessionFile }, target),
+		);
+		if (matches.length > 1) {
+			throw new StableFollowUpTargetError(
+				"ambiguous",
+				target,
+				`Stable follow-up target matches ${matches.length} retained child sessions`,
+			);
+		}
+		const passive = matches[0];
+		if (!passive) {
+			const known = [
+				...passiveCandidates.map((candidate) => ({
+					sessionId: candidate.info.id,
+					sessionFile: candidate.entry.sessionFile,
+				})),
+				...[...this.sessions.values()].map((state) => ({
+					sessionId: state.runtime.session.sessionId,
+					sessionFile: state.runtime.session.sessionFile,
+				})),
+			];
+			const mismatch = isStableTargetIdentityMismatch(known, target);
+			throw new StableFollowUpTargetError(
+				mismatch ? "identity_mismatch" : "not_found",
+				target,
+				mismatch
+					? "Stable follow-up sessionId and sessionFile describe different sessions"
+					: "No retained session carries the stable follow-up target coordinates",
+			);
+		}
+		if (passive.entry.status === "deleted") {
+			throw new StableFollowUpTargetError("not_found", target, "Stable follow-up target has been deleted");
+		}
+		return this.hydratePassiveRlmSubagent(passive);
 	}
 
 	private async waitForHydratingChild(state: ActiveSessionState, selector: string): Promise<ActiveSessionState> {
@@ -4132,7 +4226,13 @@ export class AgentDaemon {
 			}
 
 			case "follow_up": {
-				const state = this.getBoundSessionState(command.activeSessionId);
+				// Durable addressing only replaces target resolution. Everything
+				// after it — expansion, lane, admission, wake — is the unchanged
+				// active-session follow-up path.
+				const state =
+					command.stableTarget === undefined
+						? this.getBoundSessionState(command.activeSessionId)
+						: await this.resolveStableFollowUpTargetState(command.stableTarget);
 				let queued = true;
 				let admitted = true;
 				if (command.expandPromptTemplates === false) {
@@ -4155,7 +4255,29 @@ export class AgentDaemon {
 				if (admitted) {
 					this.recordWorkerRecoveryState(state, "follow_up_queued", true);
 				}
-				return success(command.id, "follow_up", { queued });
+				// A repeat of the same deterministic queueKey after a lost response is
+				// coalesced by the action store, which reports queued=false — wire
+				// shape identical to a genuine refusal. Prove the original request is
+				// still pending so the caller can tell "already queued exactly once"
+				// from "not queued at all" instead of guessing, and never queue a
+				// second visible terminal reminder. Additive field: old clients that
+				// read only `queued` are unaffected.
+				//
+				// Scoped to the stable-target route only. Active-only follow_up keeps
+				// its prior `{ queued }` response: an ordinary pending-heartbeat
+				// coalesce there is a normal queued=false, not a lost-response retry,
+				// and callers already treat it that way. The stableTarget check is
+				// first so the active path short-circuits before the pending proof and
+				// makes no extra session call just to attach metadata.
+				const duplicateOfPending =
+					command.stableTarget !== undefined &&
+					!queued &&
+					command.queueKey !== undefined &&
+					state.runtime.session.hasPendingFollowUpWithQueueKey(command.queueKey);
+				return success(command.id, "follow_up", {
+					queued,
+					...(duplicateOfPending ? { duplicate: true } : {}),
+				});
 			}
 
 			case "restore_next_turn": {

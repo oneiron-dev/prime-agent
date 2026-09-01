@@ -33,6 +33,7 @@ import {
 import { canonicalSessionPath } from "../src/core/session-lease.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../src/core/session-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { serializeDaemonError } from "../src/modes/daemon/daemon-errors.js";
 import {
 	AgentDaemon,
 	cancelPendingExtensionUiRequests,
@@ -54,6 +55,7 @@ import {
 	failure,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { StableFollowUpTargetError } from "../src/modes/daemon/daemon-stable-target.js";
 import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 
@@ -8795,6 +8797,332 @@ describe("daemon mode helpers", () => {
 			}),
 		).rejects.toThrow("Unknown active session: missing");
 	});
+
+	// --- terminal follow_up addressed by durable session identity ------------------
+	//
+	// Incident W6-12H38-LIVENESS-14-IDLE: a detached Opus phase delivered its
+	// terminal reminder to the launch-time activeSessionId of an RLM child the
+	// daemon had since passivated. The daemon answered "Unknown active session"
+	// and the completed result sat unconsumed for ~28 minutes. These pin the
+	// repair: durable coordinates reach the retained child through the existing
+	// passive hydration seam and land in the ordinary waking follow-up lane,
+	// while every unproven target is a typed refusal rather than a guess.
+
+	type StableFollowUpInternals = {
+		sessions: Map<string, ActiveSessionState>;
+		closingSessions: Map<string, { promise: Promise<void>; reason: "shutdown" }>;
+		createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+		handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+	};
+
+	const stableFollowUpCommand = (
+		stableTarget: { sessionId?: string; sessionFile?: string },
+		overrides: Partial<Extract<DaemonCommand, { type: "follow_up" }>> = {},
+	): DaemonCommand => ({
+		id: "terminal-reminder",
+		type: "follow_up",
+		// The ephemeral address the caller was launched with. It no longer exists,
+		// which is precisely the incident condition.
+		activeSessionId: "stale-ephemeral-active-id",
+		message: "MATERIAL_DETACHED_TERMINAL event_id=evt-1",
+		queueKey: "w6-terminal:0123456789abcdef",
+		stableTarget,
+		...overrides,
+	});
+
+	async function withStableFollowUpFixture(
+		name: string,
+		run: (context: {
+			fixture: ReturnType<typeof makePersistedRlmDaemonFixture>;
+			internals: StableFollowUpInternals;
+			parentState: ActiveSessionState;
+			childSessionId: string;
+			client: DaemonSocketClient;
+		}) => Promise<void>,
+	): Promise<void> {
+		const tempDir = mkdtempSync(join(tmpdir(), `prime-agent-daemon-${name}-`));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as StableFollowUpInternals;
+			const parentState = await internals.createRuntime({
+				type: "create",
+				sessionPath: fixture.parentSessionFile,
+			});
+			const childInfo = await readSessionInfo(fixture.childSessionFile);
+			if (!childInfo) throw new Error("Missing child session info");
+			await run({
+				fixture,
+				internals,
+				parentState,
+				childSessionId: childInfo.id,
+				client: makeClient("client-1", parentState.activeSessionId),
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	}
+
+	function hydratedChildSession(fixture: ReturnType<typeof makePersistedRlmDaemonFixture>) {
+		const session = fixture.runtimeSessions.find((candidate) => candidate.sessionFile === fixture.childSessionFile);
+		if (!session) throw new Error("The retained child was never hydrated");
+		return session as typeof session & {
+			followUp: ReturnType<typeof vi.fn>;
+			restoreFollowUpMessage: ReturnType<typeof vi.fn>;
+			hasPendingFollowUpWithQueueKey: ReturnType<typeof vi.fn>;
+		};
+	}
+
+	it("keeps an active follow_up on the unchanged waking path", async () => {
+		await withStableFollowUpFixture("stable-follow-up-active-unchanged", async ({ internals, client }) => {
+			const state = makeState("active-1");
+			const followUp = vi.fn(async () => true);
+			const hasPendingFollowUpWithQueueKey = vi.fn(() => false);
+			state.runtime = {
+				...state.runtime,
+				session: { followUp, hasPendingFollowUpWithQueueKey },
+			} as unknown as ActiveSessionState["runtime"];
+			internals.sessions.set(state.activeSessionId, state);
+
+			const response = await internals.handleCommand(client, {
+				id: "active-follow-up",
+				type: "follow_up",
+				activeSessionId: "active-1",
+				message: "continue",
+				queueKey: "lane-key",
+			});
+
+			// Exactly the pre-repair call: same lane, same resumeIfIdle wake, and no
+			// duplicate marker on an admitted follow-up.
+			expect(followUp).toHaveBeenCalledWith("continue", undefined, {
+				queueKey: "lane-key",
+				agentMessageId: undefined,
+				resumeIfIdle: true,
+			});
+			expect(response).toMatchObject({ success: true, data: { queued: true } });
+			expect((response as { data: Record<string, unknown> }).data.duplicate).toBeUndefined();
+		});
+	});
+
+	it("keeps an active follow_up coalesce on the unchanged queued=false response", async () => {
+		await withStableFollowUpFixture("stable-follow-up-active-coalesce", async ({ internals, client }) => {
+			const state = makeState("active-2");
+			// The ordinary heartbeat outcome: this lane already holds a pending
+			// message under the same key, so admission reports queued=false.
+			const followUp = vi.fn(async () => false);
+			const hasPendingFollowUpWithQueueKey = vi.fn(() => true);
+			state.runtime = {
+				...state.runtime,
+				session: { followUp, hasPendingFollowUpWithQueueKey },
+			} as unknown as ActiveSessionState["runtime"];
+			internals.sessions.set(state.activeSessionId, state);
+
+			const response = await internals.handleCommand(client, {
+				id: "active-follow-up-coalesce",
+				type: "follow_up",
+				activeSessionId: "active-2",
+				message: "continue",
+				queueKey: "lane-key",
+			});
+
+			// Still the pre-repair call: same lane, same resumeIfIdle wake.
+			expect(followUp).toHaveBeenCalledWith("continue", undefined, {
+				queueKey: "lane-key",
+				agentMessageId: undefined,
+				resumeIfIdle: true,
+			});
+			// An active-only coalesce is a normal queued=false, not a lost-response
+			// retry, so the response keeps its exact old shape. The daemon does not
+			// even ask for the pending proof: stable-target duplicate metadata is
+			// never requested on this route.
+			expect(response).toMatchObject({ success: true, data: { queued: false } });
+			expect((response as { data: Record<string, unknown> }).data.duplicate).toBeUndefined();
+			expect(hasPendingFollowUpWithQueueKey).not.toHaveBeenCalled();
+		});
+	});
+
+	it("delivers a stable-id-only follow_up to a passivated retained child", async () => {
+		await withStableFollowUpFixture(
+			"stable-follow-up-id-only",
+			async ({ fixture, internals, childSessionId, client }) => {
+				expect(fixture.createRuntime).toHaveBeenCalledOnce();
+
+				const response = await internals.handleCommand(
+					client,
+					stableFollowUpCommand({ sessionId: childSessionId }),
+				);
+
+				// Hydrated through the existing passive seam, not launched as a new root.
+				expect(fixture.createRuntime).toHaveBeenCalledTimes(2);
+				const childState = [...internals.sessions.values()].find(
+					(state) => state.runtime.session.sessionFile === fixture.childSessionFile,
+				);
+				expect(childState?.runtime.metadata).toMatchObject({ kind: "subagent", rlmChildId: fixture.childId });
+				// Queued in the follow-up lane with the ordinary wake, never through the
+				// non-waking replay path and never through the agent-message lane.
+				expect(hydratedChildSession(fixture).followUp).toHaveBeenCalledWith(
+					"MATERIAL_DETACHED_TERMINAL event_id=evt-1",
+					undefined,
+					{
+						queueKey: "w6-terminal:0123456789abcdef",
+						agentMessageId: undefined,
+						resumeIfIdle: true,
+					},
+				);
+				expect(hydratedChildSession(fixture).restoreFollowUpMessage).not.toHaveBeenCalled();
+				expect(response).toMatchObject({ success: true, command: "follow_up", data: { queued: true } });
+			},
+		);
+	});
+
+	it("delivers a stable-file-only follow_up to the same retained child", async () => {
+		await withStableFollowUpFixture("stable-follow-up-file-only", async ({ fixture, internals, client }) => {
+			const response = await internals.handleCommand(
+				client,
+				stableFollowUpCommand({ sessionFile: fixture.childSessionFile }),
+			);
+
+			expect(hydratedChildSession(fixture).followUp).toHaveBeenCalledOnce();
+			expect(response).toMatchObject({ success: true, data: { queued: true } });
+		});
+	});
+
+	it("accepts matching stable coordinates and refuses a mismatched pair before admission", async () => {
+		await withStableFollowUpFixture(
+			"stable-follow-up-conjunctive",
+			async ({ fixture, internals, childSessionId, client }) => {
+				// Both coordinates describe the same target: admitted.
+				await internals.handleCommand(
+					client,
+					stableFollowUpCommand({ sessionId: childSessionId, sessionFile: fixture.childSessionFile }),
+				);
+				expect(hydratedChildSession(fixture).followUp).toHaveBeenCalledOnce();
+
+				// The id names the child, the file names the grandchild. Conjunction
+				// fails, so nothing is delivered to either and neither is guessed.
+				const mismatch = internals.handleCommand(
+					client,
+					stableFollowUpCommand({ sessionId: childSessionId, sessionFile: fixture.grandchildSessionFile }),
+				);
+				await expect(mismatch).rejects.toThrow(StableFollowUpTargetError);
+				await expect(mismatch).rejects.toMatchObject({ reason: "identity_mismatch" });
+				expect(hydratedChildSession(fixture).followUp).toHaveBeenCalledOnce();
+			},
+		);
+	});
+
+	it("types every unproven stable follow_up target instead of guessing one", async () => {
+		await withStableFollowUpFixture(
+			"stable-follow-up-typed-refusals",
+			async ({ fixture, internals, parentState, childSessionId, client }) => {
+				const cases: Array<[string, { sessionId?: string; sessionFile?: string }]> = [
+					// Neither coordinate supplied: no target at all.
+					["missing_identity", {}],
+					// Malformed coordinate: not a session path.
+					["invalid_target", { sessionFile: "not-a-session" }],
+					// Absent/deleted durable id.
+					["not_found", { sessionId: "01a00000-0000-0000-0000-000000000000" }],
+					// Absent session file under a real session directory.
+					["not_found", { sessionFile: join(fixture.childSessionDir, "absent.jsonl") }],
+					// The Board/root case: a root is never a terminal-reminder target.
+					["unsupported_target", { sessionFile: fixture.parentSessionFile }],
+					["unsupported_target", { sessionId: parentState.runtime.session.sessionId }],
+				];
+				for (const [reason, stableTarget] of cases) {
+					const refusal = internals.handleCommand(client, stableFollowUpCommand(stableTarget));
+					await expect(refusal, `${reason}: ${JSON.stringify(stableTarget)}`).rejects.toMatchObject({ reason });
+				}
+				// No refusal hydrated anything and no session was substituted.
+				expect(fixture.createRuntime).toHaveBeenCalledOnce();
+
+				// A closing target is unavailable, never redirected to its parent.
+				await internals.handleCommand(client, stableFollowUpCommand({ sessionId: childSessionId }));
+				const childState = [...internals.sessions.values()].find(
+					(state) => state.runtime.session.sessionFile === fixture.childSessionFile,
+				);
+				if (!childState) throw new Error("Missing hydrated child state");
+				internals.closingSessions.set(childState.activeSessionId, {
+					promise: Promise.resolve(),
+					reason: "shutdown",
+				});
+				await expect(
+					internals.handleCommand(client, stableFollowUpCommand({ sessionId: childSessionId })),
+				).rejects.toMatchObject({ reason: "target_unavailable" });
+			},
+		);
+	});
+
+	it("refuses an ambiguous stable target rather than picking a row", async () => {
+		await withStableFollowUpFixture("stable-follow-up-ambiguous", async ({ fixture, internals, client }) => {
+			// Two resident sessions advertise the same durable id: no tie-break exists.
+			for (const id of ["twin-one", "twin-two"]) {
+				const state = makeState(id);
+				const followUp = vi.fn(async () => true);
+				state.runtime = {
+					...state.runtime,
+					session: { sessionId: "duplicate-stable-id", sessionFile: fixture.childSessionFile, followUp },
+					metadata: { kind: "subagent", createdAt: 1 },
+				} as unknown as ActiveSessionState["runtime"];
+				internals.sessions.set(id, state);
+			}
+
+			await expect(
+				internals.handleCommand(client, stableFollowUpCommand({ sessionId: "duplicate-stable-id" })),
+			).rejects.toMatchObject({ reason: "ambiguous" });
+		});
+	});
+
+	it("serializes a stable-target refusal as machine-readable error info", () => {
+		const error = new StableFollowUpTargetError(
+			"identity_mismatch",
+			{ sessionId: "child-stable", sessionFile: "/sessions/other.jsonl" },
+			"coordinates disagree",
+		);
+		expect(serializeDaemonError(error)).toEqual({
+			code: "stable_follow_up_target",
+			reason: "identity_mismatch",
+			target: { sessionId: "child-stable", sessionFile: "/sessions/other.jsonl" },
+		});
+	});
+
+	it("coalesces a repeated terminal reminder into one queued follow-up", async () => {
+		await withStableFollowUpFixture(
+			"stable-follow-up-idempotent",
+			async ({ fixture, internals, childSessionId, client }) => {
+				const first = await internals.handleCommand(client, stableFollowUpCommand({ sessionId: childSessionId }));
+				expect(first).toMatchObject({ success: true, data: { queued: true } });
+
+				// The notifier lost the response and re-sent the identical request with
+				// the identical deterministic key: the action store coalesces it.
+				const child = hydratedChildSession(fixture);
+				child.followUp.mockResolvedValueOnce(false);
+				child.hasPendingFollowUpWithQueueKey.mockReturnValueOnce(true);
+				const second = await internals.handleCommand(client, stableFollowUpCommand({ sessionId: childSessionId }));
+
+				expect(child.hasPendingFollowUpWithQueueKey).toHaveBeenCalledWith("w6-terminal:0123456789abcdef");
+				// The stable route still proves duplicates — narrowed, not deleted — and
+				// proves only when it must: skipped on the admitted first request, asked
+				// exactly once on the coalesced repeat.
+				expect(child.hasPendingFollowUpWithQueueKey).toHaveBeenCalledTimes(1);
+				// One queue, one reminder, and an honest "already pending" answer rather
+				// than a bare queued=false the caller would have to interpret as loss.
+				expect(second).toMatchObject({ success: true, data: { queued: false, duplicate: true } });
+				expect(child.followUp).toHaveBeenCalledTimes(2);
+				expect(child.followUp.mock.calls.every((call) => call[2].queueKey === "w6-terminal:0123456789abcdef")).toBe(
+					true,
+				);
+
+				// A refusal that is NOT a coalesced duplicate stays an unproven outcome.
+				child.followUp.mockResolvedValueOnce(false);
+				child.hasPendingFollowUpWithQueueKey.mockReturnValueOnce(false);
+				const uncertain = await internals.handleCommand(
+					client,
+					stableFollowUpCommand({ sessionId: childSessionId }),
+				);
+				expect(uncertain).toMatchObject({ success: true, data: { queued: false } });
+				expect((uncertain as { data: Record<string, unknown> }).data.duplicate).toBeUndefined();
+			},
+		);
+	});
 });
 
 type CronAdmissionActivity = Partial<{
@@ -9082,6 +9410,11 @@ function makeRuntimeSession(
 		get sessionName() {
 			return sessionManager.getSessionName();
 		},
+		// Follow-up lane surface used by the terminal-reminder tests. The default
+		// admits; a test that needs coalescing overrides these per session.
+		followUp: vi.fn(async () => true),
+		restoreFollowUpMessage: vi.fn(async () => true),
+		hasPendingFollowUpWithQueueKey: vi.fn(() => false),
 		setSubagentRuntimeHost: vi.fn(),
 		getRlmChildRunStatus: vi.fn(() => "running"),
 		getRlmChildSnapshots: vi.fn(() => []),

@@ -278,6 +278,7 @@ export interface KernelShutdownOptions {
 export interface KernelClient {
 	readonly ownerSessionId: string | undefined;
 	readonly isRunning: boolean;
+	readonly isShutDown: boolean;
 	start(options?: KernelStartOptions): Promise<void>;
 	execute(code: string, opts?: ExecuteOptions): Promise<ExecuteResult>;
 	shutdown(opts?: KernelShutdownOptions): Promise<boolean>;

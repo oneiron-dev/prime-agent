@@ -16,6 +16,7 @@ import {
 	type DaemonResponse,
 	type DaemonSavedSessionInfo,
 	type DaemonServerCapability,
+	daemonHelloMeetsCompatibility,
 	getDaemonCommandCompatibilities,
 	isDaemonMutatingCommand,
 } from "./daemon-protocol.js";
@@ -319,13 +320,7 @@ export class DaemonClient {
 	}
 
 	private meetsCommandCompatibility(hello: DaemonHello, compatibility: DaemonCommandCompatibility): boolean {
-		return (
-			hello.protocol.version >= compatibility.minProtocol &&
-			(compatibility.minSchemaRevision === undefined ||
-				(hello.schemaRevision ?? 0) >= compatibility.minSchemaRevision) &&
-			(compatibility.capability === undefined ||
-				hello.serverCapabilities?.includes(compatibility.capability) === true)
-		);
+		return daemonHelloMeetsCompatibility(hello, compatibility);
 	}
 
 	async authenticateWorker(token: string, timeoutMs = 3000): Promise<void> {

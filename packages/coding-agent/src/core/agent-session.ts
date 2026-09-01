@@ -4129,6 +4129,22 @@ export class AgentSession {
 			// resolution cannot write harness state or re-subscribe handlers.
 			this._autoRefineReviewAbort?.abort();
 			this._refineAbortController?.abort();
+			// A disposed session must never stay compacting. Abort every compaction this
+			// session owns before releasing its provider resources: cleanup can only close
+			// sockets, and a provider that stalls after a tool result never has to answer.
+			// Each compaction clears its own controller in its finally, so isCompacting
+			// becomes false as soon as the aborted operation settles.
+			if (this.isCompacting) {
+				log.debug("disposing session aborts in-flight compaction", {
+					sessionId: this.sessionId,
+					manual: this._compactionAbortController !== undefined,
+					auto: this._autoCompactionAbortController !== undefined,
+					branchSummary: this._branchSummaryAbortController !== undefined,
+				});
+				this._compactionAbortController?.abort();
+				this._autoCompactionAbortController?.abort();
+				this._branchSummaryAbortController?.abort();
+			}
 			for (const timer of this._scheduledAutoRefineTimers) {
 				clearTimeout(timer);
 			}
@@ -6586,6 +6602,30 @@ export class AgentSession {
 		return visibleSessionActionProjection(this._actionStore.queuedActions("when_run_idle")).map(
 			queuedAgentMessagePreview,
 		);
+	}
+
+	/**
+	 * True when an unfinished follow-up already owns `queueKey`.
+	 *
+	 * Mirrors the `_coalescedFollowUpOwner` rule exactly. A caller that re-sends
+	 * one deterministic queue key after a lost response is coalesced and sees
+	 * `followUp` return false, which is indistinguishable on the wire from a
+	 * genuine refusal. This lets the daemon prove the original request is still
+	 * pending, so a duplicate is reported as duplicate-safe rather than as a
+	 * silent loss, without opening a second queue or a second reminder.
+	 */
+	hasPendingFollowUpWithQueueKey(queueKey: string): boolean {
+		return this._actionStore
+			.unfinishedActions()
+			.some(
+				(action) =>
+					action.queueKey === queueKey &&
+					action.delivery === "when_run_idle" &&
+					action.payload.kind === "turn" &&
+					(action.lifecycle.state === "queued" ||
+						action.lifecycle.state === "selected" ||
+						action.lifecycle.state === "preparing"),
+			);
 	}
 
 	getSessionActionRecoverySnapshot(): SessionActionRecoverySnapshot {

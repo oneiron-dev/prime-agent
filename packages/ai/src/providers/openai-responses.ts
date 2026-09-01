@@ -27,6 +27,7 @@ import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copi
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
 import {
 	hasAuthenticatedOpenAIResponsesWebSocketRuntime,
+	isOpenAIResponsesWebSocketSessionDisposedError,
 	processOpenAIResponsesWebSocket,
 	resolveOpenAIResponsesWebSocketUrl,
 } from "./openai-responses-websocket.js";
@@ -164,16 +165,20 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 					stream.end();
 					return;
 				} catch (error) {
+					// Disposal of the owning session is a cancellation, not a transport failure to retry:
+					// replaying it over SSE would resend a request the session no longer owns.
+					const sessionDisposed = isOpenAIResponsesWebSocketSessionDisposedError(error);
+					const willFallback = !websocketStarted && !sessionDisposed && !options?.signal?.aborted;
 					appendAssistantMessageDiagnostic(
 						output,
 						createAssistantMessageDiagnostic("provider_transport_failure", error, {
 							configuredTransport: transport,
-							fallbackTransport: websocketStarted ? undefined : "sse",
+							fallbackTransport: willFallback ? "sse" : undefined,
 							eventsEmitted: websocketStarted,
 							phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
 						}),
 					);
-					if (websocketStarted || options?.signal?.aborted) throw error;
+					if (!willFallback) throw error;
 				}
 			}
 
@@ -204,7 +209,8 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 				// partialJson is only a streaming scratch buffer; never persist it.
 				delete (block as { partialJson?: string }).partialJson;
 			}
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			output.stopReason =
+				options?.signal?.aborted || isOpenAIResponsesWebSocketSessionDisposedError(error) ? "aborted" : "error";
 			output.errorMessage = formatStreamFailureMessage(error);
 			recordStreamFailure(model, output, error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });

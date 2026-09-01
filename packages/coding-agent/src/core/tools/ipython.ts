@@ -387,6 +387,10 @@ export class IpythonKernelProvisioner {
 		if (signal?.aborted) {
 			return Promise.reject(createAbortError());
 		}
+		if (this.startedManager?.isShutDown) {
+			this.startedManager = undefined;
+			this.managerPromise = undefined;
+		}
 		let cleanupProgressListener: (() => void) | undefined;
 		if (onProgress && !this.startedManager) {
 			this.startupListeners.add(onProgress);
