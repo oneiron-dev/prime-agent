@@ -1,0 +1,26 @@
+/**
+ * Keep tests hermetic when Vitest is launched from a live Prime Agent worker.
+ * Individual tests can still opt into these roles with vi.stubEnv or child envs.
+ */
+const ambientPrimeRuntimeVariables = [
+	"PRIME_AGENT_CODING_AGENT_DIR",
+	"PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET",
+	"PRIME_AGENT_INTERNAL_DAEMON_WORKER",
+	"PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID",
+	"PRIME_AGENT_INTERNAL_DAEMON_WORKER_INSTANCE_ID",
+	"PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL",
+	"PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN",
+	"PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL",
+	"PRIME_AGENT_INTERNAL_SESSION_LEASES",
+	"PRIME_AGENT_INTERNAL_SESSION_LEASE_OWNER_ID",
+	"PRIME_AGENT_KERNEL_OWNER_PID",
+	"RLM_DEPTH",
+	"RLM_GLOBAL_HARNESS_STATE_DIR",
+	"RLM_HARNESS_STATE_DIR",
+	"RLM_MAX_DEPTH",
+	"RLM_SESSION_DIR",
+] as const;
+
+for (const variable of ambientPrimeRuntimeVariables) {
+	delete process.env[variable];
+}

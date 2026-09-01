@@ -715,7 +715,17 @@ describe("daemon worker supervisor monitoring", () => {
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			connectWorker,
 			subscribeWorker: vi.fn(async () => undefined),
-			refreshWorkerSummaries: vi.fn(async () => undefined),
+			refreshWorkerSummaries: vi.fn(
+				async (worker: { descriptor: { rootActiveSessionId: string }; summaries: Map<string, SessionSummary> }) => {
+					const activeSessionId = worker.descriptor.rootActiveSessionId;
+					worker.summaries.set(activeSessionId, {
+						id: activeSessionId,
+						activeSessionId,
+						sessionId: "session-committed-gate",
+						cwd: root,
+					} as SessionSummary);
+				},
+			),
 			log: vi.fn(),
 		}) as {
 			launchWorker(command: {
@@ -1940,6 +1950,7 @@ describe("daemon worker supervisor monitoring", () => {
 			worker.descriptor.lifecycle = "ready";
 			worker.client = {};
 			worker.summaries.set(root.activeSessionId, root as SessionSummary);
+			seedSupervisorRoster(supervisor, worker);
 		});
 		const persistWorker = vi.fn();
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
@@ -2127,7 +2138,7 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(stopWorker).toHaveBeenCalledWith(worker, true, true);
 	});
 
-	it("continues startup recovery after live workers time out during adoption", async () => {
+	it("keeps live workers ready when their catalogs time out during adoption", async () => {
 		type AdoptionWorker = {
 			descriptor: {
 				workerId: string;
@@ -2152,6 +2163,7 @@ describe("daemon worker supervisor monitoring", () => {
 		}));
 		const pendingRecovery = new Promise<void>(() => {});
 		const recoverWorker = vi.fn(() => pendingRecovery);
+		const scheduleSummaryRehydration = vi.fn();
 		const persistWorker = vi.fn();
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			assertRecoveryAllowed: vi.fn(async () => {}),
@@ -2163,6 +2175,7 @@ describe("daemon worker supervisor monitoring", () => {
 				}
 			}),
 			recoverWorker,
+			scheduleSummaryRehydration,
 			persistWorker,
 			broadcastHeartbeatsChanged: vi.fn(),
 			log: vi.fn(),
@@ -2174,8 +2187,9 @@ describe("daemon worker supervisor monitoring", () => {
 			Promise.all(workers.map((worker) => supervisor.adoptOrRecoverWorker(worker))),
 		).resolves.toBeDefined();
 
-		expect(recoverWorker).toHaveBeenCalledTimes(2);
-		expect(workers.map((worker) => worker.descriptor.lifecycle)).toEqual(["recovering", "recovering", "ready"]);
+		expect(recoverWorker).not.toHaveBeenCalled();
+		expect(scheduleSummaryRehydration).toHaveBeenCalledTimes(2);
+		expect(workers.map((worker) => worker.descriptor.lifecycle)).toEqual(["ready", "ready", "ready"]);
 		expect(persistWorker).toHaveBeenCalledTimes(3);
 	});
 
@@ -2459,7 +2473,7 @@ describe("daemon worker supervisor monitoring", () => {
 			request: vi.fn(async (command: { type: string }) => {
 				if (command.type === "get_state") return success(undefined, "get_state", root);
 				listAttempts++;
-				if (listAttempts === 1) throw new Error("Timed out waiting for daemon worker response to list");
+				if (listAttempts <= 2) throw new Error("Timed out waiting for daemon worker response to list");
 				return success(undefined, "list", { sessions: [root] });
 			}),
 			close: vi.fn(),
@@ -2510,6 +2524,7 @@ describe("daemon worker supervisor monitoring", () => {
 		seedSupervisorRoster(supervisor, worker);
 
 		await supervisor.adoptOrRecoverWorker(worker);
+		seedSupervisorRoster(supervisor, worker);
 
 		expect(worker.descriptor.lifecycle).toBe("ready");
 		expect(worker.summaries.get(root.activeSessionId!)).toBe(root);
@@ -2524,7 +2539,7 @@ describe("daemon worker supervisor monitoring", () => {
 
 		expect(worker.summariesStale).toBe(false);
 		expect(worker.summariesRefreshedAt).toEqual(expect.any(Number));
-		expect(listAttempts).toBe(2);
+		expect(listAttempts).toBe(3);
 	});
 
 	it("captures the live process identity before an adoption stop when the descriptor has none", async () => {

@@ -32,6 +32,7 @@ import {
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
+import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
 
 // --- reported scale --------------------------------------------------------
 
@@ -266,6 +267,7 @@ describe("daemon supervisor open/attach stress", () => {
 				worker.descriptor.ownerClientId = ownerClientId;
 				launched++;
 				supervisor.workers.set(worker.descriptor.workerId, worker);
+				seedSupervisorRoster(supervisor, worker);
 				return worker;
 			},
 		);

@@ -1,8 +1,8 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import {
 	chmodSync,
+	copyFileSync,
 	existsSync,
-	linkSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -126,7 +126,8 @@ async function createPaths(): Promise<TestPaths> {
 	const harness = await createHarness();
 	harnesses.push(harness);
 	const executablePath = join(harness.tempDir, APP_NAME);
-	linkSync(process.execPath, executablePath);
+	copyFileSync(process.execPath, executablePath);
+	chmodSync(executablePath, 0o755);
 	const socketTmpDir = `/tmp/eng-4603-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	mkdirSync(socketTmpDir, { recursive: true, mode: 0o700 });
 	socketTempDirs.add(socketTmpDir);
@@ -1046,32 +1047,56 @@ describe("ENG-4603 worker recovery convergence", () => {
 		successor.child.send({ type: "go" });
 		await waitForType(successor, "ready", 60_000);
 		const successorStartId = getProcessStartId(successor.child.pid!);
+		const currentClient = await connectEventually(paths.socketPath);
+		const currentSupervisorPid = (await currentClient.waitForHello()).supervisorPid;
+		if (!currentSupervisorPid) throw new Error("Current supervisor did not expose its pid");
+		const currentSupervisorStartId = getProcessStartId(currentSupervisorPid);
+		currentClient.close();
 		client.close();
-		const systemLsofPath = spawnSync("which", ["lsof"], { encoding: "utf8" }).stdout.trim();
-		if (!systemLsofPath) throw new Error("Could not locate lsof for the shutdown regression");
-		const lsofPath = join(paths.agentDir, "lsof");
-		writeFileSync(lsofPath, '#!/bin/sh\nexec "$ENG_4603_SYSTEM_LSOF" -nP -F pn -U -a -p "$ENG_4603_LSOF_PIDS"\n', {
-			mode: 0o700,
-		});
-		const lsofEnvironment = {
-			ENG_4603_LSOF_PIDS: `${predecessor.child.pid},${successor.child.pid},${workerPid}`,
-			ENG_4603_SYSTEM_LSOF: systemLsofPath,
+		// Keep the process scan inside the fixture. A host `ss`/`lsof` would also
+		// expose unrelated live Prime Agent daemons to the destructive CLI pass.
+		const ssPath = join(paths.agentDir, "ss");
+		writeFileSync(
+			ssPath,
+			`#!/bin/sh
+if [ ! -S "$ENG_4603_SCAN_SOCKET" ]; then
+  exit 0
+fi
+old_ifs="$IFS"
+IFS=,
+for pid in $ENG_4603_SCAN_PIDS; do
+  if kill -0 "$pid" 2>/dev/null; then
+    printf 'u_str LISTEN 0 511 %s 0 * 0 users:(("prime-agent",pid=%s,fd=3))\n' "$ENG_4603_SCAN_SOCKET" "$pid"
+  fi
+done
+IFS="$old_ifs"
+exit 0
+`,
+			{ mode: 0o700 },
+		);
+		const scanEnvironment = {
+			ENG_4603_SCAN_PIDS: [
+				...new Set([predecessor.child.pid, successor.child.pid, workerPid, currentSupervisorPid]),
+			].join(","),
+			ENG_4603_SCAN_SOCKET: paths.socketPath,
 			PATH: `${paths.agentDir}:${process.env.PATH ?? ""}`,
 		};
-		const listenersBeforeShutdown = spawnSync(lsofPath, [], {
+		const listenersBeforeShutdown = spawnSync(ssPath, ["-lxp"], {
 			encoding: "utf8",
-			env: { ...process.env, ...lsofEnvironment },
+			env: { ...process.env, ...scanEnvironment },
 		}).stdout;
-		expect(listenersBeforeShutdown).toContain(`p${predecessor.child.pid}`);
-		expect(listenersBeforeShutdown).toContain(`p${successor.child.pid}`);
+		expect(listenersBeforeShutdown).toContain(`pid=${predecessor.child.pid}`);
+		expect(listenersBeforeShutdown).toContain(`pid=${successor.child.pid}`);
+		expect(listenersBeforeShutdown).toContain(`pid=${currentSupervisorPid}`);
 
-		const shutdown = await runCli(paths, ["shutdown", "--force", "--json"], 60_000, lsofEnvironment);
-		expect(shutdown.code).toBe(0);
+		const shutdown = await runCli(paths, ["shutdown", "--force", "--json"], 60_000, scanEnvironment);
+		expect(shutdown.code, JSON.stringify(shutdown)).toBe(0);
 		const shutdownResult = JSON.parse(shutdown.stdout) as { stopped: unknown[]; failed: unknown[] };
 		const survivingIdentities = [
 			{ pid: predecessor.child.pid!, processStartId: predecessorStartId },
 			{ pid: successor.child.pid!, processStartId: successorStartId },
 			{ pid: workerPid, processStartId: workerStartId },
+			{ pid: currentSupervisorPid, processStartId: currentSupervisorStartId },
 		].filter((identity) => exactProcessIsAlive(identity.pid, identity.processStartId));
 		if (survivingIdentities.length > 0) {
 			expect(shutdownResult.failed).not.toHaveLength(0);
@@ -1080,10 +1105,12 @@ describe("ENG-4603 worker recovery convergence", () => {
 		await waitForExactProcessExit(predecessor.child.pid!, predecessorStartId);
 		await waitForExactProcessExit(successor.child.pid!, successorStartId);
 		await waitForExactProcessExit(workerPid, workerStartId);
+		await waitForExactProcessExit(currentSupervisorPid, currentSupervisorStartId);
 		await delay(11_000);
 		expect(exactProcessIsAlive(predecessor.child.pid!, predecessorStartId)).toBe(false);
 		expect(exactProcessIsAlive(successor.child.pid!, successorStartId)).toBe(false);
 		expect(exactProcessIsAlive(workerPid, workerStartId)).toBe(false);
+		expect(exactProcessIsAlive(currentSupervisorPid, currentSupervisorStartId)).toBe(false);
 
 		const contracts = [
 			{ args: ["status", "--json"], json: [] },
@@ -1091,14 +1118,14 @@ describe("ENG-4603 worker recovery convergence", () => {
 			{ args: ["shutdown", "--force", "--json"], json: { stopped: [], failed: [] } },
 		];
 		for (const contract of contracts) {
-			const result = await runCli(paths, contract.args, 60_000, lsofEnvironment);
+			const result = await runCli(paths, contract.args, 60_000, scanEnvironment);
 			if (result.code !== 0) {
 				throw new Error(`${contract.args.join(" ")} exited ${result.code}: ${result.stderr}`);
 			}
 			expect(JSON.parse(result.stdout)).toEqual(contract.json);
 		}
 		for (const args of [["status"], ["doctor", "--fix"], ["shutdown", "--force"]]) {
-			const result = await runCli(paths, args, 60_000, lsofEnvironment);
+			const result = await runCli(paths, args, 60_000, scanEnvironment);
 			expect(result.code).toBe(0);
 			expect(result.stdout).toBe("No background services found.\n");
 		}

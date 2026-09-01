@@ -214,7 +214,7 @@ export function getAgentsViewSectionRows(
 }
 
 export function classifyAgentsViewSession(summary: SessionSummary): AgentsViewActivitySection {
-	return classifySessionRosterStatus(summary);
+	return summary.rosterStatus ?? classifySessionRosterStatus(summary);
 }
 
 export function classifyUnifiedSession(
