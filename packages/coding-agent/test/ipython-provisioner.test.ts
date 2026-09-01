@@ -104,6 +104,42 @@ input.on("line", (line) => {
 	return python;
 }
 
+function writeRestartableFakeReplRuntime(restoreMarkerPath: string): string {
+	const python = join(tempDir, "python-restartable-repl");
+	writeFileSync(
+		python,
+		`#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+emit({ event: "ready", protocol: 3, python: process.version });
+const input = readline.createInterface({ input: process.stdin });
+input.on("line", (line) => {
+	const request = JSON.parse(line);
+	if (request.type === "restore") {
+		fs.appendFileSync(${JSON.stringify(restoreMarkerPath)}, "restore\\n");
+		emit({ event: "done", id: request.id, status: "ok", restored: [], failed: [] });
+		return;
+	}
+	if (request.type === "snapshot") {
+		emit({ event: "done", id: request.id, status: "ok", saved: [], skipped: [], bytes: 0 });
+		return;
+	}
+	if (request.type === "execute") {
+		emit({ event: "done", id: request.id, status: "ok" });
+		return;
+	}
+	if (request.type === "shutdown") {
+		emit({ event: "done", id: request.id, status: "ok" });
+		process.exit(0);
+	}
+});
+`,
+	);
+	chmodSync(python, 0o755);
+	return python;
+}
+
 describe("IpythonKernelProvisioner", () => {
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "prime-agent-provisioner-"));
@@ -150,6 +186,39 @@ describe("IpythonKernelProvisioner", () => {
 		await expect(provisioner.ensure()).rejects.toThrow(/Kernel exited before ready/);
 		await expect(provisioner.ensure()).rejects.toThrow(/Kernel exited before ready/);
 		expect(countRuns()).toBe(2);
+	});
+
+	it("reprovisions a cached kernel only after its child shuts down", async () => {
+		const restoreMarker = join(tempDir, "restore-attempts");
+		const snapshotDir = join(tempDir, "snapshots");
+		mkdirSync(snapshotDir, { recursive: true });
+		const python = writeRestartableFakeReplRuntime(restoreMarker);
+		const provisioner = new IpythonKernelProvisioner(tempDir, { python, snapshotDir });
+
+		try {
+			const first = await provisioner.ensure();
+			const firstInternals = first as unknown as {
+				child?: { kill: (signal: NodeJS.Signals) => boolean };
+				state: "idle" | "starting" | "running" | "shutdown";
+			};
+			expect(first.isRunning).toBe(true);
+			expect(first.isShutDown).toBe(false);
+
+			firstInternals.state = "idle";
+			expect(await provisioner.ensure()).toBe(first);
+			firstInternals.state = "running";
+
+			expect(firstInternals.child).toBeDefined();
+			firstInternals.child?.kill("SIGKILL");
+			await vi.waitFor(() => expect(first.isShutDown).toBe(true));
+
+			const second = await provisioner.ensure();
+			expect(second).not.toBe(first);
+			expect(second.isRunning).toBe(true);
+			expect(readFileSync(restoreMarker, "utf8").split("\n").filter(Boolean)).toHaveLength(2);
+		} finally {
+			await provisioner.dispose();
+		}
 	});
 
 	it("prewarm() swallows the failure and the next ensure() starts fresh", async () => {

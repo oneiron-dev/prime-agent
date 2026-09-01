@@ -240,6 +240,27 @@ describe("rlm spawn ledger", () => {
 			const reader = new RlmSpawnLedger(root, sessionsDir, undefined, (message) => logged.push(message));
 			await expect(reader.edges()).resolves.toEqual([expect.objectContaining({ childId: "sub-11111111" })]);
 			expect(logged.some((message) => message.includes("unknown op"))).toBe(true);
+
+			// An unchanged ledger reuses its parsed replay rather than logging the
+			// skipped record again.
+			logged.length = 0;
+			await expect(reader.edges()).resolves.toEqual([expect.objectContaining({ childId: "sub-11111111" })]);
+			expect(logged).toEqual([]);
+
+			// Appends from another instance invalidate by file identity, while an
+			// append through this instance explicitly invalidates its own cache.
+			await ledger.appendRename({
+				childId: "sub-11111111",
+				child: join(root, "a.jsonl"),
+				name: "renamed",
+			});
+			await expect(reader.edges()).resolves.toEqual([expect.objectContaining({ name: "renamed" })]);
+			expect(logged.some((message) => message.includes("unknown op"))).toBe(true);
+			logged.length = 0;
+			await reader.appendDelete({ childId: "sub-11111111", child: join(root, "a.jsonl"), reason: "user" });
+			await expect(reader.edges()).resolves.toEqual([]);
+			expect(logged.some((message) => message.includes("unknown op"))).toBe(true);
+
 			// A future major version still fails loudly.
 			writeFileSync(
 				ledger.ledgerPath,

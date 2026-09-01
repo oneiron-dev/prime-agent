@@ -434,6 +434,107 @@ describe("AgentsViewMode", () => {
 		runView.mockRestore();
 	});
 
+	it("attaches to the active session returned by a structured create conflict", async () => {
+		const stale = summary({ id: "stale-active", activeSessionId: "stale-active" });
+		const replacementActiveSessionId = "replacement-active";
+		const runView = vi
+			.spyOn(AgentsViewMode.prototype, "run")
+			.mockResolvedValueOnce({ type: "open", summary: stale })
+			.mockResolvedValueOnce({ type: "exit" });
+		vi.mocked(DaemonAgentConnection.attach).mockRejectedValueOnce(
+			new Error(`Unknown active session: ${stale.activeSessionId}`),
+		);
+		modeMocks.clientRequest.mockResolvedValueOnce({
+			type: "response",
+			command: "create",
+			success: false,
+			error: `Session is already active in ${replacementActiveSessionId}: ${stale.sessionFile}`,
+			errorInfo: {
+				code: "session_already_active",
+				sessionPath: stale.sessionFile,
+				activeSessionId: replacementActiveSessionId,
+			},
+		});
+		modeMocks.interactiveRun.mockResolvedValueOnce({
+			type: "agents_view",
+			source: {
+				activeSessionId: replacementActiveSessionId,
+				sessionId: stale.sessionId,
+				cwd: stale.cwd,
+			},
+		} as never);
+
+		await runAgentsViewMode({
+			socketPath: "/tmp/fake-daemon.sock",
+			config: { cwd: "/tmp" } as never,
+			uiServices: createUiServices(),
+		});
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledOnce();
+		expect(modeMocks.clientRequest).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "create", sessionPath: stale.sessionFile }),
+		);
+		expect(DaemonAgentConnection.attach).toHaveBeenCalledTimes(2);
+		expect(DaemonAgentConnection.attach).toHaveBeenNthCalledWith(
+			1,
+			expect.anything(),
+			stale.activeSessionId,
+			expect.anything(),
+		);
+		expect(DaemonAgentConnection.attach).toHaveBeenNthCalledWith(
+			2,
+			expect.anything(),
+			replacementActiveSessionId,
+			expect.anything(),
+		);
+		runView.mockRestore();
+	});
+
+	it("surfaces a failed redirect attach without retrying create", async () => {
+		const stale = summary({ id: "stale-active", activeSessionId: "stale-active" });
+		const replacementActiveSessionId = "replacement-active";
+		const runView = vi
+			.spyOn(AgentsViewMode.prototype, "run")
+			.mockResolvedValueOnce({ type: "open", summary: stale })
+			.mockImplementationOnce(function (this: AgentsViewMode) {
+				const state = (this as unknown as { persistentState: AgentsViewPersistentState }).persistentState;
+				expect(state.statusMessage).toBe(
+					`Failed to open agent: Unknown active session: ${replacementActiveSessionId}`,
+				);
+				return Promise.resolve({ type: "exit" });
+			});
+		vi.mocked(DaemonAgentConnection.attach)
+			.mockRejectedValueOnce(new Error(`Unknown active session: ${stale.activeSessionId}`))
+			.mockRejectedValueOnce(new Error(`Unknown active session: ${replacementActiveSessionId}`));
+		modeMocks.clientRequest.mockResolvedValueOnce({
+			type: "response",
+			command: "create",
+			success: false,
+			error: `Session is already active in ${replacementActiveSessionId}: ${stale.sessionFile}`,
+			errorInfo: {
+				code: "session_already_active",
+				sessionPath: stale.sessionFile,
+				activeSessionId: replacementActiveSessionId,
+			},
+		});
+
+		await runAgentsViewMode({
+			socketPath: "/tmp/fake-daemon.sock",
+			config: { cwd: "/tmp" } as never,
+			uiServices: createUiServices(),
+		});
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledOnce();
+		expect(DaemonAgentConnection.attach).toHaveBeenCalledTimes(2);
+		expect(DaemonAgentConnection.attach).toHaveBeenLastCalledWith(
+			expect.anything(),
+			replacementActiveSessionId,
+			expect.anything(),
+		);
+		expect(modeMocks.interactiveRun).not.toHaveBeenCalled();
+		runView.mockRestore();
+	});
+
 	it("invalidates the persisted scope root after popping a scope frame", async () => {
 		const parent = summary({ id: "parent", activeSessionId: "parent", sessionId: "parent" });
 		const child = summary({ id: "child", activeSessionId: "child", sessionId: "child" });

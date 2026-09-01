@@ -7525,7 +7525,9 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this._compactionAbortController = undefined;
-			this._reconnectToAgent();
+			if (!this._disposed) {
+				this._reconnectToAgent();
+			}
 			if (this._compactionOperation === compactionOperation) {
 				this._compactionOperation = undefined;
 			}
