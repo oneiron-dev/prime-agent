@@ -83,20 +83,21 @@ function spawnSupervisor(
 	extraEnv: NodeJS.ProcessEnv = {},
 ): ChildProcess {
 	daemonSockets.add(socketPath);
+	const inheritedEnv = { ...process.env };
+	for (const name of Object.keys(inheritedEnv)) {
+		if (name.startsWith("PRIME_AGENT_INTERNAL_")) delete inheritedEnv[name];
+	}
+	const env = {
+		...inheritedEnv,
+		...extraEnv,
+		[ENV_AGENT_DIR]: agentDir,
+		PI_OFFLINE: "1",
+		TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+	};
 	const child = spawn(
 		process.execPath,
 		[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", socketPath, "--offline", ...extraArgs],
-		{
-			cwd,
-			env: {
-				...process.env,
-				...extraEnv,
-				[ENV_AGENT_DIR]: agentDir,
-				PI_OFFLINE: "1",
-				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
-			},
-			stdio: ["ignore", "pipe", "pipe"],
-		},
+		{ cwd, env, stdio: ["ignore", "pipe", "pipe"] },
 	);
 	children.add(child);
 	const diagnostics = { stdout: "", stderr: "" };

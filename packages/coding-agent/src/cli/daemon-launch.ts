@@ -6,8 +6,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../config.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
@@ -367,20 +367,30 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	delete env[SESSION_LEASES_ENABLED_ENV];
 	delete env[SESSION_LEASE_OWNER_ID_ENV];
 
-	const logOffset = currentDaemonLogSize(socketPath);
-	const child = spawn(
-		process.execPath,
-		[...process.execArgv, entrypoint, "--mode", "daemon", "--daemon-socket", socketPath],
-		{
-			cwd: spawnCwd ?? process.cwd(),
-			detached: true,
-			env,
-			// A pipe would tie the daemon's stderr to this short-lived CLI
-			// (EPIPE once it exits); crash details come from the daemon log,
-			// which the supervisor writes to before rethrowing startup errors.
-			stdio: "ignore",
-		},
-	);
+	const daemonLogPath = getDaemonLogPath(socketPath);
+	const crashLogPath = `${daemonLogPath}.crash`;
+	const logOffset = currentLogSize(daemonLogPath);
+	const crashLogOffset = currentLogSize(crashLogPath);
+	mkdirSync(dirname(crashLogPath), { recursive: true });
+	const daemonStderr = openSync(crashLogPath, "a", 0o600);
+	const child = (() => {
+		try {
+			return spawn(
+				process.execPath,
+				[...process.execArgv, entrypoint, "--mode", "daemon", "--daemon-socket", socketPath],
+				{
+					cwd: spawnCwd ?? process.cwd(),
+					detached: true,
+					env,
+					// A pipe would die with this short-lived CLI. A direct append fd survives
+					// detachment and captures V8/native fatal diagnostics that bypass JS handlers.
+					stdio: ["ignore", "ignore", daemonStderr],
+				},
+			);
+		} finally {
+			closeSync(daemonStderr);
+		}
+	})();
 	let childFailure:
 		| { type: "error"; error: Error }
 		| { type: "exit"; code: number | null; signal: NodeJS.Signals | null }
@@ -397,7 +407,7 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 		if (!childFailure) {
 			return;
 		}
-		const logTail = readDaemonLogTail(socketPath, logOffset);
+		const logTail = readDaemonLogTail(socketPath, logOffset, crashLogOffset);
 		if (childFailure.type === "error") {
 			throw new Error(`Failed to spawn Prime Agent daemon: ${childFailure.error.message}.${logTail}`);
 		}
@@ -425,34 +435,45 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 
 	throwIfFailed();
 	throw new Error(
-		`Timed out waiting for daemon to start on ${socketPath}.${readDaemonLogTail(socketPath, logOffset)}`,
+		`Timed out waiting for daemon to start on ${socketPath}.${readDaemonLogTail(socketPath, logOffset, crashLogOffset)}`,
 	);
 }
 
-function currentDaemonLogSize(socketPath: string): number {
+function currentLogSize(path: string): number {
 	try {
-		return statSync(getDaemonLogPath(socketPath)).size;
+		return statSync(path).size;
 	} catch {
 		return 0;
 	}
 }
 
-/** Reads only log content written after `offset`, so stale content from earlier daemon runs is not misattributed to this startup attempt. */
-function readDaemonLogTail(socketPath: string, offset: number): string {
-	const logPath = getDaemonLogPath(socketPath);
-	let tail = "";
+function readLogTail(path: string, offset: number): string {
 	try {
-		const content = readFileSync(logPath);
+		const content = readFileSync(path);
 		// A rotation may have shrunk the file below the pre-spawn byte offset.
-		tail = content
+		return content
 			.subarray(content.length < offset ? 0 : offset)
 			.subarray(-DAEMON_STARTUP_LOG_TAIL_BYTES)
 			.toString("utf8")
 			.trim();
 	} catch {
-		// Missing log means the daemon crashed before logging was set up.
+		return "";
 	}
-	return tail ? ` Recent daemon log (${logPath}):\n${tail}` : ` The daemon wrote nothing to its log (${logPath}).`;
+}
+
+/** Reads only diagnostics written by this startup attempt, including stderr that bypassed JS logging. */
+function readDaemonLogTail(socketPath: string, logOffset: number, crashLogOffset: number): string {
+	const logPath = getDaemonLogPath(socketPath);
+	const crashLogPath = `${logPath}.crash`;
+	const logTail = readLogTail(logPath, logOffset);
+	const crashTail = readLogTail(crashLogPath, crashLogOffset);
+	const diagnostics = [
+		logTail && `daemon log (${logPath}):\n${logTail}`,
+		crashTail && `daemon stderr (${crashLogPath}):\n${crashTail}`,
+	].filter(Boolean);
+	return diagnostics.length > 0
+		? ` Recent ${diagnostics.join("\n")}`
+		: ` The daemon wrote nothing to its log (${logPath}).`;
 }
 
 const ensurePromises = new Map<string, Promise<void>>();

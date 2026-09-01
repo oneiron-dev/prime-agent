@@ -1,93 +1,97 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { Agent } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, type AssistantMessageEvent, EventStream } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentSession } from "../src/core/agent-session.js";
-import { AuthStorage } from "../src/core/auth-storage.js";
-import { ModelRegistry } from "../src/core/model-registry.js";
-import { SessionManager } from "../src/core/session-manager.js";
-import { SettingsManager } from "../src/core/settings-manager.js";
-import { createTestResourceLoader } from "./utilities.js";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { CompactionResult } from "../src/core/compaction/compaction.js";
+import { createHarness, type Harness } from "./suite/harness.js";
 
-class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
+type DisposalInternals = {
+	_disposed: boolean;
+	_disposing: boolean;
+	_agentEventQueue: Promise<void>;
+	_ipythonKernelProvisioner?: { dispose(): Promise<void> };
+	_handleAgentEvent(event: { type: string; message?: unknown }): void;
+};
+
+function deferred<T>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>((res) => {
+		resolve = res;
+	});
+	return { promise, resolve };
 }
 
+const COMPACTION_RESULT: CompactionResult = {
+	summary: "compacted summary",
+	firstKeptEntryId: "entry-1",
+	tokensBefore: 100,
+};
+
 describe("AgentSession disposal during compaction", () => {
-	let testDir: string;
-	let session: AgentSession;
+	const harnesses: Harness[] = [];
 
-	beforeEach(async () => {
-		testDir = join(tmpdir(), `agent-session-disposal-compact-${Date.now()}`);
-		if (!existsSync(testDir)) {
-			mkdirSync(testDir, { recursive: true });
-		}
-
-		const sessionManager = SessionManager.create(testDir);
-		const settingsManager = SettingsManager.create(testDir, testDir);
-		const authStorage = AuthStorage.create(join(testDir, "auth.json"));
-		const modelRegistry = ModelRegistry.create(authStorage, testDir);
-
-		const agent = new Agent({
-			streamFn: vi.fn(() => new MockAssistantStream()),
-		});
-
-		session = new AgentSession({
-			agent,
-			sessionManager,
-			settingsManager,
-			cwd: testDir,
-			modelRegistry,
-			resourceLoader: createTestResourceLoader(),
-		});
-	});
-
-	afterEach(async () => {
-		if (session) {
-			session.dispose();
-		}
-		if (existsSync(testDir)) {
-			rmSync(testDir, { recursive: true, force: true });
+	afterEach(() => {
+		vi.restoreAllMocks();
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
 		}
 	});
+
+	/** Session with a real model/auth whose compaction blocks on a test-controlled gate. */
+	async function createSessionWithGatedCompaction() {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const gate = deferred<CompactionResult>();
+		const performSpy = vi.spyOn(harness.session as any, "_performCompaction").mockImplementation(() => gate.promise);
+		const reconnectSpy = vi.spyOn(harness.session as any, "_reconnectToAgent");
+		return { harness, gate, performSpy, reconnectSpy };
+	}
 
 	it("does not reconnect to agent after disposal during compaction", async () => {
-		// Mock _reconnectToAgent to track calls
-		const reconnectSpy = vi.spyOn(session as any, "_reconnectToAgent");
+		const { harness, gate, performSpy, reconnectSpy } = await createSessionWithGatedCompaction();
 
-		// Mock _performCompaction to simulate async work
-		vi.spyOn(session as any, "_performCompaction").mockImplementation(async () => {
-			// Simulate compaction work that takes time
-			await new Promise((resolve) => setTimeout(resolve, 50));
-			return { conversationTurnsRemoved: 5 };
-		});
+		const compactPromise = harness.session.compact("test instructions");
+		await vi.waitFor(() => expect(performSpy).toHaveBeenCalled());
 
-		// Start a compaction
-		const compactPromise = session.compact("test instructions");
+		harness.session.dispose();
+		gate.resolve(COMPACTION_RESULT);
+		await compactPromise.catch(() => undefined);
 
-		// Dispose while compaction is in progress
-		session.dispose();
-
-		// Wait for compaction to complete (should be cancelled or throw)
-		await compactPromise.catch(() => {});
-
-		// After disposal completes, _reconnectToAgent should not have been called
-		// because the finally block guards it with if (!this._disposed)
 		expect(reconnectSpy).not.toHaveBeenCalled();
 	});
 
-	it("does not process events after disposal when compaction completes", async () => {
+	it("does not reconnect when compaction settles while disposeAsync is draining", async () => {
+		const { harness, gate, performSpy, reconnectSpy } = await createSessionWithGatedCompaction();
+		const session = harness.session;
+		const internals = session as unknown as DisposalInternals;
+
+		// Hold disposeAsync in the window where _disposing is set but _disposed is
+		// not yet: the kernel provisioner flush is the delayed async step.
+		const kernelGate = deferred<void>();
+		internals._ipythonKernelProvisioner = { dispose: vi.fn(() => kernelGate.promise) };
+
+		const compactPromise = session.compact("test instructions");
+		await vi.waitFor(() => expect(performSpy).toHaveBeenCalled());
+
+		const disposePromise = session.disposeAsync();
+		await vi.waitFor(() => expect(internals._disposing).toBe(true));
+		expect(internals._disposed).toBe(false);
+
+		// The compaction settles inside the disposal window; its finally must not
+		// resubscribe the session to agent events.
+		gate.resolve(COMPACTION_RESULT);
+		await compactPromise.catch(() => undefined);
+		expect(reconnectSpy).not.toHaveBeenCalled();
+
+		kernelGate.resolve();
+		await disposePromise;
+		expect(internals._disposed).toBe(true);
+		expect(reconnectSpy).not.toHaveBeenCalled();
+	});
+
+	it("does not deliver agent events to subscribers after disposal when compaction completes", async () => {
+		const { harness, gate, performSpy } = await createSessionWithGatedCompaction();
+		const session = harness.session;
+		const internals = session as unknown as DisposalInternals;
+
 		const eventHandler = vi.fn();
 		session.subscribe((event) => {
 			if (event.type === "message_end") {
@@ -95,23 +99,17 @@ describe("AgentSession disposal during compaction", () => {
 			}
 		});
 
-		// Mock a successful compaction that completes after disposal
-		vi.spyOn(session as any, "_performCompaction").mockImplementation(async () => {
-			// Simulate async compaction work
-			await new Promise((resolve) => setTimeout(resolve, 50));
-			return { conversationTurnsRemoved: 5 };
-		});
-
 		const compactPromise = session.compact("test");
+		await vi.waitFor(() => expect(performSpy).toHaveBeenCalled());
 
-		// Dispose immediately
 		session.dispose();
+		gate.resolve(COMPACTION_RESULT);
+		await compactPromise.catch(() => undefined);
 
-		// Let compaction complete
-		await compactPromise.catch(() => {});
-
-		// Verify the session was disposed and won't process new events
-		// (The internal _disposed flag should prevent reconnection)
-		expect((session as any)._disposed).toBe(true);
+		// Even an agent event driven through the real dispatch path after disposal
+		// must not reach subscribers.
+		internals._handleAgentEvent({ type: "message_end", message: fauxAssistantMessage("late") });
+		await internals._agentEventQueue.catch(() => undefined);
+		expect(eventHandler).not.toHaveBeenCalled();
 	});
 });

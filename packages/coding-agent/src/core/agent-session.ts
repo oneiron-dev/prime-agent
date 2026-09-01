@@ -7533,7 +7533,9 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this._compactionAbortController = undefined;
-			if (!this._disposed) {
+			// disposeAsync() sets _disposing before _disposed while it drains the
+			// kernel; a compaction settling in that window must not resubscribe.
+			if (!this._disposed && !this._disposing) {
 				this._reconnectToAgent();
 			}
 			if (this._compactionOperation === compactionOperation) {

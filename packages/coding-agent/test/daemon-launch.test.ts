@@ -300,19 +300,19 @@ describe("ensureInteractiveDaemonRunning", () => {
 		}
 	});
 
-	it("names the missing daemon log when the daemon crashes before logging", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "pa-launch-startup-silent-"));
+	it("captures detached daemon stderr before a fatal startup exit", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-launch-startup-stderr-"));
 		const entrypoint = join(dir, "crash.mjs");
 		const socketPath = join(dir, "d.sock");
 		const originalAgentDir = process.env[ENV_AGENT_DIR];
 		process.env[ENV_AGENT_DIR] = join(dir, "agent");
-		writeFileSync(entrypoint, "process.exit(7);");
+		writeFileSync(entrypoint, 'console.error("native-fatal-marker"); process.exit(7);');
 		const originalEntrypoint = process.argv[1]!;
 		process.argv[1] = entrypoint;
 
 		try {
 			await expect(ensureInteractiveDaemonRunning(socketPath)).rejects.toThrow(
-				/exited during startup \(code 7\)\. The daemon wrote nothing to its log/,
+				/exited during startup \(code 7\)\.[\s\S]*native-fatal-marker/,
 			);
 		} finally {
 			process.argv[1] = originalEntrypoint;

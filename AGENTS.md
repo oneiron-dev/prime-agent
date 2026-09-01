@@ -19,6 +19,7 @@
 - Do not preserve backward compatibility unless the user explicitly asks for it
 - Never hardcode key checks with, eg. `matchesKey(keyData, "ctrl+x")`. All keybindings must be configurable. Add default to matching object (`DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS`)
 - NEVER modify `packages/ai/src/models.generated.ts` directly. Update `packages/ai/scripts/generate-models.ts` instead.
+- `npm run build`/`prepublishOnly` do NOT regenerate `models.generated.ts`; it is a reviewed, committed artifact. Regenerate only explicitly with `npm run generate-models` (in `packages/ai`) and review the diff before committing.
 
 ## Commands
 
