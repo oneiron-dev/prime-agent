@@ -1020,6 +1020,8 @@ export class InteractiveMode {
 	private signalCleanupHandlers: Array<() => void> = [];
 
 	private autoCompactionLoader: Loader | undefined = undefined;
+	/** Base loader text of the active compaction, so progress can be appended live. */
+	private compactionLoaderLabel: { label: string; cancelHint: string } | undefined = undefined;
 	private refineLoader: Loader | undefined = undefined;
 
 	private retryLoader: Loader | undefined = undefined;
@@ -3401,17 +3403,27 @@ export class InteractiveMode {
 		const focus = customInstructions ? ` (focus: ${truncateToWidth(customInstructions, 60, "…")})` : "";
 		const label =
 			reason === "manual"
-				? `Compacting context${focus}... ${cancelHint}`
+				? `Compacting context${focus}...`
 				: reason === "requested"
-					? `Agent requested compaction, compacting context${focus}... ${cancelHint}`
-					: `${reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting... ${cancelHint}`;
+					? `Agent requested compaction, compacting context${focus}...`
+					: `${reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting...`;
+		this.compactionLoaderLabel = { label, cancelHint };
 		this.autoCompactionLoader = new Loader(
 			this.ui,
 			(spinner) => theme.fg("muted", spinner),
 			(text) => theme.fg("muted", text),
-			label,
+			`${label} ${cancelHint}`,
 		);
 		this.statusContainer.addChild(this.autoCompactionLoader);
+		this.ui.requestRender();
+	}
+
+	/** Deep compaction reports chunk/merge progress; show it on the live loader. */
+	private updateCompactionLoaderProgress(progress: { phase: string; completed: number; total: number }): void {
+		if (!this.autoCompactionLoader || !this.compactionLoaderLabel) return;
+		const { label, cancelHint } = this.compactionLoaderLabel;
+		const counter = progress.total > 0 ? ` ${progress.phase} ${progress.completed}/${progress.total}` : "";
+		this.autoCompactionLoader.setMessage(`${label}${counter} ${cancelHint}`);
 		this.ui.requestRender();
 	}
 
@@ -5666,10 +5678,16 @@ export class InteractiveMode {
 				break;
 			}
 
+			case "compaction_progress": {
+				this.updateCompactionLoaderProgress(event);
+				break;
+			}
+
 			case "compaction_end": {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
+				this.compactionLoaderLabel = undefined;
 				if (this.autoCompactionLoader) {
 					this.autoCompactionLoader.stop();
 					this.autoCompactionLoader = undefined;

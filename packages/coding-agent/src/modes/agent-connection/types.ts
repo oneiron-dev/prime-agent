@@ -4,7 +4,7 @@ import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from
 import type { AuthSourceToken } from "../../core/auth-storage.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
-import type { CompactionResult } from "../../core/compaction/index.js";
+import type { CompactionResult, DeepCompactionProgress } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
 import type {
 	AgentCronJob,
@@ -577,6 +577,8 @@ export type AgentConnectionSessionEvent =
 			reason: "manual" | "threshold" | "overflow" | "requested";
 			customInstructions?: string;
 	  }
+	/** Deep compaction only: chunk/merge progress between start and end. */
+	| ({ type: "compaction_progress" } & DeepCompactionProgress)
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| { type: "service_tier_changed"; serviceTier: ServiceTier }

@@ -106,6 +106,8 @@ import {
 	compactMapReduce,
 	compactRemote,
 	compactRemoteV2,
+	DeepCompactionCache,
+	type DeepCompactionProgress,
 	estimateContextTokens,
 	extractRemoteCompactionDigest,
 	generateBranchSummary,
@@ -347,6 +349,8 @@ export type AgentSessionEvent =
 			reason: CompactionReason;
 			customInstructions?: string;
 	  }
+	/** Deep compaction only: chunk/merge progress between start and end. */
+	| ({ type: "compaction_progress" } & DeepCompactionProgress)
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| { type: "service_tier_changed"; serviceTier: ServiceTier }
@@ -7588,7 +7592,13 @@ export class AgentSession {
 		const pathEntries = this.sessionManager.getBranch();
 		const settings = this.settingsManager.getCompactionSettings();
 
-		const preparation = prepareCompaction(pathEntries, settings, deep === true ? { restartFromRoot: true } : {});
+		// Deep compaction reuses the newest readable checkpoint and re-summarizes only
+		// what came after it; it falls back to the branch root when none is usable.
+		const preparation = prepareCompaction(
+			pathEntries,
+			settings,
+			deep === true ? { seed: "newest-readable-summary" } : {},
+		);
 		if (!preparation) {
 			const lastEntry = pathEntries[pathEntries.length - 1];
 			if (lastEntry?.type === "compaction") {
@@ -7627,6 +7637,10 @@ export class AgentSession {
 		}
 
 		let compactionResult: CompactionResult;
+		// Set only for deep compaction: the resumable partial cache is dropped after the
+		// summary is committed to the session, never merely after it is generated.
+		let deepCache: DeepCompactionCache | undefined;
+		let deepRunId: string | undefined;
 		if (extensionCompaction) {
 			compactionResult = {
 				...extensionCompaction,
@@ -7634,23 +7648,26 @@ export class AgentSession {
 				remoteCompaction: undefined,
 			};
 		} else if (deep) {
-			// Deep compaction is explicitly local map-reduce over the whole history:
-			// remote replay/migration logic does not apply.
-			compactionResult = await compactMapReduce(
-				preparation,
-				model,
-				apiKey,
+			// Deep compaction is explicitly local map-reduce: remote replay/migration
+			// logic does not apply.
+			deepCache = DeepCompactionCache.forSessionArtifacts(this.sessionManager.getSessionArtifactDir());
+			const deepResult = await compactMapReduce(preparation, model, apiKey, {
 				headers,
 				customInstructions,
 				signal,
-				this.thinkingLevel,
-			);
+				thinkingLevel: this.thinkingLevel,
+				sessionId: this.sessionManager.getSessionId(),
+				cache: deepCache,
+				onProgress: (progress) => this._emit({ type: "compaction_progress", ...progress }),
+			});
+			deepRunId = deepResult.details?.mapReduce?.runId;
+			compactionResult = deepResult;
 		} else if (shouldUseRemoteCompactionV2(model, compactionMode)) {
 			try {
 				const remotePreparation =
 					preparation.previousRemoteCompaction &&
 					!canReplayRemoteCompaction(preparation.previousRemoteCompaction, model)
-						? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+						? prepareCompaction(pathEntries, settings, { seed: "root" })
 						: preparation;
 				if (!remotePreparation)
 					throw new CompactionSkippedError("Session is too short to rebuild for remote compaction");
@@ -7670,7 +7687,7 @@ export class AgentSession {
 				const localPreparation =
 					preparation.previousRemoteCompaction &&
 					!extractRemoteCompactionDigest(preparation.previousRemoteCompaction)
-						? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+						? prepareCompaction(pathEntries, settings, { seed: "root" })
 						: preparation;
 				if (!localPreparation)
 					throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
@@ -7714,7 +7731,7 @@ export class AgentSession {
 						model.contextWindow,
 					));
 			if (forceLocal) {
-				const localPreparation = prepareCompaction(pathEntries, settings, { restartFromRoot: true });
+				const localPreparation = prepareCompaction(pathEntries, settings, { seed: "root" });
 				if (!localPreparation)
 					throw new CompactionSkippedError(
 						"Session is too short to migrate ineffective remote compaction locally",
@@ -7737,7 +7754,7 @@ export class AgentSession {
 					const remotePreparation =
 						preparation.previousRemoteCompaction &&
 						!canReplayRemoteCompaction(preparation.previousRemoteCompaction, model)
-							? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+							? prepareCompaction(pathEntries, settings, { seed: "root" })
 							: preparation;
 					if (!remotePreparation) {
 						throw new CompactionSkippedError("Session is too short to rebuild for remote compaction");
@@ -7758,7 +7775,7 @@ export class AgentSession {
 					const localPreparation =
 						preparation.previousRemoteCompaction &&
 						!extractRemoteCompactionDigest(preparation.previousRemoteCompaction)
-							? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+							? prepareCompaction(pathEntries, settings, { seed: "root" })
 							: preparation;
 					if (!localPreparation) {
 						throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
@@ -7780,7 +7797,7 @@ export class AgentSession {
 			// readable digest justifies re-summarizing from the session root.
 			const localPreparation =
 				preparation.previousRemoteCompaction && !extractRemoteCompactionDigest(preparation.previousRemoteCompaction)
-					? prepareCompaction(pathEntries, settings, { restartFromRoot: true })
+					? prepareCompaction(pathEntries, settings, { seed: "root" })
 					: preparation;
 			if (!localPreparation) {
 				throw new CompactionSkippedError("Session is too short to compact locally");
@@ -7811,6 +7828,9 @@ export class AgentSession {
 			customInstructions,
 			{ mechanism: mechanism ?? (fromExtension ? "extension" : "local"), remoteCompaction, fallback },
 		);
+		// The checkpoint is now persisted, so the map partials behind it can never be
+		// needed again. A throw above leaves them for the next /compact-deep to resume.
+		if (deepCache && deepRunId) await deepCache.clearRun(deepRunId);
 		const newEntries = this.sessionManager.getEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
 		this._mergeUnpersistedOutcomes(this.agent.state.messages);
