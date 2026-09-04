@@ -1,0 +1,1 @@
+- Fixed event-log tail repair after concurrent file growth or replacement while preserving durable appends.

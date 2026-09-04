@@ -7,7 +7,6 @@ import {
 	mkdirSync,
 	openSync,
 	readSync,
-	statSync,
 	writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
@@ -142,31 +141,27 @@ export class EventLog {
 	 */
 	private repairTailSync(): void {
 		const { maxBytes } = this.options;
-		let size: number;
+		let fd: number;
 		try {
-			size = statSync(this.path).size;
-		} catch {
-			return;
+			fd = openSync(this.path, "r+");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
 		}
-		if (size === 0) return;
-		// Fail closed loudly at the read bound BEFORE the swallowing repair
-		// try-block: an oversized log must never trigger a file-sized
-		// allocation, and the error must not be silenced as a repair failure.
-		if (maxBytes !== undefined && size > maxBytes) {
-			throw new Error(`event log ${this.path} exceeds ${maxBytes} bytes (${size}); refusing to read`);
-		}
-		// All offsets are BYTE offsets on raw buffers: string indices diverge
-		// from byte offsets as soon as any record carries multi-byte UTF-8,
-		// and ftruncate takes bytes.
 		try {
-			const fd = openSync(this.path, "r+");
+			// Size, probe, and truncate must refer to the same opened file: a
+			// pre-open path stat can probe an old newline after a torn append.
+			const size = fstatSync(fd).size;
+			if (size === 0) return;
+			// Keep the bound outside the best-effort repair catch so it fails closed.
+			if (maxBytes !== undefined && size > maxBytes) {
+				throw new Error(`event log ${this.path} exceeds ${maxBytes} bytes (${size}); refusing to read`);
+			}
 			try {
 				const lastByte = Buffer.alloc(1);
 				if (readSync(fd, lastByte, 0, 1, size - 1) !== 1 || lastByte[0] === 0x0a) return;
-				// Truncate guarded by a double-read stability check (cheap
-				// cross-process hardening; a racing append between the check and
-				// the ftruncate stays in the same trust bucket as the documented
-				// O_APPEND small-write atomicity assumption).
+				// Byte offsets preserve UTF-8. Double reads guard concurrent writes;
+				// the existing race after final verification is not a file lock.
 				const first = readAllSync(fd, maxBytes, this.path);
 				const second = readAllSync(fd, maxBytes, this.path);
 				if (second.length !== first.length || !second.equals(first)) return;
@@ -174,11 +169,11 @@ export class EventLog {
 				const keep = first.lastIndexOf(0x0a) + 1;
 				ftruncateSync(fd, keep);
 				this.options.log?.(`truncated torn final line (${first.length - keep} bytes)`);
-			} finally {
-				closeSync(fd);
+			} catch {
+				// Leave the tail for the reader's torn-line tolerance.
 			}
-		} catch {
-			// Leave the tail for the reader's torn-line tolerance.
+		} finally {
+			closeSync(fd);
 		}
 	}
 }
