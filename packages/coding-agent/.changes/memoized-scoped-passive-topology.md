@@ -1,0 +1,2 @@
+- Reduced repeated daemon metadata reads on large agent trees with a validated passive topology cache, and kept selected subagent snapshots independent of unrelated sibling scans.
+- Fixed stale session details after a session file is atomically replaced while retaining its size and modification time.

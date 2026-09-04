@@ -1114,6 +1114,8 @@ interface SessionInfoScanState {
 interface SessionInfoCacheEntry {
 	size: number;
 	mtimeMs: number;
+	ctimeMs: number;
+	dev: number;
 	ino: number;
 	fingerprint?: string;
 	info: SessionInfo | null;
@@ -1122,8 +1124,8 @@ interface SessionInfoCacheEntry {
 
 const SESSION_INFO_SCAN_FAILED = Symbol("session-info-scan-failed");
 
-// Session files are append-only, so an unchanged (size, mtimeMs) means identical
-// content: cache list metadata and rescan only files that changed.
+// Reuse list metadata only while the file identity and change timestamps match.
+// Session files may be atomically replaced as well as appended.
 const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
 const sessionInfoReadsInFlight = new Map<string, Promise<SessionInfo | null>>();
 
@@ -1194,12 +1196,21 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 	const cached = sessionInfoCache.get(filePath);
 	const completeSize = await lastCompleteJsonlOffset(filePath, Number(stats.size));
 	if (completeSize === undefined) return null;
-	if (cached && cached.size === completeSize && cached.mtimeMs === stats.mtimeMs) return cached.info;
+	if (
+		cached &&
+		cached.size === completeSize &&
+		cached.mtimeMs === stats.mtimeMs &&
+		cached.ctimeMs === stats.ctimeMs &&
+		cached.dev === stats.dev &&
+		cached.ino === stats.ino
+	)
+		return cached.info;
 
 	// JSONL session logs append. Reuse metadata from the completed prefix; a rewrite,
 	// truncate, inode change, or incomplete prior suffix falls back to a full scan.
 	const canAppend =
 		cached?.state &&
+		cached.dev === stats.dev &&
 		cached.ino === stats.ino &&
 		completeSize > cached.size &&
 		cached.fingerprint !== undefined &&
@@ -1213,12 +1224,21 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 	);
 	if (result === SESSION_INFO_SCAN_FAILED) return null;
 	if (result === null) {
-		sessionInfoCache.set(filePath, { size: completeSize, mtimeMs: stats.mtimeMs, ino: stats.ino, info: null });
+		sessionInfoCache.set(filePath, {
+			size: completeSize,
+			mtimeMs: stats.mtimeMs,
+			ctimeMs: stats.ctimeMs,
+			dev: stats.dev,
+			ino: stats.ino,
+			info: null,
+		});
 		return null;
 	}
 	sessionInfoCache.set(filePath, {
 		size: completeSize,
 		mtimeMs: stats.mtimeMs,
+		ctimeMs: stats.ctimeMs,
+		dev: stats.dev,
 		ino: stats.ino,
 		fingerprint: await sessionPrefixFingerprint(filePath, completeSize),
 		info: result.info,
