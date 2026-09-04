@@ -1113,6 +1113,7 @@ interface SessionInfoScanState {
 
 interface SessionInfoCacheEntry {
 	size: number;
+	fileSize: number;
 	mtimeMs: number;
 	ctimeMs: number;
 	dev: number;
@@ -1128,6 +1129,16 @@ const SESSION_INFO_SCAN_FAILED = Symbol("session-info-scan-failed");
 // Session files may be atomically replaced as well as appended.
 const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
 const sessionInfoReadsInFlight = new Map<string, Promise<SessionInfo | null>>();
+
+function sessionInfoCacheMatchesFile(cached: SessionInfoCacheEntry, stats: Awaited<ReturnType<typeof stat>>): boolean {
+	return (
+		cached.fileSize === Number(stats.size) &&
+		cached.mtimeMs === stats.mtimeMs &&
+		cached.ctimeMs === stats.ctimeMs &&
+		cached.dev === stats.dev &&
+		cached.ino === stats.ino
+	);
+}
 
 async function sessionPrefixFingerprint(filePath: string, size: number): Promise<string | undefined> {
 	if (size === 0) return "";
@@ -1196,15 +1207,7 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 	const cached = sessionInfoCache.get(filePath);
 	const completeSize = await lastCompleteJsonlOffset(filePath, Number(stats.size));
 	if (completeSize === undefined) return null;
-	if (
-		cached &&
-		cached.size === completeSize &&
-		cached.mtimeMs === stats.mtimeMs &&
-		cached.ctimeMs === stats.ctimeMs &&
-		cached.dev === stats.dev &&
-		cached.ino === stats.ino
-	)
-		return cached.info;
+	if (cached && cached.size === completeSize && sessionInfoCacheMatchesFile(cached, stats)) return cached.info;
 
 	// JSONL session logs append. Reuse metadata from the completed prefix; a rewrite,
 	// truncate, inode change, or incomplete prior suffix falls back to a full scan.
@@ -1226,6 +1229,7 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 	if (result === null) {
 		sessionInfoCache.set(filePath, {
 			size: completeSize,
+			fileSize: Number(stats.size),
 			mtimeMs: stats.mtimeMs,
 			ctimeMs: stats.ctimeMs,
 			dev: stats.dev,
@@ -1236,6 +1240,7 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 	}
 	sessionInfoCache.set(filePath, {
 		size: completeSize,
+		fileSize: Number(stats.size),
 		mtimeMs: stats.mtimeMs,
 		ctimeMs: stats.ctimeMs,
 		dev: stats.dev,
@@ -1249,7 +1254,19 @@ async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null
 export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
 	const inFlight = sessionInfoReadsInFlight.get(filePath);
 	if (inFlight) {
-		return inFlight;
+		const info = await inFlight;
+		if (info === null) return null;
+		let stats: Awaited<ReturnType<typeof stat>>;
+		try {
+			stats = await stat(filePath);
+		} catch {
+			return null;
+		}
+		const cached = sessionInfoCache.get(filePath);
+		if (cached?.info === info && sessionInfoCacheMatchesFile(cached, stats)) return info;
+		// The shared read may predate this caller's view of the file. Retry once,
+		// without recursively joining old reads or waiting for transcript churn to stop.
+		return readSessionInfoOnce(filePath);
 	}
 
 	const read = readSessionInfoOnce(filePath);

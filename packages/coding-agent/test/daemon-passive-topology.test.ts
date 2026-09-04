@@ -3,11 +3,15 @@ import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as sessionMetadata from "../src/core/session-manager.js";
 import { readSessionInfo } from "../src/core/session-manager.js";
 import * as displayMetadata from "../src/modes/daemon/rlm-subagent-display.js";
+import * as fileLines from "../src/utils/file-lines.js";
 import { cleanupTopologyFixtures, topologyFixture, topologyState } from "./helpers/passive-topology-fixture.js";
 
 const originalDisplayRead = displayMetadata.readRlmSubagentDisplayEntry;
+const originalSessionRead = sessionMetadata.readSessionInfo;
+const originalReadLines = fileLines.readLinesAsBuffers;
 const scenario = { name: "memo", children: 3, depth: 0 };
 function display(path: string): Record<string, unknown> {
 	return JSON.parse(readFileSync(join(dirname(path), "rlm-subagent.json"), "utf8")) as Record<string, unknown>;
@@ -169,6 +173,45 @@ describe("validated passive topology memo", () => {
 		});
 		await internals.listPassiveRlmSubagents();
 		expect(walk).toHaveBeenCalledTimes(2);
+	});
+	it("revalidates a shared metadata read started before the walk captured its file identity", async () => {
+		const { internals, files } = topologyFixture({ ...scenario, children: 1 });
+		const file = files.get("target-child-0")!;
+		const oldDataRead = deferred();
+		const releaseOldRead = deferred();
+		const walkJoinedRead = deferred();
+		let delayed = false;
+		vi.spyOn(fileLines, "readLinesAsBuffers").mockImplementation(async function* (path, start, end) {
+			yield* originalReadLines(path, start, end);
+			if (path === file && !delayed) {
+				delayed = true;
+				oldDataRead.resolve();
+				await releaseOldRead.promise;
+			}
+		});
+		const oldRead = originalSessionRead(file);
+		await oldDataRead.promise;
+		writeFileSync(
+			`${file}.new`,
+			readFileSync(file, "utf8").replace('"name":"target-child-0"', '"name":"latest-child-0"'),
+		);
+		renameSync(`${file}.new`, file);
+		vi.spyOn(sessionMetadata, "readSessionInfo").mockImplementation((path) => {
+			const result = originalSessionRead(path);
+			if (path === file) walkJoinedRead.resolve();
+			return result;
+		});
+		const walk = vi.spyOn(internals, "walkPassiveRlmSubagents");
+		const snapshot = internals.listPassiveRlmSubagents();
+		try {
+			await walkJoinedRead.promise;
+		} finally {
+			releaseOldRead.resolve();
+		}
+		expect((await oldRead)?.name).toBe("target-child-0");
+		expect((await snapshot)[0].info.name).toBe("latest-child-0");
+		expect((await internals.listPassiveRlmSubagents())[0].info.name).toBe("latest-child-0");
+		expect(walk).toHaveBeenCalledTimes(1);
 	});
 	it("rechecks resident identities after asynchronous cache validation", async () => {
 		const { internals, root, directory } = topologyFixture(scenario);
