@@ -127,11 +127,12 @@ describe("SubagentSummaryLine", () => {
 		expect(onOpen).not.toHaveBeenCalled();
 	});
 
-	it("updates the rendered counts from consecutive child-status events", () => {
+	it("updates the rendered counts from consecutive child-status events", async () => {
 		const line = new SubagentSummaryLine();
 		line.setOpenable(true);
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
 		Object.assign(mode, {
+			isInitialized: true,
 			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],
@@ -147,16 +148,19 @@ describe("SubagentSummaryLine", () => {
 		) => void;
 
 		update.call(mode, child("worker", "running"));
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 1 running   ◐ 0 idle   ○ 0 inactive");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "active-worker" }));
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 0 running   ◐ 1 idle   ○ 0 inactive");
 	});
 
-	it("counts a retained completed child as running while a follow-up turn is active", () => {
+	it("counts a retained completed child as running while a follow-up turn is active", async () => {
 		const line = new SubagentSummaryLine();
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
 		Object.assign(mode, {
+			isInitialized: true,
 			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],
@@ -172,12 +176,15 @@ describe("SubagentSummaryLine", () => {
 		) => void;
 
 		update.call(mode, child("worker", "done", { activeSessionId: "resident-worker" }));
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 0 running   ◐ 1 idle   ○ 0 inactive");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "resident-worker", activity: { kind: "waiting" } }));
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 1 running   ◐ 0 idle   ○ 0 inactive");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "resident-worker" }));
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 0 running   ◐ 1 idle   ○ 0 inactive");
 	});
 
@@ -185,6 +192,7 @@ describe("SubagentSummaryLine", () => {
 		const line = new SubagentSummaryLine();
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
 		Object.assign(mode, {
+			isInitialized: true,
 			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],
@@ -212,10 +220,11 @@ describe("SubagentSummaryLine", () => {
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("╭─ subagents ─");
 	});
 
-	it("clears a resident session id when a terminal update reports an evicted child", () => {
+	it("clears a resident session id when a terminal update reports an evicted child", async () => {
 		const line = new SubagentSummaryLine();
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
 		Object.assign(mode, {
+			isInitialized: true,
 			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],
@@ -235,13 +244,15 @@ describe("SubagentSummaryLine", () => {
 		update.call(mode, child("worker", "running"));
 		update.call(mode, child("worker", "done"));
 
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 0 running   ◐ 0 idle   ○ 1 inactive");
 	});
 
-	it("removes a run on the producer's cancelled signal and keeps transcript-backed rows through repeated dones", () => {
+	it("removes a run on the producer's cancelled signal and keeps transcript-backed rows through repeated dones", async () => {
 		const line = new SubagentSummaryLine();
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
 		Object.assign(mode, {
+			isInitialized: true,
 			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],
@@ -266,6 +277,7 @@ describe("SubagentSummaryLine", () => {
 		update.call(mode, child("worker", "done"));
 		update.call(mode, child("worker", "done"));
 		expect(snapshots.has("worker")).toBe(true);
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 0 running   ◐ 0 idle   ○ 1 inactive");
 	});
 
@@ -297,6 +309,7 @@ describe("SubagentSummaryLine", () => {
 					throw new Error("Daemon is stale");
 				}),
 			},
+			isInitialized: true,
 			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],

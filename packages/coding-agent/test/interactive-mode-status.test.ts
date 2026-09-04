@@ -1460,6 +1460,7 @@ describe("InteractiveMode connection events", () => {
 		const subscribeToRosterBar = vi.fn(async () => {});
 		const getState = vi.fn(async () => createConnectionState());
 		const harness = {
+			cancelSubagentSummaryRefresh: vi.fn(),
 			unsubscribe: undefined,
 			localSessionHost: undefined,
 			toolDefinitionCache: { clear: vi.fn() },

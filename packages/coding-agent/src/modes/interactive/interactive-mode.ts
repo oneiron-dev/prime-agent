@@ -1026,6 +1026,8 @@ export class InteractiveMode {
 	// One summary line below the editor, backed by the existing child-status stream.
 	private subagentSummaryLine: SubagentSummaryLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
+	private subagentSummaryRefresh: ReturnType<typeof setImmediate> | undefined;
+	private subagentActivityRefreshPending = false;
 	private rlmNodeId: string | undefined;
 	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
@@ -2844,6 +2846,7 @@ export class InteractiveMode {
 	}
 
 	private async rebindCurrentSession(): Promise<void> {
+		this.cancelSubagentSummaryRefresh();
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		void this.rosterBar?.dispose();
@@ -5152,8 +5155,7 @@ export class InteractiveMode {
 		if (!this.agentConnection.subscribeAgentRoster) return;
 		try {
 			this.rosterBar = await this.agentConnection.subscribeAgentRoster(() => {
-				this.updateSubagentSummaryLine();
-				this.ui.requestRender();
+				this.scheduleSubagentSummaryRefresh(false);
 			});
 		} catch {
 			this.rosterBar = undefined;
@@ -6022,10 +6024,44 @@ export class InteractiveMode {
 			const previous = this.subagentSnapshots.get(child.id);
 			this.subagentSnapshots.set(child.id, previous ? mergeSubagentSnapshot(previous, child) : child);
 		}
-		this.refreshSubagentSummary();
+		this.scheduleSubagentSummaryRefresh();
+	}
+
+	private scheduleSubagentSummaryRefresh(refreshActivity = true): void {
+		if (!this.isInitialized) return;
+		this.subagentActivityRefreshPending ||= refreshActivity;
+		if (this.subagentSummaryRefresh) return;
+		// Session events are serialized through promises. A microtask would still
+		// recount after every child; one event-turn callback folds the whole burst.
+		this.subagentSummaryRefresh = setImmediate(() => {
+			this.subagentSummaryRefresh = undefined;
+			const refreshActivity = this.subagentActivityRefreshPending;
+			this.subagentActivityRefreshPending = false;
+			if (!this.isInitialized) return;
+			try {
+				if (refreshActivity) {
+					this.refreshSubagentSummary();
+				} else {
+					this.updateSubagentSummaryLine();
+					this.ui.requestRender();
+				}
+			} catch (error) {
+				// Preserve session-event reporting and roster-listener isolation after
+				// moving the refresh outside their original error boundaries.
+				if (refreshActivity) this.showError(error instanceof Error ? error.message : String(error));
+			}
+		});
+		this.subagentSummaryRefresh.unref();
+	}
+
+	private cancelSubagentSummaryRefresh(): void {
+		if (this.subagentSummaryRefresh) clearImmediate(this.subagentSummaryRefresh);
+		this.subagentSummaryRefresh = undefined;
+		this.subagentActivityRefreshPending = false;
 	}
 
 	private refreshSubagentSummary(): void {
+		this.cancelSubagentSummaryRefresh();
 		this.scheduleHeartbeatManagerRefresh();
 		this.updateSubagentSummaryLine();
 		this.updateWorkingPulse();
@@ -6053,13 +6089,26 @@ export class InteractiveMode {
 	}
 
 	private removeSubagentSnapshot(id: string): void {
-		this.subagentSnapshots.delete(id);
-		for (const child of [...this.subagentSnapshots.values()]) {
-			if (child.parentId === id) this.removeSubagentSnapshot(child.id);
+		const childrenByParent = new Map<string, string[]>();
+		for (const child of this.subagentSnapshots.values()) {
+			if (child.parentId === undefined) continue;
+			const children = childrenByParent.get(child.parentId) ?? [];
+			children.push(child.id);
+			childrenByParent.set(child.parentId, children);
+		}
+		const pending = [id];
+		const visited = new Set<string>();
+		while (pending.length > 0) {
+			const childId = pending.pop()!;
+			if (visited.has(childId)) continue;
+			visited.add(childId);
+			this.subagentSnapshots.delete(childId);
+			for (const descendant of childrenByParent.get(childId) ?? []) pending.push(descendant);
 		}
 	}
 
 	private resetSubagentSummary(): void {
+		this.cancelSubagentSummaryRefresh();
 		this.subagentSnapshots.clear();
 		this.rlmNodeId = undefined;
 		this.updateSubagentSummaryLine();
@@ -10127,6 +10176,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 	}
 
 	stop(options: { preserveAltScreen?: boolean } = {}): void {
+		this.cancelSubagentSummaryRefresh();
 		this.unregisterSignalHandlers();
 		this.clearCtrlCExitHint({ render: false });
 		this.clearEscapeRepeat();

@@ -1,0 +1,1 @@
+- Improved responsiveness during bursts of subagent updates and large subtree removals.
