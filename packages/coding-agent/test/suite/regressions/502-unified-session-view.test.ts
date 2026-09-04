@@ -415,7 +415,7 @@ describe("#502 unified session view regressions", () => {
 		expect(filtered.map((record) => record.identity)).toEqual(["match"]);
 	});
 
-	test("inactive rows give message count and age their full responsive cell", () => {
+	test("inactive rows give usage and age their full responsive cell", () => {
 		const inactive = {
 			kind: "agent" as const,
 			section: "inactive" as const,
@@ -433,6 +433,7 @@ describe("#502 unified session view regressions", () => {
 			depth: 0,
 			selectable: true,
 			runningSubagentCount: 0,
+			recursiveCost: 0,
 			identity: "archived",
 		};
 		const harness = {
@@ -451,7 +452,7 @@ describe("#502 unified session view regressions", () => {
 				50,
 			),
 		);
-		expect(rendered).toMatch(/123456 · 2h\s*$/);
+		expect(rendered).toMatch(/↑0 ↓0 · \$0\.00 \(\$0\.00 w\/ subagents\) · 2h\s*$/);
 	});
 
 	test("scoped subagent rows keep model and effort ahead of summaries", () => {
@@ -474,6 +475,7 @@ describe("#502 unified session view regressions", () => {
 			depth: 1,
 			selectable: true,
 			runningSubagentCount: 0,
+			recursiveCost: 0,
 			identity: "effort-child",
 			parentIdentity: "parent",
 		};
@@ -494,11 +496,11 @@ describe("#502 unified session view regressions", () => {
 				),
 			);
 
-		const full = render(120);
+		const full = render(160);
 		expect(full).toContain(
 			"Inspect agents view · prime-inference/gpt-5.6-terra:high · Investigate a variable background status",
 		);
-		const narrow = render(75);
+		const narrow = render(100);
 		expect(narrow).toContain("prime-inference/gpt-5.6-terra:high");
 		expect(narrow).not.toContain("Investigate a variable background status");
 
@@ -512,8 +514,8 @@ describe("#502 unified session view regressions", () => {
 
 		subagent.summary.thinkingLevel = "off";
 		subagent.summary.summary = "A later summary";
-		expect(render(100)).toContain("Inspect agents view · prime-inference/gpt-5.6-terra · A later summary");
-		expect(render(100)).not.toContain(":off");
+		expect(render(120)).toContain("Inspect agents view · prime-inference/gpt-5.6-terra · A later summary");
+		expect(render(120)).not.toContain(":off");
 
 		expect(render(20)).toHaveLength(20);
 	});

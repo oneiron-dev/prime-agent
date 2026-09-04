@@ -21,8 +21,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, Usage } from "@earendil-works/pi-ai";
 import { convertToLlm } from "../messages.js";
+import { addAssistantUsage, emptyUsage } from "../usage.js";
 import {
 	buildSummarizationPrompt,
 	type CompactionDetails,
@@ -31,6 +32,7 @@ import {
 	type CompactionSettings,
 	completeSummaryText,
 	elideSummaryForRequest,
+	type SummaryCallRunner,
 	summaryRequestByteLimit,
 } from "./compaction.js";
 import {
@@ -77,6 +79,7 @@ export interface DeepCompactionProgress {
 
 export interface DeepCompactionOptions {
 	headers?: Record<string, string>;
+	summaryCall?: SummaryCallRunner;
 	customInstructions?: string;
 	signal?: AbortSignal;
 	thinkingLevel?: ThinkingLevel;
@@ -279,7 +282,12 @@ export async function compactMapReduce(
 	options: DeepCompactionOptions = {},
 ): Promise<CompactionResult<CompactionDetails>> {
 	const { firstKeptEntryId, messagesToSummarize, turnPrefixMessages, tokensBefore, fileOps, settings } = preparation;
-	const { headers, customInstructions, signal, thinkingLevel, cache, onProgress } = options;
+	const { headers, summaryCall, customInstructions, signal, thinkingLevel, cache, onProgress } = options;
+	let usage: Usage | undefined;
+	const onUsage = (slice: Usage) => {
+		usage ??= emptyUsage();
+		addAssistantUsage(usage, slice);
+	};
 	if (!firstKeptEntryId) {
 		throw new Error("First kept entry has no UUID - session may need migration");
 	}
@@ -345,6 +353,8 @@ export async function compactMapReduce(
 			signal,
 			thinkingLevel,
 			`Map-reduce chunk ${index + 1} summarization failed`,
+			summaryCall,
+			onUsage,
 		);
 		if (signal?.aborted) throw new Error("Compaction cancelled");
 		partials[index] = summary;
@@ -413,6 +423,8 @@ export async function compactMapReduce(
 					signal,
 					thinkingLevel,
 					"Map-reduce merge failed",
+					summaryCall,
+					onUsage,
 				),
 			);
 			merged++;
@@ -435,6 +447,8 @@ export async function compactMapReduce(
 				signal,
 				thinkingLevel,
 				"Map-reduce final merge failed",
+				summaryCall,
+				onUsage,
 			),
 		];
 	}
@@ -467,5 +481,6 @@ export async function compactMapReduce(
 			},
 		},
 		mechanism: "local",
+		usage,
 	};
 }

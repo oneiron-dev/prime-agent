@@ -22,6 +22,7 @@ import type { CustomMessage } from "../../core/messages.js";
 import type { QueuedMessageLane, QueuedMessageMutation } from "../../core/session-action-store.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import type { SessionUsageSummary } from "../../core/usage.js";
 import type {
 	AgentConnectionAgentStatus,
 	AgentConnectionHeartbeat,
@@ -70,9 +71,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 23 lets workers query the supervisor agent roster on demand.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds capability-gated direct worker peer transport discovery.
-// Revision 26 adds capability-gated stable-target follow-up addressing (fork).
-export const DAEMON_SCHEMA_REVISION = 26;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-3d0d4e27bd94";
+// Revision 26 adds stable-target follow-up addressing in the fork and usage totals upstream.
+// Revision 27 combines capability-gated stable targets with optional own-session usage totals.
+export const DAEMON_SCHEMA_REVISION = 27;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-27-eb36e67c8aa3";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1169,6 +1171,7 @@ export interface DaemonSavedSessionInfo {
 	firstMessage: string;
 	allMessagesText: string;
 	agentStatus?: AgentConnectionAgentStatus;
+	usage?: SessionUsageSummary;
 }
 
 export type DaemonDeleteSavedSessionResult = DeleteSessionFileResult;

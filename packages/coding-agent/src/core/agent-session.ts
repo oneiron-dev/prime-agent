@@ -74,7 +74,6 @@ import {
 	normalizeObserveMaxChars,
 	ORCHESTRATION_HEARTBEAT_SKILL_NAME,
 } from "./agent-observe.js";
-import { flushAgentTraceUpload } from "./agent-traces.js";
 import {
 	addLoginGuidanceToAuthError,
 	formatAuthenticationFailedMessage,
@@ -256,6 +255,12 @@ import {
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
 import {
+	modelRequestHeaders,
+	SemanticEdgeRecorder,
+	semanticEdgeLedgerPath,
+	wrapStreamFnWithSemanticEdges,
+} from "./semantic-edges.js";
+import {
 	ActionStore,
 	type ActionTicket,
 	canSelectSessionAction,
@@ -295,11 +300,12 @@ import {
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
+import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations, DEFAULT_COMMAND_TIMEOUT_SECONDS } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
-import { addAssistantUsage, emptyUsage } from "./usage.js";
+import { addAssistantUsage, emptyUsage, type SessionUsageSummary, sessionUsageSummaryFrom } from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
 export type { GoalState, GoalStatus } from "./goals.js";
@@ -471,6 +477,8 @@ export interface AgentSessionConfig {
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	rlmParentAgent?: string;
+	semanticParentSessionId?: string;
+	semanticSpawnedByRequestId?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	autonomous?: AgentAutonomousConfig;
 	prewarmIpythonKernel?: boolean;
@@ -1166,6 +1174,7 @@ export class AgentSession {
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
+	private _acpMcpTools: ToolDefinition[] = [];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
 	private _agentDir?: string;
@@ -1203,6 +1212,7 @@ export class AgentSession {
 	private _rlmMaxDepth: number;
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	private _rlmSessionDir?: string;
+	private readonly _semanticEdges: SemanticEdgeRecorder;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
 	private _repliedToParentSinceTask: boolean | undefined;
@@ -1311,6 +1321,16 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
+		this._semanticEdges = new SemanticEdgeRecorder({
+			ledgerPath: semanticEdgeLedgerPath({
+				rlmSessionDir: this._rlmSessionDir,
+				sessionArtifactDir: this.sessionManager.getSessionArtifactDir(),
+			}),
+			sessionId: this.sessionManager.getSessionId(),
+			parentSessionId: config.semanticParentSessionId,
+			spawnedByRequestId: config.semanticSpawnedByRequestId,
+		});
+		this.agent.streamFn = wrapStreamFnWithSemanticEdges(this.agent.streamFn, this._semanticEdges);
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -1378,6 +1398,10 @@ export class AgentSession {
 			if (servers.length > 0) throw new Error("MCP is unavailable in this session");
 			return;
 		}
+		if (servers.length > 0 && !this._ipythonKernelProvisioner) {
+			throw new Error("ACP MCP servers require the built-in cpython tool");
+		}
+		this._assertAcpMcpToolNamesAvailable(acpMcpToolNames(servers));
 		if (!this._mcpManager.replaceAcpServers(servers, ownerId)) return;
 		this._rebuildRuntimeForAcpMcpServers();
 	}
@@ -1385,8 +1409,11 @@ export class AgentSession {
 	async releaseAcpMcpServers(ownerId: string, serverNames: readonly string[]): Promise<void> {
 		if (!this._mcpManager?.canReleaseAcpServers(ownerId)) return;
 		if (this._mcpManager.replaceAcpServers([], ownerId)) {
-			// Host MCP handlers read this manager dynamically, so credentials disappear
-			// before the kernel-side transport is closed.
+			const removedToolNames = new Set(this._acpMcpTools.map((tool) => tool.name));
+			const activeToolNames = this.getActiveToolNames().filter((name) => !removedToolNames.has(name));
+			for (const name of removedToolNames) this._allowedToolNames?.delete(name);
+			this._acpMcpTools = [];
+			this._refreshToolRegistry({ activeToolNames, includeAllExtensionTools: true });
 			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
 		}
@@ -1424,9 +1451,27 @@ export class AgentSession {
 		}
 	}
 
+	private _assertAcpMcpToolNamesAvailable(names: readonly string[]): void {
+		const occupiedNames = new Set([
+			...this._baseToolDefinitions.keys(),
+			...this._customTools.map((tool) => tool.name),
+			...this._extensionRunner.getAllRegisteredTools().map((tool) => tool.definition.name),
+		]);
+		for (const name of names) {
+			if (occupiedNames.has(name)) {
+				throw new Error(`ACP MCP tool name conflicts with an existing tool: ${name}`);
+			}
+		}
+	}
+
 	private _rebuildRuntimeForAcpMcpServers(): void {
+		const previousToolNames = new Set(this._acpMcpTools.map((tool) => tool.name));
+		const nextToolNames = acpMcpToolNames(this._mcpManager?.getAcpServers() ?? []);
+		this._assertAcpMcpToolNamesAvailable(nextToolNames);
+		const activeToolNames = this.getActiveToolNames().filter((name) => !previousToolNames.has(name));
+		activeToolNames.push(...nextToolNames);
 		this._buildRuntime({
-			activeToolNames: this.getActiveToolNames(),
+			activeToolNames,
 			includeAllExtensionTools: true,
 		});
 		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
@@ -3755,6 +3800,7 @@ export class AgentSession {
 	}
 
 	private _resolveRetry(): void {
+		this._semanticEdges.clearTurnRetry();
 		if (this._retryResolve) {
 			this._retryResolve();
 			this._retryResolve = undefined;
@@ -3916,7 +3962,7 @@ export class AgentSession {
 	 * (which flushes a final namespace snapshot) before the synchronous dispose, so
 	 * the latest state reaches disk instead of racing process exit.
 	 */
-	async disposeAsync(): Promise<void> {
+	async disposeAsync(options?: { kernelSnapshot?: boolean }): Promise<void> {
 		if (this._disposed) {
 			return this._disposeCallbacksPromise;
 		}
@@ -3925,6 +3971,7 @@ export class AgentSession {
 		if (this._disposeAsyncPromise) {
 			return this._disposeAsyncPromise;
 		}
+		const kernelSnapshot = options?.kernelSnapshot ?? true;
 		this._disposeAsyncPromise = (async () => {
 			// Drain before marking _disposing so a refine triggered at the final
 			// agent_end completes instead of being aborted by dispose().
@@ -3934,7 +3981,7 @@ export class AgentSession {
 			}
 			this._disposing = true;
 			this._sessionActionCommitDisposeAbortController.abort();
-			await this._disposeAsyncOnce();
+			await this._disposeAsyncOnce(kernelSnapshot);
 		})();
 		return this._disposeAsyncPromise;
 	}
@@ -4071,7 +4118,7 @@ export class AgentSession {
 		}
 	}
 
-	private async _disposeAsyncOnce(): Promise<void> {
+	private async _disposeAsyncOnce(kernelSnapshot: boolean): Promise<void> {
 		// Flush kernels/traces for both still-running and retained children; the sync
 		// dispose() below only tears them down synchronously.
 		for (const run of [...this._activeRlmChildRuns.values()]) {
@@ -4103,7 +4150,7 @@ export class AgentSession {
 		this._rlmChildCleanupFailures.clear();
 		this._deletedRlmChildIds.clear();
 		try {
-			await this._ipythonKernelProvisioner?.dispose();
+			await this._ipythonKernelProvisioner?.dispose({ snapshot: kernelSnapshot });
 		} catch {
 			// a failed kernel startup already cleaned up after itself
 		}
@@ -4331,6 +4378,10 @@ export class AgentSession {
 		return this._rlmDepth;
 	}
 
+	get semanticEdges(): SemanticEdgeRecorder {
+		return this._semanticEdges;
+	}
+
 	get rlmMaxDepth(): number {
 		return this._rlmMaxDepth;
 	}
@@ -4446,7 +4497,7 @@ export class AgentSession {
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
 			harnessState: this._loadMergedHarnessState(),
-			genericMcpServers: this._mcpManager?.getEnabledGenericServers(),
+			genericMcpServers: this._mcpManager?.getEnabledPersistentGenericServers(),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
@@ -7610,176 +7661,113 @@ export class AgentSession {
 		let extensionCompaction: CompactionResult | undefined;
 		let fromExtension = false;
 
-		if (this._extensionRunner.hasHandlers("session_before_compact")) {
-			const result = (await this._extensionRunner.emit({
-				type: "session_before_compact",
-				preparation: projectCompactionPreparationForExternalUse(preparation),
-				branchEntries: pathEntries.map(projectSessionEntryForExternalUse),
-				customInstructions,
-				signal,
-			})) as SessionBeforeCompactResult | undefined;
-
-			if (result?.cancel) {
-				throw new Error("Compaction cancelled");
-			}
-
-			if (result?.compaction) {
-				extensionCompaction = result.compaction;
-				fromExtension = true;
-			}
-		}
-
-		const compactionMode = settings.mode ?? "auto";
-		const compatibilityError =
-			extensionCompaction || deep ? undefined : remoteCompactionCompatibilityError(model, compactionMode);
-		if (compatibilityError) {
-			throw new CompactionSkippedError(compatibilityError);
-		}
-
+		const semanticCompaction = this._semanticEdges.beginCompaction();
+		let compactionRecorded = false;
+		let compactionSettled = false;
+		const uncommittedSlices: string[] = [];
 		let compactionResult: CompactionResult;
-		// Set only for deep compaction: the resumable partial cache is dropped after the
-		// summary is committed to the session, never merely after it is generated.
-		let deepCache: DeepCompactionCache | undefined;
-		let deepRunId: string | undefined;
-		if (extensionCompaction) {
-			compactionResult = {
-				...extensionCompaction,
-				mechanism: "extension",
-				remoteCompaction: undefined,
-			};
-		} else if (deep) {
-			// Deep compaction is explicitly local map-reduce: remote replay/migration
-			// logic does not apply.
-			deepCache = DeepCompactionCache.forSessionArtifacts(this.sessionManager.getSessionArtifactDir());
-			const deepResult = await compactMapReduce(preparation, model, apiKey, {
-				headers,
-				customInstructions,
-				signal,
-				thinkingLevel: this.thinkingLevel,
-				sessionId: this.sessionManager.getSessionId(),
-				cache: deepCache,
-				onProgress: (progress) => this._emit({ type: "compaction_progress", ...progress }),
-			});
-			deepRunId = deepResult.details?.mapReduce?.runId;
-			compactionResult = deepResult;
-		} else if (shouldUseRemoteCompactionV2(model, compactionMode)) {
+		const summaryCall = async <T>(
+			call: (callHeaders: Record<string, string> | undefined) => Promise<T>,
+		): Promise<T> => {
+			if (compactionSettled || signal.aborted) throw new Error("Compaction cancelled");
+			const requestId = this._semanticEdges.startCompactionRequest(semanticCompaction.compactionId);
+			if (requestId === undefined) return call(headers);
 			try {
-				const remotePreparation =
-					preparation.previousRemoteCompaction &&
-					!canReplayRemoteCompaction(preparation.previousRemoteCompaction, model)
-						? prepareCompaction(pathEntries, settings, { seed: "root" })
-						: preparation;
-				if (!remotePreparation)
-					throw new CompactionSkippedError("Session is too short to rebuild for remote compaction");
-				compactionResult = await compactRemoteV2(
-					remotePreparation,
-					model as Model<"openai-responses">,
-					apiKey,
-					this.systemPrompt,
-					headers,
-					customInstructions,
-					signal,
-					this.sessionManager.getSessionId(),
-				);
+				const result = await call({ ...headers, ...modelRequestHeaders(requestId) });
+				// A sibling can reject while this call is in flight. Its late result
+				// must not become a committed slice or let later rolling calls start.
+				if (compactionSettled) this._semanticEdges.failRequest(requestId);
+				else uncommittedSlices.push(requestId);
+				return result;
 			} catch (error) {
-				const fallbackReason = getResponsesRemoteCompactionV2FallbackReason(error);
-				if (!fallbackReason) throw error;
-				const localPreparation =
-					preparation.previousRemoteCompaction &&
-					!extractRemoteCompactionDigest(preparation.previousRemoteCompaction)
-						? prepareCompaction(pathEntries, settings, { seed: "root" })
-						: preparation;
-				if (!localPreparation)
-					throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
-				compactionResult = await compact(
-					localPreparation,
-					model,
-					apiKey,
-					headers,
-					customInstructions,
-					signal,
-					this.thinkingLevel,
-				);
-				compactionResult.fallback = { from: "remote", reason: fallbackReason };
+				this._semanticEdges.failRequest(requestId);
+				throw error;
 			}
-		} else if (shouldUseRemoteCompaction(model, compactionMode)) {
-			const priorRemote = preparation.previousRemoteCompaction;
-			const remoteBoundaryTimestamp = preparation.previousRemoteTimestamp
-				? new Date(preparation.previousRemoteTimestamp).getTime()
-				: undefined;
-			const postCheckpointAssistants =
-				remoteBoundaryTimestamp === undefined
-					? []
-					: pathEntries
-							.filter(
-								(entry): entry is SessionMessageEntry =>
-									entry.type === "message" &&
-									entry.message.role === "assistant" &&
-									entry.message.timestamp > remoteBoundaryTimestamp &&
-									entry.message.provider === model.provider &&
-									entry.message.model === model.id,
-							)
-							.map((entry) => entry.message as AssistantMessage);
-			const postCheckpoint = sampleRemotePostCheckpointUsage(postCheckpointAssistants, model.contextWindow);
-			const forceLocal =
-				priorRemote &&
-				(postCheckpoint.overflow ||
-					shouldMigrateRemoteCheckpoint(
-						priorRemote,
-						preparation.previousRemoteTokensBefore ?? 0,
-						postCheckpoint.postTokens,
-						model.contextWindow,
-					));
-			if (forceLocal) {
-				const localPreparation = prepareCompaction(pathEntries, settings, { seed: "root" });
-				if (!localPreparation)
-					throw new CompactionSkippedError(
-						"Session is too short to migrate ineffective remote compaction locally",
-					);
-				compactionResult = await compact(
-					localPreparation,
-					model,
-					apiKey,
-					headers,
+		};
+		try {
+			if (this._extensionRunner.hasHandlers("session_before_compact")) {
+				const result = (await this._extensionRunner.emit({
+					type: "session_before_compact",
+					preparation: projectCompactionPreparationForExternalUse(preparation),
+					branchEntries: pathEntries.map(projectSessionEntryForExternalUse),
 					customInstructions,
 					signal,
-					this.thinkingLevel,
-				);
-				compactionResult.fallback = {
-					from: "remote",
-					reason: "Remote checkpoint was ineffective or preserved oversized synthetic state",
+				})) as SessionBeforeCompactResult | undefined;
+
+				if (result?.cancel) {
+					throw new Error("Compaction cancelled");
+				}
+
+				if (result?.compaction) {
+					extensionCompaction = result.compaction;
+					fromExtension = true;
+				}
+			}
+
+			const compactionMode = settings.mode ?? "auto";
+			const compatibilityError =
+				extensionCompaction || deep ? undefined : remoteCompactionCompatibilityError(model, compactionMode);
+			if (compatibilityError) {
+				throw new CompactionSkippedError(compatibilityError);
+			}
+
+			// Set only for deep compaction: the resumable partial cache is dropped after the
+			// summary is committed to the session, never merely after it is generated.
+			let deepCache: DeepCompactionCache | undefined;
+			let deepRunId: string | undefined;
+			if (extensionCompaction) {
+				compactionResult = {
+					...extensionCompaction,
+					mechanism: "extension",
+					remoteCompaction: undefined,
 				};
-			} else
+			} else if (deep) {
+				// Deep compaction is explicitly local map-reduce: remote replay/migration
+				// logic does not apply.
+				deepCache = DeepCompactionCache.forSessionArtifacts(this.sessionManager.getSessionArtifactDir());
+				const deepResult = await compactMapReduce(preparation, model, apiKey, {
+					headers,
+					summaryCall,
+					customInstructions,
+					signal,
+					thinkingLevel: this.thinkingLevel,
+					sessionId: this.sessionManager.getSessionId(),
+					cache: deepCache,
+					onProgress: (progress) => this._emit({ type: "compaction_progress", ...progress }),
+				});
+				deepRunId = deepResult.details?.mapReduce?.runId;
+				compactionResult = deepResult;
+			} else if (shouldUseRemoteCompactionV2(model, compactionMode)) {
 				try {
 					const remotePreparation =
 						preparation.previousRemoteCompaction &&
 						!canReplayRemoteCompaction(preparation.previousRemoteCompaction, model)
 							? prepareCompaction(pathEntries, settings, { seed: "root" })
 							: preparation;
-					if (!remotePreparation) {
+					if (!remotePreparation)
 						throw new CompactionSkippedError("Session is too short to rebuild for remote compaction");
-					}
-					compactionResult = await compactRemote(
-						remotePreparation,
-						model as Model<"openai-responses">,
-						apiKey,
-						this.systemPrompt,
-						headers,
-						customInstructions,
-						signal,
-						this.sessionManager.getSessionId(),
+					compactionResult = await summaryCall((callHeaders) =>
+						compactRemoteV2(
+							remotePreparation,
+							model as Model<"openai-responses">,
+							apiKey,
+							this.systemPrompt,
+							callHeaders,
+							customInstructions,
+							signal,
+							this.sessionManager.getSessionId(),
+						),
 					);
 				} catch (error) {
-					const fallbackReason = getResponsesCompactFallbackReason(error);
+					const fallbackReason = getResponsesRemoteCompactionV2FallbackReason(error);
 					if (!fallbackReason) throw error;
 					const localPreparation =
 						preparation.previousRemoteCompaction &&
 						!extractRemoteCompactionDigest(preparation.previousRemoteCompaction)
 							? prepareCompaction(pathEntries, settings, { seed: "root" })
 							: preparation;
-					if (!localPreparation) {
+					if (!localPreparation)
 						throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
-					}
 					compactionResult = await compact(
 						localPreparation,
 						model,
@@ -7788,49 +7776,166 @@ export class AgentSession {
 						customInstructions,
 						signal,
 						this.thinkingLevel,
+						summaryCall,
 					);
 					compactionResult.fallback = { from: "remote", reason: fallbackReason };
 				}
-		} else {
-			// A prior remote checkpoint the local path cannot replay natively is
-			// bridged as digest text inside compact(); only a checkpoint with no
-			// readable digest justifies re-summarizing from the session root.
-			const localPreparation =
-				preparation.previousRemoteCompaction && !extractRemoteCompactionDigest(preparation.previousRemoteCompaction)
-					? prepareCompaction(pathEntries, settings, { seed: "root" })
-					: preparation;
-			if (!localPreparation) {
-				throw new CompactionSkippedError("Session is too short to compact locally");
+			} else if (shouldUseRemoteCompaction(model, compactionMode)) {
+				const priorRemote = preparation.previousRemoteCompaction;
+				const remoteBoundaryTimestamp = preparation.previousRemoteTimestamp
+					? new Date(preparation.previousRemoteTimestamp).getTime()
+					: undefined;
+				const postCheckpointAssistants =
+					remoteBoundaryTimestamp === undefined
+						? []
+						: pathEntries
+								.filter(
+									(entry): entry is SessionMessageEntry =>
+										entry.type === "message" &&
+										entry.message.role === "assistant" &&
+										entry.message.timestamp > remoteBoundaryTimestamp &&
+										entry.message.provider === model.provider &&
+										entry.message.model === model.id,
+								)
+								.map((entry) => entry.message as AssistantMessage);
+				const postCheckpoint = sampleRemotePostCheckpointUsage(postCheckpointAssistants, model.contextWindow);
+				const forceLocal =
+					priorRemote &&
+					(postCheckpoint.overflow ||
+						shouldMigrateRemoteCheckpoint(
+							priorRemote,
+							preparation.previousRemoteTokensBefore ?? 0,
+							postCheckpoint.postTokens,
+							model.contextWindow,
+						));
+				if (forceLocal) {
+					const localPreparation = prepareCompaction(pathEntries, settings, { seed: "root" });
+					if (!localPreparation)
+						throw new CompactionSkippedError(
+							"Session is too short to migrate ineffective remote compaction locally",
+						);
+					compactionResult = await compact(
+						localPreparation,
+						model,
+						apiKey,
+						headers,
+						customInstructions,
+						signal,
+						this.thinkingLevel,
+						summaryCall,
+					);
+					compactionResult.fallback = {
+						from: "remote",
+						reason: "Remote checkpoint was ineffective or preserved oversized synthetic state",
+					};
+				} else
+					try {
+						const remotePreparation =
+							preparation.previousRemoteCompaction &&
+							!canReplayRemoteCompaction(preparation.previousRemoteCompaction, model)
+								? prepareCompaction(pathEntries, settings, { seed: "root" })
+								: preparation;
+						if (!remotePreparation) {
+							throw new CompactionSkippedError("Session is too short to rebuild for remote compaction");
+						}
+						compactionResult = await summaryCall((callHeaders) =>
+							compactRemote(
+								remotePreparation,
+								model as Model<"openai-responses">,
+								apiKey,
+								this.systemPrompt,
+								callHeaders,
+								customInstructions,
+								signal,
+								this.sessionManager.getSessionId(),
+							),
+						);
+					} catch (error) {
+						const fallbackReason = getResponsesCompactFallbackReason(error);
+						if (!fallbackReason) throw error;
+						const localPreparation =
+							preparation.previousRemoteCompaction &&
+							!extractRemoteCompactionDigest(preparation.previousRemoteCompaction)
+								? prepareCompaction(pathEntries, settings, { seed: "root" })
+								: preparation;
+						if (!localPreparation) {
+							throw new CompactionSkippedError("Session is too short to compact locally after remote fallback");
+						}
+						compactionResult = await compact(
+							localPreparation,
+							model,
+							apiKey,
+							headers,
+							customInstructions,
+							signal,
+							this.thinkingLevel,
+							summaryCall,
+						);
+						compactionResult.fallback = { from: "remote", reason: fallbackReason };
+					}
+			} else {
+				// A prior remote checkpoint the local path cannot replay natively is
+				// bridged as digest text inside compact(); only a checkpoint with no
+				// readable digest justifies re-summarizing from the session root.
+				const localPreparation =
+					preparation.previousRemoteCompaction &&
+					!extractRemoteCompactionDigest(preparation.previousRemoteCompaction)
+						? prepareCompaction(pathEntries, settings, { seed: "root" })
+						: preparation;
+				if (!localPreparation) {
+					throw new CompactionSkippedError("Session is too short to compact locally");
+				}
+				compactionResult = await compact(
+					localPreparation,
+					model,
+					apiKey,
+					headers,
+					customInstructions,
+					signal,
+					this.thinkingLevel,
+					summaryCall,
+				);
 			}
-			compactionResult = await compact(
-				localPreparation,
-				model,
-				apiKey,
-				headers,
+
+			const { summary, firstKeptEntryId, tokensBefore, details, mechanism, remoteCompaction, fallback, usage } =
+				compactionResult;
+			if (signal.aborted) {
+				throw new Error("Compaction cancelled");
+			}
+
+			// Ledger-before-effect: settle the semantic outcome before committing the transcript.
+			compactionRecorded = true;
+			compactionSettled = true;
+			for (const requestId of uncommittedSlices.splice(0)) {
+				this._semanticEdges.finishRequest(requestId);
+			}
+			this._semanticEdges.finishCompaction(semanticCompaction.compactionId, "completed");
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
 				customInstructions,
-				signal,
-				this.thinkingLevel,
+				{ mechanism: mechanism ?? (fromExtension ? "extension" : "local"), remoteCompaction, fallback },
+				usage,
 			);
+			// The checkpoint is now persisted, so the map partials behind it can never be
+			// needed again. A throw above leaves them for the next /compact-deep to resume.
+			if (deepCache && deepRunId) await deepCache.clearRun(deepRunId);
+		} catch (error) {
+			compactionSettled = true;
+			for (const requestId of uncommittedSlices.splice(0)) {
+				this._semanticEdges.failRequest(requestId);
+			}
+			if (!compactionRecorded) {
+				const cancelled =
+					error instanceof Error && (error.name === "AbortError" || error.message === "Compaction cancelled");
+				this._semanticEdges.finishCompaction(semanticCompaction.compactionId, cancelled ? "cancelled" : "failed");
+			}
+			throw error;
 		}
-
-		const { summary, firstKeptEntryId, tokensBefore, details, mechanism, remoteCompaction, fallback } =
-			compactionResult;
-		if (signal.aborted) {
-			throw new Error("Compaction cancelled");
-		}
-
-		this.sessionManager.appendCompaction(
-			summary,
-			firstKeptEntryId,
-			tokensBefore,
-			details,
-			fromExtension,
-			customInstructions,
-			{ mechanism: mechanism ?? (fromExtension ? "extension" : "local"), remoteCompaction, fallback },
-		);
-		// The checkpoint is now persisted, so the map partials behind it can never be
-		// needed again. A throw above leaves them for the next /compact-deep to resume.
-		if (deepCache && deepRunId) await deepCache.clearRun(deepRunId);
+		const { summary } = compactionResult;
 		const newEntries = this.sessionManager.getEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
 		this._mergeUnpersistedOutcomes(this.agent.state.messages);
@@ -9274,14 +9379,16 @@ export class AgentSession {
 		const previousActiveToolNames = this.getActiveToolNames();
 		const allowedToolNames = this._allowedToolNames;
 		const registeredTools = this._extensionRunner.getAllRegisteredTools();
+		const sdkToolEntry = (definition: ToolDefinition) => ({
+			definition,
+			sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, {
+				source: "sdk" as const,
+			}),
+		});
 		const allCustomTools = [
 			...registeredTools,
-			...this._customTools.map((definition) => ({
-				definition,
-				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, {
-					source: "sdk",
-				}),
-			})),
+			...this._customTools.map(sdkToolEntry),
+			...this._acpMcpTools.map(sdkToolEntry),
 		];
 		const isAllowedTool = (name: string): boolean => !allowedToolNames || allowedToolNames.has(name);
 		const allowedCustomTools = allCustomTools.filter((tool) => isAllowedTool(tool.definition.name));
@@ -9443,6 +9550,19 @@ export class AgentSession {
 		}
 		this._bindExtensionCore(this._extensionRunner);
 		this._applyExtensionBindings(this._extensionRunner);
+
+		const previousAcpMcpToolNames = new Set(this._acpMcpTools.map((tool) => tool.name));
+		const acpServers = this._mcpManager?.getAcpServers() ?? [];
+		if (acpServers.length > 0 && !this._ipythonKernelProvisioner) {
+			throw new Error("ACP MCP servers require the built-in cpython tool");
+		}
+		const acpMcpTools = this._ipythonKernelProvisioner
+			? createAcpMcpToolDefinitions(acpServers, this._ipythonKernelProvisioner)
+			: [];
+		this._assertAcpMcpToolNamesAvailable(acpMcpTools.map((tool) => tool.name));
+		for (const name of previousAcpMcpToolNames) this._allowedToolNames?.delete(name);
+		for (const tool of acpMcpTools) this._allowedToolNames?.add(tool.name);
+		this._acpMcpTools = acpMcpTools;
 
 		const defaultActiveToolNames = this._baseToolsOverride ? Object.keys(this._baseToolsOverride) : ["ipython"];
 		const baseActiveToolNames = [...(options.activeToolNames ?? defaultActiveToolNames)];
@@ -9750,6 +9870,7 @@ export class AgentSession {
 		sessionDir: string;
 		model: Model<any>;
 		thinkingLevel?: ThinkingLevel;
+		spawnedByRequestId?: string;
 	}): CreateRlmSubagentRuntimeOptions {
 		return {
 			parentSession: this,
@@ -9772,6 +9893,7 @@ export class AgentSession {
 			rlmDepth: this._rlmDepth + 1,
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmParentNodeId: options.id,
+			spawnedByRequestId: options.spawnedByRequestId,
 		};
 	}
 
@@ -9837,6 +9959,8 @@ export class AgentSession {
 			rlmSessionDir: options.sessionDir,
 			rlmParentNodeId: options.rlmParentNodeId,
 			rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
+			semanticParentSessionId: options.parentSession.sessionId,
+			semanticSpawnedByRequestId: options.spawnedByRequestId,
 			sessionStartEvent: { type: "session_start", reason: "startup" },
 		});
 		if (child.sessionName !== options.sessionName) {
@@ -10019,41 +10143,31 @@ export class AgentSession {
 		childId: string,
 		isExternallyRunning: () => boolean = () => false,
 	): Promise<"deleted" | "not_found" | "running"> {
-		const isRunning = (): boolean => {
-			const status = this._activeRlmChildRuns.get(childId)?.status;
-			return status === "queued" || status === "running" || isExternallyRunning();
-		};
-		if (isRunning()) {
-			return "running";
-		}
-		const subagent = [...(await this.listRlmSubagents()).subagents, ...this._rlmChildCleanupFailures.values()].find(
-			(entry) => entry.rlm_child_id === childId,
-		);
-		if (!subagent) {
-			for (const run of this._activeRlmChildRuns.values()) {
-				const result = await run.session?.deleteInactiveRlmSubagent(childId, isExternallyRunning);
-				if (result && result !== "not_found") {
-					return result;
-				}
-			}
-			for (const { session: retained } of this._rlmChildSessions.values()) {
-				const result = await retained.deleteInactiveRlmSubagent(childId, isExternallyRunning);
-				if (result !== "not_found") {
-					return result;
-				}
-			}
-			return "not_found";
-		}
-		if (isRunning()) {
-			return "running";
-		}
-		const result = await this._trackRlmSubagentDeletion(subagent, () => {
+		for (const owner of this._rlmSubtreeSessions()) {
+			const isRunning = (): boolean => {
+				const status = owner._activeRlmChildRuns.get(childId)?.status;
+				return status === "queued" || status === "running" || isExternallyRunning();
+			};
 			if (isRunning()) {
-				return Promise.resolve({ subagent, outcome: "skipped_running" });
+				return "running";
 			}
-			return this._deleteResolvedRlmSubagent(subagent);
-		});
-		return result.outcome === "skipped_running" ? "running" : "deleted";
+			const subagent = [
+				...(await owner.listRlmSubagents()).subagents,
+				...owner._rlmChildCleanupFailures.values(),
+			].find((entry) => entry.rlm_child_id === childId);
+			if (!subagent) continue;
+			if (isRunning()) {
+				return "running";
+			}
+			const result = await owner._trackRlmSubagentDeletion(subagent, () => {
+				if (isRunning()) {
+					return Promise.resolve({ subagent, outcome: "skipped_running" });
+				}
+				return owner._deleteResolvedRlmSubagent(subagent);
+			});
+			return result.outcome === "skipped_running" ? "running" : "deleted";
+		}
+		return "not_found";
 	}
 
 	async deleteRlmSubagent(target: string): Promise<RlmDeleteSubagentResult> {
@@ -10523,18 +10637,11 @@ export class AgentSession {
 
 	/** True when any direct or nested subagent is still running or queued. */
 	hasRunningRlmChildren(): boolean {
-		for (const run of this._activeRlmChildRuns.values()) {
-			if (run.status === "running" || run.status === "queued") {
-				return true;
-			}
-			if (run.session?.hasRunningRlmChildren()) {
-				return true;
-			}
-		}
-		// A finished direct child can still have a running nested subagent.
-		for (const { session } of this._rlmChildSessions.values()) {
-			if (session.hasRunningRlmChildren()) {
-				return true;
+		for (const session of this._rlmSubtreeSessions()) {
+			for (const run of session._activeRlmChildRuns.values()) {
+				if (run.status === "running" || run.status === "queued") {
+					return true;
+				}
 			}
 		}
 		return false;
@@ -10612,20 +10719,11 @@ export class AgentSession {
 
 	// Inline (non-daemon) mode only; daemon clients attach to the child session directly.
 	getRlmChildSession(childId: string): AgentSession | undefined {
-		const direct = this._activeRlmChildRuns.get(childId)?.session ?? this._rlmChildSessions.get(childId)?.session;
-		if (direct) {
-			return direct;
-		}
-		for (const candidate of this._activeRlmChildRuns.values()) {
-			const nested = candidate.session?.getRlmChildSession(childId);
-			if (nested) {
-				return nested;
-			}
-		}
-		for (const { session: retained } of this._rlmChildSessions.values()) {
-			const nested = retained.getRlmChildSession(childId);
-			if (nested) {
-				return nested;
+		for (const session of this._rlmSubtreeSessions()) {
+			const direct =
+				session._activeRlmChildRuns.get(childId)?.session ?? session._rlmChildSessions.get(childId)?.session;
+			if (direct) {
+				return direct;
 			}
 		}
 		return undefined;
@@ -10638,26 +10736,61 @@ export class AgentSession {
 	 * was suppressed; false when the id is unknown or the run already settled.
 	 */
 	cancelRlmChildRun(childId: string, reason = "Cancelled by user"): boolean {
-		const run = this._activeRlmChildRuns.get(childId);
-		if (run) {
-			if (run.status !== "running" && run.status !== "queued" && !run.settled) {
-				if (this._sessionInputPumpSuspended) this._abandonRlmRunForQuiescence(run);
-				else run.suppressTerminalNotice = true;
-				return true;
+		for (const session of this._rlmSubtreeSessions()) {
+			const run = session._activeRlmChildRuns.get(childId);
+			if (run) {
+				if (run.status !== "running" && run.status !== "queued" && !run.settled) {
+					if (session._sessionInputPumpSuspended) session._abandonRlmRunForQuiescence(run);
+					else run.suppressTerminalNotice = true;
+					return true;
+				}
+				// The abort cascade never reaches running work retained under a settled descendant.
+				const cancelled = session._cancelRlmChildRun(run, reason);
+				const descendantsCancelled = run.session?.cancelRunningRlmDescendants(reason) ?? false;
+				if (cancelled || descendantsCancelled) {
+					return true;
+				}
 			}
-			return this._cancelRlmChildRun(run, reason);
-		}
-		for (const candidate of this._activeRlmChildRuns.values()) {
-			if (candidate.session?.cancelRlmChildRun(childId, reason)) {
-				return true;
-			}
-		}
-		for (const { session: retained } of this._rlmChildSessions.values()) {
-			if (retained.cancelRlmChildRun(childId, reason)) {
+			// A fruitless match keeps walking: child ids are only mkdir-unique among
+			// siblings, so a colliding live run elsewhere must stay reachable.
+			if (session._rlmChildSessions.get(childId)?.session.cancelRunningRlmDescendants(reason)) {
 				return true;
 			}
 		}
 		return false;
+	}
+
+	// A done child sits in BOTH maps until passivation; the visited set keeps that dual membership from doubling the walk.
+	private *_rlmSubtreeSessions(): Generator<AgentSession> {
+		const visited = new Set<AgentSession>([this]);
+		const stack: AgentSession[] = [this];
+		while (stack.length > 0) {
+			const session = stack.pop()!;
+			yield session;
+			for (const run of session._activeRlmChildRuns.values()) {
+				if (run.session && !visited.has(run.session)) {
+					visited.add(run.session);
+					stack.push(run.session);
+				}
+			}
+			for (const { session: retained } of session._rlmChildSessions.values()) {
+				if (!visited.has(retained)) {
+					visited.add(retained);
+					stack.push(retained);
+				}
+			}
+		}
+	}
+
+	/** Cancel every running or queued run in this session's subtree. */
+	cancelRunningRlmDescendants(reason = "Cancelled by user"): boolean {
+		let cancelled = false;
+		for (const session of this._rlmSubtreeSessions()) {
+			for (const run of session._activeRlmChildRuns.values()) {
+				if (session._cancelRlmChildRun(run, reason)) cancelled = true;
+			}
+		}
+		return cancelled;
 	}
 
 	private async _assertRlmSubagentSessionNameAvailable(name: string, ignorePendingReservation = false): Promise<void> {
@@ -10746,6 +10879,8 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
+		// Capture the parent turn before async runtime construction can change it.
+		const spawnedByRequestId = this.isStreaming ? this._semanticEdges.lastTurnRequestId : undefined;
 		const { name: rawName, model: rawModel, reasoning: rawReasoning, thinking: rawThinking, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
@@ -10852,6 +10987,7 @@ export class AgentSession {
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
 				thinkingLevel: requestedThinkingLevel?.level,
+				spawnedByRequestId,
 			}),
 			onSessionPublished: publishChildSession,
 		};
@@ -10946,7 +11082,6 @@ export class AgentSession {
 						}
 						const text = compactRlmText(readAssistantText(assistant));
 						if (text) run.answerPreview = text;
-						void flushAgentTraceUpload(child.sessionManager).catch(() => undefined);
 						emitChildUpdate();
 					} else if (event.type === "message_start" || event.type === "message_update") {
 						if (event.message.role === "assistant") {
@@ -10997,6 +11132,11 @@ export class AgentSession {
 				await child.waitForRlmQuiescence();
 				if (run.error) throw new Error(run.error);
 				run.status = "done";
+				// Only successful completions return; the edge lands on the parent's next commit.
+				const childLastCommitted = child.semanticEdges.lastCommittedRequestId;
+				if (childLastCommitted !== undefined) {
+					this._semanticEdges.recordChildReturned(child.sessionId, childLastCommitted);
+				}
 				run.durationMs = Date.now() - startedAt;
 				run.activity = undefined;
 				emitChildUpdate();
@@ -11030,6 +11170,13 @@ export class AgentSession {
 				if (run.status !== "cancelled") {
 					run.status = "error";
 					run.error = runError.message;
+				}
+				// A failed child still returns an error outcome the parent consumes;
+				// cancelled runs and zero-commit children return nothing.
+				const failedChild = childSession ?? childRuntime?.session;
+				const failedLastCommitted = failedChild?.semanticEdges.lastCommittedRequestId;
+				if (run.status === "error" && failedChild && failedLastCommitted !== undefined) {
+					this._semanticEdges.recordChildReturned(failedChild.sessionId, failedLastCommitted);
 				}
 				run.durationMs = Date.now() - startedAt;
 				run.activity = undefined;
@@ -11357,6 +11504,11 @@ export class AgentSession {
 		}
 
 		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		// Park now: the retry re-issues the failed call and must reuse its Idempotency-Key.
+		// Payload hooks mutate the wire body after the hash point, so reuse is forfeited.
+		if (!this._extensionRunner.hasHandlers("before_provider_request")) {
+			this._semanticEdges.prepareTurnRetry();
+		}
 
 		this._emit({
 			type: "auto_retry_start",
@@ -11907,6 +12059,7 @@ export class AgentSession {
 
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;
+			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const model = this.model!;
 				const { apiKey, headers } = await this._getRequiredRequestAuth(model);
@@ -11927,6 +12080,7 @@ export class AgentSession {
 					throw new Error(result.error);
 				}
 				summaryText = result.summary;
+				summaryUsage = result.usage;
 				summaryDetails = {
 					readFiles: result.readFiles || [],
 					modifiedFiles: result.modifiedFiles || [],
@@ -11962,6 +12116,7 @@ export class AgentSession {
 					summaryText,
 					summaryDetails,
 					fromExtension,
+					summaryUsage,
 				);
 				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
 
@@ -12130,6 +12285,22 @@ export class AgentSession {
 
 	private _contextWindowResolver(): ContextWindowResolver {
 		return (provider, modelId) => this._modelRegistry.find(provider, modelId)?.contextWindow;
+	}
+
+	private _ownUsageMemo?: { count: number; tailId: string | undefined; usage: SessionUsageSummary | undefined };
+
+	// Whole-file own spend, identical to the catalog scan so rows never shift at passivation.
+	getOwnUsageSummary(): SessionUsageSummary | undefined {
+		const entries = this.sessionManager.getEntries();
+		const tailId = entries.at(-1)?.id;
+		const memo = this._ownUsageMemo;
+		if (memo && memo.count === entries.length && memo.tailId === tailId) {
+			return memo.usage;
+		}
+		const { ownUsage } = computeOwnAndTotalUsage(entries, entries);
+		const usage = sessionUsageSummaryFrom(ownUsage);
+		this._ownUsageMemo = { count: entries.length, tailId, usage };
+		return usage;
 	}
 
 	/**

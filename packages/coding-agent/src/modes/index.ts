@@ -45,6 +45,7 @@ export {
 	buildAgentsViewSectionRows,
 	buildUnifiedSessionIndex,
 	classifyAgentsViewSession,
+	computeRecursiveCosts,
 	createUnattachableChildOpenResult,
 	filterUnifiedSessions,
 	formatAgentsViewSectionHeadingLabel,

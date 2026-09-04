@@ -31,6 +31,7 @@ import {
 	type SessionEntry,
 } from "../session-manager.js";
 import type { CompactionMode } from "../settings-manager.js";
+import { addAssistantUsage, emptyUsage } from "../usage.js";
 import {
 	appendCompactionIntegrityNotices,
 	computeFileLists,
@@ -60,6 +61,16 @@ export interface CompactionDetails {
 		seededFromCheckpoint: boolean;
 	};
 }
+
+export interface SummarySlice {
+	summary: string;
+	usage?: Usage;
+}
+
+/** Runs one summary wire call; hosts decorate each call with its own request identity. */
+export type SummaryCallRunner = <T>(
+	call: (callHeaders: Record<string, string> | undefined) => Promise<T>,
+) => Promise<T>;
 
 /**
  * Extract file operations from messages and previous compaction entries.
@@ -146,6 +157,8 @@ export interface CompactionResult<T = unknown> {
 	tokensBefore: number;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
+	/** What the summarization calls billed; persisted on the compaction entry. */
+	usage?: Usage;
 	mechanism?: CompactionMechanism;
 	remoteCompaction?: RemoteCompactionState;
 	fallback?: CompactionFallback;
@@ -157,6 +170,7 @@ export function projectCompactionResultForExternalUse<T>(result: CompactionResul
 		firstKeptEntryId: result.firstKeptEntryId,
 		tokensBefore: result.tokensBefore,
 		details: result.details,
+		usage: result.usage,
 	};
 }
 
@@ -681,6 +695,7 @@ interface RollingSummaryOptions {
 	failurePrefix: string;
 	/** Chunk ceiling for this pass; split-turn passes share the global budget. */
 	maxChunks?: number;
+	summaryCall?: SummaryCallRunner;
 }
 
 /**
@@ -688,8 +703,10 @@ interface RollingSummaryOptions {
  * capped request count, and deterministic integrity notices. Every summarization path
  * goes through here so none can issue an unbounded single-shot request.
  */
-async function runRollingSummary(options: RollingSummaryOptions): Promise<string> {
+async function runRollingSummary(options: RollingSummaryOptions): Promise<SummarySlice> {
 	const { model, reserveTokens, maxTokens, apiKey, prompts, headers, signal, thinkingLevel } = options;
+	const summaryCall: SummaryCallRunner = options.summaryCall ?? ((call) => call(headers));
+	let usage: Usage | undefined;
 	const requestLimit = summaryRequestByteLimit(model, reserveTokens, maxTokens);
 	const chunks = splitConversationForSummary(
 		convertToLlm(options.messages),
@@ -717,24 +734,34 @@ async function runRollingSummary(options: RollingSummaryOptions): Promise<string
 		const bytes = Buffer.byteLength(promptText, "utf8");
 		if (bytes > requestLimit)
 			throw new Error(`Summary request exceeds safe UTF-8 byte budget (${bytes} > ${requestLimit})`);
-		const response = await completeSimple(
-			model,
-			{
-				systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-				messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
-			},
-			model.reasoning && thinkingLevel && thinkingLevel !== "off"
-				? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-				: { maxTokens, signal, apiKey, headers },
-		);
-		if (response.stopReason === "error")
-			throw new Error(`${options.failurePrefix}: ${response.errorMessage || "Unknown error"}`);
+		const response = await summaryCall(async (callHeaders) => {
+			if (signal?.aborted) throw new Error("Compaction cancelled");
+			const result = await completeSimple(
+				model,
+				{
+					systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+					messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
+				},
+				model.reasoning && thinkingLevel && thinkingLevel !== "off"
+					? { maxTokens, signal, apiKey, headers: callHeaders, reasoning: thinkingLevel }
+					: { maxTokens, signal, apiKey, headers: callHeaders },
+			);
+			if (result.stopReason === "error")
+				throw new Error(`${options.failurePrefix}: ${result.errorMessage || "Unknown error"}`);
+			if (result.stopReason === "aborted" || signal?.aborted) throw new Error("Compaction cancelled");
+			return result;
+		});
+		usage ??= emptyUsage();
+		addAssistantUsage(usage, response.usage);
 		rollingSummary = response.content
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
 			.map((c) => c.text)
 			.join("\n");
 	}
-	return appendCompactionIntegrityNotices(rollingSummary || options.emptyResult, integrityNotices);
+	return {
+		summary: appendCompactionIntegrityNotices(rollingSummary || options.emptyResult, integrityNotices),
+		usage,
+	};
 }
 
 /** Generate a summary with byte-bounded, rolling partwise compaction. */
@@ -749,10 +776,12 @@ export async function generateSummary(
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
 	maxChunks?: number,
-): Promise<string> {
+	summaryCall?: SummaryCallRunner,
+): Promise<SummarySlice> {
 	return runRollingSummary({
 		messages: currentMessages,
 		maxChunks,
+		summaryCall,
 		model,
 		reserveTokens,
 		maxTokens: Math.floor(0.8 * reserveTokens),
@@ -970,6 +999,7 @@ export async function compact(
 	customInstructions?: string,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	summaryCall: SummaryCallRunner = (call) => call(headers),
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -984,6 +1014,7 @@ export async function compact(
 		settings,
 	} = preparation;
 	let summary: string;
+	const slices: SummarySlice[] = [];
 
 	// Continuity bridge: a prior provider-native checkpoint that the active model
 	// cannot replay natively is carried forward as digest text instead of being
@@ -1023,8 +1054,9 @@ export async function compact(
 						effectivePreviousSummary,
 						thinkingLevel,
 						MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
+						summaryCall,
 					)
-				: Promise.resolve("No prior history."),
+				: Promise.resolve<SummarySlice>({ summary: effectivePreviousSummary ?? "No prior history." }),
 			generateTurnPrefixSummary(
 				turnPrefixMessages,
 				model,
@@ -1034,11 +1066,13 @@ export async function compact(
 				signal,
 				thinkingLevel,
 				MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
+				summaryCall,
 			),
 		]);
-		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
+		slices.push(historyResult, turnPrefixResult);
+		summary = `${historyResult.summary}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.summary}`;
 	} else {
-		summary = await generateSummary(
+		const result = await generateSummary(
 			messagesToSummarize,
 			model,
 			settings.reserveTokens,
@@ -1048,7 +1082,11 @@ export async function compact(
 			customInstructions,
 			effectivePreviousSummary,
 			thinkingLevel,
+			undefined,
+			summaryCall,
 		);
+		slices.push(result);
+		summary = result.summary;
 	}
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
@@ -1058,12 +1096,19 @@ export async function compact(
 		throw new Error("First kept entry has no UUID - session may need migration");
 	}
 
+	let usage: Usage | undefined;
+	for (const slice of slices) {
+		if (!slice.usage) continue;
+		usage ??= emptyUsage();
+		addAssistantUsage(usage, slice.usage);
+	}
 	return {
 		summary,
 		firstKeptEntryId,
 		tokensBefore,
 		details: { readFiles, modifiedFiles } as CompactionDetails,
 		mechanism: "local",
+		usage,
 	};
 }
 
@@ -1078,24 +1123,29 @@ export async function completeSummaryText(
 	signal: AbortSignal | undefined,
 	thinkingLevel: ThinkingLevel | undefined,
 	failurePrefix: string,
+	summaryCall: SummaryCallRunner = (call) => call(headers),
+	onUsage?: (usage: Usage) => void,
 ): Promise<string> {
 	const bytes = Buffer.byteLength(promptText, "utf8");
 	if (bytes > requestLimit)
 		throw new Error(`${failurePrefix}: request exceeds safe UTF-8 byte budget (${bytes} > ${requestLimit})`);
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-			messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
-		},
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
-	);
-	if (response.stopReason === "error")
-		throw new Error(`${failurePrefix}: ${response.errorMessage || "Unknown error"}`);
-	// An aborted response carries no usable summary; never let it be stored or merged.
-	if (response.stopReason === "aborted") throw new Error("Compaction cancelled");
+	const response = await summaryCall(async (callHeaders) => {
+		if (signal?.aborted) throw new Error("Compaction cancelled");
+		const result = await completeSimple(
+			model,
+			{
+				systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+				messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
+			},
+			model.reasoning && thinkingLevel && thinkingLevel !== "off"
+				? { maxTokens, signal, apiKey, headers: callHeaders, reasoning: thinkingLevel }
+				: { maxTokens, signal, apiKey, headers: callHeaders },
+		);
+		if (result.stopReason === "error") throw new Error(`${failurePrefix}: ${result.errorMessage || "Unknown error"}`);
+		if (result.stopReason === "aborted" || signal?.aborted) throw new Error("Compaction cancelled");
+		return result;
+	});
+	onUsage?.(response.usage);
 	return response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map((c) => c.text)
@@ -1404,10 +1454,12 @@ async function generateTurnPrefixSummary(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	maxChunks?: number,
-): Promise<string> {
+	summaryCall?: SummaryCallRunner,
+): Promise<SummarySlice> {
 	return runRollingSummary({
 		messages,
 		maxChunks,
+		summaryCall,
 		model,
 		reserveTokens,
 		maxTokens: Math.floor(0.5 * reserveTokens), // Smaller budget for turn prefix
