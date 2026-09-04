@@ -1,0 +1,1 @@
+- Fixed unary Responses compaction to preserve caller request identifiers over session affinity regardless of header casing.

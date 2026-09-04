@@ -78,6 +78,64 @@ describe("OpenAI Responses remote compaction", () => {
 		expect(result.items.at(-1)).toEqual(compactionItem);
 	});
 
+	it.each(["x-client-request-id", "X-Client-Request-Id"])(
+		"honors caller %s over model and session identities without duplicate values",
+		async (requestIdHeader) => {
+			const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+				const headers = new Headers(init?.headers);
+				expect(headers.get("x-client-request-id")).toBe("caller-request");
+				expect(headers.get("session_id")).toBe("session-default");
+				expect(headers.get("authorization")).toBe("Bearer test-key");
+				expect(headers.get("content-type")).toBe("application/json");
+				expect(headers.get("x-model-header")).toBe("model-value");
+				expect(headers.get("x-caller-header")).toBe("caller-value");
+				expect(JSON.parse(String(init?.body)).prompt_cache_key).toBe("session-default");
+				return new Response(JSON.stringify({ output: [compactionItem] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			});
+			vi.stubGlobal("fetch", fetchMock);
+			await compactOpenAIResponses(
+				{ ...model, headers: { "X-CLIENT-REQUEST-ID": "model-request", "X-Model-Header": "model-value" } },
+				{ messages: [] },
+				{
+					apiKey: "test-key",
+					sessionId: "session-default",
+					headers: { [requestIdHeader]: "caller-request", "X-Caller-Header": "caller-value" },
+					maxRetries: 0,
+				},
+			);
+			expect(fetchMock).toHaveBeenCalledOnce();
+		},
+	);
+
+	it.each([true, false])(
+		"retains session request identity with sendSessionIdHeader=%s",
+		async (sendSessionIdHeader) => {
+			const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+				const headers = new Headers(init?.headers);
+				expect(headers.get("x-client-request-id")).toBe("session-default");
+				expect(headers.get("session_id")).toBe(sendSessionIdHeader ? "session-default" : null);
+				return new Response(JSON.stringify({ output: [compactionItem] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			});
+			vi.stubGlobal("fetch", fetchMock);
+			await compactOpenAIResponses(
+				{
+					...model,
+					headers: { "X-Client-Request-Id": "model-request" },
+					compat: { ...model.compat, sendSessionIdHeader },
+				},
+				{ messages: [] },
+				{ apiKey: "test-key", sessionId: "session-default", maxRetries: 0 },
+			);
+			expect(fetchMock).toHaveBeenCalledOnce();
+		},
+	);
+
 	it("replays matching opaque items natively and drops foreign scope", () => {
 		const matching = createOpenAIResponsesCompactionMessage("cpa-r", "gpt-test", [compactionItem], 1);
 		const foreign = createOpenAIResponsesCompactionMessage("other", "gpt-test", [compactionItem], 1);

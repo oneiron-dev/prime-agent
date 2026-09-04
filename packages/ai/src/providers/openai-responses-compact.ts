@@ -60,8 +60,22 @@ async function createClient(model: Model<"openai-responses">, options: OpenAIRes
 		if (model.compat?.sendSessionIdHeader !== false) {
 			headers.session_id = options.sessionId;
 		}
-		headers["x-client-request-id"] = options.sessionId;
 	}
+	// Per-call identity overrides session affinity; normalize casing to avoid duplicate values.
+	let requestId: string | undefined;
+	for (const source of [
+		model.headers,
+		options.sessionId ? { "x-client-request-id": options.sessionId } : undefined,
+		options.headers,
+	]) {
+		for (const [name, value] of Object.entries(source ?? {})) {
+			if (name.toLowerCase() === "x-client-request-id") requestId = value;
+		}
+	}
+	for (const name of Object.keys(headers)) {
+		if (name.toLowerCase() === "x-client-request-id") delete headers[name];
+	}
+	if (requestId !== undefined) headers["x-client-request-id"] = requestId;
 	const defaultHeaders =
 		model.provider === "cloudflare-ai-gateway"
 			? {
