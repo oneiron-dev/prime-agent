@@ -1,0 +1,1 @@
+- Added optional factory commands with durable local and SSH foreground workers, restart recovery, owner pauses, and verified Git source fingerprints.

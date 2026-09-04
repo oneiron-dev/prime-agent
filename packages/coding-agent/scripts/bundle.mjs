@@ -33,7 +33,11 @@ try {
 rmSync(outdir, { recursive: true, force: true });
 
 await build({
-	entryPoints: [join(packageDir, "dist", "cli.js")],
+	entryPoints: {
+		cli: join(packageDir, "dist", "cli.js"),
+		"factory-cli": join(packageDir, "dist", "factory", "cli-entry.js"),
+		"factory-manage": join(packageDir, "dist", "factory", "manage-entry.js"),
+	},
 	outdir,
 	bundle: true,
 	splitting: true,

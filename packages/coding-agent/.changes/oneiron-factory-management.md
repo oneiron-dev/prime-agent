@@ -1,0 +1,1 @@
+- Added on-demand model decisions for factory work, with bounded evidence and checks for stale plans and attempts.

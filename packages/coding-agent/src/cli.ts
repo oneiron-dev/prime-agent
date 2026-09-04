@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // The Node 22+ module graph fails at link time on older Node, so it must load
 // behind the dynamic import, after the dependency-free guard runs.
+import { maybeRunFactory } from "./cli/factory-launch.js";
 import { assertNodeVersion } from "./cli/node-version-check.js";
 
 const supported = assertNodeVersion({
@@ -9,7 +10,7 @@ const supported = assertNodeVersion({
 	exit: (code) => process.exit(code),
 });
 
-if (supported) {
+if (supported && !(await maybeRunFactory(process.argv.slice(2)))) {
 	const { runCli } = await import("./cli-main.js");
 	await runCli();
 }

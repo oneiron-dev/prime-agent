@@ -11,6 +11,12 @@ export interface CommandSpec {
 
 export const COMMAND_SPECS: readonly CommandSpec[] = [
 	{
+		path: ["factory"],
+		usage: "factory <init|import|status|events|fingerprint|tick|run|pause|resume|decide>",
+		summary: "Run the optional durable code factory",
+		description: "Factory mode runs separately from Prime sessions. Run factory help for commands.",
+	},
+	{
 		path: ["help"],
 		usage: "help [command]",
 		summary: "Show command help",
