@@ -1,0 +1,1 @@
+- Reduced session-journal growth by coalescing child usage at settlement or periodic checkpoints while preserving accounting across concurrent children and teardown, and suppressed fabricated or duplicate idle statuses and unbounded retries on unchanged content.

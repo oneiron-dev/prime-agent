@@ -1518,6 +1518,7 @@ export class SessionManager {
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
+	private readonly assistantUsageForPersistence = new WeakMap<AssistantMessage, Usage>();
 
 	private constructor(
 		cwd: string,
@@ -1659,9 +1660,22 @@ export class SessionManager {
 		}
 	}
 
+	/** Keep live child-usage folds out of journal rewrites until attributed durably. */
+	preserveAssistantUsageForPersistence(message: AssistantMessage): void {
+		if (!this.assistantUsageForPersistence.has(message)) {
+			this.assistantUsageForPersistence.set(message, cloneUsage(message.usage));
+		}
+	}
+
+	private _entryForPersistence(entry: FileEntry): FileEntry {
+		if (entry.type !== "message" || entry.message.role !== "assistant") return entry;
+		const usage = this.assistantUsageForPersistence.get(entry.message);
+		return usage ? { ...entry, message: { ...entry.message, usage } } : entry;
+	}
+
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
+		const content = `${this.fileEntries.map((e) => JSON.stringify(this._entryForPersistence(e))).join("\n")}\n`;
 		const targetPath = realpathIfPresent(this.sessionFile);
 		const directory = dirname(targetPath);
 		mkdirSync(directory, { recursive: true });
@@ -1785,7 +1799,7 @@ export class SessionManager {
 			this.flushed = true;
 		} else {
 			mkdirSync(dirname(this.sessionFile), { recursive: true });
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			appendFileSync(this.sessionFile, `${JSON.stringify(this._entryForPersistence(entry))}\n`);
 			this._notifyPersistListeners();
 		}
 	}
@@ -1904,7 +1918,9 @@ export class SessionManager {
 			throw new Error(`Assistant message entry ${targetId} not found`);
 		}
 
-		target.message.usage = cloneUsage(aggregateUsage);
+		const message = target.message;
+		const previousUsage = message.usage;
+		const previousPersistedUsage = this.assistantUsageForPersistence.get(message);
 		const entry: ChildUsageAttributionEntry = {
 			type: "child_usage_attributed",
 			id: generateId(this.byId),
@@ -1915,8 +1931,19 @@ export class SessionManager {
 			aggregateUsage: cloneUsage(aggregateUsage),
 			...(origin ? { origin } : {}),
 		};
-		this._appendEntry(entry);
-		return entry.id;
+		return this._appendEntryWithRollback(
+			() => {
+				message.usage = cloneUsage(aggregateUsage);
+				this.assistantUsageForPersistence.set(message, cloneUsage(aggregateUsage));
+				this._appendEntry(entry);
+				return entry.id;
+			},
+			() => {
+				message.usage = previousUsage;
+				if (previousPersistedUsage) this.assistantUsageForPersistence.set(message, previousPersistedUsage);
+				else this.assistantUsageForPersistence.delete(message);
+			},
+		);
 	}
 
 	appendSessionInfo(name: string): string {
@@ -2087,13 +2114,14 @@ export class SessionManager {
 		return this._appendEntryWithRollback(() => this.appendCustomMessageEntry(customType, content, display, details));
 	}
 
-	private _appendEntryWithRollback(append: () => string): string {
+	private _appendEntryWithRollback(append: () => string, restoreState?: () => void): string {
 		const previousLeafId = this.leafId;
 		try {
 			const entryId = append();
 			this.flushNow();
 			return entryId;
 		} catch (error) {
+			restoreState?.();
 			// The append indexes the entry before persisting it; undo exactly that.
 			if (this.leafId !== null && this.leafId !== previousLeafId) {
 				this.byId.delete(this.leafId);

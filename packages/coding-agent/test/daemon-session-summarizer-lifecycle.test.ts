@@ -27,6 +27,7 @@ function makeState(
 				sessionManager: {
 					appendAgentStatus: (s: unknown) => appended.push(s),
 					getLatestAgentStatus: () => opts.persisted,
+					getLeafId: () => null,
 				},
 			},
 		},
@@ -72,7 +73,7 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 		expect(state.summaryState).toMatchObject({ taskState: "needs_input", basedOnMessageCount: 2 });
 	});
 
-	test("a blank fallback settles repeated idle sweeps without more generation or persistence", async () => {
+	test("a blank fallback caps repeated idle generation and never persists fabricated status", async () => {
 		vi.useFakeTimers();
 		const generate = vi.fn().mockResolvedValue(undefined);
 		const state = makeState({ working: false });
@@ -84,15 +85,15 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
 		expect(generate).toHaveBeenCalledOnce();
 		expect(state.summaryState).toEqual({ summary: "", taskState: "needs_input", basedOnMessageCount: 2 });
-		expect(appended).toHaveLength(1);
+		expect(appended).toHaveLength(0);
 
 		await vi.advanceTimersByTimeAsync(SWEEP_MS * 3);
-		expect(generate).toHaveBeenCalledOnce();
-		expect(appended).toHaveLength(1);
+		expect(generate).toHaveBeenCalledTimes(3);
+		expect(appended).toHaveLength(0);
 		summarizer.stop();
 	});
 
-	test("a changed message count permits one fresh attempt and persistence after a blank fallback", async () => {
+	test("new content retries a blank fallback without persisting it", async () => {
 		vi.useFakeTimers();
 		const generate = vi.fn().mockResolvedValue(undefined);
 		const summarizer = new DaemonSessionSummarizer(() => [], undefined, generate);
@@ -102,7 +103,7 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 		summarizer.notifyActivity(state);
 		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
 		expect(state.summaryState).toEqual({ summary: "", taskState: "needs_input", basedOnMessageCount: 2 });
-		expect(appended).toHaveLength(1);
+		expect(appended).toHaveLength(0);
 
 		(state.runtime.session.messages as unknown[]).push({ role: "user", content: "new task" });
 		summarizer.notifyActivity(state);
@@ -110,15 +111,31 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 		expect(generate).toHaveBeenCalledTimes(2);
 		expect(generate.mock.calls[1]?.[0].messages).toHaveLength(3);
 		expect(state.summaryState).toEqual({ summary: "", taskState: "needs_input", basedOnMessageCount: 3 });
-		expect(appended).toEqual([
-			{ summary: "", taskState: "needs_input", basedOnMessageCount: 2 },
-			{ summary: "", taskState: "needs_input", basedOnMessageCount: 3 },
-		]);
+		expect(appended).toHaveLength(0);
 
 		summarizer.notifyActivity(state);
 		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
-		expect(generate).toHaveBeenCalledTimes(2);
-		expect(appended).toHaveLength(2);
+		expect(generate).toHaveBeenCalledTimes(3);
+		expect(appended).toHaveLength(0);
+	});
+
+	test("new content settles a stale nonblank verdict in memory when classification fails", async () => {
+		vi.useFakeTimers();
+		const generate = vi.fn().mockResolvedValue(undefined);
+		const state = makeState({ working: false, messages: 3 });
+		state.summaryState = { summary: "Previous task complete", taskState: "completed", basedOnMessageCount: 2 };
+		const summarizer = new DaemonSessionSummarizer(() => [], undefined, generate);
+
+		summarizer.notifyActivity(state);
+		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
+
+		expect(generate).toHaveBeenCalledOnce();
+		expect(state.summaryState).toEqual({
+			summary: "Previous task complete",
+			taskState: "needs_input",
+			basedOnMessageCount: 3,
+		});
+		expect((state as unknown as { appendedStatuses: unknown[] }).appendedStatuses).toHaveLength(0);
 	});
 
 	test("refreshes a working session even when the message count is unchanged", async () => {

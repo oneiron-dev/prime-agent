@@ -432,3 +432,39 @@ describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
 		expect(readFileSync(file)).toEqual(before);
 	});
 });
+
+describe("SessionManager.appendChildUsageAttribution rollback", () => {
+	it.each([false, true])("restores usage and indexes after a torn attribution (repair fails: %s)", (repairFails) => {
+		const { mgr, file, before } = createPersistedSessionForRollbackTest();
+		const target = mgr.getLeafEntry();
+		if (target?.type !== "message" || target.message.role !== "assistant") throw new Error("missing assistant");
+		const previousUsage = structuredClone(target.message.usage);
+		const childUsage = { ...previousUsage, input: 2, output: 3, totalTokens: 5 };
+		const aggregateUsage = { ...previousUsage, input: 3, output: 4 };
+		const previousCount = mgr.getEntries().length;
+		const originalPersist = mgr._persist.bind(mgr);
+		failNextOutcomeAppend(mgr, file);
+		if (repairFails) fsMocks.writeFileSync.mockImplementationOnce(failAfterPartialTempWrite);
+
+		expect(() => mgr.appendChildUsageAttribution(target.id, childUsage, aggregateUsage, "spawn_task")).toThrow(
+			"append failed",
+		);
+		mgr._persist = originalPersist;
+
+		expect(mgr.getLeafId()).toBe(target.id);
+		expect(mgr.getEntries()).toHaveLength(previousCount);
+		expect(target.message.usage).toEqual(previousUsage);
+		if (repairFails) {
+			expect(readFileSync(file).subarray(0, before.length)).toEqual(before);
+			mgr.flushNow();
+		}
+		expect(readFileSync(file)).toEqual(before);
+
+		mgr.appendChildUsageAttribution(target.id, childUsage, aggregateUsage, "spawn_task");
+		const reloaded = SessionManager.open(file);
+		const attributions = reloaded.getEntries().filter((entry) => entry.type === "child_usage_attributed");
+		expect(attributions).toHaveLength(1);
+		const attribution = attributions[0]!;
+		expect(attribution.aggregateUsage.input - attribution.childUsage.input).toBe(previousUsage.input);
+	});
+});

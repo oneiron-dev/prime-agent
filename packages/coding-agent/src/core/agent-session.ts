@@ -279,7 +279,13 @@ import {
 	type WakePolicy,
 } from "./session-action-store.js";
 import { type ChildKernelCacheCleanupResult, pruneDeletedChildKernelCaches } from "./session-file-actions.js";
-import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
+import type {
+	BranchSummaryEntry,
+	ChildUsageAttributionEntry,
+	CompactionEntry,
+	SessionContext,
+	SessionMessageEntry,
+} from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
@@ -305,7 +311,14 @@ import { type BashOperations, createLocalBashOperations, DEFAULT_COMMAND_TIMEOUT
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
-import { addAssistantUsage, emptyUsage, type SessionUsageSummary, sessionUsageSummaryFrom } from "./usage.js";
+import {
+	addAssistantUsage,
+	cloneUsage,
+	emptyUsage,
+	type SessionUsageSummary,
+	sessionUsageSummaryFrom,
+	subtractAssistantUsage,
+} from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
 export type { GoalState, GoalStatus } from "./goals.js";
@@ -953,6 +966,7 @@ interface RlmChildRun {
 	completeDeletion?: () => Promise<void>;
 	reportDeletionCleanupFailure?: (error: unknown) => Promise<void>;
 	emitUpdate?: () => void;
+	flushUsage?: () => void;
 	lastEmittedUpdate?: string;
 	unsubscribe?: () => void;
 }
@@ -1072,6 +1086,26 @@ function waitForPromiseOrAbort<T>(
 			},
 		);
 	});
+}
+
+// Bounds how much accumulated child usage a parent process crash can lose.
+const RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS = 60_000;
+
+/** Label a child completion's usage by the nearest preceding prompt that triggered it. */
+function rlmChildUsageOrigin(
+	messages: readonly AgentMessage[],
+	assistant: AssistantMessage,
+): ChildUsageAttributionEntry["origin"] {
+	for (let index = messages.lastIndexOf(assistant) - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "user" && message.role !== "custom") continue;
+		return message.role === "custom" && isAgentSessionMessage(message)
+			? message.details.id.startsWith("spawn:")
+				? "spawn_task"
+				: "agent_message"
+			: "direct_user";
+	}
+	return "direct_user";
 }
 
 function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
@@ -1241,6 +1275,13 @@ export class AgentSession {
 	// Kept alive for retained children so nested updates (e.g. a grandchild cancel)
 	// still forward to root; torn down when the retained child is disposed.
 	private _rlmChildUnsubscribes = new Map<string, () => void>();
+	private readonly _rlmDurableChildUsage = new WeakMap<AssistantMessage, Usage>();
+	private readonly _pendingRlmChildUsageBatches = new Map<
+		ReadonlyMap<ChildUsageAttributionEntry["origin"], Usage>,
+		AssistantMessage
+	>();
+	private _persistingRlmChildUsage = false;
+	private readonly _rlmChildUsageFlushes = new Set<() => void>();
 	/** Latest recap for this session, written by the daemon summarizer; read by a parent to label its child snapshots. */
 	private _currentRecap?: string;
 
@@ -3964,6 +4005,7 @@ export class AgentSession {
 	 * the latest state reaches disk instead of racing process exit.
 	 */
 	async disposeAsync(options?: { kernelSnapshot?: boolean }): Promise<void> {
+		this._flushRlmChildUsageAttributions();
 		if (this._disposed) {
 			return this._disposeCallbacksPromise;
 		}
@@ -4184,6 +4226,7 @@ export class AgentSession {
 			return;
 		}
 		this._disposed = true;
+		this._flushRlmChildUsageAttributions();
 		for (const run of this._unsettledRlmChildRuns) run.suppressTerminalNotice = true;
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
 		this._sessionActionCommitDisposeAbortController.abort();
@@ -9999,6 +10042,11 @@ export class AgentSession {
 		this._maybeResumeGoalContinuationAfterRlmWork();
 	}
 
+	private _flushRlmChildUsageAttributions(): void {
+		for (const flush of this._rlmChildUsageFlushes) flush();
+		if (this._disposed) this._rlmChildUsageFlushes.clear();
+	}
+
 	private _cancelActiveRlmChildRuns(reason: string): void {
 		for (const run of this._activeRlmChildRuns.values()) {
 			this._cancelRlmChildRun(run, reason);
@@ -10009,6 +10057,7 @@ export class AgentSession {
 		if (run.status !== "running" && run.status !== "queued") {
 			return false;
 		}
+		run.flushUsage?.();
 		run.status = "cancelled";
 		if (this._sessionInputPumpSuspended) this._abandonRlmRunForQuiescence(run);
 		run.error = reason;
@@ -10947,6 +10996,72 @@ export class AgentSession {
 		}
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
+		if (parentAssistantForUsage && !this._rlmDurableChildUsage.has(parentAssistantForUsage)) {
+			this._rlmDurableChildUsage.set(parentAssistantForUsage, cloneUsage(parentAssistantForUsage.usage));
+			this.sessionManager.preserveAssistantUsageForPersistence(parentAssistantForUsage);
+		}
+		// Child completions accumulate per origin and flush one durable entry per
+		// settle boundary (agent_end, settlement); the staleness checkpoints and
+		// timer bound crash loss to one window of accumulated usage.
+		const pendingChildUsage = new Map<ChildUsageAttributionEntry["origin"], Usage>();
+		let pendingChildUsageSince = 0;
+		let pendingChildUsageTimer: ReturnType<typeof setTimeout> | undefined;
+		let childUsageSubscriptionClosed = false;
+		const flushPendingChildUsageAttribution = () => {
+			if (pendingChildUsageTimer !== undefined) {
+				clearTimeout(pendingChildUsageTimer);
+				pendingChildUsageTimer = undefined;
+			}
+			if (pendingChildUsage.size === 0 || !parentAssistantForUsage) return;
+			const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
+			if (!parentEntry) return;
+			const batches = [...pendingChildUsage.entries()];
+			pendingChildUsage.clear();
+			this._pendingRlmChildUsageBatches.delete(pendingChildUsage);
+			for (const [origin, childUsage] of batches) {
+				const pendingTargets = new Set([parentAssistantForUsage, ...this._pendingRlmChildUsageBatches.values()]);
+				const liveUsages = new Map([...pendingTargets].map((target) => [target, target.usage]));
+				const wasPersisting = this._persistingRlmChildUsage;
+				this._persistingRlmChildUsage = true;
+				this._ownUsageMemo = undefined;
+				// Rollback may rewrite the whole journal; no pending target may leak into it.
+				for (const target of pendingTargets) target.usage = cloneUsage(this._rlmDurableChildUsage.get(target)!);
+				const aggregate = cloneUsage(this._rlmDurableChildUsage.get(parentAssistantForUsage)!);
+				// Every journal prefix excludes other siblings' and origins' pending deltas.
+				attributeChildUsage(aggregate, childUsage);
+				try {
+					this.sessionManager.appendChildUsageAttribution(parentEntry.id, childUsage, aggregate, origin);
+					this._rlmDurableChildUsage.set(parentAssistantForUsage, aggregate);
+				} catch {
+					// Keep failed bookkeeping pending; settlement must not fail or relabel it as own spend.
+					pendingChildUsage.set(origin, childUsage);
+					this._pendingRlmChildUsageBatches.set(pendingChildUsage, parentAssistantForUsage);
+					pendingChildUsageSince = Date.now();
+					if (!this._disposed && !this._disposing && pendingChildUsageTimer === undefined) {
+						pendingChildUsageTimer = setTimeout(
+							flushPendingChildUsageAttribution,
+							RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS,
+						);
+						pendingChildUsageTimer.unref?.();
+					}
+				} finally {
+					for (const [target, usage] of liveUsages) target.usage = usage;
+					this._persistingRlmChildUsage = wasPersisting;
+					this._ownUsageMemo = undefined;
+				}
+			}
+			if (childUsageSubscriptionClosed && pendingChildUsage.size === 0) {
+				this._rlmChildUsageFlushes.delete(flushPendingChildUsageAttribution);
+			}
+		};
+		const flushPendingChildUsageIfStale = () => {
+			if (
+				pendingChildUsage.size > 0 &&
+				Date.now() - pendingChildUsageSince >= RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS
+			) {
+				flushPendingChildUsageAttribution();
+			}
+		};
 		let runningToolCount = 0;
 		let childSession: AgentSession | undefined;
 		const run: RlmChildRun = {
@@ -10959,6 +11074,7 @@ export class AgentSession {
 			toolUseCount: 0,
 			settled: false,
 			abort: noopRlmChildAbort,
+			flushUsage: flushPendingChildUsageAttribution,
 			publication: createAgentMessageDeferred(),
 			settlement: createAgentMessageDeferred(),
 			deletionReservation: createAgentMessageDeferred(),
@@ -11056,6 +11172,7 @@ export class AgentSession {
 				run.status = "running";
 				emitChildUpdate();
 				const unsubscribeChildEvents = child.subscribe((event) => {
+					if (this._disposed) return;
 					if (event.type === "rlm_child_update") {
 						this._emit(event);
 						return;
@@ -11064,34 +11181,31 @@ export class AgentSession {
 						run.activity = { kind: "waiting" };
 						emitChildUpdate();
 					} else if (event.type === "agent_end") {
+						flushPendingChildUsageAttribution();
 						run.activity = undefined;
 						emitChildUpdate();
 					} else if (event.type === "message_end" && event.message.role === "assistant") {
 						const assistant = event.message as AssistantMessage;
 						if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
+							// Flush before the fold: a persisted aggregate may only include
+							// completions whose childUsage is durable with or before it.
+							flushPendingChildUsageIfStale();
 							attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
 							if (parentAssistantForUsage) {
-								const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
-								if (parentEntry) {
-									const messages = child.messages;
-									const assistantIndex = messages.lastIndexOf(assistant);
-									const precedingPrompt = messages
-										.slice(0, assistantIndex)
-										.reverse()
-										.find((message) => message.role === "user" || message.role === "custom");
-									const origin =
-										precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
-											? precedingPrompt.details.id.startsWith("spawn:")
-												? "spawn_task"
-												: "agent_message"
-											: "direct_user";
-									this.sessionManager.appendChildUsageAttribution(
-										parentEntry.id,
-										assistant.usage,
-										parentAssistantForUsage.usage,
-										origin,
+								const origin = rlmChildUsageOrigin(child.messages, assistant);
+								if (pendingChildUsage.size === 0) {
+									this._pendingRlmChildUsageBatches.set(pendingChildUsage, parentAssistantForUsage);
+									pendingChildUsageSince = Date.now();
+									// Wall-clock backstop for long tool runs without checkpoints.
+									pendingChildUsageTimer = setTimeout(
+										flushPendingChildUsageAttribution,
+										RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS,
 									);
+									pendingChildUsageTimer.unref?.();
 								}
+								const bucket = pendingChildUsage.get(origin) ?? emptyUsage();
+								addAssistantUsage(bucket, assistant.usage);
+								pendingChildUsage.set(origin, bucket);
 							}
 						}
 						const text = compactRlmText(readAssistantText(assistant));
@@ -11105,6 +11219,7 @@ export class AgentSession {
 							emitChildUpdate();
 						}
 					} else if (event.type === "tool_execution_start") {
+						flushPendingChildUsageIfStale();
 						run.toolUseCount += 1;
 						runningToolCount += 1;
 						run.activity = { kind: "executing", toolName: event.toolName };
@@ -11117,7 +11232,13 @@ export class AgentSession {
 						emitChildUpdate();
 					}
 				});
-				run.unsubscribe = unsubscribeChildEvents;
+				this._rlmChildUsageFlushes.add(flushPendingChildUsageAttribution);
+				run.unsubscribe = () => {
+					childUsageSubscriptionClosed = true;
+					flushPendingChildUsageAttribution();
+					if (pendingChildUsage.size === 0) this._rlmChildUsageFlushes.delete(flushPendingChildUsageAttribution);
+					unsubscribeChildEvents();
+				};
 				const content = `[task from parent]\n\n${prompt}`;
 				const spawnMessage: AgentSessionMessage = {
 					role: "custom",
@@ -11253,6 +11374,7 @@ export class AgentSession {
 					}
 				}
 			} finally {
+				flushPendingChildUsageAttribution();
 				if (run.detachedDeletion) {
 					run.deletionRunFinished = true;
 					if (!run.settled) {
@@ -12312,6 +12434,13 @@ export class AgentSession {
 			return memo.usage;
 		}
 		const { ownUsage } = computeOwnAndTotalUsage(entries, entries);
+		if (!this._persistingRlmChildUsage && this._pendingRlmChildUsageBatches.size > 0) {
+			const messages = new Set(entries.flatMap((entry) => (entry.type === "message" ? [entry.message] : [])));
+			for (const [pending, target] of this._pendingRlmChildUsageBatches) {
+				if (!messages.has(target)) continue;
+				for (const childUsage of pending.values()) subtractAssistantUsage(ownUsage, childUsage);
+			}
+		}
 		const usage = sessionUsageSummaryFrom(ownUsage);
 		this._ownUsageMemo = { count: entries.length, tailId, usage };
 		return usage;
@@ -12325,10 +12454,15 @@ export class AgentSession {
 	 */
 	getContextTree(): ContextTreeNode {
 		const resolveContextWindow = this._contextWindowResolver();
-		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(
-			this.sessionManager.getBranch(),
-			this.sessionManager.getEntries(),
-		);
+		const branch = this.sessionManager.getBranch();
+		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(branch, this.sessionManager.getEntries());
+		if (!this._persistingRlmChildUsage && this._pendingRlmChildUsageBatches.size > 0) {
+			const branchMessages = new Set(branch.flatMap((entry) => (entry.type === "message" ? [entry.message] : [])));
+			for (const [pending, target] of this._pendingRlmChildUsageBatches) {
+				if (!branchMessages.has(target)) continue;
+				for (const childUsage of pending.values()) subtractAssistantUsage(ownUsage, childUsage);
+			}
+		}
 
 		const children: ContextTreeNode[] = [];
 		const liveIds = new Set<string>();

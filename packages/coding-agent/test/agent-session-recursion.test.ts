@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -20,6 +20,7 @@ import {
 } from "../src/core/agent-messages.js";
 import { AgentSession, type RlmChildAgentSnapshot } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { computeOwnAndTotalUsage } from "../src/core/context-tree.js";
 import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
 import { type HostRequestHandlers, ReplKernelManager } from "../src/core/kernel/index.js";
 import { convertToLlm } from "../src/core/messages.js";
@@ -246,6 +247,120 @@ describe("AgentSession rlm recursion", () => {
 			rlmSessionDir: options.rlmSessionDir,
 		});
 		return session;
+	}
+
+	/** Session with a zero-usage parent assistant whose child answers a tool loop: usages[i] per request, tool calls until the last, then stop. */
+	function createToolLoopSession(requests: number, usages: Usage[], onRequest?: (toolResultCount: number) => void) {
+		const tool = {
+			name: "echo",
+			description: "Echo a value",
+			label: "echo",
+			parameters: Type.Object({ value: Type.String() }),
+			execute: async (_toolCallId: string, params: { value: string }) => ({
+				content: [{ type: "text" as const, text: params.value }],
+				details: {},
+			}),
+		};
+		const root = createSession({
+			customTools: [tool],
+			streamFn: (_model, context) => {
+				const toolResultCount = context.messages.filter((message) => message.role === "toolResult").length;
+				onRequest?.(toolResultCount);
+				const last = toolResultCount >= requests - 1;
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message = last
+						? assistantMessage("done", usages[toolResultCount])
+						: {
+								...assistantMessage("", usages[toolResultCount]),
+								content: [
+									{
+										type: "toolCall" as const,
+										id: `echo-${toolResultCount}`,
+										name: "echo",
+										arguments: { value: "ok" },
+									},
+								],
+								stopReason: "toolUse" as const,
+							};
+					stream.push({ type: "done", reason: last ? "stop" : "toolUse", message });
+				});
+				return stream;
+			},
+		});
+		const parentAssistant = assistantMessage("running ipython", usage(0, 0));
+		root.agent.state.messages.push(parentAssistant);
+		root.sessionManager.appendMessage(parentAssistant);
+		return root;
+	}
+
+	function createUsageGatedChild(childUsage: Usage, completionUsage = usage(0, 0)) {
+		const toolStarted = deferred<void>();
+		const toolCompletion = deferred<void>();
+		const tool = {
+			name: "usage_gate",
+			description: "Hold the child after a successful assistant completion",
+			label: "usage gate",
+			parameters: Type.Object({}),
+			execute: async () => {
+				toolStarted.resolve();
+				await toolCompletion.promise;
+				return { content: [{ type: "text" as const, text: "released" }], details: {} };
+			},
+		};
+		const child = createSession({
+			customTools: [tool],
+			streamFn: (_model, context) => {
+				const stop =
+					userText(context) === "retain" || context.messages.some((message) => message.role === "toolResult");
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						reason: stop ? "stop" : "toolUse",
+						message: stop
+							? assistantMessage("done", userText(context) === "retain" ? usage(0, 0) : completionUsage)
+							: {
+									...assistantMessage("", childUsage),
+									content: [{ type: "toolCall" as const, id: "usage-gate", name: tool.name, arguments: {} }],
+									stopReason: "toolUse" as const,
+								},
+					});
+				});
+				return stream;
+			},
+		});
+		return { child, toolStarted, toolCompletion };
+	}
+
+	function seedParentUsage(root: AgentSession, ownUsage = usage(5, 6)): AssistantMessage {
+		const parentAssistant = assistantMessage("running children", ownUsage);
+		root.agent.state.messages.push(parentAssistant);
+		root.sessionManager.appendMessage(parentAssistant);
+		root.sessionManager.flushNow();
+		return parentAssistant;
+	}
+
+	function expectDurableUsagePrefixes(root: AgentSession, ownUsage = usage(5, 6)): void {
+		root.sessionManager.flushNow();
+		if (!root.sessionFile) throw new Error("Missing parent session file");
+		const lines = readFileSync(root.sessionFile, "utf8").trimEnd().split("\n");
+		let checked = 0;
+		for (const [index, line] of lines.entries()) {
+			if (JSON.parse(line).type !== "child_usage_attributed") continue;
+			const prefixFile = join(tempDir, `usage-prefix-${index}.jsonl`);
+			writeFileSync(prefixFile, `${lines.slice(0, index + 1).join("\n")}\n`);
+			const reloaded = SessionManager.open(prefixFile, join(tempDir, "prefix-sessions"));
+			const entries = reloaded.getEntries();
+			const restored = computeOwnAndTotalUsage(entries, entries).ownUsage;
+			expect({ input: restored.input, output: restored.output, cost: restored.cost }).toEqual({
+				input: ownUsage.input,
+				output: ownUsage.output,
+				cost: ownUsage.cost,
+			});
+			checked++;
+		}
+		expect(checked).toBeGreaterThan(0);
 	}
 
 	function createAbortInsensitiveChild(): {
@@ -2524,54 +2639,432 @@ describe("AgentSession rlm recursion", () => {
 		expect(attribution.aggregateUsage.cost.total).toBe(10);
 	});
 
-	it("attributes every tool-loop turn in the admitted task to spawn usage", async () => {
-		const tool = {
-			name: "echo",
-			description: "Echo a value",
-			label: "echo",
-			parameters: Type.Object({ value: Type.String() }),
-			execute: async (_toolCallId: string, params: { value: string }) => ({
-				content: [{ type: "text" as const, text: params.value }],
-				details: {},
-			}),
-		};
-		const root = createSession({
-			customTools: [tool],
-			streamFn: (_model, context) => {
-				const toolResultCount = context.messages.filter((message) => message.role === "toolResult").length;
-				const stream = createAssistantMessageEventStream();
-				queueMicrotask(() => {
-					const message =
-						toolResultCount === 0
-							? {
-									...assistantMessage("", usage(1, 1)),
-									content: [
-										{ type: "toolCall" as const, id: "echo-1", name: "echo", arguments: { value: "ok" } },
-									],
-									stopReason: "toolUse" as const,
-								}
-							: assistantMessage("done", usage(2, 2));
-					stream.push({
-						type: "done",
-						reason: toolResultCount === 0 ? "toolUse" : "stop",
-						message,
-					});
-				});
-				return stream;
-			},
-		});
-		const parentAssistant = assistantMessage("running ipython", usage(0, 0));
-		root.agent.state.messages.push(parentAssistant);
-		root.sessionManager.appendMessage(parentAssistant);
+	it("coalesces the admitted task's tool-loop turns into one flushed spawn-usage attribution", async () => {
+		const root = createToolLoopSession(2, [usage(1, 1), usage(2, 2)]);
 
 		await root.runRlmChild("use a tool");
 		await vi.waitFor(() => {
 			const attributions = root.sessionManager
 				.getEntries()
 				.filter((entry) => entry.type === "child_usage_attributed");
-			expect(attributions).toHaveLength(2);
-			expect(attributions.map((entry) => entry.origin)).toEqual(["spawn_task", "spawn_task"]);
+			expect(attributions).toHaveLength(1);
+			expect(attributions[0]?.origin).toBe("spawn_task");
+			expect(attributions[0]?.childUsage.input).toBe(3);
+			expect(attributions[0]?.childUsage.output).toBe(3);
 		});
+	});
+
+	it("flushes a stale pending usage batch before extending it, bounding crash loss", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			// The batch from the first two completions is older than the staleness
+			// bound when the third lands.
+			const root = createToolLoopSession(3, [usage(1, 1), usage(2, 2), usage(4, 4)], (toolResultCount) => {
+				if (toolResultCount === 2) vi.setSystemTime(Date.now() + 61_000);
+			});
+
+			await root.runRlmChild("use a tool");
+			await vi.waitFor(() => {
+				const attributions = root.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "child_usage_attributed");
+				expect(attributions.map((entry) => [entry.childUsage.input, entry.childUsage.output])).toEqual([
+					[3, 3],
+					[4, 4],
+				]);
+				expect(attributions.map((entry) => entry.origin)).toEqual(["spawn_task", "spawn_task"]);
+				// Each aggregate covers exactly the completions durable with or
+				// before it, so any prefix replays to the exact own spend.
+				expect(attributions.map((entry) => entry.aggregateUsage.input)).toEqual([3, 7]);
+			});
+
+			const sessionFile = root.sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("parent session file was not created");
+			const reloadedAttributions = SessionManager.open(sessionFile, join(tempDir, "sessions"))
+				.getEntries()
+				.filter((entry) => entry.type === "child_usage_attributed");
+			const childTotal = reloadedAttributions.reduce((total, entry) => total + entry.childUsage.input, 0);
+			// Parent own spend is zero here, so the reloaded aggregate must equal the summed child usage.
+			expect(reloadedAttributions.at(-1)?.aggregateUsage.input).toBe(childTotal);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps pending sibling usage out of every durable attribution prefix", async () => {
+		const first = createUsageGatedChild(usage(2, 3));
+		const second = createUsageGatedChild(usage(7, 11));
+		const children = [first.child, second.child];
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					const child = children.shift();
+					if (!child) throw new Error("Unexpected extra child");
+					return { session: child };
+				},
+				deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
+			},
+		});
+		const parentAssistant = seedParentUsage(root);
+		try {
+			const firstSpawn = await root.runRlmChild("first");
+			await first.toolStarted.promise;
+			expect(root.getOwnUsageSummary()).toEqual({ inputTokens: 5, outputTokens: 6, cost: 11 });
+			expect(root.getContextTree().ownUsage).toMatchObject({ input: 5, output: 6, cost: { total: 11 } });
+			await root.runRlmChild("second");
+			await second.toolStarted.promise;
+			root.acquireSessionInputPause();
+			expect(parentAssistant.usage).toMatchObject({ input: 14, output: 20 });
+			expect(root.getOwnUsageSummary()).toEqual({ inputTokens: 5, outputTokens: 6, cost: 11 });
+			expect(root.getContextTree().ownUsage).toMatchObject({ input: 5, output: 6, cost: { total: 11 } });
+			expect(
+				root.sessionManager.getEntries().filter((entry) => entry.type === "child_usage_attributed"),
+			).toHaveLength(0);
+
+			first.toolCompletion.resolve();
+			await waitFor(() => root.getRlmChildRunStatus(firstSpawn.rlm_child_id) === undefined);
+			expect(second.child.isStreaming).toBe(true);
+			expectDurableUsagePrefixes(root);
+			// Flushing a sibling must not remove the still-pending child's live usage.
+			expect(parentAssistant.usage).toMatchObject({ input: 14, output: 20 });
+			expect(root.getOwnUsageSummary()).toEqual({ inputTokens: 5, outputTokens: 6, cost: 11 });
+			expect(root.getContextTree().ownUsage).toMatchObject({ input: 5, output: 6, cost: { total: 11 } });
+
+			second.toolCompletion.resolve();
+			await second.child.waitForIdle();
+			expectDurableUsagePrefixes(root);
+		} finally {
+			root.dispose();
+			first.toolCompletion.resolve();
+			second.toolCompletion.resolve();
+			await Promise.all([first.child.waitForIdle(), second.child.waitForIdle()]);
+		}
+	});
+
+	it.each(["same", "distinct"] as const)(
+		"repairs a partial attribution append before another sibling flush for %s parent targets",
+		async (targets) => {
+			const first = createUsageGatedChild(usage(2, 3));
+			const second = createUsageGatedChild(usage(7, 11));
+			const children = [first.child, second.child];
+			const root = createSession({
+				subagentRuntimeHost: {
+					createRlmSubagentRuntime: async () => {
+						const child = children.shift();
+						if (!child) throw new Error("Unexpected extra child");
+						return { session: child };
+					},
+					deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
+				},
+			});
+			const firstParent = seedParentUsage(root);
+			const expectedOwn = targets === "same" ? usage(5, 6) : usage(18, 23);
+			const persist = root.sessionManager._persist.bind(root.sessionManager);
+			let failedId: string | undefined;
+			const fault = vi.spyOn(root.sessionManager, "_persist");
+			try {
+				const firstSpawn = await root.runRlmChild("first pending child");
+				await first.toolStarted.promise;
+				const secondParent = targets === "same" ? firstParent : seedParentUsage(root, usage(13, 17));
+				const secondSpawn = await root.runRlmChild("second pending child");
+				await second.toolStarted.promise;
+				root.acquireSessionInputPause();
+				const expectedFirst = targets === "same" ? { input: 14, output: 20 } : { input: 7, output: 9 };
+				const expectedSecond = targets === "same" ? expectedFirst : { input: 20, output: 28 };
+				fault.mockImplementation((entry) => {
+					if (entry.type === "child_usage_attributed" && failedId === undefined) {
+						if (!root.sessionFile) throw new Error("Missing parent session file");
+						failedId = entry.id;
+						const serialized = JSON.stringify(entry);
+						appendFileSync(root.sessionFile, serialized.slice(0, Math.floor(serialized.length / 2)));
+						throw new Error("Disk failed after partial attribution append");
+					}
+					persist(entry);
+				});
+
+				expect(root.cancelRlmChildRun(firstSpawn.rlm_child_id)).toBe(true);
+				expect(failedId).toBeDefined();
+				expect(root.sessionManager.getEntries().some((entry) => entry.id === failedId)).toBe(false);
+				expect(root.sessionManager.getEntry(failedId!)).toBeUndefined();
+				expect(firstParent.usage).toMatchObject(expectedFirst);
+				expect(secondParent.usage).toMatchObject(expectedSecond);
+				expect(root.getOwnUsageSummary()).toEqual({
+					inputTokens: expectedOwn.input,
+					outputTokens: expectedOwn.output,
+					cost: expectedOwn.cost.total,
+				});
+				expect(root.getContextTree().ownUsage).toMatchObject({
+					input: expectedOwn.input,
+					output: expectedOwn.output,
+					cost: expectedOwn.cost,
+				});
+				if (!root.sessionFile) throw new Error("Missing parent session file");
+				// Inspect the actual repaired file before another successful append can hide the failure.
+				const repairedLines = readFileSync(root.sessionFile, "utf8").trimEnd().split("\n");
+				expect(repairedLines.map((line) => JSON.parse(line).id)).not.toContain(failedId);
+				const repaired = SessionManager.open(root.sessionFile, join(tempDir, "repaired-sessions")).getEntries();
+				expect(computeOwnAndTotalUsage(repaired, repaired).ownUsage).toMatchObject({
+					input: expectedOwn.input,
+					output: expectedOwn.output,
+					cost: expectedOwn.cost,
+				});
+
+				expect(root.cancelRlmChildRun(secondSpawn.rlm_child_id)).toBe(true);
+				const attributions = root.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "child_usage_attributed");
+				expect(attributions).toHaveLength(1);
+				expect(attributions[0]?.childUsage).toMatchObject({ input: 7, output: 11 });
+				expectDurableUsagePrefixes(root, expectedOwn);
+				expect(firstParent.usage).toMatchObject(expectedFirst);
+				expect(secondParent.usage).toMatchObject(expectedSecond);
+				expect(root.getOwnUsageSummary()).toEqual({
+					inputTokens: expectedOwn.input,
+					outputTokens: expectedOwn.output,
+					cost: expectedOwn.cost.total,
+				});
+				expect(root.getContextTree().ownUsage).toMatchObject({
+					input: expectedOwn.input,
+					output: expectedOwn.output,
+					cost: expectedOwn.cost,
+				});
+			} finally {
+				fault.mockRestore();
+				root.dispose();
+				first.toolCompletion.resolve();
+				second.toolCompletion.resolve();
+				await Promise.all([first.child.waitForIdle(), second.child.waitForIdle()]);
+			}
+		},
+	);
+
+	it("recovers an unrelated metadata write before retrying usage whose append and repair both failed", async () => {
+		vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+		const first = createUsageGatedChild(usage(2, 3));
+		const second = createUsageGatedChild(usage(7, 11));
+		const children = [first.child, second.child];
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					const child = children.shift();
+					if (!child) throw new Error("Unexpected extra child");
+					return { session: child };
+				},
+				deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
+			},
+		});
+		const firstParent = seedParentUsage(root);
+		const persist = root.sessionManager._persist.bind(root.sessionManager);
+		const appendFault = vi.spyOn(root.sessionManager, "_persist");
+		const repairFault = vi.spyOn(root.sessionManager as unknown as { _rewriteFile(): void }, "_rewriteFile");
+		let failedId: string | undefined;
+		try {
+			const firstSpawn = await root.runRlmChild("first pending child");
+			await first.toolStarted.promise;
+			const secondParent = seedParentUsage(root, usage(13, 17));
+			await root.runRlmChild("second pending child");
+			await second.toolStarted.promise;
+			root.acquireSessionInputPause();
+			appendFault.mockImplementation((entry) => {
+				if (entry.type === "child_usage_attributed" && failedId === undefined) {
+					if (!root.sessionFile) throw new Error("Missing parent session file");
+					failedId = entry.id;
+					const serialized = JSON.stringify(entry);
+					appendFileSync(root.sessionFile, serialized.slice(0, Math.floor(serialized.length / 2)));
+					throw new Error("Disk failed during attribution append");
+				}
+				persist(entry);
+			});
+			repairFault.mockImplementationOnce(() => {
+				throw new Error("Disk still unavailable during immediate repair");
+			});
+
+			expect(root.cancelRlmChildRun(firstSpawn.rlm_child_id)).toBe(true);
+			expect(failedId).toBeDefined();
+			expect(repairFault).toHaveBeenCalledOnce();
+			expect(root.sessionManager.getEntry(failedId!)).toBeUndefined();
+			appendFault.mockRestore();
+			repairFault.mockRestore();
+
+			root.sessionManager.appendSessionInfo("metadata after disk recovery");
+			if (!root.sessionFile) throw new Error("Missing parent session file");
+			const recoveredLines = readFileSync(root.sessionFile, "utf8").trimEnd().split("\n");
+			expect(recoveredLines.map((line) => JSON.parse(line).id)).not.toContain(failedId);
+			const recovered = SessionManager.open(root.sessionFile, join(tempDir, "recovered-sessions")).getEntries();
+			expect(recovered.filter((entry) => entry.type === "child_usage_attributed")).toHaveLength(0);
+			expect(computeOwnAndTotalUsage(recovered, recovered).ownUsage).toMatchObject({
+				input: 18,
+				output: 23,
+				cost: { total: 41 },
+			});
+			expect(firstParent.usage).toMatchObject({ input: 7, output: 9 });
+			expect(secondParent.usage).toMatchObject({ input: 20, output: 28 });
+			expect(root.getOwnUsageSummary()).toEqual({ inputTokens: 18, outputTokens: 23, cost: 41 });
+
+			await vi.advanceTimersByTimeAsync(60_000);
+			const reloaded = SessionManager.open(root.sessionFile, join(tempDir, "retried-sessions")).getEntries();
+			expect(reloaded.filter((entry) => entry.type === "child_usage_attributed")).toHaveLength(2);
+			expect(computeOwnAndTotalUsage(reloaded, reloaded)).toMatchObject({
+				ownUsage: { input: 18, output: 23, cost: { total: 41 } },
+				totalUsage: { input: 27, output: 37, cost: { total: 64 } },
+			});
+			expectDurableUsagePrefixes(root, usage(18, 23));
+			expect(firstParent.usage).toMatchObject({ input: 7, output: 9 });
+			expect(secondParent.usage).toMatchObject({ input: 20, output: 28 });
+		} finally {
+			appendFault.mockRestore();
+			repairFault.mockRestore();
+			root.dispose();
+			first.toolCompletion.resolve();
+			second.toolCompletion.resolve();
+			await Promise.all([first.child.waitForIdle(), second.child.waitForIdle()]);
+			await vi.advanceTimersByTimeAsync(60_000);
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps mixed-origin usage out of earlier durable attribution prefixes", async () => {
+		const gated = createUsageGatedChild(usage(2, 3), usage(7, 11));
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: gated.child }),
+				deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
+			},
+		});
+		seedParentUsage(root);
+		try {
+			const spawned = await root.runRlmChild("initial task");
+			await gated.toolStarted.promise;
+			root.acquireSessionInputPause();
+			const message = createAgentSessionMessage({
+				id: "agentmsg-usage-steer",
+				source: "agent_message",
+				message: "new instruction",
+				fromRelationship: "parent",
+				target: { activeSessionId: "child-active", sessionId: gated.child.sessionId },
+			});
+			await gated.child.queueAgentMessagePrompt(message.content as string, "steer", message);
+			gated.toolCompletion.resolve();
+			await waitFor(() => root.getRlmChildRunStatus(spawned.rlm_child_id) === undefined);
+			const attributions = root.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "child_usage_attributed");
+			expect(attributions.map((entry) => entry.origin)).toEqual(["spawn_task", "agent_message"]);
+			expect(attributions.map((entry) => [entry.childUsage.input, entry.childUsage.output])).toEqual([
+				[2, 3],
+				[7, 11],
+			]);
+			expectDurableUsagePrefixes(root);
+		} finally {
+			root.dispose();
+			gated.toolCompletion.resolve();
+			await gated.child.waitForIdle();
+		}
+	});
+
+	it.each(["dispose", "disposeAsync"] as const)(
+		"flushes retained child usage synchronously on %s without a later timer write",
+		async (method) => {
+			vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+			const gated = createUsageGatedChild(usage(2, 3));
+			const root = createSession({
+				subagentRuntimeHost: {
+					createRlmSubagentRuntime: async () => ({ session: gated.child }),
+					deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
+				},
+			});
+			seedParentUsage(root);
+			root.acquireSessionInputPause();
+			try {
+				const spawned = await root.runRlmChild("retain");
+				await waitFor(() => root.getRlmChildRunStatus(spawned.rlm_child_id) === undefined);
+				expect(root.isRetainedRlmChildSession(spawned.rlm_child_id, gated.child)).toBe(true);
+				const append = vi.spyOn(root.sessionManager, "appendChildUsageAttribution");
+				const followUp = gated.child.prompt("follow-up");
+				await gated.toolStarted.promise;
+				expect(append).not.toHaveBeenCalled();
+
+				const disposal = root[method]();
+				expect(append).toHaveBeenCalledOnce();
+				expect(append.mock.calls[0]?.[1]).toMatchObject({ input: 2, output: 3 });
+				expect(append.mock.calls[0]?.[3]).toBe("direct_user");
+				expectDurableUsagePrefixes(root);
+				await vi.advanceTimersByTimeAsync(60_000);
+				expect(append).toHaveBeenCalledOnce();
+				gated.toolCompletion.resolve();
+				await followUp;
+				await disposal;
+			} finally {
+				root.dispose();
+				gated.toolCompletion.resolve();
+				await gated.child.waitForIdle();
+				await vi.advanceTimersByTimeAsync(60_000);
+				vi.useRealTimers();
+			}
+		},
+	);
+
+	it("flushes pending child usage synchronously on cancellation without a later timer write", async () => {
+		vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+		const gated = createUsageGatedChild(usage(2, 3));
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: gated.child }),
+				deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
+			},
+		});
+		seedParentUsage(root);
+		try {
+			const spawned = await root.runRlmChild("cancel blocked task");
+			await gated.toolStarted.promise;
+			const append = vi.spyOn(root.sessionManager, "appendChildUsageAttribution");
+			expect(root.cancelRlmChildRun(spawned.rlm_child_id)).toBe(true);
+			expect(append).toHaveBeenCalledOnce();
+			expect(append.mock.calls[0]?.[1]).toMatchObject({ input: 2, output: 3 });
+			expect(append.mock.calls[0]?.[3]).toBe("spawn_task");
+			expectDurableUsagePrefixes(root);
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(append).toHaveBeenCalledOnce();
+		} finally {
+			root.dispose();
+			gated.toolCompletion.resolve();
+			await gated.child.waitForIdle();
+			await vi.advanceTimersByTimeAsync(60_000);
+			vi.useRealTimers();
+		}
+	});
+
+	it("flushes pending child usage at the actual sixty-second timer while its tool stays blocked", async () => {
+		vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+		const gated = createUsageGatedChild(usage(2, 3));
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: gated.child }),
+				deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
+			},
+		});
+		seedParentUsage(root);
+		try {
+			await root.runRlmChild("blocked task");
+			await gated.toolStarted.promise;
+			const attributions = () =>
+				root.sessionManager.getEntries().filter((entry) => entry.type === "child_usage_attributed");
+			await vi.advanceTimersByTimeAsync(59_999);
+			expect(attributions()).toHaveLength(0);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(attributions()).toHaveLength(1);
+			expect(attributions()[0]?.childUsage).toMatchObject({ input: 2, output: 3 });
+			expect(gated.child.isStreaming).toBe(true);
+			expectDurableUsagePrefixes(root);
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(attributions()).toHaveLength(1);
+		} finally {
+			root.dispose();
+			gated.toolCompletion.resolve();
+			await gated.child.waitForIdle();
+			await vi.advanceTimersByTimeAsync(60_000);
+			vi.useRealTimers();
+		}
 	});
 
 	it("gets and persists per-chat max-depth changes without transcript messages", async () => {
