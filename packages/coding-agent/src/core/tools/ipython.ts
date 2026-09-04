@@ -11,6 +11,7 @@ import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
 import {
 	type ExecuteResult,
 	type HostRequestHandlers,
+	KERNEL_STARTUP_STEP_TIMEOUT_MS,
 	type KernelAttachment,
 	KernelBusyAfterInterruptError,
 	type KernelClient,
@@ -290,6 +291,8 @@ export interface IpythonToolOptions {
 	/** Resolves before this kernel starts — e.g. the previous provisioner's dispose, so a
 	 * /reload's old-kernel snapshot flush can't race the new kernel's restore. */
 	readyGate?: Promise<unknown>;
+	/** Budget for each previous-disposal, restore and runtime-bootstrap stage. Defaults to 30 seconds. */
+	startupStepTimeoutMs?: number;
 	/**
 	 * Fires once per kernel start when a previous session's namespace was revived
 	 * (some names restored or some failed), so the session can tell the model.
@@ -448,16 +451,32 @@ export class IpythonKernelProvisioner {
 	private async startKernel(signal?: AbortSignal): Promise<KernelClient> {
 		const startupAbort = createLinkedAbortSignal([this.disposeController.signal, signal]);
 		const startupSignal = startupAbort.signal;
+		const stepTimeoutMs = this.options?.startupStepTimeoutMs ?? KERNEL_STARTUP_STEP_TIMEOUT_MS;
+		if (!Number.isSafeInteger(stepTimeoutMs) || stepTimeoutMs <= 0 || stepTimeoutMs > 2_147_483_647) {
+			startupAbort.cleanup();
+			throw new Error("Python startup step timeout must be a positive integer within the timer range");
+		}
 		// Wait for a previous provisioner (e.g. on /reload) to finish disposing — and
 		// flushing its final snapshot — before we read that snapshot back, so the two
 		// kernels can't race over the same on-disk file. Guarded so the common
 		// no-gate path stays synchronous (callers rely on prompt startup progress).
 		try {
 			if (this.options?.readyGate) {
-				await raceWithAbort(
-					this.options.readyGate.catch(() => {}),
-					startupSignal,
-				);
+				const deadline = new AbortController();
+				const timer = setTimeout(() => deadline.abort(), stepTimeoutMs);
+				timer.unref?.();
+				try {
+					await raceWithAbort(
+						this.options.readyGate.catch(() => {}),
+						AbortSignal.any([startupSignal, deadline.signal]),
+					);
+				} catch (error) {
+					if (deadline.signal.aborted)
+						throw new Error(`Timed out waiting ${stepTimeoutMs}ms for the previous Python kernel to dispose`);
+					throw error;
+				} finally {
+					clearTimeout(timer);
+				}
 			}
 			const snapshotDir = this.options?.snapshotDir;
 			// Always inject an absolute trusted shell (undefined only on win32
@@ -484,16 +503,14 @@ export class IpythonKernelProvisioner {
 				stderrLogPath: snapshotDir ? join(snapshotDir, "kernel-stderr.log") : undefined,
 				bootstrapCode,
 			});
+			const snapshotExisted = snapshotDir ? existsSync(snapshotPathIn(snapshotDir)) : false;
 			let pendingRestore: RestoreResult | undefined;
 			try {
 				// Emitted synchronously (before the permit await) so a listener attaching
 				// mid-flight can replay the current stage.
 				this.emitStartupProgress("Starting Python kernel...");
-				// Only the process spawn + port resolve contends for OS resources under a
-				// fan-out, and it is bounded by start()'s own timeouts — so the permit
-				// covers only start(). Restore/bootstrap run per-kernel afterwards and are
-				// unbounded execute()s; holding the global permit across them could pin it
-				// forever on a wedged bootstrap and starve every other session's boot.
+				// Restore/bootstrap have their own per-kernel deadlines. Keep them outside
+				// the boot permit so a slow namespace cannot monopolize process admission.
 				await withKernelBootPermit(() => {
 					// Disposed while queued for the permit — don't spawn a kernel nobody wants.
 					if (startupSignal.aborted) throw new Error("Kernel provisioner disposed before start");
@@ -505,15 +522,15 @@ export class IpythonKernelProvisioner {
 				// Revive a prior session's namespace before the bootstrap, so the bootstrap
 				// then overwrites live handles (rlm, skills) on top of anything restored.
 				if (snapshotDir) {
-					const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
 					this.emitStartupProgress("Restoring Python state...");
-					const restore = await raceWithAbort(m.restoreState(), startupSignal);
-					if (snapshotExisted) {
-						pendingRestore = restore ?? { restored: [], failed: [], path: snapshotPathIn(snapshotDir) };
-					}
+					const restore = await m.restoreState({ signal: startupSignal, timeoutMs: stepTimeoutMs });
+					if (startupSignal.aborted) throw createAbortError();
+					if (!restore) throw new Error("Failed to restore Python state; the saved snapshot was preserved");
+					if (snapshotExisted) pendingRestore = restore;
 				}
 				this.emitStartupProgress("Preparing Python runtime...");
 				const bootstrap = await m.execute(bootstrapCode, {
+					timeoutMs: stepTimeoutMs,
 					signal: startupSignal,
 					internal: true,
 				});
@@ -526,7 +543,9 @@ export class IpythonKernelProvisioner {
 				// surface the failure before the teardown (final snapshot flush included)
 				// finished, or a replacement provisioner gated on this dispose could
 				// race the still-flushing kernel over the same snapshot files.
-				await m.shutdown({ snapshot: this.disposeSnapshot, drainHostRequests: true }).catch(() => undefined);
+				await m
+					.shutdown({ snapshot: this.disposeSnapshot && !snapshotExisted, drainHostRequests: true })
+					.catch(() => undefined);
 				throw error;
 			}
 			// Only tell the model what was revived once the kernel is actually usable —

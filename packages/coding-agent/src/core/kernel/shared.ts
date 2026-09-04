@@ -7,6 +7,7 @@ export const HOST_REQUEST_SHUTDOWN_TIMEOUT_MS = 5000;
 export const KERNEL_SHUTDOWN_TIMEOUT_MS = 5000;
 export const DEFAULT_SNAPSHOT_DEBOUNCE_MS = 1500;
 export const SNAPSHOT_EXECUTION_TIMEOUT_MS = 5000;
+export const KERNEL_STARTUP_STEP_TIMEOUT_MS = 30_000;
 export const KERNEL_ABORT_GRACE_MS = 1000;
 export const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 export const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
@@ -66,6 +67,8 @@ export interface KernelStartOptions {
 }
 
 export interface ExecuteOptions {
+	/** Total request budget, including startup, repair and queue waits. */
+	timeoutMs?: number;
 	/** Aborting interrupts the kernel out-of-band. */
 	signal?: AbortSignal;
 	onStream?: (chunk: string, name: "stdout" | "stderr") => void;
@@ -289,7 +292,7 @@ export interface KernelClient {
 	disposeSync(): void;
 	snapshotState(): Promise<SnapshotResult | null>;
 	pruneOversizedVariables(): Promise<SnapshotResult | null>;
-	restoreState(): Promise<RestoreResult | null>;
+	restoreState(options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<RestoreResult | null>;
 	listNamespaceNames(signal?: AbortSignal): Promise<string[] | null>;
 }
 

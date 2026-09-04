@@ -1206,6 +1206,7 @@ export class AgentSession {
 	private _ipythonKernelSnapshotDir?: string;
 	/** True once the runtime has been built once; later builds are in-process rebuilds (/reload). */
 	private _ipythonRuntimeBuilt = false;
+	private _ipythonInitialRestorePending = false;
 	private readonly _prewarmIpythonKernel: boolean;
 	private _rlmDepth: number;
 	private readonly _configuredRlmMaxDepth: number | undefined;
@@ -7492,6 +7493,7 @@ export class AgentSession {
 	}
 
 	private _onIpythonStateRestored(result: RestoreResult): void {
+		this._ipythonInitialRestorePending = false;
 		const lines = ["<ipython_state_restored>"];
 		if (result.restored.length > 0) {
 			lines.push(
@@ -9494,10 +9496,9 @@ export class AgentSession {
 			// reload can't restore from a snapshot the old kernel is still writing.
 			const previousDispose = this._ipythonKernelProvisioner?.dispose();
 			this._ipythonKernelSnapshotDir = this.sessionManager.getSessionArtifactDir();
-			// Only surface the "revived from your previous session" notice on the first
-			// build (a genuine resume). A later rebuild (/reload) restores state silently
-			// for continuity — the conversation is unchanged, so there's nothing to flag.
-			const notifyRestore = !this._ipythonRuntimeBuilt;
+			// A resume reports restored state once, even if /reload precedes lazy first
+			// use. Later in-process rebuilds restore silently for continuity.
+			const notifyRestore = !this._ipythonRuntimeBuilt || this._ipythonInitialRestorePending;
 			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
 				env: this._rlmKernelEnv(),
 				commandPrefix: this.settingsManager.getShellCommandPrefix(),
@@ -9575,14 +9576,27 @@ export class AgentSession {
 			includeAllExtensionTools: options.includeAllExtensionTools,
 		});
 
-		// Prewarm when configured, or whenever we're resuming a session that already
-		// has a kernel snapshot — so its state is revived and the model is told what
-		// came back before the first turn, rather than a turn later when the kernel
-		// would otherwise lazily start on first use.
 		const hasSnapshot =
 			!!this._ipythonKernelSnapshotDir && existsSync(snapshotPathIn(this._ipythonKernelSnapshotDir));
-		if ((this._prewarmIpythonKernel || hasSnapshot) && this.getActiveToolNames().includes("ipython")) {
-			this._ipythonKernelProvisioner?.prewarm();
+		if (this.getActiveToolNames().includes("ipython")) {
+			if (this._prewarmIpythonKernel || (hasSnapshot && this._rlmDepth === 0)) {
+				this._ipythonKernelProvisioner?.prewarm();
+			} else if (hasSnapshot && !this._ipythonRuntimeBuilt) {
+				// Hydrating a descendant for observation must not boot its kernel. Keep
+				// the first model turn informed without waiting for Python readiness.
+				this._ipythonInitialRestorePending = true;
+				this._pendingNextTurnMessages.push({
+					role: "custom",
+					customType: "ipython_state",
+					content: [
+						"<ipython_state_restore_pending>",
+						"A saved Python kernel snapshot exists. Restoration is pending until your first Python tool call; no saved names are confirmed available yet. The tool restores state before executing your code and will fail without executing it if restoration cannot complete. A restoration notice will report the names that were revived or need to be recreated.",
+						"</ipython_state_restore_pending>",
+					].join("\n"),
+					display: false,
+					timestamp: Date.now(),
+				});
+			}
 		}
 
 		// Subsequent builds are in-process rebuilds (/reload), not a fresh resume.

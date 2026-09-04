@@ -26,6 +26,7 @@ import {
 	KERNEL_BUSY_INTERRUPT_INTERVAL_MS,
 	KERNEL_BUSY_REUSE_WAIT_MS,
 	KERNEL_SHUTDOWN_TIMEOUT_MS,
+	KERNEL_STARTUP_STEP_TIMEOUT_MS,
 	type KernelAttachment,
 	KernelBusyAfterInterruptError,
 	type KernelDiffDisplay,
@@ -187,6 +188,7 @@ export class ReplKernelManager {
 	private gracefulShutdownPromise?: Promise<boolean>;
 	/** Memoized so concurrent callers all await the same in-flight startup. */
 	private startPromise?: Promise<void>;
+	private startupController?: AbortController;
 	/** Pending debounced auto-snapshot, if one has been scheduled. */
 	private snapshotTimer?: ReturnType<typeof globalThis.setTimeout>;
 	/** While the final dispose snapshot is flushing, new external executions are rejected. */
@@ -265,7 +267,11 @@ export class ReplKernelManager {
 			throw createKernelStartupAbortError();
 		}
 		if (!this.startPromise) {
-			const startPromise = this.doStart({ onBootstrapProgress: options.onBootstrapProgress }).catch((error) => {
+			this.startupController = new AbortController();
+			const startPromise = this.doStart({
+				onBootstrapProgress: options.onBootstrapProgress,
+				signal: this.startupController.signal,
+			}).catch((error) => {
 				// Only clear our own memoization: a stale start must not evict a newer one.
 				if (this.startPromise === startPromise) this.startPromise = undefined;
 				throw error;
@@ -291,6 +297,7 @@ export class ReplKernelManager {
 				(await ensureKernelPython({
 					pythonSkills: this.options.pythonSkills,
 					onProgress: startOptions.onBootstrapProgress,
+					signal: startOptions.signal,
 				}));
 			if (this.startStale(generation)) throw new Error("Kernel start superseded");
 			this.options.python = python;
@@ -824,7 +831,6 @@ export class ReplKernelManager {
 	}
 
 	async execute(code: string, opts: ExecuteOptions = {}): Promise<ExecuteResult> {
-		await this.waitForProtocolRepair(opts.signal);
 		const result = await this.enqueueExecute(code, opts);
 		// Refresh the on-disk snapshot after real work so a later resume (or a
 		// crash before graceful shutdown) revives the most recent namespace.
@@ -850,6 +856,23 @@ export class ReplKernelManager {
 		opts: ExecuteOptions,
 		executionTimeoutMs?: number,
 	): Promise<InternalExecuteResult> {
+		const timeoutMs = executionTimeoutMs ?? opts.timeoutMs;
+		if (timeoutMs !== undefined) {
+			if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
+				throw new Error("Kernel request timeout must be a positive integer within the timer range");
+			}
+			const controller = new AbortController();
+			const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+			timeout.unref?.();
+			const { timeoutMs: _timeoutMs, ...remainingOptions } = opts;
+			const signal = opts.signal ? AbortSignal.any([opts.signal, controller.signal]) : controller.signal;
+			try {
+				return await this.enqueueRequest(requestFields, code, { ...remainingOptions, signal });
+			} finally {
+				globalThis.clearTimeout(timeout);
+			}
+		}
+		if (!opts.protocolRepair) await this.waitForProtocolRepair(opts.signal);
 		if (opts.signal?.aborted) {
 			return { stdout: "", stderr: "", status: "aborted", durationMs: 0 };
 		}
@@ -860,7 +883,7 @@ export class ReplKernelManager {
 		if (this.flushingSnapshotForDispose && !opts.internal) {
 			throw new Error("Kernel is shutting down");
 		}
-		if (!opts.protocolRepair) await this.ensureKernelRebootstrapped(opts.signal);
+		if (!opts.protocolRepair && requestFields.type !== "restore") await this.ensureKernelRebootstrapped(opts.signal);
 		// Aborted while waiting on the re-bootstrap: settle now instead of parking
 		// on the queue slot behind the still-running bootstrap.
 		if (opts.signal?.aborted) {
@@ -878,11 +901,22 @@ export class ReplKernelManager {
 		this.executionQueue = new Promise<void>((r) => {
 			resolveNext = r;
 		});
-		await prev;
-
 		const started = Date.now();
-		let executionTimeout: ReturnType<typeof globalThis.setTimeout> | undefined;
 		try {
+			await raceStartupWithAbort(prev, opts.signal);
+		} catch (error) {
+			// An abandoned slot remains behind its predecessor: settling the caller
+			// must not let its successor overlap the currently executing request.
+			void prev.then(resolveNext, resolveNext);
+			if (opts.signal?.aborted) {
+				return { stdout: "", stderr: "", status: "aborted", durationMs: Date.now() - started };
+			}
+			throw error;
+		}
+		try {
+			if (opts.signal?.aborted) {
+				return { stdout: "", stderr: "", status: "aborted", durationMs: Date.now() - started };
+			}
 			await this.waitForActiveExecutionToClearForReuse(opts.signal);
 			if (opts.signal?.aborted) {
 				return { stdout: "", stderr: "", status: "aborted", durationMs: Date.now() - started };
@@ -897,17 +931,8 @@ export class ReplKernelManager {
 				await this.waitForProtocolRepair(opts.signal);
 				return this.enqueueRequest(requestFields, code, opts, executionTimeoutMs);
 			}
-			if (executionTimeoutMs === undefined) {
-				return await this.executeInner(requestFields, code, opts, started);
-			}
-
-			const controller = new AbortController();
-			executionTimeout = globalThis.setTimeout(() => controller.abort(), executionTimeoutMs);
-			executionTimeout.unref?.();
-			const signal = opts.signal ? AbortSignal.any([opts.signal, controller.signal]) : controller.signal;
-			return await this.executeInner(requestFields, code, { ...opts, signal }, started);
+			return await this.executeInner(requestFields, code, opts, started);
 		} finally {
-			if (executionTimeout) globalThis.clearTimeout(executionTimeout);
 			resolveNext();
 		}
 	}
@@ -1251,6 +1276,8 @@ export class ReplKernelManager {
 
 	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
 		this.startGeneration++; // any teardown invalidates in-flight starts
+		this.startupController?.abort();
+		this.startupController = undefined;
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		this.pendingDoneWaiters.clear();
@@ -1495,20 +1522,25 @@ export class ReplKernelManager {
 	 * start() and before the runtime bootstrap, which then refreshes live handles
 	 * (rlm, skills) over anything restored. Never throws.
 	 */
-	async restoreState(): Promise<RestoreResult | null> {
-		return this.performRestore(false);
+	async restoreState(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<RestoreResult | null> {
+		return this.performRestore(false, options);
 	}
 
 	/** Repair restores bypass the repair gate and are bounded so a stalled kernel cannot wedge it. */
-	private async performRestore(protocolRepair: boolean): Promise<RestoreResult | null> {
+	private async performRestore(
+		protocolRepair: boolean,
+		options: { signal?: AbortSignal; timeoutMs?: number } = {},
+	): Promise<RestoreResult | null> {
 		const cfg = this.options.snapshot;
 		if (!cfg) return null;
+		// Failed/aborted restoration must never let dispose replace the saved namespace.
+		this.pendingRestore = true;
 		try {
 			const r = await this.enqueueRequest(
 				{ type: "restore", path: cfg.path },
 				"",
-				{ internal: true, protocolRepair },
-				protocolRepair ? REPAIR_STEP_TIMEOUT_MS : undefined,
+				{ internal: true, protocolRepair, signal: options.signal },
+				options.timeoutMs ?? (protocolRepair ? REPAIR_STEP_TIMEOUT_MS : KERNEL_STARTUP_STEP_TIMEOUT_MS),
 			);
 			if (r.status !== "ok" || !r.doneFields) {
 				this.appendKernelDiagnostic(

@@ -1,0 +1,2 @@
+- Fixed cancelled Python requests waiting behind unrelated work, and bounded environment setup, restoration, and runtime initialization waits.
+- Preserved saved Python state when restoration or initialization fails, and kept restored subagent kernels lazy until first Python use.

@@ -56,7 +56,27 @@ const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
 const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS = 30_000;
 
-let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
+const DEFAULT_BOOTSTRAP_TIMEOUTS = {
+	validationMs: 30_000,
+	commandMs: 300_000,
+	lockMs: 300_000,
+	totalMs: 600_000,
+};
+
+interface InFlightBootstrap {
+	promise: Promise<string>;
+	controller: AbortController;
+	waiters: Set<(error: unknown) => void>;
+}
+
+const inFlightEnsureKernelPython = new Map<string, InFlightBootstrap>();
+
+class KernelBootstrapTimeoutError extends Error {
+	constructor(stage: string, timeoutMs: number) {
+		super(`Python kernel ${stage} timed out after ${timeoutMs}ms`);
+		this.name = "TimeoutError";
+	}
+}
 
 export type KernelPythonSkill = PythonSkillRuntimeInfo;
 export type KernelBootstrapProgressHandler = (message: string) => void;
@@ -64,6 +84,23 @@ export type KernelBootstrapProgressHandler = (message: string) => void;
 export interface EnsureKernelPythonOptions {
 	pythonSkills?: readonly KernelPythonSkill[];
 	onProgress?: KernelBootstrapProgressHandler;
+	signal?: AbortSignal;
+	timeouts?: Partial<typeof DEFAULT_BOOTSTRAP_TIMEOUTS>;
+}
+
+function bootstrapTimeouts(options: EnsureKernelPythonOptions): typeof DEFAULT_BOOTSTRAP_TIMEOUTS {
+	const timeouts = { ...DEFAULT_BOOTSTRAP_TIMEOUTS, ...options.timeouts };
+	for (const [name, value] of Object.entries(timeouts)) {
+		if (!Number.isSafeInteger(value) || value <= 0 || value > 2_147_483_647) {
+			throw new Error(`Invalid Python kernel timeout ${name}: ${value}`);
+		}
+	}
+	return timeouts;
+}
+
+function rethrowInterruption(error: unknown, options: EnsureKernelPythonOptions): void {
+	options.signal?.throwIfAborted();
+	if (error instanceof KernelBootstrapTimeoutError) throw error;
 }
 
 interface BootstrapPythonSkill {
@@ -369,14 +406,53 @@ async function resolveWritableKernelVenvDir(): Promise<string> {
 	}
 }
 
-function run(command: string, args: string[], options: { stdio?: "ignore" | "inherit" } = {}): Promise<void> {
+function run(
+	command: string,
+	args: string[],
+	options: { stdio?: "ignore" | "inherit"; signal?: AbortSignal; timeoutMs: number; stage: string },
+): Promise<void> {
+	options.signal?.throwIfAborted();
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, {
 			env: process.env,
 			stdio: options.stdio ?? "ignore",
+			detached: process.platform !== "win32",
 		});
-		child.on("error", reject);
-		child.on("exit", (code, signal) => {
+		let interrupted: Error | undefined;
+		const stop = (reason: Error): void => {
+			if (interrupted) return;
+			interrupted = reason;
+			// Installers can spawn helpers. Kill their process group before releasing
+			// the bootstrap lock so a retry cannot race a timed-out installer.
+			try {
+				if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+				else child.kill("SIGKILL");
+			} catch (error) {
+				if (!isNodeError(error, "ESRCH")) child.kill("SIGKILL");
+			}
+		};
+		const abort = (): void => {
+			const reason: unknown = options.signal?.reason;
+			stop(reason instanceof Error ? reason : new Error("Python kernel setup aborted"));
+		};
+		const timer = setTimeout(
+			() => stop(new KernelBootstrapTimeoutError(options.stage, options.timeoutMs)),
+			options.timeoutMs,
+		);
+		const cleanup = (): void => {
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", abort);
+		};
+		child.once("error", (error) => {
+			cleanup();
+			reject(interrupted ?? error);
+		});
+		child.once("exit", (code, signal) => {
+			cleanup();
+			if (interrupted) {
+				reject(interrupted);
+				return;
+			}
 			if (code === 0) {
 				resolve();
 				return;
@@ -384,31 +460,53 @@ function run(command: string, args: string[], options: { stdio?: "ignore" | "inh
 			const reason = signal ? `signal ${signal}` : `exit code ${code}`;
 			reject(new Error(`${command} ${args.join(" ")} failed with ${reason}`));
 		});
+		options.signal?.addEventListener("abort", abort, { once: true });
+		if (options.signal?.aborted) abort();
 	});
 }
 
-async function pythonImports(python: string, moduleName: string): Promise<boolean> {
+function runInstall(command: string, args: string[], options: EnsureKernelPythonOptions): Promise<void> {
+	return run(command, args, {
+		signal: options.signal,
+		timeoutMs: bootstrapTimeouts(options).commandMs,
+		stage: "installation command",
+	});
+}
+
+async function pythonImports(python: string, moduleName: string, options: EnsureKernelPythonOptions): Promise<boolean> {
 	try {
-		await run(python, ["-c", `import ${moduleName}`], { stdio: "ignore" });
+		await run(python, ["-c", `import ${moduleName}`], {
+			stdio: "ignore",
+			signal: options.signal,
+			timeoutMs: bootstrapTimeouts(options).validationMs,
+			stage: `validation of ${moduleName}`,
+		});
 		return true;
-	} catch {
+	} catch (error) {
+		rethrowInterruption(error, options);
 		return false;
 	}
 }
 
-async function hasPrimeAgentRuntime(python: string): Promise<boolean> {
+async function hasPrimeAgentRuntime(python: string, options: EnsureKernelPythonOptions): Promise<boolean> {
 	try {
-		await run(python, ["-c", RUNTIME_READY_CHECK], { stdio: "ignore" });
+		await run(python, ["-c", RUNTIME_READY_CHECK], {
+			stdio: "ignore",
+			signal: options.signal,
+			timeoutMs: bootstrapTimeouts(options).validationMs,
+			stage: "runtime validation",
+		});
 		return true;
-	} catch {
+	} catch (error) {
+		rethrowInterruption(error, options);
 		return false;
 	}
 }
 
-async function missingRlmExtraImportLabels(python: string): Promise<string[]> {
+async function missingRlmExtraImportLabels(python: string, options: EnsureKernelPythonOptions): Promise<string[]> {
 	const missing: string[] = [];
 	for (const pkg of DEFAULT_RLM_EXTRA_PACKAGES) {
-		if (!(await pythonImports(python, pkg.importName))) {
+		if (!(await pythonImports(python, pkg.importName, options))) {
 			missing.push(pkg.promptLabel);
 		}
 	}
@@ -418,10 +516,11 @@ async function missingRlmExtraImportLabels(python: string): Promise<string[]> {
 async function missingPythonSkillImportLabels(
 	python: string,
 	pythonSkills: readonly KernelPythonSkill[],
+	options: EnsureKernelPythonOptions,
 ): Promise<string[]> {
 	const missing: string[] = [];
 	for (const skill of pythonSkills) {
-		if (!(await pythonImports(python, skill.importName))) {
+		if (!(await pythonImports(python, skill.importName, options))) {
 			missing.push(`${skill.name} (${skill.importName})`);
 		}
 	}
@@ -468,11 +567,15 @@ async function lockMissingPidIsStale(lockDir: string): Promise<boolean> {
 	}
 }
 
-async function acquireBootstrapLock(venv: string): Promise<() => Promise<void>> {
+async function acquireBootstrapLock(venv: string, options: EnsureKernelPythonOptions): Promise<() => Promise<void>> {
+	const timeoutMs = bootstrapTimeouts(options).lockMs;
+	const deadline = performance.now() + timeoutMs;
 	const lockDir = bootstrapLockDir(venv);
 	await mkdir(path.dirname(lockDir), { recursive: true });
 
 	for (;;) {
+		options.signal?.throwIfAborted();
+		if (performance.now() >= deadline) throw new KernelBootstrapTimeoutError("install lock wait", timeoutMs);
 		try {
 			await mkdir(lockDir);
 			await writeFile(path.join(lockDir, "pid"), `${process.pid}\n`, "utf8");
@@ -486,7 +589,9 @@ async function acquireBootstrapLock(venv: string): Promise<() => Promise<void>> 
 				continue;
 			}
 
-			await sleep(BOOTSTRAP_LOCK_RETRY_MS);
+			await sleep(Math.min(BOOTSTRAP_LOCK_RETRY_MS, Math.max(1, deadline - performance.now())), undefined, {
+				signal: options.signal,
+			});
 		}
 	}
 }
@@ -506,6 +611,7 @@ async function findExecutable(name: string): Promise<string | null> {
 }
 
 async function ensureUv(options: EnsureKernelPythonOptions): Promise<string> {
+	options.signal?.throwIfAborted();
 	const fromPath = await findExecutable("uv");
 	if (fromPath) return fromPath;
 
@@ -513,7 +619,7 @@ async function ensureUv(options: EnsureKernelPythonOptions): Promise<string> {
 	if (await isExecutable(localUv)) return localUv;
 
 	const shouldInstallUv =
-		process.env.PRIME_AGENT_INSTALL_UV === "1" || (!options.onProgress && (await confirmUvInstall()));
+		process.env.PRIME_AGENT_INSTALL_UV === "1" || (!options.onProgress && (await confirmUvInstall(options.signal)));
 	if (!shouldInstallUv) {
 		throw new Error(
 			`uv is required to set up the Python kernel. Install uv yourself: ${UV_INSTALL_COMMAND}, ` +
@@ -523,7 +629,12 @@ async function ensureUv(options: EnsureKernelPythonOptions): Promise<string> {
 
 	reportProgress(options, "› installing uv (one-time)…");
 	try {
-		await run("sh", ["-c", UV_INSTALL_COMMAND], { stdio: options.onProgress ? "ignore" : "inherit" });
+		await run("sh", ["-c", UV_INSTALL_COMMAND], {
+			stdio: options.onProgress ? "ignore" : "inherit",
+			signal: options.signal,
+			timeoutMs: bootstrapTimeouts(options).commandMs,
+			stage: "uv installation",
+		});
 	} catch (error) {
 		throw new Error(
 			`couldn't install uv from astral.sh; install it yourself: ${UV_INSTALL_COMMAND}, then re-run prime-agent. ${errorMessage(error)}`,
@@ -536,13 +647,15 @@ async function ensureUv(options: EnsureKernelPythonOptions): Promise<string> {
 	throw new Error("uv install completed but binary not found at ~/.local/bin/uv");
 }
 
-async function confirmUvInstall(): Promise<boolean> {
+async function confirmUvInstall(signal?: AbortSignal): Promise<boolean> {
 	if (process.env.PRIME_AGENT_INSTALL_UV === "0") return false;
 	if (!stdin.isTTY || !stderr.isTTY) return false;
 
 	const rl = createInterface({ input: stdin, output: stderr });
 	try {
-		const answer = (await rl.question("Prime Agent needs uv to set up Python. Install uv from astral.sh now? [Y/n] "))
+		const answer = (
+			await rl.question("Prime Agent needs uv to set up Python. Install uv from astral.sh now? [Y/n] ", { signal })
+		)
 			.trim()
 			.toLowerCase();
 		return answer !== "n" && answer !== "no";
@@ -721,17 +834,21 @@ async function bootstrapVenv(
 	const runtimeRequirement = sourceDir ?? RUNTIME_REQUIREMENT;
 	const runtimeIdentity = await resolveRuntimeIdentity();
 
-	await run(uv, ["python", "install", PYTHON_VERSION]);
-	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
-	await run(uv, [
-		"pip",
-		"install",
-		"--python",
-		python,
-		runtimeRequirement,
-		STATE_SNAPSHOT_REQUIREMENT,
-		...DEFAULT_RLM_EXTRA_UV_ARGS,
-	]);
+	await runInstall(uv, ["python", "install", PYTHON_VERSION], options);
+	await runInstall(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"], options);
+	await runInstall(
+		uv,
+		[
+			"pip",
+			"install",
+			"--python",
+			python,
+			runtimeRequirement,
+			STATE_SNAPSHOT_REQUIREMENT,
+			...DEFAULT_RLM_EXTRA_UV_ARGS,
+		],
+		options,
+	);
 	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, options);
 }
 
@@ -791,31 +908,35 @@ async function syncPythonSkills(
 			.flatMap(formatPythonSkillInstallArgs);
 
 		try {
-			await run(uv, [
-				"pip",
-				"install",
-				"--python",
-				python,
-				...formatPythonSkillInstallArgs(skill),
-				...localDependencyArgs,
-			]);
+			await runInstall(
+				uv,
+				["pip", "install", "--python", python, ...formatPythonSkillInstallArgs(skill), ...localDependencyArgs],
+				options,
+			);
 			installedPythonSkills.push(
 				skill,
 				...localDependencies.filter((dependency) => !installedPythonSkills.includes(dependency)),
 			);
 		} catch (error) {
+			rethrowInterruption(error, options);
 			reportProgress(
 				options,
 				`Warning: Python skill ${skill.importName} failed to install and will be unavailable: ${errorMessage(error)}`,
 			);
 		}
 	}
+	options.signal?.throwIfAborted();
 	await writeBootstrapVersion(venv, runtimeIdentity, installedPythonSkills);
 }
 
-async function kernelBaseReady(python: string, venv: string, runtimeIdentity: string): Promise<boolean> {
+async function kernelBaseReady(
+	python: string,
+	venv: string,
+	runtimeIdentity: string,
+	options: EnsureKernelPythonOptions,
+): Promise<boolean> {
 	return (
-		(await hasPrimeAgentRuntime(python)) &&
+		(await hasPrimeAgentRuntime(python, options)) &&
 		bootstrapBaseVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity)
 	);
 }
@@ -825,9 +946,10 @@ async function kernelReady(
 	venv: string,
 	runtimeIdentity: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
+	options: EnsureKernelPythonOptions,
 ): Promise<boolean> {
 	return (
-		(await hasPrimeAgentRuntime(python)) &&
+		(await hasPrimeAgentRuntime(python, options)) &&
 		bootstrapVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity, pythonSkills)
 	);
 }
@@ -844,23 +966,24 @@ async function ensureKernelPythonUncached(
 	options: EnsureKernelPythonOptions,
 	pythonSkills: readonly BootstrapPythonSkill[],
 ): Promise<string> {
+	options.signal?.throwIfAborted();
 	const override = process.env.PRIME_AGENT_KERNEL_PYTHON;
 	if (override) {
 		const python = path.resolve(expandHome(override));
 		const missing: string[] = [];
-		if (!(await hasPrimeAgentRuntime(python))) {
+		if (!(await hasPrimeAgentRuntime(python, options))) {
 			missing.push(
 				"a current prime-agent-runtime with callable rlm.run, rlm.host_request, and explicit harness CRUD methods",
 			);
 		}
 		if (missing.length === 0) {
-			const missingExtraImports = await missingRlmExtraImportLabels(python);
+			const missingExtraImports = await missingRlmExtraImportLabels(python, options);
 			if (missingExtraImports.length > 0) {
 				missing.push(`default Python packages (${missingExtraImports.join(", ")})`);
 			}
 		}
 		if (missing.length === 0 && pythonSkills.length > 0) {
-			const missingPythonSkills = await missingPythonSkillImportLabels(python, options.pythonSkills ?? []);
+			const missingPythonSkills = await missingPythonSkillImportLabels(python, options.pythonSkills ?? [], options);
 			if (missingPythonSkills.length > 0) {
 				reportProgress(
 					options,
@@ -875,16 +998,17 @@ async function ensureKernelPythonUncached(
 	const venv = await resolveWritableKernelVenvDir();
 	const python = path.join(venv, "bin", "python");
 	const runtimeIdentity = await resolveRuntimeIdentity();
-	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
+	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills, options)) return python;
 
-	const releaseLock = await acquireBootstrapLock(venv);
+	const releaseLock = await acquireBootstrapLock(venv, options);
 	try {
-		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
-		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
+		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills, options)) return python;
+		if (await kernelBaseReady(python, venv, runtimeIdentity, options)) {
 			await syncPythonSkills(await ensureUv(options), venv, python, runtimeIdentity, pythonSkills, options);
 			return python;
 		}
 
+		options.signal?.throwIfAborted();
 		const hadVenv = existsSync(venv);
 		reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
 		if (hadVenv) {
@@ -903,14 +1027,63 @@ async function ensureKernelPythonUncached(
 	return python;
 }
 
-export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Promise<string> {
-	const pythonSkills = normalizePythonSkills(options.pythonSkills);
-	const key = ensureKernelPythonKey(pythonSkills);
-	if (inFlightEnsureKernelPython?.key === key) return inFlightEnsureKernelPython.promise;
-
-	const promise = ensureKernelPythonUncached(options, pythonSkills).finally(() => {
-		if (inFlightEnsureKernelPython?.promise === promise) inFlightEnsureKernelPython = null;
+function waitForBootstrap(entry: InFlightBootstrap, signal?: AbortSignal): Promise<string> {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const finish = (result: { value: string } | { error: unknown }): void => {
+			if (settled) return;
+			settled = true;
+			signal?.removeEventListener("abort", abort);
+			entry.waiters.delete(sharedAbort);
+			if ("value" in result) resolve(result.value);
+			else reject(result.error);
+		};
+		const abort = (): void => {
+			finish({ error: signal?.reason ?? new Error("Python kernel setup aborted") });
+			if (entry.waiters.size === 0) entry.controller.abort(signal?.reason);
+		};
+		const sharedAbort = (error: unknown): void => finish({ error });
+		signal?.addEventListener("abort", abort, { once: true });
+		entry.waiters.add(sharedAbort);
+		entry.promise.then(
+			(value) => finish({ value }),
+			(error: unknown) => finish({ error }),
+		);
+		if (signal?.aborted) abort();
+		else if (entry.controller.signal.aborted) sharedAbort(entry.controller.signal.reason);
 	});
-	inFlightEnsureKernelPython = { key, promise };
-	return promise;
+}
+
+export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Promise<string> {
+	if (options.signal?.aborted) return Promise.reject(options.signal.reason);
+	const pythonSkills = normalizePythonSkills(options.pythonSkills);
+	const timeouts = bootstrapTimeouts(options);
+	const key = `${ensureKernelPythonKey(pythonSkills)}\0${JSON.stringify(timeouts)}`;
+	const existing = inFlightEnsureKernelPython.get(key);
+	if (existing) return waitForBootstrap(existing, options.signal);
+
+	const controller = new AbortController();
+	const timer = setTimeout(
+		() => controller.abort(new KernelBootstrapTimeoutError("setup", timeouts.totalMs)),
+		timeouts.totalMs,
+	);
+	const promise = ensureKernelPythonUncached(
+		{ ...options, signal: controller.signal, timeouts },
+		pythonSkills,
+	).finally(() => {
+		clearTimeout(timer);
+		if (inFlightEnsureKernelPython.get(key)?.promise === promise) inFlightEnsureKernelPython.delete(key);
+	});
+	const entry: InFlightBootstrap = { promise, controller, waiters: new Set() };
+	// Hundreds of managers may share this validation. A single abort listener
+	// fans out to waiters instead of exceeding AbortSignal's listener limit.
+	controller.signal.addEventListener(
+		"abort",
+		() => {
+			for (const waiter of [...entry.waiters]) waiter(controller.signal.reason);
+		},
+		{ once: true },
+	);
+	inFlightEnsureKernelPython.set(key, entry);
+	return waitForBootstrap(entry, options.signal);
 }
