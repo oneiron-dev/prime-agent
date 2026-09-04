@@ -2,17 +2,21 @@ import { createConnection, type Socket } from "node:net";
 import { serializeJsonLine } from "../rpc/jsonl.js";
 import { type PrivateFrame, PrivateFramedChannel } from "../session-worker/private-framing.js";
 import {
+	type DaemonAttachRequest,
+	DaemonCapabilityUnavailableError,
 	type DaemonClientMessageListener,
 	type DaemonClientRequestOptions,
 	DaemonSocketClosedError,
 } from "./daemon-client.js";
-import type {
-	DaemonClosingReason,
-	DaemonCommand,
-	DaemonOutbound,
-	DaemonPeerTransportTicket,
-	DaemonResponse,
-	DaemonServerCapability,
+import {
+	DAEMON_ATTACH_CANCELLATION_COMPATIBILITY,
+	type DaemonClosingReason,
+	type DaemonCommand,
+	type DaemonOutbound,
+	type DaemonPeerTransportTicket,
+	type DaemonResponse,
+	type DaemonServerCapability,
+	daemonHelloMeetsCompatibility,
 } from "./daemon-protocol.js";
 import {
 	type DaemonPeerCommand,
@@ -80,10 +84,13 @@ export class DaemonWorkerClient {
 		if (this.socket) {
 			throw new Error("Daemon worker client is already connected");
 		}
+		this.helloMessage = undefined;
 		const socket = createConnection(this.socketPath);
 		this.socket = socket;
 		this.channel = new PrivateFramedChannel(socket, isDaemonWorkerFrameHeader);
-		this.channel.onFrame((frame) => this.handleFrame(frame));
+		this.channel.onFrame((frame) => {
+			if (this.socket === socket) this.handleFrame(frame);
+		});
 
 		await new Promise<void>((resolve, reject) => {
 			const timeout = setTimeout(() => {
@@ -152,10 +159,10 @@ export class DaemonWorkerClient {
 	request(
 		command: DaemonCommandBody,
 		timeoutMs = 30_000,
-		// Progress/recovery options are supervisor-transport features; a direct request fails fast instead of replaying (no double execution).
-		_options: DaemonClientRequestOptions = {},
+		// Progress/recovery remain supervisor-only; a direct request never replays.
+		options: DaemonClientRequestOptions = {},
 	): Promise<DaemonResponse> {
-		return this.requestWire(command, timeoutMs);
+		return this.requestWire(command, timeoutMs, options);
 	}
 
 	requestWorker(command: DaemonWorkerCommandBody, timeoutMs = 30_000): Promise<DaemonResponse> {
@@ -197,39 +204,98 @@ export class DaemonWorkerClient {
 		this.channel = undefined;
 		this.socket?.destroy();
 		this.socket = undefined;
+		this.helloMessage = undefined;
 		this.directPeer = false;
 		this.directClosingReason = undefined;
 	}
 
-	private async requestWire(command: DaemonWorkerWireCommandBody, timeoutMs: number): Promise<DaemonResponse> {
+	private async requestWire(
+		command: DaemonWorkerWireCommandBody,
+		timeoutMs: number,
+		options: DaemonClientRequestOptions = {},
+	): Promise<DaemonResponse> {
 		if (!this.channel || !this.socket || this.socket.destroyed) {
 			throw new Error("Daemon worker client is not connected");
 		}
+		const socket = this.socket;
+		const channel = this.channel;
+		const supportsAttachCancellation = daemonHelloMeetsCompatibility(
+			this.helloMessage,
+			DAEMON_ATTACH_CANCELLATION_COMPATIBILITY,
+		);
+		if (
+			!supportsAttachCancellation &&
+			(command.type === "cancel_attach" || (command.type === "attach" && command.timeoutMs !== undefined))
+		) {
+			throw new DaemonCapabilityUnavailableError(command.type, "attach_cancellation");
+		}
+		if (command.type === "attach" && supportsAttachCancellation) {
+			command = { ...command, timeoutMs: Math.min(command.timeoutMs ?? timeoutMs, timeoutMs) };
+		}
 		const id = `worker_${++this.requestId}`;
 		const fullCommand = { ...command, id } as DaemonWorkerWireCommand;
+		const payload = Buffer.from(serializeJsonLine(fullCommand));
+		const attachRequest =
+			command.type === "attach" && command.timeoutMs !== undefined
+				? this.createAttachRequest(id, command.activeSessionId, command.timeoutMs, socket, channel)
+				: undefined;
 		const response = new Promise<DaemonResponse>((resolve, reject) => {
 			const timeout = setTimeout(() => {
 				this.pending.delete(id);
+				void attachRequest?.cancel().catch(() => undefined);
 				reject(
 					new DaemonWorkerProbeTimeoutError(`Timed out waiting for daemon worker response to ${command.type}`),
 				);
 			}, timeoutMs);
 			this.pending.set(id, { resolve, reject, timeout });
 		});
-		try {
-			await this.channel.send(
-				{ kind: "command", requestId: id, commandType: command.type },
-				Buffer.from(serializeJsonLine(fullCommand)),
-			);
-		} catch (error) {
+		const rejectPending = (error: unknown) => {
 			const pending = this.pending.get(id);
 			if (pending) {
 				clearTimeout(pending.timeout);
 				this.pending.delete(id);
 				pending.reject(error instanceof Error ? error : new Error(String(error)));
 			}
+		};
+		// Queue the attach before exposing cancellation, without waiting for socket backpressure.
+		void channel.send({ kind: "command", requestId: id, commandType: command.type }, payload).catch(rejectPending);
+		try {
+			if (attachRequest) options.onAttachRequest?.(attachRequest);
+		} catch (error) {
+			rejectPending(error);
+			void attachRequest?.cancel().catch(() => undefined);
 		}
 		return response;
+	}
+
+	private createAttachRequest(
+		id: string,
+		activeSessionId: string,
+		timeoutMs: number,
+		socket: Socket,
+		channel: PrivateFramedChannel<DaemonWorkerFrameHeader>,
+	): DaemonAttachRequest {
+		let cancellation: Promise<void> | undefined;
+		return {
+			id,
+			deadlineAt: Date.now() + timeoutMs,
+			cancel: () => {
+				if (cancellation) return cancellation;
+				if (socket.destroyed || this.socket !== socket || this.channel !== channel) return Promise.resolve();
+				const pending = this.pending.get(id);
+				if (pending) {
+					this.pending.delete(id);
+					clearTimeout(pending.timeout);
+					pending.reject(new Error("Daemon attach request cancelled"));
+				}
+				const cancelId = `worker_${++this.requestId}`;
+				cancellation = channel.send(
+					{ kind: "command", requestId: cancelId, commandType: "cancel_attach" },
+					Buffer.from(serializeJsonLine({ id: cancelId, type: "cancel_attach", requestId: id, activeSessionId })),
+				);
+				return cancellation;
+			},
+		};
 	}
 
 	private handleFrame(frame: PrivateFrame<DaemonWorkerFrameHeader>): void {
@@ -334,6 +400,7 @@ export class DaemonWorkerClient {
 		}
 		this.socket = undefined;
 		this.channel = undefined;
+		this.helloMessage = undefined;
 		this.directPeer = false;
 		this.directClosingReason = undefined;
 		this.rejectAll(error);

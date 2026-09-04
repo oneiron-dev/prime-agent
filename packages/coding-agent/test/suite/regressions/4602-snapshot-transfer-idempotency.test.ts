@@ -3,6 +3,7 @@ import { PassThrough } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it, vi } from "vitest";
 import type { ActiveSessionState, DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
+import { attachWaiterCount } from "../../../src/modes/daemon/attach-wait.js";
 import { AgentDaemon, createSnapshotTransferId } from "../../../src/modes/daemon/daemon-mode.js";
 import {
 	DAEMON_PROTOCOL_INFO,
@@ -446,6 +447,11 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		seedSupervisorRoster(supervisor, worker);
 		internals.streamSnapshot = streamSnapshot;
 		const frames = snapshotFrames([{ role: "user", content: "stable", timestamp: 1 }]);
+		const waitForValidationObserver = async () => {
+			const validation = worker.snapshotGenerations.get(activeSessionId)?.get(snapshotId)?.validation?.promise;
+			if (!validation) throw new Error("duplicate validation was not created");
+			await vi.waitFor(() => expect(attachWaiterCount(validation)).toBeGreaterThan(0));
+		};
 		for (const message of [frames.begin, frames.chunk, frames.end]) {
 			internals.handleWorkerFrame(worker, frame(message));
 		}
@@ -453,8 +459,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		internals.handleWorkerFrame(worker, frame(frames.begin));
 		client.catchupActiveSessionIds?.add(activeSessionId);
 		const catchup = internals.catchUpClient(client);
-		await Promise.resolve();
-		await Promise.resolve();
+		await waitForValidationObserver();
 
 		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
 		expect(request).not.toHaveBeenCalled();
@@ -472,8 +477,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		internals.handleWorkerFrame(worker, frame(frames.begin));
 		client.catchupActiveSessionIds?.add(activeSessionId);
 		const failedCatchup = internals.catchUpClient(client);
-		await Promise.resolve();
-		await Promise.resolve();
+		await waitForValidationObserver();
 		internals.handleWorkerFrame(
 			worker,
 			frame({

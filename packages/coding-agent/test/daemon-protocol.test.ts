@@ -8,6 +8,7 @@ import {
 	createDaemonEventEnvelope,
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
+	DAEMON_ATTACH_CANCELLATION_COMPATIBILITY,
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_COMMAND_PLANE,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
@@ -98,6 +99,27 @@ describe("daemon protocol helpers", () => {
 			.digest("hex")
 			.slice(0, 12);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
+	});
+
+	it("gates attachment deadlines and cancellation while preserving legacy attach shapes", () => {
+		expect(DAEMON_ATTACH_CANCELLATION_COMPATIBILITY).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 28,
+			capability: "attach_cancellation",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("attach_cancellation");
+		expect(getDaemonCommandCompatibilities({ type: "attach", activeSessionId: "old-client" })).toEqual([
+			{ minProtocol: 7 },
+		]);
+		expect(
+			getDaemonCommandCompatibilities({ type: "attach", activeSessionId: "new-client", timeoutMs: 30_000 }),
+		).toEqual([DAEMON_ATTACH_CANCELLATION_COMPATIBILITY, { minProtocol: 7 }]);
+		expect(DAEMON_COMMAND_COMPATIBILITY.cancel_attach).toEqual(DAEMON_ATTACH_CANCELLATION_COMPATIBILITY);
+		expect(DAEMON_COMMAND_PLANE.cancel_attach).toBe("session");
+		expect(isDaemonMutatingCommand({ type: "cancel_attach" })).toBe(false);
+		// Cancellation uses the existing response/failure channels, whose shapes remain compatible.
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.response).toEqual({ minProtocol: 7 });
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_snapshot_failed).toEqual({ minProtocol: 7 });
 	});
 
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {

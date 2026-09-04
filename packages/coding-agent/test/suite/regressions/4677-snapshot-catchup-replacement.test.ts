@@ -181,7 +181,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 				worker: WorkerHarness,
 				result: DaemonAttachResult,
 				transcript: SnapshotTranscriptCache,
-			): Promise<void>;
+			): Promise<boolean>;
 		};
 		internals.writeSnapshotBuffer = writeSnapshotBuffer;
 
@@ -260,7 +260,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			}),
 		);
 
-		await expect(firstStream).resolves.toBeUndefined();
+		await expect(firstStream).resolves.toBe(true);
 		expect(written.some((message) => message.type === "session_snapshot_failed")).toBe(false);
 		expect(worker.transcriptCaches.get(activeSessionId)?.snapshotId).toBe(replacementSnapshotId);
 		client.socket.destroy();
@@ -636,7 +636,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 				result: DaemonAttachResult,
 				transcript: SnapshotTranscriptCache,
 				purpose: "attach" | "replacement" | "resync",
-			): Promise<void>;
+			): Promise<boolean>;
 			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 			queueCatchup(client: DaemonSocketClient, activeSessionId: string, purpose: "replacement" | "resync"): void;
 			catchUpClient(client: DaemonSocketClient): Promise<void>;

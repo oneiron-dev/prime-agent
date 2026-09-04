@@ -157,7 +157,7 @@ export class SnapshotTranscriptCache {
 			if (index < this.chunks.length) {
 				continue;
 			}
-			for (const waiter of waiters) {
+			for (const waiter of [...waiters]) {
 				waiter.resolve(undefined);
 			}
 			this.chunkWaiters.delete(index);
@@ -170,14 +170,15 @@ export class SnapshotTranscriptCache {
 		}
 		this.failure = error;
 		for (const waiters of this.chunkWaiters.values()) {
-			for (const waiter of waiters) {
+			for (const waiter of [...waiters]) {
 				waiter.reject(error);
 			}
 		}
 		this.chunkWaiters.clear();
 	}
 
-	waitForChunk(index: number): Promise<Buffer | undefined> {
+	waitForChunk(index: number, signal?: AbortSignal): Promise<Buffer | undefined> {
+		if (signal?.aborted) return Promise.reject(signal.reason);
 		if (this.failure) {
 			return Promise.reject(this.failure);
 		}
@@ -189,8 +190,28 @@ export class SnapshotTranscriptCache {
 		}
 		return new Promise((resolve, reject) => {
 			const waiters = this.chunkWaiters.get(index) ?? [];
-			waiters.push({ resolve, reject });
+			const cleanup = () => {
+				const position = waiters.indexOf(waiter);
+				if (position >= 0) waiters.splice(position, 1);
+				if (waiters.length === 0 && this.chunkWaiters.get(index) === waiters) this.chunkWaiters.delete(index);
+				signal?.removeEventListener("abort", abort);
+			};
+			const waiter = {
+				resolve: (buffer: Buffer | undefined) => {
+					cleanup();
+					resolve(buffer);
+				},
+				reject: (error: Error) => {
+					cleanup();
+					reject(error);
+				},
+			};
+			const abort = () =>
+				waiter.reject(signal?.reason instanceof Error ? signal.reason : new Error("Snapshot reader cancelled"));
+			waiters.push(waiter);
 			this.chunkWaiters.set(index, waiters);
+			signal?.addEventListener("abort", abort, { once: true });
+			if (signal?.aborted) abort();
 		});
 	}
 
@@ -285,7 +306,7 @@ export class SnapshotTranscriptCache {
 		const waiters = this.chunkWaiters.get(index);
 		if (waiters) {
 			const stored = this.readChunk(index);
-			for (const waiter of waiters) {
+			for (const waiter of [...waiters]) {
 				waiter.resolve(stored);
 			}
 			this.chunkWaiters.delete(index);

@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import {
+	type DaemonAttachRequest,
+	DaemonClient,
+	getDaemonSocketCloseReason,
+} from "../src/modes/daemon/daemon-client.js";
 import {
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_PROTOCOL_VERSION,
@@ -385,6 +389,159 @@ describe("DaemonClient", () => {
 		);
 		await expect(response).resolves.toMatchObject({ id: envelope.id, success: true });
 
+		client.close();
+	});
+
+	it("cancels only a timed-out capable attach without closing the pooled socket", async () => {
+		vi.useFakeTimers();
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, 7, ["attach_cancellation"], 28);
+		const attach = client.request({ type: "attach", activeSessionId: "slow" }, 25).catch((error: unknown) => error);
+		const other = client.request({ type: "attach", activeSessionId: "other" }, 100);
+		const attachWire = JSON.parse(socket.writes[0]!) as { id: string };
+		const otherWire = JSON.parse(socket.writes[1]!) as { id: string };
+		expect(JSON.parse(socket.writes[0]!)).toMatchObject({ command: { timeoutMs: 25 } });
+		await vi.advanceTimersByTimeAsync(25);
+		expect(await attach).toMatchObject({ message: expect.stringContaining("Timed out after 25ms") });
+		expect(socket.destroyed).toBe(false);
+		expect(client.isConnected).toBe(true);
+		expect(JSON.parse(socket.writes[2]!)).toMatchObject({
+			command: { type: "cancel_attach", requestId: attachWire.id, activeSessionId: "slow" },
+		});
+		socket.emit(
+			"data",
+			`${JSON.stringify({ id: otherWire.id, type: "response", command: "attach", success: true })}\n`,
+		);
+		await expect(other).resolves.toMatchObject({ success: true });
+		client.close();
+	});
+
+	it("keeps legacy attaches unchanged when the daemon cannot cancel them", async () => {
+		vi.useFakeTimers();
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, 7, [], 27);
+		const onAttachRequest = vi.fn();
+		const attach = client
+			.request({ type: "attach", activeSessionId: "legacy" }, 25, { onAttachRequest })
+			.catch((error: unknown) => error);
+		expect(JSON.parse(socket.writes[0]!).command).not.toHaveProperty("timeoutMs");
+		await vi.advanceTimersByTimeAsync(25);
+		expect(await attach).toBeInstanceOf(Error);
+		expect(onAttachRequest).not.toHaveBeenCalled();
+		expect(socket.writes).toHaveLength(1);
+		expect(socket.destroyed).toBe(false);
+		client.close();
+	});
+
+	it("rejects explicit attach deadlines and cancellation before writing to an old daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, 7, [], 27);
+		await expect(client.request({ type: "attach", activeSessionId: "old", timeoutMs: 25 })).rejects.toThrow(
+			"does not support attach_cancellation",
+		);
+		await expect(
+			client.request({ type: "cancel_attach", requestId: "old-request", activeSessionId: "old" }),
+		).rejects.toThrow("does not support attach_cancellation");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("retains a same-socket cancellation handle after the initial attach response", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, 7, ["attach_cancellation"], 28);
+		let handle: DaemonAttachRequest | undefined;
+		const attach = client.request({ type: "attach", activeSessionId: "streaming" }, 100, {
+			onAttachRequest: (request) => {
+				handle = request;
+			},
+		});
+		const attachWire = JSON.parse(socket.writes[0]!) as { id: string };
+		socket.emit(
+			"data",
+			`${JSON.stringify({ id: attachWire.id, type: "response", command: "attach", success: true })}\n`,
+		);
+		await attach;
+		expect(handle?.id).toBe(attachWire.id);
+		const cancellation = handle!.cancel();
+		expect(handle!.cancel()).toBe(cancellation);
+		const cancelWire = JSON.parse(socket.writes[1]!) as { id: string };
+		expect(JSON.parse(socket.writes[1]!)).toMatchObject({
+			command: { type: "cancel_attach", requestId: attachWire.id },
+		});
+		socket.emit(
+			"data",
+			`${JSON.stringify({ id: cancelWire.id, type: "response", command: "cancel_attach", success: true })}\n`,
+		);
+		await cancellation;
+		expect(socket.writes).toHaveLength(2);
+		client.close();
+	});
+
+	it("cancels a request when its attach handle callback throws", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, 7, ["attach_cancellation"], 28);
+		await expect(
+			client.request({ type: "attach", activeSessionId: "callback" }, 1000, {
+				onAttachRequest: () => {
+					throw new Error("callback failed");
+				},
+			}),
+		).rejects.toThrow("callback failed");
+		expect(socket.writes).toHaveLength(2);
+		expect(JSON.parse(socket.writes[1]!)).toMatchObject({
+			command: { type: "cancel_attach", activeSessionId: "callback" },
+		});
+		expect(client.isConnected).toBe(true);
+		client.close();
+	});
+
+	it("does not cancel a replayed attach through its stale pre-reconnect handle", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const connect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await connect;
+		emitHello(firstSocket, 7, ["attach_cancellation"], 28);
+		const handles: DaemonAttachRequest[] = [];
+		const attach = client.request({ type: "attach", activeSessionId: "restored" }, 1000, {
+			onAttachRequest: (request) => handles.push(request),
+		});
+		const wire = JSON.parse(firstSocket.writes[0]!) as { id: string };
+		firstSocket.emit("close");
+		const reconnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await reconnect;
+		emitHello(secondSocket, 7, ["attach_cancellation"], 28);
+		expect(handles).toHaveLength(2);
+		await handles[0]!.cancel();
+		expect(secondSocket.writes).toHaveLength(1);
+		secondSocket.emit(
+			"data",
+			`${JSON.stringify({ id: wire.id, type: "response", command: "attach", success: true })}\n`,
+		);
+		await expect(attach).resolves.toMatchObject({ success: true });
 		client.close();
 	});
 

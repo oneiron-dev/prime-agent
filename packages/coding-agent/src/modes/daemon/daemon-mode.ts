@@ -136,6 +136,7 @@ import {
 	type WorkerRosterEntry,
 	workerRosterEntryFromSummary,
 } from "./agent-roster.js";
+import { AttachCancelledError, AttachLeaseRegistry, AttachWaitRegistry, type AttachWaitScope } from "./attach-wait.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
 import { DaemonClient } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
@@ -285,6 +286,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"list_saved_sessions",
 	"create",
 	"attach",
+	"cancel_attach",
 	"detach",
 	"kill",
 	"rename",
@@ -527,6 +529,8 @@ export class AgentDaemon {
 	private socketIdentity?: DaemonSocketIdentity;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly sessions = new Map<string, ActiveSessionState>();
+	private readonly viewerAttaches = new AttachWaitRegistry();
+	private readonly viewerAttachmentLeases = new AttachLeaseRegistry();
 	private readonly sessionSnapshotLoads = new Map<ActiveSessionState, Promise<DaemonSessionSnapshot>>();
 	private readonly pendingPassiveRlmSubagentScans = new Map<boolean, Promise<PassiveRlmSubagent[]>>();
 	// A timed-out caller leaves this family scan running; later callers must join it.
@@ -2586,34 +2590,39 @@ export class AgentDaemon {
 		return state;
 	}
 
-	private async getOrHydrateBoundSessionState(id: string): Promise<ActiveSessionState> {
+	private async getOrHydrateBoundSessionState(id: string, attach?: AttachWaitScope): Promise<ActiveSessionState> {
+		attach?.check();
 		let lookupError: unknown;
 		try {
 			return this.getBoundSessionState(id);
 		} catch (error) {
 			if (error instanceof BoundSessionUnavailableError) {
-				return this.waitForHydratingChild(this.getSessionState(id), id);
+				return this.waitForHydratingChild(this.getSessionState(id), id, attach);
 			}
 			if (error instanceof AmbiguousActiveSessionError) {
 				throw error;
 			}
 			lookupError = error;
 		}
-		const passiveSubagent = await this.findPassiveRlmSubagent(id);
+		const passiveSubagent = attach
+			? await attach.wait("metadata", () => this.findPassiveRlmSubagent(id))
+			: await this.findPassiveRlmSubagent(id);
 		if (passiveSubagent) {
-			return this.hydratePassiveRlmSubagent(passiveSubagent);
+			return attach
+				? attach.wait("hydrate", () => this.hydratePassiveRlmSubagent(passiveSubagent))
+				: this.hydratePassiveRlmSubagent(passiveSubagent);
 		}
 		const hydratingChild = [...this.sessions.values()].find(
 			(state) => state.runtime.metadata.kind === "subagent" && state.runtime.metadata.rlmChildId === id,
 		);
 		if (hydratingChild) {
-			return this.waitForHydratingChild(hydratingChild, id);
+			return this.waitForHydratingChild(hydratingChild, id, attach);
 		}
 		try {
 			return this.getBoundSessionState(id);
 		} catch (error) {
 			if (error instanceof BoundSessionUnavailableError) {
-				return this.waitForHydratingChild(this.getSessionState(id), id);
+				return this.waitForHydratingChild(this.getSessionState(id), id, attach);
 			}
 			if (error instanceof AmbiguousActiveSessionError) throw error;
 			throw lookupError;
@@ -2706,14 +2715,26 @@ export class AgentDaemon {
 		return this.hydratePassiveRlmSubagent(passive);
 	}
 
-	private async waitForHydratingChild(state: ActiveSessionState, selector: string): Promise<ActiveSessionState> {
+	private async waitForHydratingChild(
+		state: ActiveSessionState,
+		selector: string,
+		attach?: AttachWaitScope,
+	): Promise<ActiveSessionState> {
 		const sessionFile = state.runtime.session.sessionFile;
 		if (!sessionFile || !this.findPassivationBySessionFile(sessionFile)) {
-			return this.waitForBoundSession(state);
+			return attach
+				? attach.wait("hydrate", () => this.waitForBoundSession(state))
+				: this.waitForBoundSession(state);
 		}
-		await this.waitForPassivation(sessionFile);
-		const passive = await this.findPassiveRlmSubagent(sessionFile);
-		return passive ? this.hydratePassiveRlmSubagent(passive) : this.getOrHydrateBoundSessionState(selector);
+		if (attach) await attach.wait("passivation", () => this.waitForPassivation(sessionFile));
+		else await this.waitForPassivation(sessionFile);
+		const passive = attach
+			? await attach.wait("metadata", () => this.findPassiveRlmSubagent(sessionFile))
+			: await this.findPassiveRlmSubagent(sessionFile);
+		if (!passive) return this.getOrHydrateBoundSessionState(selector, attach);
+		return attach
+			? attach.wait("hydrate", () => this.hydratePassiveRlmSubagent(passive))
+			: this.hydratePassiveRlmSubagent(passive);
 	}
 
 	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
@@ -3685,6 +3706,7 @@ export class AgentDaemon {
 			cleanedUp = true;
 			socket.off("close", cleanup);
 			socket.off("error", cleanup);
+			this.viewerAttaches.cancelClient(client);
 			this.clearClientCatchupRetry(client);
 			for (const [pauseId, entry] of this.sessionInputPauses) {
 				if (entry.owner !== client) continue;
@@ -3753,6 +3775,19 @@ export class AgentDaemon {
 	}
 
 	private async handleLine(client: DaemonSocketClient, line: string): Promise<void> {
+		const attach: { scope?: AttachWaitScope; transferred?: boolean } = {};
+		try {
+			await this.handleLineWithAttachWait(client, line, attach);
+		} finally {
+			if (!attach.transferred) attach.scope?.finish("failed");
+		}
+	}
+
+	private async handleLineWithAttachWait(
+		client: DaemonSocketClient,
+		line: string,
+		attach: { scope?: AttachWaitScope; transferred?: boolean },
+	): Promise<void> {
 		let command: DaemonCommand;
 		let clearParsedAdmission = () => {};
 		let promptHandlerOwnsAdmission = false;
@@ -3773,7 +3808,12 @@ export class AgentDaemon {
 				capabilities?: unknown;
 				supportsExtensionUi?: unknown;
 				job?: unknown;
+				timeoutMs?: unknown;
+				requestId?: unknown;
 			};
+			if (parsed.type === "attach" && typeof parsed.activeSessionId === "string") {
+				attach.scope = this.beginViewerAttach(client, parsed as Extract<DaemonCommand, { type: "attach" }>);
+			}
 			const parsedAdmission =
 				(parsed.type === "prompt" || parsed.type === "prompt_and_wait") &&
 				typeof parsed.activeSessionId === "string" &&
@@ -3932,19 +3972,36 @@ export class AgentDaemon {
 					client.socket.end();
 					return;
 				}
+				// This only abandons an owned viewer wait; it must not queue behind the fence it cancels.
+				if (
+					parsed.type === "cancel_attach" &&
+					typeof parsed.requestId === "string" &&
+					typeof parsed.activeSessionId === "string"
+				) {
+					this.write(
+						client,
+						success(typeof parsed.id === "string" ? parsed.id : undefined, "cancel_attach", {
+							cancelled: this.viewerAttaches.cancel(client, parsed.requestId, parsed.activeSessionId),
+						}),
+					);
+					return;
+				}
 				const claimCheck = this.assertSupervisorClaimCurrent(boundClaim.claim, boundClaim.ownerFingerprint);
 				// Observe the already-running fence check even if admission cancellation
 				// wins the command wait below.
 				void claimCheck.catch(() => {});
 				try {
-					const ownerFingerprint = await waitForPromptAdmission(claimCheck, parsedAdmission?.controller?.signal);
+					const ownerFingerprint = attach.scope
+						? await attach.scope.wait("worker_fence", () => claimCheck)
+						: await waitForPromptAdmission(claimCheck, parsedAdmission?.controller?.signal);
 					if (this.supervisorClaims.get(client) !== boundClaim || client.socket.destroyed) {
 						clearParsedAdmission();
 						return;
 					}
 					boundClaim.ownerFingerprint = ownerFingerprint;
 				} catch (error) {
-					const admissionCancelled = error instanceof PromptAdmissionCancelledError;
+					const admissionCancelled =
+						error instanceof PromptAdmissionCancelledError || error instanceof AttachCancelledError;
 					if (admissionCancelled) {
 						// The fence check remains authoritative after cancellation. Its rejection
 						// revokes only the exact binding that initiated it; replacements survive.
@@ -4020,9 +4077,15 @@ export class AgentDaemon {
 		}
 		if (mutation) this.mutationDrain.begin();
 		try {
-			const response = await this.handleCommand(client, command, () => {
-				promptHandlerOwnsAdmission = true;
-			});
+			attach.transferred = command.type === "attach";
+			const response = await this.handleCommand(
+				client,
+				command,
+				() => {
+					promptHandlerOwnsAdmission = true;
+				},
+				attach.scope,
+			);
 			if (response) {
 				this.write(client, response);
 			}
@@ -4192,6 +4255,7 @@ export class AgentDaemon {
 		client: DaemonSocketClient,
 		command: DaemonCommand,
 		onPromptHandlerOwnsAdmission: () => void = () => {},
+		attachScope?: AttachWaitScope,
 	): Promise<DaemonResponse | undefined> {
 		if ("agentMessageId" in command && command.agentMessageId === "") {
 			throw new Error("agentMessageId must not be empty");
@@ -4300,123 +4364,17 @@ export class AgentDaemon {
 				return success(command.id, "create", summaryForActiveSession(state));
 			}
 
-			case "attach": {
-				const state = await this.getOrHydrateBoundSessionState(command.activeSessionId);
-				if (command.clientId) {
-					client.id = command.clientId;
-				}
-				setDaemonClientSessionCapabilities(
-					client,
-					state.activeSessionId,
-					normalizeClientCapabilities(command.capabilities, command.supportsExtensionUi),
-				);
-				const streamsSnapshot =
-					client.transport === "private-framed" &&
-					daemonClientCapabilitiesForSession(client, state.activeSessionId).has("chunked_snapshot");
-				// Attach is admitted during update-restart preparation as a read. Env
-				// adoption remains safe while mutations are only draining; after fencing,
-				// defer it until rollback so the checkpoint never omits a live identity.
-				const clientEnv = filterClientEnv(command.env);
-				const deferClientEnv = this.updateRestart && this.updateRestart.phase !== "preparing";
-				if (!deferClientEnv) this.adoptClientEnv(state, clientEnv);
-				const snapshotSignal = streamsSnapshot
-					? markClientSnapshotStreaming(client, state.activeSessionId)
-					: undefined;
-				let result: DaemonAttachResult;
-				state.pendingAttaches++;
-				try {
-					result = await this.createAttachResult(client, state, command);
-					if (
-						this.sessions.get(state.activeSessionId) !== state ||
-						this.closingSessions.has(state.activeSessionId)
-					) {
-						throw new BoundSessionUnavailableError(
-							`Active session ${state.activeSessionId} closed during attach`,
-						);
-					}
-				} catch (error) {
-					removeDaemonClientSessionCapabilities(client, state.activeSessionId);
-					if (streamsSnapshot) {
-						finishClientSnapshotStreaming(client, state.activeSessionId);
-					}
-					throw error;
-				} finally {
-					state.pendingAttaches--;
-				}
-				state.clients.add(client);
-				client.attachedActiveSessionIds.add(state.activeSessionId);
-				// Carrier-less mutation: a direct viewer changes directAttachedClients with no session event.
-				if (client.authenticationRole === "session_client") this.scheduleRosterFlush();
-				if (deferClientEnv && clientEnv) {
-					this.updateRestart?.deferredClientEnv.push({
-						client,
-						state,
-						env: clientEnv,
-					});
-				}
-				if (streamsSnapshot) {
-					const snapshotId = createSnapshotTransferId(
-						state.activeSessionId,
-						state.eventGeneration,
-						state.lastEventSequence,
-					);
-					let transcript: SnapshotTranscriptChunkSource;
-					try {
-						transcript = createSnapshotTranscriptChunks({
-							activeSessionId: state.activeSessionId,
-							snapshotId,
-							messages: result.snapshot.messages,
-							targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
-							signal: snapshotSignal,
-						});
-					} catch (error) {
-						state.clients.delete(client);
-						client.attachedActiveSessionIds.delete(state.activeSessionId);
-						removeDaemonClientSessionCapabilities(client, state.activeSessionId);
-						finishClientSnapshotStreaming(client, state.activeSessionId);
-						throw error;
-					}
-					const streamedResult: DaemonAttachResult = {
-						...result,
-						messages: result.messages ? [] : undefined,
-						snapshot: { ...result.snapshot, messages: [] },
-						snapshotStream: {
-							id: snapshotId,
-							messageCount: result.snapshot.messages.length,
-							targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
-						},
-					};
-					setImmediate(() => {
-						void this.streamWorkerSnapshot(
-							client,
-							streamedResult,
-							transcript,
-							"attach",
-							snapshotSignal,
-							true,
-						).catch((error) => this.log(`could not stream attach snapshot: ${String(error)}`));
-					});
-					return success(command.id, "attach", streamedResult);
-				}
-				// Slim clients consume only the command response; legacy clients (e.g.
-				// the plain daemon attach REPL) read state/messages off this event.
-				// Skipping it for slim clients halves the attach payload.
-				if (result.state && result.messages) {
-					this.write(client, {
-						type: "session_attached",
-						activeSessionId: state.activeSessionId,
-						state: result.state,
-						messages: result.messages,
-						snapshot: result.snapshot,
-						replay: result.replay,
-						lastEventSequence: result.lastEventSequence,
-					});
-				}
-				return success(command.id, "attach", result);
-			}
+			case "attach":
+				return this.attachViewer(client, command, attachScope);
+
+			case "cancel_attach":
+				return success(command.id, "cancel_attach", {
+					cancelled: this.viewerAttaches.cancel(client, command.requestId, command.activeSessionId),
+				});
 
 			case "detach": {
 				if (command.activeSessionId) {
+					this.viewerAttaches.cancelSession(client, command.activeSessionId);
 					const state = this.getSessionState(command.activeSessionId);
 					for (const [pauseId, entry] of this.sessionInputPauses) {
 						if (entry.owner !== client || entry.activeSessionId !== command.activeSessionId) continue;
@@ -5503,12 +5461,183 @@ export class AgentDaemon {
 		}
 	}
 
+	private beginViewerAttach(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "attach" }>,
+	): AttachWaitScope {
+		return this.viewerAttaches.start(client, command.id ?? randomUUID(), {
+			activeSessionId: command.activeSessionId,
+			clientId: client.id,
+			workerId: this.options.worker?.workerInstanceId,
+			timeoutMs: command.timeoutMs,
+			log: (line) => this.log(line),
+		});
+	}
+
+	private async attachViewer(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "attach" }>,
+		registeredScope?: AttachWaitScope,
+	): Promise<DaemonResponse> {
+		const attach = registeredScope ?? this.beginViewerAttach(client, command);
+		let streamOwnsScope = false;
+		try {
+			attach.check();
+			if (client.socket.destroyed) throw new AttachCancelledError("disconnected");
+			const state = await this.getOrHydrateBoundSessionState(command.activeSessionId, attach);
+			attach.check();
+			attach.setWorker(this.options.worker?.workerInstanceId ?? `daemon:${process.pid}`, state.activeSessionId);
+			if (command.clientId) client.id = command.clientId;
+			const capabilities = normalizeClientCapabilities(command.capabilities, command.supportsExtensionUi);
+			const streamsSnapshot = client.transport === "private-framed" && capabilities.has("chunked_snapshot");
+			const snapshotSignal = streamsSnapshot
+				? AbortSignal.any([markClientSnapshotStreaming(client, state.activeSessionId), attach.signal])
+				: undefined;
+			let snapshotHandedOff = false;
+			try {
+				let result: DaemonAttachResult;
+				state.pendingAttaches++;
+				try {
+					result = await this.createAttachResult(client, state, command, attach, capabilities);
+					attach.check();
+					if (
+						this.sessions.get(state.activeSessionId) !== state ||
+						this.closingSessions.has(state.activeSessionId)
+					) {
+						throw new BoundSessionUnavailableError(
+							`Active session ${state.activeSessionId} closed during attach`,
+						);
+					}
+				} finally {
+					state.pendingAttaches--;
+				}
+				const lease = this.viewerAttachmentLeases.acquire(client, state.activeSessionId, {
+					has: () => state.clients.has(client),
+					add: () => {
+						state.clients.add(client);
+						client.attachedActiveSessionIds.add(state.activeSessionId);
+						if (client.authenticationRole === "session_client") this.scheduleRosterFlush();
+					},
+					delete: () => {
+						state.clients.delete(client);
+						client.attachedActiveSessionIds.delete(state.activeSessionId);
+						if (client.authenticationRole === "session_client") this.scheduleRosterFlush();
+					},
+				});
+				let committed = false;
+				const commit = () => {
+					attach.check();
+					if (
+						client.socket.destroyed ||
+						this.sessions.get(state.activeSessionId) !== state ||
+						this.closingSessions.has(state.activeSessionId)
+					) {
+						throw new BoundSessionUnavailableError(
+							`Active session ${state.activeSessionId} closed during attach`,
+						);
+					}
+					// Pending viewers keep their requested capabilities local until delivery succeeds.
+					setDaemonClientSessionCapabilities(client, state.activeSessionId, capabilities);
+					const clientEnv = filterClientEnv(command.env);
+					if (clientEnv && this.updateRestart && this.updateRestart.phase !== "preparing") {
+						this.updateRestart.deferredClientEnv.push({ client, state, env: clientEnv });
+					} else {
+						this.adoptClientEnv(state, clientEnv);
+					}
+					lease.commit();
+					committed = true;
+				};
+				try {
+					if (streamsSnapshot) {
+						const snapshotId = createSnapshotTransferId(
+							state.activeSessionId,
+							state.eventGeneration,
+							state.lastEventSequence,
+						);
+						const transcript = createSnapshotTranscriptChunks({
+							activeSessionId: state.activeSessionId,
+							snapshotId,
+							messages: result.snapshot.messages,
+							targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
+							signal: snapshotSignal,
+						});
+						const streamedResult: DaemonAttachResult = {
+							...result,
+							messages: result.messages ? [] : undefined,
+							snapshot: { ...result.snapshot, messages: [] },
+							snapshotStream: {
+								id: snapshotId,
+								messageCount: result.snapshot.messages.length,
+								targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
+							},
+						};
+						streamOwnsScope = true;
+						snapshotHandedOff = true;
+						setImmediate(() => {
+							let streamStarted = false;
+							void attach
+								.wait("delivery", () => {
+									streamStarted = true;
+									return this.streamWorkerSnapshot(
+										client,
+										streamedResult,
+										transcript,
+										"attach",
+										snapshotSignal,
+										true,
+										attach,
+										commit,
+									);
+								})
+								.catch((error) => {
+									if (!(error instanceof AttachCancelledError))
+										this.log(`could not stream attach snapshot: ${String(error)}`);
+								})
+								.finally(() => {
+									if (!streamStarted) {
+										finishClientSnapshotStreaming(client, state.activeSessionId);
+									}
+									if (!committed) lease.release();
+									attach.finish(committed ? "completed" : "failed");
+								});
+						});
+						return success(command.id, "attach", streamedResult);
+					}
+					commit();
+					if (result.state && result.messages) {
+						this.write(client, {
+							type: "session_attached",
+							activeSessionId: state.activeSessionId,
+							state: result.state,
+							messages: result.messages,
+							snapshot: result.snapshot,
+							replay: result.replay,
+							lastEventSequence: result.lastEventSequence,
+						});
+					}
+					attach.finish();
+					return success(command.id, "attach", result);
+				} finally {
+					if (!streamOwnsScope && !committed) lease.release();
+				}
+			} finally {
+				if (streamsSnapshot && !snapshotHandedOff) finishClientSnapshotStreaming(client, state.activeSessionId);
+			}
+		} finally {
+			if (!streamOwnsScope) attach.finish("failed");
+		}
+	}
+
 	private async createAttachResult(
 		client: DaemonSocketClient,
 		state: ActiveSessionState,
 		command: Extract<DaemonCommand, { type: "attach" }>,
+		attach?: AttachWaitScope,
+		requestedCapabilities?: ReadonlySet<DaemonClientCapability>,
 	): Promise<DaemonAttachResult> {
-		const snapshot = await this.createSessionSnapshot(state);
+		const snapshot = attach
+			? await attach.wait("snapshot", () => this.createSessionSnapshot(state))
+			: await this.createSessionSnapshot(state);
 		const replay =
 			command.resumeCursor?.activeSessionId && command.resumeCursor.activeSessionId !== state.activeSessionId
 				? {
@@ -5527,7 +5656,7 @@ export class AgentDaemon {
 				: createDaemonReplayInfo(command.resumeCursor, state.lastEventSequence, state.eventGeneration);
 		// Slim clients read summary/messages from the snapshot; duplicating them at
 		// the top level would serialize the full history twice more per attach.
-		const capabilities = daemonClientCapabilitiesForSession(client, state.activeSessionId);
+		const capabilities = requestedCapabilities ?? daemonClientCapabilitiesForSession(client, state.activeSessionId);
 		const slim = capabilities.has("slim_attach");
 		return {
 			protocol: DAEMON_PROTOCOL_INFO,
@@ -5608,14 +5737,16 @@ export class AgentDaemon {
 		purpose: "attach" | "replacement" | "catchup" = "attach",
 		signal?: AbortSignal,
 		snapshotAlreadyMarked = false,
-	): Promise<void> {
+		attach?: AttachWaitScope,
+		onDelivered?: () => void,
+	): Promise<boolean> {
 		const stream = result.snapshotStream;
 		if (!stream) {
 			if (snapshotAlreadyMarked) {
 				finishClientSnapshotStreaming(client, result.activeSessionId);
 			}
 			transcript.dispose?.();
-			return;
+			return false;
 		}
 		if (snapshotAlreadyMarked && !signal) {
 			throw new Error(`Snapshot ${stream.id} is missing its transfer signal`);
@@ -5624,18 +5755,16 @@ export class AgentDaemon {
 		if (client.socket.destroyed) {
 			finishClientSnapshotStreaming(client, result.activeSessionId);
 			transcript.dispose?.();
-			return;
+			return false;
 		}
 		client.snapshotTransferTails ??= new Map();
 		const previousTransfer = client.snapshotTransferTails.get(result.activeSessionId);
+		let previousTransferJoined = !previousTransfer;
 		let finishTransfer!: () => void;
 		const transfer = new Promise<void>((resolve) => {
 			finishTransfer = resolve;
 		});
 		client.snapshotTransferTails.set(result.activeSessionId, transfer);
-		if (previousTransfer) {
-			await previousTransfer;
-		}
 		const { messages: _messages, ...snapshot } = result.snapshot;
 		const snapshotBegin: DaemonOutbound = {
 			type: "session_snapshot_begin",
@@ -5648,7 +5777,7 @@ export class AgentDaemon {
 		};
 		const deliverSnapshotFailure = async (streamError: Error, includeBegin = false): Promise<void> => {
 			transcript.markFailed?.(streamError);
-			if (client.socket.destroyed) {
+			if (attach?.signal.aborted || client.socket.destroyed) {
 				return;
 			}
 			try {
@@ -5687,21 +5816,26 @@ export class AgentDaemon {
 			}
 		};
 		try {
+			if (previousTransfer) {
+				if (attach) await attach.wait("delivery_queue", () => previousTransfer);
+				else await previousTransfer;
+				previousTransferJoined = true;
+			}
 			if (transferSignal.aborted) {
 				await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`), true);
-				return;
+				return false;
 			}
 			if (!(await this.writeWorkerSnapshotRecord(client, snapshotBegin, purpose, transferSignal))) {
 				if (transferSignal.aborted) {
 					await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`));
 				}
-				return;
+				return false;
 			}
 			let chunkCount = 0;
 			for await (const chunk of transcript) {
 				if (transferSignal.aborted) {
 					await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`));
-					return;
+					return false;
 				}
 				const headerMessage: DaemonOutbound = {
 					type: "session_snapshot_chunk",
@@ -5714,15 +5848,15 @@ export class AgentDaemon {
 					if (transferSignal.aborted) {
 						await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`));
 					}
-					return;
+					return false;
 				}
 				chunkCount++;
 			}
 			if (transferSignal.aborted) {
 				await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`));
-				return;
+				return false;
 			}
-			await this.writeWorkerSnapshotRecord(
+			const delivered = await this.writeWorkerSnapshotRecord(
 				client,
 				{
 					type: "session_snapshot_end",
@@ -5735,18 +5869,24 @@ export class AgentDaemon {
 				purpose,
 				transferSignal,
 			);
+			if (delivered) onDelivered?.();
+			return delivered;
 		} catch (error) {
 			if (transferSignal.aborted) {
 				await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`));
-				return;
+				return false;
 			}
 			const streamError = error instanceof Error ? error : new Error(String(error));
 			await deliverSnapshotFailure(streamError);
 			throw streamError;
 		} finally {
-			finishTransfer();
+			// A cancelled middle waiter releases its viewer now, but successors still queue behind its predecessor.
+			if (previousTransfer && !previousTransferJoined) void previousTransfer.then(finishTransfer, finishTransfer);
+			else finishTransfer();
 			if (client.snapshotTransferTails.get(result.activeSessionId) === transfer) {
-				client.snapshotTransferTails.delete(result.activeSessionId);
+				if (previousTransfer && !previousTransferJoined)
+					client.snapshotTransferTails.set(result.activeSessionId, previousTransfer);
+				else client.snapshotTransferTails.delete(result.activeSessionId);
 			}
 			finishClientSnapshotStreaming(client, result.activeSessionId);
 			transcript.dispose?.();
@@ -6862,6 +7002,7 @@ export class AgentDaemon {
 	}
 
 	private detachClient(client: DaemonSocketClient): void {
+		this.viewerAttaches.cancelClient(client);
 		for (const activeSessionId of [...client.attachedActiveSessionIds]) {
 			const state = this.sessions.get(activeSessionId);
 			if (state) {
@@ -7851,6 +7992,7 @@ export class AgentDaemon {
 		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
 		const closingReason = this.getShutdownClosingReason();
 		for (const client of this.clients) {
+			this.viewerAttaches.cancelClient(client);
 			abortClientSnapshotStreaming(client);
 			this.write(client, { type: "daemon_closing", reason: closingReason });
 		}

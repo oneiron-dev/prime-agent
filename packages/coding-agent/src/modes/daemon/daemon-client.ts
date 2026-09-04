@@ -4,6 +4,7 @@ import { getDaemonLogPath } from "../../config.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import {
 	createDaemonCommandEnvelope,
+	DAEMON_ATTACH_CANCELLATION_COMPATIBILITY,
 	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
 	DAEMON_PROTOCOL_VERSION,
 	type DaemonClosingReason,
@@ -16,6 +17,7 @@ import {
 	type DaemonResponse,
 	type DaemonSavedSessionInfo,
 	type DaemonServerCapability,
+	daemonHelloMeetsCompatibility,
 	getDaemonCommandCompatibilities,
 	isDaemonMutatingCommand,
 	meetsDaemonCommandCompatibility,
@@ -33,7 +35,16 @@ export type DaemonClientMessageListener = (message: DaemonOutbound) => void;
 export type DaemonClientCloseListener = (error: Error) => void;
 export type DaemonClientProgressListener = (message: DaemonRequestProgress) => void;
 
+export interface DaemonAttachRequest {
+	id: string;
+	deadlineAt: number;
+	/** Bound to the original socket; remains usable while the snapshot streams. */
+	cancel: () => Promise<void>;
+}
+
 export interface DaemonClientRequestOptions {
+	/** Called only for a negotiated cancellable attach, including reconnect replays. */
+	onAttachRequest?: (request: DaemonAttachRequest) => void;
 	onProgress?: DaemonClientProgressListener;
 	/**
 	 * False opts out of reconnect parking: a close rejects so the caller's own retry loop stays live.
@@ -50,6 +61,10 @@ interface PendingDaemonRequest {
 	timeoutMs: number;
 	commandType: string;
 	onProgress?: DaemonClientProgressListener;
+	attachSessionId?: string;
+	attachTimeoutMs?: number;
+	attachRequest?: DaemonAttachRequest;
+	onAttachRequest?: (request: DaemonAttachRequest) => void;
 	wireData: string;
 	awaitingReconnect: boolean;
 	acknowledgeResult: boolean;
@@ -329,6 +344,9 @@ export class DaemonClient {
 			);
 		}
 		const hello = this.helloMessage ?? (await this.waitForHello());
+		if (command.type === "attach" && daemonHelloMeetsCompatibility(hello, DAEMON_ATTACH_CANCELLATION_COMPATIBILITY)) {
+			command = { ...command, timeoutMs: Math.min(command.timeoutMs ?? timeoutMs, timeoutMs) };
+		}
 		const compatibilities = getDaemonCommandCompatibilities(command);
 		const missingCompatibility = compatibilities.find(
 			(compatibility) => !meetsDaemonCommandCompatibility(hello, compatibility),
@@ -392,6 +410,13 @@ export class DaemonClient {
 				timeoutMs,
 				commandType: command.type,
 				onProgress: options.onProgress,
+				...(command.type === "attach" && command.timeoutMs !== undefined
+					? {
+							attachSessionId: command.activeSessionId,
+							attachTimeoutMs: command.timeoutMs,
+							onAttachRequest: options.onAttachRequest,
+						}
+					: {}),
 				wireData,
 				awaitingReconnect: false,
 				acknowledgeResult,
@@ -401,12 +426,55 @@ export class DaemonClient {
 			this.pendingRequests.set(id, pending);
 			this.armPendingRequestTimeout(id, pending);
 			this.socket!.write(wireData);
+			this.publishAttachRequest(id, pending);
 		});
 	}
 
+	private publishAttachRequest(id: string, pending: PendingDaemonRequest): void {
+		if (!pending.attachRequest) return;
+		try {
+			pending.onAttachRequest?.(pending.attachRequest);
+		} catch (error) {
+			if (this.pendingRequests.get(id) === pending) {
+				this.pendingRequests.delete(id);
+				clearTimeout(pending.timeout);
+				pending.reject(error instanceof Error ? error : new Error(String(error)));
+			}
+			void pending.attachRequest.cancel().catch(() => undefined);
+		}
+	}
+
 	private armPendingRequestTimeout(id: string, pending: PendingDaemonRequest): void {
+		if (pending.attachSessionId !== undefined && pending.attachTimeoutMs !== undefined) {
+			const socket = this.socket;
+			const activeSessionId = pending.attachSessionId;
+			let cancellation: Promise<void> | undefined;
+			pending.attachRequest = {
+				id,
+				deadlineAt: Date.now() + pending.attachTimeoutMs,
+				cancel: () => {
+					if (cancellation) return cancellation;
+					if (!socket || socket.destroyed || this.socket !== socket) return Promise.resolve();
+					if (this.pendingRequests.get(id) === pending) {
+						this.pendingRequests.delete(id);
+						clearTimeout(pending.timeout);
+						pending.reject(new Error("Daemon attach request cancelled"));
+					}
+					const cancelId = `daemon_${++this.requestId}`;
+					const command: DaemonCommand = { id: cancelId, type: "cancel_attach", requestId: id, activeSessionId };
+					cancellation = new Promise<void>((resolve) => {
+						socket.write(
+							serializeJsonLine(createDaemonCommandEnvelope(command, cancelId, this.protocolClientId)),
+						);
+						resolve();
+					});
+					return cancellation;
+				},
+			};
+		}
 		pending.timeout = setTimeout(() => {
 			this.pendingRequests.delete(id);
+			void pending.attachRequest?.cancel().catch(() => undefined);
 			pending.reject(
 				new Error(
 					`Timed out after ${pending.timeoutMs}ms waiting for the Prime Agent daemon response to "${pending.commandType}". ${daemonEndpointDetails(this.socketPath)}`,
@@ -476,6 +544,7 @@ export class DaemonClient {
 					}
 					this.armPendingRequestTimeout(id, pending);
 					this.socket.write(pending.wireData);
+					this.publishAttachRequest(id, pending);
 				}
 			}
 		}

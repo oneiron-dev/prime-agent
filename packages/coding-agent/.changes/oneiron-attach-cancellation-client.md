@@ -1,0 +1,2 @@
+- Fixed abandoned session attachments retaining snapshot work while keeping other viewers on shared connections usable.
+- Added bounded attachment phase timings to diagnose slow session loading and snapshot delivery.

@@ -22,6 +22,7 @@ import { SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "../agents-view/roster-store.js";
 import {
+	type DaemonAttachRequest,
 	DaemonCapabilityUnavailableError,
 	type DaemonTransportClient,
 	getDaemonSocketCloseReason,
@@ -251,6 +252,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private rosterStore: AgentsViewRosterStore | undefined;
 	private reconnectPromise?: Promise<void>;
 	private initialAttachPending = false;
+	private pendingAttachRequest?: DaemonAttachRequest;
 	private initialControlPlaneClose?: Error;
 	private readonly definitiveRequestErrors = new WeakSet<Error>();
 	private disposing = false;
@@ -374,74 +376,99 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async attach(options?: { recoverable?: boolean }): Promise<void> {
-		const supportsExtensionUi = this.options.supportsExtensionUi !== false;
-		const result = await this.requestData<SessionSummary | DaemonAttachResult>(
-			{
-				type: "attach",
-				activeSessionId: this.activeSessionId,
-				supportsExtensionUi,
-				clientId: this.clientId,
-				capabilities: [
-					"attach_snapshot",
-					"event_sequence",
-					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
-					"slim_attach",
-					"chunked_snapshot",
-					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
-				],
-				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
-				launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
-				...(this.options.ownedSession &&
-				this.options.ownedSessionRecoveryConfig &&
-				this.client.supportsServerCapability("owned_session_recovery_context")
-					? { recoveryConfig: this.options.ownedSessionRecoveryConfig }
-					: {}),
-				telemetryDisabled: this.options.telemetryDisabled,
-				resumeCursor:
-					this.lastEventCursor === undefined
-						? undefined
-						: {
-								activeSessionId: this.activeSessionId,
-								...this.lastEventCursor,
+		if (this.disposed) throw new Error("Daemon connection is disposed");
+		this.clearPendingAttachRequest();
+		let snapshotId: string | undefined;
+		try {
+			const supportsExtensionUi = this.options.supportsExtensionUi !== false;
+			const result = await this.requestData<SessionSummary | DaemonAttachResult>(
+				{
+					type: "attach",
+					activeSessionId: this.activeSessionId,
+					supportsExtensionUi,
+					clientId: this.clientId,
+					capabilities: [
+						"attach_snapshot",
+						"event_sequence",
+						...(supportsExtensionUi ? (["extension_ui"] as const) : []),
+						"slim_attach",
+						"chunked_snapshot",
+						...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
+					],
+					env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
+					launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
+					...(this.options.ownedSession &&
+					this.options.ownedSessionRecoveryConfig &&
+					this.client.supportsServerCapability("owned_session_recovery_context")
+						? { recoveryConfig: this.options.ownedSessionRecoveryConfig }
+						: {}),
+					telemetryDisabled: this.options.telemetryDisabled,
+					resumeCursor:
+						this.lastEventCursor === undefined
+							? undefined
+							: {
+									activeSessionId: this.activeSessionId,
+									...this.lastEventCursor,
+								},
+				},
+				undefined,
+				!this.client.hello || this.client.supportsServerCapability("attach_cancellation")
+					? {
+							...options,
+							onAttachRequest: (request) => {
+								this.pendingAttachRequest = request;
+								if (this.disposed) void request.cancel().catch(() => undefined);
 							},
-			},
-			undefined,
-			options,
-		);
-		this.activeSessionId = getAttachActiveSessionId(result);
-		const summary = "snapshot" in result ? result.snapshot.summary : result;
-		this.attachedSessionId = summary.sessionId;
-		this.attachedSessionFile =
-			summary.sessionFile ?? ("snapshot" in result ? result.snapshot.state.sessionFile : undefined);
-		this.captureDaemonLogPath();
-		this.updateReconnectFailed = false;
-		this.terminalCloseEmitted = false;
-		const attachCursor = getAttachLastEventCursor(result);
-		if (attachCursor) {
-			this.observeEventCursor(attachCursor);
-		}
-		this.lastEventSequence = maxEventSequence(this.lastEventSequence, getAttachLastEventSequence(result));
-		if ("snapshot" in result) {
-			const snapshot = result.snapshotStream
-				? await this.waitForSnapshot(result.snapshotStream.id)
-				: result.snapshot;
-			this.latestSnapshot = mapDaemonSessionSnapshot(snapshot, result.replay);
-			if (Array.isArray(snapshot.children)) this.childRosterSequence = snapshot.lastEventSequence;
-			if (this.lastEventSequence !== undefined) {
-				this.latestSnapshot.lastEventSequence = this.lastEventSequence;
+						}
+					: options,
+			);
+			if (this.disposed) throw new Error("Daemon connection disposed during attach");
+			this.activeSessionId = getAttachActiveSessionId(result);
+			const summary = "snapshot" in result ? result.snapshot.summary : result;
+			this.attachedSessionId = summary.sessionId;
+			this.attachedSessionFile =
+				summary.sessionFile ?? ("snapshot" in result ? result.snapshot.state.sessionFile : undefined);
+			this.captureDaemonLogPath();
+			this.updateReconnectFailed = false;
+			this.terminalCloseEmitted = false;
+			const attachCursor = getAttachLastEventCursor(result);
+			if (attachCursor) {
+				this.observeEventCursor(attachCursor);
 			}
-			if (this.lastEventCursor) {
-				this.latestSnapshot.lastEventCursor = this.lastEventCursor;
+			this.lastEventSequence = maxEventSequence(this.lastEventSequence, getAttachLastEventSequence(result));
+			if ("snapshot" in result) {
+				snapshotId = result.snapshotStream?.id;
+				const snapshot = result.snapshotStream
+					? await this.waitForSnapshot(result.snapshotStream.id, this.pendingAttachRequest?.deadlineAt)
+					: result.snapshot;
+				this.latestSnapshot = mapDaemonSessionSnapshot(snapshot, result.replay);
+				if (Array.isArray(snapshot.children)) this.childRosterSequence = snapshot.lastEventSequence;
+				if (this.lastEventSequence !== undefined) {
+					this.latestSnapshot.lastEventSequence = this.lastEventSequence;
+				}
+				if (this.lastEventCursor) {
+					this.latestSnapshot.lastEventCursor = this.lastEventCursor;
+				}
+				this.latestSnapshotIsFresh = true;
+			} else {
+				this.latestSnapshot = undefined;
+				this.latestSnapshotIsFresh = false;
 			}
-			this.latestSnapshotIsFresh = true;
-		} else {
-			this.latestSnapshot = undefined;
-			this.latestSnapshotIsFresh = false;
+			if (this.disposed) throw new Error("Daemon connection disposed during attach");
+			this.pendingAttachRequest = undefined;
+		} catch (error) {
+			if (snapshotId) this.ignoreSnapshotId(snapshotId);
+			await this.pendingAttachRequest?.cancel().catch(() => undefined);
+			throw error;
 		}
 		// The roster bar is an accessory: its subscribe failure must never fail an
 		// otherwise-recovered session. The bar degrades; the next reconnect or rebind
 		// re-attaches through this same seam.
 		if (this.rosterStore) await this.rosterStore.attach(this.client).catch(() => undefined);
+	}
+
+	private clearPendingAttachRequest(): void {
+		this.pendingAttachRequest = undefined;
 	}
 
 	async subscribeAgentRoster(
@@ -1537,6 +1564,9 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		this.disposed = true;
 		this.updateRestartPending = false;
+		const pendingAttachRequest = this.pendingAttachRequest;
+		this.rejectSnapshotAssemblies(new Error("Daemon connection disposed during snapshot transfer"));
+		await pendingAttachRequest?.cancel().catch(() => undefined);
 		await Promise.allSettled([...this.activeSideQuestionIds].map((id) => this.abortSideQuestion(id)));
 		await this.rosterStore?.dispose().catch(() => undefined);
 		this.rosterStore = undefined;
@@ -1546,9 +1576,11 @@ export class DaemonAgentConnection implements AgentConnection {
 			await this.requestOk({ type: "complete_owned_session", activeSessionId: this.activeSessionId }).catch(
 				() => undefined,
 			);
-		} else {
+		} else if (!pendingAttachRequest) {
+			// A pending attach uses scoped cancellation, preserving other viewers on this socket.
 			await this.requestOk({ type: "detach", activeSessionId: this.activeSessionId }).catch(() => undefined);
 		}
+		this.clearPendingAttachRequest();
 		if (this.options.closeClientOnDispose) {
 			this.client.close();
 		}
@@ -2072,16 +2104,28 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
-	private async waitForSnapshot(snapshotId: string): Promise<DaemonSessionSnapshot> {
+	private async waitForSnapshot(snapshotId: string, deadlineAt?: number): Promise<DaemonSessionSnapshot> {
 		const completed = this.completedSnapshots.get(snapshotId);
 		if (completed) {
 			this.completedSnapshots.delete(snapshotId);
 			return completed;
 		}
 		const assembly = this.getSnapshotAssembly(snapshotId);
+		let deadlineTimeout: ReturnType<typeof setTimeout> | undefined;
 		try {
-			return await assembly.promise;
+			if (deadlineAt === undefined) return await assembly.promise;
+			return await Promise.race([
+				assembly.promise,
+				new Promise<never>((_resolve, reject) => {
+					deadlineTimeout = setTimeout(
+						() => reject(new Error(`Timed out waiting for snapshot ${snapshotId}`)),
+						Math.max(0, deadlineAt - Date.now()),
+					);
+					deadlineTimeout.unref();
+				}),
+			]);
 		} finally {
+			clearTimeout(deadlineTimeout);
 			clearTimeout(assembly.timeout);
 			this.snapshotAssemblies.delete(snapshotId);
 			this.completedSnapshots.delete(snapshotId);

@@ -73,8 +73,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 25 adds capability-gated direct worker peer transport discovery.
 // Revision 26 adds stable-target follow-up addressing in the fork and usage totals upstream.
 // Revision 27 combines capability-gated stable targets with optional own-session usage totals.
-export const DAEMON_SCHEMA_REVISION = 27;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-27-eb36e67c8aa3";
+// Revision 28 adds capability-gated deadlines and request-scoped attachment cancellation.
+export const DAEMON_SCHEMA_REVISION = 28;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-a8948ed0a5b5";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -128,7 +129,8 @@ export type DaemonServerCapability =
 	// must check before sending; an unchecked send is refused by DaemonClient
 	// rather than silently downgraded to an active-id-only request.
 	| "stable_target_follow_up"
-	| "direct_peer_transport";
+	| "direct_peer_transport"
+	| "attach_cancellation";
 
 /**
  * Durable coordinates of a follow-up target.
@@ -206,6 +208,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_pause",
 	"acp_mcp_servers",
 	"stable_target_follow_up",
+	"attach_cancellation",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -461,6 +464,8 @@ export type DaemonCommand =
 			id?: string;
 			type: "attach";
 			activeSessionId: string;
+			/** Total attach/snapshot deadline in milliseconds; requires attach_cancellation. */
+			timeoutMs?: number;
 			supportsExtensionUi?: boolean;
 	  } & DaemonAttachClientMetadata &
 			DaemonClientEnv &
@@ -474,6 +479,8 @@ export type DaemonCommand =
 	  } & DaemonAttachClientMetadata &
 			DaemonClientEnv &
 			DaemonLaunchEnv)
+	/** Cancels only this socket's pending attach request; a completed attach is unchanged. */
+	| { id?: string; type: "cancel_attach"; requestId: string; activeSessionId: string }
 	| { id?: string; type: "detach"; activeSessionId?: string }
 	| { id?: string; type: "complete_owned_session"; activeSessionId: string }
 	| { id?: string; type: "promote_owned_session"; activeSessionId: string }
@@ -738,6 +745,12 @@ export interface DaemonCommandCompatibility {
 	capability?: DaemonServerCapability;
 }
 
+export const DAEMON_ATTACH_CANCELLATION_COMPATIBILITY = {
+	minProtocol: 7,
+	minSchemaRevision: 28,
+	capability: "attach_cancellation",
+} as const satisfies DaemonCommandCompatibility;
+
 const LEGACY_DAEMON_COMMAND = { minProtocol: 7 } as const;
 const CURRENT_DAEMON_COMMAND = { minProtocol: 7 } as const;
 const RLM_MAX_DEPTH_COMMAND = { minProtocol: 7, minSchemaRevision: 11 } as const;
@@ -837,6 +850,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_direct_worker_transport: DIRECT_PEER_TRANSPORT_COMMAND,
 	create: LEGACY_DAEMON_COMMAND,
 	attach: LEGACY_DAEMON_COMMAND,
+	cancel_attach: DAEMON_ATTACH_CANCELLATION_COMPATIBILITY,
 	reattach: LEGACY_DAEMON_COMMAND,
 	detach: LEGACY_DAEMON_COMMAND,
 	complete_owned_session: CLIENT_OWNED_DAEMON_COMMAND,
@@ -955,6 +969,7 @@ export const DAEMON_COMMAND_PLANE = {
 	get_direct_worker_transport: "control",
 	create: "control",
 	attach: "session",
+	cancel_attach: "session",
 	reattach: "control",
 	detach: "session",
 	complete_owned_session: "control",
@@ -1062,6 +1077,9 @@ export function isSessionPlaneDaemonCommand(type: string): boolean {
 
 export function getDaemonCommandCompatibilities(command: DaemonCommand): readonly DaemonCommandCompatibility[] {
 	const requirements: DaemonCommandCompatibility[] = [];
+	if (command.type === "attach" && command.timeoutMs !== undefined) {
+		requirements.push(DAEMON_ATTACH_CANCELLATION_COMPATIBILITY);
+	}
 	if ((command.type === "attach" || command.type === "reattach") && command.recoveryConfig !== undefined) {
 		requirements.push(OWNED_SESSION_RECOVERY_CONTEXT);
 	}
@@ -1379,6 +1397,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"list_agent_peers",
 	"get_direct_worker_transport",
 	"attach",
+	"cancel_attach",
 	"reattach",
 	"roster_subscribe",
 	"roster_unsubscribe",
