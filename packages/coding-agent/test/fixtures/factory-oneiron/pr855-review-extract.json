@@ -1,0 +1,281 @@
+{
+  "github_mutation": false,
+  "pins": {
+    "855": "3a3b482ca80f361b1c7dc190c3831647aad63064"
+  },
+  "repo": "oneiron-dev/oneiron",
+  "schema": "oneiron.wave6.github-bot-corpus.v1",
+  "prs": [
+    {
+      "base_ref": "main",
+      "head_sha": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+      "number": 855,
+      "items": [
+        {
+          "author": {
+            "login": "qodo-code-review[bot]",
+            "type": "Bot"
+          },
+          "body": "",
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "commit_matches_head": true,
+          "created_at": "2026-09-04T17:05:23Z",
+          "id": 5115869863,
+          "is_bot": true,
+          "key": "review:5115869863",
+          "sources": [
+            "review"
+          ],
+          "state": "COMMENTED",
+          "url": "https://github.com/oneiron-dev/oneiron/pull/855#pullrequestreview-5115869863"
+        },
+        {
+          "author": {
+            "login": "chatgpt-codex-connector[bot]",
+            "type": "Bot"
+          },
+          "body": "\n### \ud83d\udca1 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `3a3b482ca8`\n    \n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+          "body_sha256": "7f4e42b49b00d256730683bc7383cff7da8efb03dfceaa8b3c4103e7a3a7216f",
+          "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "commit_matches_head": true,
+          "created_at": "2026-09-04T17:10:51Z",
+          "id": 5115910838,
+          "is_bot": true,
+          "key": "review:5115910838",
+          "sources": [
+            "review"
+          ],
+          "state": "COMMENTED",
+          "url": "https://github.com/oneiron-dev/oneiron/pull/855#pullrequestreview-5115910838"
+        },
+        {
+          "author": {
+            "login": "qodo-code-review",
+            "type": "Bot"
+          },
+          "body": "<img src=\"https://img.shields.io/badge/High-634FD1?style=flat-square\" height=\"20px\" alt=\"Action required\">\n\n1\\. Corpus scope loses vector recall <code>\ud83d\udc1e Bug</code> <code>\u2261 Correctness</code>\n\n<pre>\n<b><i>CorpusScope</i></b> activates scope-aware widening only for text retrieval, while vector, HyDE, and\ntemporal channels still widen solely for codebase scope and truncate before corpus filtering occurs\nafter fusion. Consequently, a higher-ranked out-of-corpus candidate can consume a bounded channel\nslot, leaving a lower-ranked in-corpus candidate unreachable and producing incomplete or empty\nresults.\n</pre>\n\n\n<details>\n<summary><strong>Agent Prompt</strong></summary>\n\n```\n## Issue description\nA narrowing `CorpusScope` is accounted for when widening text retrieval, but not vector, HyDE, or temporal retrieval. Make every bounded channel that currently widens for codebase scope also widen when corpus scope is narrower than `All`, so excluded results cannot consume limited slots before corpus filtering.\n\n## Issue Context\nVector and HyDE use finite limits through `scoped_vector_channel_limit`, while temporal retrieval similarly truncates its candidates before returning. Because corpus filtering occurs only after fusion, a higher-ranked candidate from an excluded corpus can occupy a channel slot and prevent a lower-ranked candidate from the selected corpus from ever reaching fusion; text retrieval already includes corpus scope in its widening predicate.\n\nAfter activating corpus-aware widening for vector, HyDE, and temporal retrieval, filter and truncate each widened channel consistently before fusion. Add regression coverage with a channel limit of one where an out-of-corpus result ranks above an in-corpus result.\n\n## Fix Focus Areas\n- crates/oneiron/src/pipeline/execution.rs[121-138]\n- crates/oneiron/src/pipeline/execution.rs[229-303]\n- crates/oneiron/src/pipeline/execution.rs[531-549]\n- crates/oneiron/src/pipeline/execution.rs[954-960]\n- crates/oneiron/src/pipeline/channels.rs[586-610]\n- crates/oneiron/src/pipeline/tests.rs[6857-6894]\n```\n\n<code>\u24d8 Copy this prompt and use it to remediate the issue with your preferred AI generation tools</code>\n</details>",
+          "body_sha256": "0d1b0a7f52a67558ef779cc72964f65fb8252e634dd942bed872c679606323b2",
+          "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "commit_matches_head": true,
+          "created_at": "2026-09-04T17:05:23Z",
+          "id": 3936277432,
+          "in_reply_to_id": null,
+          "is_bot": true,
+          "key": "review_comment:3936277432",
+          "line": 1661,
+          "original_commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "original_line": 1661,
+          "path": "crates/oneiron/src/pipeline/execution.rs",
+          "sources": [
+            "review_comment",
+            "review_thread_comment"
+          ],
+          "start_line": 1661,
+          "thread_id": "PRRT_kwDOQmB4wc6fYRVX",
+          "thread_outdated": false,
+          "thread_resolved": false,
+          "updated_at": "2026-09-04T17:05:23Z",
+          "url": "https://github.com/oneiron-dev/oneiron/pull/855#discussion_r3936277432"
+        },
+        {
+          "author": {
+            "login": "chatgpt-codex-connector",
+            "type": "Bot"
+          },
+          "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Widen bounded channels for corpus-scoped retrieval**\n\nWhen a bounded vector, HyDE, or temporal channel ranks an out-of-corpus claim ahead of an in-corpus claim\u2014for example, `search_vector(query, 1)`\u2014this filter runs only after `hnsw_search` or `execute_temporal` has already truncated the candidate list. Corpus scope activates text widening, but `scoped_vector_channel_limit` and `scoped_entity_channel_limit` still receive only `codebase_scope_active`, so the query can return empty despite an eligible lower-ranked claim. Include corpus scope in bounded-channel widening so the audience invariant is enforced during candidate selection as well as post-fusion.\n\nAGENTS.md reference: [AGENTS.md:L120-L123](https://github.com/oneiron-dev/oneiron/blob/3a3b482ca80f361b1c7dc190c3831647aad63064/AGENTS.md#L120-L123)\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.",
+          "body_sha256": "a2ef207be8e1b9b525831a423c3a1e3cd77fc964d08102fa3c34fe84ea7ec7c2",
+          "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "commit_matches_head": true,
+          "created_at": "2026-09-04T17:10:51Z",
+          "id": 3936314147,
+          "in_reply_to_id": null,
+          "is_bot": true,
+          "key": "review_comment:3936314147",
+          "line": 958,
+          "original_commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "original_line": 958,
+          "path": "crates/oneiron/src/pipeline/execution.rs",
+          "sources": [
+            "review_comment",
+            "review_thread_comment"
+          ],
+          "start_line": 957,
+          "thread_id": "PRRT_kwDOQmB4wc6fYXRC",
+          "thread_outdated": false,
+          "thread_resolved": false,
+          "updated_at": "2026-09-04T17:10:51Z",
+          "url": "https://github.com/oneiron-dev/oneiron/pull/855#discussion_r3936314147"
+        },
+        {
+          "author": {
+            "login": "chatgpt-codex-connector",
+            "type": "Bot"
+          },
+          "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Include corpus scope in the retrieval trace fork hash**\n\nThis adds a result-affecting query setting, but `retrieval_trace_fork_hash` hashes every existing filter through `world_scope` and never hashes `builder.corpus_scope`. Two captured runs using different corpus scopes can therefore receive the same replay key whenever their effective candidate sets happen to match, such as a vault containing only unscoped claims; `retrieval_trace_by_fork_hash` may then return the trace for the wrong query configuration. Hash the canonicalized corpus scope, including sorted corpus IDs for `AnyOf`.\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.",
+          "body_sha256": "317fe77698255e9f3da3eae6eaaea3edebb2274b047a6ebb84edbcaf501cdab6",
+          "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "commit_matches_head": true,
+          "created_at": "2026-09-04T17:10:51Z",
+          "id": 3936314153,
+          "in_reply_to_id": null,
+          "is_bot": true,
+          "key": "review_comment:3936314153",
+          "line": 464,
+          "original_commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "original_line": 464,
+          "path": "crates/oneiron/src/pipeline/builder.rs",
+          "sources": [
+            "review_comment",
+            "review_thread_comment"
+          ],
+          "start_line": 463,
+          "thread_id": "PRRT_kwDOQmB4wc6fYXRF",
+          "thread_outdated": false,
+          "thread_resolved": false,
+          "updated_at": "2026-09-04T17:10:51Z",
+          "url": "https://github.com/oneiron-dev/oneiron/pull/855#discussion_r3936314153"
+        },
+        {
+          "author": {
+            "login": "chatgpt-codex-connector",
+            "type": "Bot"
+          },
+          "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Reuse the claim-gate body for corpus filtering**\n\nFor every non-`All` corpus query, each surviving claim has already been decoded and stored by `claim_status_gate_allows`, but this helper fetches the entity and decodes the same MessagePack body again; the candidate-scan path likewise invokes it immediately after the status gate. This violates the documented `ClaimStatusGateCache` single-decode-per-run contract and doubles body lookup and decoding work for corpus-scoped claim candidates. Read the corpus ID from the cached `ClaimBody` instead.\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.",
+          "body_sha256": "857d0fda7d0b05ee0eccf5147ae03bc9e2ad3b5d7d271e9f295da74476a13f6d",
+          "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "commit_matches_head": true,
+          "created_at": "2026-09-04T17:10:51Z",
+          "id": 3936314158,
+          "in_reply_to_id": null,
+          "is_bot": true,
+          "key": "review_comment:3936314158",
+          "line": 476,
+          "original_commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "original_line": 476,
+          "path": "crates/oneiron/src/pipeline/filters.rs",
+          "sources": [
+            "review_comment",
+            "review_thread_comment"
+          ],
+          "start_line": 475,
+          "thread_id": "PRRT_kwDOQmB4wc6fYXRK",
+          "thread_outdated": false,
+          "thread_resolved": false,
+          "updated_at": "2026-09-04T17:10:51Z",
+          "url": "https://github.com/oneiron-dev/oneiron/pull/855#discussion_r3936314158"
+        },
+        {
+          "author": {
+            "login": "chatgpt-codex-connector",
+            "type": "Bot"
+          },
+          "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Move corpus execution logic out of the oversized child**\n\nThis patch grows `pipeline/execution.rs` from 1,699 to 1,722 lines for the new corpus concern even though the repository guidance explicitly prohibits growing an existing child past the 800-line bar and requires new concerns to live in their own file. Move the corpus-specific orchestration into an appropriately named child module and leave only the necessary delegation in `execution.rs`.\n\nAGENTS.md reference: [AGENTS.md:L101-L103](https://github.com/oneiron-dev/oneiron/blob/3a3b482ca80f361b1c7dc190c3831647aad63064/AGENTS.md#L101-L103)\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.",
+          "body_sha256": "c43ea7a55a007f02a564281b0501577dfbc76f39563e56a91dfab9da5fee5ee0",
+          "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "commit_matches_head": true,
+          "created_at": "2026-09-04T17:10:51Z",
+          "id": 3936314165,
+          "in_reply_to_id": null,
+          "is_bot": true,
+          "key": "review_comment:3936314165",
+          "line": 126,
+          "original_commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "original_line": 126,
+          "path": "crates/oneiron/src/pipeline/execution.rs",
+          "sources": [
+            "review_comment",
+            "review_thread_comment"
+          ],
+          "start_line": 122,
+          "thread_id": "PRRT_kwDOQmB4wc6fYXRO",
+          "thread_outdated": false,
+          "thread_resolved": false,
+          "updated_at": "2026-09-04T17:10:51Z",
+          "url": "https://github.com/oneiron-dev/oneiron/pull/855#discussion_r3936314165"
+        },
+        {
+          "author": {
+            "login": "chatgpt-codex-connector",
+            "type": "Bot"
+          },
+          "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Apply corpus scope to the coping-strategy terminal**\n\nWhen `.corpus(CorpusScope::Corpus(a))` is followed by `.prior_successful_coping_strategies(...)`, this terminal bypasses `run_for_pack`, scans every claim for the subject, and returns successful coping outcomes without checking `claim_corpus_id`. A corpus-B claim is therefore returned by an explicitly corpus-A query, and `CorpusScope::AnyOf(Vec::new())` also avoids the promised validation. Enforce the canonicalized corpus predicate at this terminal before collecting records.\n\nAGENTS.md reference: [AGENTS.md:L120-L123](https://github.com/oneiron-dev/oneiron/blob/3a3b482ca80f361b1c7dc190c3831647aad63064/AGENTS.md#L120-L123)\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.",
+          "body_sha256": "16f1181147a071d02f645a69260b8f57c355287931a35e3f3a36d511fd21c7b3",
+          "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "commit_matches_head": true,
+          "created_at": "2026-09-04T17:10:51Z",
+          "id": 3936314167,
+          "in_reply_to_id": null,
+          "is_bot": true,
+          "key": "review_comment:3936314167",
+          "line": 464,
+          "original_commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+          "original_line": 464,
+          "path": "crates/oneiron/src/pipeline/builder.rs",
+          "sources": [
+            "review_comment",
+            "review_thread_comment"
+          ],
+          "start_line": 463,
+          "thread_id": "PRRT_kwDOQmB4wc6fYXRP",
+          "thread_outdated": false,
+          "thread_resolved": false,
+          "updated_at": "2026-09-04T17:10:51Z",
+          "url": "https://github.com/oneiron-dev/oneiron/pull/855#discussion_r3936314167"
+        }
+      ],
+      "raw": {
+        "review_comments": [
+          {
+            "body": "<img src=\"https://img.shields.io/badge/High-634FD1?style=flat-square\" height=\"20px\" alt=\"Action required\">\n\n1\\. Corpus scope loses vector recall <code>\ud83d\udc1e Bug</code> <code>\u2261 Correctness</code>\n\n<pre>\n<b><i>CorpusScope</i></b> activates scope-aware widening only for text retrieval, while vector, HyDE, and\ntemporal channels still widen solely for codebase scope and truncate before corpus filtering occurs\nafter fusion. Consequently, a higher-ranked out-of-corpus candidate can consume a bounded channel\nslot, leaving a lower-ranked in-corpus candidate unreachable and producing incomplete or empty\nresults.\n</pre>\n\n\n<details>\n<summary><strong>Agent Prompt</strong></summary>\n\n```\n## Issue description\nA narrowing `CorpusScope` is accounted for when widening text retrieval, but not vector, HyDE, or temporal retrieval. Make every bounded channel that currently widens for codebase scope also widen when corpus scope is narrower than `All`, so excluded results cannot consume limited slots before corpus filtering.\n\n## Issue Context\nVector and HyDE use finite limits through `scoped_vector_channel_limit`, while temporal retrieval similarly truncates its candidates before returning. Because corpus filtering occurs only after fusion, a higher-ranked candidate from an excluded corpus can occupy a channel slot and prevent a lower-ranked candidate from the selected corpus from ever reaching fusion; text retrieval already includes corpus scope in its widening predicate.\n\nAfter activating corpus-aware widening for vector, HyDE, and temporal retrieval, filter and truncate each widened channel consistently before fusion. Add regression coverage with a channel limit of one where an out-of-corpus result ranks above an in-corpus result.\n\n## Fix Focus Areas\n- crates/oneiron/src/pipeline/execution.rs[121-138]\n- crates/oneiron/src/pipeline/execution.rs[229-303]\n- crates/oneiron/src/pipeline/execution.rs[531-549]\n- crates/oneiron/src/pipeline/execution.rs[954-960]\n- crates/oneiron/src/pipeline/channels.rs[586-610]\n- crates/oneiron/src/pipeline/tests.rs[6857-6894]\n```\n\n<code>\u24d8 Copy this prompt and use it to remediate the issue with your preferred AI generation tools</code>\n</details>",
+            "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+            "pull_request_review_id": 5115869863,
+            "user": {
+              "login": "qodo-code-review[bot]"
+            }
+          },
+          {
+            "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Widen bounded channels for corpus-scoped retrieval**\n\nWhen a bounded vector, HyDE, or temporal channel ranks an out-of-corpus claim ahead of an in-corpus claim\u2014for example, `search_vector(query, 1)`\u2014this filter runs only after `hnsw_search` or `execute_temporal` has already truncated the candidate list. Corpus scope activates text widening, but `scoped_vector_channel_limit` and `scoped_entity_channel_limit` still receive only `codebase_scope_active`, so the query can return empty despite an eligible lower-ranked claim. Include corpus scope in bounded-channel widening so the audience invariant is enforced during candidate selection as well as post-fusion.\n\nAGENTS.md reference: [AGENTS.md:L120-L123](https://github.com/oneiron-dev/oneiron/blob/3a3b482ca80f361b1c7dc190c3831647aad63064/AGENTS.md#L120-L123)\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.",
+            "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+            "pull_request_review_id": 5115910838,
+            "user": {
+              "login": "chatgpt-codex-connector[bot]"
+            }
+          },
+          {
+            "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Include corpus scope in the retrieval trace fork hash**\n\nThis adds a result-affecting query setting, but `retrieval_trace_fork_hash` hashes every existing filter through `world_scope` and never hashes `builder.corpus_scope`. Two captured runs using different corpus scopes can therefore receive the same replay key whenever their effective candidate sets happen to match, such as a vault containing only unscoped claims; `retrieval_trace_by_fork_hash` may then return the trace for the wrong query configuration. Hash the canonicalized corpus scope, including sorted corpus IDs for `AnyOf`.\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.",
+            "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+            "pull_request_review_id": 5115910838,
+            "user": {
+              "login": "chatgpt-codex-connector[bot]"
+            }
+          },
+          {
+            "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Reuse the claim-gate body for corpus filtering**\n\nFor every non-`All` corpus query, each surviving claim has already been decoded and stored by `claim_status_gate_allows`, but this helper fetches the entity and decodes the same MessagePack body again; the candidate-scan path likewise invokes it immediately after the status gate. This violates the documented `ClaimStatusGateCache` single-decode-per-run contract and doubles body lookup and decoding work for corpus-scoped claim candidates. Read the corpus ID from the cached `ClaimBody` instead.\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.",
+            "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+            "pull_request_review_id": 5115910838,
+            "user": {
+              "login": "chatgpt-codex-connector[bot]"
+            }
+          },
+          {
+            "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Move corpus execution logic out of the oversized child**\n\nThis patch grows `pipeline/execution.rs` from 1,699 to 1,722 lines for the new corpus concern even though the repository guidance explicitly prohibits growing an existing child past the 800-line bar and requires new concerns to live in their own file. Move the corpus-specific orchestration into an appropriately named child module and leave only the necessary delegation in `execution.rs`.\n\nAGENTS.md reference: [AGENTS.md:L101-L103](https://github.com/oneiron-dev/oneiron/blob/3a3b482ca80f361b1c7dc190c3831647aad63064/AGENTS.md#L101-L103)\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.",
+            "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+            "pull_request_review_id": 5115910838,
+            "user": {
+              "login": "chatgpt-codex-connector[bot]"
+            }
+          },
+          {
+            "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Apply corpus scope to the coping-strategy terminal**\n\nWhen `.corpus(CorpusScope::Corpus(a))` is followed by `.prior_successful_coping_strategies(...)`, this terminal bypasses `run_for_pack`, scans every claim for the subject, and returns successful coping outcomes without checking `claim_corpus_id`. A corpus-B claim is therefore returned by an explicitly corpus-A query, and `CorpusScope::AnyOf(Vec::new())` also avoids the promised validation. Enforce the canonicalized corpus predicate at this terminal before collecting records.\n\nAGENTS.md reference: [AGENTS.md:L120-L123](https://github.com/oneiron-dev/oneiron/blob/3a3b482ca80f361b1c7dc190c3831647aad63064/AGENTS.md#L120-L123)\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.",
+            "commit_id": "3a3b482ca80f361b1c7dc190c3831647aad63064",
+            "pull_request_review_id": 5115910838,
+            "user": {
+              "login": "chatgpt-codex-connector[bot]"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

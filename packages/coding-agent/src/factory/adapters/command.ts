@@ -29,7 +29,7 @@ export interface HostRequest {
 		version: 1;
 		attemptId: string;
 		sourceFingerprint: string;
-		command: { argv: string[]; cwd: string; timeoutMs?: number };
+		command: ActionRecord["command"];
 	};
 }
 

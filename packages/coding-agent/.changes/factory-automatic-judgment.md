@@ -1,0 +1,1 @@
+- Added opt-in bounded automatic factory judgment dispatch with exact-wake evidence, durable request deduplication, pause checks, and cached proposal application.

@@ -5,6 +5,39 @@ export interface ManagementEvidence {
 	ref: string;
 	content: string;
 }
+/** One immutable evidence snapshot, explicitly bound to a journal wake. */
+export interface ManagementEvidenceBinding {
+	version: 1;
+	wakeId: number;
+	actionId: string;
+	attemptId: string;
+	planRevision: number;
+	evidence: Array<ManagementEvidence & { sha256: string }>;
+}
+export interface ManagementClaim {
+	id: string;
+	wakeId: number;
+	actionId: string;
+	attemptId: string;
+	planRevision: number;
+	evidenceSha256: string;
+}
+export interface ManagementRequest extends ManagementClaim {
+	createdAt: string;
+	state: "CLAIMED" | "PROPOSED" | "DEFERRED" | "ERROR" | "APPLIED" | "RECONCILED";
+	result: ManagementResult | null;
+	error: string | null;
+}
+export interface ManagementReconciliation {
+	version: 1;
+	requestId: string;
+	wakeId: number;
+	attemptId: string;
+	planRevision: number;
+	priorActor: { identity: string; stopped: true; authorityRevoked: true; ref: string; sha256: string };
+	providerRequest: { disposition: "completed" | "cancelled" | "not-submitted"; ref: string; sha256: string };
+	artifacts: Array<{ ref: string; sha256: string }>;
+}
 export interface ManagementPacket {
 	version: 1;
 	planRevision: number;
@@ -31,9 +64,20 @@ export interface ManagementProposal {
 }
 export interface ManagementModelResult {
 	text: string;
+	/** SDK selector; this may equal the requested routing alias. */
 	model: string;
 	modelIdentitySource?: "sdk" | "wire";
+	responseModel?: string;
+	responseModelSource?: "provider-response";
+	responseId?: string;
 	usage?: Record<string, unknown>;
+}
+export interface ManagementServingIdentity {
+	requestedSelector: string;
+	responseModel: string | null;
+	responseId: string | null;
+	source: "provider-response" | "unknown";
+	upstreamIdentityAttested: false;
 }
 export type ManagementCaller = (
 	system: string,
@@ -48,6 +92,8 @@ export interface ManagementResult {
 	profile: ManagementProfile;
 	responseModel: string;
 	modelIdentitySource: "sdk" | "wire" | "caller";
+	/** Absent in historical receipts. Never reconstruct serving identity from the SDK selector. */
+	servingIdentity?: ManagementServingIdentity;
 	proposal: ManagementProposal;
 	usage?: Record<string, unknown>;
 }
@@ -71,7 +117,17 @@ export function createManagementPacket(
 	if (!ticket) throw new Error("Action ticket is missing");
 	if (
 		evidence.length > 4 ||
-		evidence.some((item) => !item.ref.trim() || !item.content.trim() || item.content.length > 16000)
+		evidence.some(
+			(item) =>
+				!item ||
+				typeof item.ref !== "string" ||
+				!item.ref.trim() ||
+				item.ref.length > 4000 ||
+				item.ref.startsWith("factory:attempt:") ||
+				typeof item.content !== "string" ||
+				!item.content.trim() ||
+				item.content.length > 16000,
+		)
 	) {
 		throw new Error("Supply at most four nonempty evidence records of at most 16000 characters each");
 	}
@@ -150,7 +206,7 @@ export async function proposeManagementDecision(
 	packet: ManagementPacket,
 	profile: ManagementProfile,
 	call: ManagementCaller,
-	id = randomUUID(),
+	id: string = randomUUID(),
 ): Promise<ManagementResult> {
 	const serialized = JSON.stringify(packet);
 	const result = await call(MANAGEMENT_SYSTEM_PROMPT, serialized, profile, id);
@@ -163,6 +219,19 @@ export async function proposeManagementDecision(
 		profile,
 		responseModel: result.model,
 		modelIdentitySource: result.modelIdentitySource ?? "caller",
+		servingIdentity: {
+			requestedSelector: result.model,
+			responseModel:
+				result.responseModelSource === "provider-response" && result.responseModel?.trim()
+					? result.responseModel
+					: null,
+			responseId: result.responseId?.trim() || null,
+			source:
+				result.responseModelSource === "provider-response" && result.responseModel?.trim()
+					? "provider-response"
+					: "unknown",
+			upstreamIdentityAttested: false,
+		},
 		proposal: parseManagementProposal(result.text, packet),
 		usage: result.usage,
 	};

@@ -131,6 +131,13 @@ describe("factory management boundary", () => {
 			]),
 		).toThrow(/unique/);
 	});
+	test("does not let supplied evidence impersonate the reserved process receipt namespace", () => {
+		expect(() =>
+			createManagementPacket(status(), undefined, [
+				{ ref: "factory:attempt:attempt-a", content: "Not substantive review evidence" },
+			]),
+		).toThrow(/nonempty evidence/);
+	});
 	test("makes one configured-model call and returns a proposal without mutating status", async () => {
 		const input = status();
 		const before = JSON.stringify(input);
@@ -147,6 +154,48 @@ describe("factory management boundary", () => {
 		expect(result.proposal.decision).toBe("defer");
 		expect(result.packetSha256).toMatch(/^[a-f0-9]{64}$/);
 		expect(JSON.stringify(input)).toBe(before);
+	});
+	test("retains transport-reported serving identity without relabeling the SDK selector", async () => {
+		const input = status();
+		const result = await proposeManagementDecision(
+			createManagementPacket(input),
+			input.roles!.ticketOwner,
+			async () => ({
+				text: proposal(),
+				model: "configured",
+				modelIdentitySource: "sdk",
+				responseModel: "actual-served-model",
+				responseModelSource: "provider-response",
+				responseId: "wire-request-1",
+			}),
+		);
+		expect(result.responseModel).toBe("configured");
+		expect(result.servingIdentity).toEqual({
+			requestedSelector: "configured",
+			responseModel: "actual-served-model",
+			responseId: "wire-request-1",
+			source: "provider-response",
+			upstreamIdentityAttested: false,
+		});
+	});
+	test("does not infer serving identity from an SDK or unqualified caller model field", async () => {
+		const input = status();
+		const result = await proposeManagementDecision(
+			createManagementPacket(input),
+			input.roles!.ticketOwner,
+			async () => ({
+				text: proposal(),
+				model: "configured",
+				responseModel: "claimed-but-not-transport-derived",
+			}),
+		);
+		expect(result.servingIdentity).toEqual({
+			requestedSelector: "configured",
+			responseModel: null,
+			responseId: null,
+			source: "unknown",
+			upstreamIdentityAttested: false,
+		});
 	});
 	test("does not silently accept a substituted model", async () => {
 		const input = status();

@@ -48,6 +48,9 @@ export function createPrimeManagementCaller(beforeRequest: () => void): Manageme
 				.join(""),
 			model: response.model,
 			modelIdentitySource: "sdk",
+			responseModel: response.responseModel,
+			responseModelSource: response.responseModelSource,
+			responseId: response.responseId,
 			usage: { ...response.usage },
 		};
 	};

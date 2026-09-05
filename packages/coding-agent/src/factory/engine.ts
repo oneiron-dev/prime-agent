@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import type { ManagementReconciliation } from "./management.js";
+import { verifyManagementReconciliation } from "./management-recovery.js";
 import type { FactoryStore } from "./store.js";
 import type {
 	AttemptContext,
@@ -33,9 +35,20 @@ export class FactoryEngine {
 	private requireUnpaused(): void {
 		if (this.paused()) throw new Error("Factory is paused; changes are blocked");
 	}
-	applyPlan(plan: FactoryPlan, expectedRevision?: number): number {
+	applyPlan(plan: FactoryPlan, expectedRevision?: number, mutationId?: string): number {
 		this.requireUnpaused();
-		return this.store.applyPlan(plan, expectedRevision);
+		return this.store.applyPlan(plan, expectedRevision, mutationId);
+	}
+	reconcileManagement(
+		requestId: string,
+		reconciliation: ManagementReconciliation,
+		evidence: DecisionEvidence,
+		expectedRevision: number,
+	): void {
+		this.requireUnpaused();
+		verifyManagementReconciliation(reconciliation);
+		this.requireUnpaused();
+		this.store.reconcileManagement(requestId, reconciliation, evidence, expectedRevision);
 	}
 	pause(reason: string): void {
 		this.store.pause(reason);
@@ -50,9 +63,19 @@ export class FactoryEngine {
 		evidence: DecisionEvidence,
 		expectedRevision?: number,
 		expectedAttemptId?: string,
+		expectedWakeId?: number,
+		expectedManagementRequestId?: string,
 	): void {
 		this.requireUnpaused();
-		this.store.decide(actionId, outcome, evidence, expectedRevision, expectedAttemptId);
+		this.store.decide(
+			actionId,
+			outcome,
+			evidence,
+			expectedRevision,
+			expectedAttemptId,
+			expectedWakeId,
+			expectedManagementRequestId,
+		);
 	}
 	supersede(actionId: string, replacementId: string, evidence: DecisionEvidence, expectedRevision?: number): number {
 		this.requireUnpaused();

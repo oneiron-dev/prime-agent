@@ -1,0 +1,1 @@
+- Added a preparation-first Oneiron command adapter with custody and source gates, foreground Astra repair, commit-bound review triage, existing Cargo wrappers, and guarded native single-PR publication.

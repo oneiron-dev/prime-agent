@@ -1,7 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
+import type { ManagementClaim, ManagementReconciliation, ManagementRequest, ManagementResult } from "./management.js";
 import type {
 	ActionRecord,
 	ActionSpec,
@@ -12,6 +13,7 @@ import type {
 	FactoryEvent,
 	FactoryPlan,
 	FactoryStatus,
+	PlanMutationReceipt,
 	SlotSpec,
 	TicketRecord,
 	WakeRecord,
@@ -40,7 +42,12 @@ function actionSpec(action: ActionSpec): ActionSpec {
 		dependencies: [...action.dependencies],
 		sourceFingerprint: action.sourceFingerprint,
 		kind: action.kind,
-		command: { ...action.command, argv: [...action.command.argv], cwd: resolve(action.command.cwd) },
+		command: {
+			...action.command,
+			argv: [...action.command.argv],
+			cwd: resolve(action.command.cwd),
+			env: action.command.env ? { ...action.command.env } : undefined,
+		},
 		requirements: { ...action.requirements },
 	};
 }
@@ -102,6 +109,17 @@ function validatePlan(plan: FactoryPlan): void {
 			(!Number.isSafeInteger(action.command.timeoutMs) || action.command.timeoutMs <= 0)
 		)
 			throw new Error("Invalid command timeoutMs");
+		if (
+			action.command.env !== undefined &&
+			(!action.command.env ||
+				typeof action.command.env !== "object" ||
+				Array.isArray(action.command.env) ||
+				Object.entries(action.command.env).some(
+					([name, value]) =>
+						!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || typeof value !== "string" || value.includes("\0"),
+				))
+		)
+			throw new Error("Invalid command env: expected variable names and string values without NUL");
 		if (!action.requirements || typeof action.requirements !== "object")
 			throw new Error("Action requirements are required");
 		if (action.requirements.host !== undefined) required(action.requirements.host, "requirements.host");
@@ -141,6 +159,9 @@ export class FactoryStore {
 					CREATE TABLE IF NOT EXISTS events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, action_id TEXT, attempt_id TEXT, detail TEXT NOT NULL);
 					CREATE TABLE IF NOT EXISTS wakes (id INTEGER PRIMARY KEY AUTOINCREMENT, action_id TEXT NOT NULL, attempt_id TEXT, reason TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT);
 					CREATE UNIQUE INDEX IF NOT EXISTS wakes_attempt_open ON wakes(attempt_id) WHERE resolved_at IS NULL;
+					CREATE TABLE IF NOT EXISTS management_requests (id TEXT PRIMARY KEY, wake_id INTEGER NOT NULL REFERENCES wakes(id), action_id TEXT NOT NULL, attempt_id TEXT NOT NULL, plan_revision INTEGER NOT NULL, evidence_sha256 TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL, result TEXT, error TEXT, UNIQUE(wake_id,plan_revision,attempt_id,evidence_sha256));
+					CREATE UNIQUE INDEX IF NOT EXISTS management_wake_inflight ON management_requests(wake_id) WHERE state='CLAIMED';
+					CREATE TABLE IF NOT EXISTS plan_mutations (id TEXT PRIMARY KEY, payload_sha256 TEXT NOT NULL, previous_revision INTEGER NOT NULL, revision INTEGER NOT NULL);
 				`);
 				this.setMeta("schema_version", String(SCHEMA_VERSION));
 				if (this.meta("plan_revision") === undefined) this.setMeta("plan_revision", "0");
@@ -203,14 +224,53 @@ export class FactoryStore {
 		});
 	}
 	/** Add/upsert a plan; omitted records remain. Started actions and all source fingerprints are immutable. */
-	applyPlan(plan: FactoryPlan, expectedRevision?: number): number {
+	applyPlan(plan: FactoryPlan, expectedRevision?: number, mutationId?: string): number {
 		validatePlan(plan);
+		if (mutationId !== undefined) {
+			required(mutationId, "mutationId");
+			if (!Number.isSafeInteger(expectedRevision) || expectedRevision! < 0)
+				throw new Error("A mutationId requires an explicit expected plan revision");
+		}
+		const payloadSha256 = createHash("sha256").update(JSON.stringify({ plan, expectedRevision })).digest("hex");
 		return this.transaction(() => {
+			if (mutationId !== undefined) {
+				const prior = this.planMutation(mutationId);
+				if (prior) {
+					if (prior.payloadSha256 !== payloadSha256)
+						throw new Error("Plan mutation identity reused for a different payload");
+					return prior.revision;
+				}
+			}
 			if (this.isPaused()) throw new Error("Factory is paused; plan changes are blocked");
 			const revision = Number(this.meta("plan_revision"));
 			if (expectedRevision !== undefined && revision !== expectedRevision)
 				throw new Error("Factory plan revision changed");
 			const existing = this.actions();
+			const unchanged =
+				revision > 0 &&
+				plan.actions.every((action) =>
+					existing.some((old) => isDeepStrictEqual(actionSpec(old), actionSpec(action))),
+				) &&
+				plan.tickets.every((ticket) =>
+					this.tickets().some((old) => old.id === ticket.id && old.owner === ticket.owner),
+				) &&
+				plan.slots.every((slot) => this.slots().some((old) => isDeepStrictEqual(old, slot))) &&
+				(plan.roles === undefined ||
+					isDeepStrictEqual(plan.roles, decode<FactoryPlan["roles"]>(this.meta("roles") ?? "{}")));
+			const recordMutation = (nextRevision: number): void => {
+				if (mutationId !== undefined)
+					this.db
+						.prepare("INSERT INTO plan_mutations(id,payload_sha256,previous_revision,revision) VALUES(?,?,?,?)")
+						.run(mutationId, payloadSha256, revision, nextRevision);
+			};
+			if (unchanged) {
+				recordMutation(revision);
+				return revision;
+			}
+			this.requireManagementDrained();
+			const invalidatedWakeIds = this.wakes()
+				.filter((wake) => wake.resolvedAt === null)
+				.map((wake) => wake.id);
 			const superseded = new Set(
 				existing.filter((action) => action.state === "SUPERSEDED").map((action) => action.id),
 			);
@@ -282,7 +342,14 @@ export class FactoryStore {
 			if (plan.roles !== undefined) this.setMeta("roles", JSON.stringify(plan.roles));
 			this.setMeta("plan_revision", String(revision + 1));
 			this.refreshReadiness();
-			this.event("plan_applied", null, null, { revision: revision + 1, actions: plan.actions.length });
+			recordMutation(revision + 1);
+			this.event("plan_applied", null, null, {
+				previousRevision: revision,
+				revision: revision + 1,
+				actions: plan.actions.length,
+				invalidatedWakeIds,
+				mutationId: mutationId ?? null,
+			});
 			return revision + 1;
 		});
 	}
@@ -538,6 +605,8 @@ export class FactoryStore {
 		evidence: DecisionEvidence,
 		expectedRevision?: number,
 		expectedAttemptId?: string,
+		expectedWakeId?: number,
+		expectedManagementRequestId?: string,
 	): void {
 		evidenceValid(evidence);
 		this.transaction(() => {
@@ -556,6 +625,24 @@ export class FactoryStore {
 				(expectedAttemptId !== undefined && latest.id !== expectedAttemptId)
 			)
 				throw new Error("Decision attempt changed");
+			if (
+				expectedWakeId !== undefined &&
+				!this.db
+					.prepare("SELECT 1 FROM wakes WHERE id=? AND action_id=? AND attempt_id=? AND resolved_at IS NULL")
+					.get(expectedWakeId, actionId, String(latest.id))
+			)
+				throw new Error("Decision wake changed");
+			if (expectedManagementRequestId !== undefined) {
+				const request = this.db
+					.prepare("SELECT id,state FROM management_requests WHERE wake_id=? ORDER BY rowid DESC LIMIT 1")
+					.get(expectedWakeId ?? -1);
+				if (request?.id !== expectedManagementRequestId || request.state !== "PROPOSED")
+					throw new Error("Management evidence context changed");
+				this.db
+					.prepare("UPDATE management_requests SET state='APPLIED' WHERE id=?")
+					.run(expectedManagementRequestId);
+				this.event("management_applied", actionId, String(latest.id), { id: expectedManagementRequestId });
+			}
 			if (outcome !== "accept" && outcome !== "reject") throw new Error("Invalid decision outcome");
 			this.db
 				.prepare("UPDATE actions SET state=? WHERE id=?")
@@ -575,6 +662,10 @@ export class FactoryStore {
 			const revision = Number(this.meta("plan_revision"));
 			if (expectedRevision !== undefined && revision !== expectedRevision)
 				throw new Error("Factory plan revision changed");
+			this.requireManagementDrained();
+			const invalidatedWakeIds = this.wakes()
+				.filter((wake) => wake.resolvedAt === null && wake.actionId !== actionId)
+				.map((wake) => wake.id);
 			const old = this.action(actionId);
 			const replacement = this.action(replacementId);
 			if (!old || old.state !== "REJECTED") throw new Error("Only rejected work may be superseded");
@@ -625,7 +716,13 @@ export class FactoryStore {
 				.prepare("UPDATE wakes SET resolved_at=? WHERE action_id=? AND resolved_at IS NULL")
 				.run(now(), actionId);
 			this.setMeta("plan_revision", String(revision + 1));
-			this.event("action_superseded", actionId, null, { replacementId, revision: revision + 1, ...evidence });
+			this.event("action_superseded", actionId, null, {
+				replacementId,
+				previousRevision: revision,
+				revision: revision + 1,
+				invalidatedWakeIds,
+				...evidence,
+			});
 			this.refreshReadiness();
 			return revision + 1;
 		});
@@ -645,6 +742,155 @@ export class FactoryStore {
 			this.resolveWakes(attemptId);
 			this.event("uncertainty_resolved_for_retry", action.id, attemptId, { ...evidence });
 			this.refreshReadiness();
+		});
+	}
+	planMutation(id: string): PlanMutationReceipt | undefined {
+		const row = this.db.prepare("SELECT * FROM plan_mutations WHERE id=?").get(id);
+		return row
+			? {
+					id: String(row.id),
+					payloadSha256: String(row.payload_sha256),
+					previousRevision: Number(row.previous_revision),
+					revision: Number(row.revision),
+				}
+			: undefined;
+	}
+	managementMutationBlockers(): ManagementRequest[] {
+		const requests = this.managementRequests();
+		const openWakes = new Set(
+			this.wakes()
+				.filter((wake) => wake.resolvedAt === null)
+				.map((wake) => wake.id),
+		);
+		const latest = new Map(requests.map((request) => [request.wakeId, request.id]));
+		return requests.filter(
+			(request) =>
+				request.state === "CLAIMED" ||
+				(request.state === "PROPOSED" &&
+					openWakes.has(request.wakeId) &&
+					latest.get(request.wakeId) === request.id),
+		);
+	}
+	private requireManagementDrained(): void {
+		const blockers = this.managementMutationBlockers();
+		if (blockers.length)
+			throw new Error(
+				`Plan mutation blocked by unconsumed management requests: ${blockers.map((request) => request.id).join(", ")}`,
+			);
+	}
+	/** Explicit evidence-backed release of judgment authority, never a model retry or process-custody resolution. */
+	reconcileManagement(
+		requestId: string,
+		reconciliation: ManagementReconciliation,
+		evidence: DecisionEvidence,
+		expectedRevision: number,
+	): void {
+		evidenceValid(evidence);
+		this.transaction(() => {
+			if (this.isPaused()) throw new Error("Factory is paused; management reconciliation is blocked");
+			if (!Number.isSafeInteger(expectedRevision) || Number(this.meta("plan_revision")) !== expectedRevision)
+				throw new Error("Factory plan revision changed");
+			const request = this.managementRequests().find((item) => item.id === requestId);
+			if (!request || (request.state !== "CLAIMED" && request.state !== "PROPOSED"))
+				throw new Error("Only an unconsumed management request may be reconciled");
+			if (
+				reconciliation.version !== 1 ||
+				reconciliation.requestId !== requestId ||
+				reconciliation.wakeId !== request.wakeId ||
+				reconciliation.attemptId !== request.attemptId ||
+				reconciliation.planRevision !== request.planRevision
+			)
+				throw new Error("Management reconciliation does not match the original request");
+			if (
+				reconciliation.priorActor?.stopped !== true ||
+				reconciliation.priorActor.authorityRevoked !== true ||
+				!["completed", "cancelled", "not-submitted"].includes(reconciliation.providerRequest?.disposition)
+			)
+				throw new Error("Actor and provider request custody must be reconciled first");
+			this.db.prepare("UPDATE management_requests SET state='RECONCILED' WHERE id=?").run(requestId);
+			this.event("management_reconciled", request.actionId, request.attemptId, {
+				id: requestId,
+				previousState: request.state,
+				reconciliation,
+				...evidence,
+			});
+		});
+	}
+	/** Claims never expire. An interrupted model request must not be replayed on timeout or process death. */
+	claimManagement(claim: ManagementClaim): boolean {
+		return this.transaction(() => {
+			this.assertManagementCurrent(claim);
+			if (
+				this.db
+					.prepare(
+						"SELECT id FROM management_requests WHERE wake_id=? AND attempt_id=? AND evidence_sha256=? LIMIT 1",
+					)
+					.get(claim.wakeId, claim.attemptId, claim.evidenceSha256)
+			)
+				return false;
+			const result = this.db
+				.prepare(
+					"INSERT OR IGNORE INTO management_requests(id,wake_id,action_id,attempt_id,plan_revision,evidence_sha256,created_at,state) VALUES(?,?,?,?,?,?,?,'CLAIMED')",
+				)
+				.run(
+					claim.id,
+					claim.wakeId,
+					claim.actionId,
+					claim.attemptId,
+					claim.planRevision,
+					claim.evidenceSha256,
+					now(),
+				);
+			if (!result.changes) return false;
+			this.event("management_claimed", claim.actionId, claim.attemptId, { ...claim });
+			return true;
+		});
+	}
+	assertManagementCurrent(claim: ManagementClaim): void {
+		const request = this.db.prepare("SELECT state FROM management_requests WHERE id=?").get(claim.id);
+		if (request && request.state !== "CLAIMED" && request.state !== "PROPOSED")
+			throw new Error("Management request authority is no longer active");
+		if (this.isPaused()) throw new Error("Factory is paused; management is blocked");
+		if (Number(this.meta("plan_revision")) !== claim.planRevision) throw new Error("Factory plan revision changed");
+		const wake = this.db.prepare("SELECT * FROM wakes WHERE id=? AND resolved_at IS NULL").get(claim.wakeId);
+		if (!wake || wake.action_id !== claim.actionId || wake.attempt_id !== claim.attemptId)
+			throw new Error("Management wake changed");
+		const action = this.action(claim.actionId);
+		const latest = this.db
+			.prepare("SELECT id FROM attempts WHERE action_id=? ORDER BY rowid DESC LIMIT 1")
+			.get(claim.actionId);
+		if (
+			!action ||
+			(action.state !== "AWAITING_DECISION" && action.state !== "UNCERTAIN") ||
+			latest?.id !== claim.attemptId
+		)
+			throw new Error("Management action or attempt changed");
+	}
+	managementRequests(): ManagementRequest[] {
+		return this.db
+			.prepare("SELECT * FROM management_requests ORDER BY rowid")
+			.all()
+			.map((row) => ({
+				id: String(row.id),
+				wakeId: Number(row.wake_id),
+				actionId: String(row.action_id),
+				attemptId: String(row.attempt_id),
+				planRevision: Number(row.plan_revision),
+				evidenceSha256: String(row.evidence_sha256),
+				createdAt: String(row.created_at),
+				state: String(row.state) as ManagementRequest["state"],
+				result: row.result === null ? null : decode<ManagementResult>(row.result),
+				error: row.error === null ? null : String(row.error),
+			}));
+	}
+	finishManagement(id: string, result: ManagementResult | null, error: string | null = null): void {
+		this.transaction(() => {
+			const state = error !== null ? "ERROR" : result?.proposal.decision === "defer" ? "DEFERRED" : "PROPOSED";
+			const changed = this.db
+				.prepare("UPDATE management_requests SET state=?,result=?,error=? WHERE id=? AND state='CLAIMED'")
+				.run(state, result ? JSON.stringify(result) : null, error, id);
+			if (!changed.changes) throw new Error("Management claim is no longer active");
+			this.event("management_finished", null, null, { id, state, error });
 		});
 	}
 	events(afterSequence = 0, limit = 100): FactoryEvent[] {

@@ -1,0 +1,1 @@
+- Added transaction-safe factory plan imports, no-op and exact-once import receipts, and evidence-backed management recovery without claim deletion or automatic replay.

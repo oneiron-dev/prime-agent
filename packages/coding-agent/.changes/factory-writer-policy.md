@@ -1,0 +1,1 @@
+- Added pinned OAuth-only Astra writer profiles, automatic gateway-model provenance, reconciled whole-attempt retries, and shared owned-runtime checks for project actions.

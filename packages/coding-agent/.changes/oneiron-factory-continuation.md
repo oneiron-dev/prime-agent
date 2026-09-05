@@ -1,0 +1,1 @@
+- Added durable Oneiron coordinator continuation with automatic evidence binding, serialized successor import, explicit recovery and finite supervised sessions.
