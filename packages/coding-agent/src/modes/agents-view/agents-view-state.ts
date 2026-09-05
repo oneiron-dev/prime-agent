@@ -3,6 +3,7 @@ import { canonicalizePath } from "../../utils/paths.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/index.js";
 import { rosterAgentIdForSummary } from "../daemon/agent-roster.js";
 import { classifySessionRosterStatus, type SessionSummary } from "../daemon/daemon-session-list.js";
+import { createSessionSearchText, PreparedSearchText } from "./session-view-search.js";
 
 export type AgentsViewActivitySection = "running" | "idle" | "inactive";
 export type AgentsViewDisplaySection = "pinned" | AgentsViewActivitySection;
@@ -25,6 +26,7 @@ export interface UnifiedSessionRecord {
 	identityAliases: readonly string[];
 	section: AgentsViewSection;
 	searchableText: string;
+	preparedSearchText?: PreparedSearchText;
 	heartbeat?: UnifiedSessionHeartbeat;
 }
 
@@ -281,10 +283,10 @@ function savedIdentityAliases(saved: AgentConnectionSavedSessionInfo): string[] 
 	return [fileIdentity(saved.path), `session:${saved.id}`];
 }
 
-function createUnifiedSearchableText(
+function getUnifiedSearchableParts(
 	daemon: SessionSummary | undefined,
 	saved: AgentConnectionSavedSessionInfo | undefined,
-): string {
+): (string | undefined)[] {
 	return [
 		daemon?.sessionId,
 		daemon?.activeSessionId,
@@ -301,9 +303,43 @@ function createUnifiedSearchableText(
 		saved?.cwd,
 		saved?.path,
 		saved?.parentSessionPath,
-	]
-		.filter((part): part is string => typeof part === "string" && part.length > 0)
-		.join(" ");
+	];
+}
+
+/** Search-only data for the current catalog; wrapper metadata does not invalidate it. */
+export class UnifiedSessionSearchCache {
+	private entries = new Map<string, { parts: readonly (string | undefined)[]; prepared: PreparedSearchText }>();
+
+	get size(): number {
+		return this.entries.size;
+	}
+
+	prepare(
+		identity: string,
+		daemon: SessionSummary | undefined,
+		saved: AgentConnectionSavedSessionInfo | undefined,
+	): PreparedSearchText {
+		const parts = getUnifiedSearchableParts(daemon, saved);
+		const previous = this.entries.get(identity);
+		if (previous && previous.parts.every((part, index) => part === parts[index])) return previous.prepared;
+		previous?.prepared.clear();
+		const prepared = new PreparedSearchText(createSessionSearchText(parts));
+		this.entries.set(identity, { parts, prepared });
+		return prepared;
+	}
+
+	prune(identities: ReadonlySet<string>): void {
+		for (const [identity, entry] of this.entries) {
+			if (identities.has(identity)) continue;
+			entry.prepared.clear();
+			this.entries.delete(identity);
+		}
+	}
+
+	clear(): void {
+		for (const entry of this.entries.values()) entry.prepared.clear();
+		this.entries.clear();
+	}
 }
 
 /**
@@ -315,6 +351,7 @@ export function reconcileUnifiedSessions(
 	daemonSummaries: readonly SessionSummary[],
 	savedSessions: readonly AgentConnectionSavedSessionInfo[],
 	heartbeats: readonly AgentConnectionHeartbeat[] = [],
+	searchCache?: UnifiedSessionSearchCache,
 ): UnifiedSessionRecord[] {
 	const heartbeatByActiveId = aggregateSessionHeartbeats(daemonSummaries, heartbeats);
 	const records: UnifiedSessionRecord[] = [];
@@ -337,7 +374,6 @@ export function reconcileUnifiedSessions(
 			...(heartbeat ? { heartbeat } : {}),
 		};
 		record.section = classifyUnifiedSession(record);
-		record.searchableText = createUnifiedSearchableText(daemon, undefined);
 		records.push(record);
 		for (const alias of aliases) recordByAlias.set(alias, record);
 	}
@@ -348,7 +384,6 @@ export function reconcileUnifiedSessions(
 		if (record) {
 			record.saved = saved;
 			record.identityAliases = [...new Set([...record.identityAliases, ...aliases])];
-			record.searchableText = createUnifiedSearchableText(record.daemon, saved);
 			for (const alias of aliases) recordByAlias.set(alias, record);
 			continue;
 		}
@@ -357,11 +392,21 @@ export function reconcileUnifiedSessions(
 			identity: aliases[0]!,
 			identityAliases: aliases,
 			section: "inactive",
-			searchableText: createUnifiedSearchableText(undefined, saved),
+			searchableText: "",
 		};
 		records.push(inactive);
 		for (const alias of aliases) recordByAlias.set(alias, inactive);
 	}
+	for (const record of records) {
+		if (searchCache) {
+			const prepared = searchCache.prepare(record.identity, record.daemon, record.saved);
+			record.preparedSearchText = prepared;
+			record.searchableText = prepared.text;
+		} else {
+			record.searchableText = createSessionSearchText(getUnifiedSearchableParts(record.daemon, record.saved));
+		}
+	}
+	searchCache?.prune(new Set(records.map((record) => record.identity)));
 	return records;
 }
 
@@ -524,12 +569,12 @@ export function getUnifiedSessionAncestorSessionIds(
 
 export function filterUnifiedSessions(
 	records: readonly UnifiedSessionRecord[],
-	matches: (searchableText: string) => boolean,
+	matches: (searchableText: string, record: UnifiedSessionRecord) => boolean,
 ): UnifiedSessionRecord[] {
 	const index = buildUnifiedSessionIndex(records);
 	const retained = new Set<UnifiedSessionRecord>();
 	for (const record of records) {
-		if (!matches(record.searchableText)) continue;
+		if (!matches(record.searchableText, record)) continue;
 		let current: UnifiedSessionRecord | undefined = record;
 		while (current && !retained.has(current)) {
 			retained.add(current);

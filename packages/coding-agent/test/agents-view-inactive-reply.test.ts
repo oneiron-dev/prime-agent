@@ -675,6 +675,7 @@ describe("agents view slash commands", () => {
 					return invoke("armSavedSearchFetch", self);
 				},
 			};
+			Object.setPrototypeOf(self, AgentsViewMode.prototype);
 			const supersede = () =>
 				(self.refreshSavedSessions as (options?: unknown) => Promise<boolean>)({ preserveStatusOnError: true });
 			return { self, persistentState, request, supersede };

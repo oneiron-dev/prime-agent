@@ -103,6 +103,20 @@ const STRICT_FUZZY_MAX_TOKEN_SCORE = 25;
 
 /** Match any precomputed search corpus using the resume picker's query language. */
 export function matchSearchText(text: string, parsed: ParsedSearchQuery): MatchResult {
+	return matchPreparedSearchText(
+		text,
+		parsed,
+		parsed.tokens.map((token) => normalizeWhitespaceLower(token.value)),
+		() => normalizeWhitespaceLower(text),
+	);
+}
+
+function matchPreparedSearchText(
+	text: string,
+	parsed: ParsedSearchQuery,
+	normalizedNeedles: readonly string[],
+	getNormalizedText: () => string,
+): MatchResult {
 	if (parsed.mode === "regex") {
 		if (!parsed.regex) {
 			return { matches: false, score: 0 };
@@ -117,10 +131,10 @@ export function matchSearchText(text: string, parsed: ParsedSearchQuery): MatchR
 	}
 
 	let totalScore = 0;
-	const normalizedText = normalizeWhitespaceLower(text);
+	const normalizedText = getNormalizedText();
 
-	for (const token of parsed.tokens) {
-		const needle = normalizeWhitespaceLower(token.value);
+	for (const [index, token] of parsed.tokens.entries()) {
+		const needle = normalizedNeedles[index]!;
 		if (!needle) continue;
 		const idx = normalizedText.indexOf(needle);
 		if (idx >= 0) {
@@ -139,4 +153,55 @@ export function matchSearchText(text: string, parsed: ParsedSearchQuery): MatchR
 export function matchesSearchText(text: string, query: string): boolean {
 	const parsed = parseSearchQuery(query);
 	return !parsed.error && matchSearchText(text, parsed).matches;
+}
+
+interface PreparedSearchQuery {
+	query: string;
+	parsed: ParsedSearchQuery;
+	normalizedNeedles: readonly string[];
+}
+
+/** Query work retained only for a corpus owned by the current agents view. */
+export class PreparedSearchText {
+	private normalizedText: string | undefined;
+	private lastQuery: string | undefined;
+	private lastResult: MatchResult | undefined;
+
+	constructor(readonly text: string) {}
+
+	match(prepared: PreparedSearchQuery): MatchResult {
+		if (this.lastQuery === prepared.query && this.lastResult) return { ...this.lastResult };
+		const result = prepared.parsed.error
+			? { matches: false, score: 0 }
+			: matchPreparedSearchText(this.text, prepared.parsed, prepared.normalizedNeedles, () => {
+					this.normalizedText ??= normalizeWhitespaceLower(this.text);
+					return this.normalizedText;
+				});
+		this.lastQuery = prepared.query;
+		this.lastResult = result;
+		return { ...result };
+	}
+
+	clear(): void {
+		this.normalizedText = undefined;
+		this.lastQuery = undefined;
+		this.lastResult = undefined;
+	}
+}
+
+/** Parse one query for a catalog pass and reuse unchanged records' last result. */
+export function prepareSearchMatcher(query: string): (text: string | PreparedSearchText) => boolean {
+	const parsed = parseSearchQuery(query);
+	const prepared: PreparedSearchQuery = {
+		query,
+		parsed,
+		normalizedNeedles: parsed.tokens.map((token) => normalizeWhitespaceLower(token.value)),
+	};
+	return (text) => {
+		if (text instanceof PreparedSearchText) return text.match(prepared).matches;
+		return (
+			!parsed.error &&
+			matchPreparedSearchText(text, parsed, prepared.normalizedNeedles, () => normalizeWhitespaceLower(text)).matches
+		);
+	};
 }

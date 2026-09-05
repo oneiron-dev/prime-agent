@@ -48,7 +48,6 @@ import {
 import {
 	type DaemonSavedSessionCatalogContext,
 	deleteDaemonSavedSession,
-	listDaemonSavedSessions,
 	renameDaemonSavedSession,
 } from "../daemon/saved-session-catalog.js";
 import { formatTokenCount } from "../interactive/agent-activity.js";
@@ -114,9 +113,11 @@ import {
 	transitionAgentsViewScope,
 	type UnifiedSessionIndex,
 	type UnifiedSessionRecord,
+	UnifiedSessionSearchCache,
 } from "./agents-view-state.js";
 import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "./roster-store.js";
-import { matchesSearchText } from "./session-view-search.js";
+import { prepareSearchMatcher } from "./session-view-search.js";
+import { SharedSavedCatalogRequest } from "./shared-saved-catalog.js";
 
 const HEARTBEAT_POLL_INTERVAL_MS = 15000;
 const RECONNECT_TIMEOUT_MS = 120000;
@@ -192,6 +193,8 @@ export type AgentsViewPersistentState = {
 	savedSessions?: AgentConnectionSavedSessionInfo[];
 	lastSuccessfulSavedSessions?: AgentConnectionSavedSessionInfo[];
 	savedCatalogLoaded?: boolean;
+	savedCatalogRequest?: SharedSavedCatalogRequest;
+	savedCatalogOwner?: { client: DaemonClient; contextKey: string };
 	lastSuccessfulLiveSummaries?: SessionSummary[];
 	savedCatalogGeneration?: number;
 	heartbeats?: AgentConnectionHeartbeat[];
@@ -474,6 +477,8 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 	try {
 		await runAgentsViewLoop(options, persistentState, promptStashStore);
 	} finally {
+		persistentState.savedCatalogRequest?.dispose();
+		persistentState.savedCatalogRequest = undefined;
 		// Close first: the supervisor drops the subscription with the socket.
 		persistentState.rosterClient?.close();
 		await persistentState.rosterStore?.dispose();
@@ -716,6 +721,10 @@ export class AgentsViewMode implements Component, Focusable {
 	private unifiedRecords: UnifiedSessionRecord[] = [];
 	private unifiedIndex: UnifiedSessionIndex = buildUnifiedSessionIndex([]);
 	private scopedRecords: UnifiedSessionRecord[] = [];
+	private sessionSearchCache: UnifiedSessionSearchCache | undefined;
+	private filteredRecordsCache:
+		| { query: string; records: UnifiedSessionRecord[]; filtered: UnifiedSessionRecord[] }
+		| undefined;
 	private scopeKey: AgentsViewScopeKey | undefined;
 	private scopeRootSummary: SessionSummary | undefined;
 	private savedCatalogReady = false;
@@ -729,6 +738,10 @@ export class AgentsViewMode implements Component, Focusable {
 	private savedCatalogRefreshPending = false;
 	private savedCatalogRetryTimer: NodeJS.Timeout | undefined;
 	private savedCatalogStatus: string | undefined;
+	private unsubscribeSavedCatalog: (() => void) | undefined;
+	private savedCatalogFlush:
+		| { generation: number; timer: ReturnType<typeof setImmediate>; flush: () => void }
+		| undefined;
 	private expandedSubagentParents = new Set<string>();
 	// Agent row identities whose full spawn program is currently shown.
 	// The program key toggles each agent shown ↔ hidden.
@@ -912,6 +925,15 @@ export class AgentsViewMode implements Component, Focusable {
 		this.persistentState.rosterClient ??= new DaemonClient(this.requireSocketPath());
 		const client = this.persistentState.rosterClient;
 		this.client = client;
+		const catalogOwner = this.persistentState.savedCatalogOwner;
+		if (
+			catalogOwner &&
+			(!client.isConnected ||
+				catalogOwner.client !== client ||
+				catalogOwner.contextKey !== JSON.stringify(this.getSavedSessionCatalogContext()))
+		) {
+			this.invalidateSharedSavedCatalog();
+		}
 		if (!client.isConnected) await client.reconnect();
 		this.loadAgentsViewState();
 		this.subscribeToClientClose(client);
@@ -945,6 +967,11 @@ export class AgentsViewMode implements Component, Focusable {
 			this.resolveRun = resolve;
 		});
 		this.unsubscribeRosterUpdate = this.rosterStore.onUpdate(() => this.onRosterUpdate());
+		// The shared scan may have settled while this view awaited roster attachment.
+		this.savedSessions = this.persistentState.savedSessions ?? this.savedSessions;
+		this.lastSuccessfulSavedSessions =
+			this.persistentState.lastSuccessfulSavedSessions ?? this.lastSuccessfulSavedSessions;
+		this.savedCatalogReady = this.persistentState.savedCatalogLoaded === true;
 		this.applySessionList(this.rosterStore.summaries(), true);
 		this.armSavedSearchFetch();
 		this.resolveMissingSelectionAnchor();
@@ -1495,7 +1522,7 @@ export class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		this.savedSearchFetchStarted = true;
-		void this.refreshSavedSessions({ ...options, preserveStatusOnError: true });
+		void this.refreshSavedSessions({ ...options, preserveStatusOnError: true, reuseInFlight: true });
 	}
 
 	private queryChanged(): void {
@@ -1510,7 +1537,14 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
 		const query = this.getActiveSearchQuery();
-		return filterUnifiedSessions(this.scopedRecords, (text) => matchesSearchText(text, query));
+		const cached = this.filteredRecordsCache;
+		if (cached?.query === query && cached.records === this.scopedRecords) return cached.filtered;
+		const matches = prepareSearchMatcher(query);
+		const filtered = query.trim()
+			? filterUnifiedSessions(this.scopedRecords, (text, record) => matches(record.preparedSearchText ?? text))
+			: this.scopedRecords;
+		this.filteredRecordsCache = { query, records: this.scopedRecords, filtered };
+		return filtered;
 	}
 
 	private getRowBuildOptions(): { pinnedRootSessionIds: ReadonlySet<string>; manualOrder: AgentsViewManualOrder } {
@@ -2490,7 +2524,13 @@ export class AgentsViewMode implements Component, Focusable {
 			shouldShowAgentsViewSession(summary, this.inactiveAgentIdentities.has(getSummaryIdentity(summary))),
 		);
 		this.lastVisibleSummaries = this.withPendingDeleteSession(visibleSessions);
-		this.unifiedRecords = reconcileUnifiedSessions(this.lastVisibleSummaries, this.savedSessions, this.heartbeats);
+		this.sessionSearchCache ??= new UnifiedSessionSearchCache();
+		this.unifiedRecords = reconcileUnifiedSessions(
+			this.lastVisibleSummaries,
+			this.savedSessions,
+			this.heartbeats,
+			this.sessionSearchCache,
+		);
 		this.unifiedIndex = buildUnifiedSessionIndex(this.unifiedRecords);
 		migrateAgentsViewIdentitySet(this.expandedSubagentParents, this.unifiedIndex.byKey);
 		migrateAgentsViewIdentitySet(this.programShownParents, this.unifiedIndex.byKey);
@@ -2529,8 +2569,74 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.persistentState.savedCatalogLoaded !== true) this.savedSearchFetchStarted = false;
 	}
 
+	private invalidateSharedSavedCatalog(): void {
+		this.unsubscribeSavedCatalog?.();
+		this.unsubscribeSavedCatalog = undefined;
+		this.persistentState.savedCatalogRequest?.dispose();
+		this.persistentState.savedCatalogRequest = undefined;
+		this.persistentState.savedCatalogOwner = undefined;
+		this.persistentState.savedCatalogLoaded = undefined;
+		this.savedCatalogReady = false;
+	}
+
+	private getSharedSavedCatalog(reuseInFlight: boolean): SharedSavedCatalogRequest {
+		const client = this.requireClient();
+		const context = this.getSavedSessionCatalogContext();
+		const existing = this.persistentState.savedCatalogRequest;
+		if (reuseInFlight && existing?.client === client && existing.contextKey === JSON.stringify(context))
+			return existing;
+		this.invalidateSharedSavedCatalog();
+		const request = new SharedSavedCatalogRequest(client, context);
+		const state = this.persistentState;
+		state.savedCatalogRequest = request;
+		state.savedCatalogOwner = { client, contextKey: request.contextKey };
+		void request.promise.then(
+			(sessions) => {
+				if (state.savedCatalogRequest !== request) return;
+				state.savedSessions = sessions;
+				state.lastSuccessfulSavedSessions = sessions;
+				state.savedCatalogLoaded = true;
+				state.savedCatalogRequest = undefined;
+				request.dispose();
+			},
+			() => {
+				if (state.savedCatalogRequest !== request) return;
+				const retained = new Map(
+					(state.savedSessions ?? []).map((session) => [resolvePath(canonicalizePath(session.path)), session]),
+				);
+				for (const session of request.getSessions()) {
+					const path = resolvePath(canonicalizePath(session.path));
+					retained.set(path, { ...session, usage: session.usage ?? retained.get(path)?.usage });
+				}
+				state.savedSessions = [...retained.values()];
+				state.savedCatalogLoaded = undefined;
+				state.savedCatalogRequest = undefined;
+				request.dispose();
+			},
+		);
+		return request;
+	}
+
+	private cancelPendingSavedCatalog(): void {
+		if (!this.savedCatalogFlush) return;
+		clearImmediate(this.savedCatalogFlush.timer);
+		this.savedCatalogFlush = undefined;
+	}
+
+	private flushPendingSavedCatalog(): void {
+		const pending = this.savedCatalogFlush;
+		if (!pending) return;
+		this.cancelPendingSavedCatalog();
+		if (!this.stopped && pending.generation === this.savedCatalogGeneration) pending.flush();
+	}
+
 	private async refreshSavedSessions(
-		options: { duringReconnect?: boolean; preserveStatusOnError?: boolean; retryAttempt?: number } = {},
+		options: {
+			duringReconnect?: boolean;
+			preserveStatusOnError?: boolean;
+			retryAttempt?: number;
+			reuseInFlight?: boolean;
+		} = {},
 	): Promise<boolean> {
 		if (this.stopped || (!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) {
 			this.rearmSavedSearchFetch();
@@ -2540,6 +2646,9 @@ export class AgentsViewMode implements Component, Focusable {
 			clearTimeout(this.savedCatalogRetryTimer);
 			this.savedCatalogRetryTimer = undefined;
 		}
+		this.flushPendingSavedCatalog();
+		this.unsubscribeSavedCatalog?.();
+		this.unsubscribeSavedCatalog = undefined;
 		const generation = ++this.savedCatalogGeneration;
 		this.persistentState.savedCatalogGeneration = generation;
 		this.savedCatalogRefreshPending = true;
@@ -2547,13 +2656,22 @@ export class AgentsViewMode implements Component, Focusable {
 		this.persistentState.savedCatalogLoaded = undefined;
 		this.savedCatalogStatus = "loading saved sessions";
 		const progressiveSessions = new Map(
-			[...this.lastSuccessfulSavedSessions, ...this.savedSessions].map((session) => [
-				resolvePath(canonicalizePath(session.path)),
-				session,
-			]),
+			[
+				...this.lastSuccessfulSavedSessions,
+				...this.savedSessions,
+				...(this.persistentState.savedSessions ?? []),
+			].map((session) => [resolvePath(canonicalizePath(session.path)), session]),
 		);
 		const receivedPaths = new Set<string>();
-		let progressTotal: number | undefined;
+		let fileProgress: { loaded: number; total: number } | undefined;
+		const flush = () => {
+			this.savedSessions = [...progressiveSessions.values()];
+			this.persistentState.savedSessions = this.savedSessions;
+			this.savedCatalogStatus = fileProgress
+				? `loading saved sessions (${fileProgress.loaded}/${fileProgress.total})`
+				: `loading saved sessions (${receivedPaths.size} sessions)`;
+			this.reconcileCatalogs();
+		};
 		try {
 			const onSession = (session: AgentConnectionSavedSessionInfo) => {
 				if (this.stopped || generation !== this.savedCatalogGeneration) return;
@@ -2561,26 +2679,34 @@ export class AgentsViewMode implements Component, Focusable {
 				receivedPaths.add(path);
 				const previous = progressiveSessions.get(path);
 				progressiveSessions.set(path, { ...session, usage: session.usage ?? previous?.usage });
-				this.savedSessions = [...progressiveSessions.values()];
-				this.persistentState.savedSessions = this.savedSessions;
-				this.savedCatalogStatus = `loading saved sessions (${receivedPaths.size}${progressTotal === undefined ? "" : `/${progressTotal}`})`;
-				this.reconcileCatalogs();
+				if (!this.savedCatalogFlush) {
+					const timer = setImmediate(() => {
+						if (this.savedCatalogFlush?.timer === timer) this.flushPendingSavedCatalog();
+					});
+					timer.unref();
+					this.savedCatalogFlush = { generation, timer, flush };
+				}
 			};
-			const sessions = await listDaemonSavedSessions(
-				this.requireClient(),
-				this.getSavedSessionCatalogContext(),
-				"all",
+			const request = this.getSharedSavedCatalog(options.reuseInFlight === true);
+			this.unsubscribeSavedCatalog = request.subscribe(
 				{
 					onSession,
 					onProgress: (loaded, total) => {
 						if (this.stopped || generation !== this.savedCatalogGeneration) return;
-						progressTotal = total;
+						fileProgress = { loaded, total };
 						this.savedCatalogStatus = `loading saved sessions (${loaded}/${total})`;
 						this.ui.requestRender();
 					},
 				},
+				(error) => {
+					if (!this.stopped && generation === this.savedCatalogGeneration) {
+						this.setStatusMessage(formatError("Failed to update saved sessions", error));
+					}
+				},
 			);
+			const sessions = await request.promise;
 			if (this.stopped || generation !== this.savedCatalogGeneration) return false;
+			this.cancelPendingSavedCatalog();
 			this.savedSessions = sessions;
 			this.lastSuccessfulSavedSessions = sessions;
 			this.savedCatalogReady = true;
@@ -2592,6 +2718,7 @@ export class AgentsViewMode implements Component, Focusable {
 			return true;
 		} catch (error) {
 			if (!this.stopped && generation === this.savedCatalogGeneration) {
+				this.cancelPendingSavedCatalog();
 				// A failed scan cannot disprove a row or scope; retain every verified result.
 				this.savedSessions = [...progressiveSessions.values()];
 				this.persistentState.savedSessions = this.savedSessions;
@@ -2622,6 +2749,8 @@ export class AgentsViewMode implements Component, Focusable {
 			return false;
 		} finally {
 			if (generation === this.savedCatalogGeneration) {
+				this.unsubscribeSavedCatalog?.();
+				this.unsubscribeSavedCatalog = undefined;
 				this.savedCatalogRefreshPending = false;
 				this.resolveMissingSelectionAnchor();
 			}
@@ -2805,7 +2934,13 @@ export class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		this.stopped = true;
+		this.unsubscribeSavedCatalog?.();
+		this.unsubscribeSavedCatalog = undefined;
+		this.sessionSearchCache?.clear();
+		this.sessionSearchCache = undefined;
+		this.filteredRecordsCache = undefined;
 		if (this.agentsViewStateDirty) this.flushAgentsViewStateOperations?.();
+		this.cancelPendingSavedCatalog();
 		this.savedCatalogGeneration += 1;
 		this.heartbeatCatalogGeneration += 1;
 		if (this.savedCatalogRetryTimer) {
@@ -2834,6 +2969,12 @@ export class AgentsViewMode implements Component, Focusable {
 			preserveAltScreen: result.type !== "exit",
 			flushFullscreen: false,
 		});
+		// An in-flight shared scan can retain this departed view until settlement.
+		this.unifiedRecords = [];
+		this.unifiedIndex = buildUnifiedSessionIndex([]);
+		this.scopedRecords = [];
+		this.sessionRows = [];
+		this.rows = [];
 		stopThemeWatcher();
 		this.unsubscribeClientClose?.();
 		this.unsubscribeClientClose = undefined;
@@ -2861,6 +3002,8 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.stopped || client !== this.client) {
 			return;
 		}
+		this.invalidateSharedSavedCatalog();
+		this.cancelPendingSavedCatalog();
 		this.savedCatalogGeneration += 1;
 		this.heartbeatCatalogGeneration += 1;
 		this.savedCatalogRefreshPending = false;
@@ -2888,6 +3031,8 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.stopped || client !== this.client || this.reconnectPromise || this.daemonShutdownReceived) {
 			return;
 		}
+		this.invalidateSharedSavedCatalog();
+		this.cancelPendingSavedCatalog();
 		this.savedCatalogGeneration += 1;
 		this.heartbeatCatalogGeneration += 1;
 		this.savedCatalogRefreshPending = false;

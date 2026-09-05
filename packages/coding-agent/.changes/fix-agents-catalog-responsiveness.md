@@ -1,0 +1,3 @@
+- Fixed unresponsive Agents views while large saved-session catalogs load or search text changes.
+- Kept saved-session loading progress consistent when a file contains multiple child agents.
+- Reused in-progress saved-session loading when navigating between Agents views.

@@ -693,6 +693,7 @@ describe("AgentsViewMode", () => {
 			resolveMissingSelectionAnchor: vi.fn(),
 		};
 
+		Object.setPrototypeOf(self, AgentsViewMode.prototype);
 		const refresh = invoke("refreshSavedSessions", self) as Promise<boolean>;
 		await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
 		expect(self.savedCatalogReady).toBe(false);
@@ -1684,6 +1685,7 @@ describe("Agents View durable operation recovery", () => {
 			client: undefined,
 			resolveRun: undefined,
 		};
+		Object.setPrototypeOf(self, AgentsViewMode.prototype);
 		invoke("finish", self, { type: "exit" });
 		expect(self.persistentState.pendingAgentsViewStateOperations).toHaveLength(1);
 	});

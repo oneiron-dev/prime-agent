@@ -245,7 +245,7 @@ describe("agents view saved catalog", () => {
 	);
 
 	it.each(["finish", "handleDaemonShutdown", "startClientReconnect"])(
-		"cancels retries and stale progress at %s",
+		"cancels view retries and ignores later view progress at %s",
 		async (boundary) => {
 			const pending = deferred<AgentConnectionSavedSessionInfo[]>();
 			let callbacks: AgentConnectionSessionListCallbacks | undefined;
@@ -256,7 +256,7 @@ describe("agents view saved catalog", () => {
 					callbacks = next;
 					return pending.promise;
 				});
-			const { view, client, persistentState } = harness();
+			const { view, client, persistentState, ui } = harness();
 			await invoke(view, "refreshSavedSessions", { preserveStatusOnError: true });
 			const refresh = invoke<Promise<boolean>>(view, "refreshSavedSessions");
 			Reflect.set(
@@ -266,12 +266,18 @@ describe("agents view saved catalog", () => {
 			);
 			if (boundary === "finish") invoke(view, boundary, { type: "exit" });
 			else invoke(view, boundary, client, new Error("closed"));
+			const rendersAtBoundary = ui.requestRender.mock.calls.length;
 			callbacks?.onSession?.(saved("stale"));
+			callbacks?.onProgress?.(10, 20);
 			pending.resolve([saved("stale")]);
 			await expect(refresh).resolves.toBe(false);
 			await vi.advanceTimersByTimeAsync(60000);
 			expect(list).toHaveBeenCalledTimes(2);
-			expect(persistentState.savedSessions).toEqual([]);
+			expect(field(view, "savedSessions")).toEqual([]);
+			expect(ui.requestRender).toHaveBeenCalledTimes(rendersAtBoundary);
+			// Leaving the view retains its producer; losing the connection invalidates it.
+			expect(persistentState.savedSessions).toEqual(boundary === "finish" ? [saved("stale")] : []);
+			expect(persistentState.savedCatalogLoaded).toBe(boundary === "finish" ? true : undefined);
 			expect(field(view, "savedCatalogRetryTimer")).toBeUndefined();
 		},
 	);
