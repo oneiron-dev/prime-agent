@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { FactoryEngine } from "../src/factory/engine.js";
+import { FACTORY_EVIDENCE_LIMITS } from "../src/factory/evidence.js";
 import type { ManagementEvidenceBinding, ManagementPacket } from "../src/factory/management.js";
 import {
 	type ManagementCallerFactory,
@@ -189,6 +190,162 @@ describe("bounded factory judgment consumer", () => {
 		expect((await manageFactoryWake(f.engine, options, model.create)).kind).toBe("idle");
 		expect(f.store.actions().map((action) => action.state)).toEqual(["ACCEPTED", "AWAITING_DECISION"]);
 		expect(model.invoke).toHaveBeenCalledTimes(1);
+	});
+
+	test.each([9, 12, 32])("uses all %i small bound records in authoritative requests and proposals", async (count) => {
+		const f = await fixture();
+		const binding = bind(f);
+		binding.evidence = Array.from({ length: count }, (_, index) => {
+			const content = `Independent exact-output review ${index} passed.`;
+			return { ref: `review:${index}`, content, sha256: createHash("sha256").update(content).digest("hex") };
+		});
+		writeFileSync(join(f.directory, "management-evidence", `${binding.wakeId}.json`), JSON.stringify(binding));
+		const invoke = vi.fn(async (text: string) => {
+			const packet = JSON.parse(text) as ManagementPacket;
+			return {
+				model: "mock",
+				text: JSON.stringify({
+					version: 1,
+					actionId: binding.actionId,
+					attemptId: binding.attemptId,
+					planRevision: binding.planRevision,
+					decision: "accept",
+					reason: "All independent reviews passed",
+					evidenceRefs: packet.evidence.map((item) => item.ref),
+				}),
+			};
+		});
+		const create: ManagementCallerFactory = (check) => async (_system, text) => {
+			check();
+			return invoke(text);
+		};
+		const options = { directory: f.directory, automatic: true };
+		const proposed = await manageFactoryWake(f.engine, options, create);
+		expect(proposed.kind).toBe("proposed");
+		expect(proposed.result?.proposal.evidenceRefs).toHaveLength(count);
+		const request = JSON.parse(readFileSync(join(proposed.evidenceDirectory!, "request.json"), "utf8"));
+		expect(request.packet.evidence).toEqual(
+			binding.evidence.map(({ ref, content }) => ({ ref, content })).sort((a, b) => a.ref.localeCompare(b.ref)),
+		);
+		expect(request.evidenceHashes).toEqual(
+			binding.evidence.map(({ ref, sha256 }) => ({ ref, sha256 })).sort((a, b) => a.ref.localeCompare(b.ref)),
+		);
+		// Reordering the same exact snapshots must not invent a new claim or inference.
+		binding.evidence.reverse();
+		writeFileSync(join(f.directory, "management-evidence", `${binding.wakeId}.json`), JSON.stringify(binding));
+		expect((await manageFactoryWake(f.engine, { ...options, apply: true }, create)).kind).toBe("applied");
+		expect(invoke).toHaveBeenCalledTimes(1);
+		expect(f.store.actions()[0].state).toBe("ACCEPTED");
+		expect(f.store.managementRequests()).toHaveLength(1);
+	});
+
+	test("enforces aggregate bound content bytes before claiming or invoking a model", async () => {
+		const f = await fixture();
+		const binding = bind(f);
+		binding.evidence = Array.from({ length: 8 }, (_, index) => {
+			const content = "é".repeat(4096);
+			return { ref: `review:${index}`, content, sha256: createHash("sha256").update(content).digest("hex") };
+		});
+		binding.evidence[7].content += "é";
+		binding.evidence[7].sha256 = createHash("sha256").update(binding.evidence[7].content).digest("hex");
+		const path = join(f.directory, "management-evidence", `${binding.wakeId}.json`);
+		writeFileSync(path, JSON.stringify(binding));
+		const model = caller("accept");
+		const options = { directory: f.directory, automatic: true };
+		await expect(manageFactoryWake(f.engine, options, model.create)).rejects.toThrow(
+			"binding.evidence.content aggregate: actual 65538 UTF-8 bytes exceeds limit 65536",
+		);
+		expect(model.invoke).not.toHaveBeenCalled();
+		expect(f.store.managementRequests()).toEqual([]);
+		binding.evidence[7].content = binding.evidence[7].content.slice(0, -1);
+		binding.evidence[7].sha256 = createHash("sha256").update(binding.evidence[7].content).digest("hex");
+		writeFileSync(path, JSON.stringify(binding));
+		expect((await manageFactoryWake(f.engine, options, model.create)).kind).toBe("proposed");
+		expect(model.invoke).toHaveBeenCalledTimes(1);
+	});
+
+	test("bounds exact serialized binding bytes including Unicode metadata", async () => {
+		const f = await fixture();
+		const binding = { ...bind(f), note: "" };
+		const remaining = FACTORY_EVIDENCE_LIMITS.bindingBytes - Buffer.byteLength(JSON.stringify(binding), "utf8");
+		binding.note = "é".repeat(Math.floor(remaining / 2)) + "x".repeat(remaining % 2);
+		const path = join(f.directory, "management-evidence", `${binding.wakeId}.json`);
+		const atLimit = JSON.stringify(binding);
+		expect(Buffer.byteLength(atLimit, "utf8")).toBe(FACTORY_EVIDENCE_LIMITS.bindingBytes);
+		writeFileSync(path, `${atLimit} `);
+		const model = caller("accept");
+		const options = { directory: f.directory, automatic: true };
+		await expect(manageFactoryWake(f.engine, options, model.create)).rejects.toThrow(
+			"binding: actual 262145 UTF-8 bytes exceeds limit 262144",
+		);
+		expect(model.invoke).not.toHaveBeenCalled();
+		expect(f.store.managementRequests()).toEqual([]);
+		writeFileSync(path, atLimit);
+		expect((await manageFactoryWake(f.engine, options, model.create)).kind).toBe("proposed");
+		expect(model.invoke).toHaveBeenCalledTimes(1);
+	});
+
+	test.each([
+		[null, "binding.evidence: expected an array"],
+		[[], "binding.evidence.length: actual 0; limit 1..32"],
+		[[null], "binding.evidence[0]: expected {ref,content}"],
+		[[{ content: "proof" }], "binding.evidence[0].ref: expected a nonempty string without control characters"],
+		[
+			[{ ref: "", content: "proof" }],
+			"binding.evidence[0].ref: expected a nonempty string without control characters",
+		],
+		[
+			[{ ref: "proof\n", content: "proof" }],
+			"binding.evidence[0].ref: expected a nonempty string without control characters",
+		],
+		[
+			[{ ref: "é".repeat(2001), content: "proof" }],
+			"binding.evidence[0].ref: actual 4002 UTF-8 bytes exceeds limit 4000",
+		],
+		[[{ ref: "proof", content: "" }], "binding.evidence[0].content: expected nonempty substantive text"],
+		[[{ ref: "proof", content: 42 }], "binding.evidence[0].content: expected nonempty substantive text"],
+		[
+			[
+				{ ref: "proof", content: "one" },
+				{ ref: "proof", content: "two" },
+			],
+			"binding.evidence[1].ref: duplicate reference",
+		],
+		[
+			[{ ref: "factory:attempt:fake", content: "proof" }],
+			"binding.evidence[0].ref: reserved factory receipt reference",
+		],
+		[[{ ref: "proof", content: "review passed" }], "binding.evidence[0].sha256: content hash mismatch"],
+		[
+			Array.from({ length: 33 }, (_, index) => ({ ref: `proof:${index}`, content: "small" })),
+			"binding.evidence.length: actual 33; limit 1..32",
+		],
+	])("rejects malformed authoritative binding %# before claiming or invoking a model", async (evidence, message) => {
+		const f = await fixture();
+		const binding = bind(f);
+		writeFileSync(
+			join(f.directory, "management-evidence", `${binding.wakeId}.json`),
+			JSON.stringify({ ...binding, evidence }),
+		);
+		const model = caller("accept");
+		await expect(
+			manageFactoryWake(f.engine, { directory: f.directory, automatic: true }, model.create),
+		).rejects.toThrow(message);
+		expect(model.invoke).not.toHaveBeenCalled();
+		expect(f.store.managementRequests()).toEqual([]);
+		expect(f.store.actions()[0].state).toBe("AWAITING_DECISION");
+	});
+
+	test("rejects serialized packet metadata overflow before recording an admission", async () => {
+		const f = await fixture();
+		f.engine.applyPlan({ version: 1, tickets: [{ id: "ticket", owner: "é".repeat(49152) }], actions: [], slots: [] });
+		bind(f);
+		const model = caller("accept");
+		await expect(
+			manageFactoryWake(f.engine, { directory: f.directory, automatic: true }, model.create),
+		).rejects.toThrow(/packet: actual \d+ UTF-8 bytes exceeds limit 98304/);
+		expect(model.invoke).not.toHaveBeenCalled();
+		expect(f.store.managementRequests()).toEqual([]);
 	});
 
 	test("applies a cached proposal with plan/attempt/wake CAS and no duplicate inference", async () => {

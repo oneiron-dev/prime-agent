@@ -1,9 +1,16 @@
-import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { closeSync, existsSync, fsyncSync, openSync, writeSync } from "node:fs";
 import { join } from "node:path";
-import { hashFactoryRuntimeFile, readFactoryRuntime } from "../runtime.js";
+import { readFactoryRuntime } from "../runtime.js";
 import type { ActionRecord, AttemptRecord } from "../types.js";
 import type { OneironManifest, OneironSource } from "./oneiron.js";
-import { type OneironPin, oneironSha } from "./oneiron-review.js";
+import type { OneironPin } from "./oneiron-review.js";
+import {
+	ONEIRON_TRANSPORT_LIMITS,
+	type OneironTransportLog,
+	readOneironTransport,
+	verifyOneironArtifact,
+} from "./oneiron-transport.js";
 
 export interface OneironWriterProfile {
 	version: 1;
@@ -210,12 +217,18 @@ export function validateOneironWriterRetry(
 		Array.isArray(proof.retainedEvidence) && proof.retainedEvidence.length > 0,
 		"Astra retry must retain prior product/review evidence",
 	);
-	for (const pin of [proof.processProof, proof.ownerAuthorization, ...proof.retainedEvidence]) read(pin);
+	for (const pin of [proof.processProof, proof.ownerAuthorization]) read(pin);
+	for (const pin of proof.retainedEvidence) {
+		check(typeof pin?.sha256 === "string" && /^[a-f0-9]{64}$/.test(pin.sha256), "Invalid retained artifact hash");
+		verifyOneironArtifact(pin.path, pin.sha256);
+	}
 	for (const name of ["writer.jsonl", "receipt.json"]) {
 		const path = join(prior.outputDirectory, name);
 		if (existsSync(path))
 			check(
-				proof.retainedEvidence.some((pin) => pin.path === path && pin.sha256 === hashFactoryRuntimeFile(path)),
+				proof.retainedEvidence.some(
+					(pin) => pin.path === path && pin.sha256 === verifyOneironArtifact(path).sha256,
+				),
 				"Retry dropped surviving writer transcript/receipt evidence",
 			);
 	}
@@ -226,29 +239,11 @@ export function summarizeOneironWriter(
 	m: OneironManifest,
 	stage: OneironWriterStage,
 	profile: OneironWriterProfile,
-	text: string,
+	transport: OneironTransportLog,
 	manifestSha256: string,
 ): OneironWriterProvenance {
-	const messages = text
-		.split("\n")
-		.filter((line) => line.trim())
-		.map(
-			(line) =>
-				JSON.parse(line) as {
-					type?: string;
-					message?: {
-						role?: string;
-						provider?: string;
-						model?: string;
-						responseId?: string;
-						responseModel?: string;
-						responseModelSource?: string;
-						stopReason?: string;
-					};
-				},
-		)
-		.filter((event) => event.type === "message_end" && event.message?.role === "assistant")
-		.map((event) => event.message!);
+	const { messages } = transport;
+	check(transport.transcript.path === join(m.outputDirectory, "writer.jsonl"), "Writer transcript path mismatch");
 	check(
 		messages.length > 0 &&
 			messages.every(
@@ -283,12 +278,12 @@ export function summarizeOneironWriter(
 			family: responseModel === "gpt-6-astra" ? "astra" : responseModel === "claude-fable-5.1" ? "fable" : "unknown",
 		};
 	});
-	return {
+	const result: OneironWriterProvenance = {
 		version: 1,
 		requested: { ...profile.requested },
 		profile: stage.writerProfile,
 		runtime: profile.runtime,
-		transcript: { path: join(m.outputDirectory, "writer.jsonl"), sha256: oneironSha(text) },
+		transcript: transport.transcript,
 		manifestSha256,
 		sourceFingerprint: m.source.fingerprint,
 		sessionDirectory: join(m.outputDirectory, "session"),
@@ -298,6 +293,12 @@ export function summarizeOneironWriter(
 		blockers,
 		upstreamIdentityAttested: false,
 	};
+	const derivedBytes = Buffer.byteLength(JSON.stringify(result));
+	check(
+		derivedBytes <= ONEIRON_TRANSPORT_LIMITS.derivedBytes,
+		`Writer provenance derivedBytes=${derivedBytes} exceeds limit=${ONEIRON_TRANSPORT_LIMITS.derivedBytes}`,
+	);
+	return result;
 }
 
 export function validateOneironWriterReceipt(
@@ -313,7 +314,13 @@ export function validateOneironWriterReceipt(
 		provenance?.transcript?.path === join(m.outputDirectory, "writer.jsonl"),
 		"Writer receipt transcript identity mismatch",
 	);
-	const actual = summarizeOneironWriter(m, m.stage, profile, read(provenance.transcript), manifestSha256);
+	const actual = summarizeOneironWriter(
+		m,
+		m.stage,
+		profile,
+		readOneironTransport(provenance.transcript.path, provenance.transcript.sha256),
+		manifestSha256,
+	);
 	check(
 		JSON.stringify(provenance) === JSON.stringify(actual),
 		"Writer provenance differs from factory-captured transport events",
@@ -322,4 +329,69 @@ export function validateOneironWriterReceipt(
 		actual.identityAccepted,
 		"Writer serving identity is unknown/unapproved; reconcile before accepting or retrying",
 	);
+}
+
+/** Foreground only. Retain bounded raw stdout on disk, including incomplete output on failure. */
+export function runOneironWriterForeground(
+	argv: string[],
+	cwd: string,
+	transcriptPath: string,
+	environment: Record<string, string> = {},
+): Promise<void> {
+	const fd = openSync(transcriptPath, "wx", 0o600);
+	return new Promise((resolve, reject) => {
+		try {
+			const child = spawn(argv[0]!, argv.slice(1), {
+				cwd,
+				detached: false,
+				stdio: ["ignore", "pipe", "inherit"],
+				env: { ...process.env, ...environment, GIT_OPTIONAL_LOCKS: "0" },
+			});
+			let rawBytes = 0;
+			let failure: Error | undefined;
+			const stop = (error: Error) => {
+				failure ??= error;
+				child.stdout.pause();
+				child.kill("SIGTERM");
+			};
+			child.stdout.on("data", (chunk: Buffer) => {
+				if (failure) return;
+				try {
+					const observedBytes = rawBytes + chunk.length;
+					const size = Math.min(chunk.length, ONEIRON_TRANSPORT_LIMITS.rawBytes - rawBytes);
+					let written = 0;
+					while (written < size) written += writeSync(fd, chunk, written, size - written);
+					rawBytes += size;
+					if (size < chunk.length)
+						stop(
+							new Error(
+								`Writer stdout rawBytes=${observedBytes} exceeds limit=${ONEIRON_TRANSPORT_LIMITS.rawBytes}; retained partial log requires reconciliation`,
+							),
+						);
+				} catch (error) {
+					stop(error instanceof Error ? error : new Error(String(error)));
+				}
+			});
+			child.stdout.on("error", stop);
+			child.on("error", (error) => {
+				failure ??= error;
+			});
+			child.on("close", (code, signal) => {
+				try {
+					fsyncSync(fd);
+				} catch (error) {
+					failure ??= error instanceof Error ? error : new Error(String(error));
+				} finally {
+					closeSync(fd);
+				}
+				if (failure) reject(failure);
+				else if (code !== 0)
+					reject(new Error(`Foreground writer exited ${code ?? signal}; retain log and reconcile`));
+				else resolve();
+			});
+		} catch (error) {
+			closeSync(fd);
+			reject(error);
+		}
+	});
 }

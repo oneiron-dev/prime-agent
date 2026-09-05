@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { createPrimeManagementCaller } from "./adapters/prime-management.js";
 import { readFactoryConfig } from "./config.js";
 import { FactoryEngine } from "./engine.js";
+import { assertByteLimit, FACTORY_EVIDENCE_LIMITS, validateManagementEvidence } from "./evidence.js";
 import { FACTORY_MANAGE_HELP } from "./help.js";
 import type { ManagementEvidence } from "./management.js";
 import { manageFactoryWake, watchFactoryManagement } from "./management-dispatch.js";
@@ -44,10 +45,13 @@ async function main(args: string[]): Promise<void> {
 			if (!value || value.startsWith("--")) throw new Error(`Missing value for ${arg}`);
 			if (arg === "--evidence") {
 				const path = resolve(value);
+				const field = `evidence[${evidence.length}].content`;
 				const info = statSync(path);
-				if (!info.isFile() || info.size > 64000)
-					throw new Error("Evidence must be a regular file of at most 64000 bytes");
-				evidence.push({ ref: path, content: readFileSync(path, "utf8") });
+				if (!info.isFile()) throw new Error(`${field}: expected a regular file: ${path}`);
+				assertByteLimit(field, info.size, FACTORY_EVIDENCE_LIMITS.contentBytes);
+				const bytes = readFileSync(path);
+				assertByteLimit(field, bytes.length, FACTORY_EVIDENCE_LIMITS.contentBytes);
+				evidence.push({ ref: path, content: bytes.toString("utf8") });
 			} else {
 				if (values.has(arg)) throw new Error(`Repeated option: ${arg}`);
 				values.set(arg, value);
@@ -66,6 +70,7 @@ async function main(args: string[]): Promise<void> {
 		["--evidence-directory", "--max-requests", "--max-passes", "--interval-ms"].some((option) => values.has(option))
 	)
 		throw new Error("Automatic management options require --watch");
+	validateManagementEvidence(evidence);
 	const directory = resolve(positional[0]);
 	const config = readFactoryConfig(directory);
 	const db = join(directory, "factory.db");

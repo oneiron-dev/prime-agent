@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { readFactoryConfig } from "../config.js";
 import { FactoryEngine } from "../engine.js";
+import { FACTORY_EVIDENCE_LIMITS } from "../evidence.js";
 import { readFactoryRuntime } from "../runtime.js";
 import { FactoryStore } from "../store.js";
 import type { FactoryAdapter } from "../types.js";
@@ -11,19 +12,25 @@ import {
 	type ContinuationResult,
 	OneironContinuation,
 	type OneironContinuationConfig,
+	type OneironSuccessorPacket,
 	oneironContinuationUnit,
 	readOneironContinuationStatus,
+	submitOneironSuccessor,
+	validateOneironSuccessor,
 } from "./oneiron-continuation.js";
 import { createPrimeManagementCaller } from "./prime-management.js";
 
 const HELP = `Oneiron durable coordinator continuation (separate from factory serve)
   oneiron-continuation-entry help
+  oneiron-continuation-entry validate PACKET_JSON PACKET_SHA256 CANDIDATE_JSON CANDIDATE_SHA256
+  oneiron-continuation-entry submit PACKET_JSON PACKET_SHA256 CANDIDATE_JSON CANDIDATE_SHA256
   oneiron-continuation-entry status CONFIG_JSON CONFIG_SHA256
   oneiron-continuation-entry unit CONFIG_JSON CONFIG_SHA256
   oneiron-continuation-entry reconcile CONFIG_JSON CONFIG_SHA256 REQUEST_ID PROOF_JSON PROOF_SHA256 --execute
   oneiron-continuation-entry step CONFIG_JSON CONFIG_SHA256 --execute
   oneiron-continuation-entry watch CONFIG_JSON CONFIG_SHA256 --execute [--max-passes N] [--interval-ms N]
 
+validate checks candidate shape, pins and shared limits without writing; submit repeats validation before atomic immutable response publication. Neither opens the factory DB or dispatches work. Limits: ${JSON.stringify(FACTORY_EVIDENCE_LIMITS)} (bytes are UTF-8).
 status/unit are read-only; unit prints a user systemd unit, never installs/starts it.
 step/watch preserve both pauses and never schedule product command actions.
 watch defaults: 60 passes, 1000 ms; exits 75 for deterministic rearm, 0 at closure handoff.
@@ -40,6 +47,28 @@ const noDispatch: FactoryAdapter = {
 async function main(args: string[]): Promise<void> {
 	if (!args.length || args[0] === "help" || args[0] === "--help") {
 		console.log(HELP);
+		return;
+	}
+	if (args[0] === "validate" || args[0] === "submit") {
+		if (args.length !== 5) throw new Error(HELP);
+		const packetPin = { path: resolve(args[1]), sha256: args[2] };
+		const candidatePin = { path: resolve(args[3]), sha256: args[4] };
+		if (args[0] === "submit")
+			console.log(JSON.stringify({ kind: "submitted", response: submitOneironSuccessor(packetPin, candidatePin) }));
+		else {
+			const packet = JSON.parse(readOneironPin(packetPin)) as OneironSuccessorPacket;
+			validateOneironSuccessor(
+				JSON.parse(readOneironPin(candidatePin, FACTORY_EVIDENCE_LIMITS.responseBytes, "response")),
+				packet,
+			);
+			console.log(
+				JSON.stringify({
+					kind: "valid",
+					limits: FACTORY_EVIDENCE_LIMITS,
+					authority: "preflight only; consume remains authoritative",
+				}),
+			);
+		}
 		return;
 	}
 	const [command, configPath, hash, ...rest] = args;

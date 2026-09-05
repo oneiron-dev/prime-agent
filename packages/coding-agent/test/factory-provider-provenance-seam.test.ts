@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -8,6 +8,7 @@ import { streamOpenAIResponses } from "../../ai/src/providers/openai-responses.j
 import { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { McpManager } from "../src/core/mcp/mcp-manager.js";
 import type { OneironManifest } from "../src/factory/adapters/oneiron.js";
+import { readOneironTransport } from "../src/factory/adapters/oneiron-transport.js";
 import {
 	defaultOneironWriterProfile,
 	type OneironWriterStage,
@@ -211,7 +212,19 @@ async function fixture(transport: Transport, reportedModel?: string) {
 		outputDirectory: join(harness.tempDir, "output"),
 		stage,
 	};
-	return { message, provenance: summarizeOneironWriter(manifest, stage, profile, transcript, "d".repeat(64)) };
+	mkdirSync(manifest.outputDirectory);
+	const transcriptPath = join(manifest.outputDirectory, "writer.jsonl");
+	writeFileSync(transcriptPath, transcript, { flag: "wx" });
+	return {
+		message,
+		provenance: summarizeOneironWriter(
+			manifest,
+			stage,
+			profile,
+			readOneironTransport(transcriptPath),
+			"d".repeat(64),
+		),
+	};
 }
 afterEach(async () => {
 	for (const server of servers.splice(0))

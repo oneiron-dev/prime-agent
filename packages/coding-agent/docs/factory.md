@@ -49,6 +49,18 @@ prime-agent factory manage /absolute/factory action-id --role ticketOwner --evid
 
 The first form saves a proposal. The second applies the cached valid accept/reject decision without another model request when the context is unchanged; a defer leaves the wake unresolved. Each request includes one action, current attempt, dependency states and bounded explicitly supplied evidence. A decision is bound to its observed plan revision and attempt. Missing criteria, missing substantive evidence or uncertain process custody cannot be converted into automatic semantic acceptance.
 
+Evidence uses separate citation and model-input budgets:
+
+- Supply at most 32 evidence records. Each ref must be unique, nonempty, free of control characters and at most 4000 UTF-8 bytes.
+- The sum of all inline `content` strings is at most 64 KiB (65536 UTF-8 bytes). There is no per-document character cap. Each content string must contain substantive, nonempty text.
+- The complete serialized decision packet is at most 96 KiB (98304 UTF-8 bytes), including evidence refs, JSON escaping and all action, attempt, ticket, dependency and wake metadata.
+- Proposal `evidenceRefs` contains at most 32 unique, nonempty, bounded refs. Every ref must identify supplied evidence or the supplied journal receipt. Accept/reject requires at least one citation; semantic acceptance still requires explicit criteria and substantive supplied evidence beyond a process receipt. Defer can use an empty list.
+- Proposal response text is at most 256 KiB (262144 UTF-8 bytes), checked before JSON parsing.
+
+Each manual `--evidence` option names one raw UTF-8 document, not a JSON array of evidence records. Repeat the option to supply more documents; their absolute paths become refs. Each file is at most 65536 bytes, and the shared record/ref and aggregate content checks run before factory lookup.
+
+Increasing the record count does not increase the byte budgets. The factory checks content and packet limits before inference and does not silently truncate evidence. Limit errors name the field and show the actual count or UTF-8 byte size and its limit.
+
 Management uses the existing Prime model registry and auth configuration without starting a session or daemon. Requests, proposals, evidence pointers and usage are saved privately under the factory's `decisions/` directory. A receipt marked `modelIdentitySource: sdk` records the SDK selector in `responseModel`; that historical field is not serving identity. New receipts also contain `servingIdentity`, with the transport-reported response model, response ID and source `provider-response`, or explicit `unknown` when absent. These fields are captured automatically from the provider transport, not supplied by the model or an external identity attestation. They report gateway response metadata, not cryptographic upstream identity. Historical receipts are not relabeled. Generic management records unexpected serving labels honestly; unlike a stricter project writer policy, it does not add a serving-family allowlist gate. Dollar values in SDK usage are list-price estimates, not subscription cash charges.
 
 Manual decisions use `decide <dir> <action> accept|reject --actor ... --reason ... --ref ...`. `import <dir> plan.json --expected-revision N` adds/upserts future work; omitted records persist. Started inputs and source identities cannot be silently changed. To repair rejected work, add a replacement action, then use `supersede <dir> rejected-id replacement-id --expected-revision N --actor ... --reason ... --ref ...`. This preserves history and redirects only eligible unstarted dependencies.
@@ -98,7 +110,7 @@ Automatic mode requires a file named `<wake-id>.json` in the evidence directory 
 }
 ```
 
-Use the lowercase SHA-256 hex digest of each exact UTF-8 content string, not the example placeholder. The file is at most 256000 bytes. Supply one to four distinct, nonempty evidence records, each with at most 16000 characters. `factory:attempt:` refs are reserved for journal receipts and cannot be supplied as substantive evidence. The model receives the validated inline snapshot; it does not fetch the ref. The request receipt records the refs and verified hashes.
+Use the lowercase SHA-256 hex digest of each exact UTF-8 content string, not the example placeholder. The serialized binding file is at most 256 KiB (262144 bytes), including hashes, metadata and whitespace. Supply one to 32 distinct, nonempty evidence records within the same 64 KiB aggregate content and 96 KiB packet budgets described above. `factory:attempt:` refs are reserved for journal receipts and cannot be supplied as substantive evidence. The model receives the validated inline snapshot; it does not fetch the ref. The request receipt records the refs and verified hashes. The exact binding scope and content hashes remain authoritative and are checked again before inference and application.
 
 Missing bindings, bindings for another wake/action/attempt/revision, empty factories, local pause and external owner pause cause no automatic model call. Invalid hashes or malformed bindings fail closed. Automatic mode skips uncertain custody and failed process gates; those require explicit reconciliation or planning, not acceptance or retry by a model. A project adapter or operator must generate a binding after the exact terminal wake exists. This core consumer does not discover reviews or construct project evidence. The Oneiron binder is a separate deterministic preparation step; it is not an automatic end-to-end workflow.
 

@@ -1,10 +1,11 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import type { OneironManifest } from "../src/factory/adapters/oneiron.js";
 import { readOneironPin } from "../src/factory/adapters/oneiron.js";
 import { type OneironPin, oneironSha } from "../src/factory/adapters/oneiron-review.js";
+import { readOneironTransport, verifyOneironArtifact } from "../src/factory/adapters/oneiron-transport.js";
 import {
 	defaultOneironWriterProfile,
 	type OneironWriterProfile,
@@ -84,7 +85,12 @@ function setup() {
 				...extra,
 			},
 		});
-	return { directory, pin, profile, profilePin, stage, source, manifest, event, runtime, node, cli, chunk };
+	const transport = (text: string) => {
+		const path = join(manifest.outputDirectory, "writer.jsonl");
+		writeFileSync(path, text);
+		return readOneironTransport(path);
+	};
+	return { directory, pin, profile, profilePin, stage, source, manifest, event, transport, runtime, node, cli, chunk };
 }
 afterEach(() => {
 	for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true });
@@ -117,7 +123,13 @@ describe("explicit pinned writer profile and factory model capture", () => {
 		"captures actual %s automatically and accepts only routine Astra",
 		(observed) => {
 			const f = setup();
-			const result = summarizeOneironWriter(f.manifest, f.stage, f.profile, f.event(observed), "manifest-sha");
+			const result = summarizeOneironWriter(
+				f.manifest,
+				f.stage,
+				f.profile,
+				f.transport(f.event(observed)),
+				"manifest-sha",
+			);
 			expect(result.identityAccepted).toBe(observed === "gpt-6-astra");
 			expect(result.requested.model).toBe("gpt-6-astra");
 			expect(result.responseModels).toEqual([observed]);
@@ -131,7 +143,13 @@ describe("explicit pinned writer profile and factory model capture", () => {
 			const f = setup();
 			const text = f.event(observed);
 			writeFileSync(join(f.manifest.outputDirectory, "writer.jsonl"), text);
-			const writerProvenance = summarizeOneironWriter(f.manifest, f.stage, f.profile, text, "manifest-sha");
+			const writerProvenance = summarizeOneironWriter(
+				f.manifest,
+				f.stage,
+				f.profile,
+				f.transport(text),
+				"manifest-sha",
+			);
 			expect(writerProvenance.identityAccepted).toBe(false);
 			expect(writerProvenance.blockers.length).toBeGreaterThan(0);
 			expect(() =>
@@ -152,13 +170,17 @@ describe("explicit pinned writer profile and factory model capture", () => {
 				content: [{ type: "text", text: '{"responseModel":"gpt-6-astra","source":"provider-response"}' }],
 			},
 		});
-		expect(summarizeOneironWriter(f.manifest, f.stage, f.profile, selfReport, "sha").identityAccepted).toBe(false);
+		expect(
+			summarizeOneironWriter(f.manifest, f.stage, f.profile, f.transport(selfReport), "sha").identityAccepted,
+		).toBe(false);
 		const mixed = [
 			f.event("claude-fable-5.1", { stopReason: "toolUse" }),
 			f.event("gpt-6-astra", { responseId: "msg_2" }),
 		].join("\n");
-		expect(summarizeOneironWriter(f.manifest, f.stage, f.profile, mixed, "sha").identityAccepted).toBe(false);
-		expect(summarizeOneironWriter(f.manifest, f.stage, f.profile, mixed, "sha").responseModels).toEqual([
+		expect(summarizeOneironWriter(f.manifest, f.stage, f.profile, f.transport(mixed), "sha").identityAccepted).toBe(
+			false,
+		);
+		expect(summarizeOneironWriter(f.manifest, f.stage, f.profile, f.transport(mixed), "sha").responseModels).toEqual([
 			"claude-fable-5.1",
 			"gpt-6-astra",
 		]);
@@ -167,7 +189,7 @@ describe("explicit pinned writer profile and factory model capture", () => {
 				f.manifest,
 				f.stage,
 				f.profile,
-				[f.event("claude-fable-5.1", { stopReason: "toolUse" }), f.event("gpt-6-astra")].join("\n"),
+				f.transport([f.event("claude-fable-5.1", { stopReason: "toolUse" }), f.event("gpt-6-astra")].join("\n")),
 				"sha",
 			).identityAccepted,
 		).toBe(false);
@@ -181,20 +203,53 @@ describe("explicit pinned writer profile and factory model capture", () => {
 			{ stopReason: "toolUse" },
 		])
 			expect(() =>
-				summarizeOneironWriter(f.manifest, f.stage, f.profile, f.event("gpt-6-astra", extra), "sha"),
+				summarizeOneironWriter(f.manifest, f.stage, f.profile, f.transport(f.event("gpt-6-astra", extra)), "sha"),
 			).toThrow(/terminal/);
+	});
+	test("unknown or duplicate authentic transport identities block acceptance, and receipt validation rehashes raw bytes", () => {
+		const f = setup();
+		for (const extra of [{ responseId: undefined }, { responseId: " " }, { responseModelSource: "unknown" }]) {
+			const result = summarizeOneironWriter(
+				f.manifest,
+				f.stage,
+				f.profile,
+				f.transport(f.event("gpt-6-astra", extra)),
+				"sha",
+			);
+			expect(result.identityAccepted).toBe(false);
+		}
+		const duplicate = [f.event("gpt-6-astra", { stopReason: "toolUse" }), f.event("gpt-6-astra")].join("\n");
+		const duplicateResult = summarizeOneironWriter(f.manifest, f.stage, f.profile, f.transport(duplicate), "sha");
+		expect(duplicateResult.blockers).toContain("response 1: missing or duplicate transport response identity");
+		const writerProvenance = summarizeOneironWriter(
+			f.manifest,
+			f.stage,
+			f.profile,
+			f.transport(f.event("gpt-6-astra")),
+			"sha",
+		);
+		expect(writerProvenance.identityAccepted).toBe(true);
+		expect(() => validateOneironWriterReceipt(f.manifest, { writerProvenance }, "sha", readOneironPin)).not.toThrow();
+		writeFileSync(writerProvenance.transcript.path, `${f.event("gpt-6-astra")}\n`);
+		expect(() => validateOneironWriterReceipt(f.manifest, { writerProvenance }, "sha", readOneironPin)).toThrow(
+			/hash changed/,
+		);
 	});
 	test("whole-attempt Astra retry requires fresh proven terminal custody, exact complete workspace and retained evidence", () => {
 		const f = setup();
 		const prior = structuredClone(f.manifest);
 		prior.outputDirectory = join(f.directory, "prior");
 		mkdirSync(prior.outputDirectory);
-		writeFileSync(join(prior.outputDirectory, "writer.jsonl"), "partial original bytes");
+		const priorPath = join(prior.outputDirectory, "writer.jsonl");
+		const fd = openSync(priorPath, "wx");
+		try {
+			const chunk = Buffer.alloc(1024 * 1024, "x");
+			for (let index = 0; index < 39; index++) writeSync(fd, chunk);
+		} finally {
+			closeSync(fd);
+		}
 		const priorManifest = f.pin(prior);
-		const priorTranscript = {
-			path: join(prior.outputDirectory, "writer.jsonl"),
-			sha256: oneironSha("partial original bytes"),
-		};
+		const priorTranscript = verifyOneironArtifact(priorPath);
 		const terminal = {
 			attemptId: "attempt-old",
 			sourceFingerprint: prior.source.fingerprint,
@@ -287,6 +342,8 @@ describe("explicit pinned writer profile and factory model capture", () => {
 			{ noLiveProcesses: false },
 			{ expiresAt: "2000-01-01" },
 			{ retainedEvidence: [] },
+			{ retainedEvidence: [{ ...priorTranscript, sha256: "0".repeat(64) }] },
+			{ retainedEvidence: [{ path: priorPath }] },
 			{ reconciledSource: { ...f.source, fingerprint: `git:${"d".repeat(64)}` } },
 		]) {
 			f.stage.retryReconciliation = f.pin({ ...proof, ...patch });

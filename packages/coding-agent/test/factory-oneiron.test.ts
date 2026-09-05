@@ -138,6 +138,7 @@ function setup() {
 		status: vi.fn(async () => ({ paused: false, ownerPaused: false })),
 		source: vi.fn(async () => ({ ...manifest.source })),
 		run: vi.fn(async () => ""),
+		runWriter: vi.fn(async () => {}),
 		call: vi.fn(async (_system, packet) => {
 			const data = JSON.parse(packet) as {
 				candidateCommit: string;
@@ -435,23 +436,27 @@ describe("Oneiron preparation and execution gates", () => {
 				writerProfile: writerProfileFixture(f),
 			};
 			f.seal();
-			vi.mocked(f.runtime.run).mockResolvedValue(
-				JSON.stringify({
-					type: "message_end",
-					message: {
-						role: "assistant",
-						provider: "cpa-r",
-						model: "gpt-6-astra",
-						responseModel: observed,
-						responseModelSource: "provider-response",
-						responseId: "msg_factory_transport",
-						stopReason: "stop",
-					},
-				}),
-			);
+			vi.mocked(f.runtime.runWriter!).mockImplementation(async (_argv, _cwd, transcriptPath) => {
+				writeFileSync(
+					transcriptPath,
+					JSON.stringify({
+						type: "message_end",
+						message: {
+							role: "assistant",
+							provider: "cpa-r",
+							model: "gpt-6-astra",
+							responseModel: observed,
+							responseModelSource: "provider-response",
+							responseId: "msg_factory_transport",
+							stopReason: "stop",
+						},
+					}),
+					{ flag: "wx" },
+				);
+			});
 			const result = (await f.execute()) as OneironReceipt;
 			expect(result.result.requiresSourceRebind).toBe(true);
-			expect(vi.mocked(f.runtime.run).mock.calls[0]![0]).toEqual(
+			expect(vi.mocked(f.runtime.runWriter!).mock.calls[0]![0]).toEqual(
 				expect.arrayContaining([
 					"--print",
 					"--provider",
@@ -469,8 +474,8 @@ describe("Oneiron preparation and execution gates", () => {
 				identityAccepted: observed === "gpt-6-astra",
 				upstreamIdentityAttested: false,
 			});
-			expect(vi.mocked(f.runtime.run).mock.calls[0]![0][0]).toBe(join(f.directory, "pinned-runtime", "node"));
-			expect(vi.mocked(f.runtime.run).mock.calls[0]![2]).toMatchObject({
+			expect(vi.mocked(f.runtime.runWriter!).mock.calls[0]![0][0]).toBe(join(f.directory, "pinned-runtime", "node"));
+			expect(vi.mocked(f.runtime.runWriter!).mock.calls[0]![3]).toMatchObject({
 				PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND: "1",
 				PRIME_AGENT_INTERNAL_OWNED_WORKER: "",
 				PRIME_AGENT_INTERNAL_DAEMON_WORKER: "",

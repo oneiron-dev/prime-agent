@@ -1,8 +1,14 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	assertByteLimit,
+	FACTORY_EVIDENCE_LIMITS,
+	validateArtifactPin,
+	validateManagementEvidence,
+} from "../evidence.js";
 import type { ManagementCaller, ManagementEvidenceBinding } from "../management.js";
 import { factoryOwnedEnvironment, readFactoryRuntime } from "../runtime.js";
 import type { ActionSpec, FactoryStatus } from "../types.js";
@@ -17,11 +23,13 @@ import {
 	oneironSha,
 	validateOneironTriage,
 } from "./oneiron-review.js";
+import { readOneironTransport } from "./oneiron-transport.js";
 import {
 	type OneironWriterStage,
 	type OneironWriterStatus,
 	oneironWriterCli,
 	readOneironWriterProfile,
+	runOneironWriterForeground,
 	summarizeOneironWriter,
 	validateOneironWriterReceipt,
 	validateOneironWriterRetry,
@@ -105,6 +113,7 @@ export interface OneironReceipt {
 }
 export interface OneironRuntime {
 	run(argv: string[], cwd: string, environment?: Record<string, string>): Promise<string>;
+	runWriter?(argv: string[], cwd: string, transcriptPath: string, environment?: Record<string, string>): Promise<void>;
 	source(manifest: OneironManifest): Promise<OneironSource>;
 	status(directory: string): Promise<OneironWriterStatus>;
 	call: ManagementCaller;
@@ -114,12 +123,15 @@ export interface OneironRuntime {
 function requireThat(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new Error(message);
 }
-export function readOneironPin(pin: OneironPin): string {
-	requireThat(pin && isAbsolute(pin.path) && /^[a-f0-9]{64}$/.test(pin.sha256), "Invalid artifact pin");
+export function readOneironPin(pin: OneironPin, limitBytes = 16 * 1024 * 1024, field = "artifact"): string {
+	validateArtifactPin(pin, field);
+	const info = statSync(pin.path);
+	requireThat(info.isFile(), `${field}: expected a regular file`);
+	assertByteLimit(field, info.size, limitBytes);
 	const bytes = readFileSync(pin.path);
-	requireThat(bytes.length <= 16 * 1024 * 1024, "Artifact exceeds 16 MiB; supply a bounded evidence artifact");
+	assertByteLimit(field, bytes.length, limitBytes);
 	requireThat(oneironSha(bytes) === pin.sha256, `Artifact hash changed: ${pin.path}`);
-	return bytes.toString("utf8");
+	return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 function parsePin<T>(pin: OneironPin): T {
 	return JSON.parse(readOneironPin(pin)) as T;
@@ -486,7 +498,10 @@ export async function executeOneiron(
 				{ attemptId: process.env.PRIME_FACTORY_ATTEMPT_ID, manifestSha256 },
 			);
 			const cli = oneironWriterCli(profile, readOneironPin);
-			const text = await run(
+			const transcriptPath = join(m.outputDirectory, "writer.jsonl");
+			requireThat(runtime.runWriter, "Writer runtime requires bounded file-backed stdout capture");
+			await authorize(m, manifestSha256, permitPath, runtime);
+			await runtime.runWriter(
 				[
 					...cli,
 					"--print",
@@ -509,10 +524,17 @@ export async function executeOneiron(
 					"--",
 					readOneironPin(stage.prompt),
 				],
+				m.source.workspace,
+				transcriptPath,
 				factoryOwnedEnvironment(),
 			);
-			writeFileSync(join(m.outputDirectory, "writer.jsonl"), text, { flag: "wx", mode: 0o600 });
-			const writerProvenance = summarizeOneironWriter(m, stage, profile, text, manifestSha256);
+			const writerProvenance = summarizeOneironWriter(
+				m,
+				stage,
+				profile,
+				readOneironTransport(transcriptPath),
+				manifestSha256,
+			);
 			result = {
 				writerProvenance,
 				requiresSourceRebind: true,
@@ -617,21 +639,20 @@ export async function executeOneiron(
 		}
 		case "triage": {
 			const { report, prior, evidenceRefs } = reviewInput(m, stage);
+			const evidence = [
+				{ ref: evidenceRefs[0], content: "Full selected review items above; not proof of repair." },
+				...stage.evidence.map((pin) => ({ ref: `sha256:${pin.sha256}`, content: readOneironPin(pin) })),
+			];
+			validateManagementEvidence(evidence, "triage.evidence", 1);
 			const packet = JSON.stringify({
 				candidateCommit: m.source.head,
 				sourceFingerprint: m.source.fingerprint,
 				corpusSha256: report.corpusSha256,
 				items: report.items,
 				prior,
-				evidence: [
-					{ ref: evidenceRefs[0], content: "Full selected review items above; not proof of repair." },
-					...stage.evidence.map((pin) => ({ ref: `sha256:${pin.sha256}`, content: readOneironPin(pin) })),
-				],
+				evidence,
 			});
-			requireThat(
-				packet.length <= 64000,
-				"Triage evidence exceeds bounded packet; prepare a smaller explicit review cluster without dropping obligations",
-			);
+			assertByteLimit("triage.packet", Buffer.byteLength(packet, "utf8"), FACTORY_EVIDENCE_LIMITS.packetBytes);
 			await authorize(m, manifestSha256, permitPath, runtime);
 			const requestId = randomUUID();
 			const profile = { provider: "cpa-r", model: "gpt-6-astra", effort: "low" };
@@ -795,10 +816,7 @@ export function bindOneironEvidence(
 		);
 	}
 	const content = JSON.stringify(receipt);
-	requireThat(
-		content.length <= 16000,
-		"Acceptance evidence exceeds 16000 characters; use an explicit bounded substantive report",
-	);
+	validateManagementEvidence([{ ref: `sha256:${receiptPin.sha256}`, content }], "binding.evidence", 1);
 	return {
 		version: 1,
 		wakeId: wake.id,
@@ -843,6 +861,7 @@ export function createOneironRuntime(
 	const run = runOneironForeground;
 	return {
 		run,
+		runWriter: runOneironWriterForeground,
 		now: Date.now,
 		status: async (directory) => {
 			requireThat(

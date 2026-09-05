@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { FactoryEngine } from "./engine.js";
+import { assertByteLimit, FACTORY_EVIDENCE_LIMITS, validateManagementEvidence } from "./evidence.js";
 import {
 	createManagementPacket,
 	type ManagementCaller,
@@ -58,10 +59,14 @@ function boundEvidence(directory: string, wake: WakeRecord, planRevision: number
 	const path = join(directory, `${wake.id}.json`);
 	if (!existsSync(path)) return undefined;
 	const info = statSync(path);
-	if (!info.isFile() || info.size > 256000) throw new Error(`Invalid management evidence binding: ${path}`);
-	const binding = JSON.parse(readFileSync(path, "utf8")) as ManagementEvidenceBinding;
-	if (!binding || binding.version !== 1 || !Array.isArray(binding.evidence))
-		throw new Error(`Invalid management evidence binding: ${path}`);
+	if (!info.isFile()) throw new Error(`binding: expected a regular file: ${path}`);
+	assertByteLimit("binding", info.size, FACTORY_EVIDENCE_LIMITS.bindingBytes);
+	const bytes = readFileSync(path);
+	assertByteLimit("binding", bytes.length, FACTORY_EVIDENCE_LIMITS.bindingBytes);
+	const binding = JSON.parse(bytes.toString("utf8")) as ManagementEvidenceBinding;
+	if (!binding || binding.version !== 1)
+		throw new Error(`binding: expected a version 1 management evidence binding: ${path}`);
+	if (!Array.isArray(binding.evidence)) throw new Error("binding.evidence: expected an array");
 	if (
 		binding.wakeId !== wake.id ||
 		binding.actionId !== wake.actionId ||
@@ -69,11 +74,10 @@ function boundEvidence(directory: string, wake: WakeRecord, planRevision: number
 		binding.planRevision !== planRevision
 	)
 		return undefined;
-	if (binding.evidence.length === 0 || binding.evidence.length > 4)
-		throw new Error("Automatic management requires one to four bound evidence records");
-	return binding.evidence.map((item) => {
-		if (!item || typeof item.content !== "string" || item.sha256 !== sha256(item.content))
-			throw new Error(`Management evidence content hash mismatch: ${path}`);
+	validateManagementEvidence(binding.evidence, "binding.evidence", 1);
+	return binding.evidence.map((item, index) => {
+		if (item.sha256 !== sha256(item.content))
+			throw new Error(`binding.evidence[${index}].sha256: content hash mismatch: ${path}`);
 		return { ref: item.ref, content: item.content };
 	});
 }

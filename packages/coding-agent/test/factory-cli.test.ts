@@ -7,6 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { factoryArguments, supportsFactoryRuntime } from "../src/cli/factory-launch.js";
+import { FACTORY_EVIDENCE_LIMITS } from "../src/factory/evidence.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { FactoryPlan, FactoryStatus } from "../src/factory/types.js";
 
@@ -105,6 +106,50 @@ describe("optional factory CLI", () => {
 		expect(() => invoke(["manage", directory, "--watch", "--max-requests", "0"], root)).toThrow();
 		expect(() => invoke(["manage", directory, "--watch", "--evidence", planPath], root)).toThrow();
 		expect(invoke(["manage", "--help"], root)).toContain("--max-passes");
+	});
+
+	it("accepts the full UTF-8 manual evidence file budget and diagnoses excess bytes without inference", () => {
+		const { root, directory, planPath, hostsPath } = setup();
+		invoke(["init", directory, planPath, "--hosts", hostsPath], root);
+		const path = join(root, "proof.txt");
+		writeFileSync(path, "é".repeat(FACTORY_EVIDENCE_LIMITS.contentBytes / 2));
+		expect(JSON.parse(invoke(["manage", directory, "--evidence", path], root))).toEqual({
+			kind: "paused",
+			admitted: false,
+		});
+		writeFileSync(path, "é".repeat(FACTORY_EVIDENCE_LIMITS.contentBytes / 2 + 1));
+		expect(() => invoke(["manage", directory, "--evidence", path], root)).toThrow(
+			"evidence[0].content: actual 65538 UTF-8 bytes exceeds limit 65536",
+		);
+		expect(() => invoke(["manage", directory, "--evidence", root], root)).toThrow(
+			`evidence[0].content: expected a regular file: ${root}`,
+		);
+		expect(JSON.parse(invoke(["status", directory], root)).managementRequests).toEqual([]);
+		expect(existsSync(join(directory, "decisions"))).toBe(false);
+	});
+
+	it("validates 32 manual evidence records and aggregate bytes before factory lookup", () => {
+		const { root, directory, planPath, hostsPath } = setup();
+		invoke(["init", directory, planPath, "--hosts", hostsPath], root);
+		const paths = Array.from({ length: 32 }, (_, index) => {
+			const path = join(root, `proof-${index}.txt`);
+			writeFileSync(path, "é".repeat(1024));
+			return path;
+		});
+		const options = paths.flatMap((path) => ["--evidence", path]);
+		expect(JSON.parse(invoke(["manage", directory, ...options], root))).toEqual({ kind: "paused", admitted: false });
+		const missingFactory = join(root, "not-initialized");
+		writeFileSync(paths[31], "é".repeat(1025));
+		expect(() => invoke(["manage", missingFactory, ...options], root)).toThrow(
+			"evidence.content aggregate: actual 65538 UTF-8 bytes exceeds limit 65536",
+		);
+		const extra = join(root, "extra.txt");
+		writeFileSync(extra, "proof");
+		expect(() => invoke(["manage", missingFactory, ...options, "--evidence", extra], root)).toThrow(
+			"evidence.length: actual 33; limit 0..32",
+		);
+		expect(JSON.parse(invoke(["status", directory], root)).managementRequests).toEqual([]);
+		expect(existsSync(join(directory, "decisions"))).toBe(false);
 	});
 
 	it("requires explicit revision for imports and replays an import token without another revision", () => {

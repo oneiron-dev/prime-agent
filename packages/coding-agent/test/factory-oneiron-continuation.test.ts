@@ -312,21 +312,13 @@ setTimeout(() => {
 							}),
 						};
 					},
+					runWriter: async (argv, _cwd, transcriptPath) => {
+						writeFileSync(join(workspace, "source.txt"), "repaired fixture source\n");
+						source = { ...source, fingerprint: `git:${"e".repeat(64)}` };
+						expect(argv[argv.indexOf("--thinking") + 1]).toBe("xhigh");
+						writeFileSync(transcriptPath, modelEvent());
+					},
 					run: async (argv) => {
-						if (argv.includes("--print")) {
-							writeFileSync(join(workspace, "source.txt"), "repaired fixture source\n");
-							source = { ...source, fingerprint: `git:${"e".repeat(64)}` };
-							const profile =
-								manifest.stage.kind === "writer"
-									? parse<{ requested: { model: string; provider: string } }>(
-											manifest.stage.writerProfile.path,
-										)
-									: null;
-							expect(argv[argv.indexOf("--thinking") + 1]).toBe("xhigh");
-							expect(profile!.requested.provider).toBe("cpa-r");
-							expect(profile!.requested.model).toBe("gpt-6-astra");
-							return modelEvent(profile!.requested.model, "gpt-6-astra", profile!.requested.provider);
-						}
 						if (argv.includes("--receipt")) {
 							const receiptPath = argv[argv.indexOf("--receipt") + 1];
 							writeFileSync(
@@ -551,6 +543,109 @@ function gate(f: Awaited<ReturnType<typeof fixture>>, source = f.source) {
 	);
 }
 describe("durable Oneiron continuation", () => {
+	test("39 MiB native snapshots and twelve citation pins consume once with compact transport-only provenance", async () => {
+		const f = await fixture();
+		await accepted(f);
+		f.setNext(() =>
+			f.make({
+				kind: "collect",
+				repo: "fixture/repo",
+				pr: 1,
+				base: "main",
+				helper: f.repair,
+				foregroundShim: f.repair,
+			}),
+		);
+		const admitted = await f.continuation.step();
+		const inspect = f.coordinator.inspect;
+		vi.spyOn(f.coordinator, "inspect").mockImplementationOnce(async (context) => {
+			const terminal = await inspect(context);
+			const responsePath = join(admitted.output, "response.json");
+			const response = parse<OneironSuccessor>(responsePath);
+			response.evidence = Array.from({ length: 12 }, (_, index) =>
+				pin(f.directory, `citation-${index}.json`, { retained: index }),
+			);
+			writeFileSync(responsePath, JSON.stringify(response));
+			const log = join(f.config.coordinator.runnerRoot, admitted.requestId!, "stdout.log");
+			const snapshot =
+				JSON.stringify({ type: "message_update", message: { role: "assistant", content: "x".repeat(8192) } }) +
+				"\n";
+			writeFileSync(
+				log,
+				`${snapshot.repeat(Math.ceil((39 * 1024 * 1024) / Buffer.byteLength(snapshot)))}${modelEvent()}\n`,
+			);
+			return terminal;
+		});
+		expect((await f.continuation.step()).kind).toBe("imported");
+		const provenancePath = join(admitted.output, "model-provenance.json");
+		expect(readFileSync(provenancePath).length).toBeLessThan(3000);
+		const provenance = parse<{ rawBytes: number; stdout: OneironPin; scope: string }>(provenancePath);
+		expect(provenance.rawBytes).toBeGreaterThanOrEqual(39 * 1024 * 1024);
+		expect(provenance.stdout.sha256).toBe(oneironSha(readFileSync(provenance.stdout.path)));
+		expect(provenance.scope).toContain("not response-file authorship");
+		f.restart();
+		expect((await f.continuation.step()).kind).toBe("waiting");
+		expect(f.coordinatorLaunches).toHaveBeenCalledTimes(1);
+	});
+
+	test("root-reconciled response derivations never inherit model authorship from original stdout", async () => {
+		const f = await fixture();
+		await accepted(f);
+		f.setNext(() => ({
+			kind: "wait",
+			actor: "known-producer",
+			path: join(f.directory, "next.json"),
+			observedSha256: null,
+			instructions: f.repair,
+		}));
+		const admitted = await f.continuation.step();
+		const context = f.getContext();
+		const observation = await f.coordinator.inspect(context);
+		expect(observation.kind).toBe("terminal");
+		if (observation.kind !== "terminal") throw new Error("fixture must terminate");
+		const original = parse<OneironSuccessor>(join(admitted.output, "response.json"));
+		const derived = pin(f.directory, "operator-derived-response.json", {
+			...original,
+			reason: "Root factual derivation preserves the original decision and all claims, with bounded citations.",
+		});
+		const actor = pin(f.directory, "stopped.json", {
+			requestId: admitted.requestId,
+			identity: "original-controller",
+			stopped: true,
+			authorityRevoked: true,
+		});
+		const provider = pin(f.directory, "completed.json", { requestId: admitted.requestId, disposition: "completed" });
+		const workspace = pin(f.directory, "workspace.json", {
+			requestId: admitted.requestId,
+			path: context.action.command.cwd,
+			fullWorkspaceReconciled: true,
+			noEffects: false,
+		});
+		const stdoutPath = join(f.config.coordinator.runnerRoot, admitted.requestId!, "stdout.log");
+		const proof = pin(f.directory, "operator-reconciliation.json", {
+			version: 1,
+			requestId: admitted.requestId,
+			authorization: f.config.coordinator.authorization,
+			priorActor: actor,
+			providerRequest: provider,
+			workspace,
+			artifacts: [derived],
+			disposition: "completed",
+			terminal: pin(f.directory, "terminal.json", observation.receipt),
+			response: derived,
+			stdout: { path: stdoutPath, sha256: oneironSha(readFileSync(stdoutPath)) },
+		});
+		f.continuation.reconcile(admitted.requestId!, proof);
+		expect((await f.continuation.step()).kind).toBe("waiting");
+		expect(parse(join(admitted.output, "response-artifact.json"))).toMatchObject({
+			response: derived,
+			origin: "reconciled-artifact",
+			modelAuthorshipAttested: false,
+		});
+		expect(parse<OneironSuccessor>(join(admitted.output, "response.json"))).toEqual(original);
+		expect(f.coordinatorLaunches).toHaveBeenCalledTimes(1);
+	});
+
 	test("real journal and stages advance repaired candidate through binding/apply/rebind/gates/publication/changed-head review, once across restart", async () => {
 		const f = await fixture();
 		let triage: OneironPin;
@@ -591,6 +686,7 @@ describe("durable Oneiron continuation", () => {
 					);
 				case "writer": {
 					const next = gate(f, f.newSource);
+					const retainedLog = rawPin(join(f.directory, "retained-writer-log.jsonl"), "x".repeat(39 * 1024 * 1024));
 					return {
 						...next,
 						rebind: pin(f.directory, "signed-rebind.json", {
@@ -601,7 +697,7 @@ describe("durable Oneiron continuation", () => {
 							signedCommitVerified: true,
 							clean: true,
 							processReconciled: true,
-							retainedEvidence: [packet.receipt, f.repair],
+							retainedEvidence: [packet.receipt, f.repair, retainedLog],
 							authorization: f.config.coordinator.authorization,
 						}),
 					};
@@ -1187,6 +1283,7 @@ describe("durable Oneiron continuation", () => {
 				retryReconciliation: f.repair,
 			});
 			const retry = parse<OneironManifest>(next.manifest.path);
+			const retainedLog = rawPin(join(f.directory, "failed-retained-log.jsonl"), "x".repeat(39 * 1024 * 1024));
 			const processProof = pin(f.directory, "retry-process-proof.json", {
 				fixtureOnly: true,
 				priorStopped: true,
@@ -1201,7 +1298,7 @@ describe("durable Oneiron continuation", () => {
 				priorManifest,
 				priorTerminal: terminalPin,
 				processProof,
-				retainedEvidence: [intent, terminalPin, triage],
+				retainedEvidence: [intent, terminalPin, triage, retainedLog],
 				workspaceDisposition: "restored",
 				reconciledSource: f.source,
 				custody: retry.custody,
