@@ -175,6 +175,27 @@ describe("Oneiron exact-commit review policy", () => {
 		).toThrow(/integrity/);
 		expect(() => inspectOneironCorpus(corpus([]), { ...expected, head: "b".repeat(40) })).toThrow(/pin/);
 	});
+	test.each([
+		[{ classification: "accepted" }, /classification/],
+		[{ disposition: "resolved" }, /disposition/],
+		[{ reason: "short" }, /reason.*20.*got 5/],
+		[{ reason: null }, /reason must be a string/],
+		[{ evidenceRefs: [] }, /evidenceRefs.*nonempty/],
+		[{ evidenceRefs: ["https://example.invalid/prior-ref"] }, /evidenceRefs\[0\].*current packet/],
+	] as const)("identifies the finding and failed field for %j", (patch, condition) => {
+		const r = report();
+		const findings = r.items.map((entry) => disposition(entry.id, entry.bodySha256));
+		const value = {
+			version: 1,
+			candidateCommit: head,
+			corpusSha256: r.corpusSha256,
+			sourceFingerprint: "git:test",
+			findings: [{ ...findings[0], ...patch }, ...findings.slice(1)],
+		};
+		const validate = () => validateOneironTriage(value, r, "git:test", [], [`sha256:${r.corpusSha256}`]);
+		expect(validate).toThrow(/Triage finding "org\/repo#855:review:1"/);
+		expect(validate).toThrow(condition);
+	});
 	test("requires every item and preserves old material even across heads, repos or review policy changes", () => {
 		const r = report();
 		const old = disposition("docs#457:coderabbit:1", "c".repeat(64), {

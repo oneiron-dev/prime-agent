@@ -272,6 +272,68 @@ describe("Oneiron preparation and execution gates", () => {
 		}));
 		await expect(g.execute()).rejects.toThrow(/changed source/);
 	});
+	test.each(["reason", "evidenceRefs", "invalid-json", "model-identity"])(
+		"preserves exact triage request and raw response before %s validation fails",
+		async (failure) => {
+			const f = setup();
+			const originalCall = vi.mocked(f.runtime.call).getMockImplementation()!;
+			let rawResponse: Awaited<ReturnType<OneironRuntime["call"]>> | undefined;
+			vi.mocked(f.runtime.call).mockImplementationOnce(async (system, packet, profile, requestId) => {
+				const request = JSON.parse(readFileSync(join(f.manifest.outputDirectory, "triage-request.json"), "utf8"));
+				expect(request).toMatchObject({
+					requestId,
+					system,
+					packet,
+					profile,
+					sourceFingerprint: f.manifest.source.fingerprint,
+				});
+				expect(profile).toEqual({ provider: "cpa-r", model: "gpt-6-astra", effort: "low" });
+				expect(system).toContain("at least 20 characters after trimming");
+				expect(system).toContain("CURRENT packet.evidence[].ref");
+				const response = await originalCall(system, packet, profile, requestId);
+				const triage = JSON.parse(response.text) as { findings: Array<Record<string, unknown>> };
+				if (failure === "reason") triage.findings[0]!.reason = "short";
+				if (failure === "evidenceRefs") triage.findings[0]!.evidenceRefs = ["https://example.invalid/prior-ref"];
+				rawResponse = {
+					...response,
+					model: failure === "model-identity" ? "other" : response.model,
+					text: failure === "invalid-json" ? "{ malformed JSON\n" : JSON.stringify(triage),
+					usage: { input: 111, output: 222 },
+				};
+				return rawResponse;
+			});
+			const rejection =
+				failure === "reason"
+					? /review:0.*reason.*20/
+					: failure === "evidenceRefs"
+						? /review:0.*evidenceRefs\[0\].*packet/
+						: failure === "model-identity"
+							? /model identity/
+							: /JSON|property name/;
+			await expect(f.execute()).rejects.toThrow(rejection);
+			const requestBytes = readFileSync(join(f.manifest.outputDirectory, "triage-request.json"), "utf8");
+			const saved = JSON.parse(readFileSync(join(f.manifest.outputDirectory, "triage-response.json"), "utf8"));
+			expect(saved.response).toEqual(rawResponse);
+			expect(saved.response).toMatchObject({
+				responseModel: "gpt-6-astra",
+				responseModelSource: "provider-response",
+				responseId: "resp_fixture",
+				usage: { input: 111, output: 222 },
+			});
+			expect(saved).toMatchObject({
+				requestId: JSON.parse(requestBytes).requestId,
+				requestSha256: oneironSha(requestBytes),
+				manifestSha256: oneironSha(readFileSync(f.manifestPath)),
+				sourceFingerprint: f.manifest.source.fingerprint,
+			});
+			expect(existsSync(join(f.manifest.outputDirectory, "receipt.json"))).toBe(false);
+			expect(f.runtime.call).toHaveBeenCalledTimes(1);
+			expect(f.runtime.run).not.toHaveBeenCalled();
+			await expect(f.execute()).rejects.toThrow(/EEXIST/);
+			expect(f.runtime.call).toHaveBeenCalledTimes(1);
+			expect(readFileSync(join(f.manifest.outputDirectory, "triage-request.json"), "utf8")).toBe(requestBytes);
+		},
+	);
 	test("supports exact gate, completed review acceptance, and readiness-only publication with pre/post checks", async () => {
 		const f = setup();
 		const triage = f.pin(await f.execute());

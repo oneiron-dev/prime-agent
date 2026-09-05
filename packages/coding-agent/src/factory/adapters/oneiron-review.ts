@@ -179,31 +179,38 @@ export function validateOneironTriage(
 		required.set(item.id, item.bodySha256);
 	}
 	const seen = new Set<string>();
-	for (const item of triage.findings) {
-		if (!item || seen.has(item.id) || required.get(item.id) !== item.bodySha256)
-			throw new Error("Triage invented, duplicated or changed a finding");
+	for (const [index, item] of triage.findings.entries()) {
+		const label = item && typeof item.id === "string" ? JSON.stringify(item.id.slice(0, 256)) : `at index ${index}`;
+		const fail = (condition: string): never => {
+			throw new Error(`Triage finding ${label}: ${condition}`);
+		};
+		if (!item || typeof item.id !== "string" || !required.has(item.id))
+			fail("id was not supplied in current items or carried material findings");
+		if (seen.has(item.id)) fail("duplicate id");
+		if (required.get(item.id) !== item.bodySha256) fail("bodySha256 differs from the supplied finding");
 		seen.add(item.id);
-		if (
-			!["informational", "stale", "duplicate", "invalid", "material", "debt"].includes(item.classification) ||
-			!["open", "fixed", "dismissed"].includes(item.disposition) ||
-			typeof item.reason !== "string" ||
-			item.reason.trim().length < 20 ||
-			!Array.isArray(item.evidenceRefs) ||
-			!item.evidenceRefs.length ||
-			item.evidenceRefs.some((ref) => !allowedEvidenceRefs.includes(ref))
-		)
-			throw new Error("Triage needs a substantive reason and supplied evidence");
+		if (!["informational", "stale", "duplicate", "invalid", "material", "debt"].includes(item.classification))
+			fail("classification must be exactly informational, stale, duplicate, invalid, material or debt");
+		if (!["open", "fixed", "dismissed"].includes(item.disposition))
+			fail("disposition must be exactly open, fixed or dismissed");
+		if (typeof item.reason !== "string") fail("reason must be a string");
+		if (item.reason.trim().length < 20)
+			fail(`reason must have at least 20 characters after trimming (got ${item.reason.trim().length})`);
+		if (!Array.isArray(item.evidenceRefs) || !item.evidenceRefs.length)
+			fail("evidenceRefs must be a nonempty array of current packet.evidence[].ref values");
+		const invalidRef = item.evidenceRefs.findIndex((ref) => !allowedEvidenceRefs.includes(ref));
+		if (invalidRef !== -1)
+			fail(
+				`evidenceRefs[${invalidRef}] is not a current packet.evidence[].ref value: ${JSON.stringify(String(item.evidenceRefs[invalidRef]).slice(0, 512))}`,
+			);
 		const wasMaterial = oldMaterial.some((old) => old.id === item.id);
 		if (wasMaterial && !["material", "debt"].includes(item.classification))
-			throw new Error("Unresolved material finding cannot be erased by reclassification");
+			fail("unresolved material finding cannot be erased by reclassification");
 		if ((wasMaterial || ["material", "debt"].includes(item.classification)) && item.disposition !== "open") {
-			if (
-				item.resolvedAtCommit !== report.candidateCommit ||
-				!item.evidenceRefs.some((ref) => ref !== `sha256:${report.corpusSha256}`)
-			)
-				throw new Error(
-					"Material resolution requires current-commit repair/adjudication evidence beyond the bot corpus",
-				);
+			if (item.resolvedAtCommit !== report.candidateCommit)
+				fail("resolvedAtCommit must equal candidateCommit for material resolution");
+			if (!item.evidenceRefs.some((ref) => ref !== `sha256:${report.corpusSha256}`))
+				fail("material resolution requires supplied repair/adjudication evidence beyond the bot corpus");
 		}
 	}
 	if (seen.size !== required.size)
