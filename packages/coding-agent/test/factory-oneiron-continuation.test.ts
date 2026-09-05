@@ -27,10 +27,12 @@ import {
 import {
 	OneironContinuation,
 	type OneironContinuationConfig,
+	type OneironCoordinatorEffortOverride,
 	type OneironSuccessor,
 	type OneironSuccessorPacket,
 	oneironContinuationUnit,
 	readOneironContinuationStatus,
+	selectOneironCoordinatorDecision,
 } from "../src/factory/adapters/oneiron-continuation.js";
 import { type OneironFinding, type OneironPin, oneironSha } from "../src/factory/adapters/oneiron-review.js";
 import { defaultOneironWriterProfile } from "../src/factory/adapters/oneiron-writer.js";
@@ -73,7 +75,7 @@ function modelEvent(model = "gpt-6-astra", responseModel = model, provider = "cp
 		},
 	});
 }
-async function fixture(nativeCoordinator = false) {
+async function fixture(nativeCoordinator = false, initialEffort?: Omit<OneironCoordinatorEffortOverride, "actionId">) {
 	const directory = realpathSync(mkdtempSync(join(tmpdir(), "oneiron-continuation-")));
 	roots.push(directory);
 	const workspace = join(directory, "product");
@@ -254,6 +256,7 @@ setTimeout(() => {
 		slotId: "slot1",
 	}).action!;
 	config.initialActionId = first.id;
+	if (initialEffort) config.coordinator.effortOverrides = [{ actionId: first.id, ...initialEffort }];
 	pin(directory, "continuation.json", config);
 	const store = new FactoryStore(join(factoryDirectory, "factory.db"));
 	let storeClosed = false;
@@ -319,6 +322,7 @@ setTimeout(() => {
 											manifest.stage.writerProfile.path,
 										)
 									: null;
+							expect(argv[argv.indexOf("--thinking") + 1]).toBe("xhigh");
 							expect(profile!.requested.provider).toBe("cpa-r");
 							expect(profile!.requested.model).toBe("gpt-6-astra");
 							return modelEvent(profile!.requested.model, "gpt-6-astra", profile!.requested.provider);
@@ -375,7 +379,7 @@ setTimeout(() => {
 		actions: [first],
 		roles: {
 			ticketOwner: { provider: "fixture", model: "mock-manager", effort: "low" },
-			coordinator: { provider: "cpa-r", model: "gpt-6-astra", effort: "xhigh" },
+			coordinator: { provider: "cpa-r", model: "gpt-6-astra", effort: "medium" },
 		},
 	});
 	let decision: "accept" | "defer" = "accept";
@@ -403,6 +407,7 @@ setTimeout(() => {
 	let next: (packet: OneironSuccessorPacket) => OneironSuccessor["next"] = () => {
 		throw new Error("No fixture successor configured");
 	};
+	let futureDecision: OneironCoordinatorEffortOverride | undefined;
 	const coordinatorLaunches = vi.fn();
 	let pendingContext: AttemptContext | undefined;
 	let inspection: Inspection | undefined;
@@ -422,6 +427,7 @@ setTimeout(() => {
 				planRevision: packet.planRevision,
 				reason: "Fixture coordinator pins one exact next stage and retains every review obligation.",
 				evidence: [repair],
+				coordinatorDecision: futureDecision,
 				next: next(packet),
 			};
 			writeFileSync(packet.responsePath, JSON.stringify(response));
@@ -482,6 +488,9 @@ setTimeout(() => {
 		},
 		setNext(value: typeof next) {
 			next = value;
+		},
+		setFutureDecision(value: OneironCoordinatorEffortOverride | undefined) {
+			futureDecision = value;
 		},
 		setDecision(value: typeof decision) {
 			decision = value;
@@ -928,6 +937,7 @@ describe("durable Oneiron continuation", () => {
 			join(f.config.coordinator.runnerRoot, admitted.requestId!, "manifest.json"),
 		).command;
 		expect(command.argv[command.argv.indexOf("--tools") + 1]).toBe("ipython");
+		expect(command.argv[command.argv.indexOf("--thinking") + 1]).toBe("medium");
 		expect(command.env.PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND).toBe("1");
 		expect(classifyOwnedSessionWorkerInvocation(command.argv.slice(2), false, command.env)).toBe("json");
 		const ownedWorker = createOwnedWorkerLaunchSpec(command.argv.slice(2), command.argv[0], [], command.argv[1]);
@@ -960,7 +970,11 @@ describe("durable Oneiron continuation", () => {
 		const provenance = parse<{ requested: { model: string }; source: string }>(
 			join(admitted.output, "model-provenance.json"),
 		);
-		expect(provenance).toMatchObject({ requested: { model: "gpt-6-astra" }, source: "provider-response" });
+		expect(provenance).toMatchObject({
+			requested: { model: "gpt-6-astra", effort: "medium" },
+			coordinatorDecision: { decisionClass: "routine", source: "default" },
+			source: "provider-response",
+		});
 		f.restart();
 		expect((await f.continuation.step()).kind).toBe("waiting");
 		expect(readdirSync(f.config.coordinator.runnerRoot)).toEqual([admitted.requestId]);
@@ -1222,6 +1236,136 @@ describe("durable Oneiron continuation", () => {
 		admitted.mockRestore();
 		expect(f.store.attempts()).toHaveLength(3);
 		expect(f.store.actions().at(-1)?.state).toBe("ACCEPTED");
+	});
+
+	test("coordinator effort defaults medium and accepts only exact named scopes, including verified future-stage instructions", async () => {
+		const reason = "Named fixture decision requires wider evidence reconciliation for this exact action.";
+		for (const [decisionClass, effort] of [
+			["broader-replanning", "high"],
+			["cross-ticket-conflict", "high"],
+			["unresolved-architecture", "xhigh"],
+			["unresolved-correctness", "xhigh"],
+		] as const) {
+			const f = await fixture(false, { decisionClass, reason });
+			await accepted(f);
+			f.setNext(() => ({
+				kind: "wait",
+				actor: "fixture-evidence-producer",
+				path: join(f.directory, "next-evidence.json"),
+				observedSha256: null,
+				instructions: f.repair,
+			}));
+			const admitted = await f.continuation.step();
+			const packet = parse<OneironSuccessorPacket>(join(admitted.output, "packet.json"));
+			expect(packet.coordinatorDecision).toMatchObject({
+				requestedProfile: { provider: "cpa-r", model: "gpt-6-astra", effort },
+				scopeActionId: f.first.id,
+				decisionClass,
+				reason,
+				source: "config-action",
+				sourceRequestId: null,
+			});
+			const argv = f.getContext().action.command.argv;
+			expect(argv[argv.indexOf("--thinking") + 1]).toBe(effort);
+			f.restart();
+			expect((await f.continuation.step()).kind).toBe("waiting");
+			expect(parse<Record<string, unknown>>(join(admitted.output, "model-provenance.json"))).toMatchObject({
+				requested: { effort },
+				coordinatorDecision: packet.coordinatorDecision,
+			});
+			expect(
+				selectOneironCoordinatorDecision("unmatched-future-action", f.config.coordinator.effortOverrides)
+					.requestedProfile.effort,
+			).toBe("medium");
+		}
+		const scoped: OneironCoordinatorEffortOverride = {
+			actionId: "exact-action",
+			decisionClass: "broader-replanning",
+			reason,
+		};
+		expect(() => selectOneironCoordinatorDecision("exact-action", [scoped, scoped])).toThrow(/unique/);
+		expect(() => selectOneironCoordinatorDecision("exact-action", [{ ...scoped, reason: "" }])).toThrow(
+			/bounded reason/,
+		);
+		expect(() =>
+			selectOneironCoordinatorDecision("exact-action", [
+				{ ...scoped, decisionClass: "routine" } as unknown as OneironCoordinatorEffortOverride,
+			]),
+		).toThrow(/named decision class/);
+		expect(() =>
+			selectOneironCoordinatorDecision("exact-action", [
+				{ ...scoped, effort: "xhigh" } as OneironCoordinatorEffortOverride,
+			]),
+		).toThrow(/no raw effort/);
+		expect(() =>
+			selectOneironCoordinatorDecision("exact-action", [scoped], {
+				requestId: "prior",
+				decision: { ...scoped, decisionClass: "unresolved-correctness" },
+			}),
+		).toThrow(/conflict/);
+
+		const f = await fixture();
+		await accepted(f);
+		const next = f.make({
+			kind: "collect",
+			repo: "fixture/repo",
+			pr: 1,
+			base: "main",
+			helper: f.repair,
+			foregroundShim: f.repair,
+		});
+		const nextAction = prepareOneiron(parse<OneironManifest>(next.manifest.path), {
+			manifestPath: next.manifest.path,
+			permitPath: next.permit.path,
+			adapterArgv: f.config.adapterArgv,
+			host: next.host,
+			slotId: next.slotId,
+		}).action!;
+		f.setNext(() => next);
+		f.setFutureDecision({ actionId: nextAction.id, decisionClass: "cross-ticket-conflict", reason });
+		const imported = await successor(f);
+		expect(imported.kind).toBe("imported");
+		const previousRequestId = imported.requestId;
+		f.setFutureDecision(undefined);
+		await accepted(f);
+		f.setNext(() => ({
+			kind: "wait",
+			actor: "fixture-conflict-evidence",
+			path: join(f.directory, "conflict-result.json"),
+			observedSha256: null,
+			instructions: f.repair,
+		}));
+		const admitted = await f.continuation.step();
+		const packet = parse<OneironSuccessorPacket>(join(admitted.output, "packet.json"));
+		expect(packet.coordinatorDecision).toMatchObject({
+			requestedProfile: { effort: "high" },
+			decisionClass: "cross-ticket-conflict",
+			reason,
+			source: "successor-instruction",
+			sourceRequestId: previousRequestId,
+		});
+		f.restart();
+		expect((await f.continuation.step()).kind).toBe("waiting");
+		expect(parse<Record<string, unknown>>(join(admitted.output, "model-provenance.json"))).toMatchObject({
+			requested: { effort: "high" },
+			coordinatorDecision: packet.coordinatorDecision,
+		});
+
+		const invalid = await fixture();
+		await accepted(invalid);
+		invalid.setNext(() =>
+			invalid.make({
+				kind: "collect",
+				repo: "fixture/repo",
+				pr: 1,
+				base: "main",
+				helper: invalid.repair,
+				foregroundShim: invalid.repair,
+			}),
+		);
+		invalid.setFutureDecision({ ...scoped, actionId: "not-the-prepared-successor" });
+		await expect(successor(invalid)).rejects.toThrow(/exact prepared successor/);
+		expect(invalid.store.status().planRevision).toBe(1);
 	});
 
 	test.each(["local", "external"])(

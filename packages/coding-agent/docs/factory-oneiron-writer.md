@@ -1,6 +1,6 @@
 # Oneiron writer policy and automatic model provenance
 
-The latest owner OAuth-only policy restores `cpa-r/gpt-6-astra` at `xhigh` for routine writing and coordination. It supersedes the briefly ratified, undeployed Fable-default preparation. Fable is reserved for explicitly requested architecture/post-wave work, not routine writer stages. This policy does not resume Wave work or change historical receipts. Initial ONE-1914 triage remains Astra at `low`, with `max` available for escalation.
+The owner OAuth-only policy uses `cpa-r/gpt-6-astra` at `xhigh` for routine writing. CEO coordination uses `medium` routinely, `high` for broader replanning or difficult cross-ticket conflicts, and `xhigh` for unresolved architecture or correctness escalations. This supersedes the briefly ratified, undeployed Fable-default preparation. Fable is reserved for explicitly requested architecture/post-wave work, not routine writer stages. This policy does not resume Wave work or change historical receipts. Initial ONE-1914 triage remains Astra at `low`.
 
 ## Explicit pinned profile
 

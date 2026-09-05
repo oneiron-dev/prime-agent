@@ -1,6 +1,6 @@
 # Oneiron durable coordinator continuation
 
-This opt-in consumer connects the existing Oneiron coordinator to the existing factory. It does not replace `factory serve`, schedule product processes, author product source, or merge PRs. The latest owner policy uses `cpa-r/gpt-6-astra xhigh` for routine writing and coordination through Arch CPA Codex OAuth only. Initial triage and bounded ticket judgments remain Astra `low`; escalation uses `max` only when explicitly called for. Fable is reserved for explicitly requested architecture or post-wave work, not routine writer manifests. No promotional or paid fallback is configured. This consumer adds no model quota scheduler or paid-balance bypass. A whole-attempt Astra retry after a failed primary Astra attempt still requires full reconciliation.
+This opt-in consumer connects the existing Oneiron coordinator to the existing factory. It does not replace `factory serve`, schedule product processes, author product source, or merge PRs. The owner-ratified normal policy uses `cpa-r/gpt-6-astra` through Arch CPA Codex OAuth only. Routine CEO/coordinator work uses `medium`; named broader replanning or difficult cross-ticket conflict uses `high`; unresolved architecture or correctness uses `xhigh`. Writer work remains `xhigh`. Initial triage and bounded ticket judgments remain `low`. This is the normal policy, not a trial. Fable is reserved for explicitly requested architecture or post-wave work, not routine writer manifests. No promotional or paid fallback is configured. This consumer adds no model quota scheduler or paid-balance bypass. A whole-attempt Astra retry after a failed primary Astra attempt still requires full reconciliation.
 
 ## Execution and custody
 
@@ -10,7 +10,7 @@ A coordinator command uses the shared, hash-verified `FactoryRuntimeIdentity.cli
 
 ```text
 --print --mode json --offline --provider cpa-r --model gpt-6-astra
---thinking xhigh --cwd REQUEST_WORKSPACE --session-dir REQUEST_SESSION
+--thinking SELECTED_COORDINATOR_EFFORT --cwd REQUEST_WORKSPACE --session-dir REQUEST_SESSION
 --no-extensions --no-skills --tools ipython
 --append-system-prompt BOUNDED_COORDINATOR_CONTRACT -- BOUNDED_PACKET
 ```
@@ -19,7 +19,7 @@ The command also carries `env:factoryOwnedEnvironment()` through the existing co
 
 The coordinator uses the native `ipython` tool. File access uses Python APIs; foreground helpers use the REPL `bash` handle interface. There are no legacy `read`, `write`, or `bash` tool names in this runtime.
 
-The factory reads transport-derived `responseModel`, `responseModelSource`, and `responseId` from the native JSON events. It saves `model-provenance.json` with the requested route, SDK selectors, reported serving identities, response IDs, and transcript hash. Unknown/missing transport identity blocks successor application. The coordinator must never certify its own model. A gateway report is not authenticated upstream identity.
+The factory reads transport-derived `responseModel`, `responseModelSource`, and `responseId` from the native JSON events. It saves `model-provenance.json` with the factory-selected requested route and effort, decision class/reason/source, SDK selectors, reported serving identities, response IDs, and transcript hash. Requested effort comes from the admitted command metadata, never a model self-report; provider serving identity does not attest observed effort. Unknown/missing transport identity blocks successor application. The coordinator must never certify its own model. A gateway report is not authenticated upstream identity.
 
 Opening or supervising the consumer never resumes a factory or removes its external owner pause. The product scheduler remains separate and uses the same pinned release. The continuation runtime, stage `factoryRuntime`, writer profile runtime, adapter argv, supervisor entry, and helper files must refer to that same reviewed deployment. Pinning an entrypoint alone is insufficient; the shared runtime envelope verifies Node, CLI, lazy modules and release assets.
 
@@ -53,8 +53,15 @@ The exact schema is `OneironContinuationConfig` in `src/factory/adapters/oneiron
 - `coordinator.authorization`: the existing owner authorization pin. Each successor permit must cite this exact pin. This grants only its written scope; it cannot clear pauses.
 - `coordinator.instructions`: a pinned concrete helper/authority packet. It must identify the existing signed-commit/rebind workflow, actual bot request command and consume-once deadline owner, exact-source gate preparation, native publication preparation, core judgment recovery, and final merge/Linear-close actor. It must contain real reviewed paths and command arguments, not placeholder commands. It grants no product-source authorship to the coordinator.
 - `coordinator.timeoutMs`: 1,000–1,800,000 ms. The existing host runner enforces it for the foreground group.
+- Optional `coordinator.effortOverrides`: up to 1,000 unique exact-action entries `{actionId,decisionClass,reason}`. Reasons must contain 20–2,000 characters of substantive scope. `broader-replanning` and `cross-ticket-conflict` map to `high`; `unresolved-architecture` and `unresolved-correctness` map to `xhigh`. Omitted and unmatched actions always use routine `medium`. Raw effort overrides and ambiguous/duplicate scopes fail closed.
 - `adapterArgv` and `adapterPins`: exact Oneiron entry invocation and its reviewed release files.
 - `supervisor.actor`, concrete `.service` `unit`, `argv` containing the absolute Node/continuation-entry prefix, and absolute `configPath` naming this JSON file. The consumer appends a hash-pinned finite watch invocation. Do not include the config hash in the config itself.
+
+### Effort for future actions
+
+The coordinator does not need to rewrite a live config or restart its cursor to select a justified higher effort for newly prepared work. A verified stage successor response may include top-level `coordinatorDecision:{actionId,decisionClass,reason}` with the same bounded schema as a config override. Obtain the exact action ID from `prepareOneiron` for the pinned next manifest. The actuator rejects metadata for another action or for a non-stage instruction. Config and successor scopes must agree if both apply.
+
+After successful CAS import, the next request reads the instruction from the existing APPLIED predecessor outbox record. The factory maps its class to effort and stores `packet.coordinatorDecision` with `requestedProfile`, `scopeActionId`, `decisionClass`, `reason`, `source` (`default`, `config-action`, or `successor-instruction`) and `sourceRequestId`. The exact stored profile drives CLI `--thinking`, status and the private provenance receipt. The coordinator never reports its own effort. This metadata cannot alter/replay an already admitted request. Without a matching explicit instruction, the next request stays medium; no inference-based automatic escalation is added.
 
 A configuration is immutable once its cursor is registered. A different config does not silently take over its live request. Reconcile and explicitly transfer custody before changing the configured actor/runtime.
 
