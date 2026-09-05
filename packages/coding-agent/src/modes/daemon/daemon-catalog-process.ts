@@ -6,9 +6,10 @@ import { createRequire } from "node:module";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
-import { getPackageDir, isBunBinary } from "../../config.js";
+import { ENV_AGENT_DIR, getAgentDir, getAgentsViewStatePath, getPackageDir, isBunBinary } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
+import { readPinnedSessionIds } from "../../core/session-list-priority.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
@@ -208,6 +209,7 @@ export async function handleCatalogRequest(
 				const callbacks =
 					request.stream !== false
 						? {
+								prioritySessionIds: await readPinnedSessionIds(getAgentsViewStatePath()),
 								onProgress: (loaded: number, total: number) =>
 									send({ type: "progress", id: request.id, loaded, total }),
 								onSession: (session: SessionInfo) =>
@@ -336,7 +338,10 @@ export class DaemonCatalogClient {
 		}
 	>();
 
-	constructor(private readonly onDiagnostic: (message: string) => void) {}
+	constructor(
+		private readonly onDiagnostic: (message: string) => void,
+		private readonly agentDir: string = getAgentDir(),
+	) {}
 
 	async start(): Promise<void> {
 		if (this.child?.connected) {
@@ -424,7 +429,11 @@ export class DaemonCatalogClient {
 	private async spawnCatalog(): Promise<void> {
 		let command: string;
 		let args: string[];
-		let environment = createCliSubprocessEnv({ ...process.env, [DAEMON_CATALOG_ROLE_ENV]: "1" });
+		let environment = createCliSubprocessEnv({
+			...process.env,
+			[ENV_AGENT_DIR]: this.agentDir,
+			[DAEMON_CATALOG_ROLE_ENV]: "1",
+		});
 		if (isBunBinary) {
 			const launch = createCliSubprocessLaunchSpec(["--version"]);
 			command = launch.command;

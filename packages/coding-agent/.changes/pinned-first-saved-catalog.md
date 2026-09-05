@@ -1,0 +1,1 @@
+- Loaded pinned saved sessions before unrelated session histories during Agents View discovery.

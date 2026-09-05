@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
+import { getAgentsViewStatePath } from "../../config.js";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
@@ -17,6 +18,7 @@ import type { ExtensionUIContext } from "../../core/extensions/types.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
+import { readPinnedSessionIds } from "../../core/session-list-priority.js";
 import {
 	projectAgentMessagesForExternalUse,
 	projectSessionContextForExternalUse,
@@ -204,10 +206,18 @@ export class InProcessAgentConnection implements AgentConnection {
 		// In-memory managers hold "" for "no explicit session dir"; pass undefined so
 		// list()/listAll() fall back to the default directories instead of scanning "".
 		const sessionDir = this.session.sessionManager.getSessionDir() || undefined;
+		const prioritizedCallbacks = callbacks
+			? {
+					...callbacks,
+					prioritySessionIds: await readPinnedSessionIds(
+						getAgentsViewStatePath(this.runtimeHost.services.agentDir),
+					),
+				}
+			: undefined;
 		if (scope === "current") {
-			return SessionManager.list(this.session.sessionManager.getCwd(), sessionDir, callbacks);
+			return SessionManager.list(this.session.sessionManager.getCwd(), sessionDir, prioritizedCallbacks);
 		}
-		return SessionManager.listAll(callbacks, sessionDir);
+		return SessionManager.listAll(prioritizedCallbacks, sessionDir);
 	}
 
 	async getQueue(): Promise<AgentConnectionQueueState> {

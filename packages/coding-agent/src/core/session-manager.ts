@@ -38,6 +38,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.js";
+import { prioritizeSessionFiles } from "./session-list-priority.js";
 import {
 	addAssistantUsage,
 	cloneUsage,
@@ -1442,6 +1443,8 @@ export type SessionListProgress = (loaded: number, total: number) => void;
 export type SessionListItem = (session: SessionInfo) => void;
 
 export interface SessionListCallbacks {
+	/** Internal IO priority; does not change final sorting or scope filtering. */
+	prioritySessionIds?: readonly string[];
 	onProgress?: SessionListProgress;
 	onSession?: SessionListItem;
 }
@@ -1470,7 +1473,7 @@ async function listSessionsFromDir(
 		}
 
 		let loaded = 0;
-		for (const file of files) {
+		for await (const file of prioritizeSessionFiles(files, callbacks?.prioritySessionIds)) {
 			const info = await readSessionInfo(file);
 			loaded++;
 			callbacks?.onProgress?.(progressOffset + loaded, total);
@@ -2514,6 +2517,7 @@ export class SessionManager {
 		const matchesCwd = (session: SessionInfo) => sessionInfoMatchesCwd(session, cwd);
 		const sessions = (
 			await listSessionsFromDir(dir, {
+				prioritySessionIds: callbacks?.prioritySessionIds,
 				onProgress: callbacks?.onProgress,
 				onSession: callbacks?.onSession
 					? (session) => {

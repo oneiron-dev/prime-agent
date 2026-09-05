@@ -802,7 +802,7 @@ export class DaemonSupervisor {
 			this.loadPersistedSupervisorConfig(),
 		);
 		this.snapshotCacheRoot = join(this.descriptorDir, "snapshot-cache", this.generation);
-		this.catalog = new DaemonCatalogClient((message) => this.log(message));
+		this.catalog = new DaemonCatalogClient((message) => this.log(message), agentDir);
 		this.settingsManager = SettingsManager.create(process.cwd(), this.defaultSessionConfig.agentDir ?? agentDir);
 	}
 

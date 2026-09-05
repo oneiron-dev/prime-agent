@@ -16,6 +16,7 @@ import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	appendRotatingLog,
+	getAgentsViewStatePath,
 	getCronJobsPath,
 	getDaemonLogPath,
 	getDaemonUpdateRestartManifestPath,
@@ -98,6 +99,7 @@ import {
 } from "../../core/session-action-store.js";
 import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
 import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
+import { readPinnedSessionIds } from "../../core/session-list-priority.js";
 import {
 	getSessionArtifactPathForFile,
 	projectAgentMessagesForExternalUse,
@@ -4324,6 +4326,7 @@ export class AgentDaemon {
 				}
 				const callbacks = command.id
 					? {
+							prioritySessionIds: await readPinnedSessionIds(getAgentsViewStatePath(this.agentDir)),
 							onProgress: (loaded: number, total: number) => {
 								this.write(client, {
 									id: command.id,
