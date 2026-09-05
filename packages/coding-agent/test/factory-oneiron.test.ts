@@ -272,7 +272,7 @@ describe("Oneiron preparation and execution gates", () => {
 		}));
 		await expect(g.execute()).rejects.toThrow(/changed source/);
 	});
-	test.each(["reason", "evidenceRefs", "invalid-json", "model-identity"])(
+	test.each(["reason", "evidenceRefs", "malformed-ref", "invalid-json", "model-identity"])(
 		"preserves exact triage request and raw response before %s validation fails",
 		async (failure) => {
 			const f = setup();
@@ -294,6 +294,7 @@ describe("Oneiron preparation and execution gates", () => {
 				const triage = JSON.parse(response.text) as { findings: Array<Record<string, unknown>> };
 				if (failure === "reason") triage.findings[0]!.reason = "short";
 				if (failure === "evidenceRefs") triage.findings[0]!.evidenceRefs = ["https://example.invalid/prior-ref"];
+				if (failure === "malformed-ref") triage.findings[0]!.evidenceRefs = [{ toString: null }];
 				rawResponse = {
 					...response,
 					model: failure === "model-identity" ? "other" : response.model,
@@ -305,7 +306,7 @@ describe("Oneiron preparation and execution gates", () => {
 			const rejection =
 				failure === "reason"
 					? /review:0.*reason.*20/
-					: failure === "evidenceRefs"
+					: failure === "evidenceRefs" || failure === "malformed-ref"
 						? /review:0.*evidenceRefs\[0\].*packet/
 						: failure === "model-identity"
 							? /model identity/

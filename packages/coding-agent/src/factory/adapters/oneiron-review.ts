@@ -199,10 +199,14 @@ export function validateOneironTriage(
 		if (!Array.isArray(item.evidenceRefs) || !item.evidenceRefs.length)
 			fail("evidenceRefs must be a nonempty array of current packet.evidence[].ref values");
 		const invalidRef = item.evidenceRefs.findIndex((ref) => !allowedEvidenceRefs.includes(ref));
-		if (invalidRef !== -1)
-			fail(
-				`evidenceRefs[${invalidRef}] is not a current packet.evidence[].ref value: ${JSON.stringify(String(item.evidenceRefs[invalidRef]).slice(0, 512))}`,
-			);
+		if (invalidRef !== -1) {
+			const ref: unknown = item.evidenceRefs[invalidRef];
+			const rendered =
+				typeof ref === "string"
+					? JSON.stringify(ref.slice(0, 512))
+					: `<${ref === null ? "null" : Array.isArray(ref) ? "array" : typeof ref}>`;
+			fail(`evidenceRefs[${invalidRef}] is not a current packet.evidence[].ref value: ${rendered}`);
+		}
 		const wasMaterial = oldMaterial.some((old) => old.id === item.id);
 		if (wasMaterial && !["material", "debt"].includes(item.classification))
 			fail("unresolved material finding cannot be erased by reclassification");

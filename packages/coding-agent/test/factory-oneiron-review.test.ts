@@ -182,6 +182,7 @@ describe("Oneiron exact-commit review policy", () => {
 		[{ reason: null }, /reason must be a string/],
 		[{ evidenceRefs: [] }, /evidenceRefs.*nonempty/],
 		[{ evidenceRefs: ["https://example.invalid/prior-ref"] }, /evidenceRefs\[0\].*current packet/],
+		[{ evidenceRefs: [{ toString: null }] }, /evidenceRefs\[0\].*current packet.*<object>/],
 	] as const)("identifies the finding and failed field for %j", (patch, condition) => {
 		const r = report();
 		const findings = r.items.map((entry) => disposition(entry.id, entry.bodySha256));
