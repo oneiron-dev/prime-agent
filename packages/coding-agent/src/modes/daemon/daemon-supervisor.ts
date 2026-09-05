@@ -777,6 +777,8 @@ export class DaemonSupervisor {
 	private idleEvictionFence?: Promise<void>;
 	private scheduledWakeTimer?: ReturnType<typeof setTimeout>;
 	private scheduledWakeRecompute?: Promise<void>;
+	private scheduledWakeDrain?: Promise<void>;
+	private scheduledWakeRevision = 0;
 	private scheduledWakeRecomputeQueued = false;
 	private readonly scheduledWakeFailures = new Map<string, number>();
 
@@ -941,8 +943,11 @@ export class DaemonSupervisor {
 
 	// The supervisor only wakes non-resident trees; firing and delivery stay worker-owned.
 	private scheduleScheduledSessionWakeRecompute(): void {
-		if (this.shuttingDown) return;
-		if (this.scheduledWakeRecompute) {
+		if (this.shuttingDown || this.updateRestartPhase !== undefined) {
+			this.clearScheduledWakeTimer();
+			return;
+		}
+		if (this.scheduledWakeDrain || this.scheduledWakeRecompute) {
 			this.scheduledWakeRecomputeQueued = true;
 			return;
 		}
@@ -960,6 +965,8 @@ export class DaemonSupervisor {
 	/** Durable truth: the ledger family (fork headers stripped) plus each session's scheduled-jobs artifact. */
 	private async collectPassiveScheduledJobs(
 		includeInactive = false,
+		rootKey?: string,
+		familySnapshot?: { infos?: SessionInfo[] },
 	): Promise<Array<{ rootSessionFile: string; job: AgentCronJob; info: SessionInfo }>> {
 		const pendingCancelRoots = new Set<string>();
 		for (const intent of this.collectEphemeralCancelIntents()) {
@@ -973,20 +980,9 @@ export class DaemonSupervisor {
 				pendingCancelRoots.add(canonicalSessionPath(context.sessionFile));
 			}
 		}
-		const infos = await this.rlmSpawnLedger().family();
+		const infos = familySnapshot?.infos ?? (await this.rlmSpawnLedger().family());
+		if (familySnapshot) familySnapshot.infos = infos;
 		const infoByPath = new Map(infos.map((info) => [canonicalSessionPath(info.path), info] as const));
-		const storeBySessionId = new Map<string, AgentCronJobStore>();
-		const infoBySessionId = new Map<string, SessionInfo>();
-		for (const info of infos) {
-			if (info.state !== undefined && info.state.status !== "active") continue;
-			const artifactDir = getSessionArtifactPathForFile(resolve(info.path), info.id);
-			if (!existsSync(join(artifactDir, SESSION_SCHEDULED_JOBS_FILENAME))) continue;
-			const store = AgentCronJobStore.forSessionArtifacts();
-			store.registerSessionArtifact(info.id, artifactDir);
-			storeBySessionId.set(info.id, store);
-			infoBySessionId.set(info.id, info);
-		}
-		if (infoBySessionId.size === 0) return [];
 		const uncoveredRootFor = (info: SessionInfo): string | undefined => {
 			let current = info;
 			const visited = new Set([canonicalSessionPath(current.path)]);
@@ -1004,6 +1000,22 @@ export class DaemonSupervisor {
 			}
 			return current.path;
 		};
+		const storeBySessionId = new Map<string, AgentCronJobStore>();
+		const infoBySessionId = new Map<string, SessionInfo>();
+		for (const info of infos) {
+			if (info.state !== undefined && info.state.status !== "active") continue;
+			if (rootKey !== undefined) {
+				const root = uncoveredRootFor(info);
+				if (root === undefined || canonicalSessionPath(root) !== rootKey) continue;
+			}
+			const artifactDir = getSessionArtifactPathForFile(resolve(info.path), info.id);
+			if (!existsSync(join(artifactDir, SESSION_SCHEDULED_JOBS_FILENAME))) continue;
+			const store = AgentCronJobStore.forSessionArtifacts();
+			store.registerSessionArtifact(info.id, artifactDir);
+			storeBySessionId.set(info.id, store);
+			infoBySessionId.set(info.id, info);
+		}
+		if (infoBySessionId.size === 0) return [];
 		const results: Array<{ rootSessionFile: string; job: AgentCronJob; info: SessionInfo }> = [];
 		for (const [artifactSessionId, store] of storeBySessionId) {
 			let jobs: AgentCronJob[];
@@ -1027,10 +1039,23 @@ export class DaemonSupervisor {
 	}
 
 	private async recomputeScheduledSessionWake(): Promise<void> {
-		if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+		if (this.shuttingDown || this.updateRestartPhase !== undefined) {
+			this.clearScheduledWakeTimer();
+			return;
+		}
+		if (this.scheduledWakeDrain) {
+			this.scheduledWakeRecomputeQueued = true;
+			return;
+		}
+		const revision = this.scheduledWakeRevision;
 		const candidates = await this.collectPassiveScheduledJobs();
 		this.clearScheduledWakeTimer();
 		if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+		// A drain can start and finish while the ledger is loading. Discard that stale scan.
+		if (this.scheduledWakeDrain || revision !== this.scheduledWakeRevision) {
+			this.scheduledWakeRecomputeQueued = true;
+			return;
+		}
 		const now = Date.now();
 		const wakeTimes: number[] = [];
 		const candidateRoots = new Set(candidates.map(({ rootSessionFile }) => canonicalSessionPath(rootSessionFile)));
@@ -1056,34 +1081,67 @@ export class DaemonSupervisor {
 		this.scheduledWakeTimer.unref();
 	}
 
-	private async wakeDueScheduledSessions(now = Date.now()): Promise<void> {
+	private wakeDueScheduledSessions(now = Date.now()): Promise<void> {
+		if (this.scheduledWakeDrain) return this.scheduledWakeDrain;
+		this.clearScheduledWakeTimer();
 		// Disarmed during update-restart preparation; the phase transition or next boot re-arms once.
-		if (this.shuttingDown || this.updateRestartPhase !== undefined) {
-			this.clearScheduledWakeTimer();
-			return;
-		}
-		try {
-			const due = new Map<string, string>();
-			for (const { rootSessionFile, job } of await this.collectPassiveScheduledJobs()) {
-				if (job.status !== "active" || job.nextRunAt === undefined) continue;
-				const runAt = Date.parse(job.nextRunAt);
-				if (!Number.isFinite(runAt) || runAt > now) continue;
-				due.set(canonicalSessionPath(rootSessionFile), rootSessionFile);
-			}
-			for (const [rootKey, sessionPath] of due) {
-				if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
-				try {
-					await this.createOrReuseWorker(SCHEDULED_WAKE_CLIENT_ID, { type: "create", sessionPath });
-					this.scheduledWakeFailures.delete(rootKey);
-					this.log(`Woke session worker for a due scheduled job: ${sessionPath}`);
-				} catch (error) {
-					this.scheduledWakeFailures.set(rootKey, Date.now());
-					this.log(`Scheduled wake failed for ${sessionPath}: ${String(error)}`);
+		if (this.shuttingDown || this.updateRestartPhase !== undefined) return Promise.resolve();
+		this.scheduledWakeRevision = (this.scheduledWakeRevision ?? 0) + 1;
+		const startedAt = Date.now();
+		const wakeNow = () => now + Math.max(0, Date.now() - startedAt);
+		const backedOff = (rootKey: string): boolean => {
+			const failedAt = this.scheduledWakeFailures.get(rootKey);
+			return failedAt !== undefined && failedAt + SCHEDULED_WAKE_RETRY_MS > wakeNow();
+		};
+		const isDue = (job: AgentCronJob): boolean => {
+			if (job.status !== "active" || job.nextRunAt === undefined) return false;
+			const runAt = Date.parse(job.nextRunAt);
+			return Number.isFinite(runAt) && runAt <= wakeNow();
+		};
+		// Publish before collection or worker creation can broadcast another wake request.
+		const drain = Promise.resolve()
+			.then(async () => {
+				const due = new Map<string, string>();
+				// Topology is a pass snapshot; per-root artifacts and resident ownership stay fresh.
+				const familySnapshot: { infos?: SessionInfo[] } = {};
+				for (const { rootSessionFile, job } of await this.collectPassiveScheduledJobs(
+					false,
+					undefined,
+					familySnapshot,
+				)) {
+					if (isDue(job)) due.set(canonicalSessionPath(rootSessionFile), rootSessionFile);
 				}
-			}
-		} finally {
-			this.scheduleScheduledSessionWakeRecompute();
-		}
+				for (const [rootKey, sessionPath] of due) {
+					if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+					if (backedOff(rootKey)) continue;
+					try {
+						// A previous launch awaited startup. Re-read only this root's artifacts:
+						// it may now be resident, paused, cancelled, or no longer due.
+						const current = await this.collectPassiveScheduledJobs(false, rootKey, familySnapshot);
+						if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+						if (
+							!current.some(
+								({ rootSessionFile, job }) => canonicalSessionPath(rootSessionFile) === rootKey && isDue(job),
+							)
+						)
+							continue;
+						if (backedOff(rootKey) || this.findWorkerBySessionFile(sessionPath)) continue;
+						await this.createOrReuseWorker(SCHEDULED_WAKE_CLIENT_ID, { type: "create", sessionPath });
+						this.scheduledWakeFailures.delete(rootKey);
+						this.log(`Woke session worker for a due scheduled job: ${sessionPath}`);
+					} catch (error) {
+						this.scheduledWakeFailures.set(rootKey, Date.now());
+						this.log(`Scheduled wake failed for ${sessionPath}: ${String(error)}`);
+					}
+				}
+			})
+			.finally(() => {
+				if (this.scheduledWakeDrain === drain) this.scheduledWakeDrain = undefined;
+				this.scheduledWakeRecomputeQueued = false;
+				this.scheduleScheduledSessionWakeRecompute();
+			});
+		this.scheduledWakeDrain = drain;
+		return drain;
 	}
 
 	private scheduleIdleEvictionSweep(): void {

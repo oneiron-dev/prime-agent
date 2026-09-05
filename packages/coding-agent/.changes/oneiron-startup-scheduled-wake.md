@@ -1,0 +1,1 @@
+- Fixed overlapping scheduled-session wake passes during daemon startup, preserving job pauses and per-root retry backoff.
