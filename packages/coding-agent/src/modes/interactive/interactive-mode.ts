@@ -168,6 +168,7 @@ import type {
 } from "../agent-connection/index.js";
 import { AgentConnectionPromptAdmissionError } from "../agent-connection/index.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
+import { HEARTBEAT_CATALOG_RETRY_DELAYS_MS, isHeartbeatCatalogUnavailableError } from "../daemon/heartbeat-catalog.js";
 import { getModelArgumentCompletions } from "../model-autocomplete.js";
 import {
 	checkForPackageUpdates,
@@ -1053,6 +1054,11 @@ export class InteractiveMode {
 	private heartbeatCatalog: AgentConnectionHeartbeat[] = [];
 	private heartbeatRefreshPromise: Promise<void> | undefined;
 	private heartbeatRefreshRequested = false;
+	private heartbeatRefreshEpoch = {};
+	private heartbeatBackgroundRefreshPromise: Promise<void> | undefined;
+	private heartbeatRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	private heartbeatRetryAttempt = 0;
+	private heartbeatCatalogWaiting = false;
 	private heartbeatManager: HeartbeatManagerComponent | undefined;
 	private heartbeatManagerHandle: OverlayHandle | undefined;
 	private heartbeatManagerRefreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2598,12 +2604,20 @@ export class InteractiveMode {
 			return this.heartbeatRefreshPromise;
 		}
 		const connection = this.agentConnection;
+		const epoch = this.heartbeatRefreshEpoch;
 		const refresh = (async () => {
 			do {
 				this.heartbeatRefreshRequested = false;
 				const heartbeats = await connection.listHeartbeats();
-				if (this.agentConnection !== connection) return;
+				if (this.agentConnection !== connection || this.heartbeatRefreshEpoch !== epoch) return;
 				this.applyHeartbeatCatalog(heartbeats);
+				clearTimeout(this.heartbeatRetryTimer);
+				this.heartbeatRetryTimer = undefined;
+				this.heartbeatRetryAttempt = 0;
+				if (this.heartbeatCatalogWaiting) {
+					this.heartbeatCatalogWaiting = false;
+					this.showStatus("Heartbeats loaded");
+				}
 			} while (this.heartbeatRefreshRequested);
 		})().finally(() => {
 			if (this.heartbeatRefreshPromise === refresh) {
@@ -2612,6 +2626,60 @@ export class InteractiveMode {
 		});
 		this.heartbeatRefreshPromise = refresh;
 		return refresh;
+	}
+
+	private refreshHeartbeatCatalogInBackground(): void {
+		if (!this.isInitialized || this.heartbeatRetryTimer) return;
+		if (this.heartbeatBackgroundRefreshPromise) {
+			this.heartbeatRefreshRequested = true;
+			return;
+		}
+		const epoch = this.heartbeatRefreshEpoch;
+		let completed = false;
+		const refresh = this.refreshHeartbeatCatalog()
+			.then(() => {
+				completed = true;
+			})
+			.catch((error: unknown) => {
+				if (this.heartbeatRefreshEpoch !== epoch || !this.isInitialized) return;
+				if (!isHeartbeatCatalogUnavailableError(error)) {
+					this.showError(error instanceof Error ? error.message : String(error));
+					return;
+				}
+				if (!this.heartbeatCatalogWaiting) {
+					this.heartbeatCatalogWaiting = true;
+					this.showStatus("Waiting for session workers to load heartbeats…");
+				}
+				const attempt = this.heartbeatRetryAttempt ?? 0;
+				const delay = HEARTBEAT_CATALOG_RETRY_DELAYS_MS[attempt];
+				if (delay === undefined) return;
+				this.heartbeatRetryAttempt = attempt + 1;
+				this.heartbeatRetryTimer = setTimeout(() => {
+					this.heartbeatRetryTimer = undefined;
+					if (this.heartbeatRefreshEpoch === epoch) this.refreshHeartbeatCatalogInBackground();
+				}, delay);
+				this.heartbeatRetryTimer.unref();
+			})
+			.finally(() => {
+				if (this.heartbeatBackgroundRefreshPromise !== refresh) return;
+				this.heartbeatBackgroundRefreshPromise = undefined;
+				// A notification can arrive after the raw loop finishes but before this owner settles.
+				if (completed && this.heartbeatRefreshRequested && this.heartbeatRefreshEpoch === epoch) {
+					this.refreshHeartbeatCatalogInBackground();
+				}
+			});
+		this.heartbeatBackgroundRefreshPromise = refresh;
+	}
+
+	private resetHeartbeatCatalogRefresh(): void {
+		clearTimeout(this.heartbeatRetryTimer);
+		this.heartbeatRetryTimer = undefined;
+		this.heartbeatRetryAttempt = 0;
+		this.heartbeatCatalogWaiting = false;
+		this.heartbeatRefreshEpoch = {};
+		this.heartbeatRefreshPromise = undefined;
+		this.heartbeatBackgroundRefreshPromise = undefined;
+		this.heartbeatRefreshRequested = false;
 	}
 
 	private applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[]): void {
@@ -2846,6 +2914,7 @@ export class InteractiveMode {
 	}
 
 	private async rebindCurrentSession(): Promise<void> {
+		this.resetHeartbeatCatalogRefresh();
 		this.cancelSubagentSummaryRefresh();
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
@@ -2870,7 +2939,7 @@ export class InteractiveMode {
 		this.patchConnectionState({ sessionActions: (await this.agentConnection.getState()).sessionActions });
 		this.refreshQueueSelectionFromState();
 		this.updatePendingMessagesDisplay();
-		await this.refreshHeartbeatCatalog().catch(() => undefined);
+		this.refreshHeartbeatCatalogInBackground();
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
@@ -5210,16 +5279,18 @@ export class InteractiveMode {
 				} else if (event.type === "extension_ui_request") {
 					await this.handleConnectionExtensionUiRequest(event.request);
 				} else if (event.type === "connection_status") {
+					this.resetHeartbeatCatalogRefresh();
 					this.showStatus(
 						event.status === "connected" ? "Daemon reconnected" : "Daemon connection lost; reconnecting…",
 						event.status === "reconnecting" ? "warning" : "dim",
 					);
 					if (event.status === "connected") {
-						await this.refreshHeartbeatCatalog();
+						this.refreshHeartbeatCatalogInBackground();
 					}
 				} else if (event.type === "heartbeats_changed") {
-					await this.refreshHeartbeatCatalog();
+					this.refreshHeartbeatCatalogInBackground();
 				} else if (event.type === "closed") {
+					this.resetHeartbeatCatalogRefresh();
 					this.showError(event.error ?? "Agent connection closed");
 				}
 			} catch (error) {
@@ -9799,7 +9870,7 @@ export class InteractiveMode {
 			if (!this.heartbeatManager) {
 				return;
 			}
-			void this.refreshHeartbeatCatalog().catch(() => this.scheduleHeartbeatManagerRefresh());
+			this.refreshHeartbeatCatalogInBackground();
 		}, delay);
 		this.heartbeatManagerRefreshTimer.unref?.();
 	}
@@ -9830,7 +9901,7 @@ export class InteractiveMode {
 				? [...remaining, { ...heartbeat, job: updated }]
 				: remaining,
 		);
-		void this.refreshHeartbeatCatalog().catch(() => undefined);
+		this.refreshHeartbeatCatalogInBackground();
 	}
 
 	private showHeartbeat(job: AgentCronJob | undefined): void {
@@ -10176,6 +10247,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 	}
 
 	stop(options: { preserveAltScreen?: boolean } = {}): void {
+		this.resetHeartbeatCatalogRefresh();
 		this.cancelSubagentSummaryRefresh();
 		this.unregisterSignalHandlers();
 		this.clearCtrlCExitHint({ render: false });

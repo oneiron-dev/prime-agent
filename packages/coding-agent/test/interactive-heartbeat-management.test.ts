@@ -79,6 +79,7 @@ describe("interactive heartbeat management", () => {
 		const stopped = { ...current, status: "cancelled" as const, nextRunAt: undefined };
 		const patches: Array<{ heartbeat: AgentCronJob | null }> = [];
 		const harness = Object.create(InteractiveMode.prototype) as HeartbeatManagementHarness;
+		Object.assign(harness, { isInitialized: true, showStatus: vi.fn(), showError: vi.fn() });
 		harness.heartbeatCatalog = [{ job: current }];
 		harness.connectionState = { activeSessionId: current.activeSessionId };
 		harness.agentConnection = {
@@ -99,6 +100,7 @@ describe("interactive heartbeat management", () => {
 		const current = heartbeat();
 		const paused = { ...current, status: "paused" as const, nextRunAt: undefined };
 		const harness = Object.create(InteractiveMode.prototype) as HeartbeatManagementHarness;
+		Object.assign(harness, { isInitialized: true, showStatus: vi.fn(), showError: vi.fn() });
 		harness.heartbeatCatalog = [{ job: current, sessionName: "Primary session" }];
 		harness.connectionState = { activeSessionId: current.activeSessionId };
 		harness.agentConnection = { manageHeartbeat: vi.fn(async () => paused) };
@@ -125,6 +127,7 @@ describe("interactive heartbeat management", () => {
 			job: heartbeat({ id: "heartbeat-3", activeSessionId: "active-3", sessionId: "session-3" }),
 		};
 		const harness = Object.create(InteractiveMode.prototype) as HeartbeatScopeHarness;
+		Object.assign(harness, { isInitialized: true, showStatus: vi.fn(), showError: vi.fn() });
 		harness.heartbeatCatalog = [];
 		harness.connectionState = { activeSessionId: "active-1", sessionId: "session-1" };
 		harness.subagentSnapshots = new Map([
@@ -150,7 +153,7 @@ describe("interactive heartbeat management", () => {
 		expect(harness.updateSubagentSummaryLine).toHaveBeenCalledOnce();
 	});
 
-	it("refreshes heartbeat scope when a known subagent gains its active session id", () => {
+	it("refreshes heartbeat scope when a known subagent gains its active session id", async () => {
 		const existing: AgentConnectionRlmChildAgentSnapshot = {
 			id: "child-1",
 			label: "child",
@@ -158,6 +161,7 @@ describe("interactive heartbeat management", () => {
 			sessionDir: "/tmp/child-1",
 		};
 		const harness = Object.create(InteractiveMode.prototype) as ChildIdentityUpdateHarness;
+		Object.assign(harness, { isInitialized: true, showStatus: vi.fn(), showError: vi.fn() });
 		harness.subagentSnapshots = new Map([[existing.id, existing]]);
 		harness.ui = { requestRender: vi.fn() };
 		harness.scheduleHeartbeatManagerRefresh = vi.fn();
@@ -167,6 +171,7 @@ describe("interactive heartbeat management", () => {
 		harness.updateWorkingLoaderMessage = vi.fn();
 
 		harness.updateSubagentSummary({ ...existing, activeSessionId: "active-2" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
 
 		expect(harness.subagentSnapshots.get(existing.id)?.activeSessionId).toBe("active-2");
 		expect(harness.scheduleHeartbeatManagerRefresh).toHaveBeenCalledOnce();
@@ -177,6 +182,7 @@ describe("interactive heartbeat management", () => {
 		try {
 			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
 			const harness = Object.create(InteractiveMode.prototype) as HeartbeatRefreshHarness;
+			Object.assign(harness, { isInitialized: true, showStatus: vi.fn(), showError: vi.fn() });
 			harness.heartbeatCatalog = [{ job: { ...heartbeat(), nextRunAt: "2026-01-01T00:00:01.000Z" } }];
 			harness.connectionState = { activeSessionId: "active-1", sessionId: "session-1" };
 			harness.subagentSnapshots = new Map();
@@ -199,6 +205,7 @@ describe("interactive heartbeat management", () => {
 			// nextRunAt (00:05) is already in the past, so the 5s overdue fallback applies.
 			vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
 			const harness = Object.create(InteractiveMode.prototype) as HeartbeatRefreshHarness;
+			Object.assign(harness, { isInitialized: true, showStatus: vi.fn(), showError: vi.fn() });
 			harness.heartbeatCatalog = [{ job: heartbeat() }];
 			harness.connectionState = { activeSessionId: "active-1", sessionId: "session-1" };
 			harness.subagentSnapshots = new Map();
@@ -225,6 +232,7 @@ describe("interactive heartbeat management", () => {
 		try {
 			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
 			const harness = Object.create(InteractiveMode.prototype) as HeartbeatRefreshHarness;
+			Object.assign(harness, { isInitialized: true, showStatus: vi.fn(), showError: vi.fn() });
 			// Two minutes out, so the first schedule arms the capped 60s poll.
 			harness.heartbeatCatalog = [{ job: { ...heartbeat(), nextRunAt: "2026-01-01T00:02:00.000Z" } }];
 			harness.connectionState = { activeSessionId: "active-1", sessionId: "session-1" };

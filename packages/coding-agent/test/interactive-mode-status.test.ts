@@ -1459,7 +1459,9 @@ describe("InteractiveMode connection events", () => {
 		const subscribeToAgent = vi.fn();
 		const subscribeToRosterBar = vi.fn(async () => {});
 		const getState = vi.fn(async () => createConnectionState());
-		const harness = {
+		const harness = Object.assign(Object.create(InteractiveMode.prototype), {
+			isInitialized: true,
+			showError: vi.fn(),
 			cancelSubagentSummaryRefresh: vi.fn(),
 			unsubscribe: undefined,
 			localSessionHost: undefined,
@@ -1483,7 +1485,7 @@ describe("InteractiveMode connection events", () => {
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			getGoalState: () => emptyGoalState(),
-		} as unknown as InteractiveMode;
+		}) as unknown as InteractiveMode;
 
 		await expect(rebindCurrentSession.call(harness)).resolves.toBeUndefined();
 		expect(updatePendingMessagesDisplay).toHaveBeenCalledOnce();

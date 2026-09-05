@@ -40,7 +40,11 @@ import {
 	isUnknownDaemonCommandError,
 } from "../daemon/daemon-protocol.js";
 import { resolveAttachModelFallbackMessage, type SessionSummary } from "../daemon/daemon-session-list.js";
-import { listDaemonHeartbeats } from "../daemon/heartbeat-catalog.js";
+import {
+	HEARTBEAT_CATALOG_RETRY_DELAYS_MS,
+	isHeartbeatCatalogUnavailableError,
+	listDaemonHeartbeats,
+} from "../daemon/heartbeat-catalog.js";
 import {
 	type DaemonSavedSessionCatalogContext,
 	deleteDaemonSavedSession,
@@ -117,6 +121,7 @@ import { matchesSearchText } from "./session-view-search.js";
 const HEARTBEAT_POLL_INTERVAL_MS = 15000;
 const RECONNECT_TIMEOUT_MS = 120000;
 const RECONNECT_RETRY_MS = 1000;
+const CATALOG_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 15000] as const;
 const EXIT_HINT_DURATION_MS = 2000;
 const DELETE_CONFIRM_DURATION_MS = 2000;
 const STATUS_MESSAGE_DURATION_MS = 4500;
@@ -716,7 +721,14 @@ export class AgentsViewMode implements Component, Focusable {
 	private savedCatalogReady = false;
 	private savedCatalogGeneration = 0;
 	private heartbeatCatalogGeneration = 0;
+	private heartbeatRefreshPromise: Promise<boolean> | undefined;
+	private heartbeatRefreshQueued = false;
+	private heartbeatRetryTimer: NodeJS.Timeout | undefined;
+	private heartbeatRetryAttempt = 0;
+	private heartbeatCatalogStatus: string | undefined;
 	private savedCatalogRefreshPending = false;
+	private savedCatalogRetryTimer: NodeJS.Timeout | undefined;
+	private savedCatalogStatus: string | undefined;
 	private expandedSubagentParents = new Set<string>();
 	// Agent row identities whose full spawn program is currently shown.
 	// The program key toggles each agent shown ↔ hidden.
@@ -1475,7 +1487,11 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private armSavedSearchFetch(options: { duringReconnect?: boolean } = {}): void {
 		// The inactive section is catalog-fed, so no query gate: load on view open.
-		if (this.savedSearchFetchStarted || this.persistentState.savedCatalogLoaded === true) {
+		if (
+			this.savedSearchFetchStarted ||
+			this.savedCatalogRetryTimer ||
+			this.persistentState.savedCatalogLoaded === true
+		) {
 			return;
 		}
 		this.savedSearchFetchStarted = true;
@@ -2514,26 +2530,40 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async refreshSavedSessions(
-		options: { duringReconnect?: boolean; preserveStatusOnError?: boolean } = {},
+		options: { duringReconnect?: boolean; preserveStatusOnError?: boolean; retryAttempt?: number } = {},
 	): Promise<boolean> {
-		if ((!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) {
+		if (this.stopped || (!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) {
 			this.rearmSavedSearchFetch();
 			return false;
+		}
+		if (this.savedCatalogRetryTimer) {
+			clearTimeout(this.savedCatalogRetryTimer);
+			this.savedCatalogRetryTimer = undefined;
 		}
 		const generation = ++this.savedCatalogGeneration;
 		this.persistentState.savedCatalogGeneration = generation;
 		this.savedCatalogRefreshPending = true;
 		this.savedCatalogReady = false;
-		const successfulSessions = this.lastSuccessfulSavedSessions;
+		this.persistentState.savedCatalogLoaded = undefined;
+		this.savedCatalogStatus = "loading saved sessions";
 		const progressiveSessions = new Map(
-			successfulSessions.map((session) => [resolvePath(canonicalizePath(session.path)), session]),
+			[...this.lastSuccessfulSavedSessions, ...this.savedSessions].map((session) => [
+				resolvePath(canonicalizePath(session.path)),
+				session,
+			]),
 		);
+		const receivedPaths = new Set<string>();
+		let progressTotal: number | undefined;
 		try {
 			const onSession = (session: AgentConnectionSavedSessionInfo) => {
-				if (generation !== this.savedCatalogGeneration) return;
-				progressiveSessions.set(resolvePath(canonicalizePath(session.path)), session);
+				if (this.stopped || generation !== this.savedCatalogGeneration) return;
+				const path = resolvePath(canonicalizePath(session.path));
+				receivedPaths.add(path);
+				const previous = progressiveSessions.get(path);
+				progressiveSessions.set(path, { ...session, usage: session.usage ?? previous?.usage });
 				this.savedSessions = [...progressiveSessions.values()];
 				this.persistentState.savedSessions = this.savedSessions;
+				this.savedCatalogStatus = `loading saved sessions (${receivedPaths.size}${progressTotal === undefined ? "" : `/${progressTotal}`})`;
 				this.reconcileCatalogs();
 			};
 			const sessions = await listDaemonSavedSessions(
@@ -2542,23 +2572,47 @@ export class AgentsViewMode implements Component, Focusable {
 				"all",
 				{
 					onSession,
+					onProgress: (loaded, total) => {
+						if (this.stopped || generation !== this.savedCatalogGeneration) return;
+						progressTotal = total;
+						this.savedCatalogStatus = `loading saved sessions (${loaded}/${total})`;
+						this.ui.requestRender();
+					},
 				},
 			);
-			if (generation !== this.savedCatalogGeneration) return false;
+			if (this.stopped || generation !== this.savedCatalogGeneration) return false;
 			this.savedSessions = sessions;
 			this.lastSuccessfulSavedSessions = sessions;
 			this.savedCatalogReady = true;
+			this.savedCatalogStatus = undefined;
 			this.persistentState.lastSuccessfulSavedSessions = sessions;
 			this.persistentState.savedSessions = sessions;
 			this.persistentState.savedCatalogLoaded = true;
 			this.reconcileCatalogs();
 			return true;
 		} catch (error) {
-			if (generation === this.savedCatalogGeneration) {
-				this.savedSessions = successfulSessions;
-				this.persistentState.savedSessions = successfulSessions;
-				// Treat a terminal failure as settled so scope fallback cannot soft-lock.
-				this.savedCatalogReady = true;
+			if (!this.stopped && generation === this.savedCatalogGeneration) {
+				// A failed scan cannot disprove a row or scope; retain every verified result.
+				this.savedSessions = [...progressiveSessions.values()];
+				this.persistentState.savedSessions = this.savedSessions;
+				const retryAttempt = options.retryAttempt ?? 0;
+				const delay = CATALOG_RETRY_DELAYS_MS[retryAttempt];
+				this.savedCatalogStatus =
+					delay === undefined
+						? "saved sessions incomplete; search to retry"
+						: `saved sessions incomplete; retry ${retryAttempt + 1}/${CATALOG_RETRY_DELAYS_MS.length} in ${delay / 1000}s`;
+				if (delay !== undefined && !this.reconnectPromise && !this.daemonShutdownReceived) {
+					this.savedCatalogRetryTimer = setTimeout(() => {
+						this.savedCatalogRetryTimer = undefined;
+						if (this.stopped || generation !== this.savedCatalogGeneration) return;
+						void this.refreshSavedSessions({
+							...options,
+							duringReconnect: false,
+							retryAttempt: retryAttempt + 1,
+						});
+					}, delay);
+					this.savedCatalogRetryTimer.unref?.();
+				}
 				this.rearmSavedSearchFetch();
 				this.reconcileCatalogs();
 				if (!options.preserveStatusOnError && !this.reconnectPromise && !this.daemonShutdownReceived) {
@@ -2575,26 +2629,72 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async refreshHeartbeats(options: { duringReconnect?: boolean } = {}): Promise<boolean> {
-		if ((!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) return false;
+		if (this.stopped || (!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived)
+			return false;
+		if (this.heartbeatRefreshPromise) {
+			this.heartbeatRefreshQueued = true;
+			return this.heartbeatRefreshPromise;
+		}
+		if (this.heartbeatRetryTimer && !options.duringReconnect) return false;
+		if (this.heartbeatRetryTimer) {
+			clearTimeout(this.heartbeatRetryTimer);
+			this.heartbeatRetryTimer = undefined;
+		}
 		const generation = ++this.heartbeatCatalogGeneration;
-		try {
-			const heartbeats = await listDaemonHeartbeats(this.requireClient());
-			if (generation !== this.heartbeatCatalogGeneration) return false;
-			this.heartbeats = heartbeats;
-			this.persistentState.heartbeats = heartbeats;
-			this.reconcileCatalogs();
-			return true;
-		} catch (error) {
-			if (generation === this.heartbeatCatalogGeneration && !this.reconnectPromise) {
+		const refreshPromise = Promise.resolve().then(async () => {
+			let transientFailure = false;
+			let completed = false;
+			try {
+				if (this.stopped || generation !== this.heartbeatCatalogGeneration) return false;
+				const heartbeats = await listDaemonHeartbeats(this.requireClient());
+				if (this.stopped || generation !== this.heartbeatCatalogGeneration) return false;
+				this.heartbeats = heartbeats;
+				this.persistentState.heartbeats = heartbeats;
+				this.heartbeatRetryAttempt = 0;
+				this.heartbeatCatalogStatus = undefined;
+				this.reconcileCatalogs();
+				completed = true;
+				return true;
+			} catch (error) {
+				if (this.stopped || generation !== this.heartbeatCatalogGeneration) return false;
 				const client = this.client;
-				if (client && !client.isConnected) {
+				if (client && !client.isConnected && !options.duringReconnect) {
 					this.startClientReconnect(client, error);
-				} else if (!this.statusMessageSticky) {
+				} else if (isHeartbeatCatalogUnavailableError(error)) {
+					transientFailure = true;
+					if (!this.heartbeatCatalogStatus) {
+						this.heartbeatCatalogStatus = "heartbeats temporarily unavailable";
+						this.ui.requestRender();
+					}
+				} else if (!this.statusMessageSticky || options.duringReconnect) {
 					this.setStatusMessage(formatError("Failed to refresh heartbeats", error));
 				}
+				return false;
+			} finally {
+				if (this.heartbeatRefreshPromise === refreshPromise) this.heartbeatRefreshPromise = undefined;
+				if (!this.stopped && generation === this.heartbeatCatalogGeneration) {
+					const queued = this.heartbeatRefreshQueued;
+					this.heartbeatRefreshQueued = false;
+					if (transientFailure) {
+						const attempt = this.heartbeatRetryAttempt ?? 0;
+						const delay = HEARTBEAT_CATALOG_RETRY_DELAYS_MS[attempt];
+						if (delay !== undefined) {
+							this.heartbeatRetryAttempt = attempt + 1;
+							this.heartbeatRetryTimer = setTimeout(() => {
+								this.heartbeatRetryTimer = undefined;
+								if (!this.stopped && generation === this.heartbeatCatalogGeneration)
+									void this.refreshHeartbeats();
+							}, delay);
+							this.heartbeatRetryTimer.unref?.();
+						}
+					} else if (completed && queued) {
+						void this.refreshHeartbeats();
+					}
+				}
 			}
-			return false;
-		}
+		});
+		this.heartbeatRefreshPromise = refreshPromise;
+		return refreshPromise;
 	}
 
 	private withPendingDeleteSession(sessions: readonly SessionSummary[]): SessionSummary[] {
@@ -2620,7 +2720,7 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private resolveMissingSelectionAnchor(): void {
-		if (!this.selectionAnchorPending || this.savedCatalogRefreshPending) {
+		if (!this.selectionAnchorPending || this.savedCatalogRefreshPending || !this.savedCatalogReady) {
 			return;
 		}
 		this.selectionAnchorPending = false;
@@ -2708,6 +2808,17 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.agentsViewStateDirty) this.flushAgentsViewStateOperations?.();
 		this.savedCatalogGeneration += 1;
 		this.heartbeatCatalogGeneration += 1;
+		if (this.savedCatalogRetryTimer) {
+			clearTimeout(this.savedCatalogRetryTimer);
+			this.savedCatalogRetryTimer = undefined;
+		}
+		this.heartbeatRefreshPromise = undefined;
+		this.heartbeatRefreshQueued = false;
+		this.heartbeatRetryAttempt = 0;
+		if (this.heartbeatRetryTimer) {
+			clearTimeout(this.heartbeatRetryTimer);
+			this.heartbeatRetryTimer = undefined;
+		}
 		if (this.heartbeatPollTimer) {
 			clearInterval(this.heartbeatPollTimer);
 			this.heartbeatPollTimer = undefined;
@@ -2750,6 +2861,20 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.stopped || client !== this.client) {
 			return;
 		}
+		this.savedCatalogGeneration += 1;
+		this.heartbeatCatalogGeneration += 1;
+		this.savedCatalogRefreshPending = false;
+		if (this.savedCatalogRetryTimer) {
+			clearTimeout(this.savedCatalogRetryTimer);
+			this.savedCatalogRetryTimer = undefined;
+		}
+		this.heartbeatRefreshPromise = undefined;
+		this.heartbeatRefreshQueued = false;
+		this.heartbeatRetryAttempt = 0;
+		if (this.heartbeatRetryTimer) {
+			clearTimeout(this.heartbeatRetryTimer);
+			this.heartbeatRetryTimer = undefined;
+		}
 		this.daemonShutdownReceived = true;
 		this.reconnectTimedOut = false;
 		this.setStatusMessage(`Prime Agent daemon shut down. Restart Prime Agent to reconnect. ${error.message}`, {
@@ -2763,6 +2888,21 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.stopped || client !== this.client || this.reconnectPromise || this.daemonShutdownReceived) {
 			return;
 		}
+		this.savedCatalogGeneration += 1;
+		this.heartbeatCatalogGeneration += 1;
+		this.savedCatalogRefreshPending = false;
+		if (this.savedCatalogRetryTimer) {
+			clearTimeout(this.savedCatalogRetryTimer);
+			this.savedCatalogRetryTimer = undefined;
+		}
+		this.heartbeatRefreshPromise = undefined;
+		this.heartbeatRefreshQueued = false;
+		this.heartbeatRetryAttempt = 0;
+		if (this.heartbeatRetryTimer) {
+			clearTimeout(this.heartbeatRetryTimer);
+			this.heartbeatRetryTimer = undefined;
+		}
+		this.rearmSavedSearchFetch();
 		if (!this.reconnectTimedOut) {
 			this.setStatusMessage("Daemon connection lost; reconnecting…", { tone: "warning", sticky: true });
 		}
@@ -2781,15 +2921,19 @@ export class AgentsViewMode implements Component, Focusable {
 			try {
 				await this.options.recoverDaemon?.();
 				await client.reconnect(1000);
+				if (this.stopped || this.daemonShutdownReceived || client !== this.client) return;
 				if (!this.rosterStore || !(await this.rosterStore.attach(client))) {
 					throw new Error("Daemon lost the agent_roster capability during reconnect");
 				}
+				if (this.stopped || this.daemonShutdownReceived || client !== this.client) return;
 				const heartbeatsRefreshed = await this.refreshHeartbeats({ duringReconnect: true });
-				if (!heartbeatsRefreshed) throw new Error("Heartbeat catalog did not refresh during reconnect");
+				if (this.stopped || this.daemonShutdownReceived || client !== this.client) return;
 				const sessions = this.rosterStore.summaries();
 				this.daemonShutdownReceived = false;
 				this.reconnectTimedOut = false;
-				this.setStatusMessage("Daemon reconnected", { render: false });
+				if (heartbeatsRefreshed || this.statusMessageTone !== "error") {
+					this.setStatusMessage("Daemon reconnected", { render: false });
+				}
 				this.applySessionList(sessions, true);
 				this.armSavedSearchFetch({ duringReconnect: true });
 				return;
@@ -2826,7 +2970,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private getAgentCountsText(): string {
 		// Counts describe the roster, so collapse must not change them.
 		const counts = countRowsBySection(this.sessionRows);
-		return `${counts.pinned} pinned, ${counts.running} running, ${counts.idle} idle, ${counts.inactive} inactive`;
+		return `${counts.pinned} pinned, ${counts.running} running, ${counts.idle} idle, ${counts.inactive} inactive${this.savedCatalogStatus ? ` · ${this.savedCatalogStatus}` : ""}${this.heartbeatCatalogStatus ? ` · ${this.heartbeatCatalogStatus}` : ""}`;
 	}
 
 	private renderSessionRows(width: number, maxRows: number): string[] {

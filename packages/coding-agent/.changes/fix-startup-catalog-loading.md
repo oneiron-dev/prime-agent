@@ -1,0 +1,2 @@
+- Fixed repeated heartbeat loading errors while session workers start or recover.
+- Preserved loaded saved sessions after interrupted catalog scans and showed loading and retry progress.
