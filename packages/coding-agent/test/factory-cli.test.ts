@@ -76,7 +76,11 @@ afterEach(() => {
 describe("optional factory CLI", () => {
 	it("keeps help independent of SQLite, sessions and daemon startup", () => {
 		const { root } = setup();
-		expect(invoke(["help"], root)).toContain("Factory mode is optional");
+		const help = invoke(["help"], root);
+		expect(help).toContain("Factory mode is optional");
+		expect(help).toContain("prime factory settle-no-retry");
+		expect(help).toContain("prime factory withdraw");
+		expect(help).toContain("NOT_EXECUTED");
 		expect(existsSync(join(root, ".prime"))).toBe(false);
 		expect(factoryArguments(["factory", "status", "/tmp/test"])).toEqual(["status", "/tmp/test"]);
 		expect(factoryArguments(["help", "factory"])).toEqual(["help"]);

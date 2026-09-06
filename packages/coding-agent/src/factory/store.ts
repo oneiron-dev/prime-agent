@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
@@ -6,6 +7,7 @@ import type { ManagementClaim, ManagementReconciliation, ManagementRequest, Mana
 import type {
 	ActionRecord,
 	ActionSpec,
+	ActionWithdrawal,
 	AttemptContext,
 	AttemptRecord,
 	CompletionReceipt,
@@ -13,6 +15,7 @@ import type {
 	FactoryEvent,
 	FactoryPlan,
 	FactoryStatus,
+	NonRetrySettlement,
 	PlanMutationReceipt,
 	SlotSpec,
 	TicketRecord,
@@ -32,6 +35,52 @@ function evidenceValid(evidence: DecisionEvidence): void {
 	required(evidence.actor, "evidence.actor");
 	required(evidence.reason, "evidence.reason");
 	required(evidence.ref, "evidence.ref");
+}
+function settlementProof(proof: { ref: string; sha256: string }): string {
+	if (!proof || typeof proof.ref !== "string" || !isAbsolute(proof.ref) || !/^[a-f0-9]{64}$/.test(proof.sha256))
+		throw new Error("Settlement proof requires an absolute artifact path and SHA-256");
+	const stat = statSync(proof.ref);
+	if (!stat.isFile() || stat.size > 1000000)
+		throw new Error("Settlement artifacts must be regular files of at most 1000000 bytes");
+	const bytes = readFileSync(proof.ref);
+	if (bytes.length > 1000000 || createHash("sha256").update(bytes).digest("hex") !== proof.sha256)
+		throw new Error(`Settlement artifact hash mismatch: ${proof.ref}`);
+	return bytes.toString("utf8");
+}
+/** Checks operator-supplied evidence, not remote process liveness. Missing PID or timeout alone is not proof. */
+function verifySettlement(settlement: NonRetrySettlement): void {
+	if (!settlement || settlement.version !== 1) throw new Error("Invalid no-retry settlement");
+	for (const key of [
+		"actionId",
+		"attemptId",
+		"ticketOwner",
+		"slotId",
+		"host",
+		"cwd",
+		"sourceFingerprint",
+		"processIdentity",
+		"uncertainty",
+	] as const)
+		required(settlement[key], `settlement.${key}`);
+	const { custody, artifacts, ...binding } = settlement;
+	if (
+		!custody ||
+		custody.supervisorStopped !== true ||
+		custody.processGroupStopped !== true ||
+		custody.cannotExecute !== true ||
+		typeof custody.observedAt !== "string" ||
+		!Number.isFinite(Date.parse(custody.observedAt))
+	)
+		throw new Error("Settlement requires proven stopped execution custody; UNKNOWN is not safe");
+	const receipt = decode<Record<string, unknown>>(settlementProof(custody));
+	const { ref: _ref, sha256: _sha256, ...facts } = custody;
+	if (!isDeepStrictEqual(receipt, { ...binding, ...facts }))
+		throw new Error("Settlement custody receipt does not match the exact attempt and ownership");
+	if (!Array.isArray(artifacts) || artifacts.length < 1 || artifacts.length > 8)
+		throw new Error("Preserve one to eight settlement evidence artifacts");
+	if (new Set(artifacts.map((artifact) => artifact.ref)).size !== artifacts.length)
+		throw new Error("Settlement artifact refs must be unique");
+	for (const artifact of artifacts) settlementProof(artifact);
 }
 function actionSpec(action: ActionSpec): ActionSpec {
 	return {
@@ -654,7 +703,7 @@ export class FactoryStore {
 			this.refreshReadiness();
 		});
 	}
-	/** Replace rejected work explicitly, retaining its failure history and updating only future dependencies. */
+	/** Replace rejected or deliberately abandoned work explicitly, retaining history and updating only future dependencies. */
 	supersede(actionId: string, replacementId: string, evidence: DecisionEvidence, expectedRevision?: number): number {
 		evidenceValid(evidence);
 		return this.transaction(() => {
@@ -668,13 +717,16 @@ export class FactoryStore {
 				.map((wake) => wake.id);
 			const old = this.action(actionId);
 			const replacement = this.action(replacementId);
-			if (!old || old.state !== "REJECTED") throw new Error("Only rejected work may be superseded");
+			if (!old || (old.state !== "REJECTED" && old.state !== "ABANDONED"))
+				throw new Error("Only rejected or abandoned work may be superseded");
+			if (old.state === "ABANDONED" && !Number.isSafeInteger(expectedRevision))
+				throw new Error("An exact expected plan revision is required for abandoned supersession");
 			if (
 				!replacement ||
 				replacement.id === old.id ||
 				replacement.ticketId !== old.ticketId ||
 				replacement.kind !== old.kind ||
-				replacement.state === "SUPERSEDED"
+				["REJECTED", "ABANDONED", "WITHDRAWN", "SUPERSEDED"].includes(replacement.state)
 			)
 				throw new Error("Replacement must be a distinct current action of the same ticket and kind");
 			const actions = this.actions();
@@ -718,6 +770,7 @@ export class FactoryStore {
 			this.setMeta("plan_revision", String(revision + 1));
 			this.event("action_superseded", actionId, null, {
 				replacementId,
+				previousState: old.state,
 				previousRevision: revision,
 				revision: revision + 1,
 				invalidatedWakeIds,
@@ -742,6 +795,149 @@ export class FactoryStore {
 			this.resolveWakes(attemptId);
 			this.event("uncertainty_resolved_for_retry", action.id, attemptId, { ...evidence });
 			this.refreshReadiness();
+		});
+	}
+	/** Close uncertain work without retry or judgment. The attempt ID is the exactly-once settlement identity. */
+	settleWithoutRetry(
+		actionId: string,
+		settlement: NonRetrySettlement,
+		evidence: DecisionEvidence,
+		expectedRevision: number,
+	): boolean {
+		evidenceValid(evidence);
+		if (
+			!Number.isSafeInteger(expectedRevision) ||
+			expectedRevision < 0 ||
+			settlement?.planRevision !== expectedRevision
+		)
+			throw new Error("An exact expected plan revision is required for settlement");
+		if (settlement.actionId !== actionId) throw new Error("Settlement action identity mismatch");
+		verifySettlement(settlement);
+		const detail = { settlement, ...evidence, outcome: "UNKNOWN" };
+		return this.transaction(() => {
+			if (this.isPaused()) throw new Error("Factory is paused; settlement is blocked");
+			const { attempt, action, slot } = this.context(settlement.attemptId);
+			const prior = this.db
+				.prepare("SELECT detail FROM events WHERE kind='uncertainty_settled_without_retry' AND attempt_id=?")
+				.get(attempt.id);
+			if (prior) {
+				if (!isDeepStrictEqual(decode(prior.detail), detail))
+					throw new Error("Settlement identity reused for a different payload");
+				const superseded =
+					action.state === "SUPERSEDED" &&
+					this.db
+						.prepare(
+							"SELECT 1 FROM events WHERE kind='action_superseded' AND action_id=? AND json_extract(detail,'$.previousState')='ABANDONED'",
+						)
+						.get(actionId);
+				if (
+					(!superseded && action.state !== "ABANDONED") ||
+					attempt.state !== "ABANDONED" ||
+					!attempt.claimReleased
+				)
+					throw new Error("Settlement state changed");
+				return false;
+			}
+			if (Number(this.meta("plan_revision")) !== expectedRevision) throw new Error("Factory plan revision changed");
+			if (
+				action.id !== actionId ||
+				attempt.slotId !== settlement.slotId ||
+				slot.host !== settlement.host ||
+				action.command.cwd !== settlement.cwd ||
+				action.sourceFingerprint !== settlement.sourceFingerprint ||
+				this.tickets().find((ticket) => ticket.id === action.ticketId)?.owner !== settlement.ticketOwner ||
+				!attempt.processIdentity ||
+				attempt.processIdentity !== settlement.processIdentity ||
+				attempt.uncertainty !== settlement.uncertainty
+			)
+				throw new Error("Settlement attempt or ownership changed");
+			const latest = this.db
+				.prepare("SELECT id FROM attempts WHERE action_id=? ORDER BY rowid DESC LIMIT 1")
+				.get(actionId);
+			if (
+				attempt.state !== "UNCERTAIN" ||
+				action.state !== "UNCERTAIN" ||
+				attempt.claimReleased ||
+				!attempt.submittedAt ||
+				attempt.receipt !== null ||
+				latest?.id !== attempt.id
+			)
+				throw new Error("Only the current uncertain claimed attempt and action may be settled without retry");
+			if (!Number.isSafeInteger(settlement.wakeId) || settlement.wakeId < 1)
+				throw new Error("Settlement wake changed");
+			const wake = this.db
+				.prepare("SELECT created_at FROM wakes WHERE id=? AND action_id=? AND attempt_id=? AND resolved_at IS NULL")
+				.get(settlement.wakeId, actionId, attempt.id);
+			if (!wake) throw new Error("Settlement wake changed");
+			const observedAt = Date.parse(settlement.custody.observedAt);
+			if (observedAt < Date.parse(String(wake.created_at)) || observedAt > Date.now())
+				throw new Error("Settlement custody observation must follow the current wake and not be in the future");
+			if (this.managementMutationBlockers().some((request) => request.actionId === actionId))
+				throw new Error("Settlement blocked by unconsumed management requests for this action");
+			this.db.prepare("UPDATE attempts SET state='ABANDONED',claim_released=1 WHERE id=?").run(attempt.id);
+			this.db.prepare("UPDATE actions SET state='ABANDONED' WHERE id=?").run(actionId);
+			this.resolveWakes(attempt.id);
+			this.event("uncertainty_settled_without_retry", actionId, attempt.id, detail);
+			return true;
+		});
+	}
+	/** Atomically close never-claimed work. No attempt, receipt, wake or management authority is manufactured. */
+	withdrawUnstarted(
+		actionId: string,
+		withdrawal: ActionWithdrawal,
+		evidence: DecisionEvidence,
+		expectedRevision: number,
+	): boolean {
+		evidenceValid(evidence);
+		if (!withdrawal || withdrawal.version !== 1) throw new Error("Invalid action withdrawal");
+		if (
+			!Number.isSafeInteger(expectedRevision) ||
+			expectedRevision < 0 ||
+			withdrawal.planRevision !== expectedRevision
+		)
+			throw new Error("An exact expected plan revision is required for withdrawal");
+		for (const key of ["actionId", "ticketId", "ticketOwner", "sourceFingerprint", "cwd"] as const)
+			required(withdrawal[key], `withdrawal.${key}`);
+		if (withdrawal.actionId !== actionId) throw new Error("Withdrawal action identity mismatch");
+		return this.transaction(() => {
+			if (this.isPaused()) throw new Error("Factory is paused; withdrawal is blocked");
+			const action = this.action(actionId);
+			const prior = this.db
+				.prepare("SELECT detail FROM events WHERE kind='action_withdrawn' AND action_id=?")
+				.get(actionId);
+			if (prior) {
+				const { previousState: _previousState, ...payload } = decode<Record<string, unknown>>(prior.detail);
+				if (!isDeepStrictEqual(payload, { withdrawal, ...evidence, outcome: "NOT_EXECUTED" }))
+					throw new Error("Withdrawal identity reused for a different payload");
+				if (action?.state !== "WITHDRAWN") throw new Error("Withdrawal state changed");
+				return false;
+			}
+			if (Number(this.meta("plan_revision")) !== expectedRevision) throw new Error("Factory plan revision changed");
+			if (
+				!action ||
+				action.ticketId !== withdrawal.ticketId ||
+				action.command.cwd !== withdrawal.cwd ||
+				action.sourceFingerprint !== withdrawal.sourceFingerprint ||
+				this.tickets().find((ticket) => ticket.id === action.ticketId)?.owner !== withdrawal.ticketOwner
+			)
+				throw new Error("Withdrawal action or ownership changed");
+			if (
+				(action.state !== "QUEUED" && action.state !== "READY") ||
+				this.db.prepare("SELECT 1 FROM attempts WHERE action_id=? LIMIT 1").get(actionId)
+			)
+				throw new Error("Only unstarted QUEUED or READY actions with zero attempts may be withdrawn");
+			if (this.db.prepare("SELECT 1 FROM management_requests WHERE action_id=? LIMIT 1").get(actionId))
+				throw new Error("Withdrawal requires zero management history for this action");
+			if (this.db.prepare("SELECT 1 FROM wakes WHERE action_id=? LIMIT 1").get(actionId))
+				throw new Error("Withdrawal requires unstarted work without wake history");
+			this.db.prepare("UPDATE actions SET state='WITHDRAWN' WHERE id=?").run(actionId);
+			this.event("action_withdrawn", actionId, null, {
+				withdrawal,
+				...evidence,
+				outcome: "NOT_EXECUTED",
+				previousState: action.state,
+			});
+			return true;
 		});
 	}
 	planMutation(id: string): PlanMutationReceipt | undefined {
