@@ -6,7 +6,7 @@ import { FactoryEngine } from "./engine.js";
 import { FACTORY_HELP } from "./help.js";
 import type { ManagementReconciliation } from "./management.js";
 import { FactoryStore } from "./store.js";
-import type { DecisionEvidence, FactoryPlan } from "./types.js";
+import type { ActionWithdrawal, DecisionEvidence, FactoryPlan, NonRetrySettlement } from "./types.js";
 
 function parseArguments(args: readonly string[]): { positionals: string[]; options: Map<string, string> } {
 	const positionals: string[] = [];
@@ -66,6 +66,31 @@ function emit(value: unknown): void {
 export async function runFactoryCli(args: readonly string[]): Promise<void> {
 	if (!args.length || ["help", "--help", "-h"].includes(args[0]!)) {
 		console.log(FACTORY_HELP);
+		return;
+	}
+	if (args[0] === "settle-no-retry" && args.length === 2 && ["help", "--help", "-h"].includes(args[1]!)) {
+		console.log(`Usage:
+  prime factory settle-no-retry <directory> <action-id> --expected-revision <revision> --expected-attempt <id> --actor <actor> --reason <reason> --ref <absolute-settlement.json>
+
+Atomically abandons a proven-dead UNCERTAIN attempt and its action, releases its claim and closes its wake.
+The original outcome remains UNKNOWN; no terminal receipt, acceptance, rejection or retry is created.
+The version:1 bundle binds actionId, attemptId, planRevision, wakeId, ticketOwner, slotId, host, cwd, sourceFingerprint, processIdentity and uncertainty.
+Its custody object requires ref, sha256, observedAt, supervisorStopped:true, processGroupStopped:true and cannotExecute:true.
+The custody JSON artifact repeats the bundle bindings and the four custody facts, without ref, sha256 or artifacts.
+Preserve one to eight artifacts with absolute ref and sha256. Each proof file must be at most 1000000 bytes.
+This verifies operator evidence; it does not kill or inspect processes. A missing PID, deadline or partial output is not proof.
+Active management authority for this action must be reconciled separately. Dependencies remain blocked.`);
+		return;
+	}
+	if (args[0] === "withdraw" && args.length === 2 && ["help", "--help", "-h"].includes(args[1]!)) {
+		console.log(`Usage:
+  prime factory withdraw <directory> <action-id> --expected-revision <revision> --actor <actor> --reason <reason> --ref <absolute-withdrawal.json>
+
+Atomically closes truly unstarted QUEUED/READY work as WITHDRAWN and journals NOT_EXECUTED.
+The version:1 bundle binds actionId, planRevision, ticketId, ticketOwner, sourceFingerprint and cwd.
+Requires zero attempts, claims, wakes and management history for this action. Refuses if a scheduler claimed it first.
+No attempt, terminal receipt, product judgment or dependency acceptance is created. No process is inspected or launched.
+Preserve the owner directive as evidence and the exact bundle for duplicate delivery. Dependencies remain blocked.`);
 		return;
 	}
 	const { positionals, options } = parseArguments(args);
@@ -164,7 +189,8 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 				emit(engine.status());
 				break;
 			case "supersede":
-				if (!argument || !choice) throw new Error("supersede requires rejected and replacement action IDs");
+				if (!argument || !choice)
+					throw new Error("supersede requires rejected or abandoned and replacement action IDs");
 				engine.supersede(argument, choice, evidence(options), expectedRevision(options));
 				emit(engine.status());
 				break;
@@ -179,6 +205,36 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 				const reconciliation = readFactoryJson(proof.ref) as ManagementReconciliation;
 				engine.reconcileManagement(argument, reconciliation, proof, expectedRevision(options));
 				emit({ ...engine.status(), managementRequests: store.managementRequests() });
+				break;
+			}
+			case "settle-no-retry": {
+				if (!argument || choice) throw new Error("settle-no-retry requires exactly one action-id");
+				const revision = expectedRevision(options);
+				const attemptId = options.get("--expected-attempt");
+				if (!attemptId) throw new Error("An explicit --expected-attempt is required");
+				const proof = evidence(options);
+				if (!isAbsolute(proof.ref)) throw new Error("Settlement --ref must be an absolute bundle path");
+				const bundle = statSync(proof.ref);
+				if (!bundle.isFile() || bundle.size > 1000000)
+					throw new Error("Settlement bundle must be a regular file of at most 1000000 bytes");
+				const settlement = readFactoryJson(proof.ref) as NonRetrySettlement;
+				if (settlement?.attemptId !== attemptId) throw new Error("Settlement attempt identity mismatch");
+				engine.settleWithoutRetry(argument, settlement, proof, revision);
+				emit(engine.status());
+				break;
+			}
+			case "withdraw": {
+				if (!argument || choice) throw new Error("withdraw requires exactly one action-id");
+				if (options.has("--expected-attempt") || options.has("--expected-wake"))
+					throw new Error("withdraw requires unstarted work, not an attempt or wake");
+				const revision = expectedRevision(options);
+				const proof = evidence(options);
+				if (!isAbsolute(proof.ref)) throw new Error("Withdrawal --ref must be an absolute bundle path");
+				const bundle = statSync(proof.ref);
+				if (!bundle.isFile() || bundle.size > 1000000)
+					throw new Error("Withdrawal bundle must be a regular file of at most 1000000 bytes");
+				engine.withdrawUnstarted(argument, readFactoryJson(proof.ref) as ActionWithdrawal, proof, revision);
+				emit(engine.status());
 				break;
 			}
 			case "resolve":
