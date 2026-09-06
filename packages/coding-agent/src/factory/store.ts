@@ -729,6 +729,16 @@ export class FactoryStore {
 				["REJECTED", "ABANDONED", "WITHDRAWN", "SUPERSEDED"].includes(replacement.state)
 			)
 				throw new Error("Replacement must be a distinct current action of the same ticket and kind");
+			if (
+				old.state === "ABANDONED" &&
+				((replacement.state !== "QUEUED" && replacement.state !== "READY") ||
+					this.db.prepare("SELECT 1 FROM attempts WHERE action_id=? LIMIT 1").get(replacementId) ||
+					this.db.prepare("SELECT 1 FROM wakes WHERE action_id=? LIMIT 1").get(replacementId) ||
+					this.db.prepare("SELECT 1 FROM management_requests WHERE action_id=? LIMIT 1").get(replacementId))
+			)
+				throw new Error(
+					"Abandoned work requires an unstarted QUEUED or READY replacement with no execution history",
+				);
 			const actions = this.actions();
 			const changed: ActionSpec[] = [];
 			for (const action of actions) {
@@ -812,7 +822,6 @@ export class FactoryStore {
 		)
 			throw new Error("An exact expected plan revision is required for settlement");
 		if (settlement.actionId !== actionId) throw new Error("Settlement action identity mismatch");
-		verifySettlement(settlement);
 		const detail = { settlement, ...evidence, outcome: "UNKNOWN" };
 		return this.transaction(() => {
 			if (this.isPaused()) throw new Error("Factory is paused; settlement is blocked");
@@ -838,6 +847,7 @@ export class FactoryStore {
 					throw new Error("Settlement state changed");
 				return false;
 			}
+			verifySettlement(settlement);
 			if (Number(this.meta("plan_revision")) !== expectedRevision) throw new Error("Factory plan revision changed");
 			if (
 				action.id !== actionId ||

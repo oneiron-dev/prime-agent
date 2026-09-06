@@ -1,8 +1,10 @@
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runFactoryCli } from "../src/factory/cli.js";
 import { FactoryEngine } from "../src/factory/engine.js";
@@ -143,6 +145,125 @@ describe("native no-retry settlement", () => {
 			expect(f.store.events(0, 10000).find((event) => event.kind === "action_superseded")).toMatchObject({
 				detail: { previousState: "ABANDONED", replacementId: "replacement" },
 			});
+		});
+
+		it.each(["QUEUED", "READY"] as const)("allows only fresh %s replacement work", (state) => {
+			const f = fixture();
+			f.engine.settleWithoutRetry("old", f.settlement, evidence, 1);
+			const replacement = {
+				...f.plan.actions[0],
+				id: "replacement",
+				dependencies: state === "QUEUED" ? ["other"] : [],
+			};
+			f.engine.applyPlan({ version: 1, tickets: [], slots: [], actions: [replacement] }, 1);
+			expect(f.store.actions().at(-1)!.state).toBe(state);
+			expect(f.store.attempts().filter((attempt) => attempt.actionId === "replacement")).toEqual([]);
+			expect(f.engine.supersede("old", "replacement", evidence, 2)).toBe(3);
+			expect(f.store.actions()[1]).toMatchObject({ state: "QUEUED", dependencies: ["replacement"] });
+			expect(f.store.context(f.attemptId).attempt).toMatchObject({ state: "ABANDONED", receipt: null });
+		});
+
+		it.each(["ACCEPTED", "RUNNING", "UNCERTAIN", "AWAITING_DECISION"] as const)(
+			"refuses a genuinely started %s replacement without rewiring dependencies",
+			(state) => {
+				const f = fixture(state === "AWAITING_DECISION" ? "decision" : "process");
+				f.engine.settleWithoutRetry("old", f.settlement, evidence, 1);
+				const replacement = { ...f.plan.actions[0], id: "replacement" };
+				f.engine.applyPlan({ version: 1, tickets: [], slots: [], actions: [replacement] }, 1);
+				const claimed = f.store.claim("replacement", "slot")!;
+				f.store.markSubmitted(claimed.attempt.id);
+				f.store.markRunning(claimed.attempt.id, "replacement:pid:start");
+				if (state === "UNCERTAIN") f.store.markUncertain(claimed.attempt.id, "replacement custody unknown");
+				if (state === "ACCEPTED" || state === "AWAITING_DECISION")
+					f.store.complete({
+						attemptId: claimed.attempt.id,
+						sourceFingerprint: replacement.sourceFingerprint,
+						exitCode: 0,
+						finishedAt: new Date().toISOString(),
+					});
+				expect(f.store.actions().at(-1)!.state).toBe(state);
+				const db = new DatabaseSync(f.path);
+				try {
+					const dependencies = db.prepare("SELECT * FROM dependencies ORDER BY action_id,dependency_id").all();
+					const before = snapshot(f.store);
+					expect(() => f.engine.supersede("old", "replacement", evidence, 2)).toThrow("unstarted");
+					expect(snapshot(f.store)).toEqual(before);
+					expect(db.prepare("SELECT * FROM dependencies ORDER BY action_id,dependency_id").all()).toEqual(
+						dependencies,
+					);
+					expect(f.store.claim("dependent", "other-slot")).toBeUndefined();
+				} finally {
+					db.close();
+				}
+			},
+		);
+
+		describe.each(["QUEUED", "READY"] as const)("%s replacement history", (state) => {
+			it.each(["claim", "released-prepared", "retry", "wake", "management"])(
+				"refuses %s without rewiring dependencies",
+				(history) => {
+					const f = fixture();
+					f.engine.settleWithoutRetry("old", f.settlement, evidence, 1);
+					f.engine.applyPlan(
+						{ version: 1, tickets: [], slots: [], actions: [{ ...f.plan.actions[0], id: "replacement" }] },
+						1,
+					);
+					if (["claim", "released-prepared", "retry"].includes(history)) {
+						const claimed = f.store.claim("replacement", "slot")!;
+						if (history === "released-prepared") f.store.abandonPrepared(claimed.attempt.id);
+						if (history === "retry") {
+							f.store.markSubmitted(claimed.attempt.id);
+							f.store.markUncertain(claimed.attempt.id, "retry custody");
+							f.store.resolveForRetry(claimed.attempt.id, evidence, 2);
+						}
+					}
+					const db = new DatabaseSync(f.path);
+					try {
+						db.prepare("UPDATE actions SET state=? WHERE id='replacement'").run(state);
+						if (history === "wake" || history === "management")
+							db.exec(
+								"INSERT INTO wakes(id,action_id,reason,created_at,resolved_at) VALUES(99,'replacement','history','2026-09-06','2026-09-06')",
+							);
+						if (history === "management") {
+							db.exec(
+								"INSERT INTO management_requests(id,wake_id,action_id,attempt_id,plan_revision,evidence_sha256,created_at,state) VALUES('history',99,'replacement','history',2,'hash','2026-09-06','RECONCILED')",
+							);
+							db.exec("UPDATE wakes SET action_id='other' WHERE id=99");
+						}
+						const before = snapshot(f.store);
+						const dependencies = db.prepare("SELECT * FROM dependencies ORDER BY action_id,dependency_id").all();
+						expect(() => f.engine.supersede("old", "replacement", evidence, 2), history).toThrow("unstarted");
+						expect(snapshot(f.store), history).toEqual(before);
+						expect(db.prepare("SELECT * FROM dependencies ORDER BY action_id,dependency_id").all()).toEqual(
+							dependencies,
+						);
+					} finally {
+						db.close();
+					}
+				},
+			);
+		});
+
+		it("preserves intentional REJECTED supersession by an accepted replacement", () => {
+			const f = fixture();
+			f.store.complete({
+				attemptId: f.attemptId,
+				sourceFingerprint: f.settlement.sourceFingerprint,
+				exitCode: 1,
+				finishedAt: new Date().toISOString(),
+			});
+			const replacement = { ...f.plan.actions[0], id: "replacement" };
+			f.engine.applyPlan({ version: 1, tickets: [], slots: [], actions: [replacement] }, 1);
+			const claimed = f.store.claim("replacement", "slot")!;
+			f.store.markSubmitted(claimed.attempt.id);
+			f.store.complete({
+				attemptId: claimed.attempt.id,
+				sourceFingerprint: replacement.sourceFingerprint,
+				exitCode: 0,
+				finishedAt: new Date().toISOString(),
+			});
+			expect(f.engine.supersede("old", "replacement", evidence)).toBe(3);
+			expect(f.store.actions()[1]).toMatchObject({ state: "READY", dependencies: ["replacement"] });
 		});
 
 		it.each(["self", "missing", "cycle", "ticket", "kind", "REJECTED", "ABANDONED", "WITHDRAWN", "SUPERSEDED"])(
@@ -366,6 +487,145 @@ describe("native no-retry settlement", () => {
 		);
 		expect(snapshot(f.store)).toEqual(before);
 	});
+
+	it("replays committed identity after proof removal, but rejects mismatched delivery without writes", () => {
+		const f = fixture();
+		expect(f.store.settleWithoutRetry("old", f.settlement, evidence, 1)).toBe(true);
+		rmSync(f.settlement.custody.ref);
+		for (const proof of f.settlement.artifacts) rmSync(proof.ref);
+		const second = new FactoryStore(f.path);
+		stores.push(second);
+		const before = snapshot(second);
+		expect(second.settleWithoutRetry("old", structuredClone(f.settlement), { ...evidence }, 1)).toBe(false);
+		for (const key of [
+			"ticketOwner",
+			"slotId",
+			"host",
+			"cwd",
+			"sourceFingerprint",
+			"processIdentity",
+			"uncertainty",
+			"wakeId",
+		] as const) {
+			const changed = { ...f.settlement, [key]: key === "wakeId" ? 999 : "changed" };
+			expect(() => second.settleWithoutRetry("old", changed, evidence, 1)).toThrow("different payload");
+		}
+		const changedProof = { ...f.settlement, custody: { ...f.settlement.custody, sha256: "0".repeat(64) } };
+		expect(() => second.settleWithoutRetry("old", changedProof, evidence, 1)).toThrow("different payload");
+		const changedArtifact = { ...f.settlement, artifacts: [{ ...f.settlement.artifacts[0], ref: "/changed" }] };
+		expect(() => second.settleWithoutRetry("old", changedArtifact, evidence, 1)).toThrow("different payload");
+		expect(() => second.settleWithoutRetry("old", f.settlement, { ...evidence, reason: "changed" }, 1)).toThrow(
+			"different payload",
+		);
+		expect(() => second.settleWithoutRetry("other", f.settlement, evidence, 1)).toThrow("action identity");
+		expect(() => second.settleWithoutRetry("old", f.settlement, evidence, 2)).toThrow("revision");
+		expect(() => second.settleWithoutRetry("old", { ...f.settlement, planRevision: 2 }, evidence, 2)).toThrow(
+			"different payload",
+		);
+		expect(() => second.settleWithoutRetry("old", { ...f.settlement, attemptId: "unknown" }, evidence, 1)).toThrow(
+			"Unknown attempt",
+		);
+		expect(snapshot(second)).toEqual(before);
+	});
+
+	it.each(["action", "attempt", "claim"])("refuses committed replay after %s state changes", (field) => {
+		const f = fixture();
+		f.store.settleWithoutRetry("old", f.settlement, evidence, 1);
+		rmSync(f.settlement.custody.ref);
+		for (const proof of f.settlement.artifacts) rmSync(proof.ref);
+		const db = new DatabaseSync(f.path);
+		try {
+			if (field === "action") db.exec("UPDATE actions SET state='READY' WHERE id='old'");
+			if (field === "attempt") db.prepare("UPDATE attempts SET state='RUNNING' WHERE id=?").run(f.attemptId);
+			if (field === "claim") db.prepare("UPDATE attempts SET claim_released=0 WHERE id=?").run(f.attemptId);
+			const before = snapshot(f.store);
+			expect(() => f.store.settleWithoutRetry("old", f.settlement, evidence, 1)).toThrow("Settlement state changed");
+			expect(snapshot(f.store)).toEqual(before);
+		} finally {
+			db.close();
+		}
+	});
+
+	it.each([false, true])(
+		"serializes concurrent settlement delivery with mismatched=%s payload",
+		async (mismatched) => {
+			const f = fixture();
+			const source = pathToFileURL(resolve("src/factory/store.ts")).href;
+			const loader = pathToFileURL(resolve("../../node_modules/tsx/dist/loader.mjs")).href;
+			const workers = [0, 1].map((index) => {
+				const delivery = mismatched && index === 1 ? { ...evidence, reason: "other delivery" } : evidence;
+				const call = `store.settleWithoutRetry("old", ${JSON.stringify(f.settlement)}, ${JSON.stringify(delivery)}, 1)`;
+				const code = `import { FactoryStore } from ${JSON.stringify(source)}; const store = new FactoryStore(${JSON.stringify(f.path)}); process.stdout.write(${JSON.stringify("ready\n")}); process.stdin.once('data', () => { try { console.log(JSON.stringify({ won: ${call} })); } catch(error) { console.log(JSON.stringify({ won: false, error: error.message })); } finally { store.close(); process.stdin.destroy(); } });`;
+				const child = spawn(process.execPath, ["--import", loader, "--input-type=module", "-e", code], {
+					stdio: ["pipe", "pipe", "pipe"],
+				});
+				let output = "";
+				let stderr = "";
+				const ready = new Promise<void>((done, reject) => {
+					child.stdout.on("data", (data) => {
+						output += String(data);
+						if (output.includes("ready\n")) done();
+					});
+					child.once("error", reject);
+					child.once("close", () => {
+						if (!output.includes("ready\n")) reject(new Error(stderr || "Worker closed before ready"));
+					});
+				});
+				child.stderr.on("data", (data) => {
+					stderr += String(data);
+				});
+				const done = new Promise<{ won: boolean; error?: string }>((done, reject) => {
+					child.once("error", reject);
+					child.stdin.on("error", reject);
+					child.once("close", (exit) => {
+						if (exit !== 0) reject(new Error(stderr || `Worker closed with code ${exit}`));
+						else {
+							try {
+								done(JSON.parse(output.trim().split("\n").at(-1)!));
+							} catch (error) {
+								reject(error);
+							}
+						}
+					});
+				});
+				return { child, ready, done };
+			});
+			try {
+				const [, results] = await Promise.all([
+					Promise.all(workers.map((worker) => worker.ready)).then(() => {
+						for (const worker of workers) worker.child.stdin.write("go\n");
+					}),
+					Promise.all(workers.map((worker) => worker.done)),
+				]);
+				expect(results.filter((result) => result.won)).toHaveLength(1);
+				const duplicate = results.find((result) => !result.won)!;
+				if (mismatched) expect(duplicate.error).toContain("different payload");
+				else expect(duplicate.error).toBeUndefined();
+				expect(f.store.actions()[0].state).toBe("ABANDONED");
+				expect(f.store.actions()[1]).toMatchObject({ state: "QUEUED", dependencies: ["old"] });
+				expect(f.store.attempts()).toHaveLength(1);
+				expect(f.store.context(f.attemptId).attempt).toMatchObject({
+					state: "ABANDONED",
+					claimReleased: true,
+					receipt: null,
+					uncertainty,
+				});
+				const settled = f.store
+					.events(0, 10000)
+					.filter((event) => event.kind === "uncertainty_settled_without_retry");
+				expect(settled).toHaveLength(1);
+				expect(settled[0].detail).toEqual({
+					settlement: f.settlement,
+					...evidence,
+					reason: mismatched && results[1].won ? "other delivery" : evidence.reason,
+					outcome: "UNKNOWN",
+				});
+			} finally {
+				for (const worker of workers) worker.child.kill();
+				await Promise.allSettled(workers.map((worker) => worker.done));
+			}
+		},
+	);
 
 	it.each([0, 2, NaN, undefined])("refuses stale or absent revision %s atomically", (revision) => {
 		const f = fixture();
