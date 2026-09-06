@@ -12,6 +12,7 @@ import {
 	type OneironPermit,
 	type OneironReceipt,
 	type OneironRuntime,
+	prepareOneiron,
 } from "../src/factory/adapters/oneiron.js";
 import { inspectOneironCorpus, type OneironPin, oneironSha } from "../src/factory/adapters/oneiron-review.js";
 
@@ -408,7 +409,50 @@ test("historical completion cannot satisfy current review acceptance, even with 
 	const stage = f.manifest.stage;
 	if (stage.kind !== "triage") throw new Error("fixture");
 	const receipt = (await f.execute()) as OneironReceipt;
-	const gate = f.pin({ ...receipt, stage: "gate", result: { commandRc: 0, provenancePassed: true } });
+	const proof = f.pin({
+		fixtureOnly: true,
+		evidenceKind: "UNIT MOCK",
+		status: "COMPLETED",
+		command_rc: 0,
+		workspace_root: f.manifest.source.workspace,
+		command: ["cargo", "test", "fixture"],
+		provenance: { pass: true },
+	});
+	const gateManifest: OneironManifest = {
+		...f.manifest,
+		outputDirectory: join(f.directory, "unit-mock-gate"),
+		stage: {
+			kind: "gate",
+			wrapper: f.pin({ evidenceKind: "UNIT MOCK wrapper; never executed" }),
+			capacity: f.pin({ evidenceKind: "UNIT MOCK capacity" }),
+			host: "arch",
+			slot: 1,
+			argv: ["cargo", "test", "fixture"],
+		},
+	};
+	const gateManifestPin = f.pin(gateManifest);
+	const gateAction = prepareOneiron(gateManifest, {
+		manifestPath: gateManifestPin.path,
+		permitPath: join(f.directory, "unit-mock-gate-permit.json"),
+		adapterArgv: [
+			process.execPath,
+			fileURLToPath(new URL("../src/factory/adapters/oneiron-entry.ts", import.meta.url)),
+		],
+		host: "local",
+		slotId: "unit-mock-gate-slot",
+	}).action!;
+	vi.mocked(f.runtime.status).mockResolvedValue({
+		paused: false,
+		ownerPaused: false,
+		actions: [{ ...gateAction, description: "UNIT MOCK historical Cargo action; never executed", state: "ACCEPTED" }],
+	});
+	const gate = f.pin({
+		...receipt,
+		stage: "gate",
+		manifestSha256: gateManifestPin.sha256,
+		stageSha256: oneironSha(JSON.stringify(gateManifest.stage)),
+		result: { commandRc: 0, provenancePassed: true, proof },
+	});
 	f.manifest.outputDirectory = join(f.directory, "acceptance");
 	// Excess JSON fields must not opt acceptance into the triage-only extension.
 	f.manifest.stage = { ...stage, kind: "review-acceptance", triage: f.pin(receipt), gates: [gate] };

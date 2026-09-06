@@ -176,16 +176,59 @@ async function fixture() {
 			},
 		},
 	});
+	const gateProof = pin(directory, "gate-proof.json", {
+		fixtureOnly: true,
+		evidenceKind: "UNIT MOCK",
+		status: "COMPLETED",
+		command_rc: 0,
+		workspace_root: workspace,
+		command: ["cargo", "test", "fixture"],
+		provenance: { pass: true },
+	});
+	const gateManifest: OneironManifest = {
+		version: 1,
+		ticketId: "FIXTURE-1",
+		owner: "fixture-owner",
+		source,
+		factoryDirectory,
+		ownerPauseFile,
+		custody,
+		outputDirectory: join(directory, "unit-mock-gate"),
+		stage: {
+			kind: "gate",
+			wrapper: pin(directory, "gate-wrapper.json", { evidenceKind: "UNIT MOCK wrapper; never executed" }),
+			capacity: pin(directory, "gate-capacity.json", { evidenceKind: "UNIT MOCK capacity" }),
+			host: "arch",
+			slot: 1,
+			argv: ["cargo", "test", "fixture"],
+		},
+	};
+	const gateManifestPin = pin(directory, "gate-manifest.json", gateManifest);
+	const gateAction = prepareOneiron(gateManifest, {
+		manifestPath: gateManifestPin.path,
+		permitPath: join(directory, "unit-mock-gate-permit.json"),
+		adapterArgv: [process.execPath, "--import", tsx, entry],
+		host: "local",
+		slotId: "fixture-slot",
+	}).action!;
+	const historicalGateAction = {
+		...gateAction,
+		description: "UNIT MOCK historical Cargo action; never executed",
+		state: "ACCEPTED",
+	};
 	const gate = pin(directory, "gate.json", {
 		...receiptBase,
 		stage: "gate",
-		result: { commandRc: 0, provenancePassed: true },
+		manifestSha256: gateManifestPin.sha256,
+		stageSha256: oneironSha(JSON.stringify(gateManifest.stage)),
+		result: { commandRc: 0, provenancePassed: true, proof: gateProof },
 	});
+	// Only the historical gate action is synthetic; live stage/journal status still comes from the real CLI.
 	const pinnedCli = join(bin, "factory-cli.mjs");
 	const statusArgs = ["--import", tsx, factoryEntry, "status", factoryDirectory];
 	writeFileSync(
 		pinnedCli,
-		`import {execFileSync} from "node:child_process"; if(JSON.stringify(process.argv.slice(2))!==${JSON.stringify(JSON.stringify(["factory", "status", factoryDirectory]))})throw Error("fixture forbids non-status calls"); process.stdout.write(execFileSync(${JSON.stringify(process.execPath)},${JSON.stringify(statusArgs)}));`,
+		`import {execFileSync} from "node:child_process"; if(JSON.stringify(process.argv.slice(2))!==${JSON.stringify(JSON.stringify(["factory", "status", factoryDirectory]))})throw Error("fixture forbids non-status calls"); const status = JSON.parse(execFileSync(${JSON.stringify(process.execPath)},${JSON.stringify(statusArgs)})); status.actions.push(${JSON.stringify(historicalGateAction)}); console.log(JSON.stringify(status));`,
 	);
 	const factoryRuntime = pin(directory, "factory-runtime.json", {
 		version: 1,

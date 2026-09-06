@@ -1,9 +1,9 @@
-import { spawn } from "node:child_process";
-import { closeSync, existsSync, fsyncSync, openSync, writeSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { readFactoryRuntime, requireFactoryJsonEventProfile } from "../runtime.js";
 import type { ActionRecord, AttemptRecord } from "../types.js";
 import type { OneironManifest, OneironSource } from "./oneiron.js";
+import { runOneironCapture } from "./oneiron-capture.js";
 import type { OneironPin } from "./oneiron-review.js";
 import {
 	ONEIRON_TRANSPORT_LIMITS,
@@ -340,60 +340,10 @@ export function runOneironWriterForeground(
 	transcriptPath: string,
 	environment: Record<string, string> = {},
 ): Promise<void> {
-	const fd = openSync(transcriptPath, "wx", 0o600);
-	return new Promise((resolve, reject) => {
-		try {
-			const child = spawn(argv[0]!, argv.slice(1), {
-				cwd,
-				detached: false,
-				stdio: ["ignore", "pipe", "inherit"],
-				env: { ...process.env, ...environment, GIT_OPTIONAL_LOCKS: "0" },
-			});
-			let rawBytes = 0;
-			let failure: Error | undefined;
-			const stop = (error: Error) => {
-				failure ??= error;
-				child.stdout.pause();
-				child.kill("SIGTERM");
-			};
-			child.stdout.on("data", (chunk: Buffer) => {
-				if (failure) return;
-				try {
-					const observedBytes = rawBytes + chunk.length;
-					const size = Math.min(chunk.length, ONEIRON_TRANSPORT_LIMITS.rawBytes - rawBytes);
-					let written = 0;
-					while (written < size) written += writeSync(fd, chunk, written, size - written);
-					rawBytes += size;
-					if (size < chunk.length)
-						stop(
-							new Error(
-								`Writer stdout rawBytes=${observedBytes} exceeds limit=${ONEIRON_TRANSPORT_LIMITS.rawBytes}; retained partial log requires reconciliation`,
-							),
-						);
-				} catch (error) {
-					stop(error instanceof Error ? error : new Error(String(error)));
-				}
-			});
-			child.stdout.on("error", stop);
-			child.on("error", (error) => {
-				failure ??= error;
-			});
-			child.on("close", (code, signal) => {
-				try {
-					fsyncSync(fd);
-				} catch (error) {
-					failure ??= error instanceof Error ? error : new Error(String(error));
-				} finally {
-					closeSync(fd);
-				}
-				if (failure) reject(failure);
-				else if (code !== 0)
-					reject(new Error(`Foreground writer exited ${code ?? signal}; retain log and reconcile`));
-				else resolve();
-			});
-		} catch (error) {
-			closeSync(fd);
-			reject(error);
-		}
-	});
+	return runOneironCapture(argv, cwd, {
+		stdoutPath: transcriptPath,
+		limitBytes: ONEIRON_TRANSPORT_LIMITS.rawBytes,
+		environment,
+		label: "writer",
+	}).then(() => {});
 }

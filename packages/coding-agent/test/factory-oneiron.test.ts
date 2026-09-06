@@ -14,6 +14,7 @@ import {
 	type OneironRuntime,
 	prepareOneiron,
 } from "../src/factory/adapters/oneiron.js";
+import { runOneironCapture } from "../src/factory/adapters/oneiron-capture.js";
 import { inspectOneironCorpus, type OneironPin, oneironSha } from "../src/factory/adapters/oneiron-review.js";
 import { defaultOneironWriterProfile, validateOneironWriterReceipt } from "../src/factory/adapters/oneiron-writer.js";
 import { FactoryEngine } from "../src/factory/engine.js";
@@ -113,7 +114,12 @@ function setup() {
 		version: 1,
 		cliArgv: [runtimeNode, runtimeCli],
 		files: [runtimeNode, runtimeCli].map((path) => ({ path, sha256: oneironSha(readFileSync(path)) })),
-		capabilities: ["provider-response-model-v1", "factory-completed-json-v1"],
+		capabilities: [
+			"provider-response-model-v1",
+			"factory-completed-json-v1",
+			"oneiron-native-gate-capture-v1",
+			"oneiron-cargo-nextest-doc-v1",
+		],
 	});
 	const manifestPath = join(directory, "manifest.json");
 	const permitPath = join(directory, "permit.json");
@@ -170,6 +176,31 @@ function setup() {
 			};
 		}),
 	};
+	// Explicit unit wrapper fixture: capture the mocked wrapper response, not production Cargo evidence.
+	runtime.capture = vi.fn(async (argv, cwd, options) => {
+		const stdout = await runtime.run(argv, cwd, options.environment);
+		writeFileSync(options.stdoutPath, stdout);
+		writeFileSync(options.stderrPath!, "");
+		const stream = (path: string, text: string) => ({
+			path,
+			sha256: oneironSha(text),
+			bytes: Buffer.byteLength(text),
+			observedBytes: Buffer.byteLength(text),
+			truncated: false,
+			preview: text,
+		});
+		return {
+			argv,
+			cwd,
+			environment: options.environment ?? {},
+			startedAt: new Date().toISOString(),
+			finishedAt: new Date().toISOString(),
+			exitCode: 0,
+			signal: null,
+			stdout: stream(options.stdoutPath, stdout),
+			stderr: stream(options.stderrPath!, ""),
+		};
+	});
 	seal();
 	const execute = () => executeOneiron(manifestPath, permitPath, true, runtime);
 	return { directory, manifest, manifestPath, permitPath, pin, seal, runtime, execute };
@@ -182,6 +213,135 @@ afterEach(() => {
 });
 
 describe("Oneiron preparation and execution gates", () => {
+	test("retains genuine local cargo fmt nonzero stdout/stderr in the native gate failure summary", async () => {
+		const f = setup(),
+			cwd = f.manifest.source.workspace;
+		mkdirSync(join(cwd, "src"));
+		writeFileSync(join(cwd, "Cargo.toml"), '[package]\nname="capture_fixture"\nversion="0.1.0"\nedition="2021"\n');
+		writeFileSync(join(cwd, "src/lib.rs"), "pub fn value( )->i32{1}\n");
+		// Unit wrapper plumbing only. Runs genuine local rustfmt; never fabricates a successful v23 proof.
+		const wrapper = f.pin(
+			'import subprocess,sys\nsys.stderr.write("fmt fixture stderr prefix\\n")\nsys.exit(subprocess.call(["/home/lexi/.cargo/bin/cargo","fmt","--check"]))\n',
+		);
+		const argv = ["cargo", "fmt", "--check"];
+		f.manifest.stage = {
+			kind: "gate",
+			host: "arch",
+			slot: 1,
+			argv,
+			wrapper,
+			capacity: f.pin({
+				status: "PASS",
+				sourceFingerprint: f.manifest.source.fingerprint,
+				host: "arch",
+				slot: 1,
+				argv,
+				expiresAt: "2099-01-01",
+				duplicateFree: true,
+				resourcesPassed: true,
+			}),
+		};
+		f.runtime.capture = runOneironCapture;
+		f.seal();
+		await expect(f.execute()).rejects.toThrow(/Foreground Gate exited 1/);
+		expect(readFileSync(join(f.manifest.outputDirectory, "command-0.stdout"), "utf8")).toContain("Diff in");
+		expect(readFileSync(join(f.manifest.outputDirectory, "command-0.stderr"), "utf8")).toContain(
+			"fmt fixture stderr prefix",
+		);
+		expect(JSON.parse(readFileSync(join(f.manifest.outputDirectory, "command-0.json"), "utf8"))).toMatchObject({
+			exitCode: 1,
+			stdout: { truncated: false },
+			stderr: { truncated: false },
+		});
+		expect(existsSync(join(f.manifest.outputDirectory, "receipt.json"))).toBe(false);
+	});
+	test.each(["nextest", "doc"])(
+		"extended Cargo %s requires substantive exact-root v23 proof and preserves historical reuse",
+		async (verb) => {
+			const f = setup(),
+				argv = verb === "doc" ? ["cargo", "doc", "--no-deps"] : ["cargo", "nextest", "run", "--lib"];
+			const capacity = f.pin({
+				status: "PASS",
+				sourceFingerprint: f.manifest.source.fingerprint,
+				host: "arch",
+				slot: 1,
+				argv,
+				expiresAt: "2099-01-01",
+				duplicateFree: true,
+				resourcesPassed: true,
+			});
+			f.manifest.stage = {
+				kind: "gate",
+				host: "arch",
+				slot: 1,
+				argv,
+				wrapper: f.pin("UNIT MOCK v23 wrapper; never invoked"),
+				capacity,
+			};
+			let depInfoFiles = 0;
+			vi.mocked(f.runtime.run).mockImplementation(async (argv) => {
+				writeFileSync(
+					argv[argv.indexOf("--receipt") + 1]!,
+					JSON.stringify({
+						schema: "oneiron.wave6.cargo-slot-v2.3-provenance.v1",
+						runner_version: "v2.3-five-slot",
+						slot: 1,
+						status: "COMPLETED",
+						command_rc: 0,
+						workspace_root: f.manifest.source.workspace,
+						command:
+							f.manifest.stage.kind === "gate" && f.manifest.stage.driver !== "bun-docs-v1"
+								? f.manifest.stage.argv
+								: [],
+						provenance: {
+							pass: true,
+							dep_info_files: depInfoFiles,
+							exact_root_seen: true,
+							foreign_wave_roots: [],
+						},
+					}),
+				);
+				return "UNIT MOCK substantive schema fixture; not production Cargo proof";
+			});
+			f.seal();
+			await expect(f.execute()).rejects.toThrow(/substantive v23/);
+			depInfoFiles = 2;
+			f.manifest.outputDirectory = join(f.directory, "gate-success");
+			f.seal();
+			const receipt = (await f.execute()) as OneironReceipt;
+			expect(receipt.result.provenancePassed).toBe(true);
+			const pinned = JSON.parse(readFileSync(f.manifest.factoryRuntime!.path, "utf8"));
+			pinned.capabilities = ["provider-response-model-v1"];
+			f.manifest.factoryRuntime = f.pin(pinned);
+			f.manifest.completed = f.pin(receipt);
+			f.seal();
+			expect(inspectOneiron(f.manifest).reuse).toBeTruthy();
+			expect(await f.execute()).toEqual({ reused: f.manifest.completed });
+		},
+	);
+
+	test.each(["list", "archive", "self", "run-extra", ""])("rejects non-run nextest %s", (verb) => {
+		const f = setup();
+		f.manifest.stage = {
+			kind: "gate",
+			host: "arch",
+			slot: 1,
+			wrapper: f.pin("wrapper"),
+			capacity: f.pin({}),
+			argv: ["cargo", "nextest", verb],
+		};
+		expect(() => inspectOneiron(f.manifest)).toThrow(/nextest supports run/);
+	});
+
+	test.each([
+		["cargo", "nextest", "run", "--lib"],
+		["cargo", "doc", "--no-deps"],
+	])("admits documented native gate %j", (...argv) => {
+		const f = setup();
+		f.manifest.stage = { kind: "gate", host: "arch", slot: 1, wrapper: f.pin("wrapper"), capacity: f.pin({}), argv };
+		expect(() => inspectOneiron(f.manifest)).not.toThrow();
+	});
+
 	test("prepares a concrete triage-only decision while paused and pending transfer, without executing", () => {
 		const f = setup();
 		writeFileSync(f.manifest.ownerPauseFile, "paused");
@@ -377,6 +537,20 @@ describe("Oneiron preparation and execution gates", () => {
 			return "";
 		});
 		const gate = f.pin(await f.execute());
+		// UNIT MOCK journal retains the original prepared Cargo manifest, not mutable gate labels.
+		const original = f.pin(f.manifest);
+		const prepared = prepareOneiron(f.manifest, {
+			manifestPath: original.path,
+			permitPath: f.permitPath,
+			adapterArgv: [process.execPath, "adapter.js"],
+			host: "arch",
+			slotId: "slot1",
+		}).action!;
+		vi.mocked(f.runtime.status).mockResolvedValue({
+			paused: false,
+			ownerPaused: false,
+			actions: [{ ...prepared, state: "ACCEPTED" }],
+		});
 		if (review.kind !== "triage") throw new Error("fixture stage");
 		f.manifest.outputDirectory = join(f.directory, "acceptance");
 		f.manifest.stage = { ...review, kind: "review-acceptance", triage, gates: [gate] };

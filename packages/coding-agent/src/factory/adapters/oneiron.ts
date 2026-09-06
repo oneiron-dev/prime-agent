@@ -18,6 +18,20 @@ import {
 } from "../runtime.js";
 import type { ActionSpec, FactoryStatus } from "../types.js";
 import { fingerprintCommand } from "./command.js";
+import { runOneironCapture } from "./oneiron-capture.js";
+import {
+	captureOneironGate,
+	executeOneironDocsGate,
+	inspectOneironDocsStage,
+	ONEIRON_DOCS_ENTRY_ENVIRONMENT,
+	type OneironDocsGateStage,
+	type OneironGateStatus,
+	oneironDocsEntry,
+	requireOneironGateRuntime,
+	validateOneironDocsProof,
+	validateOneironDocsTerminal,
+} from "./oneiron-docs-gate.js";
+import { oneironInterlockPrefix } from "./oneiron-interlock.js";
 import { type OneironPublicationStage, publishOneiron } from "./oneiron-publication.js";
 import {
 	inspectOneironCorpus,
@@ -31,7 +45,6 @@ import {
 import { readOneironTransport } from "./oneiron-transport.js";
 import {
 	type OneironWriterStage,
-	type OneironWriterStatus,
 	oneironWriterCli,
 	readOneironWriterProfile,
 	runOneironWriterForeground,
@@ -59,9 +72,11 @@ interface ReviewInput {
 	evidence: OneironPin[];
 }
 export type OneironStage =
+	| OneironDocsGateStage
 	| OneironWriterStage
 	| {
 			kind: "gate";
+			driver?: "cargo";
 			wrapper: OneironPin;
 			host: "arch" | "macbook" | "mini";
 			slot: number;
@@ -120,7 +135,8 @@ export interface OneironRuntime {
 	run(argv: string[], cwd: string, environment?: Record<string, string>): Promise<string>;
 	runWriter?(argv: string[], cwd: string, transcriptPath: string, environment?: Record<string, string>): Promise<void>;
 	source(manifest: OneironManifest): Promise<OneironSource>;
-	status(directory: string): Promise<OneironWriterStatus>;
+	capture?: typeof runOneironCapture;
+	status(directory: string): Promise<OneironGateStatus>;
 	call: ManagementCaller;
 	now(): number;
 }
@@ -159,7 +175,9 @@ function stagePins(stage: OneironStage): OneironPin[] {
 				...(stage.retryReconciliation ? [stage.retryReconciliation] : []),
 			];
 		case "gate":
-			return [stage.wrapper, stage.capacity];
+			return stage.driver === "bun-docs-v1"
+				? [stage.capacity, stage.toolchain, stage.generation]
+				: [stage.wrapper, stage.capacity];
 		case "collect":
 			return [stage.helper, stage.foregroundShim];
 		case "triage":
@@ -187,10 +205,12 @@ function completed(m: OneironManifest): OneironReceipt | undefined {
 			sameSource(receipt.output, m.source),
 		"Completed evidence does not match this exact stage/source; rebind, never credit historical green by label",
 	);
+	if (m.stage.kind === "gate" && m.stage.driver === "bun-docs-v1") validateOneironDocsProof(receipt, readOneironPin);
 	return receipt;
 }
-function gateEvidence(pins: OneironPin[], m: OneironManifest): void {
+async function gateEvidence(pins: OneironPin[], m: OneironManifest, runtime: OneironRuntime): Promise<void> {
 	requireThat(pins.length > 0, "Exact-source deterministic gate evidence required");
+	const state = await runtime.status(m.factoryDirectory);
 	for (const pin of pins) {
 		const receipt = parsePin<OneironReceipt>(pin);
 		requireThat(
@@ -204,6 +224,43 @@ function gateEvidence(pins: OneironPin[], m: OneironManifest): void {
 				receipt.result.provenancePassed === true,
 			"Gate evidence is not a completed exact-source provenance-checked gate",
 		);
+		// Driver authority comes from the immutable prepared journal action, never mutable receipt labels.
+		const actions =
+			state.actions?.filter(
+				(action) =>
+					action.ticketId === m.ticketId &&
+					action.sourceFingerprint === receipt.input.fingerprint &&
+					action.command.cwd === m.source.workspace &&
+					action.command.argv.at(-5) === "execute" &&
+					action.command.argv.at(-2) === receipt.manifestSha256 &&
+					action.command.argv.at(-1) === "--execute",
+			) ?? [];
+		requireThat(actions.length === 1, "Gate evidence needs its unique original prepared action");
+		const original = parsePin<OneironManifest>({
+			path: actions[0]!.command.argv.at(-4)!,
+			sha256: receipt.manifestSha256,
+		});
+		requireThat(
+			original.stage.kind === "gate" &&
+				oneironSha(JSON.stringify(original.stage)) === receipt.stageSha256 &&
+				sameSource(original.source, m.source),
+			"Gate evidence original stage/source identity mismatch",
+		);
+		if (original.stage.driver === "bun-docs-v1") validateOneironDocsTerminal(receipt, state, readOneironPin);
+		else {
+			const proof = parsePin<Record<string, unknown>>(receipt.result.proof as OneironPin);
+			requireThat(
+				(receipt.result.driver === undefined || receipt.result.driver === "cargo") &&
+					proof.driver === undefined &&
+					proof.status === "COMPLETED" &&
+					proof.command_rc === 0 &&
+					proof.workspace_root === m.source.workspace &&
+					JSON.stringify(proof.command) === JSON.stringify(original.stage.argv) &&
+					proof.source_unchanged !== false &&
+					(proof.provenance as { pass?: boolean })?.pass === true,
+				"Historical Cargo proof must match its original prepared Cargo stage; docs driver downgrade denied",
+			);
+		}
 	}
 }
 function reviewInput(m: OneironManifest, stage: Extract<OneironStage, { kind: "triage" | "review-acceptance" }>) {
@@ -289,10 +346,17 @@ export function inspectOneiron(m: OneironManifest) {
 			Number.isInteger(m.stage.slot) && m.stage.slot >= 1 && m.stage.slot <= max,
 			"Gate slot violates host capacity policy",
 		);
-		requireThat(
-			m.stage.argv[0] === "cargo" && ["test", "check", "clippy", "fmt"].includes(m.stage.argv[1] ?? ""),
-			"Gate must use the pinned Cargo capacity wrapper",
-		);
+		if (m.stage.driver === "bun-docs-v1") inspectOneironDocsStage(m.stage);
+		else
+			requireThat(
+				(m.stage.driver === undefined || m.stage.driver === "cargo") &&
+					Array.isArray(m.stage.argv) &&
+					m.stage.argv.every((arg) => typeof arg === "string") &&
+					m.stage.argv[0] === "cargo" &&
+					(["test", "check", "clippy", "fmt", "doc"].includes(m.stage.argv[1] ?? "") ||
+						(m.stage.argv[1] === "nextest" && m.stage.argv[2] === "run")),
+				"Gate must use the pinned Cargo capacity wrapper; nextest supports run only",
+			);
 	}
 	return {
 		version: 1 as const,
@@ -335,6 +399,14 @@ export function prepareOneiron(
 		"Manifest path does not contain the prepared object",
 	);
 	if (inspection.reuse) return { inspection, action: null };
+	if (m.stage.kind === "gate" && m.stage.driver === "bun-docs-v1") {
+		const identity = readFactoryRuntime(m.factoryRuntime!, readOneironPin);
+		requireThat(
+			JSON.stringify(options.adapterArgv) === JSON.stringify(oneironDocsEntry(identity)) &&
+				options.host === m.stage.host,
+			"Docs preparation requires exact approved native entry/host",
+		);
+	}
 	return {
 		inspection,
 		action: {
@@ -353,7 +425,11 @@ export function prepareOneiron(
 			sourceFingerprint: m.source.fingerprint,
 			kind: "decision",
 			command: {
+				...(m.stage.kind === "gate" && m.stage.driver === "bun-docs-v1"
+					? { env: ONEIRON_DOCS_ENTRY_ENVIRONMENT }
+					: {}),
 				argv: [
+					...(m.stage.kind === "gate" && m.stage.driver === "bun-docs-v1" ? oneironInterlockPrefix(m.stage) : []),
 					...options.adapterArgv,
 					"execute",
 					options.manifestPath,
@@ -525,7 +601,19 @@ export async function executeOneiron(
 			await authorize(m, manifestSha256, permitPath, runtime);
 		}, factoryCli);
 	await authorize(m, manifestSha256, permitPath, runtime);
-	if (inspection.reuse) return { reused: inspection.reuse };
+	if (inspection.reuse) {
+		const receipt = parsePin<OneironReceipt>(inspection.reuse);
+		if (m.stage.kind === "gate" && m.stage.driver === "bun-docs-v1")
+			validateOneironDocsTerminal(receipt, await runtime.status(m.factoryDirectory), readOneironPin);
+		return { reused: inspection.reuse };
+	}
+	if (m.stage.kind === "gate")
+		requireOneironGateRuntime(
+			pinnedRuntime,
+			m.stage.driver === "bun-docs-v1",
+			m.stage.driver !== "bun-docs-v1" && ["nextest", "doc"].includes(m.stage.argv[1] ?? ""),
+			!suppliedRuntime,
+		);
 	if (m.stage.kind === "triage" && m.stage.reviewedHead !== undefined && m.stage.reviewedHead !== m.source.head)
 		requireThat(
 			pinnedRuntime?.capabilities.includes("oneiron-triage-reviewed-head-v1"),
@@ -614,6 +702,34 @@ export async function executeOneiron(
 			break;
 		}
 		case "gate": {
+			const gateSeam = async () => {
+				requireThat(
+					oneironSha(readFileSync(manifestPath)) === manifestSha256 &&
+						oneironSha(readFileSync(permitPath)) === oneironSha(permitBytes),
+					"Gate manifest/permit changed during execution",
+				);
+				await authorize(m, manifestSha256, permitPath, runtime);
+				if (stage.driver === "bun-docs-v1") {
+					const state = await runtime.status(m.factoryDirectory);
+					const attempt = state.attempts?.find((a) => a.id === process.env.PRIME_FACTORY_ATTEMPT_ID),
+						action = state.actions?.find((a) => a.id === attempt?.actionId);
+					requireThat(
+						action?.command.argv.at(-4) === manifestPath && action.command.argv.at(-3) === permitPath,
+						"Gate execution paths differ from current prepared action",
+					);
+				}
+			};
+			if (stage.driver === "bun-docs-v1") {
+				result = await executeOneironDocsGate(
+					m,
+					stage,
+					{ path: manifestPath, sha256: manifestSha256 },
+					runtime,
+					readOneironPin,
+					gateSeam,
+				);
+				break;
+			}
 			const capacity = parsePin<{
 				sourceFingerprint: string;
 				host: string;
@@ -636,24 +752,40 @@ export async function executeOneiron(
 				"Fresh exact-command capacity/resource/global-duplicate evidence required",
 			);
 			const receiptPath = join(m.outputDirectory, "gate-provenance.json");
-			await run([
-				"python3",
-				stage.wrapper.path,
-				"--slot",
-				String(stage.slot),
-				"--workspace",
+			await gateSeam();
+			await captureOneironGate(
+				runtime,
+				[
+					"python3",
+					stage.wrapper.path,
+					"--slot",
+					String(stage.slot),
+					"--workspace",
+					m.source.workspace,
+					"--receipt",
+					receiptPath,
+					"--",
+					...stage.argv,
+				],
 				m.source.workspace,
-				"--receipt",
-				receiptPath,
-				"--",
-				...stage.argv,
-			]);
+				m.outputDirectory,
+				0,
+			);
+			await gateSeam();
 			const proof = JSON.parse(readFileSync(receiptPath, "utf8")) as {
 				status: string;
 				command_rc: number;
 				workspace_root: string;
 				command: string[];
-				provenance: { pass: boolean };
+				provenance: {
+					pass: boolean;
+					dep_info_files?: number;
+					exact_root_seen?: boolean;
+					foreign_wave_roots?: string[];
+				};
+				schema?: string;
+				runner_version?: string;
+				slot?: number;
 				source_unchanged?: boolean;
 			};
 			requireThat(
@@ -665,6 +797,18 @@ export async function executeOneiron(
 					proof.source_unchanged !== false,
 				"Gate wrapper did not return completed matching provenance",
 			);
+			if (["nextest", "doc"].includes(stage.argv[1] ?? ""))
+				requireThat(
+					proof.schema === "oneiron.wave6.cargo-slot-v2.3-provenance.v1" &&
+						proof.runner_version === "v2.3-five-slot" &&
+						proof.slot === stage.slot &&
+						Number.isInteger(proof.provenance.dep_info_files) &&
+						proof.provenance.dep_info_files! > 0 &&
+						proof.provenance.exact_root_seen === true &&
+						Array.isArray(proof.provenance.foreign_wave_roots) &&
+						proof.provenance.foreign_wave_roots.length === 0,
+					"Extended Cargo gate requires substantive v23 dep-info provenance for this root",
+				);
 			result = {
 				commandRc: 0,
 				provenancePassed: true,
@@ -781,7 +925,7 @@ export async function executeOneiron(
 			break;
 		}
 		case "review-acceptance": {
-			gateEvidence(stage.gates, m);
+			await gateEvidence(stage.gates, m, runtime);
 			const { report, prior, evidenceRefs } = reviewInput(m, stage);
 			const receipt = parsePin<OneironReceipt>(stage.triage);
 			requireThat(
@@ -801,7 +945,7 @@ export async function executeOneiron(
 		}
 		case "publish-ready":
 		case "publish-update": {
-			gateEvidence(stage.gates, m);
+			await gateEvidence(stage.gates, m, runtime);
 			result = await publishOneiron(m, stage, run, readOneironPin);
 			break;
 		}
@@ -826,6 +970,7 @@ export async function executeOneiron(
 		productAccepted: false,
 		result,
 	};
+	if (result.driver === "bun-docs-v1") validateOneironDocsProof(receipt, readOneironPin);
 	writeFileSync(join(m.outputDirectory, "receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`, {
 		flag: "wx",
 		mode: 0o600,
@@ -885,6 +1030,8 @@ export function bindOneironEvidence(
 			attempt.receipt.artifact?.sourceFingerprint === receipt.output.fingerprint,
 		"Binding action/receipt/source identity mismatch",
 	);
+	if (manifest.stage.kind === "gate" && manifest.stage.driver === "bun-docs-v1")
+		validateOneironDocsTerminal(receipt, status, readOneironPin, attempt.id);
 	if (manifest.stage.kind === "writer")
 		validateOneironWriterReceipt(manifest, receipt.result, receipt.manifestSha256, readOneironPin);
 	if (manifest.stage.kind === "triage") {
@@ -945,6 +1092,7 @@ export function createOneironRuntime(
 	const run = runOneironForeground;
 	return {
 		run,
+		capture: runOneironCapture,
 		runWriter: runOneironWriterForeground,
 		now: Date.now,
 		status: async (directory) => {
@@ -952,9 +1100,7 @@ export function createOneironRuntime(
 				factoryCli.length > 0 && isAbsolute(factoryCli[0]!),
 				"Factory status requires the pinned runtime CLI",
 			);
-			return JSON.parse(
-				await run([...factoryCli, "factory", "status", directory], directory),
-			) as OneironWriterStatus;
+			return JSON.parse(await run([...factoryCli, "factory", "status", directory], directory)) as OneironGateStatus;
 		},
 		source: async (m) => {
 			const cwd = realpathSync(m.source.workspace);

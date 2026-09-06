@@ -20,6 +20,7 @@ import {
 	executeOneiron,
 	type OneironManifest,
 	type OneironReceipt,
+	type OneironRuntime,
 	type OneironSource,
 	type OneironStage,
 	prepareOneiron,
@@ -111,7 +112,11 @@ setTimeout(() => {
 		version: 1,
 		cliArgv: [node.path, cli.path],
 		files: [node, cli, adapter, continuationEntry],
-		capabilities: ["provider-response-model-v1", ...(completedJson ? ["factory-completed-json-v1"] : [])],
+		capabilities: [
+			"provider-response-model-v1",
+			"oneiron-native-gate-capture-v1",
+			...(completedJson ? ["factory-completed-json-v1"] : []),
+		],
 	});
 	const authorization = pin(directory, "authorization.json", {
 		fixtureOnly: true,
@@ -268,6 +273,32 @@ setTimeout(() => {
 		if (!storeClosed) store.close();
 	});
 	const stageCalls: string[] = [];
+	const mockRun: OneironRuntime["run"] = async (argv) => {
+		if (argv.includes("--receipt")) {
+			const receiptPath = argv[argv.indexOf("--receipt") + 1];
+			writeFileSync(
+				receiptPath,
+				JSON.stringify({
+					fixtureOnly: true,
+					evidenceKind: "UNIT MOCK",
+					status: "COMPLETED",
+					command_rc: 0,
+					workspace_root: workspace,
+					command: ["cargo", "test", "fixture"],
+					provenance: { pass: true },
+					source_unchanged: true,
+				}),
+			);
+			return "UNIT MOCK Cargo wrapper output; no Cargo command executed.\n";
+		}
+		if (argv.includes("--output-dir")) {
+			const output = argv[argv.indexOf("--output-dir") + 1];
+			mkdirSync(output);
+			pin(output, "corpus.json", corpus(source));
+			return "";
+		}
+		throw new Error(`Unexpected live effect ${argv}`);
+	};
 	const stageAdapter: FactoryAdapter = {
 		async launch(context) {
 			const args = context.action.command.argv;
@@ -325,29 +356,35 @@ setTimeout(() => {
 						expect(argv[argv.indexOf("--json-event-profile") + 1]).toBe("factory-completed");
 						writeFileSync(transcriptPath, modelEvent());
 					},
-					run: async (argv) => {
-						if (argv.includes("--receipt")) {
-							const receiptPath = argv[argv.indexOf("--receipt") + 1];
-							writeFileSync(
-								receiptPath,
-								JSON.stringify({
-									status: "COMPLETED",
-									command_rc: 0,
-									workspace_root: workspace,
-									command: ["cargo", "test", "fixture"],
-									provenance: { pass: true },
-									source_unchanged: true,
-								}),
-							);
-							return "";
-						}
-						if (argv.includes("--output-dir")) {
-							const output = argv[argv.indexOf("--output-dir") + 1];
-							mkdirSync(output);
-							pin(output, "corpus.json", corpus(source));
-							return "";
-						}
-						throw new Error(`Unexpected live effect ${argv}`);
+					run: mockRun,
+					// Capture only the synthetic run output; this fixture never executes Cargo.
+					capture: async (argv, cwd, options) => {
+						const startedAt = new Date().toISOString();
+						const output = await mockRun(argv, cwd, options.environment);
+						const stream = (path: string, text: string) => {
+							const bytes = Buffer.byteLength(text);
+							expect(bytes).toBeLessThanOrEqual(options.limitBytes);
+							writeFileSync(path, text, { flag: "wx" });
+							return {
+								path,
+								sha256: oneironSha(text),
+								bytes,
+								observedBytes: bytes,
+								truncated: false,
+								preview: text.slice(0, options.previewBytes ?? 0),
+							};
+						};
+						return {
+							argv,
+							cwd,
+							environment: options.environment ?? {},
+							startedAt,
+							finishedAt: new Date().toISOString(),
+							exitCode: 0,
+							signal: null,
+							stdout: stream(options.stdoutPath, output),
+							...(options.stderrPath ? { stderr: stream(options.stderrPath, "") } : {}),
+						};
 					},
 				},
 				args.at(-2),
