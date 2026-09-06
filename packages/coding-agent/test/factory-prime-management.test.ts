@@ -58,3 +58,15 @@ test("captures automatic transport identity separately from the requested SDK se
 		responseId: "wire-request-1",
 	});
 });
+
+test("awaits asynchronous source/custody recheck before inference", async () => {
+	mocks.auth.mockResolvedValue({ ok: true, apiKey: "fixture" });
+	const call = createPrimeManagementCaller(async () => {
+		await Promise.resolve();
+		throw new Error("source CAS changed");
+	});
+	await expect(
+		call("system", "packet", { provider: "test", model: "configured", effort: "low" }, "attempt"),
+	).rejects.toThrow("source CAS changed");
+	expect(mocks.complete).not.toHaveBeenCalled();
+});

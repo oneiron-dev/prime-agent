@@ -5,7 +5,7 @@ import type { ManagementCaller } from "../management.js";
 
 const EFFORTS = new Set<string>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
-export function createPrimeManagementCaller(beforeRequest: () => void): ManagementCaller {
+export function createPrimeManagementCaller(beforeRequest: () => void | Promise<void>): ManagementCaller {
 	return async (system, packet, profile, requestId) => {
 		if (profile.effort !== undefined && !EFFORTS.has(profile.effort))
 			throw new Error(`Unsupported reasoning effort: ${profile.effort}`);
@@ -16,7 +16,7 @@ export function createPrimeManagementCaller(beforeRequest: () => void): Manageme
 		if (!model) throw new Error(`Model is not registered: ${profile.provider}/${profile.model}`);
 		const auth = await registry.getApiKeyAndHeaders(model);
 		if (!auth.ok) throw new Error(auth.error);
-		beforeRequest();
+		await beforeRequest();
 		const response = await completeSimple(
 			model,
 			{

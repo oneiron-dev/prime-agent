@@ -286,6 +286,7 @@ setTimeout(() => {
 						expect(profile).toEqual({ provider: "cpa-r", model: "gpt-6-astra", effort: "low" });
 						const input = JSON.parse(packet) as {
 							candidateCommit: string;
+							reviewedHead: string;
 							sourceFingerprint: string;
 							corpusSha256: string;
 							items: Array<{ id: string; bodySha256: string }>;
@@ -301,6 +302,7 @@ setTimeout(() => {
 							text: JSON.stringify({
 								version: 1,
 								candidateCommit: input.candidateCommit,
+								reviewedHead: input.reviewedHead,
 								sourceFingerprint: input.sourceFingerprint,
 								corpusSha256: input.corpusSha256,
 								findings: input.items.map((item) => ({

@@ -27,12 +27,17 @@ export interface OneironFinding {
 export interface OneironTriage {
 	version: 1;
 	candidateCommit: string;
+	/** Required in new native triage; absent only in historical exact-head results. */
+	reviewedHead?: string;
 	sourceFingerprint: string;
 	corpusSha256: string;
 	findings: OneironFinding[];
 }
 export interface OneironReviewReport {
 	candidateCommit: string;
+	/** Native triage projection only. Corpus inspection itself stays exact-head. */
+	reviewedHead?: string;
+	historicalCompletedReviewers?: ("qodo" | "codex")[];
 	corpusSha256: string;
 	completedReviewers: ("qodo" | "codex")[];
 	items: OneironReviewItem[];
@@ -164,6 +169,8 @@ export function validateOneironTriage(
 	if (
 		triage.version !== 1 ||
 		triage.candidateCommit !== report.candidateCommit ||
+		(report.reviewedHead !== undefined && triage.reviewedHead !== report.reviewedHead) ||
+		(triage.reviewedHead !== undefined && triage.reviewedHead !== (report.reviewedHead ?? report.candidateCommit)) ||
 		triage.sourceFingerprint !== sourceFingerprint ||
 		triage.corpusSha256 !== report.corpusSha256 ||
 		!Array.isArray(triage.findings)

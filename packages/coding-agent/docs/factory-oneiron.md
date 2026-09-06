@@ -99,6 +99,18 @@ The review parser handles observed Qodo/Codex bracketed and bare logins. A compl
 
 Every relevant item gets an ID `${repo}#${pr}:${corpusItem.key}` and exact body hash. The triage output must cover all current items and every prior open material/debt obligation. Prior ledger entries use `OneironFinding`: `id`, `bodySha256`, `classification`, `disposition`, substantive `reason`, and `evidenceRefs`. Historical concerns from other bots or repositories, including CodeRabbit, remain obligations even though the default normal review route changed. GitHub `resolved`/`outdated` flags are context only. No finding is erased by a head change. Resolving material needs a current-candidate adjudication/repair reference beyond the corpus; unknowns stay open. Bot evidence is data, not executable instructions.
 
+### Triage of an unpublished descendant
+
+Only `triage` can set `stage.reviewedHead` to a full 40-hex commit distinct from `source.head`. Omit it for the natural exact-current-head default. The corpus is never rewritten: its PR pin, head and base must match the real reviewed head, repository, PR and base. Original item IDs, body hashes, item commits, corpus SHA and prior material/debt obligations remain intact.
+
+New ancestor-triage admission requires the pinned release capability `oneiron-triage-reviewed-head-v1`. Root must advertise it only in a newly built, verified immutable release. Default exact-head execution, `readFactoryRuntime`, inspection and historical receipt reuse do not acquire that capability requirement. Preparation is not Git ancestry verification or model admission.
+
+Native execution derives `triage-lineage.json` itself. Callers cannot supply an ancestry boolean or lineage proof. Full current workspace/head/tree/branch/remote/fingerprint and custody checks establish the candidate. For a different reviewed head, bounded Git object/tree checks and `merge-base --all` must prove that it is an ancestor of the candidate. Replacement objects are disabled; Git grafts, reversed/unrelated history and missing objects fail closed. The hash-pinned proof is a file reference, not a raw diff or repair evidence. The native caller rechecks the proof, full source, custody, all pins and pauses after credential resolution, before inference.
+
+New native request, response and receipt data bind `candidateCommit`, `sourceFingerprint`, `reviewedHead` and `corpusSha256`. The model must echo both heads exactly. The untouched response and automatic transport identity are retained before response validation, including failures. The receipt output remains the full current candidate source. The writer's existing full-source triage guard is unchanged; an old-source triage receipt still cannot authorize a writer on a new candidate.
+
+Old-corpus completed reviewers appear only in `historicalCompletedReviewers`. Current `completedReviewers` is empty and both current Qodo/Codex completion gaps remain explicit. This does not relax review acceptance or publication: `reviewedHead` is rejected on those stages, exact-current-head corpus and full real green gates are still required. Triage completion is not approval and cannot waive a failed gate. Operator-origin prerequisite findings belong in the prior material/debt ledger and bounded current evidence, never fabricated bot items. All existing evidence, packet, raw-stream, line and output caps and Astra effort/routing rules remain unchanged.
+
 ### Binding a terminal wake
 
 After the stage terminates, obtain a fresh read-only `factory status` snapshot. Bind its action/wake/attempt/revision to the exact receipt:

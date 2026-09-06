@@ -142,6 +142,7 @@ function setup() {
 		call: vi.fn(async (_system, packet) => {
 			const data = JSON.parse(packet) as {
 				candidateCommit: string;
+				reviewedHead: string;
 				sourceFingerprint: string;
 				corpusSha256: string;
 				items: Array<{ id: string; bodySha256: string }>;
@@ -154,6 +155,7 @@ function setup() {
 				text: JSON.stringify({
 					version: 1,
 					candidateCommit: data.candidateCommit,
+					reviewedHead: data.reviewedHead,
 					sourceFingerprint: data.sourceFingerprint,
 					corpusSha256: data.corpusSha256,
 					findings: data.items.map((item) => ({
@@ -560,6 +562,7 @@ describe("Oneiron real journal and foreground command-runner integration", () =>
 		const triage = {
 			version: 1,
 			candidateCommit: actualHead,
+			reviewedHead: actualHead,
 			sourceFingerprint: f.manifest.source.fingerprint,
 			corpusSha256: report.corpusSha256,
 			findings: report.items.map((item) => ({
