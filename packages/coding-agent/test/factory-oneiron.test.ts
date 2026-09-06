@@ -113,7 +113,7 @@ function setup() {
 		version: 1,
 		cliArgv: [runtimeNode, runtimeCli],
 		files: [runtimeNode, runtimeCli].map((path) => ({ path, sha256: oneironSha(readFileSync(path)) })),
-		capabilities: ["provider-response-model-v1"],
+		capabilities: ["provider-response-model-v1", "factory-completed-json-v1"],
 	});
 	const manifestPath = join(directory, "manifest.json");
 	const permitPath = join(directory, "permit.json");
@@ -459,6 +459,8 @@ describe("Oneiron preparation and execution gates", () => {
 			expect(vi.mocked(f.runtime.runWriter!).mock.calls[0]![0]).toEqual(
 				expect.arrayContaining([
 					"--print",
+					"--json-event-profile",
+					"factory-completed",
 					"--provider",
 					"cpa-r",
 					"--model",

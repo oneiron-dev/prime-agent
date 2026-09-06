@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, fsyncSync, openSync, writeSync } from "node:fs";
 import { join } from "node:path";
-import { readFactoryRuntime } from "../runtime.js";
+import { readFactoryRuntime, requireFactoryJsonEventProfile } from "../runtime.js";
 import type { ActionRecord, AttemptRecord } from "../types.js";
 import type { OneironManifest, OneironSource } from "./oneiron.js";
 import type { OneironPin } from "./oneiron-review.js";
@@ -109,7 +109,9 @@ export function readOneironWriterProfile(pin: OneironPin, read: ReadPin): Oneiro
 	return profile;
 }
 export function oneironWriterCli(profile: OneironWriterProfile, read: ReadPin): string[] {
-	return [...readFactoryRuntime(profile.runtime, read).cliArgv];
+	const runtime = readFactoryRuntime(profile.runtime, read);
+	requireFactoryJsonEventProfile(runtime);
+	return [...runtime.cliArgv];
 }
 function sameSource(a: OneironSource, b: OneironSource): boolean {
 	return ["workspace", "head", "tree", "branch", "remoteUrl", "fingerprint"].every(

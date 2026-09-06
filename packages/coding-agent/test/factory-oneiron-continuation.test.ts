@@ -75,7 +75,11 @@ function modelEvent(model = "gpt-6-astra", responseModel = model, provider = "cp
 		},
 	});
 }
-async function fixture(nativeCoordinator = false, initialEffort?: Omit<OneironCoordinatorEffortOverride, "actionId">) {
+async function fixture(
+	nativeCoordinator = false,
+	initialEffort?: Omit<OneironCoordinatorEffortOverride, "actionId">,
+	completedJson = true,
+) {
 	const directory = realpathSync(mkdtempSync(join(tmpdir(), "oneiron-continuation-")));
 	roots.push(directory);
 	const workspace = join(directory, "product");
@@ -107,7 +111,7 @@ setTimeout(() => {
 		version: 1,
 		cliArgv: [node.path, cli.path],
 		files: [node, cli, adapter, continuationEntry],
-		capabilities: ["provider-response-model-v1"],
+		capabilities: ["provider-response-model-v1", ...(completedJson ? ["factory-completed-json-v1"] : [])],
 	});
 	const authorization = pin(directory, "authorization.json", {
 		fixtureOnly: true,
@@ -316,6 +320,7 @@ setTimeout(() => {
 						writeFileSync(join(workspace, "source.txt"), "repaired fixture source\n");
 						source = { ...source, fingerprint: `git:${"e".repeat(64)}` };
 						expect(argv[argv.indexOf("--thinking") + 1]).toBe("xhigh");
+						expect(argv[argv.indexOf("--json-event-profile") + 1]).toBe("factory-completed");
 						writeFileSync(transcriptPath, modelEvent());
 					},
 					run: async (argv) => {
@@ -405,6 +410,9 @@ setTimeout(() => {
 	let inspection: Inspection | undefined;
 	const fakeCoordinator: FactoryAdapter = {
 		async launch(context) {
+			expect(context.action.command.argv[context.action.command.argv.indexOf("--json-event-profile") + 1]).toBe(
+				"factory-completed",
+			);
 			coordinatorLaunches(context);
 			pendingContext = context;
 			return { kind: "running", processIdentity: "fixture-coordinator-process" };
@@ -543,6 +551,13 @@ function gate(f: Awaited<ReturnType<typeof fixture>>, source = f.source) {
 	);
 }
 describe("durable Oneiron continuation", () => {
+	test("unsupported completed JSON runtime rejects new coordinator admission before launch or outbox dispatch", async () => {
+		const f = await fixture(false, undefined, false);
+		await accepted(f);
+		await expect(f.continuation.step()).rejects.toThrow(/factory-completed-json-v1/);
+		expect(f.coordinatorLaunches).not.toHaveBeenCalled();
+		expect(readOneironContinuationStatus(join(f.factoryDirectory, "factory.db")).requests).toEqual([]);
+	});
 	test("39 MiB native snapshots and twelve citation pins consume once with compact transport-only provenance", async () => {
 		const f = await fixture();
 		await accepted(f);

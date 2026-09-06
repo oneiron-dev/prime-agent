@@ -163,12 +163,21 @@ async function fixture(transport: Transport, reportedModel?: string) {
 		throw new Error("Fixture cannot replace runtimes");
 	});
 	output.chunks.length = 0;
-	expect(await runPrintMode(runtime, { mode: "json", initialMessage: "Return the fixture response." })).toBe(0);
+	expect(
+		await runPrintMode(runtime, {
+			mode: "json",
+			jsonEventProfile: "factory-completed",
+			initialMessage: "Return the fixture response.",
+		}),
+	).toBe(0);
 	const transcript = output.chunks.join("");
 	const emitted = transcript
 		.split("\n")
 		.filter(Boolean)
 		.map((line) => JSON.parse(line) as { type?: string; message?: AssistantMessage });
+	expect(emitted.some((event) => event.type === "message_update" || event.type === "tool_execution_update")).toBe(
+		false,
+	);
 	const terminal = emitted.filter((event) => event.type === "message_end" && event.message?.role === "assistant");
 	expect(terminal).toHaveLength(1);
 	const message = terminal[0].message!;

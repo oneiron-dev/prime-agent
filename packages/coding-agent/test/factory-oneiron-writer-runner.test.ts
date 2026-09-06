@@ -74,7 +74,7 @@ describe("whole-attempt retry under the real factory supervisor", () => {
 				version: 1,
 				cliArgv: [node, cli],
 				files: [node, cli].map((path) => ({ path, sha256: oneironSha(readFileSync(path)) })),
-				capabilities: ["provider-response-model-v1"],
+				capabilities: ["provider-response-model-v1", "factory-completed-json-v1"],
 			});
 			const primaryProfile = defaultOneironWriterProfile(runtimePin);
 			const primaryProfilePin = pin(primaryProfile);

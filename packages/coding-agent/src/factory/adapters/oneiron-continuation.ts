@@ -25,7 +25,12 @@ import {
 } from "../evidence.js";
 import type { ManagementReconciliation } from "../management.js";
 import { type ManagementCallerFactory, manageFactoryWake } from "../management-dispatch.js";
-import { factoryOwnedEnvironment, readFactoryRuntime } from "../runtime.js";
+import {
+	FACTORY_JSON_EVENT_PROFILE,
+	factoryOwnedEnvironment,
+	readFactoryRuntime,
+	requireFactoryJsonEventProfile,
+} from "../runtime.js";
 import type { AttemptContext, FactoryAdapter, FactoryPlan, Inspection } from "../types.js";
 import {
 	bindOneironEvidence,
@@ -598,6 +603,7 @@ export class OneironContinuation {
 		const c = this.config.coordinator;
 		const profile = packet.coordinatorDecision.requestedProfile;
 		const runtime = readFactoryRuntime(c.runtime, readOneironPin);
+		requireFactoryJsonEventProfile(runtime);
 		const prompt = `${ONEIRON_COORDINATOR_CONTRACT}\nPinned authorized helper instructions: ${JSON.stringify(c.instructions)}\nPacket: ${JSON.stringify(packet)}`;
 		assertByteLimit("coordinator.prompt", Buffer.byteLength(prompt, "utf8"), FACTORY_EVIDENCE_LIMITS.packetBytes);
 		const sourceFingerprint = `oneiron-coordinator:${oneironSha(prompt)}`;
@@ -617,6 +623,8 @@ export class OneironContinuation {
 						"--print",
 						"--mode",
 						"json",
+						"--json-event-profile",
+						FACTORY_JSON_EVENT_PROFILE,
 						"--offline",
 						"--provider",
 						profile.provider,

@@ -1616,6 +1616,7 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 		const exitCode = await runPrintModeWithConnection(connection, {
 			mode: toPrintOutputMode(appMode),
+			jsonEventProfile: parsed.jsonEventProfile,
 			messages: parsed.messages,
 			initialMessage,
 			initialImages,
@@ -1742,6 +1743,7 @@ export async function main(args: string[], options?: MainOptions) {
 		printTimings();
 		const exitCode = await runPrintMode(runtime, {
 			mode: toPrintOutputMode(appMode),
+			jsonEventProfile: parsed.jsonEventProfile,
 			messages: parsed.messages,
 			initialMessage,
 			initialImages,

@@ -41,7 +41,7 @@ function setup() {
 		version: 1,
 		cliArgv: [node, cli],
 		files: [node, cli, chunk].map((path) => ({ path, sha256: oneironSha(readFileSync(path)) })),
-		capabilities: ["provider-response-model-v1"],
+		capabilities: ["provider-response-model-v1", "factory-completed-json-v1"],
 	});
 	const profile = defaultOneironWriterProfile(runtime);
 	const profilePin = pin(profile);
@@ -118,6 +118,22 @@ describe("explicit pinned writer profile and factory model capture", () => {
 		writeFileSync(f.chunk, "changed");
 		expect(() => oneironWriterCli(f.profile, readOneironPin)).toThrow(/component changed/);
 		expect(() => readFactoryRuntime(f.pin({ ...raw, cliArgv: ["node", f.cli] }), readOneironPin)).toThrow(/pinned/);
+	});
+	test("historical runtime and writer receipts remain inspectable, but old CLI cannot launch a new writer", () => {
+		const f = setup();
+		const old = f.pin({ ...JSON.parse(readOneironPin(f.runtime)), capabilities: ["provider-response-model-v1"] });
+		const profile = { ...f.profile, runtime: old };
+		expect(readFactoryRuntime(old, readOneironPin).capabilities).toEqual(["provider-response-model-v1"]);
+		expect(() => oneironWriterCli(profile, readOneironPin)).toThrow(/factory-completed-json-v1/);
+		f.stage.writerProfile = f.pin(profile);
+		const writerProvenance = summarizeOneironWriter(
+			f.manifest,
+			f.stage,
+			profile,
+			f.transport(f.event("gpt-6-astra")),
+			"sha",
+		);
+		expect(() => validateOneironWriterReceipt(f.manifest, { writerProvenance }, "sha", readOneironPin)).not.toThrow();
 	});
 	test.each(["claude-fable-5.1", "gpt-6-astra"])(
 		"captures actual %s automatically and accepts only routine Astra",

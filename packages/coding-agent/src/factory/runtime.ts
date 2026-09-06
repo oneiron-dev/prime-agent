@@ -85,6 +85,16 @@ export function readFactoryRuntime(
 	return runtime;
 }
 
+export const FACTORY_JSON_EVENT_PROFILE = "factory-completed";
+
+/** New model launches need this profile. Historical runtime/proof reads do not. */
+export function requireFactoryJsonEventProfile(runtime: FactoryRuntimeIdentity): void {
+	check(
+		runtime.capabilities.includes("factory-completed-json-v1"),
+		"Factory model launch requires runtime capability factory-completed-json-v1 (--json-event-profile factory-completed)",
+	);
+}
+
 /** Native owned frontend, not a daemon-free CLI flag. Clear only inherited native worker authority in the child. */
 export function factoryOwnedEnvironment(): Record<string, string> {
 	return {

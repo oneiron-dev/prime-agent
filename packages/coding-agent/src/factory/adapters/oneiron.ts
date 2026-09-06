@@ -10,7 +10,12 @@ import {
 	validateManagementEvidence,
 } from "../evidence.js";
 import type { ManagementCaller, ManagementEvidenceBinding } from "../management.js";
-import { factoryOwnedEnvironment, readFactoryRuntime } from "../runtime.js";
+import {
+	FACTORY_JSON_EVENT_PROFILE,
+	factoryOwnedEnvironment,
+	readFactoryRuntime,
+	requireFactoryJsonEventProfile,
+} from "../runtime.js";
 import type { ActionSpec, FactoryStatus } from "../types.js";
 import { fingerprintCommand } from "./command.js";
 import { type OneironPublicationStage, publishOneiron } from "./oneiron-publication.js";
@@ -429,6 +434,7 @@ export async function executeOneiron(
 		);
 	const runtimePin = m.factoryRuntime ?? writerProfile?.runtime;
 	const pinnedRuntime = runtimePin ? readFactoryRuntime(runtimePin, readOneironPin) : undefined;
+	if (writerProfile && pinnedRuntime) requireFactoryJsonEventProfile(pinnedRuntime);
 	if (!suppliedRuntime) {
 		const required = [fileURLToPath(import.meta.url), process.argv[1]!];
 		requireThat(
@@ -507,6 +513,8 @@ export async function executeOneiron(
 					"--print",
 					"--mode",
 					"json",
+					"--json-event-profile",
+					FACTORY_JSON_EVENT_PROFILE,
 					"--offline",
 					"--provider",
 					profile.requested.provider,

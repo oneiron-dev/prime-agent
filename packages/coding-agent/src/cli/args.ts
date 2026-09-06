@@ -5,6 +5,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { APP_NAME } from "../config.js";
 import { THINKING_LEVELS } from "../core/thinking-levels.js";
+import type { JsonEventProfile } from "../modes/print-mode.js";
 
 export type Mode = "text" | "json" | "rpc" | "acp" | "daemon";
 
@@ -21,6 +22,7 @@ export interface Args {
 	help?: boolean;
 	version?: boolean;
 	mode?: Mode;
+	jsonEventProfile?: JsonEventProfile;
 	daemonSocket?: string;
 	noSession?: boolean;
 	fork?: string;
@@ -104,6 +106,18 @@ export function parseArgs(args: string[]): Args {
 			if (mode === "text" || mode === "json" || mode === "rpc" || mode === "acp" || mode === "daemon") {
 				result.mode = mode;
 			}
+		} else if (arg === "--json-event-profile" || arg.startsWith("--json-event-profile=")) {
+			const profile = arg.startsWith("--json-event-profile=")
+				? arg.slice("--json-event-profile=".length)
+				: hasRequiredOptionValue(args, i, arg, result)
+					? args[++i]
+					: undefined;
+			if (profile === "all" || profile === "factory-completed") result.jsonEventProfile = profile;
+			else if (profile !== undefined)
+				result.diagnostics.push({
+					type: "error",
+					message: `Invalid JSON event profile "${profile}". Valid values: all, factory-completed`,
+				});
 		} else if (arg === "--daemon-socket" && i + 1 < args.length) {
 			result.daemonSocket = args[++i];
 		} else if (arg === "--continue" || arg === "-c") {
@@ -324,6 +338,9 @@ export function parseArgs(args: string[]): Args {
 		});
 	}
 
+	if (result.jsonEventProfile !== undefined && result.mode !== "json") {
+		result.diagnostics.push({ type: "error", message: "--json-event-profile requires --mode json" });
+	}
 	return result;
 }
 

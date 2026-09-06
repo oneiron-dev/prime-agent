@@ -37,7 +37,7 @@ The provider transport copies wire metadata into the existing assistant message:
 
 Anthropic capture reads `message_start.message.model`. OpenAI Responses capture reads the **terminal** `response.completed` or `response.incomplete` model. It does not use `response.created.model`; the inspected gateway can synthesize the requested alias there.
 
-Agent-core forwards the completed provider message, and print mode serializes the complete event. The native writer stage uses a dedicated foreground capture path. It creates `writer.jsonl` exclusively before spawning the writer and writes raw stdout to HDD as it arrives. It does not accumulate the full chat stream or kill a healthy writer at the old 16 MiB small-artifact limit. Nonzero exit, owner loss, timeout, parse/identity failure, or an explicit raw-byte safety limit leaves the partial log in place for reconciliation; no successful authoring receipt is invented.
+Both factory writer and coordinator automatically pass `--json-event-profile factory-completed` to the existing native JSON print path. It omits only `message_update` and `tool_execution_update` before serialization/output. The session header records the selected `jsonEventProfile`; every other native session event is unchanged. Agent-core forwards the completed provider message, and print mode serializes the complete event, including its content and automatic metadata. This is a native completed-event log, not full provider-wire capture. No terminal event is invented for failed or cancelled work. The native writer stage uses a dedicated foreground capture path. It creates `writer.jsonl` exclusively before spawning the writer and writes raw stdout to HDD as it arrives. It does not accumulate the full chat stream or kill a healthy writer at the old 16 MiB small-artifact limit. Nonzero exit, owner loss, timeout, parse/identity failure, or an explicit raw-byte safety limit leaves the partial log in place for reconciliation; no successful authoring receipt is invented.
 
 The same streaming reader serves writer and coordinator provenance. It hashes the full raw log and parses bounded JSON lines. It retains only completed native assistant `message_end` metadata, not repeated `message_update` snapshots or model text. Raw logs have a 256 MiB limit; lines 8 MiB; events 250,000; completed assistant records 256; metadata fields 1,024 bytes each; compact derived JSON 256 KiB. The reader rejects file drift, malformed or partial input and unfinished native lifecycles. Raw logs remain outside the shared 64 KiB inline evidence budget. Receipt validation re-streams the exact pinned log; retry reconciliation also hashes retained large logs without treating them as inline documents. It writes `result.writerProvenance`, including requested profile, per-response observed identity, response IDs, runtime/profile/transcript pins, manifest/source identity, and session directory.
 
@@ -65,9 +65,11 @@ The shared `factory/runtime.ts` envelope is:
   "version": 1,
   "cliArgv": ["/absolute/node", "/absolute/reviewed-install/dist/bundle/cli.js"],
   "files": [{"path": "/absolute/runtime-component", "sha256": "EXACT_SHA256"}],
-  "capabilities": ["provider-response-model-v1"]
+  "capabilities": ["provider-response-model-v1", "factory-completed-json-v1"]
 }
 ```
+
+New writer/coordinator model admission requires `factory-completed-json-v1` before launching the pinned CLI. An old runtime without the profile cannot silently fall back to cumulative snapshots. `readFactoryRuntime` itself still allows historical runtime/proof inspection without that new launch capability. Genuine oversized completed content still fails the unchanged raw/line bounds; final events are never dropped or truncated to fit.
 
 `readFactoryRuntime` verifies actual bytes with bounded streaming hashes. Both Node and CLI must be pinned. Every JavaScript bundle chunk in the CLI directory must be included. The deployment manifest must also pin required adapter, lazy-import, manager/coordinator and helper assets. Bundle symlinks fail closed. The capability string alone is not evidence that a release implements the feature.
 
