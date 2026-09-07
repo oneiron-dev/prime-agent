@@ -55,7 +55,7 @@ describe("#858 daemon child profile rehydration", () => {
 		}
 	});
 
-	async function createFixture() {
+	async function createFixture(withPrivateModelAuth = false) {
 		const spawn = await createHarness({
 			provider: "rehydrate-spawn",
 			models: [
@@ -71,7 +71,11 @@ describe("#858 daemon child profile rehydration", () => {
 		cleanups.push(() => latest.cleanup());
 
 		// Keep auth and catalog discovery local. All provider requests still use the faux streams.
-		vi.spyOn(AuthStorage, "create").mockImplementation(() => AuthStorage.inMemory());
+		vi.spyOn(AuthStorage, "create").mockImplementation(() => {
+			const authStorage = AuthStorage.inMemory();
+			if (withPrivateModelAuth) authStorage.setRuntimeApiKey("prime-inference", "faux-prime-key");
+			return authStorage;
+		});
 		vi.spyOn(ModelRegistry.prototype, "refreshAvailableModels").mockImplementation(
 			async function (this: ModelRegistry) {
 				return this.getAvailable();
@@ -260,22 +264,46 @@ describe("#858 daemon child profile rehydration", () => {
 	);
 
 	it.each([
-		{ name: "spawn model when no model is persisted", persisted: false, spawnModel: true, expected: "spawn-model" },
-		{ name: "defaults when neither model is present", persisted: false, spawnModel: false, expected: "global-model" },
+		{
+			name: "spawn model when no model is persisted",
+			persisted: undefined,
+			spawnModel: true,
+			expected: "spawn-model",
+		},
+		{
+			name: "defaults when neither model is present",
+			persisted: undefined,
+			spawnModel: false,
+			expected: "global-model",
+		},
 		{
 			name: "normal fallback, not spawn, when the persisted model is unavailable",
-			persisted: true,
+			persisted: { provider: "unavailable-provider", modelId: "unavailable-model" },
+			spawnModel: true,
+			expected: "global-model",
+		},
+		{
+			name: "normal fallback, not spawn, when the configured persisted model is catalog-excluded",
+			persisted: { provider: "prime-inference", modelId: "internal/glm-5.2-fast" },
 			spawnModel: true,
 			expected: "global-model",
 		},
 	])("keeps $name without changing global defaults", async ({ persisted, spawnModel, expected }) => {
-		const { spawn, internals, parent, createRuntime, settingsPath } = await createFixture();
+		const withPrivateModelAuth = persisted?.provider === "prime-inference";
+		const { spawn, internals, parent, createRuntime, settingsPath } = await createFixture(withPrivateModelAuth);
+		if (persisted && withPrivateModelAuth) {
+			const registry = parent.runtime.services.modelRegistry;
+			const privateModel = registry.find(persisted.provider, persisted.modelId)!;
+			expect(privateModel).toBeDefined();
+			expect(registry.hasConfiguredAuth(privateModel)).toBe(true);
+			expect(await registry.canUseModel(privateModel)).toBe(false);
+		}
 		const parentSession = parent.runtime.session;
 		const sessionDir = join(parentSession.sessionManager.getSessionArtifactDir()!, "sub-fallback");
 		const manager = SessionManager.create(spawn.tempDir, sessionDir);
 		manager.newSession({ parentSession: parentSession.sessionFile, rlmDepth: 1 });
 		manager.appendMessage({ role: "user", content: "saved task", timestamp: 1 });
-		if (persisted) manager.appendModelChange("unavailable-provider", "unavailable-model");
+		if (persisted) manager.appendModelChange(persisted.provider, persisted.modelId);
 		manager.flushNow();
 		const defaultsBefore = readFileSync(settingsPath, "utf8");
 		const restored = await internals.rehydrateCompletedRlmSubagentOnce(parent, {
@@ -299,7 +327,7 @@ describe("#858 daemon child profile rehydration", () => {
 		expect(restoredOptions?.thinkingLevel).toBeUndefined();
 		if (persisted) {
 			expect(restored.runtime.modelFallbackMessage).toContain(
-				"Could not restore model unavailable-provider/unavailable-model",
+				`Could not restore model ${persisted.provider}/${persisted.modelId}`,
 			);
 		}
 		await restored.runtime.services.settingsManager.flush();
