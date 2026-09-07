@@ -168,6 +168,7 @@ export class ReplKernelManager {
 	/** Serializes execute() calls — the runtime runs one request at a time. */
 	private executionQueue: Promise<unknown> = Promise.resolve();
 	private activeExecution?: ActiveExecution;
+	private pendingExecutions = 0;
 	private readonly activeExecutionIdleWaiters = new Set<() => void>();
 	private readonly lateSentAgentMessageHandlers = new Map<string, (message: KernelSentAgentMessage) => void>();
 	/** Resolvers for done events outside the active execution (the shutdown reply). */
@@ -851,6 +852,20 @@ export class ReplKernelManager {
 
 	/** Queue one protocol request (execute or state op) behind every other request. */
 	private async enqueueRequest(
+		requestFields: Record<string, unknown> & { type: string },
+		code: string,
+		opts: ExecuteOptions,
+		executionTimeoutMs?: number,
+	): Promise<InternalExecuteResult> {
+		this.pendingExecutions++;
+		try {
+			return await this.enqueueTrackedRequest(requestFields, code, opts, executionTimeoutMs);
+		} finally {
+			this.pendingExecutions--;
+		}
+	}
+
+	private async enqueueTrackedRequest(
 		requestFields: Record<string, unknown> & { type: string },
 		code: string,
 		opts: ExecuteOptions,
@@ -1639,6 +1654,28 @@ export class ReplKernelManager {
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources();
+	}
+
+	get processId(): number | undefined {
+		return this.child?.pid;
+	}
+
+	get noForceUpdateBlocker(): string | undefined {
+		if (this.activeExecution || this.pendingExecutions > 0 || this.inFlightHostRequests.size > 0) {
+			return "Python kernel execution or host request is busy";
+		}
+		if (
+			this.state === "starting" ||
+			this.protocolRepairPromise ||
+			this.rebootstrapPromise ||
+			this.teardownInFlight > 0 ||
+			this.flushingSnapshotForDispose ||
+			this.gracefulShutdownPromise
+		) {
+			return "Python kernel lifecycle is busy";
+		}
+		if (this.isRunning && !this.child?.pid) return "Python kernel process custody is unverified";
+		return undefined;
 	}
 
 	get isRunning(): boolean {

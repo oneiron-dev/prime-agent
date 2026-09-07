@@ -80,6 +80,7 @@ interface MockUpdateRestartSession {
 }
 
 interface MockUpdateRestartManifest {
+	noForce?: true;
 	formatVersion: 1;
 	createdAt: string;
 	sessions: MockUpdateRestartSession[];
@@ -128,6 +129,8 @@ const mockState = vi.hoisted(() => ({
 	globalPackageRoot: "",
 	hello: { protocol: { version: 0 } } as {
 		protocol: { version: number };
+		schemaRevision?: number;
+		serverCapabilities?: string[];
 		schemaId?: string;
 		supervisorGeneration?: string;
 		supervisorOwnerToken?: string;
@@ -413,6 +416,55 @@ describe("self-update daemon restart", () => {
 		});
 	}
 
+	async function runNoForceCoordinator(): Promise<DaemonUpdateRestartStatus> {
+		const restartDirectory = join(agentDir, "update-restarts");
+		mkdirSync(restartDirectory, { recursive: true });
+		return runDaemonUpdateRestartCoordinator({
+			socketPath: mockState.socketPath,
+			agentDir,
+			statusPath: join(restartDirectory, "no-force-status.json"),
+			noForce: true,
+		});
+	}
+
+	it("refuses no-force restart on an old daemon before prepare or shutdown", async () => {
+		const status = await runNoForceCoordinator();
+		expect(status.phase).toBe("failed");
+		expect(status.message).toContain("no_force_update_restart");
+		expect(mockState.calls).not.toContain("daemon-request:prepare_update_restart");
+		expect(mockState.calls).not.toContain("shutdown-daemon");
+	});
+
+	it("does not trust a persisted checkpoint after a no-force prepare disconnect", async () => {
+		mockState.hello.schemaRevision = 30;
+		mockState.hello.serverCapabilities = ["no_force_update_restart"];
+		mockState.disconnectAfterPersistRequestTypes = ["prepare_update_restart"];
+		const status = await runNoForceCoordinator();
+		expect(status.phase).toBe("failed");
+		expect(mockState.calls).not.toContain("shutdown-daemon");
+		expect(mockState.calls).not.toContain("ensure-daemon");
+	});
+
+	it("carries no-force through the native coordinator without package installation", async () => {
+		mockState.hello.schemaRevision = 30;
+		mockState.hello.serverCapabilities = ["no_force_update_restart"];
+		mockState.prepareManifest.noForce = true;
+		const status = await runNoForceCoordinator();
+		expect(status.phase).toBe("complete");
+		expect(mockState.requestPayloads).toContainEqual({ type: "prepare_update_restart", noForce: true });
+		expect(mockState.calls).toContain("shutdown-daemon");
+		expect(mockState.calls.some((call) => call.startsWith("spawn:npm "))).toBe(false);
+	});
+
+	it("does not downgrade a rejected no-force checkpoint to idle legacy shutdown", async () => {
+		mockState.hello.schemaRevision = 30;
+		mockState.hello.serverCapabilities = ["no_force_update_restart"];
+		mockState.prepareError = "Unknown daemon command: prepare_update_restart";
+		const status = await runNoForceCoordinator();
+		expect(status.phase).toBe("failed");
+		expect(mockState.calls).not.toContain("shutdown-daemon");
+	});
+
 	function createAcceptedRecoveryManifest(nextTurn: MockCustomMessage[] = []): MockUpdateRestartManifest {
 		return {
 			formatVersion: 1,
@@ -566,6 +618,8 @@ describe("self-update daemon restart", () => {
 	});
 
 	it("uses the interactive no-change sentinel only when self-update is unchanged", async () => {
+		vi.stubEnv("PI_SKIP_VERSION_CHECK", undefined);
+		vi.stubEnv("PI_OFFLINE", undefined);
 		process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] = "1";
 		vi.stubGlobal(
 			"fetch",

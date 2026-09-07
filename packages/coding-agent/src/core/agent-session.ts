@@ -930,6 +930,7 @@ type AutonomousRuntimeSnapshot = Pick<
 >;
 
 interface RlmChildRun {
+	owner: AgentSession;
 	id: string;
 	prompt: string;
 	sessionName: string;
@@ -1236,6 +1237,7 @@ export class AgentSession {
 	private _disposing = false;
 	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
+	private _noForceUpdateCheckpoint = false;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
 	/** True once the runtime has been built once; later builds are in-process rebuilds (/reload). */
@@ -4036,6 +4038,7 @@ export class AgentSession {
 	 * before disposal.
 	 */
 	private async _drainPendingRefinementForDisposal(): Promise<void> {
+		if (this._noForceUpdateCheckpoint) return;
 		for (const timer of this._scheduledAutoRefineTimers) {
 			clearTimeout(timer);
 		}
@@ -4416,6 +4419,73 @@ export class AgentSession {
 
 	get sessionId(): string {
 		return this.sessionManager.getSessionId();
+	}
+
+	/** Prepare only; the daemon invokes the returned no-I/O commit under the ledger writer guard. */
+	prepareRlmChildTransfer(childId: string, child: AgentSession, parent: AgentSession): () => void {
+		const activeRun = this._activeRlmChildRuns.get(childId);
+		const retained = this._rlmChildSessions.get(childId);
+		const run = activeRun ?? retained?.run;
+		if (this === parent) return () => {};
+		if (
+			this._disposed ||
+			this._disposing ||
+			parent._disposed ||
+			parent._disposing ||
+			this._deletingRlmChildren.size ||
+			parent._deletingRlmChildren.size ||
+			this._rlmChildCleanupFailures.size ||
+			parent._rlmChildCleanupFailures.size ||
+			run?.detachedDeletion ||
+			(run !== undefined && run.status !== "running" && run.status !== "done") ||
+			(activeRun ? activeRun.session !== child : retained?.session !== child)
+		) {
+			throw new Error("RLM child custody is not transferable");
+		}
+		if (
+			parent._activeRlmChildRuns.has(childId) ||
+			parent._rlmChildSessions.has(childId) ||
+			parent._deletedRlmChildIds.has(childId)
+		)
+			throw new Error("RLM child handle collision");
+		return () => {
+			this._activeRlmChildRuns.delete(childId);
+			this._rlmChildSessions.delete(childId);
+			if (run) {
+				run.owner = parent;
+				if (activeRun) parent._activeRlmChildRuns.set(childId, run);
+				if (this._unsettledRlmChildRuns.delete(run)) parent._unsettledRlmChildRuns.add(run);
+			}
+			if (retained) parent._rlmChildSessions.set(childId, retained);
+			const unsubscribe = this._rlmChildUnsubscribes.get(childId);
+			this._rlmChildUnsubscribes.delete(childId);
+			if (unsubscribe) parent._rlmChildUnsubscribes.set(childId, unsubscribe);
+		};
+	}
+
+	prepareRlmTopologyUpdate(depth: number, parent: AgentSession): () => void {
+		if (
+			[...this._activeRlmChildRuns.values()].some((run) => run.status === "queued" || (!run.session && !run.settled))
+		)
+			throw new Error("RLM topology update conflicts with child admission");
+		if (!Number.isSafeInteger(depth) || depth < 1 || depth > this._rlmMaxDepth || this._disposed || this._disposing)
+			throw new Error("RLM topology cannot be updated");
+		// Build future prompt state before publication; no provider or kernel is restarted.
+		const options = {
+			...this._baseSystemPromptOptions,
+			rlmDepth: depth,
+			rlmParentAgent: parent.sessionName ?? parent.sessionId,
+			allowRecursion: depth < this._rlmMaxDepth,
+		};
+		const prompt = buildSystemPrompt(options);
+		return () => {
+			const oldBase = this._baseSystemPrompt;
+			this._rlmDepth = depth;
+			this._rlmParentAgent = options.rlmParentAgent;
+			this._baseSystemPromptOptions = options;
+			this._baseSystemPrompt = prompt;
+			this.agent.state.systemPrompt = this._refreshExtensionSystemPrompt(this.agent.state.systemPrompt, oldBase);
+		};
 	}
 
 	get rlmDepth(): number {
@@ -6848,6 +6918,51 @@ export class AgentSession {
 			deferred,
 			stop: () => this._sessionInputCheckpointWaiters.delete(check),
 		};
+	}
+
+	get noForceUpdateKernelPid(): number | undefined {
+		return this._ipythonKernelProvisioner?.manager?.processId;
+	}
+
+	async acquireNoForceUpdateCheckpoint(): Promise<{ release(): void }> {
+		this.assertNoForceUpdateSafe();
+		await this._ipythonKernelProvisioner?.assertNoForceUpdateCustody();
+		this._noForceUpdateCheckpoint = true;
+		return {
+			release: () => {
+				this._noForceUpdateCheckpoint = false;
+			},
+		};
+	}
+
+	assertNoForceUpdateSafe(): void {
+		if (
+			this.isStreaming ||
+			this.isCompacting ||
+			this.isRetrying ||
+			this.isBashRunning ||
+			this._disposed ||
+			this._disposing ||
+			this._refineInFlight ||
+			this._refinePlanInFlight ||
+			this._serializedPlanInFlight ||
+			this._serializedPlanClaim ||
+			this._autoRefineOperations.size ||
+			this._scheduledAutoRefineTimers.size ||
+			this._pendingRequestedRefine ||
+			this._pendingRequestedCompaction ||
+			this._branchSummaryOperation ||
+			this._postCompactionContinuationSettlement ||
+			this._pendingRlmSubagentSessionNames.size ||
+			this._deletingRlmChildren.size ||
+			this._unsettledRlmChildRuns.size ||
+			this._actionStore.activeActions().length
+		)
+			throw new Error(
+				`No-force update checkpoint: session ${this.sessionId} runtime is busy; retry at its natural boundary`,
+			);
+		const kernelBlocker = this._ipythonKernelProvisioner?.noForceUpdateBlocker;
+		if (kernelBlocker) throw new Error(`No-force update checkpoint: ${kernelBlocker}`);
 	}
 
 	async waitForSessionInputCheckpoint(signal?: AbortSignal): Promise<void> {
@@ -9544,6 +9659,7 @@ export class AgentSession {
 			const notifyRestore = !this._ipythonRuntimeBuilt || this._ipythonInitialRestorePending;
 			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
 				env: this._rlmKernelEnv(),
+				liveEnv: () => ({ RLM_DEPTH: String(this._rlmDepth), RLM_MAX_DEPTH: String(this._rlmMaxDepth) }),
 				commandPrefix: this.settingsManager.getShellCommandPrefix(),
 				shellPath: this.settingsManager.getShellPath(),
 				sessionId: this.sessionId,
@@ -10942,6 +11058,7 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
+		if (this._sessionInputAdmissionPauses.size > 0) this._assertSessionActionAdmissionAvailable();
 		// Capture the parent turn before async runtime construction can change it.
 		const spawnedByRequestId = this.isStreaming ? this._semanticEdges.lastTurnRequestId : undefined;
 		const { name: rawName, model: rawModel, reasoning: rawReasoning, thinking: rawThinking, ...unsupported } = kwargs;
@@ -10985,6 +11102,7 @@ export class AgentSession {
 			}
 			if (this._disposed || this._disposing)
 				throw new Error("Cannot spawn a subagent after its parent was disposed");
+			if (this._rlmDepth >= this._rlmMaxDepth) throw new Error("RLM recursion depth changed during admission");
 
 			childSessionDir = this._createChildRlmSessionDir();
 			childNodeId = basename(childSessionDir);
@@ -11065,6 +11183,7 @@ export class AgentSession {
 		let runningToolCount = 0;
 		let childSession: AgentSession | undefined;
 		const run: RlmChildRun = {
+			owner: this,
 			id: childNodeId,
 			prompt,
 			sessionName,
@@ -11089,18 +11208,18 @@ export class AgentSession {
 		// spawns cannot both admit.
 		if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
 		const emitChildUpdate = () => {
-			const child = this._rlmChildSnapshotForRun(run);
+			const child = run.owner._rlmChildSnapshotForRun(run);
 			const serialized = JSON.stringify(child);
 			if (serialized === run.lastEmittedUpdate) return;
 			run.lastEmittedUpdate = serialized;
-			this._emit({ type: "rlm_child_update", child });
+			run.owner._emit({ type: "rlm_child_update", child });
 		};
 		run.emitUpdate = emitChildUpdate;
 		emitChildUpdate();
 
 		const publishChildSession = (child: AgentSession) => {
 			childSession = child;
-			if (this._activeRlmChildRuns.get(run.id) !== run) return;
+			if (run.owner._activeRlmChildRuns.get(run.id) !== run) return;
 			run.session = child;
 			run.abort = () => void child.abort();
 			run.publication.resolve();
@@ -11125,11 +11244,16 @@ export class AgentSession {
 		const deliverTerminalMessageToParent = async (message: CustomMessage): Promise<void> => {
 			// Synthesized lifecycle notices always use the parent's private durable
 			// path. Explicit child replies continue through agent_message separately.
-			await this._deferRlmTerminalNotice(message);
+			await run.owner._deferRlmTerminalNotice(message);
 		};
 
 		run.completeDeletion = () => {
-			if (!run.deletionNeedsCompletionNotice || run.suppressTerminalNotice || this._disposed || this._disposing) {
+			if (
+				!run.deletionNeedsCompletionNotice ||
+				run.suppressTerminalNotice ||
+				run.owner._disposed ||
+				run.owner._disposing
+			) {
 				return Promise.resolve();
 			}
 			if (run.deletionNotice) return run.deletionNotice;
@@ -11146,7 +11270,7 @@ export class AgentSession {
 		};
 
 		run.reportDeletionCleanupFailure = (error) => {
-			if (run.suppressTerminalNotice || this._disposed || this._disposing) return Promise.resolve();
+			if (run.suppressTerminalNotice || run.owner._disposed || run.owner._disposing) return Promise.resolve();
 			const cleanupError = error instanceof Error ? error.message : String(error);
 			return deliverTerminalMessageToParent(
 				createRlmChildFailureMessage({
@@ -11172,9 +11296,9 @@ export class AgentSession {
 				run.status = "running";
 				emitChildUpdate();
 				const unsubscribeChildEvents = child.subscribe((event) => {
-					if (this._disposed) return;
+					if (run.owner._disposed) return;
 					if (event.type === "rlm_child_update") {
-						this._emit(event);
+						run.owner._emit(event);
 						return;
 					}
 					if (event.type === "agent_start") {
@@ -11270,7 +11394,7 @@ export class AgentSession {
 				// Only successful completions return; the edge lands on the parent's next commit.
 				const childLastCommitted = child.semanticEdges.lastCommittedRequestId;
 				if (childLastCommitted !== undefined) {
-					this._semanticEdges.recordChildReturned(child.sessionId, childLastCommitted);
+					run.owner._semanticEdges.recordChildReturned(child.sessionId, childLastCommitted);
 				}
 				run.durationMs = Date.now() - startedAt;
 				run.activity = undefined;
@@ -11290,9 +11414,9 @@ export class AgentSession {
 						}),
 					);
 				}
-				if (!this.registerRlmChildSession(run.id, child) && !run.detachedDeletion) {
-					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
-						await this._subagentRuntimeHost
+				if (!run.owner.registerRlmChildSession(run.id, child) && !run.detachedDeletion) {
+					if (childRuntime && run.owner._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
+						await run.owner._subagentRuntimeHost
 							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")
 							.catch(() => void child.disposeAsync().catch(() => undefined));
 					} else {
@@ -11311,15 +11435,15 @@ export class AgentSession {
 				const failedChild = childSession ?? childRuntime?.session;
 				const failedLastCommitted = failedChild?.semanticEdges.lastCommittedRequestId;
 				if (run.status === "error" && failedChild && failedLastCommitted !== undefined) {
-					this._semanticEdges.recordChildReturned(failedChild.sessionId, failedLastCommitted);
+					run.owner._semanticEdges.recordChildReturned(failedChild.sessionId, failedLastCommitted);
 				}
 				run.durationMs = Date.now() - startedAt;
 				run.activity = undefined;
 				if (run.status === "error" && childSession === undefined) {
 					// A pre-bind failure leaves no row: "cancelled" is the wire's removal signal.
-					this._emit({
+					run.owner._emit({
 						type: "rlm_child_update",
-						child: { ...this._rlmChildSnapshotForRun(run), status: "cancelled" },
+						child: { ...run.owner._rlmChildSnapshotForRun(run), status: "cancelled" },
 					});
 				} else {
 					emitChildUpdate();
@@ -11344,30 +11468,30 @@ export class AgentSession {
 						);
 					}
 				}
-				if (!run.detachedDeletion && childSession && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
+				if (!run.detachedDeletion && childSession && run.owner._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 					try {
-						await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
+						await run.owner._subagentRuntimeHost.releaseRlmSubagentRuntime(
 							childRuntime ?? { session: childSession },
 							subagentOptions,
 							run.status === "cancelled" ? "cancelled" : "error",
 						);
-						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
-							this._deletedRlmChildIds.add(run.id);
-							this._removeRlmSubagentTracking(run.id);
+						if (run.status === "cancelled" && !run.owner._disposed && !run.owner._disposing) {
+							run.owner._deletedRlmChildIds.add(run.id);
+							run.owner._removeRlmSubagentTracking(run.id);
 						}
 					} catch {
 						await childSession?.disposeAsync().catch(() => undefined);
 					}
 				} else if (!run.detachedDeletion) {
 					try {
-						if (childRuntime && this._subagentRuntimeHost) {
-							await this._subagentRuntimeHost.deleteRlmSubagentRuntime(run.id, childRuntime.session);
+						if (childRuntime && run.owner._subagentRuntimeHost) {
+							await run.owner._subagentRuntimeHost.deleteRlmSubagentRuntime(run.id, childRuntime.session);
 						} else if (childSession) {
 							await childSession.disposeAsync();
 						}
-						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
-							this._deletedRlmChildIds.add(run.id);
-							this._removeRlmSubagentTracking(run.id);
+						if (run.status === "cancelled" && !run.owner._disposed && !run.owner._disposing) {
+							run.owner._deletedRlmChildIds.add(run.id);
+							run.owner._removeRlmSubagentTracking(run.id);
 						}
 					} catch {
 						// A failed best-effort retry remains available through the retained cleanup maps.
@@ -11381,26 +11505,26 @@ export class AgentSession {
 						let cleanupSucceeded = !run.deletionCleanupFailed;
 						if (childRuntime && cleanupSucceeded) {
 							const cleanup =
-								run.deletionCleanup ?? this._ensureRlmRunDeletionCleanup(run, childRuntime.session);
-							cleanupSucceeded = await this._observeRlmRunDeletionCleanup(
+								run.deletionCleanup ?? run.owner._ensureRlmRunDeletionCleanup(run, childRuntime.session);
+							cleanupSucceeded = await run.owner._observeRlmRunDeletionCleanup(
 								run,
 								run.detachedDeletion,
 								childRuntime.session,
 								cleanup,
 							);
 						}
-						if (cleanupSucceeded) await this._finishRlmRunDeletion(run);
+						if (cleanupSucceeded) await run.owner._finishRlmRunDeletion(run);
 					}
 				} else {
-					if (this._activeRlmChildRuns.get(run.id) === run) {
-						if (this._rlmChildSessions.has(run.id)) {
-							this._activeRlmChildRuns.delete(run.id);
-							if (run.unsubscribe) this._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
+					if (run.owner._activeRlmChildRuns.get(run.id) === run) {
+						if (run.owner._rlmChildSessions.has(run.id)) {
+							run.owner._activeRlmChildRuns.delete(run.id);
+							if (run.unsubscribe) run.owner._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
 							run.abort = noopRlmChildAbort;
 							run.unsubscribe = undefined;
 							run.session = undefined;
 						} else if (run.status !== "error") {
-							this._removeRlmSubagentTracking(run.id, run);
+							run.owner._removeRlmSubagentTracking(run.id, run);
 						} else {
 							run.unsubscribe?.();
 							run.abort = noopRlmChildAbort;
@@ -11409,8 +11533,8 @@ export class AgentSession {
 					}
 					run.settled = true;
 					run.settlement.resolve();
-					this._unsettledRlmChildRuns.delete(run);
-					this._maybeResumeGoalContinuationAfterRlmWork();
+					run.owner._unsettledRlmChildRuns.delete(run);
+					run.owner._maybeResumeGoalContinuationAfterRlmWork();
 				}
 			}
 		})().catch(() => undefined);

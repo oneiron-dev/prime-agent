@@ -120,6 +120,14 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		return { ...this._metadata };
 	}
 
+	commitSupervisionParent(
+		parent: Pick<AgentSessionRuntimeMetadata, "parentActiveSessionId" | "parentSessionId" | "parentSessionFile">,
+	): void {
+		this._metadata.parentActiveSessionId = parent.parentActiveSessionId;
+		this._metadata.parentSessionId = parent.parentSessionId;
+		this._metadata.parentSessionFile = parent.parentSessionFile;
+	}
+
 	get runtimeConfig(): AgentSessionRuntimeConfig | undefined {
 		return this.sessionConfig ? { ...this.sessionConfig } : undefined;
 	}

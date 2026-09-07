@@ -276,6 +276,8 @@ export interface IpythonToolOptions {
 	/** Python override. Must have prime-agent-runtime installed. */
 	python?: string;
 	env?: Record<string, string>;
+	/** Refreshed before each user cell without replacing the live kernel. */
+	liveEnv?: () => Record<string, string>;
 	/** Command prefix prepended to every bash() command. */
 	commandPrefix?: string;
 	/** Shell used by bash(). */
@@ -325,9 +327,67 @@ export class IpythonKernelProvisioner {
 		private readonly options?: Omit<IpythonToolOptions, "provisioner">,
 	) {}
 
+	prepareUserCode(code: string): string {
+		const env = this.options?.liveEnv?.();
+		if (!env) return code;
+		return `import os as _prime_agent_live_os\n_prime_agent_live_os.environ.update(${JSON.stringify(env)})\n${code}`;
+	}
+
 	/** The kernel manager, once a startup has completed successfully. */
 	get manager(): KernelClient | undefined {
 		return this.startedManager;
+	}
+
+	get noForceUpdateBlocker(): string | undefined {
+		if (!this.managerPromise) return undefined;
+		if (!this.startedManager) return "Python kernel startup is busy";
+		if (this.startedManager.isShutDown) return undefined;
+		return this.startedManager.noForceUpdateBlocker;
+	}
+
+	async assertNoForceUpdateCustody(): Promise<void> {
+		const blocker = this.noForceUpdateBlocker;
+		if (blocker) throw new Error(blocker);
+		const manager = this.startedManager;
+		if (!manager || manager.isShutDown) return;
+		const code = `
+def _prime_agent_update_checkpoint():
+    import asyncio, importlib, os, threading
+    repl = importlib.import_module("rlm.repl")
+    current = asyncio.current_task()
+    tasks = [t for t in asyncio.all_tasks() if t is not current and t is not repl._serve_task and not t.done()]
+    allowed = (repl._Pump._run, repl._read_requests, repl._owner_watchdog)
+    threads = [t for t in threading.enumerate() if t is not threading.main_thread() and getattr(getattr(t, "_target", None), "__func__", getattr(t, "_target", None)) not in allowed]
+    loop = asyncio.get_running_loop()
+    scheduled = [h for h in [*loop._scheduled, *loop._ready] if not h.cancelled()]
+    if tasks or threads or scheduled:
+        raise RuntimeError("Python background work custody is unsafe")
+    if os.name != "posix" or not os.path.exists("/proc/self/task"):
+        raise RuntimeError("Native process custody inspection is unavailable")
+    for tid in os.listdir("/proc/self/task"):
+        with open("/proc/self/task/" + tid + "/children") as children:
+            if children.read().strip():
+                raise RuntimeError("Python external process custody is unsafe")
+_prime_agent_update_checkpoint()
+del _prime_agent_update_checkpoint
+`;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			// No abort signal: a failed checkpoint must not interrupt a user cell.
+			const result = await Promise.race([
+				manager.execute(`exec(${JSON.stringify(code)}, {})`, { internal: true }),
+				new Promise<never>((_, reject) => {
+					timeout = setTimeout(
+						() => reject(new Error("Python custody checkpoint timed out without interruption")),
+						5_000,
+					);
+					timeout.unref();
+				}),
+			]);
+			if (result.status !== "ok") throw new Error(result.error?.evalue ?? "Python custody checkpoint failed");
+		} finally {
+			if (timeout) clearTimeout(timeout);
+		}
 	}
 
 	/** Result of reviving a prior session's namespace on the last kernel start, if any. */
@@ -595,7 +655,7 @@ async function executeWithBusyKernelChoice(
 	while (true) {
 		const m = await provisioner.ensure(reportStartupProgress, signal);
 		try {
-			const result = await m.execute(code, {
+			const result = await m.execute(provisioner.prepareUserCode(code), {
 				signal,
 				onStream,
 				onLateSentAgentMessage: onLateSentAgentMessage

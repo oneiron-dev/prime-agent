@@ -17,6 +17,7 @@ import {
 	acquireDaemonUpdateRestartCoordinator,
 	buildDaemonUpdateRestartReport,
 	DAEMON_UPDATE_RESTART_COORDINATOR_FLAG,
+	DAEMON_UPDATE_RESTART_NO_FORCE_FLAG,
 	DAEMON_UPDATE_RESTART_ORIGIN_FLAG,
 	DAEMON_UPDATE_RESTART_STATUS_FLAG,
 	DaemonUpdateRestartCoordinatorAlreadyRunningError,
@@ -50,11 +51,13 @@ import { DefaultPackageManager } from "./core/package-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { DaemonClient, type DaemonHello } from "./modes/daemon/daemon-client.js";
 import {
+	DAEMON_NO_FORCE_UPDATE_RESTART_COMPATIBILITY,
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_ID,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartSession,
+	daemonHelloMeetsCompatibility,
 	isUnknownDaemonCommandError,
 } from "./modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "./modes/daemon/daemon-socket.js";
@@ -89,6 +92,7 @@ interface PackageCommandOptions {
 	help: boolean;
 	daemonSocketPath?: string;
 	restartCoordinator: boolean;
+	restartNoForce: boolean;
 	restartStatusPath?: string;
 	restartOriginActiveSessionId?: string;
 	invalidOption?: string;
@@ -210,6 +214,7 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 	let extensionFlagSource: string | undefined;
 	let daemonSocketPath: string | undefined;
 	let restartCoordinator = false;
+	let restartNoForce = false;
 	let restartStatusPath: string | undefined;
 	let restartOriginActiveSessionId: string | undefined;
 
@@ -271,6 +276,11 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 				daemonSocketPath = normalizeSocketPath(value);
 				index++;
 			}
+			continue;
+		}
+
+		if (arg === DAEMON_UPDATE_RESTART_NO_FORCE_FLAG) {
+			restartNoForce = true;
 			continue;
 		}
 
@@ -374,6 +384,7 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 		help,
 		daemonSocketPath,
 		restartCoordinator,
+		restartNoForce,
 		restartStatusPath,
 		restartOriginActiveSessionId,
 		invalidOption,
@@ -760,6 +771,7 @@ function parseDaemonUpdateRestartManifest(value: unknown): DaemonUpdateRestartMa
 	return {
 		formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 		createdAt: readString(value.createdAt, "createdAt"),
+		...(value.noForce === true ? { noForce: true } : {}),
 		sessions: sessions.map(parseDaemonUpdateRestartSession),
 	};
 }
@@ -851,7 +863,11 @@ async function prepareConnectedDaemonUpdateRestart(
 	socketPath: string,
 	agentDir: string,
 	hello: DaemonHello | undefined,
+	noForce = false,
 ): Promise<DaemonUpdateRestartManifest> {
+	if (noForce && !daemonHelloMeetsCompatibility(hello, DAEMON_NO_FORCE_UPDATE_RESTART_COMPATIBILITY)) {
+		throw new Error("Daemon has not proven no_force_update_restart; no workers were closed");
+	}
 	const pendingManifest = tryReadPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
 	let startedAt: number | undefined;
 	let fixedOwnerIdentity: FixedDaemonSupervisorOwnerIdentity | undefined;
@@ -871,7 +887,7 @@ async function prepareConnectedDaemonUpdateRestart(
 		if (hasFixedDaemonSupervisorOwnerIdentity(hello)) {
 			fixedOwnerIdentity = hello;
 		}
-		if (pendingManifest && pendingManifest.sessions.length > 0) {
+		if (!noForce && pendingManifest && pendingManifest.sessions.length > 0) {
 			const listResponse = await client.request({ type: "list" }, 30000);
 			if (listResponse.success && !responseHasActiveDaemonSessions(listResponse.data)) {
 				await persistPreparedRestartFence();
@@ -880,18 +896,22 @@ async function prepareConnectedDaemonUpdateRestart(
 		}
 		clearPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
 		startedAt = Date.now();
-		const response = await client.request({ type: "prepare_update_restart" }, 120000);
+		const response = await client.request(
+			{ type: "prepare_update_restart", ...(noForce ? { noForce: true } : {}) },
+			120000,
+		);
 		if (!response.success) {
 			throw new Error(response.error);
 		}
 		const manifest = parseDaemonUpdateRestartManifest(response.data);
+		if (noForce && manifest.noForce !== true) throw new Error("Daemon did not verify a no-force checkpoint");
 		await persistPreparedRestartFence();
 		return manifest;
 	} catch (error) {
 		if (fencePersistenceStarted) {
 			throw error;
 		}
-		if (startedAt !== undefined) {
+		if (!noForce && startedAt !== undefined) {
 			const fallback = readPreparedDaemonUpdateRestartManifest(socketPath, agentDir, startedAt);
 			if (fallback) {
 				await persistPreparedRestartFence();
@@ -987,6 +1007,7 @@ async function restoreDaemonUpdateRestartSession(
 	session: DaemonUpdateRestartSession,
 	restoredActiveSessionIds: Map<string, string>,
 	restartOriginActiveSessionId?: string,
+	noForce = false,
 ): Promise<RestoreDaemonUpdateRestartSessionResult> {
 	const runtimeMetadata = remapDaemonUpdateRestartRuntimeMetadata(session, restoredActiveSessionIds);
 	const createResponse = await client.request(
@@ -1004,6 +1025,15 @@ async function restoreDaemonUpdateRestartSession(
 		return { restored: false, resumed: false, failureMessage: createResponse.error };
 	}
 	const activeSessionId = readCreatedActiveSessionId(createResponse.data);
+	if (
+		noForce &&
+		(!isRecord(createResponse.data) ||
+			createResponse.data.sessionId !== session.sessionId ||
+			typeof createResponse.data.sessionFile !== "string" ||
+			resolve(createResponse.data.sessionFile) !== resolve(session.sessionFile))
+	) {
+		throw new Error(`Cold restore identity mismatch for ${session.activeSessionId}`);
+	}
 	restoredActiveSessionIds.set(session.activeSessionId, activeSessionId);
 	if (session.activeSessionId === restartOriginActiveSessionId) {
 		try {
@@ -1035,8 +1065,14 @@ async function restoreDaemonUpdateRestartSession(
 			);
 		}
 	}
-	await restoreNextTurnMessages(client, activeSessionId, session.sessionFile, session.queue.nextTurn);
-	if (!session.shouldResume) return { restored: true, resumed: false };
+	const restoredNextTurn = await restoreNextTurnMessages(
+		client,
+		activeSessionId,
+		session.sessionFile,
+		session.queue.nextTurn,
+	);
+	if (noForce && !restoredNextTurn) throw new Error("Cold restore did not preserve accepted next-turn messages");
+	if (!session.shouldResume && !noForce) return { restored: true, resumed: false };
 
 	const needsContinuationPrompt =
 		session.wasStreaming ||
@@ -1055,6 +1091,7 @@ async function restoreDaemonUpdateRestartSession(
 		if (response.success) {
 			restoredQueuedWork = true;
 		} else {
+			if (noForce) throw new Error(`Cold restore did not preserve queued action IDs: ${response.error}`);
 			console.error(
 				chalk.yellow(`Warning: could not restore queued actions for ${session.sessionFile}: ${response.error}`),
 			);
@@ -1066,6 +1103,7 @@ async function restoreDaemonUpdateRestartSession(
 			(action) =>
 				action.payload.kind === "turn" && !action.payload.queueVisible && action.payload.acceptedBeforeCompletion,
 		);
+	if (noForce && needsContinuationPrompt) throw new Error("No-force checkpoint contained interrupted work");
 	if (needsContinuationPrompt && !restoredAcceptedTurn) {
 		const promptResponse = await client.request(
 			{
@@ -1118,6 +1156,7 @@ async function restoreDaemonUpdateRestart(
 					session,
 					restoredActiveSessionIds,
 					restartOriginActiveSessionId,
+					manifest.noForce === true,
 				);
 				if (result.restored) {
 					restored++;
@@ -1223,6 +1262,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 	agentDir: string;
 	statusPath: string;
 	originActiveSessionId?: string;
+	noForce?: boolean;
 }): Promise<DaemonUpdateRestartStatus> {
 	const statusWriter = new DaemonUpdateRestartStatusWriter(
 		options.statusPath,
@@ -1275,10 +1315,11 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 					options.socketPath,
 					options.agentDir,
 					hello,
+					options.noForce,
 				);
 			} catch (error: unknown) {
 				const daemonLacksPrepareCommand = isUnknownDaemonCommandError(error, "prepare_update_restart");
-				if (daemonProbeMayHaveBusySessions(daemonProbe) || !daemonLacksPrepareCommand) {
+				if (options.noForce || daemonProbeMayHaveBusySessions(daemonProbe) || !daemonLacksPrepareCommand) {
 					throw new Error(
 						`Could not prepare daemon sessions for automatic resume; the previous daemon is still running (${formatUnknownError(error)})`,
 					);
@@ -1299,7 +1340,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 			if (!stopped) {
 				const remainingDaemon = await probeRunningDaemonSessions(options.socketPath);
 				if (remainingDaemon.reachable) {
-					if (manifest) {
+					if (manifest && !options.noForce) {
 						try {
 							const restoreResult = await restoreDaemonUpdateRestart(
 								options.socketPath,
@@ -1322,6 +1363,9 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 			}
 		} else {
 			manifest = tryReadPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			if (options.noForce && manifest && manifest.noForce !== true) {
+				throw new Error("Saved manifest is not a verified no-force checkpoint");
+			}
 			if (!hasRestorableDaemonUpdateRestart(manifest)) {
 				statusWriter.update({ phase: "skipped", message: "No running daemon needed to be restarted" });
 				return statusWriter.current();
@@ -1361,7 +1405,10 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 				failed: restoreResult.failed,
 			};
 			failures = restoreResult.failures;
-			clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			if (!options.noForce || failures.length === 0)
+				clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			if (options.noForce && failures.length > 0)
+				throw new Error("Cold restore incomplete; retained native checkpoint");
 		}
 		statusWriter.update({
 			phase: "complete",
@@ -1449,6 +1496,12 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 		return true;
 	}
 
+	if (options.restartNoForce && (!options.restartCoordinator || options.force)) {
+		console.error(chalk.red("No-force restart requires the native coordinator and cannot use --force."));
+		process.exitCode = 1;
+		return true;
+	}
+
 	if (options.restartCoordinator) {
 		const agentDir = getAgentDir();
 		const statusPath = options.restartStatusPath;
@@ -1464,6 +1517,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 			agentDir,
 			statusPath,
 			originActiveSessionId: options.restartOriginActiveSessionId,
+			noForce: options.restartNoForce,
 		});
 		if (status.phase === "failed") {
 			process.exitCode = 1;

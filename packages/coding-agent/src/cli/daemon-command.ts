@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
@@ -14,6 +15,7 @@ import type { DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-prot
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
+import type { RlmSupervisionRequest } from "../modes/daemon/rlm-supervision.js";
 import { isLocalPath } from "../utils/paths.js";
 import { isValidThinkingLevel } from "./args.js";
 import { formatSessionListTable } from "./daemon-list-format.js";
@@ -38,6 +40,7 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"prompt",
 	"send",
 	"agent-messages",
+	"supervision",
 	"steer",
 	"follow-up",
 	"state",
@@ -187,6 +190,25 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 			case "send":
 				await runSend(client, parsed.positionals, parsed.json);
 				return;
+			case "supervision": {
+				const [operation, activeSessionId, file] = parsed.positionals;
+				if (!activeSessionId)
+					throw new Error("Usage: daemon supervision snapshot <owner> | adopt <owner> <signed-request.json>");
+				if (operation === "snapshot") {
+					await printResponseData(client, { type: "supervision_snapshot", activeSessionId }, parsed.json);
+				} else if (operation === "adopt" && file) {
+					const input = JSON.parse(await readFile(file, "utf8")) as {
+						request: RlmSupervisionRequest;
+						signature: string;
+					};
+					await printResponseData(
+						client,
+						{ type: "adopt_supervision", activeSessionId, request: input.request, signature: input.signature },
+						parsed.json,
+					);
+				} else throw new Error("Invalid supervision command");
+				break;
+			}
 			case "agent-messages":
 				await runAgentMessages(client, parsed.positionals, parsed.json);
 				return;

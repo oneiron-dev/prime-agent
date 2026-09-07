@@ -89,7 +89,7 @@ import {
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
-import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV, readActiveOrphanProcesses } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import {
@@ -98,7 +98,12 @@ import {
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
 import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
-import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
+import {
+	acquireSessionLease,
+	canonicalSessionPath,
+	getProcessStartId,
+	type SessionLease,
+} from "../../core/session-lease.js";
 import { readPinnedSessionIds } from "../../core/session-list-priority.js";
 import {
 	getSessionArtifactPathForFile,
@@ -236,12 +241,14 @@ import {
 	rlmSubagentDisplayPath,
 	writeRlmSubagentDisplayEntry,
 } from "./rlm-subagent-display.js";
+import type { RlmSupervisionChange } from "./rlm-supervision.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import {
 	createSnapshotTranscriptChunks,
 	SNAPSHOT_TARGET_CHUNK_BYTES,
 	type SnapshotTranscriptChunkSource,
 } from "./snapshot-transcript-cache.js";
+import { authorizeSupervision } from "./supervision-authorization.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
 export interface DaemonModeOptions {
@@ -302,6 +309,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"append_custom_message",
 	"resume_queue",
 	"send_message",
+	"supervision_snapshot",
+	"adopt_supervision",
 	"agent_messages_status",
 	"agent_messages_pause",
 	"agent_messages_resume",
@@ -520,6 +529,7 @@ export class AgentDaemon {
 		abort: AbortController;
 		deadline?: ReturnType<typeof setTimeout>;
 		phase: "preparing" | "fencing" | "prepared" | "publishing";
+		noForce: boolean;
 		manifest?: DaemonUpdateRestartManifest;
 		deferredClientEnv: Array<{
 			client: DaemonSocketClient;
@@ -1035,6 +1045,56 @@ export class AgentDaemon {
 		);
 	}
 
+	private prepareSupervisionRuntime(changes: readonly RlmSupervisionChange[]): () => void {
+		if (this.updateRestart || this.shuttingDown || this.pendingSessionNames.size)
+			throw new Error("Supervision adoption conflicts with runtime maintenance");
+		const resolveState = (path: string): ActiveSessionState => {
+			const state = this.findSessionBySessionFile(path);
+			if (
+				!state ||
+				this.bindingSessions.has(state.activeSessionId) ||
+				this.closingSessions.has(state.activeSessionId) ||
+				this.openingSessions.has(resolve(path)) ||
+				this.passivatingSessions.has(resolve(path))
+			)
+				throw new Error("Supervision adoption requires affected sessions in the same ready worker");
+			return state;
+		};
+		const commits: Array<() => void> = [];
+		for (const { before, after } of changes) {
+			const child = resolveState(after.child);
+			const oldParent = resolveState(before.parent);
+			const parent = resolveState(after.parent);
+			if (
+				child.runtime.metadata.rlmChildId !== after.childId ||
+				child.runtime.metadata.parentActiveSessionId !== oldParent.activeSessionId
+			)
+				throw new Error("Resident supervision old-parent CAS failed");
+			if (before.parent !== after.parent)
+				commits.push(
+					oldParent.runtime.session.prepareRlmChildTransfer(
+						after.childId,
+						child.runtime.session,
+						parent.runtime.session,
+					),
+				);
+			commits.push(child.runtime.session.prepareRlmTopologyUpdate(after.depth, parent.runtime.session));
+			commits.push(() => {
+				child.runtime.commitSupervisionParent({
+					parentActiveSessionId: parent.activeSessionId,
+					parentSessionId: parent.runtime.session.sessionId,
+					parentSessionFile: parent.runtime.session.sessionFile,
+				});
+			});
+		}
+		return () => {
+			for (const commit of commits) commit();
+			this.passiveRlmSubagentMemo.clear();
+			this.agentFamilyRosterScans.clear();
+			this.scheduleRosterFlush();
+		};
+	}
+
 	private async appendRlmLedgerRenameForState(state: ActiveSessionState, name: string): Promise<void> {
 		const childId = state.runtime.metadata.rlmChildId;
 		const child = state.runtime.session.sessionFile;
@@ -1174,6 +1234,8 @@ export class AgentDaemon {
 				// already durable.
 				return;
 			}
+			const current = this.rlmSpawnLedger().supervisionEdge(legacy.sessionFile);
+			if (current && current.parent !== parentPath) throw new Error("Stale parent cannot delete adopted child");
 			entry = {
 				childId: legacy.childId,
 				sessionName: legacy.sessionName,
@@ -1293,7 +1355,13 @@ export class AgentDaemon {
 			return { ...metadataFields(display), rlmDepth: edge.depth };
 		}
 		if (readHealth?.displayPresent) readHealth.degraded();
-		const registryPath = this.legacyRlmSubagentRegistryPath(parent.sessionFile, parent.sessionId);
+		const admissionParent = this.rlmSpawnLedger().admissionParent(edge.child) ?? parent.sessionFile;
+		const admissionParentId =
+			admissionParent === canonicalSessionPath(parent.sessionFile)
+				? parent.sessionId
+				: (await readSessionInfo(admissionParent))?.id;
+		if (!admissionParentId) throw new Error("Original RLM admission metadata is unavailable");
+		const registryPath = this.legacyRlmSubagentRegistryPath(admissionParent, admissionParentId);
 		let registryRead = legacyRegistryCache?.get(registryPath);
 		if (!registryRead) {
 			registryRead = this.readLegacyRlmSubagentRegistry(registryPath);
@@ -1304,7 +1372,7 @@ export class AgentDaemon {
 			// A seeded edge's depth may be a parent+1 guess for legacy entries
 			// without one: leave it absent so hydration falls back to the
 			// persisted header depth, exactly as the registry reader did.
-			return { ...metadataFields(legacy), ...(legacy.rlmDepth !== undefined ? { rlmDepth: legacy.rlmDepth } : {}) };
+			return { ...metadataFields(legacy), rlmDepth: edge.depth };
 		}
 		if (readHealth?.legacyPresent) readHealth.degraded();
 		// Ledger-only child (metadata lost): hydratable with defaults.
@@ -2770,6 +2838,9 @@ export class AgentDaemon {
 				});
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
+				const resident = [...this.sessions.values()].find((state) => state.runtime.session === runtime.session);
+				if (resident && resident.runtime.metadata.parentActiveSessionId !== parentState.activeSessionId)
+					throw new Error("Stale parent cannot release adopted child");
 				// Persist the deletion boundary first, but never let a registry failure
 				// strand the cancelled child as a stale resident session.
 				let deletionError: unknown;
@@ -2814,6 +2885,9 @@ export class AgentDaemon {
 				if (deletionError !== undefined) throw deletionError;
 			},
 			deleteRlmSubagentRuntime: async (childId, session) => {
+				const resident = session && [...this.sessions.values()].find((state) => state.runtime.session === session);
+				if (resident && resident.runtime.metadata.parentActiveSessionId !== parentState.activeSessionId)
+					throw new Error("Stale parent cannot delete adopted child");
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
 						candidate.runtime.metadata.kind === "subagent" &&
@@ -2895,6 +2969,7 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		options: CreateRlmSubagentRuntimeOptions,
 	): Promise<AgentSessionRuntime> {
+		if (this.updateRestart?.noForce) throw new Error("No-force update checkpoint fences RLM admission");
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		sessionManager.newSession({
 			parentSession: options.parentSession.sessionFile,
@@ -3406,6 +3481,8 @@ export class AgentDaemon {
 							},
 						},
 						rlmSessionDir: entry.sessionDir,
+						rlmParentAgent: parentState.runtime.session.sessionName ?? parentState.runtime.session.sessionId,
+						semanticParentSessionId: parentState.runtime.session.sessionId,
 						// Registry depth is authoritative (written at spawn); for legacy entries
 						// without it, the shared accessor resolves persisted header depth or the
 						// session file's sub- path before the depth-1 default.
@@ -4068,8 +4145,10 @@ export class AgentDaemon {
 		// Mirror the supervisor's drain/fence split: abort-style commands stay
 		// admitted only while mutations drain; once the checkpoint is being
 		// captured they could race the snapshot and are rejected too.
-		const restartRejected =
-			restartPhase === "preparing"
+		const restartRejected = this.updateRestart?.noForce
+			? !(command.type === "shutdown" && restartPhase === "publishing" && this.sessions.size === 0) &&
+				!(command.type === "shutdown" && restartPhase === "publishing" && this.sessions.size === 0)
+			: restartPhase === "preparing"
 				? !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)
 				: restartPhase !== undefined && command.type !== "shutdown";
 		if (mutation && restartRejected) {
@@ -4188,6 +4267,9 @@ export class AgentDaemon {
 						targetSelector: command.targetActiveSessionId,
 						message: command.message,
 						sender: command.sender,
+						fromState: [...this.sessions.values()].find(
+							(state) => state.runtime.session.sessionId === command.sender.sessionId,
+						),
 						senderKey: command.sender.activeSessionId ?? `client:${command.sender.clientId}`,
 						origin: "agent",
 					});
@@ -4196,7 +4278,7 @@ export class AgentDaemon {
 				}
 				case "worker_prepare_update": {
 					this.fencePeerTransports("update");
-					const transaction = this.beginUpdateRestartTransaction(client);
+					const transaction = this.beginUpdateRestartTransaction(client, command.noForce);
 					const manifest = await this.runUpdateRestartPreparation(transaction);
 					this.writeWorkerSuccess(client, command, manifest);
 					return;
@@ -4211,6 +4293,8 @@ export class AgentDaemon {
 					}
 					if (transaction.owner !== client)
 						throw new Error("Daemon update checkpoint belongs to another supervisor");
+					if (transaction.noForce !== (command.noForce === true))
+						throw new Error("Daemon update checkpoint no-force mode mismatch");
 					if (transaction.deadline) clearTimeout(transaction.deadline);
 					transaction.deadline = undefined;
 					transaction.phase = "publishing";
@@ -4276,6 +4360,32 @@ export class AgentDaemon {
 			}
 		}
 		switch (command.type) {
+			case "supervision_snapshot":
+				this.getBoundSessionState(command.activeSessionId);
+				return success(command.id, command.type, await this.rlmSpawnLedger().supervisionSnapshot());
+			case "adopt_supervision": {
+				if (this.options.worker && !this.supervisorClaims.has(client))
+					throw new Error("Supervision adoption requires the authenticated supervisor transport");
+				const owner = this.getBoundSessionState(command.activeSessionId);
+				if (
+					!owner.runtime.session.sessionFile ||
+					canonicalSessionPath(owner.runtime.session.sessionFile) !==
+						canonicalSessionPath(command.request.ownerRoot)
+				)
+					throw new Error("Supervision owner identity mismatch");
+				const receipt = await this.rlmSpawnLedger().adoptBatch(command.request, {
+					authorize: (request) => authorizeSupervision(this.agentDir, request, command.signature),
+					maxDepthBySession: new Map(
+						[...this.sessions.values()].flatMap((state) =>
+							state.runtime.session.sessionFile
+								? [[canonicalSessionPath(state.runtime.session.sessionFile), state.runtime.session.rlmMaxDepth]]
+								: [],
+						),
+					),
+					prepareRuntime: (changes) => this.prepareSupervisionRuntime(changes),
+				});
+				return success(command.id, command.type, receipt);
+			}
 			case "ack_result":
 				return undefined;
 			case "list": {
@@ -5444,7 +5554,7 @@ export class AgentDaemon {
 				this.log(
 					`prepare_update_restart command received over socket; ${this.sessions.size} active session(s) will be closed`,
 				);
-				return success(command.id, "prepare_update_restart", await this.prepareUpdateRestart());
+				return success(command.id, "prepare_update_restart", await this.prepareUpdateRestart(command.noForce));
 
 			case "retry_worker":
 				throw new Error("Worker retry is only available through the daemon supervisor");
@@ -6097,11 +6207,10 @@ export class AgentDaemon {
 	private findResidentAgentFamilyRoot(current: ActiveSessionState): ActiveSessionState {
 		let root = current;
 		const seen = new Set<string>();
-		while (root.runtime.metadata.parentSessionId && !seen.has(root.activeSessionId)) {
+		while (root.runtime.session.rlmDepth > 0 && !seen.has(root.activeSessionId)) {
 			seen.add(root.activeSessionId);
-			const parent = [...this.sessions.values()].find(
-				(state) => state.runtime.session.sessionId === root.runtime.metadata.parentSessionId,
-			);
+			const path = this.resolveHeaderParentSessionPath(root);
+			const parent = path ? this.findSessionBySessionFile(path) : undefined;
 			if (!parent) break;
 			root = parent;
 		}
@@ -6182,7 +6291,12 @@ export class AgentDaemon {
 			const entry = byId.get(passive.info.id);
 			if (entry) entry.sessionPath = canonicalSessionPath(passive.entry.sessionFile);
 		}
-		return [...byId.values()];
+		return [...byId.values()].map((entry) => {
+			const edge = entry.sessionPath ? this.rlmSpawnLedger().supervisionEdge(entry.sessionPath) : undefined;
+			if (!edge) return entry;
+			const { parentSessionId: _oldId, ...rest } = entry;
+			return { ...rest, depth: edge.depth, parentSessionPath: edge.parent };
+		});
 	}
 
 	private agentFamilyRosterKey(current: ActiveSessionState): string {
@@ -6251,6 +6365,8 @@ export class AgentDaemon {
 
 	private resolveHeaderParentSessionPath(state: ActiveSessionState): string | undefined {
 		const session = state.runtime.session;
+		const edge = session.sessionFile ? this.rlmSpawnLedger().supervisionEdge(session.sessionFile) : undefined;
+		if (edge) return edge.parent;
 		const headerParent = session.sessionManager?.getHeader?.()?.parentSession;
 		if (!headerParent || isAbsolute(headerParent)) return headerParent;
 		return session.sessionFile ? resolve(dirname(session.sessionFile), headerParent) : undefined;
@@ -6390,7 +6506,10 @@ export class AgentDaemon {
 
 	private agentFamilyEntry(state: ActiveSessionState): AgentFamilyCatalogEntry {
 		const metadata = state.runtime.metadata;
-		const depth = state.runtime.session.rlmDepth ?? 0;
+		const edge = state.runtime.session.sessionFile
+			? this.rlmSpawnLedger().supervisionEdge(state.runtime.session.sessionFile)
+			: undefined;
+		const depth = edge?.depth ?? state.runtime.session.rlmDepth ?? 0;
 		const headerParent = depth > 0 ? this.resolveHeaderParentSessionPath(state) : undefined;
 		const parentSessionPath = depth > 0 ? (headerParent ?? metadata.parentSessionFile) : undefined;
 		return {
@@ -6410,10 +6529,12 @@ export class AgentDaemon {
 
 	private passiveAgentFamilyEntry(passive: PassiveRlmSubagent): AgentFamilyCatalogEntry {
 		const entry = passive.entry;
-		const depth = passive.info.rlmDepth ?? entry.rlmDepth ?? passive.chain.length;
+		const edge = this.rlmSpawnLedger().supervisionEdge(entry.sessionFile);
+		const depth = edge?.depth ?? passive.info.rlmDepth ?? entry.rlmDepth ?? passive.chain.length;
 		const parentSessionPath =
 			depth > 0
-				? (entry.parentSessionFile ??
+				? (edge?.parent ??
+					entry.parentSessionFile ??
 					passive.chain.at(-2)?.sessionFile ??
 					passive.rootParentState?.runtime.session.sessionFile ??
 					passive.rootInfo?.path)
@@ -6423,7 +6544,9 @@ export class AgentDaemon {
 			name: passive.info.name ?? entry.sessionName,
 			depth,
 			status: "idle",
-			...(depth > 0 && entry.parentSessionId ? { parentSessionId: entry.parentSessionId } : {}),
+			...(depth > 0 && !parentSessionPath && entry.parentSessionId
+				? { parentSessionId: entry.parentSessionId }
+				: {}),
 			...(parentSessionPath ? { parentSessionPath: canonicalSessionPath(parentSessionPath) } : {}),
 			sessionPath: canonicalSessionPath(entry.sessionFile),
 		};
@@ -6578,7 +6701,7 @@ export class AgentDaemon {
 			target: this.createAgentSessionMessageEndpoint(targetState),
 		};
 		try {
-			const { status } = await this.acceptAgentSessionMessage(targetState, payload);
+			const { status } = await this.acceptAgentSessionMessage(targetState, payload, options.fromState);
 			return createAgentSessionMessageReceipt(payload, status);
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);
@@ -6640,6 +6763,7 @@ export class AgentDaemon {
 	private async acceptAgentSessionMessage(
 		targetState: ActiveSessionState,
 		payload: AgentSessionMessagePayload,
+		fromState?: ActiveSessionState,
 	): Promise<{ status: AgentSessionMessageDeliveryStatus }> {
 		const message = createAgentSessionMessage(payload);
 		let preflightFailed = false;
@@ -6650,6 +6774,7 @@ export class AgentDaemon {
 			queueIfBusy: true,
 			customMessage: message,
 			admissionCommitted: () => {
+				if (fromState) this.assertAgentFamilyReachable(fromState, targetState);
 				if (this.agentMessagesPaused) {
 					throw new Error("Agent messaging is paused");
 				}
@@ -6834,19 +6959,83 @@ export class AgentDaemon {
 		return depth;
 	}
 
+	private assertNoForceUpdateSafe(): void {
+		if (
+			this.openingSessions.size ||
+			this.reservingSessionOpens.size ||
+			this.bindingSessions.size ||
+			this.closingSessions.size ||
+			this.passivatingSessions.size ||
+			this.pendingRlmSpawnAppends.size ||
+			this.pendingSessionNames.size ||
+			this.sideQuestionRuns.size ||
+			this.promptAdmissions.size
+		)
+			throw new Error("No-force update checkpoint: worker runtime is busy; retry at its natural boundary");
+		for (const state of this.sessions.values()) {
+			state.runtime.session.assertNoForceUpdateSafe();
+		}
+		const kernelPids = new Set(
+			[...this.sessions.values()].map((state) => state.runtime.session.noForceUpdateKernelPid),
+		);
+		const journal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		if (journal) {
+			if (existsSync(journal)) {
+				try {
+					for (const line of readFileSync(journal, "utf8").split("\n")) {
+						if (!line) continue;
+						const record: unknown = JSON.parse(line);
+						if (
+							!record ||
+							typeof record !== "object" ||
+							!("version" in record) ||
+							record.version !== 1 ||
+							!("pid" in record) ||
+							!Number.isSafeInteger(record.pid) ||
+							Number(record.pid) <= 0 ||
+							!("ownerPid" in record) ||
+							!Number.isSafeInteger(record.ownerPid) ||
+							!("active" in record) ||
+							typeof record.active !== "boolean" ||
+							!("recordedAt" in record) ||
+							typeof record.recordedAt !== "string" ||
+							("processStartId" in record && typeof record.processStartId !== "string")
+						)
+							throw new Error("Invalid process record");
+					}
+				} catch {
+					throw new Error("No-force update checkpoint: external process custody journal is unreadable");
+				}
+			}
+			const unsafe = readActiveOrphanProcesses(journal, process.pid).find((orphan) => {
+				if (kernelPids.has(orphan.pid)) return false;
+				if (!orphan.processStartId) return true;
+				if (!this.isProcessAlive(orphan.pid)) return false;
+				const observed = getProcessStartId(orphan.pid);
+				return observed === undefined || observed === orphan.processStartId;
+			});
+			if (unsafe)
+				throw new Error(`No-force update checkpoint: external process custody is unsafe for pid ${unsafe.pid}`);
+		}
+	}
+
 	private assertUpdateRestartNotCancelled(transaction: { id: symbol; abort: AbortController }): void {
 		if (transaction.abort.signal.aborted || this.updateRestart?.id !== transaction.id) {
 			throw new Error("Update restart preparation cancelled");
 		}
 	}
 
-	private beginUpdateRestartTransaction(owner?: DaemonSocketClient): NonNullable<AgentDaemon["updateRestart"]> {
+	private beginUpdateRestartTransaction(
+		owner?: DaemonSocketClient,
+		noForce = false,
+	): NonNullable<AgentDaemon["updateRestart"]> {
 		if (this.updateRestart) throw new Error("Daemon is already preparing an update restart");
 		const transaction: NonNullable<AgentDaemon["updateRestart"]> = {
 			id: Symbol("update-restart"),
 			...(owner ? { owner } : {}),
 			abort: new AbortController(),
 			phase: "preparing",
+			noForce,
 			deferredClientEnv: [],
 		};
 		this.updateRestart = transaction;
@@ -6863,6 +7052,7 @@ export class AgentDaemon {
 		transaction: NonNullable<AgentDaemon["updateRestart"]>,
 	): Promise<DaemonUpdateRestartManifest> {
 		try {
+			if (transaction.noForce) this.assertNoForceUpdateSafe();
 			await this.mutationDrain.waitForDrain(0, transaction.abort.signal, "Update restart preparation cancelled");
 			this.assertUpdateRestartNotCancelled(transaction);
 			transaction.phase = "fencing";
@@ -6887,10 +7077,21 @@ export class AgentDaemon {
 			const states = [...this.sessions.values()];
 			this.updateRestartQueuePauses.clear();
 			for (const state of states) {
-				this.updateRestartQueuePauses.set(state.activeSessionId, state.runtime.session.acquireQueuedWorkPause());
+				const queuePause = state.runtime.session.acquireQueuedWorkPause();
+				const inputPause = transaction.noForce ? state.runtime.session.acquireSessionInputPause() : undefined;
+				let kernelPause: { release(): void } | undefined;
+				this.updateRestartQueuePauses.set(state.activeSessionId, {
+					release: () => {
+						kernelPause?.release();
+						inputPause?.release();
+						queuePause.release();
+					},
+				});
+				if (transaction.noForce) kernelPause = await state.runtime.session.acquireNoForceUpdateCheckpoint();
 			}
 			await Promise.all(states.map((state) => state.runtime.session.waitForSessionInputCheckpoint(signal)));
 			this.assertUpdateRestartNotCancelled(transaction);
+			if (transaction.noForce) this.assertNoForceUpdateSafe();
 			const snapshottedIds = new Set(states.map((state) => state.activeSessionId));
 			const addedSession = [...this.sessions.keys()].find((activeSessionId) => !snapshottedIds.has(activeSessionId));
 			if (addedSession) throw new Error(`Session ${addedSession} became resident during update preparation`);
@@ -6919,6 +7120,7 @@ export class AgentDaemon {
 			return {
 				formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 				createdAt: new Date().toISOString(),
+				...(transaction.noForce ? { noForce: true as const } : {}),
 				sessions: restartSessions,
 				...(discardedActiveSessionIds.length > 0 ? { discardedActiveSessionIds } : {}),
 			};
@@ -6933,11 +7135,12 @@ export class AgentDaemon {
 		if (transaction?.id !== transactionId || !transaction.manifest) {
 			throw new Error("Daemon has no prepared update checkpoint");
 		}
+		if (transaction.noForce) this.assertNoForceUpdateSafe();
 		const manifest = transaction.manifest;
 		const restartByActiveSessionId = new Map(manifest.sessions.map((session) => [session.activeSessionId, session]));
 		for (const state of this.sessions.values()) {
 			const restartSession = restartByActiveSessionId.get(state.activeSessionId);
-			if (restartSession) this.appendUpdateRestartMarker(state, restartSession);
+			if (restartSession && !transaction.noForce) this.appendUpdateRestartMarker(state, restartSession);
 		}
 		const closeStates = [...this.sessions.values()].sort(
 			(left, right) => this.getUpdateRestartSessionDepth(right) - this.getUpdateRestartSessionDepth(left),
@@ -6977,8 +7180,8 @@ export class AgentDaemon {
 		}
 	}
 
-	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
-		const transaction = this.beginUpdateRestartTransaction();
+	private async prepareUpdateRestart(noForce = false): Promise<DaemonUpdateRestartManifest> {
+		const transaction = this.beginUpdateRestartTransaction(undefined, noForce);
 		try {
 			const manifest = await this.runUpdateRestartPreparation(transaction);
 			if (transaction.deadline) clearTimeout(transaction.deadline);
@@ -7187,7 +7390,7 @@ export class AgentDaemon {
 		if (reason === "killed" || reason === "shutdown" || reason === "replaced" || reason === "update") {
 			await this.abortBashForClose(state);
 		}
-		if (reason === "update") {
+		if (reason === "update" && !this.updateRestart?.noForce) {
 			state.runtime.session.abortForUpdateRestart();
 		}
 		if (reason === "killed") {
@@ -7429,7 +7632,9 @@ export class AgentDaemon {
 				runtimeKind: "subagent",
 				rlmChildId: metadata.rlmChildId,
 				sessionId: metadata.rlmChildId,
-				parentSessionPath: metadata.parentSessionFile,
+				parentSessionPath:
+					(session.sessionFile ? this.rlmSpawnLedger().admissionParent(session.sessionFile) : undefined) ??
+					metadata.parentSessionFile,
 				parentActiveSessionId: metadata.parentActiveSessionId,
 			});
 		}
@@ -7531,6 +7736,11 @@ export class AgentDaemon {
 		const scheduledJobs = this.cronStore.list();
 		for (const summary of buildSessionList([...this.sessions.values()], [], scheduledJobs)) {
 			const entry = workerRosterEntryFromSummary(summary);
+			const admissionParent = summary.sessionFile
+				? this.rlmSpawnLedger().admissionParent(summary.sessionFile)
+				: undefined;
+			if (admissionParent)
+				entry.agentId = rosterAgentIdForSummary({ ...summary, parentSessionPath: admissionParent });
 			entries.set(entry.agentId, entry);
 		}
 		for (const [agentId, queued] of reporter.queuedChildren) {
