@@ -183,7 +183,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	if (!model && hasExistingSession && existingSession.model) {
 		const restoredModel = modelRegistry.find(existingSession.model.provider, existingSession.model.modelId);
-		if (restoredModel && modelRegistry.hasConfiguredAuth(restoredModel)) {
+		if (restoredModel && (await modelRegistry.canUseModel(restoredModel))) {
 			model = restoredModel;
 		}
 		if (!model) {
