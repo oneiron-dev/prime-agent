@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import lockfile from "proper-lockfile";
-import { ENV_AGENT_DIR, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
+import { ENV_AGENT_DIR, getDaemonUpdateRestartManifestPath, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
+import type { DaemonUpdateRestartSession } from "../modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
@@ -16,7 +17,67 @@ import {
 } from "../modes/daemon/daemon-worker-protocol.js";
 import { createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
+export interface DaemonUpdateRestartAlias {
+	activeSessionId: string;
+	sessionId: string;
+	sessionFile: string;
+}
+
+export function readDaemonUpdateRestartAliases(socketPath: string, agentDir: string): DaemonUpdateRestartAlias[] {
+	const path = `${getDaemonUpdateRestartManifestPath(socketPath, agentDir)}.aliases.json`;
+	let value: unknown;
+	try {
+		value = JSON.parse(readFileSync(path, "utf8"));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+	if (
+		!Array.isArray(value) ||
+		value.some((entry: unknown) => {
+			if (!entry || typeof entry !== "object") return true;
+			const alias = entry as Partial<DaemonUpdateRestartAlias>;
+			return (
+				!alias.activeSessionId ||
+				!alias.sessionId ||
+				!alias.sessionFile ||
+				typeof alias.activeSessionId !== "string" ||
+				typeof alias.sessionId !== "string" ||
+				typeof alias.sessionFile !== "string"
+			);
+		})
+	)
+		throw new Error("Invalid native update restore alias map");
+	return value as DaemonUpdateRestartAlias[];
+}
+
+export function persistDaemonUpdateRestartAliases(
+	socketPath: string,
+	agentDir: string,
+	sessions: readonly DaemonUpdateRestartSession[],
+): void {
+	const aliases = new Map(
+		readDaemonUpdateRestartAliases(socketPath, agentDir).map((entry) => [entry.activeSessionId, entry]),
+	);
+	for (const session of sessions) {
+		const entry = {
+			activeSessionId: session.activeSessionId,
+			sessionId: session.sessionId,
+			sessionFile: resolve(session.sessionFile),
+		};
+		const previous = aliases.get(entry.activeSessionId);
+		if (previous && (previous.sessionId !== entry.sessionId || previous.sessionFile !== entry.sessionFile)) {
+			throw new Error(`Conflicting native update alias ${entry.activeSessionId}`);
+		}
+		aliases.set(entry.activeSessionId, entry);
+	}
+	writeJsonAtomically(`${getDaemonUpdateRestartManifestPath(socketPath, agentDir)}.aliases.json`, [
+		...aliases.values(),
+	]);
+}
+
 export const DAEMON_UPDATE_RESTART_COORDINATOR_FLAG = "--internal-update-restart-coordinator";
+export const DAEMON_UPDATE_RESTART_NO_FORCE_FLAG = "--internal-update-restart-no-force";
 export const DAEMON_UPDATE_RESTART_STATUS_FLAG = "--internal-update-restart-status";
 export const DAEMON_UPDATE_RESTART_ORIGIN_FLAG = "--internal-update-restart-origin";
 
@@ -84,6 +145,7 @@ export interface LaunchDaemonUpdateRestartCoordinatorOptions {
 	agentDir: string;
 	cwd?: string;
 	originActiveSessionId?: string;
+	noForce?: boolean;
 	timeoutMs?: number;
 }
 
@@ -159,7 +221,21 @@ function writeJsonAtomically(path: string, value: unknown): void {
 	const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
 	try {
 		writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+		const descriptor = openSync(tempPath, "r");
+		try {
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
 		renameSync(tempPath, path);
+		if (process.platform !== "win32") {
+			const directory = openSync(dirname(path), "r");
+			try {
+				fsyncSync(directory);
+			} finally {
+				closeSync(directory);
+			}
+		}
 	} catch (error) {
 		rmSync(tempPath, { force: true });
 		throw error;
@@ -555,6 +631,7 @@ export async function launchDaemonUpdateRestartCoordinator(
 		DAEMON_UPDATE_RESTART_STATUS_FLAG,
 		statusPath,
 		...(originActiveSessionId ? [DAEMON_UPDATE_RESTART_ORIGIN_FLAG, originActiveSessionId] : []),
+		...(options.noForce ? [DAEMON_UPDATE_RESTART_NO_FORCE_FLAG] : []),
 	]);
 	const child = spawn(launch.command, launch.args, {
 		cwd: options.cwd ?? process.cwd(),

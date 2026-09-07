@@ -284,6 +284,8 @@ export interface KernelClient {
 	readonly ownerSessionId: string | undefined;
 	readonly isRunning: boolean;
 	readonly isShutDown: boolean;
+	readonly processId: number | undefined;
+	readonly noForceUpdateBlocker: string | undefined;
 	start(options?: KernelStartOptions): Promise<void>;
 	execute(code: string, opts?: ExecuteOptions): Promise<ExecuteResult>;
 	shutdown(opts?: KernelShutdownOptions): Promise<boolean>;

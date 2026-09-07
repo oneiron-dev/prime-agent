@@ -1,0 +1,5 @@
+- Added signed, CAS-guarded native supervision adoption for resident sessions in one worker without recreating their tasks or messages.
+- Added capability-gated no-force cold checkpoints that reject busy or unsafe workers and preserve stable restore aliases without forced process shutdown.
+- Fixed resident parent routing after native supervision adoption, including sessions restored from an older daemon.
+- Fixed update launches so safe updates can start normally without forcing active work.
+- Fixed handling of failed safety checks so new work stays paused until the check finishes.

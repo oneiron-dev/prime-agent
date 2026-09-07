@@ -42,6 +42,7 @@ import type {
 } from "../agent-connection/types.js";
 import type { AgentRosterEntry } from "./agent-roster.js";
 import type { SessionSummary } from "./daemon-session-list.js";
+import type { RlmSupervisionRequest } from "./rlm-supervision.js";
 
 /**
  * Local daemon JSONL protocol.
@@ -53,7 +54,7 @@ import type { SessionSummary } from "./daemon-session-list.js";
  */
 
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
-export const DAEMON_PROTOCOL_VERSION = 7;
+export const DAEMON_PROTOCOL_VERSION = 8;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 9 publishes persisted RLM spawn depth on passive session rows.
 // Revision 10 publishes persisted RLM spawn depth on all session catalog rows.
@@ -74,8 +75,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 26 adds stable-target follow-up addressing in the fork and usage totals upstream.
 // Revision 27 combines capability-gated stable targets with optional own-session usage totals.
 // Revision 28 adds capability-gated deadlines and request-scoped attachment cancellation.
-export const DAEMON_SCHEMA_REVISION = 28;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-a8948ed0a5b5";
+// Revision 29 gates atomic native supervision and the incompatible v2 ledger reader.
+// Revision 30 gates no-force native cold checkpoints and verified restore aliases.
+export const DAEMON_SCHEMA_REVISION = 30;
+export const DAEMON_SCHEMA_ID = "protocol-8-schema-30-6903678c1d80";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -130,7 +133,9 @@ export type DaemonServerCapability =
 	// rather than silently downgraded to an active-id-only request.
 	| "stable_target_follow_up"
 	| "direct_peer_transport"
-	| "attach_cancellation";
+	| "attach_cancellation"
+	| "native_supervision"
+	| "no_force_update_restart";
 
 /**
  * Durable coordinates of a follow-up target.
@@ -209,6 +214,8 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"acp_mcp_servers",
 	"stable_target_follow_up",
 	"attach_cancellation",
+	"native_supervision",
+	"no_force_update_restart",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -415,6 +422,8 @@ export interface DaemonUpdateRestartSession {
 }
 
 export interface DaemonUpdateRestartManifest {
+	/** True only after every resident worker proved a safe no-force checkpoint. */
+	noForce?: true;
 	formatVersion: typeof DAEMON_UPDATE_RESTART_FORMAT_VERSION;
 	createdAt: string;
 	sessions: DaemonUpdateRestartSession[];
@@ -577,6 +586,14 @@ export type DaemonCommand =
 			agentOrigin?: boolean;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
 	  }
+	| { id?: string; type: "supervision_snapshot"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "adopt_supervision";
+			activeSessionId: string;
+			request: RlmSupervisionRequest;
+			signature: string;
+	  }
 	| { id?: string; type: "agent_messages_status"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_pause"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_resume"; activeSessionId?: string }
@@ -732,7 +749,7 @@ export type DaemonCommand =
 			response: DaemonExtensionUIResponse;
 	  }
 	| { id?: string; type: "ack_result"; commandId: string }
-	| { id?: string; type: "prepare_update_restart" }
+	| { id?: string; type: "prepare_update_restart"; noForce?: boolean }
 	| { id?: string; type: "retry_worker"; activeSessionId: string }
 	| { id?: string; type: "restart" }
 	| { id?: string; type: "shutdown"; force?: boolean };
@@ -867,6 +884,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
+	supervision_snapshot: { minProtocol: 8, minSchemaRevision: 29, capability: "native_supervision" },
+	adopt_supervision: { minProtocol: 8, minSchemaRevision: 29, capability: "native_supervision" },
 	agent_messages_status: LEGACY_DAEMON_COMMAND,
 	agent_messages_pause: LEGACY_DAEMON_COMMAND,
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
@@ -986,6 +1005,8 @@ export const DAEMON_COMMAND_PLANE = {
 	append_custom_message: "session",
 	resume_queue: "session",
 	send_message: "control",
+	supervision_snapshot: "control",
+	adopt_supervision: "control",
 	agent_messages_status: "control",
 	agent_messages_pause: "control",
 	agent_messages_resume: "control",
@@ -1075,8 +1096,17 @@ export function isSessionPlaneDaemonCommand(type: string): boolean {
 	return (DAEMON_COMMAND_PLANE as Record<string, "session" | "control" | undefined>)[type] === "session";
 }
 
+export const DAEMON_NO_FORCE_UPDATE_RESTART_COMPATIBILITY = {
+	minProtocol: 8,
+	minSchemaRevision: 30,
+	capability: "no_force_update_restart",
+} as const satisfies DaemonCommandCompatibility;
+
 export function getDaemonCommandCompatibilities(command: DaemonCommand): readonly DaemonCommandCompatibility[] {
 	const requirements: DaemonCommandCompatibility[] = [];
+	if (command.type === "prepare_update_restart" && command.noForce === true) {
+		requirements.push(DAEMON_NO_FORCE_UPDATE_RESTART_COMPATIBILITY);
+	}
 	if (command.type === "attach" && command.timeoutMs !== undefined) {
 		requirements.push(DAEMON_ATTACH_CANCELLATION_COMPATIBILITY);
 	}
@@ -1401,6 +1431,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"reattach",
 	"roster_subscribe",
 	"roster_unsubscribe",
+	"supervision_snapshot",
 	"agent_messages_status",
 	"wait_for_idle",
 	"get_session_header",

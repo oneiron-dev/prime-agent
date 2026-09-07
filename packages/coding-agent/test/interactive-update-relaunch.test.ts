@@ -167,9 +167,9 @@ describe("tryExecUpdateRelaunch", () => {
 });
 
 describe("interactive self-update relaunch", () => {
-	it.skipIf(process.platform === "win32")(
-		"tears down and replaces the TUI process without waiting for a child TUI to quit",
-		async () => {
+	it.skipIf(process.platform === "win32").each(["", "--force"])(
+		"tears down and replaces the TUI process with update args '%s' without waiting for a child TUI to quit",
+		async (args) => {
 			const events: string[] = [];
 			updateMocks.spawnSync.mockReset();
 			updateMocks.spawnSync.mockImplementation(() => {
@@ -232,7 +232,7 @@ describe("interactive self-update relaunch", () => {
 			).handleUpdateCommand;
 
 			try {
-				await handleUpdateCommand.call(receiver, "");
+				await handleUpdateCommand.call(receiver, args);
 			} finally {
 				updateProcess.execve = originalExecve;
 				if (originalNodeVersion) {
@@ -252,6 +252,13 @@ describe("interactive self-update relaunch", () => {
 				"execve",
 			]);
 			expect(updateMocks.spawnSync).toHaveBeenCalledTimes(1);
+			expect(updateMocks.launchCoordinator).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({
+					socketPath: "/tmp/update.sock",
+					originActiveSessionId: "active-session",
+					noForce: args !== "--force",
+				}),
+			);
 			expect(execve.mock.calls[0]?.[1]).toEqual(expect.arrayContaining(["--resume", "/tmp/session.jsonl"]));
 		},
 	);

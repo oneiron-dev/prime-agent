@@ -5,8 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DaemonUpdateRestartModule from "../src/cli/daemon-update-restart.js";
 import {
 	acquireDaemonUpdateRestartCoordinator,
+	DAEMON_UPDATE_RESTART_COORDINATOR_FLAG,
+	DAEMON_UPDATE_RESTART_NO_FORCE_FLAG,
+	DAEMON_UPDATE_RESTART_STATUS_FLAG,
 	type DaemonUpdateRestartStatus,
 	DaemonUpdateRestartStatusWriter,
+	launchDaemonUpdateRestartCoordinator,
+	readDaemonUpdateRestartStatus,
 	waitForActiveDaemonUpdateRestartCoordinator,
 } from "../src/cli/daemon-update-restart.js";
 import {
@@ -80,6 +85,7 @@ interface MockUpdateRestartSession {
 }
 
 interface MockUpdateRestartManifest {
+	noForce?: true;
 	formatVersion: 1;
 	createdAt: string;
 	sessions: MockUpdateRestartSession[];
@@ -128,6 +134,8 @@ const mockState = vi.hoisted(() => ({
 	globalPackageRoot: "",
 	hello: { protocol: { version: 0 } } as {
 		protocol: { version: number };
+		schemaRevision?: number;
+		serverCapabilities?: string[];
 		schemaId?: string;
 		supervisorGeneration?: string;
 		supervisorOwnerToken?: string;
@@ -413,6 +421,97 @@ describe("self-update daemon restart", () => {
 		});
 	}
 
+	async function runNoForceCoordinator(): Promise<DaemonUpdateRestartStatus> {
+		const restartDirectory = join(agentDir, "update-restarts");
+		mkdirSync(restartDirectory, { recursive: true });
+		return runDaemonUpdateRestartCoordinator({
+			socketPath: mockState.socketPath,
+			agentDir,
+			statusPath: join(restartDirectory, "no-force-status.json"),
+			noForce: true,
+		});
+	}
+
+	it.each([false, true])("parses coordinator no-force=%s without weakening the old-daemon gate", async (noForce) => {
+		const restartDirectory = join(agentDir, "update-restarts");
+		mkdirSync(restartDirectory, { recursive: true });
+		const statusPath = join(restartDirectory, "parsed-status.json");
+		await handlePackageCommand([
+			"update",
+			DAEMON_UPDATE_RESTART_COORDINATOR_FLAG,
+			"--daemon-socket",
+			mockState.socketPath,
+			DAEMON_UPDATE_RESTART_STATUS_FLAG,
+			statusPath,
+			...(noForce ? [DAEMON_UPDATE_RESTART_NO_FORCE_FLAG] : []),
+		]);
+		expect(readDaemonUpdateRestartStatus(statusPath)?.phase).toBe(noForce ? "failed" : "complete");
+		expect(mockState.calls.includes("daemon-request:prepare_update_restart")).toBe(!noForce);
+		expect(mockState.calls.includes("shutdown-daemon")).toBe(!noForce);
+		expect(mockState.calls.some((call) => call.startsWith("spawn:npm "))).toBe(false);
+		if (noForce) {
+			expect(process.exitCode).toBe(1);
+			expect(readDaemonUpdateRestartStatus(statusPath)?.message).toContain("no_force_update_restart");
+		} else {
+			expect(mockState.requestPayloads).toContainEqual({ type: "prepare_update_restart" });
+		}
+	});
+
+	it("rejects conflicting coordinator force flags before any daemon operation", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await handlePackageCommand([
+				"update",
+				DAEMON_UPDATE_RESTART_COORDINATOR_FLAG,
+				DAEMON_UPDATE_RESTART_NO_FORCE_FLAG,
+				"--force",
+			]);
+			expect(process.exitCode).toBe(1);
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("cannot use --force"));
+			expect(mockState.calls).toEqual([]);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("refuses no-force restart on an old daemon before prepare or shutdown", async () => {
+		const status = await runNoForceCoordinator();
+		expect(status.phase).toBe("failed");
+		expect(status.message).toContain("no_force_update_restart");
+		expect(mockState.calls).not.toContain("daemon-request:prepare_update_restart");
+		expect(mockState.calls).not.toContain("shutdown-daemon");
+	});
+
+	it("does not trust a persisted checkpoint after a no-force prepare disconnect", async () => {
+		mockState.hello.schemaRevision = 30;
+		mockState.hello.serverCapabilities = ["no_force_update_restart"];
+		mockState.disconnectAfterPersistRequestTypes = ["prepare_update_restart"];
+		const status = await runNoForceCoordinator();
+		expect(status.phase).toBe("failed");
+		expect(mockState.calls).not.toContain("shutdown-daemon");
+		expect(mockState.calls).not.toContain("ensure-daemon");
+	});
+
+	it("carries no-force through the native coordinator without package installation", async () => {
+		mockState.hello.schemaRevision = 30;
+		mockState.hello.serverCapabilities = ["no_force_update_restart"];
+		mockState.prepareManifest.noForce = true;
+		const status = await runNoForceCoordinator();
+		expect(status.phase).toBe("complete");
+		expect(mockState.requestPayloads).toContainEqual({ type: "prepare_update_restart", noForce: true });
+		expect(mockState.calls).toContain("shutdown-daemon");
+		expect(mockState.calls.some((call) => call.startsWith("spawn:npm "))).toBe(false);
+	});
+
+	it("does not downgrade a rejected no-force checkpoint to idle legacy shutdown", async () => {
+		mockState.hello.schemaRevision = 30;
+		mockState.hello.serverCapabilities = ["no_force_update_restart"];
+		mockState.prepareError = "Unknown daemon command: prepare_update_restart";
+		const status = await runNoForceCoordinator();
+		expect(status.phase).toBe("failed");
+		expect(mockState.calls).not.toContain("shutdown-daemon");
+	});
+
 	function createAcceptedRecoveryManifest(nextTurn: MockCustomMessage[] = []): MockUpdateRestartManifest {
 		return {
 			formatVersion: 1,
@@ -566,6 +665,8 @@ describe("self-update daemon restart", () => {
 	});
 
 	it("uses the interactive no-change sentinel only when self-update is unchanged", async () => {
+		vi.stubEnv("PI_SKIP_VERSION_CHECK", undefined);
+		vi.stubEnv("PI_OFFLINE", undefined);
 		process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] = "1";
 		vi.stubGlobal(
 			"fetch",
@@ -620,6 +721,17 @@ describe("self-update daemon restart", () => {
 			errorSpy.mockRestore();
 			logSpy.mockRestore();
 		}
+	});
+
+	it.each([false, true])("opts normal CLI updates into no-force custody unless force=%s", async (force) => {
+		await handlePackageCommand(["update", "--self", ...(force ? ["--force"] : [])]);
+		expect(launchDaemonUpdateRestartCoordinator).toHaveBeenLastCalledWith({
+			socketPath: mockState.socketPath,
+			agentDir,
+			cwd: projectDir,
+			originActiveSessionId: process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID,
+			noForce: !force,
+		});
 	});
 
 	it("defers the exact custom-socket restart to the interactive parent", async () => {

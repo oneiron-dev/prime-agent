@@ -2,8 +2,11 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
 	chmodSync,
+	closeSync,
 	existsSync,
+	fsyncSync,
 	mkdirSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	renameSync,
@@ -14,6 +17,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { getLogger } from "@earendil-works/pi-ai";
+import { persistDaemonUpdateRestartAliases, readDaemonUpdateRestartAliases } from "../../cli/daemon-update-restart.js";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	appendRotatingLog,
@@ -88,6 +92,7 @@ import {
 	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	DAEMON_NO_FORCE_UPDATE_RESTART_COMPATIBILITY,
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
@@ -268,6 +273,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"append_custom_message",
 	"resume_queue",
 	"send_message",
+	"supervision_snapshot",
+	"adopt_supervision",
 	"agent_messages_status",
 	"agent_messages_pause",
 	"agent_messages_resume",
@@ -730,6 +737,7 @@ export class DaemonSupervisor {
 	private shuttingDown = false;
 	private startupComplete = false;
 	private updateRestartPhase?: "draining" | "fencing" | "prepared";
+	private updateRestartNoForce = false;
 	private readonly mutationDrain = new MutationDrainLatch();
 	private readonly clients = new Set<DaemonSocketClient>();
 	private attachWaitRegistry?: AttachWaitRegistry;
@@ -2038,6 +2046,27 @@ export class DaemonSupervisor {
 		cancellationAdmission?: SupervisorPromptAdmission,
 		attachScope?: AttachWaitScope,
 	): Promise<DaemonResponse | undefined> {
+		const agentDir = this.defaultSessionConfig?.agentDir;
+		if (
+			agentDir &&
+			("activeSessionId" in command || "fromActiveSessionId" in command || "targetActiveSessionId" in command)
+		) {
+			const aliases = readDaemonUpdateRestartAliases(this.socketPath, agentDir);
+			for (const field of ["activeSessionId", "fromActiveSessionId", "targetActiveSessionId"] as const) {
+				const selector = field in command ? (command as Record<string, unknown>)[field] : undefined;
+				const alias = aliases.find((entry) => entry.activeSessionId === selector);
+				if (!alias) continue;
+				const match = await this.findWorkerForClient(client, alias.sessionId);
+				if (
+					match.summary.sessionId !== alias.sessionId ||
+					!match.summary.sessionFile ||
+					canonicalSessionPath(match.summary.sessionFile) !== canonicalSessionPath(alias.sessionFile)
+				) {
+					throw new Error(`Native restore alias identity mismatch: ${alias.activeSessionId}`);
+				}
+				command = { ...command, [field]: match.summary.activeSessionId ?? match.summary.id };
+			}
+		}
 		switch (command.type) {
 			case "cancel_attach":
 				this.attachWaits.cancel(client, command.requestId, command.activeSessionId);
@@ -2401,10 +2430,12 @@ export class DaemonSupervisor {
 				setImmediate(() => void this.shutdown(0, false, true, false, "update"));
 				return success(command.id, command.type);
 			case "shutdown":
+				if (command.force && this.updateRestartNoForce && this.updateRestartPhase === "prepared")
+					throw new Error("Prepared update cannot use forced shutdown");
 				setImmediate(() => void this.shutdown(0, true, false, command.force === true, "shutdown"));
 				return success(command.id, "shutdown");
 			case "prepare_update_restart": {
-				const manifest = await this.prepareUpdateRestart();
+				const manifest = await this.prepareUpdateRestart(command.noForce === true);
 				return success(command.id, "prepare_update_restart", manifest);
 			}
 			case "agent_messages_status": {
@@ -2687,6 +2718,19 @@ export class DaemonSupervisor {
 					return success(command.id, command.type, result);
 				}
 				break;
+		}
+
+		if (command.type === "adopt_supervision") {
+			// A v2 ledger must never coexist with an old resident reader/writer.
+			for (const worker of this.workers.values()) {
+				if (
+					!daemonHelloMeetsCompatibility(
+						worker.client?.hello ?? worker.hello,
+						DAEMON_COMMAND_COMPATIBILITY.adopt_supervision,
+					)
+				)
+					throw new Error("All registered workers must prove native supervision compatibility");
+			}
 		}
 
 		if (command.type === "send_message") {
@@ -5181,16 +5225,16 @@ export class DaemonSupervisor {
 	}
 
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {
-		const depth = summary.rlmDepth ?? (summary.parentSessionPath ? 1 : 0);
+		const edge = summary.sessionFile ? this.rlmSpawnLedger().supervisionEdge(summary.sessionFile) : undefined;
+		const parent = edge?.parent ?? summary.parentSessionPath;
+		const depth = edge?.depth ?? summary.rlmDepth ?? (parent ? 1 : 0);
 		return {
 			id: summary.sessionId,
 			...(summary.sessionName ? { name: summary.sessionName } : {}),
 			depth,
 			status: summary.rosterStatus ?? classifySessionRosterStatus(summary),
-			...(depth > 0 && summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
-			...(depth > 0 && summary.parentSessionPath
-				? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
-				: {}),
+			...(depth > 0 && !parent && summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
+			...(depth > 0 && parent ? { parentSessionPath: canonicalSessionPath(parent) } : {}),
 			...(summary.sessionFile ? { sessionPath: canonicalSessionPath(summary.sessionFile) } : {}),
 		};
 	}
@@ -6792,26 +6836,27 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
+	private async prepareUpdateRestart(noForce = false): Promise<DaemonUpdateRestartManifest> {
 		if (this.updateRestartPhase !== undefined) throw new Error("Daemon is already preparing an update restart");
 		this.updateRestartPhase = "draining";
+		this.updateRestartNoForce = noForce;
 		try {
 			const deadline = Date.now() + UPDATE_RESTART_PREPARE_DEADLINE_MS;
 			const abort = AbortSignal.timeout(Math.min(UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS, deadline - Date.now()));
 			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
 			this.updateRestartPhase = "fencing";
 			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
-			const manifest = await this.prepareUpdateRestartFenced(deadline);
+			const manifest = await this.prepareUpdateRestartFenced(deadline, noForce);
 			this.updateRestartPhase = "prepared";
 			return manifest;
 		} catch (error) {
-			this.updateRestartPhase = undefined;
+			if (this.updateRestartPhase !== "prepared") this.updateRestartPhase = undefined;
 			this.scheduleScheduledSessionWakeRecompute();
 			throw error;
 		}
 	}
 
-	private async prepareUpdateRestartFenced(deadline: number): Promise<DaemonUpdateRestartManifest> {
+	private async prepareUpdateRestartFenced(deadline: number, noForce = false): Promise<DaemonUpdateRestartManifest> {
 		const residents = [...this.workers.values()];
 		const unavailable = residents.find(
 			(worker) =>
@@ -6822,13 +6867,25 @@ export class DaemonSupervisor {
 				`Cannot prepare update restart while resident worker ${unavailable.descriptor.workerId} is ${this.effectiveWorkerState(unavailable)}${unavailable.client ? "" : " and disconnected"}`,
 			);
 		}
+		if (noForce) {
+			for (const worker of residents) {
+				if (
+					!daemonHelloMeetsCompatibility(
+						worker.client?.hello ?? worker.hello,
+						DAEMON_NO_FORCE_UPDATE_RESTART_COMPATIBILITY,
+					)
+				) {
+					throw new Error(`Worker ${worker.descriptor.workerId} has not proven no_force_update_restart`);
+				}
+			}
+		}
 		const workers = residents as Array<ResidentWorker & { client: DaemonWorkerClient }>;
 		const acknowledged: ResidentWorker[] = [];
 		const preparationResults = await Promise.allSettled(
 			workers.map(async (worker) => {
 				const client = worker.client;
 				const response = await client.requestWorker(
-					{ type: "worker_prepare_update" },
+					{ type: "worker_prepare_update", ...(noForce ? { noForce: true } : {}) },
 					Math.max(1, Math.min(UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS, deadline - Date.now())),
 				);
 				if (!response.success) throw new Error(response.error);
@@ -6841,6 +6898,7 @@ export class DaemonSupervisor {
 					throw new Error(`Worker ${worker.descriptor.workerId} disconnected during update preparation`);
 				}
 				const manifest = response.data as DaemonUpdateRestartManifest;
+				if (noForce && manifest.noForce !== true) throw new Error("Worker did not verify a no-force checkpoint");
 				if (manifest.formatVersion !== DAEMON_UPDATE_RESTART_FORMAT_VERSION) {
 					throw new Error(`Worker returned unsupported update manifest version ${manifest.formatVersion}`);
 				}
@@ -6853,6 +6911,31 @@ export class DaemonSupervisor {
 					throw new Error(
 						`Worker ${worker.descriptor.workerId} omitted its root disposition from the update manifest`,
 					);
+				}
+				if (noForce) {
+					for (const summary of worker.summaries.values()) {
+						if (!summary.activeSessionId) continue;
+						const id = summary.activeSessionId;
+						if (
+							!manifest.sessions.some((session) => session.activeSessionId === id) &&
+							!manifest.discardedActiveSessionIds?.includes(id)
+						) {
+							throw new Error(`Worker omitted session ${id} from its no-force checkpoint`);
+						}
+					}
+					if (
+						manifest.sessions.some(
+							(session) =>
+								session.wasStreaming ||
+								session.wasCompacting ||
+								session.wasBashRunning ||
+								session.wasRetrying ||
+								session.hadAcceptedPromptInFlight ||
+								session.hadRunningRlmChildren,
+						)
+					) {
+						throw new Error("Worker returned interrupted work in a no-force checkpoint");
+					}
 				}
 				return { worker, manifest };
 			}),
@@ -6894,6 +6977,7 @@ export class DaemonSupervisor {
 			formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 			createdAt: new Date().toISOString(),
 			sessions: responses.flatMap((manifest) => manifest.sessions),
+			...(noForce ? { noForce: true } : {}),
 			...(discardedActiveSessionIds.length > 0 ? { discardedActiveSessionIds } : {}),
 		};
 		// A worker that disconnected after preparing cancelled its checkpoint with
@@ -6909,6 +6993,8 @@ export class DaemonSupervisor {
 		}
 		try {
 			this.validateAndPersistUpdateManifest(manifest);
+			if (noForce)
+				persistDaemonUpdateRestartAliases(this.socketPath, this.defaultSessionConfig.agentDir!, manifest.sessions);
 		} catch (error) {
 			await cancelAcknowledged();
 			throw error;
@@ -6916,6 +7002,7 @@ export class DaemonSupervisor {
 		// Commit through the connection that owns the prepared transaction; a client
 		// swapped in after the check above must fail the commit rather than reach a
 		// worker that no longer holds the checkpoint.
+		if (noForce) this.updateRestartPhase = "prepared";
 		const commitClients = new Map(prepared.map((worker) => [worker, worker.updateRestartPrepareClient]));
 		for (const worker of prepared) worker.updateRestartPrepareClient = undefined;
 		const commitResults = await Promise.allSettled(
@@ -6923,7 +7010,7 @@ export class DaemonSupervisor {
 				const client = commitClients.get(worker);
 				if (!client) throw new Error(`Worker ${worker.descriptor.workerId} disconnected before update commit`);
 				const response = await client.requestWorker(
-					{ type: "worker_commit_update" },
+					{ type: "worker_commit_update", ...(noForce ? { noForce: true } : {}) },
 					UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS,
 				);
 				if (!response.success) throw new Error(response.error);
@@ -6933,12 +7020,19 @@ export class DaemonSupervisor {
 			(result): result is PromiseRejectedResult => result.status === "rejected",
 		);
 		if (commitFailure) {
+			if (noForce)
+				throw new Error(
+					`No-force update commit result is uncertain; retained checkpoint and admission fence: ${String(commitFailure.reason)}`,
+				);
 			this.log(`Update restart commit response failed; forcing restart completion: ${String(commitFailure.reason)}`);
 			await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
 			return manifest;
 		}
-		const stopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false)));
+		const stopResults = await Promise.allSettled(
+			prepared.map((worker) => this.stopWorker(worker, false, false, false, false, undefined, noForce)),
+		);
 		if (stopResults.some((result) => result.status === "rejected")) {
+			if (noForce) throw new Error("No-force update worker did not stop; retained checkpoint and admission fence");
 			this.log("A committed update worker did not stop gracefully; forcing restart completion");
 			await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
 		}
@@ -6984,7 +7078,21 @@ export class DaemonSupervisor {
 		if (!Array.isArray(validated.sessions) || validated.sessions.length !== manifest.sessions.length) {
 			throw new Error("Could not validate aggregate update manifest");
 		}
+		const descriptor = openSync(tempPath, "r");
+		try {
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
 		renameSync(tempPath, path);
+		if (process.platform !== "win32") {
+			const directory = openSync(dirname(path), "r");
+			try {
+				fsyncSync(directory);
+			} finally {
+				closeSync(directory);
+			}
+		}
 	}
 
 	/**
@@ -7037,10 +7145,19 @@ export class DaemonSupervisor {
 		archiveSession = false,
 		recoveryCleanup = false,
 		directChild?: { child: ChildProcess; closed: Promise<void> },
+		noForce = false,
 	): Promise<void> {
 		const releaseStopOwnership = this.acquireWorkerStopOwnership(worker);
 		try {
-			await this.stopWorkerUntracked(worker, removeDescriptor, force, archiveSession, recoveryCleanup, directChild);
+			await this.stopWorkerUntracked(
+				worker,
+				removeDescriptor,
+				force,
+				archiveSession,
+				recoveryCleanup,
+				directChild,
+				noForce,
+			);
 		} finally {
 			releaseStopOwnership();
 		}
@@ -7053,7 +7170,9 @@ export class DaemonSupervisor {
 		archiveSession = false,
 		recoveryCleanup = false,
 		directChild?: { child: ChildProcess; closed: Promise<void> },
+		noForce = false,
 	): Promise<void> {
+		if (noForce && force) throw new Error("No-force update cannot force-stop a worker");
 		if (worker.ownerCleanupTimer) {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
@@ -7125,6 +7244,8 @@ export class DaemonSupervisor {
 			}
 			worker.client.close();
 			worker.client = undefined;
+		} else if (noForce) {
+			// A disconnected worker may still own processes. Never signal it here.
 		} else if (directChild) {
 			directChild.child.kill("SIGTERM");
 		} else if (this.processIdentity(entryPid, entryStartId) === "current") {

@@ -6,17 +6,29 @@ import {
 	linkSync,
 	mkdirSync,
 	openSync,
+	readFileSync,
 	realpathSync,
+	renameSync,
 	rmSync,
 	statSync,
 	writeSync,
 } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import lockfile from "proper-lockfile";
 import { EventLog } from "../../core/event-log.js";
 import { canonicalSessionPath } from "../../core/session-lease.js";
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { readFirstLineSync } from "../../utils/file-lines.js";
+import {
+	MAX_SUPERVISION_DEPTH,
+	normalizeSupervisionRequest,
+	planSupervisionAdoption,
+	type RlmSupervisionChange,
+	type RlmSupervisionOptions,
+	type RlmSupervisionReceipt,
+	type RlmSupervisionRequest,
+} from "./rlm-supervision.js";
 
 /**
  * Daemon-owned RLM spawn ledger.
@@ -27,12 +39,10 @@ import { readFirstLineSync } from "../../utils/file-lines.js";
  * file instead of being re-derived from writer-owned session headers,
  * registries, and bodies at read time.
  *
- * Multi-writer reality: the supervisor and each session worker hold their own
- * instance over the same file. Appends are single small O_APPEND writes (well
- * under PIPE_BUF-scale sizes), whose atomicity we rely on for interleaving;
- * reads reuse parsed state only while file identity and metadata are unchanged,
- * so cross-process staleness is bounded to in-flight appends. In-process
- * appends are serialized on an internal queue.
+ * The supervisor and session workers share this file. Writers take a common
+ * filesystem guard; adoption publishes a complete replacement by atomic rename.
+ * Readers cache only while file identity and metadata are unchanged. Adoption
+ * requires every writer/reader to understand v2 records before activation.
  */
 
 export const RLM_LEDGER_DIR = "rlm-ledger";
@@ -79,7 +89,20 @@ export interface RlmLedgerDeleteRecord {
 	reason: RlmLedgerDeleteReason;
 }
 
-export type RlmLedgerRecord = RlmLedgerSpawnRecord | RlmLedgerRenameRecord | RlmLedgerDeleteRecord;
+// Version 2 deliberately fails closed in old readers; unknown v1 ops would silently retain stale permissions.
+export interface RlmLedgerAdoptionRecord {
+	v: 2;
+	op: "adopt";
+	at: string;
+	request: RlmSupervisionRequest;
+	changes: RlmSupervisionChange[];
+}
+
+export type RlmLedgerRecord =
+	| RlmLedgerSpawnRecord
+	| RlmLedgerRenameRecord
+	| RlmLedgerDeleteRecord
+	| RlmLedgerAdoptionRecord;
 
 /** A live edge after replaying the ledger (last-writer-wins per childId+child). */
 export interface RlmLedgerEdge {
@@ -217,11 +240,9 @@ function isDeleteReason(value: unknown): value is RlmLedgerDeleteReason {
 
 /**
  * Parse one ledger line. Returns undefined for a well-formed v:1 record with
- * an unknown op (forward-compat: newer writers may add ops; readers skip
- * them). Any other violation throws. Version policy: v !== 1 fails loudly —
- * a future v2 must move to a new file/hash (or accept breaking old readers),
- * because silently skipping records a reader cannot understand would corrupt
- * topology.
+ * an unknown op (readers skip them). Version 2 is accepted only for atomic
+ * adoption, which intentionally breaks old readers rather than letting them
+ * silently authorize requests using stale topology. All other versions fail.
  */
 function parseLedgerLine(line: string, index: number): RlmLedgerRecord | RlmLedgerMetaRecord | undefined {
 	let parsed: unknown;
@@ -244,6 +265,34 @@ function parseLedgerLine(line: string, index: number): RlmLedgerRecord | RlmLedg
 		name?: unknown;
 		reason?: unknown;
 	};
+	if (record.v === 2 && record.op === "adopt" && typeof record.at === "string") {
+		const adoption = parsed as RlmLedgerAdoptionRecord;
+		normalizeSupervisionRequest(adoption.request);
+		if (
+			!Array.isArray(adoption.changes) ||
+			adoption.changes.some(
+				(change) =>
+					!change ||
+					[change.before, change.after].some(
+						(edge) =>
+							!edge ||
+							typeof edge.childId !== "string" ||
+							typeof edge.child !== "string" ||
+							typeof edge.parent !== "string" ||
+							typeof edge.name !== "string" ||
+							!Number.isSafeInteger(edge.depth) ||
+							edge.depth < 1 ||
+							edge.deleted !== undefined,
+					) ||
+					change.before.child !== change.after.child ||
+					change.before.childId !== change.after.childId ||
+					change.before.name !== change.after.name,
+			)
+		) {
+			throw new Error(`Malformed RLM ledger line ${index + 1}: invalid adoption record`);
+		}
+		return adoption;
+	}
 	if (record.v !== 1 || typeof record.at !== "string") {
 		throw new Error(`Malformed RLM ledger line ${index + 1}: missing v/at`);
 	}
@@ -294,6 +343,9 @@ interface RlmLedgerReplayCache {
 	size: number;
 	mtimeMs: number;
 	edges: ReadonlyMap<string, RlmLedgerEdge>;
+	revision: string;
+	adoptions: ReadonlyMap<string, { fingerprint: string; receipt: RlmSupervisionReceipt }>;
+	admissionParents: ReadonlyMap<string, string>;
 }
 
 /**
@@ -330,7 +382,7 @@ export class RlmSpawnLedger {
 	}
 
 	appendSpawn(input: { childId: string; parent: string; child: string; depth: number; name: string }): Promise<void> {
-		return this.enqueue(() => this.appendSpawnUnlocked(input));
+		return this.enqueue(() => this.appendSpawnUnlocked(input), true);
 	}
 
 	appendRename(input: { childId: string; child: string; name: string }): Promise<void> {
@@ -343,7 +395,7 @@ export class RlmSpawnLedger {
 				child: canonicalSessionPath(input.child),
 				name: input.name,
 			});
-		});
+		}, true);
 	}
 
 	/** Rename by child session path alone (offline saved-session rename knows no childId). */
@@ -355,7 +407,7 @@ export class RlmSpawnLedger {
 					this.appendRecord({ v: 1, op: "rename", at: nowIso(), childId: edge.childId, child: target, name });
 				}
 			}
-		});
+		}, true);
 	}
 
 	appendDelete(input: { childId: string; child: string; reason: RlmLedgerDeleteReason }): Promise<void> {
@@ -368,7 +420,7 @@ export class RlmSpawnLedger {
 				child: canonicalSessionPath(input.child),
 				reason: input.reason,
 			});
-		});
+		}, true);
 	}
 
 	/** Resolves once every operation enqueued so far has completed (durably, for appends). */
@@ -442,7 +494,7 @@ export class RlmSpawnLedger {
 		});
 	}
 
-	private enqueue<T>(fn: () => Promise<T> | T): Promise<T> {
+	private enqueue<T>(fn: () => Promise<T> | T, write = false): Promise<T> {
 		const next = this.queue.then(async () => {
 			if (!this.seedAttempted) {
 				this.seedAttempted = true;
@@ -452,10 +504,129 @@ export class RlmSpawnLedger {
 					this.log(`RLM ledger seeding failed: ${error instanceof Error ? error.message : String(error)}`);
 				}
 			}
-			return fn();
+			return write ? this.withWriteGuard(fn) : fn();
 		});
 		this.queue = next.catch(() => undefined);
 		return next;
+	}
+
+	private async withWriteGuard<T>(fn: () => Promise<T> | T): Promise<T> {
+		mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
+		const release = await lockfile.lock(this.path, {
+			realpath: false,
+			lockfilePath: `${this.path}.guard`,
+			stale: 30_000,
+			retries: { retries: 20, factor: 1, minTimeout: 10, maxTimeout: 10 },
+		});
+		try {
+			return await fn();
+		} finally {
+			await release();
+		}
+	}
+
+	/** Read the current committed edge; never use transcript parent metadata as authority over it. */
+	admissionParent(child: string): string | undefined {
+		this.replaySync();
+		return this.replayCache?.admissionParents.get(canonicalSessionPath(child));
+	}
+
+	supervisionEdge(child: string): RlmLedgerEdge | undefined {
+		const path = canonicalSessionPath(child);
+		return [...this.replaySync().values()].find((edge) => edge.child === path && !edge.deleted);
+	}
+
+	supervisionSnapshot(): Promise<{ revision: string; edges: RlmLedgerEdge[] }> {
+		return this.enqueue(() => {
+			const edges = [...this.replaySync().values()].map((edge) => ({ ...edge }));
+			return { revision: this.replayCache?.revision ?? createHash("sha256").digest("hex"), edges };
+		});
+	}
+
+	/** Atomic ledger publication with an optional same-worker resident custody commit. */
+	adoptBatch(input: RlmSupervisionRequest, options: RlmSupervisionOptions): Promise<RlmSupervisionReceipt> {
+		return this.enqueue(() => {
+			const request = normalizeSupervisionRequest(input);
+			if (!options || typeof options.authorize !== "function") throw new Error("Owner authorization is required");
+			if (options.authorize(structuredClone(request)) !== true)
+				throw new Error("Owner authorization and runtime custody fence are required");
+			const edges = [...this.replaySync().values()];
+			const fingerprint = JSON.stringify(request);
+			const prior = this.replayCache?.adoptions.get(request.operationId);
+			if (prior) {
+				if (prior.fingerprint !== fingerprint)
+					throw new Error("Supervision operation ID was reused with another request");
+				return structuredClone(prior.receipt);
+			}
+			const revision = this.replayCache?.revision ?? createHash("sha256").digest("hex");
+			if (request.expectedRevision !== revision) throw new Error("Supervision topology revision CAS failed");
+			const roots = new Set<string>();
+			for (const edge of edges) {
+				if (edge.deleted) continue;
+				for (const path of [edge.child, edge.parent]) {
+					if (dirname(path) === this.canonicalSessionsDir) roots.add(path);
+				}
+			}
+			const changes = planSupervisionAdoption(request, edges, roots, options.maxDepthBySession);
+			const parents = new Map(edges.filter((edge) => !edge.deleted).map((edge) => [edge.child, edge.parent]));
+			const required = new Set([
+				request.ownerRoot,
+				...request.moves.flatMap((move) => [move.child, move.parent]),
+				...changes.map((change) => change.after.child),
+			]);
+			for (const path of required) {
+				const parent = parents.get(path);
+				if (parent) required.add(parent);
+				if (!statSync(path).isFile()) throw new Error("Supervision session file is unavailable");
+			}
+			const commit = options.prepareRuntime?.(changes);
+			this.publishAdoption({ v: 2, op: "adopt", at: nowIso(), request, changes }, commit);
+			this.replaySync();
+			return structuredClone(this.replayCache!.adoptions.get(request.operationId)!.receipt);
+		}, true);
+	}
+
+	private publishAdoption(record: RlmLedgerAdoptionRecord, commit?: () => void): void {
+		const original = readFileSync(this.path);
+		if (original.length && original[original.length - 1] !== 0x0a) {
+			throw new Error("Cannot adopt with an unterminated ledger tail; reconcile the interrupted writer first");
+		}
+		const payload = Buffer.concat([original, Buffer.from(`${JSON.stringify(record)}\n`)]);
+		if (
+			payload.length > RLM_LEDGER_MAX_BYTES ||
+			original.toString("utf8").split("\n").length > RLM_LEDGER_MAX_RECORDS
+		) {
+			throw new Error("Supervision adoption exceeds ledger bounds");
+		}
+		const temp = `${this.path}.adopt-${process.pid}-${Date.now()}`;
+		const handle = openSync(temp, "wx", 0o600);
+		try {
+			let offset = 0;
+			while (offset < payload.length) {
+				const written = writeSync(handle, payload, offset, payload.length - offset);
+				if (written <= 0) throw new Error("Short supervision ledger write");
+				offset += written;
+			}
+			fsyncSync(handle);
+		} catch (error) {
+			rmSync(temp, { force: true });
+			throw error;
+		} finally {
+			closeSync(handle);
+		}
+		try {
+			renameSync(temp, this.path);
+			this.replayCache = undefined;
+			commit?.();
+			const directory = openSync(dirname(this.path), "r");
+			try {
+				fsyncSync(directory);
+			} finally {
+				closeSync(directory);
+			}
+		} finally {
+			rmSync(temp, { force: true });
+		}
 	}
 
 	private appendSpawnUnlocked(input: {
@@ -473,10 +644,17 @@ export class RlmSpawnLedger {
 			);
 		}
 		const childPath = canonicalSessionPath(input.child);
-		// Advisory, per-process: catches double-admission mistakes inside this
-		// daemon. It is NOT a global uniqueness guarantee — other processes
-		// append to the same file between our read and write.
+		// The writer guard covers this identity check and append. Mixed old
+		// writers do not hold that guard and must be fenced before adoption.
 		for (const edge of this.replaySync().values()) {
+			if (
+				!edge.deleted &&
+				canonicalSessionPath(edge.child) === childPath &&
+				this.replayCache?.adoptions.size &&
+				(edge.parent !== canonicalSessionPath(input.parent) || edge.depth !== input.depth)
+			) {
+				throw new Error("RLM spawn cannot overwrite adopted topology");
+			}
 			if (!edge.deleted && canonicalSessionPath(edge.child) === childPath && edge.childId !== input.childId) {
 				throw new Error(`RLM ledger: duplicate child session path ${childPath} (already ${edge.childId})`);
 			}
@@ -754,11 +932,52 @@ export class RlmSpawnLedger {
 			}
 			return record;
 		});
+		const digest = createHash("sha256");
+		const admissionParents = new Map<string, string>();
+		const adoptions = new Map<string, { fingerprint: string; receipt: RlmSupervisionReceipt }>();
 		for (const record of records) {
+			const previousRevision = digest.copy().digest("hex");
+			digest.update(`${JSON.stringify(record)}\n`);
 			if (record.op === "meta") continue;
+			if (record.op === "adopt") {
+				if (record.request.expectedRevision !== previousRevision || adoptions.has(record.request.operationId)) {
+					throw new Error("Malformed RLM ledger adoption revision or operation ID");
+				}
+				const roots = new Set(
+					[...edges.values()]
+						.flatMap((edge) => [edge.parent, edge.child])
+						.filter((path) => dirname(path) === this.canonicalSessionsDir),
+				);
+				const limits = new Map([...edges.values()].map((edge) => [edge.child, MAX_SUPERVISION_DEPTH]));
+				const expected = planSupervisionAdoption(record.request, [...edges.values()], roots, limits);
+				if (JSON.stringify(expected) !== JSON.stringify(record.changes))
+					throw new Error("Malformed RLM ledger adoption change set");
+				const changed = new Set<string>();
+				for (const change of record.changes) {
+					const key = edgeKey(change.before.childId, change.before.child);
+					if (changed.has(key) || JSON.stringify(edges.get(key)) !== JSON.stringify(change.before)) {
+						throw new Error("Malformed RLM ledger adoption old-edge CAS");
+					}
+					changed.add(key);
+				}
+				for (const change of record.changes) {
+					edges.set(edgeKey(change.after.childId, change.after.child), { ...change.after });
+				}
+				adoptions.set(record.request.operationId, {
+					fingerprint: JSON.stringify(record.request),
+					receipt: {
+						operationId: record.request.operationId,
+						previousRevision,
+						revision: digest.copy().digest("hex"),
+						changes: record.changes,
+					},
+				});
+				continue;
+			}
 			const key = edgeKey(record.childId, record.child);
 			switch (record.op) {
 				case "spawn":
+					if (!admissionParents.has(record.child)) admissionParents.set(record.child, record.parent);
 					edges.set(key, {
 						childId: record.childId,
 						parent: record.parent,
@@ -784,6 +1003,9 @@ export class RlmSpawnLedger {
 			size: stats.size,
 			mtimeMs: stats.mtimeMs,
 			edges,
+			revision: digest.digest("hex"),
+			adoptions,
+			admissionParents,
 		};
 		return edges;
 	}

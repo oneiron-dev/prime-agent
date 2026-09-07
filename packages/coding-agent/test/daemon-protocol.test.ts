@@ -23,6 +23,7 @@ import {
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 	isSessionPlaneDaemonCommand,
+	meetsDaemonCommandCompatibility,
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
 import {
@@ -122,8 +123,24 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_snapshot_failed).toEqual({ minProtocol: 7 });
 	});
 
+	it("gates no-force checkpoints without changing legacy update commands or response events", () => {
+		const legacy = getDaemonCommandCompatibilities({ type: "prepare_update_restart" });
+		const guarded = getDaemonCommandCompatibilities({ type: "prepare_update_restart", noForce: true });
+		const oldDaemon = { protocol: { ...DAEMON_PROTOCOL_INFO, version: 7 }, schemaRevision: 28 };
+		const newDaemon = {
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaRevision: DAEMON_SCHEMA_REVISION,
+			serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+		};
+		expect(legacy.every((requirement) => meetsDaemonCommandCompatibility(oldDaemon, requirement))).toBe(true);
+		expect(guarded.every((requirement) => meetsDaemonCommandCompatibility(oldDaemon, requirement))).toBe(false);
+		expect(guarded.every((requirement) => meetsDaemonCommandCompatibility(newDaemon, requirement))).toBe(true);
+		expect(guarded[0]).toEqual({ minProtocol: 8, minSchemaRevision: 30, capability: "no_force_update_restart" });
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.response).toEqual({ minProtocol: 7 });
+	});
+
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {
-		expect(DAEMON_PROTOCOL_VERSION).toBe(7);
+		expect(DAEMON_PROTOCOL_VERSION).toBe(8);
 		expect(DAEMON_SCHEMA_ID).toContain(`protocol-${DAEMON_PROTOCOL_VERSION}`);
 		expect(DAEMON_COMMAND_COMPATIBILITY.heartbeats_list).toEqual({
 			minProtocol: 7,
