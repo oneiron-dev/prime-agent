@@ -3,7 +3,7 @@ export const FACTORY_HELP = `Usage:
   prime factory import <directory> <plan.json> --expected-revision <revision> [--mutation-id <id>]
   prime factory status <directory>
   prime factory events <directory> [--after <sequence>]
-  prime factory fingerprint <host> <absolute-cwd> --hosts <hosts.json>
+  prime factory fingerprint <host> <absolute-cwd> --hosts <hosts.json> [--timeout-ms <milliseconds>]
   prime factory tick <directory>
   prime factory run <directory> [--interval-ms <milliseconds>]
   prime factory serve <directory> [--interval-ms <milliseconds>]
@@ -24,6 +24,7 @@ Hosts JSON: {"local":{"type":"local","runnerRoot":"/absolute/attempts"}}
 SSH host: {"type":"ssh","sshHost":"arch","runnerRoot":"/absolute/attempts","python":"python3"}
 Only foreground commands are supported; daemonized/detached descendants require another adapter.
 Plans use argv arrays and absolute cwd paths. Use fingerprint for verified Git source identity.
+fingerprint --timeout-ms accepts integers 1..120000 (default 20000 ms); launch and inspect deadlines are unchanged.
 resolve requires evidence that any previous process tree is gone; it does not kill or inspect it for you.
 manage returns a proposal unless --apply is explicit; --watch opts into bounded automatic wake handling, separate from serve.
 Automatic handling needs exact per-wake evidence bindings. Requests are durably consumed, including defer/errors; crashes never authorize replay.
