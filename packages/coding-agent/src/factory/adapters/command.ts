@@ -59,8 +59,10 @@ export function hostLaunchSpec(host: CommandHost): { command: string; args: stri
 	};
 }
 
-export const commandTransport: HostTransport = (host, request) =>
-	new Promise((resolve, reject) => {
+export const commandTransport: HostTransport = (host, request) => transportCommand(host, request, 20_000);
+
+function transportCommand(host: CommandHost, request: HostRequest, timeoutMs: number): Promise<unknown> {
+	return new Promise((resolve, reject) => {
 		const spec = hostLaunchSpec(host);
 		const child = spawn(spec.command, spec.args, { stdio: ["pipe", "pipe", "pipe"] });
 		let output = "";
@@ -75,8 +77,14 @@ export const commandTransport: HostTransport = (host, request) =>
 		};
 		const timer = setTimeout(() => {
 			child.kill();
-			finish(new Error("Host transport timed out; launch state is uncertain"));
-		}, 20_000);
+			finish(
+				new Error(
+					request.operation === "fingerprint"
+						? "Host transport timed out while fingerprinting source"
+						: "Host transport timed out; launch state is uncertain",
+				),
+			);
+		}, timeoutMs);
 		child.stdout.on("data", (chunk: Buffer) => {
 			output += chunk.toString();
 			if (output.length > 1024 * 1024) {
@@ -99,6 +107,7 @@ export const commandTransport: HostTransport = (host, request) =>
 		});
 		child.stdin.end(JSON.stringify(request));
 	});
+}
 
 export class CommandAdapter {
 	constructor(
@@ -165,13 +174,20 @@ export class CommandAdapter {
 	}
 }
 
-export async function fingerprintCommand(host: CommandHost, cwd: string): Promise<string> {
+export async function fingerprintCommand(host: CommandHost, cwd: string, timeoutMs = 20_000): Promise<string> {
 	if (!isAbsolute(cwd)) throw new Error("Fingerprint requires an absolute cwd");
-	const value = await commandTransport(host, {
-		operation: "fingerprint",
-		runnerRoot: host.runnerRoot,
-		manifest: { version: 1, attemptId: "fingerprint", sourceFingerprint: "", command: { argv: ["git"], cwd } },
-	});
+	if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 120_000) {
+		throw new Error("Fingerprint timeout must be an integer between 1 and 120000 ms");
+	}
+	const value = await transportCommand(
+		host,
+		{
+			operation: "fingerprint",
+			runnerRoot: host.runnerRoot,
+			manifest: { version: 1, attemptId: "fingerprint", sourceFingerprint: "", command: { argv: ["git"], cwd } },
+		},
+		timeoutMs,
+	);
 	if (
 		!value ||
 		typeof value !== "object" ||

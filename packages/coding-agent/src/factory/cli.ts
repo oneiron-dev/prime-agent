@@ -16,6 +16,7 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 		"--pause-file",
 		"--after",
 		"--interval-ms",
+		"--timeout-ms",
 		"--actor",
 		"--reason",
 		"--ref",
@@ -70,13 +71,19 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 	}
 	const { positionals, options } = parseArguments(args);
 	const [command, rawDirectory, argument, choice] = positionals;
+	if (options.has("--timeout-ms") && command !== "fingerprint") {
+		throw new Error("--timeout-ms is only supported for fingerprint");
+	}
 	if (command === "fingerprint") {
 		const hostsPath = options.get("--hosts");
 		if (!hostsPath || !rawDirectory || !argument)
 			throw new Error("fingerprint requires host, absolute cwd and --hosts");
 		const host = readFactoryHosts(hostsPath)[rawDirectory];
 		if (!host) throw new Error(`Unknown host ${rawDirectory}`);
-		emit({ sourceFingerprint: await fingerprintCommand(host, argument) });
+		const timeout = options.get("--timeout-ms");
+		emit({
+			sourceFingerprint: await fingerprintCommand(host, argument, timeout === undefined ? undefined : Number(timeout)),
+		});
 		return;
 	}
 	if (!rawDirectory) throw new Error("An explicit factory directory is required");
