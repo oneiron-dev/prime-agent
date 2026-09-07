@@ -315,6 +315,7 @@ export interface IpythonToolOptions {
 export class IpythonKernelProvisioner {
 	private managerPromise?: Promise<KernelClient>;
 	private startedManager?: KernelClient;
+	private custodyProbeDrain?: Promise<void>;
 	private readonly startupListeners = new Set<KernelBootstrapProgressHandler>();
 	private lastStartupMessage?: string;
 	private _lastRestore?: RestoreResult;
@@ -339,13 +340,14 @@ export class IpythonKernelProvisioner {
 	}
 
 	get noForceUpdateBlocker(): string | undefined {
+		if (this.custodyProbeDrain) return "Python custody checkpoint is pending";
 		if (!this.managerPromise) return undefined;
 		if (!this.startedManager) return "Python kernel startup is busy";
 		if (this.startedManager.isShutDown) return undefined;
 		return this.startedManager.noForceUpdateBlocker;
 	}
 
-	async assertNoForceUpdateCustody(): Promise<void> {
+	async assertNoForceUpdateCustody(onDrain?: (settled: Promise<void>) => void): Promise<void> {
 		const blocker = this.noForceUpdateBlocker;
 		if (blocker) throw new Error(blocker);
 		const manager = this.startedManager;
@@ -374,8 +376,18 @@ del _prime_agent_update_checkpoint
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		try {
 			// No abort signal: a failed checkpoint must not interrupt a user cell.
+			const probe = manager.execute(`exec(${JSON.stringify(code)}, {})`, { internal: true });
+			const drain = probe.then(
+				() => {},
+				() => {},
+			);
+			this.custodyProbeDrain = drain;
+			void drain.then(() => {
+				if (this.custodyProbeDrain === drain) this.custodyProbeDrain = undefined;
+			});
+			onDrain?.(drain);
 			const result = await Promise.race([
-				manager.execute(`exec(${JSON.stringify(code)}, {})`, { internal: true }),
+				probe,
 				new Promise<never>((_, reject) => {
 					timeout = setTimeout(
 						() => reject(new Error("Python custody checkpoint timed out without interruption")),

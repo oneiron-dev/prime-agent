@@ -8976,6 +8976,7 @@ export class InteractiveMode {
 						agentDir: getAgentDir(),
 						cwd: updateCwd,
 						originActiveSessionId: this.connectionState?.activeSessionId,
+						noForce: !updateArgs.includes("--force"),
 					});
 					const report = buildDaemonUpdateRestartReport(status);
 					for (const message of report.info) {

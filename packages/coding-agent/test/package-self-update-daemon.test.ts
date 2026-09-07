@@ -5,8 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DaemonUpdateRestartModule from "../src/cli/daemon-update-restart.js";
 import {
 	acquireDaemonUpdateRestartCoordinator,
+	DAEMON_UPDATE_RESTART_COORDINATOR_FLAG,
+	DAEMON_UPDATE_RESTART_NO_FORCE_FLAG,
+	DAEMON_UPDATE_RESTART_STATUS_FLAG,
 	type DaemonUpdateRestartStatus,
 	DaemonUpdateRestartStatusWriter,
+	launchDaemonUpdateRestartCoordinator,
+	readDaemonUpdateRestartStatus,
 	waitForActiveDaemonUpdateRestartCoordinator,
 } from "../src/cli/daemon-update-restart.js";
 import {
@@ -427,6 +432,48 @@ describe("self-update daemon restart", () => {
 		});
 	}
 
+	it.each([false, true])("parses coordinator no-force=%s without weakening the old-daemon gate", async (noForce) => {
+		const restartDirectory = join(agentDir, "update-restarts");
+		mkdirSync(restartDirectory, { recursive: true });
+		const statusPath = join(restartDirectory, "parsed-status.json");
+		await handlePackageCommand([
+			"update",
+			DAEMON_UPDATE_RESTART_COORDINATOR_FLAG,
+			"--daemon-socket",
+			mockState.socketPath,
+			DAEMON_UPDATE_RESTART_STATUS_FLAG,
+			statusPath,
+			...(noForce ? [DAEMON_UPDATE_RESTART_NO_FORCE_FLAG] : []),
+		]);
+		expect(readDaemonUpdateRestartStatus(statusPath)?.phase).toBe(noForce ? "failed" : "complete");
+		expect(mockState.calls.includes("daemon-request:prepare_update_restart")).toBe(!noForce);
+		expect(mockState.calls.includes("shutdown-daemon")).toBe(!noForce);
+		expect(mockState.calls.some((call) => call.startsWith("spawn:npm "))).toBe(false);
+		if (noForce) {
+			expect(process.exitCode).toBe(1);
+			expect(readDaemonUpdateRestartStatus(statusPath)?.message).toContain("no_force_update_restart");
+		} else {
+			expect(mockState.requestPayloads).toContainEqual({ type: "prepare_update_restart" });
+		}
+	});
+
+	it("rejects conflicting coordinator force flags before any daemon operation", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await handlePackageCommand([
+				"update",
+				DAEMON_UPDATE_RESTART_COORDINATOR_FLAG,
+				DAEMON_UPDATE_RESTART_NO_FORCE_FLAG,
+				"--force",
+			]);
+			expect(process.exitCode).toBe(1);
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("cannot use --force"));
+			expect(mockState.calls).toEqual([]);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
 	it("refuses no-force restart on an old daemon before prepare or shutdown", async () => {
 		const status = await runNoForceCoordinator();
 		expect(status.phase).toBe("failed");
@@ -674,6 +721,17 @@ describe("self-update daemon restart", () => {
 			errorSpy.mockRestore();
 			logSpy.mockRestore();
 		}
+	});
+
+	it.each([false, true])("opts normal CLI updates into no-force custody unless force=%s", async (force) => {
+		await handlePackageCommand(["update", "--self", ...(force ? ["--force"] : [])]);
+		expect(launchDaemonUpdateRestartCoordinator).toHaveBeenLastCalledWith({
+			socketPath: mockState.socketPath,
+			agentDir,
+			cwd: projectDir,
+			originActiveSessionId: process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID,
+			noForce: !force,
+		});
 	});
 
 	it("defers the exact custom-socket restart to the interactive parent", async () => {

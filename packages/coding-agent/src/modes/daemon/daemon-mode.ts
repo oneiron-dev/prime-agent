@@ -528,7 +528,8 @@ export class AgentDaemon {
 		owner?: DaemonSocketClient;
 		abort: AbortController;
 		deadline?: ReturnType<typeof setTimeout>;
-		phase: "preparing" | "fencing" | "prepared" | "publishing";
+		phase: "preparing" | "fencing" | "prepared" | "publishing" | "draining";
+		pendingCheckpoints: Set<Promise<unknown>>;
 		noForce: boolean;
 		manifest?: DaemonUpdateRestartManifest;
 		deferredClientEnv: Array<{
@@ -4285,7 +4286,12 @@ export class AgentDaemon {
 				}
 				case "worker_commit_update": {
 					const transaction = this.updateRestart;
-					if (!transaction || transaction.phase === "preparing" || transaction.phase === "fencing") {
+					if (
+						!transaction ||
+						transaction.phase === "preparing" ||
+						transaction.phase === "fencing" ||
+						transaction.phase === "draining"
+					) {
 						throw new Error("Daemon has no prepared update checkpoint");
 					}
 					if (transaction.phase === "publishing") {
@@ -4321,7 +4327,7 @@ export class AgentDaemon {
 						throw new Error("Daemon update checkpoint is already committing");
 					}
 					if (transaction) this.cancelPreparedUpdateRestart(transaction.id);
-					this.peerAdmissionsFenced = false;
+					if (!this.updateRestart) this.peerAdmissionsFenced = false;
 					this.writeWorkerSuccess(client, command);
 					return;
 				}
@@ -7035,6 +7041,7 @@ export class AgentDaemon {
 			...(owner ? { owner } : {}),
 			abort: new AbortController(),
 			phase: "preparing",
+			pendingCheckpoints: new Set(),
 			noForce,
 			deferredClientEnv: [],
 		};
@@ -7087,7 +7094,16 @@ export class AgentDaemon {
 						queuePause.release();
 					},
 				});
-				if (transaction.noForce) kernelPause = await state.runtime.session.acquireNoForceUpdateCheckpoint();
+				if (transaction.noForce) {
+					const checkpoint = state.runtime.session
+						.acquireNoForceUpdateCheckpoint((drain) => this.trackUpdateRestartCheckpoint(transaction, drain))
+						.then((pause) => {
+							kernelPause = pause;
+						});
+					this.trackUpdateRestartCheckpoint(transaction, checkpoint);
+					await checkpoint;
+					this.assertUpdateRestartNotCancelled(transaction);
+				}
 			}
 			await Promise.all(states.map((state) => state.runtime.session.waitForSessionInputCheckpoint(signal)));
 			this.assertUpdateRestartNotCancelled(transaction);
@@ -7154,6 +7170,18 @@ export class AgentDaemon {
 		return manifest;
 	}
 
+	private trackUpdateRestartCheckpoint(
+		transaction: NonNullable<AgentDaemon["updateRestart"]>,
+		pending: Promise<unknown>,
+	): void {
+		transaction.pendingCheckpoints.add(pending);
+		const settled = () => {
+			transaction.pendingCheckpoints.delete(pending);
+			if (transaction.phase === "draining") this.cancelPreparedUpdateRestart(transaction.id);
+		};
+		void pending.then(settled, settled);
+	}
+
 	private cancelPreparedUpdateRestart(transactionId?: symbol): void {
 		const transaction = this.updateRestart;
 		if (!transaction || (transactionId && transaction.id !== transactionId)) return;
@@ -7161,6 +7189,11 @@ export class AgentDaemon {
 		transaction.deadline = undefined;
 		transaction.abort.abort();
 		if (transaction.phase === "publishing") return;
+		if (transaction.pendingCheckpoints.size > 0) {
+			// Keep every pause and admission fence until our non-abortable probe and acquisition settle.
+			transaction.phase = "draining";
+			return;
+		}
 		this.updateRestart = undefined;
 		for (const deferred of transaction.deferredClientEnv) {
 			if (

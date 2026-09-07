@@ -6924,9 +6924,9 @@ export class AgentSession {
 		return this._ipythonKernelProvisioner?.manager?.processId;
 	}
 
-	async acquireNoForceUpdateCheckpoint(): Promise<{ release(): void }> {
+	async acquireNoForceUpdateCheckpoint(onDrain?: (settled: Promise<void>) => void): Promise<{ release(): void }> {
 		this.assertNoForceUpdateSafe();
-		await this._ipythonKernelProvisioner?.assertNoForceUpdateCustody();
+		await this._ipythonKernelProvisioner?.assertNoForceUpdateCustody(onDrain);
 		this._noForceUpdateCheckpoint = true;
 		return {
 			release: () => {

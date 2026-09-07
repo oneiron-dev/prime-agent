@@ -2,6 +2,7 @@ import { writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExecuteResult, KernelClient } from "../src/core/kernel/index.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../src/core/orphan-process-journal.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
@@ -65,6 +66,150 @@ afterEach(() => {
 	vi.restoreAllMocks();
 });
 describe("worker no-force update checkpoint", () => {
+	it.each(["resolve", "reject"] as const)(
+		"retains timeout fences until the owned probe drains (%s)",
+		async (outcome) => {
+			const f = await fixture();
+			const earlier = await fixture();
+			f.host.sessions = new Map([
+				[earlier.state.activeSessionId, earlier.state],
+				[f.state.activeSessionId, f.state],
+			]);
+			let resolveProbe!: (result: ExecuteResult) => void;
+			let rejectProbe!: (error: Error) => void;
+			const probe = new Promise<ExecuteResult>((resolve, reject) => {
+				resolveProbe = resolve;
+				rejectProbe = reject;
+			});
+			const execute = vi.fn<KernelClient["execute"]>().mockReturnValueOnce(probe).mockResolvedValue({
+				stdout: "",
+				stderr: "",
+				status: "ok",
+				durationMs: 0,
+			});
+			const interrupt = vi.fn();
+			const manager = { execute, interrupt } as unknown as KernelClient;
+			const provisioner = new IpythonKernelProvisioner(f.h.tempDir);
+			Object.assign(provisioner, { startedManager: manager, managerPromise: Promise.resolve(manager) });
+			Object.assign(f.h.session, { _ipythonKernelProvisioner: provisioner });
+			const queueReleases: ReturnType<typeof vi.fn>[] = [];
+			const inputReleases: ReturnType<typeof vi.fn>[] = [];
+			for (const session of [earlier.h.session, f.h.session]) {
+				const acquireQueue = session.acquireQueuedWorkPause.bind(session);
+				const acquireInput = session.acquireSessionInputPause.bind(session);
+				vi.spyOn(session, "acquireQueuedWorkPause").mockImplementation(() => {
+					const pause = acquireQueue();
+					const release = vi.fn(() => pause.release());
+					queueReleases.push(release);
+					return { release };
+				});
+				vi.spyOn(session, "acquireSessionInputPause").mockImplementation(() => {
+					const pause = acquireInput();
+					const release = vi.fn(() => pause.release());
+					inputReleases.push(release);
+					return { release };
+				});
+			}
+			vi.useFakeTimers();
+			try {
+				const owner = {} as DaemonSocketClient;
+				Object.assign(f.host, { peerAdmissionsFenced: true });
+				const transaction = f.host.beginUpdateRestartTransaction(owner, true);
+				const preparing = f.host.runUpdateRestartPreparation(transaction);
+				const failed = expect(preparing).rejects.toThrow(/timed out without interruption/);
+				await vi.advanceTimersByTimeAsync(5_000);
+				await failed;
+				expect(f.host.updateRestart).toBe(transaction);
+				expect(transaction.phase).toBe("draining");
+				expect(Reflect.get(earlier.h.session, "_noForceUpdateCheckpoint")).toBe(true);
+				for (const release of [...queueReleases, ...inputReleases]) expect(release).not.toHaveBeenCalled();
+				expect(execute).toHaveBeenCalledWith(expect.any(String), { internal: true });
+				expect(interrupt).not.toHaveBeenCalled();
+				expect(() => f.host.beginUpdateRestartTransaction(owner, true)).toThrow(/already preparing/);
+				await expect(provisioner.assertNoForceUpdateCustody()).rejects.toThrow(/custody.*pending/i);
+				expect(execute).toHaveBeenCalledTimes(1);
+				await f.host.handleWorkerCommand({} as DaemonSocketClient, { type: "worker_cancel_update", id: "foreign" });
+				expect(f.host.write.mock.calls.at(-1)?.[1]).toMatchObject({ success: false });
+				await f.host.handleWorkerCommand(owner, { type: "worker_cancel_update", id: "cancel" });
+				expect(f.host.write.mock.calls.at(-1)?.[1]).toMatchObject({ success: true });
+				expect(Reflect.get(f.host, "peerAdmissionsFenced")).toBe(true);
+				await f.host.handleWorkerCommand(owner, { type: "worker_commit_update", id: "commit", noForce: true });
+				expect(f.host.write.mock.calls.at(-1)?.[1]).toMatchObject({ success: false });
+				expect(f.host.closeSession).not.toHaveBeenCalled();
+				if (outcome === "resolve") resolveProbe({ stdout: "", stderr: "", status: "ok", durationMs: 0 });
+				else rejectProbe(new Error("owned request failed late"));
+				await vi.advanceTimersByTimeAsync(0);
+				expect(f.host.updateRestart).toBeUndefined();
+				expect(Reflect.get(f.host, "peerAdmissionsFenced")).toBe(false);
+				expect(Reflect.get(earlier.h.session, "_noForceUpdateCheckpoint")).toBe(false);
+				for (const release of [...queueReleases, ...inputReleases]) expect(release).toHaveBeenCalledTimes(1);
+				const retry = f.host.beginUpdateRestartTransaction(owner, true);
+				expect((await f.host.runUpdateRestartPreparation(retry)).noForce).toBe(true);
+				expect(execute).toHaveBeenCalledTimes(2);
+				f.host.cancelPreparedUpdateRestart(retry.id);
+				f.h.setResponses([fauxAssistantMessage("resumed after custody drain")]);
+				const resumed = f.h.session.prompt("resume normal work");
+				await vi.advanceTimersByTimeAsync(0);
+				await resumed;
+				expect(f.h.session.messages.at(-1)).toMatchObject({ role: "assistant" });
+				expect(interrupt).not.toHaveBeenCalled();
+			} finally {
+				resolveProbe({ stdout: "", stderr: "", status: "ok", durationMs: 0 });
+				await vi.advanceTimersByTimeAsync(0);
+				vi.useRealTimers();
+				Object.assign(f.h.session, { _ipythonKernelProvisioner: undefined });
+				f.cleanup();
+				earlier.cleanup();
+			}
+		},
+	);
+
+	it("cancels promptly before timeout and releases a late acquired pause only after drain", async () => {
+		const f = await fixture();
+		let resolveProbe!: (result: ExecuteResult) => void;
+		const probe = new Promise<ExecuteResult>((resolve) => {
+			resolveProbe = resolve;
+		});
+		const execute = vi.fn<KernelClient["execute"]>().mockReturnValue(probe);
+		const interrupt = vi.fn();
+		const manager = { execute, interrupt } as unknown as KernelClient;
+		const provisioner = new IpythonKernelProvisioner(f.h.tempDir);
+		Object.assign(provisioner, { startedManager: manager, managerPromise: Promise.resolve(manager) });
+		Object.assign(f.h.session, { _ipythonKernelProvisioner: provisioner });
+		const owner = {} as DaemonSocketClient;
+		vi.useFakeTimers();
+		try {
+			const transaction = f.host.beginUpdateRestartTransaction(owner, true);
+			const preparing = f.host.runUpdateRestartPreparation(transaction);
+			const cancelled = expect(preparing).rejects.toThrow(/cancelled/);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(execute).toHaveBeenCalledTimes(1);
+			await f.host.handleWorkerCommand(owner, { type: "worker_cancel_update", id: "cancel" });
+			expect(f.host.write.mock.calls.at(-1)?.[1]).toMatchObject({ success: true });
+			expect(f.host.updateRestart).toBe(transaction);
+			expect(transaction.phase).toBe("draining");
+			expect(Reflect.get(f.h.session, "_queuedWorkPauses").size).toBe(1);
+			expect(Reflect.get(f.h.session, "_sessionInputAdmissionPauses").size).toBe(1);
+			expect(() => f.host.beginUpdateRestartTransaction(owner, true)).toThrow(/already preparing/);
+			resolveProbe({ stdout: "", stderr: "", status: "ok", durationMs: 0 });
+			await cancelled;
+			await vi.advanceTimersByTimeAsync(0);
+			expect(f.host.updateRestart).toBeUndefined();
+			expect(Reflect.get(f.h.session, "_queuedWorkPauses").size).toBe(0);
+			expect(Reflect.get(f.h.session, "_sessionInputAdmissionPauses").size).toBe(0);
+			expect(Reflect.get(f.h.session, "_noForceUpdateCheckpoint")).toBe(false);
+			expect(interrupt).not.toHaveBeenCalled();
+			expect(f.host.closeSession).not.toHaveBeenCalled();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			resolveProbe({ stdout: "", stderr: "", status: "ok", durationMs: 0 });
+			await vi.advanceTimersByTimeAsync(0);
+			vi.useRealTimers();
+			Object.assign(f.h.session, { _ipythonKernelProvisioner: undefined });
+			f.cleanup();
+		}
+	});
+
 	it("checks native kernel custody without interrupting a detached Python task", async () => {
 		const python = process.env.PRIME_AGENT_KERNEL_PYTHON;
 		if (!python) throw new Error("PRIME_AGENT_KERNEL_PYTHON must name the local native runtime executable");

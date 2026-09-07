@@ -145,6 +145,7 @@ export interface LaunchDaemonUpdateRestartCoordinatorOptions {
 	agentDir: string;
 	cwd?: string;
 	originActiveSessionId?: string;
+	noForce?: boolean;
 	timeoutMs?: number;
 }
 
@@ -630,6 +631,7 @@ export async function launchDaemonUpdateRestartCoordinator(
 		DAEMON_UPDATE_RESTART_STATUS_FLAG,
 		statusPath,
 		...(originActiveSessionId ? [DAEMON_UPDATE_RESTART_ORIGIN_FLAG, originActiveSessionId] : []),
+		...(options.noForce ? [DAEMON_UPDATE_RESTART_NO_FORCE_FLAG] : []),
 	]);
 	const child = spawn(launch.command, launch.args, {
 		cwd: options.cwd ?? process.cwd(),

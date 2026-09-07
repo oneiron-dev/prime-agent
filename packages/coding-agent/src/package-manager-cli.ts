@@ -1671,6 +1671,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 							agentDir,
 							cwd,
 							originActiveSessionId: process.env[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV],
+							noForce: !options.force,
 						});
 						reportDaemonUpdateRestartStatus(status);
 					} catch (error: unknown) {
