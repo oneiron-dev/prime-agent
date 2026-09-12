@@ -1,7 +1,7 @@
-import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { rm, unlink } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { spawnSyncHidden } from "../utils/child-process.js";
 import { canonicalSessionPath } from "./session-lease.js";
 import { getSessionArtifactPathForFile } from "./session-manager.js";
 
@@ -112,7 +112,7 @@ export async function deleteSessionArtifacts(sessionPath: string): Promise<void>
 /** Remove the session `.jsonl`, trying the `trash` CLI first, then falling back to unlink. */
 async function removeSessionFile(sessionPath: string): Promise<DeleteSessionFileResult> {
 	const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
-	const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
+	const trashResult = spawnSyncHidden("trash", trashArgs, { encoding: "utf-8" });
 
 	const getTrashErrorHint = (): string | null => {
 		const parts: string[] = [];

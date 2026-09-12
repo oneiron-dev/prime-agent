@@ -31,7 +31,6 @@ export function createPrimeManagementCaller(beforeRequest: () => void): Manageme
 				maxTokens: 2000,
 				timeoutMs: 120000,
 				signal: AbortSignal.timeout(125000),
-				maxRetries: 0,
 				transport: "sse",
 			},
 		);

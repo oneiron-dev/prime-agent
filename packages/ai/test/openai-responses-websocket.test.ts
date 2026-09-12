@@ -33,6 +33,7 @@ vi.mock("openai", () => ({
 }));
 
 import { streamOpenAIResponses } from "../src/providers/openai-responses.js";
+import { compactOpenAIResponsesV2 } from "../src/providers/openai-responses-remote-compaction-v2.js";
 import {
 	closeOpenAIResponsesWebSocketSessions,
 	processOpenAIResponsesWebSocket,
@@ -245,6 +246,85 @@ afterEach(() => {
 });
 
 describe("generic OpenAI Responses WebSocket transport", () => {
+	it("settles incomplete generation without waiting for the socket to close", async () => {
+		class IncompleteSocket extends MockWebSocket {
+			override send() {
+				queueMicrotask(() =>
+					this.message({
+						type: "response.incomplete",
+						response: {
+							id: "incomplete",
+							status: "incomplete",
+							incomplete_details: { reason: "max_output_tokens" },
+						},
+					} as ResponseStreamEvent),
+				);
+			}
+		}
+		setOpenAIResponsesWebSocketConstructorForTesting(IncompleteSocket);
+		const result = await streamOpenAIResponses(
+			model,
+			{ messages: [] },
+			{ apiKey: "key", transport: "websocket", sessionId: "incomplete" },
+		).result();
+		expect(result.stopReason).toBe("length");
+		expect(MockWebSocket.instances[0]?.readyState).toBe(1);
+		expect(sdk.calls).toBe(0);
+	});
+
+	it("rejects incomplete compaction without returning a checkpoint or replaying over SSE", async () => {
+		class IncompleteSocket extends MockWebSocket {
+			override send() {
+				queueMicrotask(() =>
+					this.message({
+						type: "response.incomplete",
+						response: {
+							id: "incomplete",
+							status: "incomplete",
+							incomplete_details: { reason: "max_output_tokens" },
+						},
+					} as ResponseStreamEvent),
+				);
+			}
+		}
+		setOpenAIResponsesWebSocketConstructorForTesting(IncompleteSocket);
+		await expect(
+			compactOpenAIResponsesV2(model, { messages: [] }, { apiKey: "key", transport: "websocket" }),
+		).rejects.toThrow("Remote Compaction V2 stream failed");
+		expect(sdk.calls).toBe(0);
+	});
+
+	it.each(["none", "short"] as const)(
+		"sends OpenCode identity independently of %s cache retention",
+		async (cacheRetention) => {
+			setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
+			await streamOpenAIResponses(
+				{ ...model, provider: "opencode" },
+				{ messages: [] },
+				{ apiKey: "key", transport: "websocket", sessionId: "identity", cacheRetention },
+			).result();
+			const headers = MockWebSocket.instances[0]?.options?.headers;
+			expect(headers?.["x-opencode-session"]).toBe("identity");
+			expect(headers?.["user-agent"]).toBe("prime-agent");
+		},
+	);
+
+	it("honors mixed-case OpenCode identity overrides on WebSocket", async () => {
+		setOpenAIResponsesWebSocketConstructorForTesting(MockWebSocket);
+		await streamOpenAIResponses(
+			{ ...model, provider: "opencode", headers: { "X-OpenCode-Session": "model" } },
+			{ messages: [] },
+			{
+				apiKey: "key",
+				transport: "websocket",
+				sessionId: "identity",
+				headers: { "X-OPENCODE-SESSION": "caller", "USER-AGENT": "custom" },
+			},
+		).result();
+		const headers = MockWebSocket.instances[0]?.options?.headers;
+		expect(headers?.["x-opencode-session"]).toBe("caller");
+		expect(headers?.["user-agent"]).toBe("custom");
+	});
 	it("resolves the standard responses WebSocket endpoint", () => {
 		expect(resolveOpenAIResponsesWebSocketUrl("https://cpa.test/v1")).toBe("wss://cpa.test/v1/responses");
 	});

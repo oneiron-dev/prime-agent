@@ -74,8 +74,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 26 adds stable-target follow-up addressing in the fork and usage totals upstream.
 // Revision 27 combines capability-gated stable targets with optional own-session usage totals.
 // Revision 28 adds capability-gated deadlines and request-scoped attachment cancellation.
-export const DAEMON_SCHEMA_REVISION = 28;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-a8948ed0a5b5";
+// Revision 29 combines attachment deadlines with recovery errors and saved-session models.
+export const DAEMON_SCHEMA_REVISION = 29;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-29-ecca1b51cd60";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1133,6 +1134,7 @@ export type DaemonErrorInfo =
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
+	| { code: "session_recovering"; activeSessionId: string }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId }
 	| {
 			code: "stable_follow_up_target";
@@ -1190,6 +1192,8 @@ export interface DaemonSavedSessionInfo {
 	allMessagesText: string;
 	agentStatus?: AgentConnectionAgentStatus;
 	usage?: SessionUsageSummary;
+	/** Last recorded provider/model selector; absent for sessions that never ran a model. */
+	model?: { provider: string; modelId: string };
 }
 
 export type DaemonDeleteSavedSessionResult = DeleteSessionFileResult;

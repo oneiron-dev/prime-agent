@@ -19,7 +19,9 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "../messages.js";
+import { completeWithProviderRetry, type ProviderRetryPolicy } from "../provider-retry.js";
 import {
 	buildSessionContext,
 	type CompactionEntry,
@@ -129,12 +131,15 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 			entry.tokensBefore,
 			entry.timestamp,
 			entry.customInstructions,
+			undefined,
+			entry.harnessDigest,
 		);
 	}
 	return undefined;
 }
 
 const SYNTHETIC_COMPACTION_TYPES = new Set([
+	HARNESS_DIGEST_CUSTOM_TYPE,
 	"heartbeat_prompt",
 	"ipython_state",
 	"ipython_state_restored",
@@ -521,6 +526,8 @@ export function findCutPoint(
 
 		// Check if we've exceeded the budget
 		if (accumulatedTokens >= keepRecentTokens) {
+			// No cut point at/after i (trailing tool results): keep only the final turn, not everything.
+			cutIndex = cutPoints[cutPoints.length - 1];
 			for (let c = 0; c < cutPoints.length; c++) {
 				if (cutPoints[c] >= i) {
 					cutIndex = cutPoints[c];
@@ -696,6 +703,8 @@ interface RollingSummaryOptions {
 	/** Chunk ceiling for this pass; split-turn passes share the global budget. */
 	maxChunks?: number;
 	summaryCall?: SummaryCallRunner;
+	retry?: ProviderRetryPolicy;
+	sessionId?: string;
 }
 
 /**
@@ -704,7 +713,8 @@ interface RollingSummaryOptions {
  * goes through here so none can issue an unbounded single-shot request.
  */
 async function runRollingSummary(options: RollingSummaryOptions): Promise<SummarySlice> {
-	const { model, reserveTokens, maxTokens, apiKey, prompts, headers, signal, thinkingLevel } = options;
+	const { model, reserveTokens, maxTokens, apiKey, prompts, headers, signal, thinkingLevel, retry, sessionId } =
+		options;
 	const summaryCall: SummaryCallRunner = options.summaryCall ?? ((call) => call(headers));
 	let usage: Usage | undefined;
 	const requestLimit = summaryRequestByteLimit(model, reserveTokens, maxTokens);
@@ -736,15 +746,19 @@ async function runRollingSummary(options: RollingSummaryOptions): Promise<Summar
 			throw new Error(`Summary request exceeds safe UTF-8 byte budget (${bytes} > ${requestLimit})`);
 		const response = await summaryCall(async (callHeaders) => {
 			if (signal?.aborted) throw new Error("Compaction cancelled");
-			const result = await completeSimple(
-				model,
-				{
-					systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-					messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
-				},
-				model.reasoning && thinkingLevel && thinkingLevel !== "off"
-					? { maxTokens, signal, apiKey, headers: callHeaders, reasoning: thinkingLevel }
-					: { maxTokens, signal, apiKey, headers: callHeaders },
+			const result = await completeWithProviderRetry(
+				() =>
+					completeSimple(
+						model,
+						{
+							systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+							messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
+						},
+						model.reasoning && thinkingLevel && thinkingLevel !== "off"
+							? { maxTokens, signal, apiKey, headers: callHeaders, sessionId, reasoning: thinkingLevel }
+							: { maxTokens, signal, apiKey, headers: callHeaders, sessionId },
+					),
+				{ policy: retry, signal },
 			);
 			if (result.stopReason === "error")
 				throw new Error(`${options.failurePrefix}: ${result.errorMessage || "Unknown error"}`);
@@ -777,11 +791,15 @@ export async function generateSummary(
 	thinkingLevel?: ThinkingLevel,
 	maxChunks?: number,
 	summaryCall?: SummaryCallRunner,
+	retry?: ProviderRetryPolicy,
+	sessionId?: string,
 ): Promise<SummarySlice> {
 	return runRollingSummary({
 		messages: currentMessages,
 		maxChunks,
 		summaryCall,
+		retry,
+		sessionId,
 		model,
 		reserveTokens,
 		maxTokens: Math.floor(0.8 * reserveTokens),
@@ -1000,6 +1018,8 @@ export async function compact(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	summaryCall: SummaryCallRunner = (call) => call(headers),
+	retry?: ProviderRetryPolicy,
+	sessionId?: string,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -1055,6 +1075,8 @@ export async function compact(
 						thinkingLevel,
 						MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
 						summaryCall,
+						retry,
+						sessionId,
 					)
 				: Promise.resolve<SummarySlice>({ summary: effectivePreviousSummary ?? "No prior history." }),
 			generateTurnPrefixSummary(
@@ -1067,6 +1089,8 @@ export async function compact(
 				thinkingLevel,
 				MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
 				summaryCall,
+				retry,
+				sessionId,
 			),
 		]);
 		slices.push(historyResult, turnPrefixResult);
@@ -1084,6 +1108,8 @@ export async function compact(
 			thinkingLevel,
 			undefined,
 			summaryCall,
+			retry,
+			sessionId,
 		);
 		slices.push(result);
 		summary = result.summary;
@@ -1125,21 +1151,27 @@ export async function completeSummaryText(
 	failurePrefix: string,
 	summaryCall: SummaryCallRunner = (call) => call(headers),
 	onUsage?: (usage: Usage) => void,
+	retry?: ProviderRetryPolicy,
+	sessionId?: string,
 ): Promise<string> {
 	const bytes = Buffer.byteLength(promptText, "utf8");
 	if (bytes > requestLimit)
 		throw new Error(`${failurePrefix}: request exceeds safe UTF-8 byte budget (${bytes} > ${requestLimit})`);
 	const response = await summaryCall(async (callHeaders) => {
 		if (signal?.aborted) throw new Error("Compaction cancelled");
-		const result = await completeSimple(
-			model,
-			{
-				systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-				messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
-			},
-			model.reasoning && thinkingLevel && thinkingLevel !== "off"
-				? { maxTokens, signal, apiKey, headers: callHeaders, reasoning: thinkingLevel }
-				: { maxTokens, signal, apiKey, headers: callHeaders },
+		const result = await completeWithProviderRetry(
+			() =>
+				completeSimple(
+					model,
+					{
+						systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+						messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
+					},
+					model.reasoning && thinkingLevel && thinkingLevel !== "off"
+						? { maxTokens, signal, apiKey, headers: callHeaders, sessionId, reasoning: thinkingLevel }
+						: { maxTokens, signal, apiKey, headers: callHeaders, sessionId },
+				),
+			{ policy: retry, signal },
 		);
 		if (result.stopReason === "error") throw new Error(`${failurePrefix}: ${result.errorMessage || "Unknown error"}`);
 		if (result.stopReason === "aborted" || signal?.aborted) throw new Error("Compaction cancelled");
@@ -1269,7 +1301,10 @@ export function remoteCompactionCompatibilityError(model: Model<any>, mode: Comp
 export function hasOversizedSyntheticRemoteCheckpoint(state: RemoteCompactionState, maxBytes = 16 * 1024): boolean {
 	const visit = (value: unknown, seen: Set<object>, depth: number): boolean => {
 		if (typeof value === "string")
-			return Buffer.byteLength(value, "utf8") > maxBytes && /<ipython_state(?:_restored)?|<heartbeat/i.test(value);
+			return (
+				Buffer.byteLength(value, "utf8") > maxBytes &&
+				/<ipython_state(?:_restored)?|<heartbeat|\[ipython-state(?:-restored)?\]|\[heartbeat\]/i.test(value)
+			);
 		if (!value || typeof value !== "object" || depth > 8 || seen.has(value)) return false;
 		seen.add(value);
 		for (const child of Object.values(value)) if (visit(child, seen, depth + 1)) return true;
@@ -1455,11 +1490,15 @@ async function generateTurnPrefixSummary(
 	thinkingLevel?: ThinkingLevel,
 	maxChunks?: number,
 	summaryCall?: SummaryCallRunner,
+	retry?: ProviderRetryPolicy,
+	sessionId?: string,
 ): Promise<SummarySlice> {
 	return runRollingSummary({
 		messages,
 		maxChunks,
 		summaryCall,
+		retry,
+		sessionId,
 		model,
 		reserveTokens,
 		maxTokens: Math.floor(0.5 * reserveTokens), // Smaller budget for turn prefix

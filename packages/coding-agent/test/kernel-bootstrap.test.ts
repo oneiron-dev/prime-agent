@@ -9,6 +9,7 @@ import {
 	ensureKernelPython,
 	getKernelVenvDir,
 	type KernelPythonSkill,
+	kernelVenvPython,
 	resolveRuntimeIdentity,
 } from "../src/core/kernel/bootstrap.js";
 
@@ -518,7 +519,7 @@ dependencies = ["httpx"]
 		writeFakePython(overridePython, ["dill"]);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
-		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime with callable rlm\.run/);
+		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime with callable rlm\.spawn/);
 	});
 
 	it("rejects PRIME_AGENT_KERNEL_PYTHON with a legacy harness API", async () => {
@@ -541,7 +542,7 @@ dependencies = ["httpx"]
 		);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
-		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime with callable rlm\.run/);
+		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime with callable rlm\.spawn/);
 	});
 
 	it("fails an invalid PRIME_AGENT_KERNEL_PYTHON without bootstrapping", async () => {
@@ -550,5 +551,11 @@ dependencies = ["httpx"]
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
 		await expect(ensureKernelPython()).rejects.toThrow(/PRIME_AGENT_KERNEL_PYTHON points to a Python missing/);
+	});
+
+	it("resolves the venv python under Scripts\\python.exe on win32 (uv layout)", () => {
+		const venv = join(tempDir, "kernel-venv");
+		expect(kernelVenvPython(venv, "win32")).toBe(join(venv, "Scripts", "python.exe"));
+		expect(kernelVenvPython(venv, "linux")).toBe(join(venv, "bin", "python"));
 	});
 });

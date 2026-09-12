@@ -85,6 +85,7 @@ function fixture(worker = false) {
 		summary: {},
 		state: {},
 		messages: [],
+		lastEventCursor: { generation: "generation", sequence: 0 },
 		lastEventSequence: 0,
 	} as unknown as DaemonSessionSnapshot;
 	internals.sessions.set(state.activeSessionId, state);

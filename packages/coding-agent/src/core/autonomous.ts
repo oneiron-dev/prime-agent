@@ -1,10 +1,9 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat, readlink } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { AssistantMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
-import { waitForChildProcess } from "../utils/child-process.js";
+import { spawnHidden, waitForChildProcess } from "../utils/child-process.js";
 import { killProcessTree, trackDetachedChildPid, untrackDetachedChildPid } from "../utils/shell.js";
 
 export interface AgentAutonomousConfig {
@@ -59,6 +58,17 @@ export const DEFAULT_AUTONOMOUS_GATES: Required<AgentAutonomousGateConfig> = {
 	maxRetries: 3,
 	timeoutMs: 5 * 60 * 1000,
 };
+
+/**
+ * JSON-safe sentinel meaning "no cap". Limit checks compare usage against the
+ * configured value, so this stays finite and serializes to JSON while no
+ * realistic run can ever reach it.
+ */
+export const UNLIMITED_AUTONOMOUS_LIMIT = Number.MAX_SAFE_INTEGER;
+
+export function isUnlimitedAutonomousLimit(value: number): boolean {
+	return value >= UNLIMITED_AUTONOMOUS_LIMIT;
+}
 
 const MAX_GATE_OUTPUT_CHARS = 6000;
 const MAX_CHILD_PROCESS_OUTPUT_CHARS = 1024 * 1024;
@@ -154,6 +164,31 @@ export function setAutonomousEnabled(
 	}
 }
 
+/**
+ * Apply user-provided budget and gate options to a live runtime state.
+ * Only fields present in `config` change; unspecified fields keep the state's
+ * current values, which come from the session/CLI configuration or defaults.
+ */
+export function setAutonomousLimits(state: AutonomousRuntimeState, config?: AgentAutonomousConfig): void {
+	if (!config) {
+		return;
+	}
+	state.limits.maxContinuations = normalizeLimit(config.maxContinuations, state.limits.maxContinuations);
+	state.limits.maxTurns = normalizeLimit(config.maxTurns, state.limits.maxTurns);
+	state.limits.maxTokens = normalizeLimit(config.maxTokens, state.limits.maxTokens);
+	state.limits.timeoutMs = normalizeLimit(config.timeoutMs, state.limits.timeoutMs);
+	if (config.continuationPrompt?.trim()) {
+		state.continuationPrompt = config.continuationPrompt.trim();
+	}
+	if (config.gates) {
+		if (config.gates.commands !== undefined) {
+			state.gates.commands = [...config.gates.commands];
+		}
+		state.gates.maxRetries = normalizeLimit(config.gates.maxRetries, state.gates.maxRetries);
+		state.gates.timeoutMs = normalizeLimit(config.gates.timeoutMs, state.gates.timeoutMs);
+	}
+}
+
 export function autonomousStatus(state: AutonomousRuntimeState): AgentAutonomousStatus {
 	return {
 		enabled: state.enabled,
@@ -209,15 +244,13 @@ export async function nextAutonomousContinuation(
 		return undefined;
 	}
 	state.continuationsUsed++;
+	const gateFailureText = decision.reason === "gate_failed" ? buildGateFailureContinuation(state, now) : undefined;
 	return {
 		role: "user",
 		content: [
 			{
 				type: "text",
-				text:
-					decision.reason === "gate_failed"
-						? (buildGateFailureContinuation(state, now) ?? state.continuationPrompt)
-						: state.continuationPrompt,
+				text: gateFailureText ?? `[autonomous-continuation]\n\n${state.continuationPrompt}`,
 			},
 		],
 		timestamp: now,
@@ -353,6 +386,7 @@ export function buildAutonomousGateFailureContinuation(
 	timestamp = Date.now(),
 ): string {
 	return (
+		`[autonomous-continuation: gate-failed]\n\n` +
 		`Autonomous quality gate failed (attempt ${failure.attempt}/${maxRetries}): \`${failure.command}\` ${failure.exitText}.\n` +
 		(failure.output ? `\nOutput:\n${failure.output}\n` : "\n") +
 		`\nContinue working. Fix the failure, then produce terminal evidence. Timestamp: ${new Date(timestamp).toISOString()}.`
@@ -491,7 +525,7 @@ function runChildProcess(
 ): Promise<ChildProcessResult> {
 	options.signal?.throwIfAborted();
 	return new Promise((resolve) => {
-		const child = spawn(command, args, {
+		const child = spawnHidden(command, args, {
 			cwd: options.cwd,
 			detached: process.platform !== "win32",
 			shell: options.shell === true,

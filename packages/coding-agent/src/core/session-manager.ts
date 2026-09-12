@@ -13,23 +13,23 @@ import type {
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
-	chmodSync,
 	chownSync,
+	closeSync,
 	existsSync,
+	fstatSync,
 	mkdirSync,
+	openSync,
 	readdirSync,
 	readFileSync,
-	realpathSync,
-	renameSync,
-	rmSync,
+	readSync,
 	statSync,
-	writeFileSync,
 } from "fs";
-import { open, readdir, readFile, stat } from "fs/promises";
+import { readdir, readFile, stat } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
-import { readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
+import { realpathIfPresentSync, writeFileAtomicSync } from "../utils/atomic-file.js";
+import { readBytesSync, readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
 import {
 	type BashExecutionMessage,
@@ -37,6 +37,7 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	createHarnessDigestMessage,
 } from "./messages.js";
 import { prioritizeSessionFiles } from "./session-list-priority.js";
 import {
@@ -70,15 +71,6 @@ const CONTENT_ENTRY_TYPES = new Set([
 	"compaction",
 	"branch_summary",
 ]);
-
-function realpathIfPresent(path: string): string {
-	try {
-		return realpathSync(path);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return path;
-		throw error;
-	}
-}
 
 function statMetadataIfPresent(path: string): { mode: number; uid: number; gid: number } | undefined {
 	try {
@@ -177,6 +169,8 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	fromHook?: boolean;
 	customInstructions?: string;
 	usage?: Usage;
+	/** Harness digest snapshot taken at compaction time; rendered before the summary in LLM context. */
+	harnessDigest?: string;
 }
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
@@ -291,12 +285,19 @@ export interface SessionContext {
 	modelApi?: Api;
 }
 
+export interface SessionModelRef {
+	provider: string;
+	modelId: string;
+}
+
 export interface SessionInfo {
 	path: string;
 	id: string;
 	cwd: string;
 	name?: string;
 	state?: SessionState;
+	/** Last model the session ran with, from model_change entries and assistant messages. */
+	model?: SessionModelRef;
 	parentSessionPath?: string;
 	rlmDepth: number;
 	created: Date;
@@ -675,6 +676,8 @@ export function buildSessionContext(
 		}
 
 		if (compaction.mechanism === "remote" && compaction.remoteCompaction) {
+			if (compaction.harnessDigest)
+				messages.push(createHarnessDigestMessage(compaction.harnessDigest, Date.parse(compaction.timestamp)));
 			messages.push(createRemoteCompactionMessage(compaction.remoteCompaction, compaction.timestamp));
 		} else {
 			messages.push(
@@ -684,6 +687,7 @@ export function buildSessionContext(
 					compaction.timestamp,
 					compaction.customInstructions,
 					retainedMessages.length,
+					compaction.harnessDigest,
 				),
 			);
 		}
@@ -755,6 +759,125 @@ async function parseEntriesFromBufferAsync(buffer: Buffer): Promise<FileEntry[]>
 		}
 	}
 	return entries;
+}
+
+// Crash damage (torn tail, zero-filled append) poisons the NEXT append into the
+// same physical line, so the file is repaired once at open, not tolerated in memory.
+const REPAIR_SUSPICION_WINDOW_BYTES = 1024 * 1024;
+
+// A bounded tail read gates the full repair scan: clean opens stay O(window).
+function tailLooksDamaged(targetPath: string): boolean {
+	let descriptor: number;
+	try {
+		descriptor = openSync(targetPath, "r");
+	} catch {
+		return false;
+	}
+	try {
+		const size = fstatSync(descriptor).size;
+		if (size === 0) return false;
+		const windowBytes = Math.min(size, REPAIR_SUSPICION_WINDOW_BYTES);
+		const window = Buffer.allocUnsafe(windowBytes);
+		readSync(descriptor, window, 0, windowBytes, size - windowBytes);
+		if (window.includes(0)) return true;
+		if (window[windowBytes - 1] !== 0x0a) return true;
+		const previousNewline = window.lastIndexOf(0x0a, windowBytes - 2);
+		// No boundary inside the window: the final line exceeds it; scan to be sure.
+		if (previousNewline === -1 && windowBytes < size) return true;
+		const lastLine = window.subarray(previousNewline + 1, windowBytes - 1);
+		// A blank final line is benign (the loader skips it) and appends stay safe.
+		return lastLine.length > 0 && !parsesAsJson(lastLine);
+	} catch {
+		return true;
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
+function repairJsonlDamage(filePath: string): void {
+	const targetPath = realpathIfPresentSync(filePath);
+	if (!tailLooksDamaged(targetPath)) return;
+	let buffer: Buffer;
+	let snapshot: { size: number; mtimeMs: number };
+	try {
+		buffer = readFileSync(targetPath);
+		const measured = statSync(targetPath);
+		snapshot = { size: measured.size, mtimeMs: measured.mtimeMs };
+	} catch {
+		return;
+	}
+	if (buffer.length === 0 || snapshot.size !== buffer.length) return;
+	const keptLines: Buffer[] = [];
+	let recoveredNulLines = 0;
+	let droppedLines = 0;
+	let repairedTail = false;
+	let dirty = false;
+	let start = 0;
+	while (start < buffer.length) {
+		let end = buffer.indexOf(0x0a, start);
+		const terminated = end !== -1;
+		if (!terminated) end = buffer.length;
+		let lineStart = start;
+		while (lineStart < end && buffer[lineStart] === 0) lineStart++;
+		const line = buffer.subarray(lineStart, end);
+		if (lineStart > start) {
+			dirty = true;
+			if (line.length > 0 && parsesAsJson(line)) {
+				keptLines.push(line);
+				recoveredNulLines++;
+			} else {
+				droppedLines++;
+			}
+		} else if (!terminated) {
+			// An unterminated tail merges with the next append: re-terminate or truncate.
+			dirty = true;
+			if (line.length > 0 && parsesAsJson(line)) {
+				keptLines.push(line);
+				repairedTail = true;
+			} else {
+				droppedLines++;
+			}
+		} else if (end + 1 >= buffer.length && line.length > 0 && !parsesAsJson(line)) {
+			dirty = true;
+			droppedLines++;
+		} else {
+			keptLines.push(line);
+		}
+		start = end + 1;
+	}
+	if (!dirty) return;
+	const metadata = statMetadataIfPresent(targetPath);
+	const content = keptLines.length > 0 ? `${keptLines.map((kept) => kept.toString("utf8")).join("\n")}\n` : "";
+	try {
+		writeFileAtomicSync(targetPath, content, {
+			...(metadata === undefined ? {} : { mode: metadata.mode }),
+			beforeRename: (tempPath) => {
+				if (metadata !== undefined) chownSync(tempPath, metadata.uid, metadata.gid);
+				// A concurrent appender wins; skipping the repair is safe (next open retries).
+				const current = statSync(targetPath);
+				if (current.size !== snapshot.size || current.mtimeMs !== snapshot.mtimeMs) {
+					throw new RepairSupersededError();
+				}
+			},
+		});
+	} catch (error) {
+		if (error instanceof RepairSupersededError) return;
+		throw error;
+	}
+	console.error(
+		`Repaired crash damage in ${targetPath}: recovered ${recoveredNulLines} zero-filled line(s), dropped ${droppedLines} unrecoverable line(s)${repairedTail ? ", restored the trailing newline" : ""}`,
+	);
+}
+
+class RepairSupersededError extends Error {}
+
+function parsesAsJson(line: Buffer): boolean {
+	try {
+		JSON.parse(line.toString("utf8"));
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function finalizeLoadedEntries(entries: FileEntry[]): FileEntry[] {
@@ -1098,345 +1221,356 @@ function extractOversizedMessageSummary(line: string): {
 	};
 }
 
-interface SessionInfoScanState {
-	assistantUsageById: Map<string, Usage>;
-	attributedChildUsages: Usage[];
-	summarizationUsages: Usage[];
-	header: SessionHeader;
+interface SessionScanAccumulator {
+	header?: SessionHeader;
+	model?: SessionModelRef;
+	/** The first parsed entry was not a session header; appends cannot repair this. */
+	invalid: boolean;
 	messageCount: number;
 	firstMessage: string;
 	allMessagesText: string;
-	name: string | undefined;
-	state: SessionState | undefined;
-	agentStatus: AgentStatus | undefined;
-	lastActivityTime: number | undefined;
+	name?: string;
+	state?: SessionState;
+	agentStatus?: AgentStatus;
+	lastActivityTime?: number;
+	// Fold attribution aggregates like the loader: either disk representation cancels to the same own spend.
+	assistantUsageById: Map<string, Usage>;
+	attributedChildUsage: Usage;
+	summarizationUsage: Usage;
 }
 
-interface SessionInfoCacheEntry {
-	size: number;
+interface SessionScanState {
 	fileSize: number;
 	mtimeMs: number;
 	ctimeMs: number;
+	/** Identity of the scanned file: a rename rewrite replaces the inode and invalidates the resume state. */
 	dev: number;
 	ino: number;
-	fingerprint?: string;
+	/** Bytes consumed as complete newline-terminated lines; the resume point for the next scan. */
+	offset: number;
+	/** Last bytes of the consumed prefix; a resume only proceeds while the file still starts with them. */
+	tail: Buffer;
+	head: Buffer;
+	acc: SessionScanAccumulator;
 	info: SessionInfo | null;
-	state?: SessionInfoScanState;
+	/** Usage entries counted against the retained bound at the last store. */
+	accountedUsageEntries: number;
 }
 
-const SESSION_INFO_SCAN_FAILED = Symbol("session-info-scan-failed");
+const SESSION_SCAN_RESUME_TAIL_BYTES = 4096;
+const NEWLINE_BUFFER = Buffer.from("\n");
+// Memory bound (~tens of MB): LRU whole-state eviction only while over it, so
+// small states never thrash and an evicted file just pays one full rescan.
+const SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES = 100_000;
 
-// Reuse list metadata only while the file identity and change timestamps match.
-// Session files may be atomically replaced as well as appended.
-const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
-const sessionInfoReadsInFlight = new Map<string, Promise<SessionInfo | null>>();
+// Session files are append-only between whole-file rewrites, so scans resume
+// from the last consumed byte offset; rewrites are detected by shrink,
+// same-size mtime change, replaced inode, or a changed prefix tail. In-place
+// interior edits that defeat all four are outside the writer model.
+const sessionScanStates = new Map<string, SessionScanState>();
+// Scans of a path run one at a time; a later caller chains its own pass (its
+// stat sees every prior append) instead of joining an earlier scan's result.
+const sessionScanQueue = new Map<string, Promise<SessionInfo | null>>();
 
-function sessionInfoCacheMatchesFile(cached: SessionInfoCacheEntry, stats: Awaited<ReturnType<typeof stat>>): boolean {
-	return (
-		cached.fileSize === Number(stats.size) &&
-		cached.mtimeMs === stats.mtimeMs &&
-		cached.ctimeMs === stats.ctimeMs &&
-		cached.dev === stats.dev &&
-		cached.ino === stats.ino
-	);
+export function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
+	const previous = sessionScanQueue.get(filePath);
+	const scan = previous
+		? previous.then(
+				() => scanSessionInfo(filePath),
+				() => scanSessionInfo(filePath),
+			)
+		: scanSessionInfo(filePath);
+	sessionScanQueue.set(filePath, scan);
+	void scan.finally(() => {
+		if (sessionScanQueue.get(filePath) === scan) sessionScanQueue.delete(filePath);
+	});
+	return scan;
 }
 
-async function sessionPrefixFingerprint(filePath: string, size: number): Promise<string | undefined> {
-	if (size === 0) return "";
-	try {
-		const handle = await open(filePath, "r");
-		try {
-			const width = Math.min(4096, size);
-			const first = Buffer.alloc(width);
-			const last = Buffer.alloc(width);
-			if ((await handle.read(first, 0, width, 0)).bytesRead !== width) return undefined;
-			if ((await handle.read(last, 0, width, size - width)).bytesRead !== width) return undefined;
-			return `${first.toString("base64")}:${last.toString("base64")}`;
-		} finally {
-			await handle.close();
-		}
-	} catch {
-		return undefined;
+let retainedUsageEntries = 0;
+
+function dropSessionScanState(filePath: string): void {
+	const state = sessionScanStates.get(filePath);
+	if (!state) return;
+	retainedUsageEntries -= state.accountedUsageEntries;
+	sessionScanStates.delete(filePath);
+}
+
+/** Refresh LRU recency and enforce the retained-usage bound. */
+function storeSessionScanState(filePath: string, state: SessionScanState): void {
+	dropSessionScanState(filePath);
+	state.accountedUsageEntries = state.acc.assistantUsageById.size;
+	retainedUsageEntries += state.accountedUsageEntries;
+	sessionScanStates.set(filePath, state);
+	for (const key of sessionScanStates.keys()) {
+		if (retainedUsageEntries <= SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES) break;
+		dropSessionScanState(key);
 	}
 }
 
-async function lastCompleteJsonlOffset(filePath: string, size: number): Promise<number | undefined> {
-	if (size === 0) return 0;
+function createSessionScanAccumulator(): SessionScanAccumulator {
+	return {
+		invalid: false,
+		messageCount: 0,
+		firstMessage: "",
+		allMessagesText: "",
+		assistantUsageById: new Map<string, Usage>(),
+		attributedChildUsage: emptyUsage(),
+		summarizationUsage: emptyUsage(),
+	};
+}
+
+function scannedPrefixIntact(filePath: string, state: SessionScanState): boolean {
+	if (state.offset === 0) return true;
 	try {
-		const handle = await open(filePath, "r");
-		try {
-			let lastNewline = -1;
-			for (let end = size; end > 0; ) {
-				const width = Math.min(64 * 1024, end);
-				const start = end - width;
-				const chunk = Buffer.alloc(width);
-				if ((await handle.read(chunk, 0, width, start)).bytesRead !== width) return undefined;
-				const newline = chunk.lastIndexOf(0x0a);
-				if (newline !== -1) {
-					lastNewline = start + newline;
-					break;
-				}
-				end = start;
-			}
-			if (lastNewline === size - 1) return size;
-			const trailingLength = size - lastNewline - 1;
-			if (trailingLength > SESSION_LIST_PARSE_MAX_LINE_CHARS) return lastNewline + 1;
-			const trailing = Buffer.alloc(trailingLength);
-			if ((await handle.read(trailing, 0, trailingLength, lastNewline + 1)).bytesRead !== trailingLength)
-				return undefined;
-			try {
-				JSON.parse(trailing.toString("utf8"));
-				return size;
-			} catch {
-				return lastNewline + 1;
-			}
-		} finally {
-			await handle.close();
-		}
+		const start = Math.max(0, state.offset - SESSION_SCAN_RESUME_TAIL_BYTES);
+		return (
+			readBytesSync(filePath, 0, state.head.length).equals(state.head) &&
+			readBytesSync(filePath, start, state.offset).equals(state.tail)
+		);
 	} catch {
-		return undefined;
+		return false;
 	}
 }
 
-async function readSessionInfoOnce(filePath: string): Promise<SessionInfo | null> {
+/** Last bytes of the consumed prefix after appending one line and its newline, copied out of the stream chunk. */
+function advanceScanTail(tail: Buffer, line: Buffer): Buffer {
+	if (line.length >= SESSION_SCAN_RESUME_TAIL_BYTES - 1) {
+		return Buffer.concat([line.subarray(line.length - (SESSION_SCAN_RESUME_TAIL_BYTES - 1)), NEWLINE_BUFFER]);
+	}
+	const combined = Buffer.concat([tail, line, NEWLINE_BUFFER]);
+	return combined.length <= SESSION_SCAN_RESUME_TAIL_BYTES
+		? combined
+		: Buffer.from(combined.subarray(combined.length - SESSION_SCAN_RESUME_TAIL_BYTES));
+}
+
+async function scanSessionInfo(filePath: string, retryOnReplacement = true): Promise<SessionInfo | null> {
 	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
 		stats = await stat(filePath);
 	} catch {
+		dropSessionScanState(filePath);
 		return null;
 	}
-	const cached = sessionInfoCache.get(filePath);
-	const completeSize = await lastCompleteJsonlOffset(filePath, Number(stats.size));
-	if (completeSize === undefined) return null;
-	if (cached && cached.size === completeSize && sessionInfoCacheMatchesFile(cached, stats)) return cached.info;
-
-	// JSONL session logs append. Reuse metadata from the completed prefix; a rewrite,
-	// truncate, inode change, or incomplete prior suffix falls back to a full scan.
-	const canAppend =
-		cached?.state &&
-		cached.dev === stats.dev &&
-		cached.ino === stats.ino &&
-		completeSize > cached.size &&
-		cached.fingerprint !== undefined &&
-		cached.fingerprint === (await sessionPrefixFingerprint(filePath, cached.size));
-	const result = await scanSessionInfo(
-		filePath,
-		stats,
-		canAppend ? cached.state : undefined,
-		canAppend ? cached.size : 0,
-		completeSize,
-	);
-	if (result === SESSION_INFO_SCAN_FAILED) return null;
-	if (result === null) {
-		sessionInfoCache.set(filePath, {
-			size: completeSize,
-			fileSize: Number(stats.size),
-			mtimeMs: stats.mtimeMs,
-			ctimeMs: stats.ctimeMs,
-			dev: stats.dev,
-			ino: stats.ino,
-			info: null,
-		});
-		return null;
+	const previous = sessionScanStates.get(filePath);
+	const sameFile = previous !== undefined && previous.dev === stats.dev && previous.ino === stats.ino;
+	if (
+		sameFile &&
+		previous.fileSize === stats.size &&
+		previous.mtimeMs === stats.mtimeMs &&
+		previous.ctimeMs === stats.ctimeMs
+	) {
+		storeSessionScanState(filePath, previous);
+		return previous.info;
 	}
-	sessionInfoCache.set(filePath, {
-		size: completeSize,
-		fileSize: Number(stats.size),
-		mtimeMs: stats.mtimeMs,
-		ctimeMs: stats.ctimeMs,
-		dev: stats.dev,
-		ino: stats.ino,
-		fingerprint: await sessionPrefixFingerprint(filePath, completeSize),
-		info: result.info,
-		state: result.state,
-	});
-	return result.info;
-}
-export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
-	const inFlight = sessionInfoReadsInFlight.get(filePath);
-	if (inFlight) {
-		const info = await inFlight;
-		if (info === null) return null;
-		let stats: Awaited<ReturnType<typeof stat>>;
-		try {
-			stats = await stat(filePath);
-		} catch {
-			return null;
-		}
-		const cached = sessionInfoCache.get(filePath);
-		if (cached?.info === info && sessionInfoCacheMatchesFile(cached, stats)) return info;
-		// The shared read may predate this caller's view of the file. Retry once,
-		// without recursively joining old reads or waiting for transcript churn to stop.
-		return readSessionInfoOnce(filePath);
-	}
-
-	const read = readSessionInfoOnce(filePath);
-	sessionInfoReadsInFlight.set(filePath, read);
+	const resume = sameFile && stats.size > previous.fileSize && scannedPrefixIntact(filePath, previous);
+	const state: SessionScanState = resume
+		? previous
+		: {
+				fileSize: 0,
+				mtimeMs: 0,
+				ctimeMs: 0,
+				dev: stats.dev,
+				ino: stats.ino,
+				offset: 0,
+				tail: Buffer.alloc(0),
+				head: Buffer.alloc(0),
+				acc: createSessionScanAccumulator(),
+				info: null,
+				accountedUsageEntries: 0,
+			};
 	try {
-		return await read;
-	} finally {
-		if (sessionInfoReadsInFlight.get(filePath) === read) {
-			sessionInfoReadsInFlight.delete(filePath);
+		const tornTail = await scanSessionLines(filePath, state, stats.size);
+		state.info = snapshotSessionInfo(state.acc, tornTail, filePath, stats);
+	} catch {
+		dropSessionScanState(filePath);
+		return null;
+	}
+	// A rename rewrite racing the scan can mix two files' bytes into one
+	// accumulator: a changed inode afterwards discards the state and rescans.
+	let after: Awaited<ReturnType<typeof stat>> | undefined;
+	try {
+		after = await stat(filePath);
+	} catch {
+		after = undefined;
+	}
+	if (!after || after.dev !== stats.dev || after.ino !== stats.ino) {
+		dropSessionScanState(filePath);
+		return retryOnReplacement ? scanSessionInfo(filePath, false) : null;
+	}
+	state.fileSize = stats.size;
+	state.mtimeMs = stats.mtimeMs;
+	state.ctimeMs = stats.ctimeMs;
+	storeSessionScanState(filePath, state);
+	return state.info;
+}
+
+/**
+ * Fold the complete lines in [state.offset, size) into the accumulator. An
+ * unterminated final line may be an in-progress append: it is returned for
+ * snapshot-only folding, never consumed into the resumable accumulator.
+ */
+async function scanSessionLines(filePath: string, state: SessionScanState, size: number): Promise<Buffer | undefined> {
+	if (state.acc.invalid || state.offset >= size) return undefined;
+	for await (const lineBuffer of readLinesAsBuffers(filePath, { start: state.offset, end: size - 1 })) {
+		const lineEnd = state.offset + lineBuffer.length;
+		if (lineEnd >= size) return lineBuffer;
+		foldSessionScanLine(state.acc, lineBuffer);
+		state.tail = advanceScanTail(state.tail, lineBuffer);
+		if (state.head.length < SESSION_SCAN_RESUME_TAIL_BYTES) {
+			state.head = Buffer.concat([
+				state.head,
+				lineBuffer.subarray(0, SESSION_SCAN_RESUME_TAIL_BYTES - state.head.length),
+				NEWLINE_BUFFER,
+			]).subarray(0, SESSION_SCAN_RESUME_TAIL_BYTES);
 		}
+		state.offset = lineEnd + 1;
+		if (state.acc.invalid) break;
+	}
+	return undefined;
+}
+
+function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): void {
+	const line = lineBuffer.toString("utf8");
+	if (!line.trim()) return;
+
+	// Large tool-result entries can be many MB. They do not carry the
+	// session-list metadata we need, and parsing them during every refresh
+	// can exhaust the daemon heap.
+	if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
+		if (looksLikeMessageEntry(line)) {
+			acc.messageCount++;
+			const summary = extractOversizedMessageSummary(line);
+			if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
+				acc.lastActivityTime = Math.max(acc.lastActivityTime ?? 0, summary.timestamp);
+			}
+			if (summary.role === "user" && !acc.firstMessage) {
+				acc.firstMessage = summary.textPreview || "(large message)";
+			}
+		}
+		return;
+	}
+
+	const trimmed = line.trim();
+	let entry: FileEntry;
+	try {
+		entry = JSON.parse(trimmed) as FileEntry;
+	} catch {
+		return;
+	}
+
+	if (entry.type === "session_info") {
+		const infoEntry = entry as SessionInfoEntry;
+		acc.name = infoEntry.name?.trim() || undefined;
+	}
+	if (entry.type === "session_state") {
+		const stateEntry = entry as SessionStateEntry;
+		const status = normalizeSessionStateStatus(stateEntry.state?.status);
+		if (status) {
+			acc.state = { status };
+		}
+	}
+	// Keep the latest recap/verdict so off-daemon sessions don't all show as
+	// unjudged in the agents view. Append-only, so last seen wins.
+	if (entry.type === "agent_status") {
+		acc.agentStatus = (entry as AgentStatusEntry).status;
+	}
+	if (entry.type === "model_change") {
+		const modelEntry = entry as ModelChangeEntry;
+		acc.model = { provider: modelEntry.provider, modelId: modelEntry.modelId };
+	}
+	if (entry.type === "child_usage_attributed") {
+		const attribution = entry as ChildUsageAttributionEntry;
+		if (acc.assistantUsageById.has(attribution.targetId)) {
+			acc.assistantUsageById.set(attribution.targetId, attribution.aggregateUsage);
+			addAssistantUsage(acc.attributedChildUsage, attribution.childUsage);
+		}
+	}
+	if (entry.type === "compaction" || entry.type === "branch_summary") {
+		const summarizationUsage = (entry as CompactionEntry | BranchSummaryEntry).usage;
+		if (summarizationUsage) addAssistantUsage(acc.summarizationUsage, summarizationUsage);
+	}
+	if (!acc.header) {
+		if (entry.type !== "session") {
+			acc.invalid = true;
+			return;
+		}
+		acc.header = entry as SessionHeader;
+	}
+
+	acc.lastActivityTime = updateLastActivityTime(acc.lastActivityTime, entry);
+
+	if (entry.type !== "message") return;
+	acc.messageCount++;
+
+	const message = (entry as SessionMessageEntry).message;
+	if (message.role === "assistant" && (message as { usage?: Usage }).usage) {
+		acc.assistantUsageById.set(entry.id, (message as { usage: Usage }).usage);
+	}
+	if (message.role === "assistant") {
+		const assistant = message as { provider?: string; model?: string };
+		if (typeof assistant.provider === "string" && typeof assistant.model === "string") {
+			acc.model = { provider: assistant.provider, modelId: assistant.model };
+		}
+	}
+	if (!isMessageWithContent(message)) return;
+	if (message.role !== "user" && message.role !== "assistant") return;
+
+	const textContent = extractTextContent(message);
+	if (!textContent) return;
+
+	acc.allMessagesText = appendCappedSearchText(acc.allMessagesText, textContent);
+	if (!acc.firstMessage && message.role === "user") {
+		acc.firstMessage = textContent;
 	}
 }
 
-async function scanSessionInfo(
+function snapshotSessionInfo(
+	persistent: SessionScanAccumulator,
+	tornTail: Buffer | undefined,
 	filePath: string,
 	stats: Awaited<ReturnType<typeof stat>>,
-	seed?: SessionInfoScanState,
-	start = 0,
-	end = Number(stats.size),
-): Promise<{ info: SessionInfo; state: SessionInfoScanState } | null | typeof SESSION_INFO_SCAN_FAILED> {
-	try {
-		let header: SessionHeader | undefined = seed?.header;
-		let messageCount = seed?.messageCount ?? 0;
-		let firstMessage = seed?.firstMessage ?? "";
-		let allMessagesText = seed?.allMessagesText ?? "";
-		let name: string | undefined = seed?.name;
-		let state: SessionState | undefined = seed?.state;
-		let agentStatus: AgentStatus | undefined = seed?.agentStatus;
-		let lastActivityTime: number | undefined = seed?.lastActivityTime;
-		// Clone cached usage state so a failed tail scan cannot mutate the completed prefix.
-		const assistantUsageById = new Map<string, Usage>(seed?.assistantUsageById);
-		const attributedChildUsages = [...(seed?.attributedChildUsages ?? [])];
-		const summarizationUsages = [...(seed?.summarizationUsages ?? [])];
-
-		for await (const lineBuffer of readLinesAsBuffers(filePath, start, end - 1)) {
-			const line = lineBuffer.toString("utf8");
-			if (!line.trim()) continue;
-
-			// Large tool-result entries can be many MB. They do not carry the
-			// session-list metadata we need, and parsing them during every refresh
-			// can exhaust the daemon heap.
-			if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
-				if (looksLikeMessageEntry(line)) {
-					messageCount++;
-					const summary = extractOversizedMessageSummary(line);
-					if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
-						lastActivityTime = Math.max(lastActivityTime ?? 0, summary.timestamp);
-					}
-					if (summary.role === "user" && !firstMessage) {
-						firstMessage = summary.textPreview || "(large message)";
-					}
-				}
-				continue;
-			}
-
-			const trimmed = line.trim();
-			let entry: FileEntry;
-			try {
-				entry = JSON.parse(trimmed) as FileEntry;
-			} catch {
-				continue;
-			}
-
-			if (entry.type === "session_info") {
-				const infoEntry = entry as SessionInfoEntry;
-				name = infoEntry.name?.trim() || undefined;
-			}
-			if (entry.type === "session_state") {
-				const stateEntry = entry as SessionStateEntry;
-				const status = normalizeSessionStateStatus(stateEntry.state?.status);
-				if (status) {
-					state = { status };
-				}
-			}
-			// Keep the latest recap/verdict so off-daemon sessions don't all show as
-			// unjudged in the agents view. Append-only, so last seen wins.
-			if (entry.type === "agent_status") {
-				agentStatus = (entry as AgentStatusEntry).status;
-			}
-			if (entry.type === "child_usage_attributed") {
-				const attribution = entry as ChildUsageAttributionEntry;
-				if (assistantUsageById.has(attribution.targetId)) {
-					assistantUsageById.set(attribution.targetId, attribution.aggregateUsage);
-					attributedChildUsages.push(attribution.childUsage);
-				}
-			}
-			if (entry.type === "compaction" || entry.type === "branch_summary") {
-				const summarizationUsage = (entry as CompactionEntry | BranchSummaryEntry).usage;
-				if (summarizationUsage) summarizationUsages.push(summarizationUsage);
-			}
-			if (!header) {
-				if (entry.type !== "session") {
-					return null;
-				}
-				header = entry as SessionHeader;
-			}
-
-			lastActivityTime = updateLastActivityTime(lastActivityTime, entry);
-
-			if (entry.type !== "message") continue;
-			messageCount++;
-
-			const message = (entry as SessionMessageEntry).message;
-			if (message.role === "assistant" && (message as { usage?: Usage }).usage) {
-				assistantUsageById.set(entry.id, (message as { usage: Usage }).usage);
-			}
-			if (!isMessageWithContent(message)) continue;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-
-			const textContent = extractTextContent(message);
-			if (!textContent) continue;
-
-			allMessagesText = appendCappedSearchText(allMessagesText, textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
-			}
-		}
-
-		if (!header) return null;
-		const usageTotal = emptyUsage();
-		for (const usage of assistantUsageById.values()) {
-			addAssistantUsage(usageTotal, usage);
-		}
-		for (const usage of summarizationUsages) {
-			addAssistantUsage(usageTotal, usage);
-		}
-		for (const childUsage of attributedChildUsages) {
-			subtractAssistantUsage(usageTotal, childUsage);
-		}
-		const cwd = typeof header.cwd === "string" ? header.cwd : "";
-		const parentSessionPath = header.parentSession;
-		const rlmDepth = resolveSessionRlmDepth(header, filePath);
-		const modified = getSessionModifiedDateFromLastActivity(lastActivityTime, header, stats.mtime);
-
-		const scanState: SessionInfoScanState = {
-			header,
-			messageCount,
-			firstMessage,
-			allMessagesText,
-			name,
-			state,
-			agentStatus,
-			lastActivityTime,
-			assistantUsageById,
-			attributedChildUsages,
-			summarizationUsages,
+): SessionInfo | null {
+	let acc = persistent;
+	if (tornTail !== undefined && tornTail.length > 0 && !acc.invalid) {
+		acc = {
+			...persistent,
+			assistantUsageById: new Map(persistent.assistantUsageById),
+			attributedChildUsage: cloneUsage(persistent.attributedChildUsage),
+			summarizationUsage: cloneUsage(persistent.summarizationUsage),
 		};
-		return {
-			info: {
-				path: filePath,
-				id: header.id,
-				cwd,
-				name,
-				state,
-				parentSessionPath,
-				rlmDepth,
-				created: new Date(header.timestamp),
-				modified,
-				messageCount,
-				firstMessage: firstMessage || "(no messages)",
-				allMessagesText,
-				agentStatus,
-				usage: sessionUsageSummaryFrom(usageTotal),
-			},
-			state: scanState,
-		};
-	} catch {
-		return SESSION_INFO_SCAN_FAILED;
+		foldSessionScanLine(acc, tornTail);
 	}
+	if (acc.invalid || !acc.header) return null;
+	const usageTotal = emptyUsage();
+	for (const usage of acc.assistantUsageById.values()) {
+		addAssistantUsage(usageTotal, usage);
+	}
+	addAssistantUsage(usageTotal, acc.summarizationUsage);
+	subtractAssistantUsage(usageTotal, acc.attributedChildUsage);
+	const header = acc.header;
+	const cwd = typeof header.cwd === "string" ? header.cwd : "";
+	const parentSessionPath = header.parentSession;
+	const rlmDepth = resolveSessionRlmDepth(header, filePath);
+	const modified = getSessionModifiedDateFromLastActivity(acc.lastActivityTime, header, stats.mtime);
+
+	return {
+		path: filePath,
+		id: header.id,
+		cwd,
+		name: acc.name,
+		state: acc.state,
+		model: acc.model,
+		parentSessionPath,
+		rlmDepth,
+		created: new Date(header.timestamp),
+		modified,
+		messageCount: acc.messageCount,
+		firstMessage: acc.firstMessage || "(no messages)",
+		allMessagesText: acc.allMessagesText,
+		agentStatus: acc.agentStatus,
+		usage: sessionUsageSummaryFrom(usageTotal),
+	};
 }
 
 export type SessionListProgress = (loaded: number, total: number) => void;
@@ -1457,6 +1591,9 @@ async function listSessionsFromDir(
 ): Promise<SessionInfo[]> {
 	const sessions: SessionInfo[] = [];
 	if (!existsSync(dir)) {
+		for (const key of sessionScanStates.keys()) {
+			if (dirname(key) === dir) dropSessionScanState(key);
+		}
 		return sessions;
 	}
 
@@ -1466,9 +1603,9 @@ async function listSessionsFromDir(
 		const total = progressTotal ?? files.length;
 
 		const present = new Set(files);
-		for (const key of sessionInfoCache.keys()) {
+		for (const key of sessionScanStates.keys()) {
 			if (dirname(key) === dir && !present.has(key)) {
-				sessionInfoCache.delete(key);
+				dropSessionScanState(key);
 			}
 		}
 
@@ -1552,6 +1689,7 @@ export class SessionManager {
 	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
+			if (this.persist && preloadedEntries === undefined) repairJsonlDamage(this.sessionFile);
 			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
 
 			// If file was empty or corrupted (no valid header), truncate and start fresh
@@ -1679,21 +1817,16 @@ export class SessionManager {
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(this._entryForPersistence(e))).join("\n")}\n`;
-		const targetPath = realpathIfPresent(this.sessionFile);
+		const targetPath = realpathIfPresentSync(this.sessionFile);
 		const directory = dirname(targetPath);
 		mkdirSync(directory, { recursive: true });
-		const tempPath = join(directory, `.${basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
-		try {
-			const metadata = statMetadataIfPresent(targetPath);
-			writeFileSync(tempPath, content, metadata === undefined ? undefined : { mode: metadata.mode });
-			if (metadata !== undefined) {
-				chownSync(tempPath, metadata.uid, metadata.gid);
-				chmodSync(tempPath, metadata.mode);
-			}
-			renameSync(tempPath, targetPath);
-		} finally {
-			rmSync(tempPath, { force: true });
-		}
+		const metadata = statMetadataIfPresent(targetPath);
+		writeFileAtomicSync(targetPath, content, {
+			...(metadata === undefined ? {} : { mode: metadata.mode }),
+			beforeRename: (tempPath) => {
+				if (metadata !== undefined) chownSync(tempPath, metadata.uid, metadata.gid);
+			},
+		});
 		this._notifyPersistListeners();
 	}
 
@@ -1874,6 +2007,7 @@ export class SessionManager {
 		customInstructions?: string,
 		metadata?: CompactionMetadata,
 		usage?: Usage,
+		harnessDigest?: string,
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -1888,6 +2022,7 @@ export class SessionManager {
 			customInstructions,
 			...metadata,
 			usage,
+			harnessDigest,
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -2435,6 +2570,7 @@ export class SessionManager {
 		if (!existsSync(path)) {
 			return SessionManager.open(path, sessionDir, cwdOverride);
 		}
+		repairJsonlDamage(path);
 		const entries = await loadEntriesFromFileAsync(path);
 		if (entries.length === 0) {
 			return SessionManager.open(path, sessionDir, cwdOverride);

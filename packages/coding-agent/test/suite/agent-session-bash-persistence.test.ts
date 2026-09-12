@@ -191,7 +191,9 @@ describe("AgentSession bash and persistence characterization", () => {
 		await harness.session.prompt("start");
 
 		const entries = harness.sessionManager.getEntries();
+		// The first custom_message entry is the session-start harness digest.
 		expect(entries.map((entry) => entry.type)).toEqual([
+			"custom_message",
 			"custom_message",
 			"message",
 			"message",
@@ -199,6 +201,7 @@ describe("AgentSession bash and persistence characterization", () => {
 			"message",
 		]);
 		expect(harness.session.messages.map((message) => message.role)).toEqual([
+			"custom",
 			"custom",
 			"user",
 			"assistant",

@@ -23,6 +23,7 @@ import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model, Usage } from "@earendil-works/pi-ai";
 import { convertToLlm } from "../messages.js";
+import type { ProviderRetryPolicy } from "../provider-retry.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
 import {
 	buildSummarizationPrompt,
@@ -80,6 +81,7 @@ export interface DeepCompactionProgress {
 export interface DeepCompactionOptions {
 	headers?: Record<string, string>;
 	summaryCall?: SummaryCallRunner;
+	retry?: ProviderRetryPolicy;
 	customInstructions?: string;
 	signal?: AbortSignal;
 	thinkingLevel?: ThinkingLevel;
@@ -355,6 +357,8 @@ export async function compactMapReduce(
 			`Map-reduce chunk ${index + 1} summarization failed`,
 			summaryCall,
 			onUsage,
+			options.retry,
+			options.sessionId,
 		);
 		if (signal?.aborted) throw new Error("Compaction cancelled");
 		partials[index] = summary;
@@ -425,6 +429,8 @@ export async function compactMapReduce(
 					"Map-reduce merge failed",
 					summaryCall,
 					onUsage,
+					options.retry,
+					options.sessionId,
 				),
 			);
 			merged++;
@@ -449,6 +455,8 @@ export async function compactMapReduce(
 				"Map-reduce final merge failed",
 				summaryCall,
 				onUsage,
+				options.retry,
+				options.sessionId,
 			),
 		];
 	}

@@ -154,7 +154,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["update"],
-		usage: "update [--force]",
+		usage: "update [--force] [--rollback]",
 		summary: "Update Prime Agent",
 	},
 	{

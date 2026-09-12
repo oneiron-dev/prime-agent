@@ -100,13 +100,9 @@ it("keeps actual input responsive while searching or loading nested sessions", a
 		workingIconFrame: 0,
 		ctrlCExitHintExpiresAt: 0,
 		deleteConfirmExpiresAt: 0,
-		splash: new BrandSplashHeader(
-			"repro",
-			() => undefined,
-			() => "/tmp/search-repro",
-			undefined,
-			{ getExtraMetadata: () => [{ label: "agents", value: invoke(view, "getAgentCountsText") }] },
-		),
+		splash: new BrandSplashHeader("repro", () => "/tmp/search-repro", undefined, {
+			getExtraMetadata: () => [{ label: "agents", value: invoke(view, "getAgentCountsText") }],
+		}),
 	}) as AgentsViewMode;
 	const timings: Record<string, number> = {};
 	for (const method of ["getFilteredRecords", "rebuildRows"]) {

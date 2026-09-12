@@ -387,11 +387,11 @@ describe("ENG-4649 subagent model selection", () => {
 		});
 		try {
 			await expect(harness.session.runRlmChild("reject invalid reasoning type", { reasoning: 42 })).rejects.toThrow(
-				"rlm.run reasoning must be a Prime ThinkingLevel string",
+				"rlm.spawn reasoning must be a Prime ThinkingLevel string",
 			);
 			await expect(
 				harness.session.runRlmChild("reject invalid reasoning value", { reasoning: "turbo" }),
-			).rejects.toThrow("rlm.run reasoning must be a Prime ThinkingLevel string");
+			).rejects.toThrow("rlm.spawn reasoning must be a Prime ThinkingLevel string");
 			await expect(
 				harness.session.runRlmChild("reject unsupported child reasoning", {
 					model: `${provider}/non-reasoning-child`,
@@ -411,9 +411,9 @@ describe("ENG-4649 subagent model selection", () => {
 		try {
 			await expect(
 				harness.session.runRlmChild("conflicting levels", { reasoning: "low", thinking: "high" }),
-			).rejects.toThrow('rlm.run reasoning "low" conflicts with thinking "high"');
+			).rejects.toThrow('rlm.spawn reasoning "low" conflicts with thinking "high"');
 			await expect(harness.session.runRlmChild("bad alias value", { thinking: "turbo" })).rejects.toThrow(
-				"rlm.run thinking must be one of: off, minimal, low, medium, high, xhigh, max",
+				"rlm.spawn thinking must be one of: off, minimal, low, medium, high, xhigh, max",
 			);
 			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
 			harness.setResponses([fauxAssistantMessage("alias answer"), fauxAssistantMessage("agreeing answer")]);
@@ -587,7 +587,7 @@ describe("ENG-4649 subagent model selection", () => {
 		});
 		try {
 			await expect(harness.session.runRlmChild("bad type", { model: 42 })).rejects.toThrow(
-				"rlm.run model must be a string",
+				"rlm.spawn model must be a string",
 			);
 			await expect(
 				harness.session.runRlmChild("unknown model", { model: `${provider}/missing-model` }),

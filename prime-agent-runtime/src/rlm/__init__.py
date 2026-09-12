@@ -11,11 +11,24 @@ from typing import Any
 from .bash import BashHandle, BashResult, bash
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
 
+_NOT_CALLABLE_MESSAGE = "'rlm' is not callable; spawn a child with: handle = await rlm.spawn('sub-task', name='worker')"
+_RENAMED_RUN_MESSAGE = "rlm.run was renamed; spawn a child with: handle = await rlm.spawn('sub-task', name='worker')"
+
+
 @dataclass(frozen=True)
 class RLMSpawnHandle:
     rlm_child_id: str
     name: str
     session_dir: Path
+    model: str
+
+
+@dataclass(frozen=True)
+class RLMCreateSessionHandle:
+    active_session_id: str
+    session_id: str
+    name: str
+    session_file: Path
     model: str
 
 
@@ -39,17 +52,36 @@ class RLMSubagent:
 
 def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     if not isinstance(payload, dict):
-        raise RuntimeError("rlm.run returned an invalid spawn handle")
+        raise RuntimeError("rlm.spawn returned an invalid spawn handle")
     child_id = payload.get("rlm_child_id")
     name = payload.get("name")
     session_dir = payload.get("session_dir")
     model = payload.get("model")
     if not all(isinstance(value, str) and value for value in (child_id, name, session_dir, model)):
-        raise RuntimeError("rlm.run returned an invalid spawn handle")
+        raise RuntimeError("rlm.spawn returned an invalid spawn handle")
     return RLMSpawnHandle(
         rlm_child_id=child_id,
         name=name,
         session_dir=Path(session_dir),
+        model=model,
+    )
+
+
+def _create_session_handle_from_payload(payload: Any) -> RLMCreateSessionHandle:
+    if not isinstance(payload, dict):
+        raise RuntimeError("rlm.create_session returned an invalid payload")
+    active_session_id = payload.get("active_session_id")
+    session_id = payload.get("session_id")
+    name = payload.get("name")
+    session_file = payload.get("session_file")
+    model = payload.get("model")
+    if not all(isinstance(value, str) and value for value in (active_session_id, session_id, name, session_file, model)):
+        raise RuntimeError("rlm.create_session returned an invalid payload structure")
+    return RLMCreateSessionHandle(
+        active_session_id=active_session_id,
+        session_id=session_id,
+        name=name,
+        session_file=Path(session_file),
         model=model,
     )
 
@@ -89,9 +121,17 @@ def emit(data: dict[str, Any]) -> None:
     repl.emit(data)
 
 
-async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
+async def spawn(
+    prompt: str,
+    *,
+    name: str,
+    model: str | None = None,
+    thinking: str | None = None,
+    reasoning: str | None = None,
+) -> RLMSpawnHandle:
     """Spawn a recursive Prime Agent child and return once its task is admitted.
 
+    ``name`` is required and must be unique among siblings.
     ``model`` selects a child with an exact ``provider/model`` selector.
     ``reasoning`` selects a supported Prime ThinkingLevel for that child; it defaults to
     the parent level and levels invalid for the resolved model fail the spawn.
@@ -99,6 +139,14 @@ async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
     """
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
+    kwargs: dict[str, Any] = {"name": name}
+    if model is not None:
+        kwargs["model"] = model
+    if thinking is not None:
+        kwargs["thinking"] = thinking
+    if reasoning is not None:
+        kwargs["reasoning"] = reasoning
+    # Wire type stays "rlm.run" so kernels and hosts of different versions stay compatible.
     payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
     return _spawn_handle_from_payload(payload)
 
@@ -113,6 +161,33 @@ def _model_from_payload(payload: Any) -> RLMModel:
     if not all(isinstance(value, str) and value for value in (provider, model_id, name, selector)):
         raise RuntimeError("rlm.find_models returned an invalid model entry")
     return RLMModel(provider=provider, id=model_id, name=name, selector=selector)
+
+
+async def create_session(
+    prompt: str,
+    name: str | None = None,
+    model: str | None = None,
+    thinking: str | None = None,
+    cwd: str | None = None,
+) -> RLMCreateSessionHandle:
+    """Create and prompt a resident depth-0 daemon session.
+
+    Only daemon-backed depth-0 sessions support this operation. The optional
+    arguments set the session name, model, thinking level, and working directory.
+    """
+    if not isinstance(prompt, str):
+        raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
+    kwargs: dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if model is not None:
+        kwargs["model"] = model
+    if thinking is not None:
+        kwargs["thinking"] = thinking
+    if cwd is not None:
+        kwargs["cwd"] = cwd
+    payload = await host_request("rlm.create_session", {"prompt": prompt, "kwargs": kwargs})
+    return _create_session_handle_from_payload(payload)
 
 
 async def find_models(query: str = "", limit: int = 8) -> list[RLMModel]:
@@ -231,12 +306,30 @@ class _HarnessProxy:
 _harness_state = _HarnessProxy()
 
 
-class _RLMCallable:
+class _RLMNamespace:
     harness = _harness_state
     get_harness_state = staticmethod(get_harness_state)
 
-    async def run(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
-        return await run(prompt, **kwargs)
+    async def spawn(
+        self,
+        prompt: str,
+        *,
+        name: str,
+        model: str | None = None,
+        thinking: str | None = None,
+        reasoning: str | None = None,
+    ) -> RLMSpawnHandle:
+        return await spawn(prompt, name=name, model=model, thinking=thinking, reasoning=reasoning)
+
+    async def create_session(
+        self,
+        prompt: str,
+        name: str | None = None,
+        model: str | None = None,
+        thinking: str | None = None,
+        cwd: str | None = None,
+    ) -> RLMCreateSessionHandle:
+        return await create_session(prompt, name=name, model=model, thinking=thinking, cwd=cwd)
 
     async def find_models(self, query: str = "", limit: int = 8) -> list[RLMModel]:
         return await find_models(query, limit)
@@ -247,20 +340,26 @@ class _RLMCallable:
     async def delete_subagent(self, target: str | RLMSubagent) -> RLMSubagent:
         return await delete_subagent(target)
 
-    async def __call__(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
-        return await run(prompt, **kwargs)
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        raise TypeError(_NOT_CALLABLE_MESSAGE)
+
+    # AttributeError keeps hasattr() semantics intact while still naming the replacement.
+    def __getattr__(self, name: str) -> Any:
+        if name == "run":
+            raise AttributeError(_RENAMED_RUN_MESSAGE)
+        raise AttributeError(f"'rlm' object has no attribute {name!r}")
 
 
-rlm = _RLMCallable()
+rlm = _RLMNamespace()
 harness = _harness_state
 
 
-class _CallableModule(types.ModuleType):
-    async def __call__(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
-        return await run(prompt, **kwargs)
+class _NotCallableModule(types.ModuleType):
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        raise TypeError(_NOT_CALLABLE_MESSAGE)
 
 
-sys.modules[__name__].__class__ = _CallableModule
+sys.modules[__name__].__class__ = _NotCallableModule
 
 __all__ = [
     "BashHandle",
@@ -271,9 +370,11 @@ __all__ = [
     "McpIntegration",
     "McpToolError",
     "NotEnabled",
+    "RLMCreateSessionHandle",
     "RLMModel",
     "RLMSpawnHandle",
     "RLMSubagent",
+    "create_session",
     "RefinementEvent",
     "bash",
     "delete_subagent",
@@ -284,7 +385,7 @@ __all__ = [
     "host_request",
     "list_subagents",
     "rlm",
-    "run",
+    "spawn",
 ]
 
 # Lazily re-export the MCP base class. Kept lazy so `import rlm` never requires
@@ -297,4 +398,6 @@ def __getattr__(name: str) -> Any:  # noqa: D401 - module-level lazy attr hook
         from . import mcp_base
 
         return getattr(mcp_base, name)
+    if name == "run":
+        raise AttributeError(_RENAMED_RUN_MESSAGE)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

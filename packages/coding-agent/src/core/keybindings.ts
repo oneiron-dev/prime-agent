@@ -19,11 +19,7 @@ export interface AppKeybindings {
 	"app.suspend": true;
 	"app.model.select": true;
 	"app.model.toggleScope": true;
-	"app.configuration.previousTab": true;
 	"app.tools.expand": true;
-	"app.messages.expand": true;
-	"app.edits.expand": true;
-	"app.thinking.toggle": true;
 	"app.subagents.focus": true;
 	"app.heartbeats.open": true;
 	"app.heartbeats.openSelected": true;
@@ -51,6 +47,7 @@ export interface AppKeybindings {
 	"app.agents.togglePin": true;
 	"app.agents.reorderUp": true;
 	"app.agents.reorderDown": true;
+	"app.agents.expand": true;
 	"app.tree.foldOrUp": true;
 	"app.tree.unfoldOrDown": true;
 	"app.tree.editLabel": true;
@@ -89,19 +86,7 @@ export const KEYBINDINGS = {
 	},
 	"app.model.select": { defaultKeys: "ctrl+l", description: "Open model selector" },
 	"app.model.toggleScope": { defaultKeys: "alt+s", description: "Toggle model selector scope" },
-	"app.configuration.previousTab": { defaultKeys: "shift+tab", description: "Select previous configuration tab" },
-	"app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output", defaultKeyScope: "editor" },
-	"app.messages.expand": {
-		defaultKeys: "ctrl+p",
-		description: "Toggle agent message expansion",
-		defaultKeyScope: "editor",
-	},
-	"app.edits.expand": { defaultKeys: "ctrl+j", description: "Toggle edit diffs", defaultKeyScope: "editor" },
-	"app.thinking.toggle": {
-		defaultKeys: "ctrl+t",
-		description: "Toggle thinking blocks",
-		defaultKeyScope: "editor",
-	},
+	"app.tools.expand": { defaultKeys: "ctrl+o", description: "Cycle conversation detail", defaultKeyScope: "editor" },
 	"app.subagents.focus": {
 		defaultKeys: "alt+a",
 		description: "Open child agents",
@@ -165,6 +150,7 @@ export const KEYBINDINGS = {
 	"app.agents.togglePin": { defaultKeys: "ctrl+t", description: "Pin or unpin selected agent tree" },
 	"app.agents.reorderUp": { defaultKeys: "shift+up", description: "Move selected agent up" },
 	"app.agents.reorderDown": { defaultKeys: "shift+down", description: "Move selected agent down" },
+	"app.agents.expand": { defaultKeys: "alt+right", description: "Expand or collapse selected agent subagents" },
 	"app.tree.foldOrUp": {
 		defaultKeys: ["ctrl+left", "alt+left"],
 		description: "Fold tree branch or move up",
@@ -275,7 +261,6 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	suspend: "app.suspend",
 	selectModel: "app.model.select",
 	expandTools: "app.tools.expand",
-	toggleThinking: "app.thinking.toggle",
 	focusSubagents: "app.subagents.focus",
 	externalEditor: "app.editor.external",
 	followUp: "app.message.followUp",

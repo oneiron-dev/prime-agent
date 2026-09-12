@@ -21,6 +21,16 @@ const killCommand = { id: "command-1", type: "kill", activeSessionId: "root" } a
 const worker = { descriptor: { workerId: "worker-1", pid: process.pid } };
 
 describe("daemon supervisor bounded root kill", () => {
+	it("does not wait for an unresolved recovery before the bounded kill request", async () => {
+		const supervisor = makeSupervisor();
+		Reflect.deleteProperty(supervisor, "forwardToWorker");
+		const request = vi.fn(async () => ({ type: "response", command: "kill", success: true }));
+		Reflect.set(supervisor, "requireAvailableWorkerClient", () => ({ request }));
+		const recovering = { ...worker, recovery: new Promise<void>(() => {}) };
+		await expect(supervisor.stopKilledRootWorker(recovering, killCommand)).resolves.toMatchObject({ success: true });
+		expect(request).toHaveBeenCalledWith({ type: "kill", activeSessionId: "root" }, WORKER_KILL_ACK_TIMEOUT_MS);
+		expect(supervisor.stopWorker).toHaveBeenCalledOnce();
+	});
 	it("forwards the kill behind a bounded ack timeout instead of the 24h worker timeout", async () => {
 		const supervisor = makeSupervisor();
 		await supervisor.stopKilledRootWorker(worker, killCommand);

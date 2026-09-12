@@ -143,7 +143,9 @@ describe("AgentSession remote Responses compaction", () => {
 			const entry = latestCompaction(harness);
 			expect(entry.mechanism).toBe("remote");
 			expect(entry.remoteCompaction?.version).toBe(1);
-			expect(harness.sessionManager.buildSessionContext().messages[0]?.role).toBe("openaiResponsesCompaction");
+			const messages = harness.sessionManager.buildSessionContext().messages;
+			expect(messages[0]).toMatchObject({ role: "custom", customType: "harness_digest" });
+			expect(messages[1]?.role).toBe("openaiResponsesCompaction");
 			expect(harness.eventsOfType("compaction_end").at(-1)?.result?.mechanism).toBeUndefined();
 		} finally {
 			harness.cleanup();

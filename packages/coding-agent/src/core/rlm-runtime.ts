@@ -6,11 +6,24 @@ import type { HostRequestHandler } from "./kernel/index.js";
 import type { ChildKernelCacheCleanupResult } from "./session-file-actions.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
 
-/** Request emitted by `rlm.run`; cellSourceCode preserves the spawning cell for display. */
+/** Request emitted by `rlm.spawn`; cellSourceCode preserves the spawning cell for display. */
 export interface RlmRunRequest {
 	prompt: string;
 	kwargs: Record<string, unknown>;
 	cellSourceCode?: string;
+}
+
+interface RlmCreateSessionRequest {
+	prompt: string;
+	kwargs: Record<string, unknown>;
+}
+
+export interface RlmCreateSessionResult {
+	active_session_id: string;
+	session_id: string;
+	name: string;
+	session_file: string;
+	model: string;
 }
 
 export interface RlmSpawnHandle {
@@ -54,6 +67,22 @@ export interface RlmFindModelsResult {
 }
 
 export type RlmRunHandler = (request: RlmRunRequest) => Promise<Record<string, unknown>>;
+type RlmCreateSessionHandler = (request: RlmCreateSessionRequest) => Promise<RlmCreateSessionResult>;
+
+interface AsyncBashCompletionRequest {
+	pid: number;
+	command: string;
+	exitCode: number;
+}
+
+type AsyncBashCompletionHandler = (request: AsyncBashCompletionRequest) => void | Promise<void>;
+
+interface AsyncBashConsumedRequest {
+	pid: number;
+	command: string;
+}
+
+type AsyncBashConsumedHandler = (request: AsyncBashConsumedRequest) => void | Promise<void>;
 export type RlmListSubagentsHandler = () => RlmListSubagentsResult | Promise<RlmListSubagentsResult>;
 export type RlmDeleteSubagentHandler = (target: string) => Promise<RlmDeleteSubagentResult>;
 export type RlmFindModelsHandler = (query: string, limit: number) => RlmFindModelsResult | Promise<RlmFindModelsResult>;
@@ -62,25 +91,22 @@ const RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH = 64;
 export const DEFAULT_RLM_MODEL_SEARCH_LIMIT = 8;
 export const MAX_RLM_MODEL_SEARCH_LIMIT = 20;
 
-/** Validate and normalize an orchestrator-supplied subagent session name. */
-export function normalizeRequestedRlmSubagentSessionName(value: unknown): string | undefined {
+export function normalizeRequestedRlmSubagentSessionName(value: unknown, operation = "rlm.spawn"): string | undefined {
 	if (value === undefined) {
 		return undefined;
 	}
 	if (typeof value !== "string") {
-		throw new Error("rlm.run name must be a string");
+		throw new Error(`${operation} name must be a string`);
 	}
 	const name = value.trim();
 	if (!name) {
-		throw new Error("rlm.run name must not be empty");
+		throw new Error(`${operation} name must not be empty`);
 	}
 	if (name.length > RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH) {
-		throw new Error(`rlm.run name must be at most ${RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH} characters`);
+		throw new Error(`${operation} name must be at most ${RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH} characters`);
 	}
 	return name;
 }
-
-const RLM_REASONING_LEVEL_ERROR = "rlm.run reasoning must be a Prime ThinkingLevel string";
 
 /**
  * Strictly validate an explicit reasoning level. Levels are exact-match only: no
@@ -92,18 +118,23 @@ const RLM_REASONING_LEVEL_ERROR = "rlm.run reasoning must be a Prime ThinkingLev
 function normalizeRequestedRlmSubagentLevel(
 	value: unknown,
 	kwarg: "reasoning" | "thinking",
+	operation = "rlm.spawn",
 ): ThinkingLevel | undefined {
 	if (value === undefined) {
 		return undefined;
 	}
 	if (typeof value !== "string") {
-		throw new Error(kwarg === "thinking" ? "rlm.run thinking must be a string" : RLM_REASONING_LEVEL_ERROR);
+		throw new Error(
+			kwarg === "thinking"
+				? `${operation} thinking must be a string`
+				: `${operation} reasoning must be a Prime ThinkingLevel string`,
+		);
 	}
 	if (!THINKING_LEVELS.includes(value as ThinkingLevel)) {
 		throw new Error(
 			kwarg === "thinking"
-				? `rlm.run thinking must be one of: ${THINKING_LEVELS.join(", ")}`
-				: RLM_REASONING_LEVEL_ERROR,
+				? `${operation} thinking must be one of: ${THINKING_LEVELS.join(", ")}`
+				: `${operation} reasoning must be a Prime ThinkingLevel string`,
 		);
 	}
 	return value as ThinkingLevel;
@@ -115,8 +146,11 @@ export function normalizeRequestedRlmSubagentReasoning(value: unknown): Thinking
 }
 
 /** Validate the upstream `thinking=` spelling of the same override. */
-export function normalizeRequestedRlmSubagentThinkingLevel(value: unknown): ThinkingLevel | undefined {
-	return normalizeRequestedRlmSubagentLevel(value, "thinking");
+export function normalizeRequestedRlmSubagentThinkingLevel(
+	value: unknown,
+	operation = "rlm.spawn",
+): ThinkingLevel | undefined {
+	return normalizeRequestedRlmSubagentLevel(value, "thinking", operation);
 }
 
 export interface RequestedRlmSubagentThinkingLevel {
@@ -138,7 +172,7 @@ export function resolveRequestedRlmSubagentThinkingLevel(
 	const thinking = normalizeRequestedRlmSubagentThinkingLevel(rawThinking);
 	if (reasoning !== undefined && thinking !== undefined && reasoning !== thinking) {
 		throw new Error(
-			`rlm.run reasoning "${reasoning}" conflicts with thinking "${thinking}"; pass only one of reasoning/thinking`,
+			`rlm.spawn reasoning "${reasoning}" conflicts with thinking "${thinking}"; pass only one of reasoning/thinking`,
 		);
 	}
 	if (reasoning !== undefined) return { level: reasoning, kwarg: "reasoning" };
@@ -156,16 +190,16 @@ export function formatUnsupportedRlmSubagentThinkingLevelError(
 	return `${subject} "${requested.level}" is not supported by model "${modelSelector}"; supported levels: ${supported.join(", ")}`;
 }
 
-export function normalizeRequestedRlmSubagentModel(value: unknown): string | undefined {
+export function normalizeRequestedRlmSubagentModel(value: unknown, operation = "rlm.spawn"): string | undefined {
 	if (value === undefined) {
 		return undefined;
 	}
 	if (typeof value !== "string") {
-		throw new Error("rlm.run model must be a string");
+		throw new Error(`${operation} model must be a string`);
 	}
 	const model = value.trim();
 	if (!model) {
-		throw new Error("rlm.run model must not be empty");
+		throw new Error(`${operation} model must not be empty`);
 	}
 	return model;
 }
@@ -227,11 +261,22 @@ export function findRlmModelMatches(query: string, models: Model<Api>[], limit: 
 		}));
 }
 
+export function createRlmCreateSessionHostHandler(handler: RlmCreateSessionHandler): HostRequestHandler {
+	return async (payload) => {
+		if (typeof payload.prompt !== "string") {
+			throw new Error("rlm.create_session prompt must be a string");
+		}
+		const kwargs = isRecord(payload.kwargs) ? payload.kwargs : {};
+		const result = await handler({ prompt: payload.prompt, kwargs });
+		return result as unknown as Record<string, unknown>;
+	};
+}
+
 /** Adapt an RlmRunHandler into the typed `rlm.run` kernel host handler. */
 export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHandler {
 	return async (payload) => {
 		if (typeof payload.prompt !== "string") {
-			throw new Error("rlm.run prompt must be a string");
+			throw new Error("rlm.spawn prompt must be a string");
 		}
 		const kwargs = isRecord(payload.kwargs) ? payload.kwargs : {};
 		const cellSourceCode = typeof payload.cellSourceCode === "string" ? payload.cellSourceCode : undefined;
@@ -241,6 +286,39 @@ export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHand
 			cellSourceCode,
 		});
 		return result as unknown as Record<string, unknown>;
+	};
+}
+
+/** Adapt detached kernel bash completions into a validated host notification. */
+export function createAsyncBashCompletionHostHandler(handler: AsyncBashCompletionHandler): HostRequestHandler {
+	return async (payload) => {
+		const { pid, command, exitCode } = payload;
+		if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+			throw new Error("bash.completed pid must be a positive integer");
+		}
+		if (typeof command !== "string" || !command) {
+			throw new Error("bash.completed command must be a non-empty string");
+		}
+		if (typeof exitCode !== "number" || !Number.isInteger(exitCode)) {
+			throw new Error("bash.completed exitCode must be an integer");
+		}
+		await handler({ pid, command, exitCode });
+		return {};
+	};
+}
+
+/** The kernel read a finished command's result, so its completion notice is stale. */
+export function createAsyncBashConsumedHostHandler(handler: AsyncBashConsumedHandler): HostRequestHandler {
+	return async (payload) => {
+		const { pid, command } = payload;
+		if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+			throw new Error("bash.consumed pid must be a positive integer");
+		}
+		if (typeof command !== "string" || !command) {
+			throw new Error("bash.consumed command must be a non-empty string");
+		}
+		await handler({ pid, command });
+		return {};
 	};
 }
 
@@ -307,8 +385,17 @@ export interface CreateRlmSubagentRuntimeOptions {
 	onSessionPublished?: (session: AgentSession) => void;
 }
 
+export interface CreateRlmRootSessionOptions {
+	prompt: string;
+	sessionName?: string;
+	cwd: string;
+	model: Model<Api>;
+	thinkingLevel: ThinkingLevel;
+}
+
 export interface SubagentRuntimeHost {
 	createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime>;
+	createRlmRootSession?(options: CreateRlmRootSessionOptions): Promise<RlmCreateSessionResult>;
 	/** Persist host-owned completion before the child becomes passivation-eligible. */
 	completeRlmSubagentRuntime?(childId: string, session: AgentSession): boolean;
 	/** Release a host-owned child after its detached initial task settles. */

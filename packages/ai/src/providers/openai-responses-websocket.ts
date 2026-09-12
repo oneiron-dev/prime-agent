@@ -395,7 +395,12 @@ async function* events(socket: Socket, signal?: AbortSignal, send?: () => void):
 				if (!text) return;
 				const parsed = JSON.parse(text) as ResponseStreamEvent;
 				queue.push(parsed);
-				if (parsed.type === "response.completed" || parsed.type === "response.failed" || parsed.type === "error") {
+				if (
+					parsed.type === "response.completed" ||
+					parsed.type === "response.failed" ||
+					parsed.type === "response.incomplete" ||
+					parsed.type === "error"
+				) {
 					completed = true;
 					done = true;
 				}

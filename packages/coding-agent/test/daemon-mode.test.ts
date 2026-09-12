@@ -1,16 +1,21 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
+	appendFileSync,
 	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -24,7 +29,11 @@ import {
 	DEFAULT_AGENT_MESSAGE_MAX_CHARS,
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
-import type { AgentObserveController } from "../src/core/agent-observe.js";
+import {
+	AGENT_OBSERVE_PREVIEW_MAX_CHARS,
+	type AgentObserveController,
+	type AgentObserveListResult,
+} from "../src/core/agent-observe.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
@@ -44,6 +53,7 @@ import {
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { serializeDaemonError } from "../src/modes/daemon/daemon-errors.js";
 import {
 	AgentDaemon,
@@ -57,6 +67,7 @@ import {
 } from "../src/modes/daemon/daemon-mode.js";
 import {
 	createDaemonCommandEnvelope,
+	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
@@ -70,8 +81,25 @@ import { StableFollowUpTargetError } from "../src/modes/daemon/daemon-stable-tar
 import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
+import * as themeModule from "../src/modes/interactive/theme/theme.js";
 
 describe("daemon mode helpers", () => {
+	it("initializes the headless theme for hosted extensions", () => {
+		const initSpy = vi.spyOn(themeModule, "initTheme");
+		try {
+			new AgentDaemon("/tmp/unused-daemon.sock", {
+				defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+				createRuntime: vi.fn(),
+			});
+			// Extensions receive this proxy via ctx.ui.theme; the watcher stays off in the headless worker.
+			expect(initSpy).toHaveBeenCalledOnce();
+			expect(initSpy.mock.calls[0]?.[1]).toBe(false);
+			expect(() => themeModule.theme.fg("dim", "worker")).not.toThrow();
+		} finally {
+			initSpy.mockRestore();
+		}
+	});
+
 	it("preserves envelope client identity while registering prompt admission", () => {
 		const daemon = new AgentDaemon("/tmp/unused-daemon.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
@@ -864,8 +892,9 @@ describe("daemon mode helpers", () => {
 			target: { activeSessionId: subagentState.activeSessionId, runtimeKind: "subagent" },
 		});
 		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain(`To: ${defaultSubagentName}, active child`);
-		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain("report current progress");
+		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toBe(
+			"[agent-message from sibling:Parent]\n\nreport current progress",
+		);
 	});
 
 	it("closes a hosted child through the release hook and persists cancellation", async () => {
@@ -1025,10 +1054,10 @@ describe("daemon mode helpers", () => {
 
 			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry.childId)).toContain("child-1");
 			expect((await internals.findPassiveRlmSubagent("real-worker"))?.entry.childId).toBe("child-1");
-			const roster = await internals.createAgentMessageController(() => parentState).roster?.();
-			const passiveRosterEntry = roster?.entries.find((entry) => entry.name === "real-worker");
-			expect(passiveRosterEntry).toMatchObject({ relationship: "child", status: "inactive" });
-			expect(passiveRosterEntry).not.toHaveProperty("repliedSinceTask");
+			const family = await internals.createAgentMessageController(() => parentState).family?.();
+			const passiveMember = family?.find((member) => member.entry.name === "real-worker");
+			expect(passiveMember).toMatchObject({ relationship: "child", entry: { status: "inactive" } });
+			expect(passiveMember?.entry).not.toHaveProperty("repliedSinceTask");
 			const listed = await internals.buildSessionListWithPassiveRlmSubagents(
 				[parentState],
 				await SessionManager.listAll(undefined, sessionDir),
@@ -1137,9 +1166,12 @@ describe("daemon mode helpers", () => {
 			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry)).toContainEqual(
 				expect.objectContaining({ childId: fixture.childId, status: "running" }),
 			);
-			await expect(internals.createAgentMessageController(() => parentState).roster?.()).resolves.toMatchObject({
-				entries: [expect.objectContaining({ relationship: "child", name: "renamed-worker" })],
-			});
+			await expect(internals.createAgentMessageController(() => parentState).family?.()).resolves.toEqual([
+				expect.objectContaining({
+					relationship: "child",
+					entry: expect.objectContaining({ name: "renamed-worker" }),
+				}),
+			]);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -1774,6 +1806,305 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it.each([
+		{
+			label: "parent-only runtime key",
+			provider: "prime-inference",
+			configuredProvider: "prime-inference",
+			runtimeKey: "parent-runtime-key",
+			envKey: undefined,
+			stale: false,
+		},
+		{
+			label: "parent environment key and selected team",
+			provider: "prime-inference",
+			configuredProvider: "prime-inference",
+			runtimeKey: undefined,
+			envKey: "parent-env-key",
+			stale: false,
+		},
+		{
+			label: "selected provider alias precedence",
+			provider: "anthropic",
+			configuredProvider: "prime-inference",
+			runtimeKey: "parent-runtime-key",
+			envKey: "parent-env-key",
+			stale: false,
+		},
+		{
+			label: "resolved provider switch",
+			provider: "openai",
+			configuredProvider: "prime-inference",
+			runtimeKey: "parent-runtime-key",
+			envKey: "parent-env-key",
+			stale: false,
+		},
+		{
+			label: "stale runtime key after parent provider switch",
+			provider: "prime-inference",
+			configuredProvider: "openai",
+			runtimeKey: "parent-runtime-key",
+			envKey: "parent-env-key",
+			stale: false,
+		},
+		{
+			label: "rejected runtime credential",
+			provider: "prime-inference",
+			configuredProvider: "prime-inference",
+			runtimeKey: "parent-runtime-key",
+			envKey: undefined,
+			stale: true,
+		},
+		{
+			label: "rejected environment credential",
+			provider: "prime-inference",
+			configuredProvider: "prime-inference",
+			runtimeKey: undefined,
+			envKey: "parent-env-key",
+			stale: true,
+		},
+	])(
+		"creates and prompts a resident depth-0 session with $label",
+		async ({ provider, configuredProvider, runtimeKey, envKey, stale }) => {
+			const tempDir = mkdtempSync(join(tmpdir(), "pa-root-session-"));
+			const socketPath = join(tempDir, "supervisor.sock");
+			const commands: Array<Record<string, unknown>> = [];
+			const server: Server = createServer((socket) => {
+				socket.on("error", () => undefined);
+				socket.write(
+					`${JSON.stringify({
+						type: "daemon_hello",
+						socketPath,
+						protocol: DAEMON_PROTOCOL_INFO,
+						schemaId: DAEMON_SCHEMA_ID,
+						schemaRevision: DAEMON_SCHEMA_REVISION,
+						clientId: "supervisor",
+						serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+					})}
+`,
+				);
+				let buffer = "";
+				socket.on("data", (chunk) => {
+					buffer += chunk.toString();
+					for (;;) {
+						const newline = buffer.indexOf("\n");
+						if (newline === -1) return;
+						const wire = JSON.parse(buffer.slice(0, newline)) as {
+							id: string;
+							command?: Record<string, unknown>;
+							type?: string;
+						};
+						buffer = buffer.slice(newline + 1);
+						const command = wire.command ?? wire;
+						commands.push(command);
+						const type = command.type as string;
+						const data =
+							type === "create"
+								? {
+										id: "new-root-active",
+										activeSessionId: "new-root-active",
+										sessionId: "new-root-session",
+										sessionFile: join(tempDir, "new-root-session.jsonl"),
+										sessionName: "researcher",
+										cwd: join(tempDir, "project"),
+										rlmDepth: 0,
+									}
+								: undefined;
+						socket.write(
+							`${JSON.stringify({ type: "response", id: wire.id, command: type, success: true, data })}
+`,
+						);
+					}
+				});
+			});
+			const previousSupervisorSocket = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			try {
+				await new Promise<void>((resolveListen) => server.listen(socketPath, resolveListen));
+				process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+				vi.stubEnv("PRIME_API_KEY", envKey);
+				vi.stubEnv("PRIME_TEAM_ID", "parent-team");
+				vi.stubEnv("OPENAI_API_KEY", "unrelated-provider-key");
+				vi.stubEnv("ANTHROPIC_OAUTH_TOKEN", "selected-anthropic-token");
+				vi.stubEnv("ANTHROPIC_API_KEY", "lower-priority-anthropic-key");
+				vi.stubEnv("UNRELATED_SECRET", "unrelated-secret");
+				vi.stubEnv("PATH", `/parent/toolchain:${process.env.PATH}`);
+				const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+					defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+					createRuntime: vi.fn(),
+					worker: { authenticationToken: "worker-token" },
+				});
+				const authStorage = AuthStorage.inMemory(
+					{},
+					{ usePrimeCliConfig: true, primeCliConfigPath: join(tempDir, "prime-config.json") },
+				);
+				if (runtimeKey) authStorage.setRuntimeApiKey(configuredProvider, runtimeKey);
+				if (stale) expect(authStorage.markAuthStale("prime-inference")).toBe(true);
+				const parent = makeState("parent-root");
+				parent.runtime = {
+					...parent.runtime,
+					runtimeConfig: {
+						sessionDir: join(tempDir, "sessions"),
+						telemetryDisabled: true,
+						provider: configuredProvider,
+						apiKey: runtimeKey,
+					},
+					session: { model: { provider: "prime-inference", id: "parent-model" } },
+					services: { agentDir: join(tempDir, "agent"), authStorage },
+				} as ActiveSessionState["runtime"];
+				const createHost = (
+					daemon as unknown as { createSubagentRuntimeHost(state: ActiveSessionState): SubagentRuntimeHost }
+				).createSubagentRuntimeHost.bind(daemon);
+				const host = createHost(parent);
+				const result = await host.createRlmRootSession?.({
+					prompt: "investigate independently",
+					sessionName: "researcher",
+					cwd: join(tempDir, "project"),
+					model: { provider, id: "model" } as Model<Api>,
+					thinkingLevel: "high",
+				});
+
+				expect(result).toEqual({
+					active_session_id: "new-root-active",
+					session_id: "new-root-session",
+					name: "researcher",
+					session_file: join(tempDir, "new-root-session.jsonl"),
+					model: `${provider}/model`,
+				});
+				expect(commands.filter((command) => command.type !== "ack_result")).toEqual([
+					expect.objectContaining({
+						type: "create",
+						lifecycle: "resident",
+						name: "researcher",
+						config: expect.objectContaining({
+							cwd: join(tempDir, "project"),
+							agentDir: join(tempDir, "agent"),
+							sessionDir: join(tempDir, "sessions"),
+							provider,
+							model: "model",
+							thinking: "high",
+							telemetryDisabled: true,
+						}),
+					}),
+					expect.objectContaining({
+						type: "prompt",
+						activeSessionId: "new-root-active",
+						message: "investigate independently",
+						source: "rpc",
+					}),
+				]);
+				const createCommand = commands.find((command) => command.type === "create");
+				expect(createCommand).toBeDefined();
+				expect((createCommand?.launchEnv as Record<string, string> | undefined)?.PATH).toBe(process.env.PATH);
+				const config = createCommand?.config as Record<string, unknown>;
+				expect(config.apiKey).toBe(
+					provider === "prime-inference" && provider === configuredProvider && !stale ? runtimeKey : undefined,
+				);
+				expect(createCommand?.launchEnv).toEqual({
+					PATH: process.env.PATH,
+					...(provider === "openai" ? { OPENAI_API_KEY: "unrelated-provider-key" } : {}),
+					...(provider === "anthropic" ? { ANTHROPIC_OAUTH_TOKEN: "selected-anthropic-token" } : {}),
+					...(provider === "prime-inference"
+						? {
+								...(envKey && !stale && !(runtimeKey && configuredProvider === provider)
+									? { PRIME_API_KEY: envKey }
+									: {}),
+								PRIME_TEAM_ID: "parent-team",
+							}
+						: {}),
+				});
+				if (provider === "prime-inference") {
+					const childAuth = AuthStorage.inMemory(
+						{},
+						{ usePrimeCliConfig: true, primeCliConfigPath: join(tempDir, "prime-config.json") },
+					);
+					vi.stubEnv("PRIME_TEAM_ID", (createCommand?.launchEnv as Record<string, string>).PRIME_TEAM_ID);
+					expect(childAuth.getProviderHeaders(provider)).toEqual({ "X-Prime-Team-ID": "parent-team" });
+				}
+			} finally {
+				vi.unstubAllEnvs();
+				if (previousSupervisorSocket === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+				else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSupervisorSocket;
+				await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("does not prompt or guess a cleanup target after a create response timeout", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-root-timeout-"));
+		const socketPath = join(tempDir, "supervisor.sock");
+		const commands: Array<Record<string, unknown>> = [];
+		const server = createServer((socket) => {
+			socket.on("error", () => {});
+			socket.write(
+				`${JSON.stringify({
+					type: "daemon_hello",
+					socketPath,
+					protocol: DAEMON_PROTOCOL_INFO,
+					schemaId: DAEMON_SCHEMA_ID,
+					schemaRevision: DAEMON_SCHEMA_REVISION,
+					clientId: "supervisor",
+					serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+				})}\n`,
+			);
+			let buffer = "";
+			socket.on("data", (chunk) => {
+				buffer += chunk.toString();
+				for (;;) {
+					const newline = buffer.indexOf("\n");
+					if (newline === -1) break;
+					const wire = JSON.parse(buffer.slice(0, newline));
+					buffer = buffer.slice(newline + 1);
+					commands.push(wire.command ?? wire);
+				}
+			});
+		});
+		const request = DaemonClient.prototype.request;
+		const requestSpy = vi.spyOn(DaemonClient.prototype, "request").mockImplementation(function (
+			this: DaemonClient,
+			command,
+			timeout,
+			options,
+		) {
+			return request.call(this, command, command.type === "create" ? 20 : timeout, options);
+		});
+		const previousSocket = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		try {
+			await new Promise<void>((resolveListen) => server.listen(socketPath, resolveListen));
+			process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+			const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "worker-token" },
+			});
+			const parent = makeState("parent-root");
+			parent.runtime = {
+				...parent.runtime,
+				session: { model: { provider: "prime-inference", id: "parent-model" } },
+				services: { agentDir: tempDir, authStorage: AuthStorage.inMemory() },
+			} as ActiveSessionState["runtime"];
+			const host = (
+				daemon as unknown as { createSubagentRuntimeHost(state: ActiveSessionState): SubagentRuntimeHost }
+			).createSubagentRuntimeHost(parent);
+			await expect(
+				host.createRlmRootSession?.({
+					prompt: "do not run without create acknowledgement",
+					cwd: tempDir,
+					model: { provider: "prime-inference", id: "model" } as Model<Api>,
+					thinkingLevel: "off",
+				}),
+			).rejects.toThrow('response to "create"');
+			expect(commands.map((command) => command.type)).toEqual(["create"]);
+			expect(commands[0]).toMatchObject({ lifecycle: "resident" });
+		} finally {
+			requestSpy.mockRestore();
+			if (previousSocket === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocket;
+			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("lists and role-addresses root siblings hosted by another worker", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -1832,15 +2163,18 @@ describe("daemon mode helpers", () => {
 		);
 		const listAll = vi.spyOn(SessionManager, "listAll").mockResolvedValue([]);
 		try {
-			const handlers = createAgentMessageHostHandlers(internals.createAgentMessageController(() => source));
-			const roster = await handlers["agent_message.list_agents"]!({});
-			expect(roster.current).toMatchObject({ name: "Source", id: "session-source", depth: 0 });
-			expect(roster.entries).toContainEqual({
+			const controller = internals.createAgentMessageController(() => source);
+			const handlers = createAgentMessageHostHandlers({ ...controller, family: async () => controller.family!() });
+			await expect(controller.family!()).resolves.toContainEqual({
 				relationship: "sibling",
-				name: "Remote",
-				id: "session-remote",
-				depth: 0,
-				status: "idle",
+				entry: {
+					id: "session-remote",
+					name: "Remote",
+					depth: 0,
+					status: "idle",
+					cwd: "/tmp/remote",
+					activeSessionId: remoteSelector,
+				},
 			});
 			await expect(
 				handlers["agent_message.send"]!({
@@ -2771,6 +3105,99 @@ describe("daemon mode helpers", () => {
 		expect((await internals.createAgentObserveListResult(targetState)).current.status).toBe("compacting");
 	});
 
+	it("lists inactive family members in the agent-observe roster", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const currentState = makeState("current");
+		currentState.runtime = {
+			...currentState.runtime,
+			cwd: "/tmp",
+			diagnostics: [],
+			modelFallbackMessage: undefined,
+			session: {
+				sessionId: "session-current",
+				sessionName: "Current",
+				sessionFile: "/tmp/current.jsonl",
+				sessionManager: { getCwd: () => "/tmp" },
+				isStreaming: false,
+				isCompacting: false,
+				isSessionActive: false,
+				unfinishedActionCount: 0,
+				getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+				messages: [],
+				state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+				hasRunningRlmChildren: () => false,
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAgentFamilyCatalog: ReturnType<typeof vi.fn>;
+			createAgentObserveListResult(current: ActiveSessionState): Promise<AgentObserveListResult>;
+		};
+		internals.sessions.set(currentState.activeSessionId, currentState);
+		internals.createAgentFamilyCatalog = vi.fn(async () => [
+			{ id: "session-current", name: "Current", depth: 0, status: "running", sessionPath: "/tmp/current.jsonl" },
+			{
+				id: "session-archived",
+				name: "archivist",
+				depth: 0,
+				status: "inactive",
+				sessionPath: "/tmp/archivist.jsonl",
+				cwd: "/tmp/archivist",
+				messageCount: 3,
+				firstMessage: "x".repeat(1000),
+			},
+			{
+				id: "session-remote",
+				name: "peer",
+				depth: 0,
+				status: "running",
+				sessionPath: "/tmp/peer.jsonl",
+				cwd: "/tmp/peer",
+				activeSessionId: "remote-active",
+			},
+		]);
+
+		const listed = await internals.createAgentObserveListResult(currentState);
+		expect(listed.agents).toEqual([
+			{
+				relationship: "sibling",
+				sessionId: "session-archived",
+				sessionName: "archivist",
+				runtimeKind: "top-level",
+				cwd: "/tmp/archivist",
+				status: "inactive",
+				isCurrent: false,
+				isStreaming: false,
+				isCompacting: false,
+				attachedClients: 0,
+				messageCount: 3,
+				queuedCount: 0,
+				isSessionActive: false,
+				firstMessage: "x".repeat(AGENT_OBSERVE_PREVIEW_MAX_CHARS),
+			},
+			{
+				activeSessionId: "remote-active",
+				relationship: "sibling",
+				sessionId: "session-remote",
+				sessionName: "peer",
+				runtimeKind: "top-level",
+				cwd: "/tmp/peer",
+				status: "running",
+				isCurrent: false,
+				isStreaming: false,
+				isCompacting: false,
+				attachedClients: 0,
+				queuedCount: 0,
+				isSessionActive: true,
+			},
+		]);
+	});
+
 	it("canonicalizes symlinked family paths before comparison", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-family-paths-"));
 		try {
@@ -3003,11 +3430,12 @@ describe("daemon mode helpers", () => {
 		const messaging = internals.createAgentMessageController(() => child);
 		const observe = internals.createAgentObserveController(() => child);
 
-		expect((await observe.listAgents()).agents.map((agent) => agent.activeSessionId)).toEqual([
-			"root",
-			"child",
-			"sibling",
-			"grandchild",
+		const observed = await observe.listAgents();
+		expect(observed.current.activeSessionId).toBe("child");
+		expect(observed.agents.map((agent) => [agent.relationship, agent.activeSessionId])).toEqual([
+			["parent", "root"],
+			["sibling", "sibling"],
+			["child", "grandchild"],
 		]);
 		await expect(observe.getAgent("cousin")).rejects.toThrow(
 			"Agent reach is limited to parent, siblings, and children",
@@ -3652,7 +4080,14 @@ describe("daemon mode helpers", () => {
 			client.transport = "private-framed";
 			const result = {
 				activeSessionId: state.activeSessionId,
-				snapshot: { summary: {}, state: {}, messages: [] },
+				snapshot: {
+					activeSessionId: state.activeSessionId,
+					summary: {},
+					state: {},
+					messages: [],
+					lastEventSequence: 0,
+					lastEventCursor: { generation: state.eventGeneration, sequence: 0 },
+				},
 				lastEventSequence: 0,
 			} as unknown as DaemonAttachResult;
 			const streamWorkerSnapshot = vi.fn(async () => undefined);
@@ -3719,9 +4154,12 @@ describe("daemon mode helpers", () => {
 			const result = {
 				activeSessionId: state.activeSessionId,
 				snapshot: {
+					activeSessionId: state.activeSessionId,
 					summary: {},
 					state: {},
 					messages: [{ role: "user", content: "x".repeat(4 * 1024 * 1024 + 1), timestamp: 0 }],
+					lastEventSequence: 0,
+					lastEventCursor: { generation: state.eventGeneration, sequence: 0 },
 				},
 				lastEventSequence: 0,
 			} as unknown as DaemonAttachResult;
@@ -4000,9 +4438,10 @@ describe("daemon mode helpers", () => {
 					const controller = options.sessionOptions?.agentMessageController;
 					const result = await controller?.listAgents();
 					expect(result?.current?.activeSessionId).toBeTruthy();
-					await expect(controller?.roster?.()).resolves.toMatchObject({
-						current: { id: session.sessionId },
-					});
+					// The catalog must resolve around the binding session, which is the selection
+					// origin and therefore never one of its own family members.
+					const family = await controller?.family?.();
+					expect(family?.some((member) => member.entry.id === session.sessionId)).toBe(false);
 					listedAgentsDuringBind++;
 				});
 				return {
@@ -4364,6 +4803,223 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	function makePassiveMemoHarness(tempDir: string) {
+		const fixture = makePersistedRlmDaemonFixture(tempDir);
+		const internals = fixture.daemon as unknown as {
+			createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+			listPassiveRlmSubagents(): Promise<
+				Array<{ entry: { childId: string; status: string }; info: { messageCount: number } }>
+			>;
+		};
+		return { fixture, internals };
+	}
+
+	const passiveMessageLine = (id: string, text: string) =>
+		`${JSON.stringify({
+			type: "message",
+			id,
+			parentId: null,
+			timestamp: "2026-01-01T00:00:02.000Z",
+			message: { role: "user", content: text, timestamp: 3 },
+		})}\n`;
+
+	it("memoizes the passive topology walk until a topology input changes", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-memo-"));
+		try {
+			const { fixture, internals } = makePassiveMemoHarness(tempDir);
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+
+			// The first walk seeds the ledger, so it never memoizes; the second is
+			// the first stable derivation and the third must reuse it.
+			await internals.listPassiveRlmSubagents();
+			const first = await internals.listPassiveRlmSubagents();
+			expect(first.map(({ entry }) => entry.childId)).toEqual(
+				expect.arrayContaining([fixture.childId, fixture.grandchildId]),
+			);
+			expect(await internals.listPassiveRlmSubagents()).toEqual(first);
+
+			// A child session append invalidates the memo and re-derives fresh infos.
+			appendFileSync(fixture.childSessionFile, passiveMessageLine("m2", "one more instruction"));
+			const third = await internals.listPassiveRlmSubagents();
+			expect(third).not.toBe(first);
+			expect(third.find(({ entry }) => entry.childId === fixture.childId)?.info.messageCount).toBe(2);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a rejecting topology walk request-scoped and retries on the next call", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-reject-"));
+		try {
+			const { fixture, internals } = makePassiveMemoHarness(tempDir);
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await internals.listPassiveRlmSubagents();
+
+			const ledgerDir = join(tempDir, "rlm-ledger");
+			const ledgerFile = readdirSync(ledgerDir).find((name) => name.endsWith(".jsonl"));
+			if (!ledgerFile) throw new Error("Missing spawn ledger file");
+			const ledgerPath = join(ledgerDir, ledgerFile);
+			const intact = readFileSync(ledgerPath, "utf8");
+			appendFileSync(ledgerPath, "not json\n");
+
+			// The walk rejects to its caller only; a discarded cleanup promise must
+			// not surface as an unhandled rejection (the daemon crashes on those).
+			await expect(internals.listPassiveRlmSubagents()).rejects.toThrow();
+
+			writeFileSync(ledgerPath, intact);
+			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry.childId)).toContain(
+				fixture.childId,
+			);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("re-lists a child whose session file returns after being absent", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-absent-"));
+		try {
+			const { fixture, internals } = makePassiveMemoHarness(tempDir);
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await internals.listPassiveRlmSubagents();
+
+			const asideFile = `${fixture.grandchildSessionFile}.aside`;
+			renameSync(fixture.grandchildSessionFile, asideFile);
+			const without = await internals.listPassiveRlmSubagents();
+			expect(without.map(({ entry }) => entry.childId)).not.toContain(fixture.grandchildId);
+			await internals.listPassiveRlmSubagents();
+
+			// An absent input is a stat identity too: the file reappearing must
+			// invalidate the memo even though no listed child changed.
+			renameSync(asideFile, fixture.grandchildSessionFile);
+			const restored = await internals.listPassiveRlmSubagents();
+			expect(restored.map(({ entry }) => entry.childId)).toContain(fixture.grandchildId);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("re-derives passive metadata when a child display record is rewritten", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-display-"));
+		try {
+			const { fixture, internals } = makePassiveMemoHarness(tempDir);
+			const display = {
+				type: "rlm_subagent" as const,
+				childId: fixture.childId,
+				sessionName: "spawn-worker",
+				sessionDir: fixture.childSessionDir,
+				sessionFile: fixture.childSessionFile,
+				rlmParentNodeId: fixture.childId,
+				status: "running" as const,
+				createdAt: 1,
+				updatedAt: "2026-01-01T00:00:00.000Z",
+			};
+			const displayPath = join(fixture.childSessionDir, "rlm-subagent.json");
+			writeFileSync(displayPath, `${JSON.stringify(display)}\n`);
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await internals.listPassiveRlmSubagents();
+			const running = await internals.listPassiveRlmSubagents();
+			expect(running.find(({ entry }) => entry.childId === fixture.childId)?.entry.status).toBe("running");
+
+			// A cross-process completion rewrites only the display record; the memo
+			// must treat it as a walk input and re-derive.
+			writeFileSync(displayPath, `${JSON.stringify({ ...display, status: "completed" })}\n`);
+			const completed = await internals.listPassiveRlmSubagents();
+			expect(completed.find(({ entry }) => entry.childId === fixture.childId)?.entry.status).toBe("completed");
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each(["display", "legacy"] as const)(
+		"retries a transient %s metadata read failure without a stat change",
+		async (source) => {
+			const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-read-retry-"));
+			const readFile = fsPromises.readFile;
+			let readSpy: ReturnType<typeof vi.spyOn> | undefined;
+			try {
+				const { fixture, internals } = makePassiveMemoHarness(tempDir);
+				await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+				// Seed the ledger before failing optional metadata reads.
+				await internals.listPassiveRlmSubagents();
+				const metadata = {
+					type: "rlm_subagent",
+					childId: fixture.childId,
+					sessionName: "spawn-worker",
+					sessionDir: fixture.childSessionDir,
+					sessionFile: fixture.childSessionFile,
+					rlmDepth: 1,
+					rlmMaxDepth: 7,
+					prompt: "recover the original task",
+					model: { provider: "test-provider", modelId: "test-model" },
+					status: "running",
+					createdAt: 1,
+					updatedAt: "2026-01-01T00:00:00.000Z",
+				};
+				const metadataPath =
+					source === "display"
+						? join(fixture.childSessionDir, "rlm-subagent.json")
+						: join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+				writeFileSync(metadataPath, `${JSON.stringify(metadata)}\n`);
+				const before = statSync(metadataPath);
+				let metadataReads = 0;
+				readSpy = vi.spyOn(fsPromises, "readFile").mockImplementation((...args) => {
+					if (
+						typeof args[0] === "string" &&
+						canonicalSessionPath(args[0]) === canonicalSessionPath(metadataPath) &&
+						++metadataReads === 1
+					) {
+						return Promise.reject(
+							Object.assign(new Error("transient metadata read failure"), { code: "EACCES" }),
+						);
+					}
+					return readFile(...args);
+				});
+				syncBuiltinESMExports();
+
+				const fallback = await internals.listPassiveRlmSubagents();
+				expect(fallback.find(({ entry }) => entry.childId === fixture.childId)?.entry.status).toBe("completed");
+				expect(metadataReads).toBe(1);
+				const recovered = await internals.listPassiveRlmSubagents();
+				expect(recovered.find(({ entry }) => entry.childId === fixture.childId)?.entry).toMatchObject({
+					prompt: metadata.prompt,
+					model: metadata.model,
+					rlmDepth: 1,
+					rlmMaxDepth: 7,
+					status: "running",
+				});
+				expect(metadataReads).toBe(2);
+				const after = statSync(metadataPath);
+				expect([after.size, after.mtimeMs, after.ino]).toEqual([before.size, before.mtimeMs, before.ino]);
+				expect(await internals.listPassiveRlmSubagents()).toEqual(recovered);
+				expect(metadataReads).toBe(2);
+			} finally {
+				readSpy?.mockRestore();
+				syncBuiltinESMExports();
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("keeps the memo across appends to a resident child's transcript", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-resident-append-"));
+		try {
+			const { fixture, internals } = makePassiveMemoHarness(tempDir);
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			await internals.listPassiveRlmSubagents();
+			const first = await internals.listPassiveRlmSubagents();
+			expect(first.map(({ entry }) => entry.childId)).toContain(fixture.grandchildId);
+			expect(first.map(({ entry }) => entry.childId)).not.toContain(fixture.childId);
+
+			// A resident child's identity comes from the roster, not its transcript:
+			// its streaming appends must not invalidate the passive memo.
+			appendFileSync(fixture.childSessionFile, passiveMessageLine("m9", "streamed while resident"));
+			expect(await internals.listPassiveRlmSubagents()).toEqual(first);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("cancels a detached subagent heartbeat when its parent is archived", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-archived-subagent-heartbeat-"));
 		try {
@@ -4496,25 +5152,25 @@ describe("daemon mode helpers", () => {
 				}
 			).createAgentObserveController(() => parentState);
 			const observedAgents = await observeController.listAgents();
-			expect(observedAgents.agents).toContainEqual(
-				expect.objectContaining({
-					activeSessionId: expect.any(String),
-					sessionName: "renamed-worker",
-					runtimeKind: "subagent",
-					status: "idle",
-					messageCount: 1,
-					rlmChildId: fixture.childId,
-				}),
-			);
+			const observedChild = observedAgents.agents.find((agent) => agent.sessionName === "renamed-worker");
+			expect(observedChild).toMatchObject({
+				relationship: "child",
+				runtimeKind: "subagent",
+				status: "inactive",
+				isSessionActive: false,
+				messageCount: 1,
+				rlmChildId: fixture.childId,
+			});
+			expect(observedChild).not.toHaveProperty("activeSessionId");
 			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 
 			const messageController = internals.createAgentMessageController(() => parentState);
-			await expect(messageController.roster?.()).resolves.toMatchObject({
-				current: { id: parentState.runtime.session.sessionId, depth: 0 },
-				entries: [
-					expect.objectContaining({ relationship: "child", name: "renamed-worker", depth: 1, status: "inactive" }),
-				],
-			});
+			await expect(messageController.family?.()).resolves.toEqual([
+				expect.objectContaining({
+					relationship: "child",
+					entry: expect.objectContaining({ name: "renamed-worker", depth: 1, status: "inactive" }),
+				}),
+			]);
 			await expect(
 				messageController.assertSessionNameAvailable?.({
 					name: "renamed-worker",
@@ -6717,6 +7373,52 @@ describe("daemon mode helpers", () => {
 			} else {
 				process.env[ENV_AGENT_DIR] = originalAgentDir;
 			}
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reconciles a stale display status on a tombstoned ledger edge (idempotent delete)", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-reconcile-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const host = internals.createSubagentRuntimeHost(parentState);
+			const displayPath = join(fixture.childSessionDir, "rlm-subagent.json");
+
+			// First delete: write the deletion tombstone to the display and
+			// append a delete record to the ledger.
+			await host.deleteRlmSubagentRuntime(fixture.childId);
+			expect(JSON.parse(readFileSync(displayPath, "utf8"))).toMatchObject({ status: "deleted" });
+
+			// Simulate a stale overwrite by a completion write that raced
+			// before the ledger tombstone was durable. The display now claims
+			// the child is running again.
+			writeFileSync(
+				displayPath,
+				`${JSON.stringify({
+					type: "rlm_subagent",
+					childId: fixture.childId,
+					sessionName: "stale",
+					sessionDir: fixture.childSessionDir,
+					sessionFile: fixture.childSessionFile,
+					status: "running",
+					createdAt: 1,
+					updatedAt: new Date().toISOString(),
+				})}\n`,
+			);
+
+			// Retry the delete: the tombstoned-edge path must reconcile the
+			// display back to "deleted" and sweep the artifact dir.
+			await host.deleteRlmSubagentRuntime(fixture.childId);
+
+			expect(JSON.parse(readFileSync(displayPath, "utf8"))).toMatchObject({ status: "deleted" });
+			expect(existsSync(fixture.childArtifactDir)).toBe(false);
+			expect(existsSync(fixture.childSessionFile)).toBe(true);
+		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});

@@ -6,13 +6,12 @@
  * disposing the underlying agent loop.
  */
 
-import { spawn } from "node:child_process";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
+import { type Api, findEnvKeys, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	appendRotatingLog,
@@ -27,8 +26,8 @@ import {
 	AGENT_FAMILY_REACH_ERROR,
 	AGENT_MESSAGE_SOURCE,
 	type AgentFamilyCatalogEntry,
+	type AgentFamilyMember,
 	type AgentFamilyRelationship,
-	type AgentFamilyRosterResult,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageDeliveryStatus,
@@ -42,7 +41,6 @@ import {
 	assertAgentFamilyReach,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
-	buildAgentFamilyRoster,
 	createAgentSessionMessage,
 	createAgentSessionMessageId,
 	createAgentSessionMessageReceipt,
@@ -52,9 +50,11 @@ import {
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS,
 	formatAgentSessionNameUnavailable,
 	normalizeAgentSessionMessage,
+	selectAgentFamily,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
 import {
+	AGENT_OBSERVE_PREVIEW_MAX_CHARS,
 	type AgentObserveAgentSnapshot,
 	type AgentObserveAgentSummary,
 	type AgentObserveController,
@@ -91,7 +91,13 @@ import {
 } from "../../core/cron-jobs.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
-import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
+import { providerRetryPolicy } from "../../core/provider-retry.js";
+import type {
+	CreateRlmRootSessionOptions,
+	CreateRlmSubagentRuntimeOptions,
+	RlmCreateSessionResult,
+	SubagentRuntimeHost,
+} from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
 	type IdleEvictionMinutes,
@@ -112,7 +118,10 @@ import {
 } from "../../core/session-manager.js";
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
+import { SettingsManager } from "../../core/settings-manager.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
+import { isProcessAlive, spawnHidden, waitForChildProcess } from "../../utils/child-process.js";
+import { tryAcquireDirLock } from "../../utils/dir-lock.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import {
 	createAgentConnectionCommands,
@@ -122,6 +131,7 @@ import {
 import { createAgentConnectionToolDefinition } from "../agent-connection/tool-definition.js";
 import type { AgentConnectionHeartbeat, AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
+import { initTheme } from "../interactive/theme/theme.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../session-worker/private-framing.js";
 import {
@@ -145,6 +155,7 @@ import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
 import {
+	collectDaemonLaunchEnv,
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
@@ -630,6 +641,11 @@ export class AgentDaemon {
 			throw new Error("Daemon config is missing agentDir");
 		}
 		this.agentDir = options.defaultSessionConfig.agentDir;
+		// Hosted extensions get ctx.ui.theme; init it headlessly (no TTY, watcher off) or their first access kills the worker.
+		initTheme(
+			SettingsManager.create(options.defaultSessionConfig.cwd ?? process.cwd(), this.agentDir).getTheme(),
+			false,
+		);
 		this.cronStore = options.worker
 			? AgentCronJobStore.forSessionArtifacts()
 			: new AgentCronJobStore(getCronJobsPath(this.agentDir));
@@ -888,41 +904,13 @@ export class AgentDaemon {
 		let ownsLock = false;
 		try {
 			for (let attempt = 0; attempt < 3 && !ownsLock; attempt++) {
-				const token = randomUUID();
-				const candidateDirectory = `${lockDirectory}.candidate-${process.pid}-${token}`;
-				mkdirSync(candidateDirectory, { mode: 0o700 });
-				writeFileSync(join(candidateDirectory, "pid"), `${process.pid}\n`, {
-					mode: 0o600,
-				});
-				try {
-					renameSync(candidateDirectory, lockDirectory);
-					ownsLock = true;
-					break;
-				} catch (error) {
-					rmSync(candidateDirectory, { recursive: true, force: true });
-					const code = (error as NodeJS.ErrnoException).code;
-					if (code !== "EEXIST" && code !== "ENOTEMPTY") {
-						throw error;
-					}
-					let ownerPid: number | undefined;
-					try {
-						ownerPid = Number(readFileSync(join(lockDirectory, "pid"), "utf8").trim());
-					} catch {
-						// An invalid owner is reclaimed atomically below.
-					}
-					if (ownerPid && this.isProcessAlive(ownerPid)) {
-						return;
-					}
-					const staleDirectory = `${lockDirectory}.stale-${process.pid}-${token}`;
-					try {
-						renameSync(lockDirectory, staleDirectory);
-						rmSync(staleDirectory, { recursive: true, force: true });
-					} catch (reclaimError) {
-						if ((reclaimError as NodeJS.ErrnoException).code !== "ENOENT") {
-							throw reclaimError;
-						}
-					}
+				const result = await tryAcquireDirLock(lockDirectory, (ownerPid) =>
+					ownerPid !== undefined ? isProcessAlive(ownerPid) : false,
+				);
+				if (result === "held") {
+					return;
 				}
+				ownsLock = result === "acquired";
 			}
 			if (!ownsLock) {
 				return;
@@ -943,21 +931,54 @@ export class AgentDaemon {
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
-			const child = spawn(launch.command, launch.args, {
+			const child = spawnHidden(launch.command, launch.args, {
 				cwd: this.options.defaultSessionConfig.cwd ?? process.cwd(),
 				detached: true,
 				env: environment,
 				stdio: "ignore",
 			});
+			const childExited = waitForChildProcess(child);
+			void childExited.catch(() => undefined);
 			child.unref();
 			const deadline = Date.now() + 10_000;
 			while (!this.shuttingDown && Date.now() < deadline) {
-				if (await this.canConnectToSupervisor(supervisorSocketPath)) {
-					this.log(`launched replacement supervisor on ${supervisorSocketPath}`);
+				if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+					await childExited;
+					return;
+				}
+				for (const [client, boundClaim] of this.supervisorClaims) {
+					const { claim } = boundClaim;
+					if (
+						claim.supervisorSocketPath !== supervisorSocketPath ||
+						!client.authenticated ||
+						client.socket.destroyed
+					)
+						continue;
+					try {
+						await this.assertSupervisorClaimCurrent(claim);
+					} catch {
+						continue;
+					}
+					if (
+						this.shuttingDown ||
+						Date.now() >= deadline ||
+						this.supervisorClaims.get(client) !== boundClaim ||
+						!client.authenticated ||
+						client.socket.destroyed
+					)
+						continue;
+					if (claim.supervisorPid === child.pid) {
+						this.log(`launched replacement supervisor on ${supervisorSocketPath}`);
+						return;
+					}
+					if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+					await waitForPromptAdmission(childExited, AbortSignal.timeout(Math.max(1, deadline - Date.now())));
+					this.log(`stopped losing replacement supervisor ${child.pid} on ${supervisorSocketPath}`);
 					return;
 				}
 				await delay(50);
 			}
+			this.log(`replacement supervisor ${child.pid} left running without a current authenticated supervisor`);
 		} catch (error) {
 			this.log(`failed to launch replacement supervisor: ${String(error)}`);
 		} finally {
@@ -965,15 +986,6 @@ export class AgentDaemon {
 				rmSync(lockDirectory, { recursive: true, force: true });
 			}
 			this.supervisorLaunchInProgress = false;
-		}
-	}
-
-	private isProcessAlive(pid: number): boolean {
-		try {
-			process.kill(pid, 0);
-			return true;
-		} catch (error) {
-			return (error as NodeJS.ErrnoException).code === "EPERM";
 		}
 	}
 
@@ -1060,9 +1072,11 @@ export class AgentDaemon {
 	private readLegacyRlmSubagentRegistry(
 		path: string,
 		throwOnReadError = false,
+		onReadError?: () => void,
 	): Promise<LegacyRlmSubagentRegistryEntry[]> {
 		return readLegacyRlmSubagentRegistryFile(path, {
 			throwOnReadError,
+			onReadError,
 			log: (message) => this.log(message),
 		});
 	}
@@ -1111,7 +1125,7 @@ export class AgentDaemon {
 			this.pendingRlmSpawnAppends.set(`${parentState.activeSessionId}#${input.childId}`, spawnAppend);
 		}
 		try {
-			writeRlmSubagentDisplayEntry({
+			const written = writeRlmSubagentDisplayEntry({
 				type: "rlm_subagent",
 				childId: input.childId,
 				sessionName: input.sessionName,
@@ -1122,7 +1136,10 @@ export class AgentDaemon {
 				createdAt: input.createdAt ?? Date.now(),
 				updatedAt: new Date().toISOString(),
 			});
-			return true;
+			if (!written) {
+				this.log(`skipped RLM subagent display entry for ${input.childId}: deleted tombstone exists`);
+			}
+			return written;
 		} catch (error) {
 			this.log(
 				`failed to persist RLM subagent display entry: ${error instanceof Error ? error.message : String(error)}`,
@@ -1154,8 +1171,28 @@ export class AgentDaemon {
 		} else if (edges.length > 0) {
 			// Only tombstoned edges: the tombstones are already durable, nothing
 			// to re-append. A prior deletion may have crashed before its artifact
-			// sweep, so retry it here.
+			// sweep. Restore the display tombstone before sweeping artifacts.
 			for (const tombstoned of edges) {
+				try {
+					const currentDisplay = await readRlmSubagentDisplayEntry(dirname(tombstoned.child));
+					if (!currentDisplay || currentDisplay.status !== "deleted") {
+						writeRlmSubagentDisplayEntry({
+							type: "rlm_subagent",
+							childId,
+							sessionName: currentDisplay?.sessionName ?? tombstoned.name,
+							sessionDir: dirname(tombstoned.child),
+							sessionFile: currentDisplay?.sessionFile ?? tombstoned.child,
+							...rlmSubagentMetadataFields(currentDisplay ?? {}),
+							status: "deleted",
+							createdAt: currentDisplay?.createdAt ?? 0,
+							updatedAt: new Date().toISOString(),
+						});
+					}
+				} catch {
+					// Best-effort: the ledger tombstone is the authority; the display
+					// file is display-grade and the sweep below will remove artifacts.
+					this.log(`failed to reconcile display entry for tombstoned RLM subagent ${childId}`);
+				}
 				await this.deleteRlmSubagentArtifacts(childId, tombstoned.child);
 			}
 			return;
@@ -1287,7 +1324,9 @@ export class AgentDaemon {
 				createdAt: source.createdAt,
 			};
 		};
-		const display = await readRlmSubagentDisplayEntry(dirname(edge.child));
+		const display = await readRlmSubagentDisplayEntry(dirname(edge.child), () => {
+			if (readHealth?.displayPresent) readHealth.degraded();
+		});
 		if (display && display.childId === edge.childId) {
 			// A display-file child was ledger-spawned: the edge depth is real.
 			return { ...metadataFields(display), rlmDepth: edge.depth };
@@ -1296,7 +1335,9 @@ export class AgentDaemon {
 		const registryPath = this.legacyRlmSubagentRegistryPath(parent.sessionFile, parent.sessionId);
 		let registryRead = legacyRegistryCache?.get(registryPath);
 		if (!registryRead) {
-			registryRead = this.readLegacyRlmSubagentRegistry(registryPath);
+			registryRead = this.readLegacyRlmSubagentRegistry(registryPath, false, () => {
+				if (readHealth?.legacyPresent) readHealth.degraded();
+			});
 			legacyRegistryCache?.set(registryPath, registryRead);
 		}
 		const legacy = (await registryRead).find((entry) => entry.childId === edge.childId);
@@ -2742,6 +2783,7 @@ export class AgentDaemon {
 	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
 		return {
 			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
+			createRlmRootSession: async (options) => this.createRlmRootSession(parentState, options),
 			completeRlmSubagentRuntime: (childId, session) => {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
@@ -2889,6 +2931,95 @@ export class AgentDaemon {
 				}
 			},
 		};
+	}
+
+	private async createRlmRootSession(
+		parentState: ActiveSessionState,
+		options: CreateRlmRootSessionOptions,
+	): Promise<RlmCreateSessionResult> {
+		const supervisorSocketPath = this.supervisorSocketPathFromEnv();
+		if (!this.options.worker || !supervisorSocketPath) {
+			throw new Error("rlm.create_session requires a daemon worker connected to its supervisor");
+		}
+
+		const client = new DaemonClient(supervisorSocketPath);
+		let activeSessionId: string | undefined;
+		try {
+			await client.connect(3000);
+			await client.waitForHello(3000);
+			const runtimeConfig = parentState.runtime.runtimeConfig;
+			const inheritsProvider = options.model.provider === parentState.runtime.session.model?.provider;
+			const authSource = parentState.runtime.services.authStorage.getAuthStatus(options.model.provider).source;
+			const apiKey =
+				inheritsProvider &&
+				authSource === "runtime" &&
+				(runtimeConfig?.provider ?? parentState.runtime.session.model?.provider) === options.model.provider
+					? runtimeConfig?.apiKey
+					: undefined;
+			const launchEnv = collectDaemonLaunchEnv({ PATH: process.env.PATH });
+			const envKey = authSource === "environment" ? findEnvKeys(options.model.provider)?.[0] : undefined;
+			if (envKey && process.env[envKey]) launchEnv[envKey] = process.env[envKey];
+			if (options.model.provider === "prime-inference" && process.env.PRIME_TEAM_ID !== undefined) {
+				launchEnv.PRIME_TEAM_ID = process.env.PRIME_TEAM_ID;
+			}
+			const createResponse = await client.request(
+				{
+					type: "create",
+					lifecycle: "resident",
+					launchEnv,
+					...(options.sessionName ? { name: options.sessionName } : {}),
+					config: {
+						cwd: options.cwd,
+						agentDir: parentState.runtime.services.agentDir,
+						...(runtimeConfig?.sessionDir ? { sessionDir: runtimeConfig.sessionDir } : {}),
+						provider: options.model.provider,
+						model: options.model.id,
+						...(apiKey ? { apiKey } : {}),
+						thinking: options.thinkingLevel,
+						...(runtimeConfig?.telemetryDisabled ? { telemetryDisabled: true as const } : {}),
+					},
+				},
+				120_000,
+			);
+			if (!createResponse.success) throw deserializeDaemonError(createResponse);
+			const summary = createResponse.data as Partial<SessionSummary> | undefined;
+			activeSessionId = summary?.activeSessionId ?? summary?.id;
+			if (
+				!activeSessionId ||
+				typeof summary?.sessionId !== "string" ||
+				!summary.sessionId ||
+				typeof summary.sessionFile !== "string" ||
+				!summary.sessionFile ||
+				(summary.rlmDepth !== undefined && summary.rlmDepth !== 0)
+			) {
+				throw new Error("Daemon supervisor returned an invalid depth-0 session summary");
+			}
+
+			const promptResponse = await client.request(
+				{
+					type: "prompt",
+					activeSessionId,
+					message: options.prompt,
+					source: "rpc",
+				},
+				30_000,
+			);
+			if (!promptResponse.success) throw deserializeDaemonError(promptResponse);
+			return {
+				active_session_id: activeSessionId,
+				session_id: summary.sessionId,
+				name: summary.sessionName ?? activeSessionId,
+				session_file: summary.sessionFile,
+				model: `${options.model.provider}/${options.model.id}`,
+			};
+		} catch (error) {
+			if (activeSessionId) {
+				await client.request({ type: "kill", activeSessionId }, 30_000).catch(() => undefined);
+			}
+			throw error;
+		} finally {
+			client.close();
+		}
 	}
 
 	private async createRlmSubagentRuntime(
@@ -3489,7 +3620,7 @@ export class AgentDaemon {
 		};
 		return {
 			listAgents: () => this.createAgentMessageListResult(requireCurrentState()),
-			roster: () => this.createAgentFamilyRoster(requireCurrentState()),
+			family: () => this.createAgentFamily(requireCurrentState()),
 			assertSessionNameAvailable: (input) => this.assertFamilySessionNameAvailable(input),
 			setSessionName: (name) => this.setStateSessionNameViaSupervisor(requireCurrentState(), name),
 			sendAgentMessage: (input) =>
@@ -3518,49 +3649,54 @@ export class AgentDaemon {
 	}
 
 	private async createAgentObserveListResult(currentState: ActiveSessionState): Promise<AgentObserveListResult> {
-		const agents = this.listTargetableSessionStates(currentState)
-			.filter(
-				(state) =>
-					state.activeSessionId === currentState.activeSessionId ||
-					this.isAgentFamilyReachable(currentState, state),
-			)
-			.map((state) => this.createAgentObserveSummary(state, currentState));
-		const residentIds = new Set(agents.map((agent) => agent.activeSessionId));
-		for (const passive of await this.listPassiveRlmSubagents()) {
-			if (residentIds.has(passive.info.id)) continue;
-			try {
-				assertAgentFamilyReach(this.agentFamilyEntry(currentState), this.passiveAgentFamilyEntry(passive));
-			} catch (error) {
-				if (error instanceof Error && error.message === AGENT_FAMILY_REACH_ERROR) continue;
-				throw error;
-			}
-			agents.push({
-				activeSessionId: passive.info.id,
-				sessionId: passive.info.id,
-				sessionName: passive.info.name ?? passive.entry.sessionName,
-				runtimeKind: "subagent",
-				cwd: passive.info.cwd,
-				status: "idle",
-				isCurrent: false,
-				isStreaming: false,
-				isCompacting: false,
-				attachedClients: 0,
-				messageCount: passive.info.messageCount,
-				queuedCount: 0,
-				isSessionActive: false,
-				...(passive.chain.length === 1 && passive.rootParentState
-					? { parentActiveSessionId: passive.rootParentState.activeSessionId }
-					: {}),
-				parentSessionId: passive.entry.parentSessionId,
-				rlmChildId: passive.entry.childId,
-				...(passive.entry.rlmParentNodeId ? { rlmParentNodeId: passive.entry.rlmParentNodeId } : {}),
-				...(passive.info.firstMessage ? { firstMessage: passive.info.firstMessage } : {}),
-			});
-			residentIds.add(passive.info.id);
-		}
+		const family = await this.createAgentFamily(currentState);
+		const residentBySessionId = new Map(
+			this.listTargetableSessionStates(currentState).map((state) => [state.runtime.session.sessionId, state]),
+		);
+		const agents = family.map((member) => {
+			const state = residentBySessionId.get(member.entry.id);
+			return state
+				? {
+						...this.createAgentObserveSummary(state, currentState),
+						relationship: member.relationship,
+						...(member.entry.repliedSinceTask !== undefined
+							? { repliedSinceTask: member.entry.repliedSinceTask }
+							: {}),
+					}
+				: this.createPersistedAgentObserveSummary(member);
+		});
 		return {
 			current: this.createAgentObserveSummary(currentState, currentState),
 			agents,
+		};
+	}
+
+	/**
+	 * Family member with no live session in this daemon: only catalog facts are known,
+	 * so the runtime flags stay false. A peer working in another worker keeps its
+	 * `activeSessionId` and its live status; everything else is absent or inactive.
+	 */
+	private createPersistedAgentObserveSummary(member: AgentFamilyMember): AgentObserveAgentSummary {
+		const entry = member.entry;
+		return {
+			...(entry.activeSessionId ? { activeSessionId: entry.activeSessionId } : {}),
+			sessionId: entry.id,
+			...(entry.name ? { sessionName: entry.name } : {}),
+			relationship: member.relationship,
+			runtimeKind: entry.depth > 0 ? "subagent" : "top-level",
+			...(entry.cwd ? { cwd: entry.cwd } : {}),
+			status: entry.status,
+			isCurrent: false,
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			...(entry.messageCount !== undefined ? { messageCount: entry.messageCount } : {}),
+			queuedCount: 0,
+			isSessionActive: entry.status === "running",
+			...(entry.repliedSinceTask !== undefined ? { repliedSinceTask: entry.repliedSinceTask } : {}),
+			...(entry.parentSessionId ? { parentSessionId: entry.parentSessionId } : {}),
+			...(entry.rlmChildId ? { rlmChildId: entry.rlmChildId } : {}),
+			...(entry.firstMessage ? { firstMessage: entry.firstMessage.slice(0, AGENT_OBSERVE_PREVIEW_MAX_CHARS) } : {}),
 		};
 	}
 
@@ -3636,7 +3772,11 @@ export class AgentDaemon {
 			...(summary.firstMessage ? { firstMessage: summary.firstMessage } : {}),
 			...(latest
 				? {
-						latestMessage: createAgentObserveMessagePreview(latest, messages.length - 1, 240),
+						latestMessage: createAgentObserveMessagePreview(
+							latest,
+							messages.length - 1,
+							AGENT_OBSERVE_PREVIEW_MAX_CHARS,
+						),
 					}
 				: {}),
 		};
@@ -4787,6 +4927,7 @@ export class AgentDaemon {
 						}
 					},
 					command.previousTurns,
+					providerRetryPolicy(state.runtime.session.settingsManager),
 				);
 				this.sideQuestionRuns.set(command.sideQuestionId, {
 					run,
@@ -5062,19 +5203,17 @@ export class AgentDaemon {
 			}
 
 			case "get_available_models": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_available_models", {
-					models: await state.runtime.session.modelRegistry.refreshAvailableModels(),
-				});
+				const { session } = this.getSessionState(command.activeSessionId).runtime;
+				const models = await session.modelRegistry.refreshAvailableModels();
+				session.refreshModelMetadata();
+				return success(command.id, "get_available_models", { models });
 			}
 
 			case "get_model_catalog": {
-				const state = this.getSessionState(command.activeSessionId);
-				return success(
-					command.id,
-					"get_model_catalog",
-					await state.runtime.session.modelRegistry.refreshModelCatalog(),
-				);
+				const { session } = this.getSessionState(command.activeSessionId).runtime;
+				const catalog = await session.modelRegistry.refreshModelCatalog();
+				session.refreshModelMetadata();
+				return success(command.id, "get_model_catalog", catalog);
 			}
 
 			case "get_queue": {
@@ -5182,9 +5321,15 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				const session = state.runtime.session;
 				const availableModels = await session.modelRegistry.refreshAvailableModels();
-				const model = availableModels.find((candidate) => {
-					return candidate.provider === command.provider && candidate.id === command.modelId;
-				});
+				const model =
+					availableModels.find(
+						(candidate) => candidate.provider === command.provider && candidate.id === command.modelId,
+					) ??
+					// Stale-auth providers are excluded from the available list; the lookup
+					// never mutates stale state (session.setModel owns the clear).
+					(session.modelRegistry.getProviderAuthStatus(command.provider).source === "stale"
+						? session.modelRegistry.find(command.provider, command.modelId)
+						: undefined);
 				if (!model) {
 					throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
 				}
@@ -5552,11 +5697,7 @@ export class AgentDaemon {
 				};
 				try {
 					if (streamsSnapshot) {
-						const snapshotId = createSnapshotTransferId(
-							state.activeSessionId,
-							state.eventGeneration,
-							state.lastEventSequence,
-						);
+						const snapshotId = snapshotTransferId(result.snapshot);
 						const transcript = createSnapshotTranscriptChunks({
 							activeSessionId: state.activeSessionId,
 							snapshotId,
@@ -6030,7 +6171,7 @@ export class AgentDaemon {
 		const client = new DaemonClient(supervisorSocketPath);
 		try {
 			await client.connect(1000);
-			await client.waitForHello(1000);
+			await client.waitForHello();
 			const response = await client.request(
 				{ type: "list_agent_peers", workerToken: this.options.worker.authenticationToken },
 				5000,
@@ -6146,11 +6287,15 @@ export class AgentDaemon {
 							depth: info.rlmDepth ?? 0,
 							status: "inactive",
 							sessionPath: canonicalSessionPath(info.path),
+							cwd: info.cwd,
+							messageCount: info.messageCount,
 						}),
 					)
 			: [];
 		const byId = new Map<string, AgentFamilyCatalogEntry>(savedRoots.map((entry) => [entry.id, entry]));
-		const addAgent = (agent: AgentSessionMessageAgentSummary) => {
+		// `remote` peers live in another worker: their active id stays routable, while a
+		// local summary's stand-in id for a passive child does not.
+		const addAgent = (agent: AgentSessionMessageAgentSummary, remote = false) => {
 			const depth = agent.rlmDepth ?? 0;
 			byId.set(agent.sessionId, {
 				id: agent.sessionId,
@@ -6169,9 +6314,12 @@ export class AgentDaemon {
 					? { parentSessionPath: canonicalSessionPath(agent.parentSessionPath) }
 					: {}),
 				...(agent.sessionPath ? { sessionPath: canonicalSessionPath(agent.sessionPath) } : {}),
+				...(agent.rlmChildId ? { rlmChildId: agent.rlmChildId } : {}),
+				...(remote ? { activeSessionId: agent.activeSessionId } : {}),
+				cwd: agent.cwd,
 			});
 		};
-		for (const peer of remotePeers) addAgent(peer);
+		for (const peer of remotePeers) addAgent(peer, true);
 		for (const agent of localAgents) addAgent(agent);
 		for (const state of this.sessions.values()) {
 			const entry = byId.get(state.runtime.session.sessionId);
@@ -6180,7 +6328,10 @@ export class AgentDaemon {
 		}
 		for (const passive of passiveRlmSubagents) {
 			const entry = byId.get(passive.info.id);
-			if (entry) entry.sessionPath = canonicalSessionPath(passive.entry.sessionFile);
+			if (!entry) continue;
+			entry.sessionPath = canonicalSessionPath(passive.entry.sessionFile);
+			entry.messageCount = passive.info.messageCount;
+			entry.firstMessage = passive.info.firstMessage;
 		}
 		return [...byId.values()];
 	}
@@ -6204,7 +6355,7 @@ export class AgentDaemon {
 		return tracked;
 	}
 
-	private async createAgentFamilyRoster(currentState: ActiveSessionState): Promise<AgentFamilyRosterResult> {
+	private async createAgentFamily(currentState: ActiveSessionState): Promise<AgentFamilyMember[]> {
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		try {
 			const catalog = await Promise.race([
@@ -6223,7 +6374,7 @@ export class AgentDaemon {
 			]);
 			const current = catalog.find((entry) => entry.id === currentState.runtime.session.sessionId);
 			if (!current) throw new Error("Current agent is missing from the family catalog");
-			return buildAgentFamilyRoster(current, catalog);
+			return selectAgentFamily(current, catalog);
 		} finally {
 			if (timeout) clearTimeout(timeout);
 		}
@@ -6302,7 +6453,7 @@ export class AgentDaemon {
 		const client = new DaemonClient(supervisorSocketPath);
 		try {
 			await client.connect(1000);
-			await client.waitForHello(1000);
+			await client.waitForHello();
 			const response = await client.request(
 				{
 					type: "set_session_name",
@@ -6602,7 +6753,7 @@ export class AgentDaemon {
 			const candidate = new DaemonClient(supervisorSocketPath);
 			try {
 				await candidate.connect(1000);
-				await candidate.waitForHello(1000);
+				await candidate.waitForHello();
 				client = candidate;
 				break;
 			} catch (error) {
@@ -7330,14 +7481,9 @@ export class AgentDaemon {
 		state: ActiveSessionState,
 		message: Extract<DaemonOutbound, { type: "session_replaced" }>,
 	): void {
-		const snapshotId = createSnapshotTransferId(
-			state.activeSessionId,
-			state.eventGeneration,
-			state.lastEventSequence,
-		);
 		// Mark before the registry read so later events queue behind this snapshot.
 		const snapshotSignal = markClientSnapshotStreaming(client, state.activeSessionId);
-		void this.prepareReplacementSnapshot(client, state, message, snapshotId, snapshotSignal).catch((error) => {
+		void this.prepareReplacementSnapshot(client, state, message, snapshotSignal).catch((error) => {
 			finishClientSnapshotStreaming(client, state.activeSessionId);
 			this.log(`could not prepare replacement snapshot: ${String(error)}`);
 			if (!client.socket.destroyed && this.sessions.get(state.activeSessionId) === state) {
@@ -7355,13 +7501,13 @@ export class AgentDaemon {
 		client: DaemonSocketClient,
 		state: ActiveSessionState,
 		message: Extract<DaemonOutbound, { type: "session_replaced" }>,
-		snapshotId: string,
 		snapshotSignal: AbortSignal,
 	): Promise<void> {
 		const result = await this.createAttachResult(client, state, {
 			type: "attach",
 			activeSessionId: state.activeSessionId,
 		});
+		const snapshotId = snapshotTransferId(result.snapshot);
 		if (this.sessions.get(state.activeSessionId) !== state) {
 			finishClientSnapshotStreaming(client, state.activeSessionId);
 			if (!client.snapshotStreaming && client.catchupActiveSessionIds?.size) {
@@ -7763,11 +7909,7 @@ export class AgentDaemon {
 							),
 						});
 					}
-					const snapshotId = createSnapshotTransferId(
-						activeSessionId,
-						state.eventGeneration,
-						state.lastEventSequence,
-					);
+					const snapshotId = snapshotTransferId(result.snapshot);
 					const snapshotSignal = markClientSnapshotStreaming(client, activeSessionId);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
@@ -8049,6 +8191,16 @@ const ROSTER_SESSION_EVENT_TRIGGERS = new Set([
 	"session_info_changed",
 	"thinking_level_changed",
 ]);
+
+/**
+ * The transfer id must name the cursor observed at materialization, not the live session cursor:
+ * events appended in between would let two different byte streams share one snapshot id.
+ */
+function snapshotTransferId(snapshot: DaemonSessionSnapshot): string {
+	// createSessionSnapshot always sets lastEventCursor; it is optional only on the wire.
+	const cursor = snapshot.lastEventCursor!;
+	return createSnapshotTransferId(snapshot.activeSessionId, cursor.generation, cursor.sequence);
+}
 
 function hasDaemonOutboundActiveSessionId(
 	message: DaemonOutbound,

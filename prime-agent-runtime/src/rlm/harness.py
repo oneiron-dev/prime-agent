@@ -4,16 +4,18 @@ The state model is intentionally small: it records prompt notes, memory,
 skills, subagent specs, and refinement events in the session-local harness
 store by default; pass ``global_=True`` for the cross-session global store.
 Execution still belongs to Prime Agent's TypeScript host and the existing
-``rlm.run`` recursion bridge.
+``rlm.spawn`` recursion bridge.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import stat
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 from typing import Any, Literal
 
 HarnessKind = Literal["prompt", "memory", "skill", "subagent"]
@@ -295,8 +297,24 @@ class HarnessState:
             },
             "refinements": [asdict(event) for event in self.refinements],
         }
-        with self.file_path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        # Atomic replace on the real file: aliases survive, readers never see a torn file.
+        target_path = Path(os.path.realpath(self.file_path))
+        temp_path = target_path.with_name(f"{target_path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            existing_mode = stat.S_IMODE(os.stat(target_path).st_mode)
+        except FileNotFoundError:
+            existing_mode = None
+        mode = existing_mode if existing_mode is not None else 0o600
+        try:
+            # Create no looser than the destination; retain the umask for new files.
+            descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            if existing_mode is not None:
+                os.chmod(temp_path, existing_mode)
+            os.replace(temp_path, target_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
         self._loaded_mtime = self._disk_mtime()
         return self
 
@@ -728,7 +746,7 @@ class HarnessState:
             "Call contract: installed Python skills use await <skill_import>(...) or a matching shell CLI; "
             "harness skill entries are Python REPL skills and must include a Python reference plus arguments. "
             "Spawn a subagent spec by composing a concise task prompt and calling "
-            "handle = await rlm('sub-task'); admission returns immediately with rlm_child_id, name, session_dir, "
+            "handle = await rlm.spawn('sub-task', name='worker'); admission returns immediately with rlm_child_id, name, session_dir, "
             "and model, never the child's answer. Results arrive only through explicit agent_message replies or "
             "files; children reply with await agent_message.send(message, receiver_role='parent'). Use "
             "await rlm.list_subagents() to recover direct child handles and await agent_message.send(..., "

@@ -181,8 +181,8 @@ describe("validated passive topology memo", () => {
 		const releaseOldRead = deferred();
 		const walkJoinedRead = deferred();
 		let delayed = false;
-		vi.spyOn(fileLines, "readLinesAsBuffers").mockImplementation(async function* (path, start, end) {
-			yield* originalReadLines(path, start, end);
+		vi.spyOn(fileLines, "readLinesAsBuffers").mockImplementation(async function* (path, range) {
+			yield* originalReadLines(path, range);
 			if (path === file && !delayed) {
 				delayed = true;
 				oldDataRead.resolve();
@@ -208,7 +208,7 @@ describe("validated passive topology memo", () => {
 		} finally {
 			releaseOldRead.resolve();
 		}
-		expect((await oldRead)?.name).toBe("target-child-0");
+		expect((await oldRead)?.name).toBe("latest-child-0");
 		expect((await snapshot)[0].info.name).toBe("latest-child-0");
 		expect((await internals.listPassiveRlmSubagents())[0].info.name).toBe("latest-child-0");
 		expect(walk).toHaveBeenCalledTimes(1);

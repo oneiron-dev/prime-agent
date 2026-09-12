@@ -9,7 +9,8 @@ let tempDir = "";
 let originalEnv: NodeJS.ProcessEnv;
 let runtimeIdentity = "";
 const silent = (): void => {};
-const timeouts = { validationMs: 250, commandMs: 250, lockMs: 250, totalMs: 5_000 };
+// Allow a cold Node fixture and its helper to start before exercising the deadline.
+const timeouts = { validationMs: 1_000, commandMs: 1_000, lockMs: 250, totalMs: 5_000 };
 
 function executable(filePath: string, body: string): void {
 	mkdirSync(join(filePath, ".."), { recursive: true });
