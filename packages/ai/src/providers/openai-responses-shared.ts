@@ -569,6 +569,11 @@ export async function processResponsesStream<TApi extends Api>(
 					}
 				}
 			}
+			// Some gateways synthesize requested aliases in response.created. Only terminal response identity is evidence.
+			if (typeof response?.model === "string" && response.model.trim()) {
+				output.responseModel = response.model;
+				output.responseModelSource = "provider-response";
+			}
 			if (response?.id) {
 				output.responseId = response.id;
 			}
@@ -591,7 +596,7 @@ export async function processResponsesStream<TApi extends Api>(
 					: (response?.service_tier ?? options.serviceTier);
 				options.applyServiceTierPricing(output.usage, serviceTier);
 			}
-			output.stopReason = mapStopReason(response?.status);
+			output.stopReason = event.type === "response.incomplete" ? "length" : mapStopReason(response?.status);
 			if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
 				output.stopReason = "toolUse";
 			}

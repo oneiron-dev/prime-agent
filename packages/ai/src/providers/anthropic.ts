@@ -571,6 +571,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			for await (const event of iterateAnthropicEvents(response, options?.signal, requestId)) {
 				if (event.type === "message_start") {
 					output.responseId = event.message.id;
+					if (typeof event.message.model === "string" && event.message.model.trim()) {
+						output.responseModel = event.message.model;
+						output.responseModelSource = "provider-response";
+					}
 					// Capture initial token usage from message_start event
 					// This ensures we have input token counts even if the stream is aborted early
 					output.usage.input = event.message.usage.input_tokens || 0;

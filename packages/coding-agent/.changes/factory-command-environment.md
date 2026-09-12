@@ -1,0 +1,1 @@
+- Added immutable per-command factory environment settings while preserving runner-owned attempt and source identity.

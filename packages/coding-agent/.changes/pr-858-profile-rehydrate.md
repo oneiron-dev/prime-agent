@@ -1,0 +1,1 @@
+- Fixed passivated subagents restoring their spawn model instead of the latest saved model and thinking level.

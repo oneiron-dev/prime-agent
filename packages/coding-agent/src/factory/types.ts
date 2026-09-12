@@ -20,7 +20,7 @@ export interface ActionSpec {
 	sourceFingerprint: string;
 	/** Only process actions may be accepted by a successful command alone. */
 	kind: "process" | "decision";
-	command: { argv: string[]; cwd: string; timeoutMs?: number };
+	command: { argv: string[]; cwd: string; timeoutMs?: number; env?: Record<string, string> };
 	requirements: { host?: string; slotId?: string; capabilities?: string[] };
 }
 
@@ -30,6 +30,13 @@ export interface FactoryPlan {
 	slots: SlotSpec[];
 	actions: ActionSpec[];
 	roles?: Record<string, { provider: string; model: string; effort?: string }>;
+}
+
+export interface PlanMutationReceipt {
+	id: string;
+	payloadSha256: string;
+	previousRevision: number;
+	revision: number;
 }
 
 export type ActionState =

@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { type Api, findEnvKeys, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
@@ -3490,10 +3491,14 @@ export class AgentDaemon {
 		try {
 			sessionLease = acquireSessionLease(entry.sessionFile, parentState.runtime.services.agentDir);
 			const sessionManager = await SessionManager.openAsync(entry.sessionFile, entry.sessionDir);
+			const persistedContext = sessionManager.buildSessionContext();
+			// Spawn metadata is only a fallback; same-session restores keep the latest profile.
+			const modelToRestore = persistedContext.model ?? entry.model;
+			const hasThinkingEntry = sessionManager.getBranch().some((item) => item.type === "thinking_level_change");
 			const modelRegistry = parentState.runtime.services.modelRegistry;
 			let rehydratedModel: Model<Api> | undefined;
-			if (entry.model) {
-				const resolved = modelRegistry.find(entry.model.provider, entry.model.modelId);
+			if (modelToRestore) {
+				const resolved = modelRegistry.find(modelToRestore.provider, modelToRestore.modelId);
 				if (resolved && (await modelRegistry.canUseModel(resolved))) {
 					rehydratedModel = resolved;
 				}
@@ -3508,6 +3513,7 @@ export class AgentDaemon {
 					sessionLease,
 					sessionOptions: {
 						...(rehydratedModel ? { model: rehydratedModel } : {}),
+						thinkingLevel: hasThinkingEntry ? (persistedContext.thinkingLevel as ThinkingLevel) : undefined,
 						agentMessageController: this.createAgentMessageController(() => stateRef),
 						agentObserveController: this.createAgentObserveController(() => stateRef),
 						rlmHeartbeatController: {

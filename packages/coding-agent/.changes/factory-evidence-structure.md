@@ -1,0 +1,2 @@
+- Changed factory citations and inline evidence to use separate reference limits and shared UTF-8 byte budgets with native pre-submit validation.
+- Fixed factory writer and coordinator provenance capture to stream retained raw logs and derive compact native transport metadata without asking agents to record model identity.

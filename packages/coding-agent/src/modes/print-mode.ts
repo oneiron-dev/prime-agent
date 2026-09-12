@@ -15,12 +15,16 @@ import { InProcessAgentConnection } from "./agent-connection/in-process-agent-co
 import type { AgentConnection } from "./agent-connection/types.js";
 import { latestAutonomousGateAttempt, selectHeadlessTerminalResult } from "./headless-completion.js";
 
+export type JsonEventProfile = "all" | "factory-completed";
+
 /**
  * Options for print mode.
  */
 export interface PrintModeOptions {
-	/** Output mode: "text" for final response only, "json" for all events */
+	/** Output mode: "text" for final response only, "json" for native events */
 	mode: "text" | "json";
+	/** Factory profile omits only progressive message/tool snapshots before serialization. Default: all. */
+	jsonEventProfile?: JsonEventProfile;
 	/** Array of additional prompts to send after initialMessage */
 	messages?: string[];
 	/** First message to send (may contain @file content) */
@@ -64,7 +68,7 @@ async function runPrintModeWithConnectionInternal(
 	options: PrintModeOptions,
 	bindHeadlessExtensions?: () => Promise<void>,
 ): Promise<number> {
-	const { mode, messages = [], initialMessage, initialImages } = options;
+	const { mode, jsonEventProfile = "all", messages = [], initialMessage, initialImages } = options;
 	let exitCode = 0;
 	let disposed = false;
 	let unsubscribe: (() => void) | undefined;
@@ -97,12 +101,19 @@ async function runPrintModeWithConnectionInternal(
 		if (mode === "json") {
 			const header = await connection.getSessionHeader();
 			if (header) {
-				writeRawStdout(`${JSON.stringify(header)}\n`);
+				writeRawStdout(
+					`${JSON.stringify(jsonEventProfile === "all" ? header : { ...header, jsonEventProfile })}\n`,
+				);
 			}
 		}
 
 		unsubscribe = connection.subscribe((event) => {
-			if (mode === "json" && event.type === "session_event") {
+			if (
+				mode === "json" &&
+				event.type === "session_event" &&
+				(jsonEventProfile === "all" ||
+					(event.event.type !== "message_update" && event.event.type !== "tool_execution_update"))
+			) {
 				writeRawStdout(`${JSON.stringify(event.event)}\n`);
 			}
 			if (event.type === "extension_error") {

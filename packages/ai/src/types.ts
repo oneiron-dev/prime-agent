@@ -215,7 +215,10 @@ export interface AssistantMessage {
 	api: Api;
 	provider: Provider;
 	model: string;
-	responseModel?: string; // Concrete `chunk.model` when different from the requested `model` (e.g. OpenRouter `auto` -> `anthropic/...`)
+	/** Model identifier reported by the provider response. A gateway may echo a routing alias; this is not an upstream attestation. */
+	responseModel?: string;
+	/** Set only when the transport read responseModel from a provider response, not from the requested selector. */
+	responseModelSource?: "provider-response";
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
 	usage: Usage;

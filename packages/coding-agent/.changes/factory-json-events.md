@@ -1,0 +1,2 @@
+- Added a factory-completed JSON event profile that omits progressive snapshots before serialization while preserving completed native events and metadata.
+- Changed new Oneiron writer and coordinator launches to require and select the completed-event profile without changing historical proof inspection or safety limits.

@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -6,6 +7,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { factoryArguments, supportsFactoryRuntime } from "../src/cli/factory-launch.js";
+import { FACTORY_EVIDENCE_LIMITS } from "../src/factory/evidence.js";
+import { FactoryStore } from "../src/factory/store.js";
 import type { FactoryPlan, FactoryStatus } from "../src/factory/types.js";
 
 const require = createRequire(import.meta.url);
@@ -82,6 +85,184 @@ describe("optional factory CLI", () => {
 		expect(supportsFactoryRuntime({ node: "22.13.0" })).toBe(true);
 		expect(supportsFactoryRuntime({ node: "26.2.0" })).toBe(true);
 		expect(supportsFactoryRuntime({ node: "24.0.0", bun: "1.2.0" })).toBe(false);
+	});
+
+	it("runs a bounded paused management watch without inference and validates its opt-in options", () => {
+		const { root, directory, planPath, hostsPath } = setup();
+		invoke(["init", directory, planPath, "--hosts", hostsPath], root);
+		const output = invoke(
+			["manage", directory, "--watch", "--apply", "--max-requests", "1", "--max-passes", "1"],
+			root,
+		)
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(output).toEqual([
+			{ kind: "paused", admitted: false },
+			{ kind: "watch-finished", admitted: 0, passes: 1 },
+		]);
+		expect(JSON.parse(invoke(["status", directory])).managementRequests).toEqual([]);
+		expect(existsSync(join(directory, "decisions"))).toBe(false);
+		expect(() => invoke(["manage", directory, "--watch", "--max-requests", "0"], root)).toThrow();
+		expect(() => invoke(["manage", directory, "--watch", "--evidence", planPath], root)).toThrow();
+		expect(invoke(["manage", "--help"], root)).toContain("--max-passes");
+	});
+
+	it("accepts the full UTF-8 manual evidence file budget and diagnoses excess bytes without inference", () => {
+		const { root, directory, planPath, hostsPath } = setup();
+		invoke(["init", directory, planPath, "--hosts", hostsPath], root);
+		const path = join(root, "proof.txt");
+		writeFileSync(path, "é".repeat(FACTORY_EVIDENCE_LIMITS.contentBytes / 2));
+		expect(JSON.parse(invoke(["manage", directory, "--evidence", path], root))).toEqual({
+			kind: "paused",
+			admitted: false,
+		});
+		writeFileSync(path, "é".repeat(FACTORY_EVIDENCE_LIMITS.contentBytes / 2 + 1));
+		expect(() => invoke(["manage", directory, "--evidence", path], root)).toThrow(
+			"evidence[0].content: actual 65538 UTF-8 bytes exceeds limit 65536",
+		);
+		expect(() => invoke(["manage", directory, "--evidence", root], root)).toThrow(
+			`evidence[0].content: expected a regular file: ${root}`,
+		);
+		expect(JSON.parse(invoke(["status", directory], root)).managementRequests).toEqual([]);
+		expect(existsSync(join(directory, "decisions"))).toBe(false);
+	});
+
+	it("validates 32 manual evidence records and aggregate bytes before factory lookup", () => {
+		const { root, directory, planPath, hostsPath } = setup();
+		invoke(["init", directory, planPath, "--hosts", hostsPath], root);
+		const paths = Array.from({ length: 32 }, (_, index) => {
+			const path = join(root, `proof-${index}.txt`);
+			writeFileSync(path, "é".repeat(1024));
+			return path;
+		});
+		const options = paths.flatMap((path) => ["--evidence", path]);
+		expect(JSON.parse(invoke(["manage", directory, ...options], root))).toEqual({ kind: "paused", admitted: false });
+		const missingFactory = join(root, "not-initialized");
+		writeFileSync(paths[31], "é".repeat(1025));
+		expect(() => invoke(["manage", missingFactory, ...options], root)).toThrow(
+			"evidence.content aggregate: actual 65538 UTF-8 bytes exceeds limit 65536",
+		);
+		const extra = join(root, "extra.txt");
+		writeFileSync(extra, "proof");
+		expect(() => invoke(["manage", missingFactory, ...options, "--evidence", extra], root)).toThrow(
+			"evidence.length: actual 33; limit 0..32",
+		);
+		expect(JSON.parse(invoke(["status", directory], root)).managementRequests).toEqual([]);
+		expect(existsSync(join(directory, "decisions"))).toBe(false);
+	});
+
+	it("requires explicit revision for imports and replays an import token without another revision", () => {
+		const { directory, planPath, hostsPath } = setup();
+		invoke(["init", directory, planPath, "--hosts", hostsPath]);
+		invoke(["resume", directory]);
+		expect(() => invoke(["import", directory, planPath])).toThrow();
+		expect(JSON.parse(invoke(["import", directory, planPath, "--expected-revision", "1"])).planRevision).toBe(1);
+		const plan = JSON.parse(readFileSync(planPath, "utf8")) as FactoryPlan;
+		plan.tickets[0].owner = "coordinator";
+		writeFileSync(planPath, JSON.stringify(plan));
+		const command = ["import", directory, planPath, "--expected-revision", "1", "--mutation-id", "outbox-1"];
+		expect(JSON.parse(invoke(command)).planRevision).toBe(2);
+		expect(JSON.parse(invoke(command)).planRevision).toBe(2);
+		expect(() => invoke(["import", directory, planPath, "--expected-revision", "1"])).toThrow();
+	});
+
+	it("reconciles a proven unsubmitted management request through the CLI without inference or process retry", () => {
+		const { root, directory, marker, planPath, hostsPath } = setup("decision");
+		invoke(["init", directory, planPath, "--hosts", hostsPath]);
+		invoke(["resume", directory]);
+		const store = new FactoryStore(join(directory, "factory.db"));
+		let attemptId: string;
+		let wakeId: number;
+		try {
+			const context = store.claim("a", "local-slot")!;
+			attemptId = context.attempt.id;
+			store.markSubmitted(attemptId);
+			store.complete({
+				attemptId,
+				sourceFingerprint: context.action.sourceFingerprint,
+				exitCode: 0,
+				finishedAt: "2026-09-05T00:00:00Z",
+			});
+			wakeId = store.wakes()[0].id;
+			store.claimManagement({
+				id: "fixture-request",
+				wakeId,
+				actionId: "a",
+				attemptId,
+				planRevision: 1,
+				evidenceSha256: "0".repeat(64),
+			});
+		} finally {
+			store.close();
+		}
+		const writeProof = (name: string, data: unknown) => {
+			const ref = join(root, name);
+			const content = JSON.stringify(data);
+			writeFileSync(ref, content);
+			return { ref, sha256: createHash("sha256").update(content).digest("hex") };
+		};
+		const actor = writeProof("actor.json", {
+			version: 1,
+			requestId: "fixture-request",
+			actorIdentity: "fixture-process",
+			stopped: true,
+			authorityRevoked: true,
+		});
+		const provider = writeProof("provider.json", {
+			version: 1,
+			requestId: "fixture-request",
+			disposition: "not-submitted",
+		});
+		const bundle = writeProof("reconciliation.json", {
+			version: 1,
+			requestId: "fixture-request",
+			wakeId,
+			attemptId,
+			planRevision: 1,
+			priorActor: { identity: "fixture-process", stopped: true, authorityRevoked: true, ...actor },
+			providerRequest: { disposition: "not-submitted", ...provider },
+			artifacts: [],
+		});
+		const output = JSON.parse(
+			invoke([
+				"reconcile-management",
+				directory,
+				"fixture-request",
+				"--expected-revision",
+				"1",
+				"--actor",
+				"owner",
+				"--reason",
+				"Reconciled exact process and request",
+				"--ref",
+				bundle.ref,
+			]),
+		);
+		expect(output.managementRequests[0].state).toBe("RECONCILED");
+		expect(output.actions[0].state).toBe("AWAITING_DECISION");
+		expect(output.attempts).toHaveLength(1);
+		expect(existsSync(marker)).toBe(false);
+		const decide = [
+			"decide",
+			directory,
+			"a",
+			"accept",
+			"--actor",
+			"owner",
+			"--reason",
+			"Reviewed preserved output",
+			"--ref",
+			bundle.ref,
+			"--expected-revision",
+			"1",
+			"--expected-attempt",
+			attemptId,
+			"--expected-wake",
+			String(wakeId),
+		];
+		expect(JSON.parse(invoke(decide)).actions[0].state).toBe("ACCEPTED");
+		expect(() => invoke(decide)).toThrow();
 	});
 
 	it("starts paused and reconciles a detached job after the scheduling process is killed", async () => {

@@ -1,16 +1,29 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { CommandAdapter, fingerprintCommand } from "./adapters/command.js";
 import { type FactoryConfig, readFactoryConfig, readFactoryHosts, readFactoryJson } from "./config.js";
 import { FactoryEngine } from "./engine.js";
 import { FACTORY_HELP } from "./help.js";
+import type { ManagementReconciliation } from "./management.js";
 import { FactoryStore } from "./store.js";
 import type { DecisionEvidence, FactoryPlan } from "./types.js";
 
 function parseArguments(args: readonly string[]): { positionals: string[]; options: Map<string, string> } {
 	const positionals: string[] = [];
 	const options = new Map<string, string>();
-	const allowed = new Set(["--hosts", "--pause-file", "--after", "--interval-ms", "--actor", "--reason", "--ref"]);
+	const allowed = new Set([
+		"--hosts",
+		"--pause-file",
+		"--after",
+		"--interval-ms",
+		"--actor",
+		"--reason",
+		"--ref",
+		"--expected-revision",
+		"--expected-attempt",
+		"--expected-wake",
+		"--mutation-id",
+	]);
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index]!;
 		if (!arg.startsWith("--")) {
@@ -31,6 +44,11 @@ function integer(value: string | undefined, fallback: number, minimum: number): 
 	const parsed = Number(value);
 	if (!Number.isSafeInteger(parsed) || parsed < minimum) throw new Error(`Expected an integer >= ${minimum}`);
 	return parsed;
+}
+
+function expectedRevision(options: Map<string, string>): number {
+	if (!options.has("--expected-revision")) throw new Error("An explicit --expected-revision is required");
+	return integer(options.get("--expected-revision"), 0, 0);
 }
 
 function evidence(options: Map<string, string>): DecisionEvidence {
@@ -102,12 +120,18 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 		switch (command) {
 			case "import":
 				if (!argument) throw new Error("import requires plan.json");
-				engine.applyPlan(readFactoryJson(argument) as FactoryPlan);
+				engine.applyPlan(
+					readFactoryJson(argument) as FactoryPlan,
+					expectedRevision(options),
+					options.get("--mutation-id"),
+				);
 				emit(engine.status());
 				break;
 			case "status":
 				emit({
 					...engine.status(),
+					managementRequests: store.managementRequests(),
+					managementMutationBlockers: store.managementMutationBlockers().map((request) => request.id),
 					ownerPauseFile: config.pauseFile ?? null,
 					ownerPaused: Boolean(config.pauseFile && existsSync(config.pauseFile)),
 				});
@@ -129,14 +153,34 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 			case "decide":
 				if (!argument || (choice !== "accept" && choice !== "reject"))
 					throw new Error("decide requires action-id and accept|reject");
-				engine.decide(argument, choice, evidence(options));
+				engine.decide(
+					argument,
+					choice,
+					evidence(options),
+					options.has("--expected-revision") ? expectedRevision(options) : undefined,
+					options.get("--expected-attempt"),
+					options.has("--expected-wake") ? integer(options.get("--expected-wake"), 0, 1) : undefined,
+				);
 				emit(engine.status());
 				break;
 			case "supersede":
 				if (!argument || !choice) throw new Error("supersede requires rejected and replacement action IDs");
-				engine.supersede(argument, choice, evidence(options));
+				engine.supersede(argument, choice, evidence(options), expectedRevision(options));
 				emit(engine.status());
 				break;
+			case "reconcile-management": {
+				if (!argument)
+					throw new Error("reconcile-management requires request-id and request-bound recovery evidence");
+				const proof = evidence(options);
+				if (!isAbsolute(proof.ref)) throw new Error("Management recovery --ref must be an absolute bundle path");
+				const bundle = statSync(proof.ref);
+				if (!bundle.isFile() || bundle.size > 1000000)
+					throw new Error("Management recovery bundle must be a regular file of at most 1000000 bytes");
+				const reconciliation = readFactoryJson(proof.ref) as ManagementReconciliation;
+				engine.reconcileManagement(argument, reconciliation, proof, expectedRevision(options));
+				emit({ ...engine.status(), managementRequests: store.managementRequests() });
+				break;
+			}
 			case "resolve":
 				if (!argument) throw new Error("resolve requires attempt-id and evidence proving safe retry");
 				engine.resolveForRetry(argument, evidence(options));

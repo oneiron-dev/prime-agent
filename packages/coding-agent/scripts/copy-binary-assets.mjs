@@ -28,6 +28,7 @@ export const binaryAssets = [
 	"export-html",
 	"docs",
 	"examples",
+	"factory/adapters",
 	"photon_rs_bg.wasm",
 ];
 
@@ -52,11 +53,12 @@ export function copyBinaryAssets(destination) {
 		"export-html": join(packageDir, "src/core/export-html"),
 		docs: join(packageDir, "docs"),
 		examples: join(packageDir, "examples"),
+		"factory/adapters": join(packageDir, "src/factory/adapters"),
 		"photon_rs_bg.wasm": join(root, "node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm"),
 	};
 	for (const [name, source] of Object.entries(sources)) {
 		const target = join(destination, name);
-		rmSync(target, { recursive: true, force: true });
+		if (name !== "factory/adapters") rmSync(target, { recursive: true, force: true });
 		cpSync(source, target, {
 			recursive: true,
 			filter: (path) => {
@@ -64,6 +66,7 @@ export function copyBinaryAssets(destination) {
 				if (lstatSync(path).isSymbolicLink()) throw new Error(`Unexpected symlink in binary assets: ${path}`);
 				if (name === "theme") return path === source || path.endsWith(".json");
 				if (name === "export-html") return !path.endsWith(".ts");
+				if (name === "factory/adapters") return path === source || path.endsWith(".py");
 				return true;
 			},
 		});
@@ -83,6 +86,8 @@ export function validateBinaryAssets(directory) {
 		"export-html/template.js",
 		"export-html/vendor/marked.min.js",
 		"export-html/vendor/highlight.min.js",
+		"factory/adapters/oneiron-corpus-foreground.py",
+		"factory/adapters/oneiron-push-guard.py",
 	]) {
 		if (!lstatSync(join(directory, name)).isFile()) throw new Error(`Missing binary asset: ${name}`);
 	}

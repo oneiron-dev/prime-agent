@@ -125,7 +125,11 @@ def supervise(directory, manifest):
             os._exit(0)
     try:
         with open(directory + "/stdout.log", "ab", buffering=0) as out, open(directory + "/stderr.log", "ab", buffering=0) as err:
-            child = subprocess.Popen(manifest["command"]["argv"], cwd=manifest["command"]["cwd"],
+            child_env = dict(os.environ)
+            child_env.update(manifest["command"].get("env", {}))
+            child_env.update(PRIME_FACTORY_ATTEMPT_ID=manifest["attemptId"],
+                PRIME_FACTORY_SOURCE_FINGERPRINT=manifest["sourceFingerprint"])
+            child = subprocess.Popen(manifest["command"]["argv"], cwd=manifest["command"]["cwd"], env=child_env,
                 stdin=subprocess.DEVNULL, stdout=out, stderr=err, close_fds=True, start_new_session=True)
             atomic(directory + "/child.json", {"pid": child.pid, "processIdentity": identity(child.pid)})
             timeout = manifest["command"].get("timeoutMs")
@@ -164,6 +168,10 @@ def main():
         raise ValueError("Invalid runner root or attempt identity")
     if not os.path.isabs(manifest["command"]["cwd"]) or not manifest["command"]["argv"]:
         raise ValueError("Command requires absolute cwd and nonempty argv")
+    environment = manifest["command"].get("env", {})
+    if not isinstance(environment, dict) or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+            or not isinstance(value, str) or "\0" in value for name, value in environment.items()):
+        raise ValueError("Invalid command environment")
     if request["operation"] == "fingerprint":
         return {"sourceFingerprint": fingerprint(manifest["command"]["cwd"])}
     directory = os.path.join(root, attempt_id)

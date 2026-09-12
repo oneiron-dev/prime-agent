@@ -1,0 +1,1 @@
+- Added transport-captured response model identity for Anthropic and terminal OpenAI Responses messages without changing requested model selectors.
