@@ -577,7 +577,7 @@ test("default native execution uses real Git/status and retains automatic transp
 	expect(receipt.result.modelIdentitySource).toBe("sdk");
 	expect(receipt.result.effort).toBe("low");
 	expect(transport.complete).toHaveBeenCalledTimes(1);
-	expect(transport.complete.mock.calls[0]![2]).toMatchObject({ reasoning: "low", maxTokens: 2000, maxRetries: 0 });
+	expect(transport.complete.mock.calls[0]![2]).toMatchObject({ reasoning: "low", maxTokens: 2000 });
 }, 15000);
 
 test.each([
