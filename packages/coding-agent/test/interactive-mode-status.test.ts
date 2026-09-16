@@ -224,6 +224,7 @@ type RenderSessionContextHarness = {
 	getRetryAttempt: () => number;
 	ui: { requestRender: () => void };
 	addMessageToChat: (message: AgentMessage, options?: { populateHistory?: boolean }) => void;
+	showWarning: (warningMessage: string) => void;
 	connectionState?: AgentConnectionState;
 };
 
@@ -272,6 +273,7 @@ function createRenderSessionContextHarness(overrides: Partial<RenderSessionConte
 		getRetryAttempt: () => 0,
 		ui: { requestRender: vi.fn() },
 		addMessageToChat,
+		showWarning: vi.fn(),
 		...overrides,
 	};
 	Object.setPrototypeOf(harness, InteractiveMode.prototype);
@@ -482,6 +484,43 @@ describe("InteractiveMode.renderSessionContext", () => {
 		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ content: "message 0" });
 		expect(renderAll(chatContainer)).not.toContain("old transcript");
 		expect(renderAll(chatContainer)).not.toContain("for faster open");
+	});
+
+	test("still renders the transcript when tool definition preloading fails", async () => {
+		const showWarning = vi.fn();
+		const { harness, chatContainer, addMessageToChat } = createRenderSessionContextHarness({
+			preloadToolDefinitions: vi.fn(async () => {
+				throw new Error("daemon transport unavailable");
+			}),
+			showWarning,
+		});
+		const messages = [userMessage("message 0", 0), userMessage("message 1", 1)];
+
+		await renderMessages(harness, messages, { clearChat: true });
+
+		expect(showWarning).toHaveBeenCalledWith(expect.stringContaining("daemon transport unavailable"));
+		expect(addMessageToChat).toHaveBeenCalledTimes(2);
+		expect(chatContainer.children).toHaveLength(2);
+	});
+
+	test("keeps rendering later messages when one message fails to render", async () => {
+		const chatContainer = new Container();
+		const addMessageToChat = vi.fn((message: AgentMessage) => {
+			if (message.role === "user" && message.content === "broken") {
+				throw new Error("render boom");
+			}
+			chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
+		});
+		const { harness } = createRenderSessionContextHarness({ chatContainer, addMessageToChat });
+
+		await renderMessages(harness, [userMessage("first", 0), userMessage("broken", 1), userMessage("last", 2)], {
+			clearChat: true,
+		});
+
+		expect(addMessageToChat).toHaveBeenCalledTimes(3);
+		// Two rendered messages plus the inline failure placeholder.
+		expect(chatContainer.children).toHaveLength(3);
+		expect(renderAll(chatContainer)).toContain("Failed to render a user message");
 	});
 
 	test("populates editor history from the full transcript when initial rendering is capped", async () => {
@@ -719,6 +758,7 @@ describe("InteractiveMode working timer", () => {
 			updateWorkingLoaderMessage: vi.fn(),
 			renderSessionContext: vi.fn(async () => {}),
 			restoreStreamingMessageFromSnapshot: vi.fn(async () => {}),
+			showLoadedResources: vi.fn(),
 			showStatus: vi.fn(),
 			stopWorkingLoader: vi.fn(),
 			createWorkingLoader: vi.fn(() => ({})),
@@ -737,6 +777,78 @@ describe("InteractiveMode working timer", () => {
 			timestamp,
 		};
 	}
+
+	test.each(["success", "snapshot failure", "render failure"])(
+		"releases deferred events after the last queued render: %s",
+		async (outcome) => {
+			const snapshot = { state: createConnectionState(), messages: [userMessage("Only one copy.", 100)] };
+			const firstSnapshot = createDeferred<AgentConnectionSnapshot>();
+			const lastSnapshot = createDeferred<AgentConnectionSnapshot>();
+			const flushBufferedSessionEvents = vi.fn(() => new Promise<void>(() => {}));
+			const harness = Object.assign(
+				{},
+				createInitialTimerHarness(snapshot),
+				createRenderSessionContextHarness().harness,
+				{
+					agentConnection: {
+						getInitialSnapshot: vi
+							.fn()
+							.mockReturnValueOnce(firstSnapshot.promise)
+							.mockReturnValueOnce(lastSnapshot.promise),
+						flushBufferedSessionEvents,
+					},
+					renderSessionContext: vi.fn(renderSessionContext),
+				},
+			);
+			Object.setPrototypeOf(harness, InteractiveMode.prototype);
+			const first = harness.renderInitialMessages();
+			const last = harness.renderInitialMessages();
+			const completion =
+				outcome === "success" ? expect(last).resolves.toBeUndefined() : expect(last).rejects.toThrow(outcome);
+			firstSnapshot.resolve(snapshot);
+			await first;
+			expect(flushBufferedSessionEvents).not.toHaveBeenCalled();
+			const firstChildren = [...harness.chatContainer.children];
+			expect(firstChildren.length).toBeGreaterThan(0);
+			if (outcome === "snapshot failure") lastSnapshot.reject(new Error(outcome));
+			else {
+				if (outcome === "render failure") harness.renderSessionContext.mockRejectedValueOnce(new Error(outcome));
+				lastSnapshot.resolve(snapshot);
+			}
+			await completion;
+			expect(flushBufferedSessionEvents).toHaveBeenCalledOnce();
+			expect(harness.chatContainer.children).toHaveLength(firstChildren.length);
+			if (outcome === "success") {
+				expect(harness.chatContainer.children.some((child) => firstChildren.includes(child))).toBe(false);
+			}
+		},
+	);
+
+	test("preserves resource diagnostics through initial and repeated transcript renders", async () => {
+		const snapshot = { state: createConnectionState(), messages: [userMessage("Hello.", 100)] };
+		const harness = Object.assign(
+			{},
+			createInitialTimerHarness(snapshot),
+			createRenderSessionContextHarness().harness,
+			{
+				options: { verbose: false },
+				connectionCommands: [],
+				connectionResourceSnapshot: {
+					diagnostics: { skills: [{ type: "warning", message: "Resource warning" }] },
+				},
+				formatDiagnostics: () => "Resource warning",
+				showLoadedResources: (InteractiveMode.prototype as unknown as { showLoadedResources(): void })
+					.showLoadedResources,
+				renderSessionContext,
+			},
+		);
+		Object.setPrototypeOf(harness, InteractiveMode.prototype);
+		for (let render = 0; render < 2; render++) {
+			await harness.renderInitialMessages();
+			const text = harness.chatContainer.render(80).join("\n");
+			expect(text.match(/Resource warning/g)).toHaveLength(1);
+		}
+	});
 
 	test("restores the first active-run starter instead of a steering message", async () => {
 		const harness = createInitialTimerHarness({
@@ -1181,6 +1293,17 @@ describe("InteractiveMode MCP command", () => {
 		expect(manager.getGlobalMcpServers()).toHaveProperty("fetch");
 	});
 
+	test("prefixes showError output with the warning icon like showWarning", () => {
+		const fakeThis = createRenderedMcpHarness(SettingsManager.inMemory({}));
+
+		fakeThis.showError("boom");
+		expect(normalizeRenderedOutput(fakeThis.chatContainer)).toContain("⚠ Error: boom");
+
+		fakeThis.chatContainer.clear();
+		fakeThis.showWarning("careful");
+		expect(normalizeRenderedOutput(fakeThis.chatContainer)).toContain("⚠ careful");
+	});
+
 	test("refreshes MCP providers before deferring a changed command while busy", async () => {
 		const manager = SettingsManager.inMemory({});
 		const events: string[] = [];
@@ -1475,6 +1598,7 @@ describe("InteractiveMode connection events", () => {
 			updateAvailableProviderCount: vi.fn(async () => {}),
 			updateEditorBorderColor: vi.fn(),
 			updateTerminalTitle: vi.fn(),
+			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -1512,6 +1636,7 @@ describe("InteractiveMode connection events", () => {
 			renderSessionContext: renderSessionContextMock,
 			restoreStreamingMessageFromSnapshot,
 			restoreTurnStartFromMessages: vi.fn(),
+			showLoadedResources: vi.fn(),
 			showStatus: vi.fn(),
 		} as unknown as InteractiveMode;
 
@@ -1527,11 +1652,13 @@ describe("InteractiveMode connection events", () => {
 		).toHaveBeenCalledTimes(2);
 		expect(renderSessionContextMock).toHaveBeenCalledTimes(2);
 		expect(renderSessionContextMock).toHaveBeenNthCalledWith(1, expect.anything(), {
+			clearChat: true,
 			updateFooter: true,
 			populateHistory: true,
 			limitTranscript: true,
 		});
 		expect(renderSessionContextMock).toHaveBeenNthCalledWith(2, expect.anything(), {
+			clearChat: true,
 			updateFooter: true,
 			populateHistory: true,
 			limitTranscript: true,
@@ -1717,6 +1844,7 @@ describe("InteractiveMode connection events", () => {
 			restoreStreamingMessageFromSnapshot: vi.fn(),
 			updatePendingMessagesDisplay: vi.fn(),
 			updateTerminalTitle: vi.fn(),
+			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -1783,6 +1911,7 @@ describe("InteractiveMode connection events", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			flushPendingBashComponents: vi.fn(),
 			updateTerminalTitle: vi.fn(),
+			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -1803,7 +1932,11 @@ describe("InteractiveMode connection events", () => {
 		expect((fakeThis as unknown as { activeBashComponent: unknown }).activeBashComponent).toBe(activeBashComponent);
 		expect(
 			(fakeThis as unknown as { renderSessionContext: ReturnType<typeof vi.fn> }).renderSessionContext,
-		).toHaveBeenCalledWith(expect.anything(), { clearChat: true, updateFooter: true });
+		).toHaveBeenCalledWith(expect.anything(), {
+			clearChat: true,
+			updateFooter: true,
+			limitTranscript: true,
+		});
 		expect(startAssistantStreamingMessage).toHaveBeenCalledWith(streamingMessage);
 		expect((fakeThis as unknown as { turnStartedAt: number | undefined }).turnStartedAt).toBe(100);
 		expect((fakeThis as unknown as { workingStartedAt: number | undefined }).workingStartedAt).toBe(100);
@@ -1840,6 +1973,7 @@ describe("InteractiveMode connection events", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			flushPendingBashComponents,
 			updateTerminalTitle: vi.fn(),
+			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -2166,7 +2300,7 @@ describe("InteractiveMode transcript rebuild", () => {
 
 		await fakeThis.rebuildChatFromMessages();
 
-		expect(fakeThis.renderSessionContext).toHaveBeenCalledWith(context, { clearChat: true });
+		expect(fakeThis.renderSessionContext).toHaveBeenCalledWith(context, { clearChat: true, limitTranscript: true });
 		expect(fakeThis.chatContainer.children).toEqual([rebuiltChild]);
 		expect(fakeThis.chatContainer.children).not.toContain(staleChild);
 	});
@@ -2376,6 +2510,7 @@ describe("InteractiveMode model selection persistence", () => {
 			getLoginProviderOptions(): ReadonlyArray<AuthSelectorProvider>;
 			loginProvider(provider: AuthSelectorProvider): Promise<AuthenticationResult>;
 		};
+		prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean>;
 		ensureModelProviderConfigured(
 			model: AgentConnectionModel,
 			authFlows: ReturnType<ModelSelectorHarness["createAuthFlows"]>,
@@ -2495,6 +2630,7 @@ describe("InteractiveMode model selection persistence", () => {
 			getLoginProviderOptions: () => options.providerOptions ?? [],
 			loginProvider: options.loginProvider ?? (async () => ({ status: "cancelled" as const })),
 		}));
+		fakeThis.prepareForModelSelectionAfterLogin = selectorPrototype.prepareForModelSelectionAfterLogin;
 		fakeThis.applySelectedModel = options.applySelectedModel ?? vi.fn(async () => {});
 		fakeThis.ensureModelProviderConfigured = selectorPrototype.ensureModelProviderConfigured;
 		fakeThis.completeModelSelection = selectorPrototype.completeModelSelection;
@@ -2931,6 +3067,47 @@ describe("InteractiveMode model selection persistence", () => {
 		await expect(result).resolves.toBeUndefined();
 	});
 
+	test("keeps the providers tab after a successful provider login", async () => {
+		const provider: AuthSelectorProvider = { id: "openai", name: "OpenAI", authType: "api_key" };
+		const loginProvider = vi.fn(async (): Promise<AuthenticationResult> => {
+			// Successful logins store the credential, so the row flips to configured.
+			fakeThis.uiServices.modelRegistry.authStorage.set(provider.id, {
+				type: "api_key",
+				key: "test-key",
+			});
+			return {
+				status: "success",
+				providerId: provider.id,
+				providerName: provider.name,
+				authType: provider.authType,
+			};
+		});
+		const { fakeThis, getSelector } = createSelectorHarness({
+			connectionModels: [createModel("openai", "gpt-5.5")],
+			providerOptions: [provider],
+			loginProvider,
+		});
+		const prepareForModelSelection = vi.spyOn(fakeThis, "prepareForModelSelectionAfterLogin");
+
+		const result = fakeThis.showConfigurationMenu("providers");
+
+		expect(getSelector().getActiveTab()).toBe("providers");
+		getSelector().handleInput("\r");
+		await flushAsyncWork();
+
+		expect(loginProvider).toHaveBeenCalledWith(provider);
+		expect(prepareForModelSelection).toHaveBeenCalledTimes(1);
+		// Finishing a login stays on the providers tab with the provider configured.
+		expect(getSelector().getActiveTab()).toBe("providers");
+		expect(fakeThis.editorContainer.children).toEqual([getSelector()]);
+		expect(fakeThis.ui.setFocus).toHaveBeenLastCalledWith(getSelector());
+		expect(stripAnsi(getSelector().render(120).join("\n"))).toContain("configured");
+
+		getSelector().handleInput("\x1b");
+		await expect(result).resolves.toBeUndefined();
+		expect(fakeThis.editorContainer.children).toEqual([fakeThis.editor]);
+	});
+
 	test("refreshes model selector results in the background without clearing search", async () => {
 		const alpha = createModel("openai", "alpha");
 		const beta = { ...createModel("openai", "beta"), name: "Beta Model" };
@@ -3232,6 +3409,7 @@ describe("InteractiveMode session switch command catalog", () => {
 				updateAvailableProviderCount: vi.fn(async () => {}),
 				updateEditorBorderColor: vi.fn(),
 				updateTerminalTitle: vi.fn(),
+				refreshTopBarCost: vi.fn(),
 				setGoalAnnouncementBaseline: vi.fn(),
 				syncGoalTray: vi.fn(),
 				getGoalState: () => emptyGoalState(),
@@ -3296,16 +3474,17 @@ describe("InteractiveMode session switch command catalog", () => {
 
 describe("InteractiveMode Prime CLI onboarding", () => {
 	type OnboardingSplashHandle = {
-		showProgress(message: string): void;
 		dismiss(): void;
 	};
 	type OnboardingHarness = {
 		shouldRunOnboarding(): boolean;
 		markOnboardingShown(): void;
 		runStartupOnboarding(): Promise<boolean>;
-		runOnboardingFlow(showPrimeCliSplash?: boolean): Promise<void>;
+		runOnboardingFlow(): Promise<boolean>;
 		applySelectedModel(model: AgentConnectionModel): Promise<void>;
 		prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean>;
+		askOnboardingProviders(signal: AbortSignal): Promise<void>;
+		askOnboardingTraceOptIn(): Promise<void>;
 		setupAutocompleteProvider(): void;
 	};
 	type OnboardingFake = OnboardingHarness & {
@@ -3325,6 +3504,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				getOnboardingShown: () => boolean;
 				setOnboardingShown: (shown: boolean) => void;
 				setDefaultModelAndProvider: (provider: string, modelId: string) => void;
+				getAgentTracesEnabled: () => boolean;
 				flush: () => Promise<void>;
 			};
 		};
@@ -4003,6 +4183,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				getOnboardingShown: vi.fn(() => shown),
 				setOnboardingShown: vi.fn(),
 				setDefaultModelAndProvider: vi.fn(),
+				getAgentTracesEnabled: vi.fn(() => false),
 				flush: vi.fn(async () => {}),
 			},
 		};
@@ -4031,7 +4212,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		expect(fakeThis.uiServices.settingsManager.setOnboardingShown).toHaveBeenCalledWith(true);
 	});
 
-	test("persists onboarding before opening the one-shot flow", async () => {
+	test("persists onboarding only after the flow completes", async () => {
 		let shown = false;
 		let flushed = false;
 		const fakeThis = createPrimeCliHarness(false);
@@ -4042,70 +4223,53 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		fakeThis.uiServices.settingsManager.flush = vi.fn(async () => {
 			flushed = true;
 		});
-		fakeThis.runOnboardingFlow = vi.fn(async (showPrimeCliSplash?: boolean) => {
-			expect(showPrimeCliSplash).toBe(true);
-			expect(shown).toBe(true);
-			expect(flushed).toBe(true);
+		fakeThis.runOnboardingFlow = vi.fn(async () => {
+			expect(shown).toBe(false);
+			expect(flushed).toBe(false);
+			return true;
 		});
 
 		await expect(runStartupOnboarding.call(fakeThis)).resolves.toBe(true);
 
 		expect(fakeThis.uiServices.settingsManager.setOnboardingShown).toHaveBeenCalledWith(true);
 		expect(fakeThis.uiServices.settingsManager.flush).toHaveBeenCalledTimes(1);
-		expect(fakeThis.runOnboardingFlow).toHaveBeenCalledWith(true);
 	});
 
-	test("cancelled Prime CLI splash exits onboarding before opening configuration", async () => {
+	test("reports no completion when the block never mounts", async () => {
 		const fakeThis = createPrimeCliHarness(false);
 		fakeThis.showOnboardingSplash = vi.fn(async () => undefined);
 		fakeThis.showConfigurationMenu = vi.fn(async () => {});
 
-		await expect(runOnboardingFlow.call(fakeThis)).resolves.toBeUndefined();
+		await expect(runOnboardingFlow.call(fakeThis)).resolves.toBe(false);
 
 		expect(fakeThis.showConfigurationMenu).not.toHaveBeenCalled();
 	});
 
-	test("opens the Models tab after the Prime CLI splash", async () => {
+	test("skips the sign-in flow when the model already works, even with Prime CLI credentials on disk", async () => {
 		const fakeThis = createPrimeCliHarness(false);
-		const configuration = createDeferred<void>();
 		const dismiss = vi.fn();
-		fakeThis.showOnboardingSplash = vi.fn(async () => ({ showProgress: vi.fn(), dismiss }));
-		fakeThis.showConfigurationMenu = vi.fn(() => configuration.promise);
+		fakeThis.showOnboardingSplash = vi.fn(async () => ({ dismiss }));
+		fakeThis.askOnboardingTraceOptIn = vi.fn(async () => {});
+		fakeThis.createAuthFlows = vi.fn();
+		fakeThis.prepareForModelSelectionAfterLogin = vi.fn(async () => true);
+		fakeThis.showConfigurationMenu = vi.fn(async () => {});
 
-		const onboarding = runOnboardingFlow.call(fakeThis);
-		await flushAsyncWork();
+		await expect(runOnboardingFlow.call(fakeThis)).resolves.toBe(true);
 
-		expect(fakeThis.showConfigurationMenu).toHaveBeenCalledWith("models");
+		expect(fakeThis.showOnboardingSplash).toHaveBeenCalledWith({ immediate: true });
+		expect(fakeThis.createAuthFlows).not.toHaveBeenCalled();
+		expect(fakeThis.prepareForModelSelectionAfterLogin).not.toHaveBeenCalled();
+		expect(fakeThis.askOnboardingTraceOptIn).toHaveBeenCalledTimes(1);
+		// The model picker is no longer part of first launch.
+		expect(fakeThis.showConfigurationMenu).not.toHaveBeenCalled();
 		expect(dismiss).toHaveBeenCalledOnce();
-		expect(dismiss.mock.invocationCallOrder[0]).toBeLessThan(
-			vi.mocked(fakeThis.showConfigurationMenu).mock.invocationCallOrder[0]!,
-		);
-
-		configuration.resolve();
-		await expect(onboarding).resolves.toBeUndefined();
-
-		expect(dismiss).toHaveBeenCalledTimes(1);
 	});
 
-	test("opens the Models tab when models are already available", async () => {
+	test("never opens the model picker, even when models are already available", async () => {
 		const fakeThis = createPrimeCliHarness(false);
 		fakeThis.connectionState = createConnectionState({ model: undefined });
 		fakeThis.getModelCandidates = vi.fn(async () => [primeModel]);
-		fakeThis.showConfigurationMenu = vi.fn(async () => {});
-
-		await expect(runOnboardingFlow.call(fakeThis, false)).resolves.toBeUndefined();
-
-		expect(fakeThis.getModelCandidates).toHaveBeenCalledTimes(1);
-		expect(fakeThis.showConfigurationMenu).toHaveBeenCalledWith("models");
-	});
-
-	test("opens Prime login before the Models tab when no models are available", async () => {
-		const fakeThis = createPrimeCliHarness(false);
-		fakeThis.connectionState = createConnectionState({ model: undefined });
-		fakeThis.getModelCandidates = vi.fn(async () => []);
-		const showProgress = vi.fn();
-		const dismiss = vi.fn();
-		fakeThis.showOnboardingSplash = vi.fn(async () => ({ showProgress, dismiss }));
+		fakeThis.showOnboardingSplash = vi.fn(async () => ({ showProgress: vi.fn(), dismiss: vi.fn() }));
 		fakeThis.createAuthFlows = vi.fn(() => ({
 			runPrimeInferenceLogin: vi.fn(async () => ({
 				status: "success" as const,
@@ -4116,26 +4280,106 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			})),
 		}));
 		fakeThis.prepareForModelSelectionAfterLogin = vi.fn(async () => true);
-		const configuration = createDeferred<void>();
-		fakeThis.showConfigurationMenu = vi.fn(() => configuration.promise);
+		fakeThis.showConfigurationMenu = vi.fn(async () => {});
 
-		const onboarding = runOnboardingFlow.call(fakeThis, false);
-		await flushAsyncWork();
+		await expect(runOnboardingFlow.call(fakeThis)).resolves.toBe(true);
 
-		expect(fakeThis.showOnboardingSplash).toHaveBeenCalledWith();
-		expect(showProgress).toHaveBeenNthCalledWith(1, "Signing in to Prime Intellect...");
-		expect(showProgress).toHaveBeenNthCalledWith(2, "Preparing models...");
-		expect(fakeThis.prepareForModelSelectionAfterLogin).toHaveBeenCalledTimes(1);
-		expect(fakeThis.showConfigurationMenu).toHaveBeenCalledWith("models");
-		expect(dismiss).toHaveBeenCalledOnce();
-		expect(dismiss.mock.invocationCallOrder[0]).toBeLessThan(
-			vi.mocked(fakeThis.showConfigurationMenu).mock.invocationCallOrder[0]!,
+		expect(fakeThis.showConfigurationMenu).not.toHaveBeenCalled();
+	});
+
+	test("keeps onboarding pending when a configured user cancels the sign-in", async () => {
+		// The harness already carries a working model and stored credentials.
+		const fakeThis = createPrimeCliHarness(false);
+		fakeThis.uiServices.settingsManager.setOnboardingShown = vi.fn();
+		fakeThis.uiServices.settingsManager.flush = vi.fn(async () => {});
+		// The user already has a working model, so readiness alone would look like
+		// a completed flow; only the flow's own result may persist the flag.
+		fakeThis.runOnboardingFlow = vi.fn(async () => false);
+
+		await expect(runStartupOnboarding.call(fakeThis)).resolves.toBe(true);
+
+		expect(fakeThis.uiServices.settingsManager.setOnboardingShown).not.toHaveBeenCalled();
+		expect(fakeThis.uiServices.settingsManager.flush).not.toHaveBeenCalled();
+	});
+
+	test("reports no completion when a reset interrupts the trace question", async () => {
+		const fakeThis = createPrimeCliHarness(false);
+		fakeThis.showOnboardingSplash = vi.fn(async () => ({ dismiss: vi.fn() }));
+		// The reset settles the trace question and aborts the flow behind it.
+		fakeThis.askOnboardingTraceOptIn = vi.fn(async () => {
+			(fakeThis as unknown as { onboardingFlowAbort?: AbortController }).onboardingFlowAbort?.abort();
+		});
+
+		await expect(runOnboardingFlow.call(fakeThis)).resolves.toBe(false);
+	});
+
+	test("stops asking for providers once the flow is aborted", async () => {
+		const askOnboardingProviders = (InteractiveMode.prototype as unknown as OnboardingHarness).askOnboardingProviders;
+		const abort = new AbortController();
+		const showInlineAuthPanel = vi.fn();
+		const fakeThis = {
+			onboardingSplash: { setPanel: vi.fn(), getActivePanel: () => undefined },
+			onboardingFlowAbort: abort,
+			createAuthFlows: vi.fn(() => ({
+				getLoginProviderOptions: vi.fn(() => [{ id: "openai", name: "OpenAI", category: "provider" }]),
+			})),
+			modelRegistry: { getProviderAuthStatus: vi.fn(() => ({ configured: false })) },
+			ui: { requestRender: vi.fn() },
+			showInlineAuthPanel,
+		};
+		// A reset aborts the flow and then tears the block down, which clears the
+		// field: the question has to end on the signal it was handed.
+		abort.abort();
+		fakeThis.onboardingFlowAbort = undefined as unknown as AbortController;
+
+		await expect(askOnboardingProviders.call(fakeThis, abort.signal)).resolves.toBeUndefined();
+
+		expect(showInlineAuthPanel).not.toHaveBeenCalled();
+	});
+
+	test("settles the pending step when a reset unmounts its panel", () => {
+		const showInlineAuthPanel = (
+			InteractiveMode.prototype as unknown as {
+				showInlineAuthPanel(component: unknown, options?: { onReset?: () => void }): (reason?: "reset") => void;
+			}
+		).showInlineAuthPanel;
+		const closers: ((reason?: "reset") => void)[] = [];
+		const fakeThis = {
+			onboardingSplash: { setPanel: vi.fn(), getActivePanel: () => undefined },
+			ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+			inlineAuthPanelClosers: closers,
+		};
+		let settled = false;
+		showInlineAuthPanel.call(
+			fakeThis,
+			{},
+			{
+				onReset: () => {
+					settled = true;
+				},
+			},
 		);
 
-		configuration.resolve();
-		await expect(onboarding).resolves.toBeUndefined();
+		closers[0]?.("reset");
 
-		expect(dismiss).toHaveBeenCalledTimes(1);
+		expect(settled).toBe(true);
+	});
+
+	test("ends the flow when the sign-in does not succeed", async () => {
+		// Without a working model the user still needs the full sign-in flow.
+		const fakeThis = createPrimeCliHarness(false);
+		fakeThis.connectionState = createConnectionState({ model: undefined });
+		const dismiss = vi.fn();
+		fakeThis.showOnboardingSplash = vi.fn(async () => ({ dismiss }));
+		fakeThis.createAuthFlows = vi.fn(() => ({
+			runPrimeInferenceLogin: vi.fn(async () => ({ status: "cancelled" as const })),
+		}));
+		fakeThis.prepareForModelSelectionAfterLogin = vi.fn(async () => true);
+
+		await expect(runOnboardingFlow.call(fakeThis)).resolves.toBe(false);
+
+		expect(fakeThis.prepareForModelSelectionAfterLogin).not.toHaveBeenCalled();
+		expect(dismiss).toHaveBeenCalledOnce();
 	});
 });
 
@@ -5625,4 +5869,166 @@ test("session teardown removes a running refine loader without remounting anythi
 	expect(statusContainer.children).toHaveLength(0);
 	expect((fakeThis as unknown as { refineLoader?: unknown }).refineLoader).toBeUndefined();
 	expect((fakeThis as unknown as { syncWorkingLoader: () => void }).syncWorkingLoader).not.toHaveBeenCalled();
+});
+
+test("session reset tears down an inline auth panel and restores the editor", () => {
+	initTheme("dark");
+	const editor = new Input();
+	const editorContainer = new Container();
+	editorContainer.addChild(editor);
+	const setFocus = vi.fn();
+	const fakeThis = {
+		editor,
+		editorContainer,
+		ui: { requestRender: vi.fn(), setFocus, hideOverlay: vi.fn(), terminal: { rows: 24 } } as unknown as TUI,
+		inlineAuthPanelClosers: [] as Array<() => void>,
+		cancelActiveConnectionExtensionUiRequests: vi.fn(),
+		closeHeartbeatManager: vi.fn(),
+		clearExtensionTerminalInputListeners: vi.fn(),
+		setExtensionFooter: vi.fn(),
+		setExtensionHeader: vi.fn(),
+		clearExtensionWidgets: vi.fn(),
+		footerDataProvider: { clearExtensionStatuses: vi.fn() },
+		footer: { invalidate: vi.fn() },
+		autocompleteProviderWrappers: [],
+		setCustomEditorComponent: vi.fn(),
+		setupAutocompleteProvider: vi.fn(),
+		defaultEditor: {},
+		updateTerminalTitle: vi.fn(),
+		refreshTopBarCost: vi.fn(),
+		setWorkingIndicator: vi.fn(),
+	} as unknown as InteractiveMode;
+	Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+	const prototype = InteractiveMode.prototype as unknown as {
+		showInlineAuthPanel(component: Component): () => void;
+		resetExtensionUI(): void;
+	};
+	const closers = () => (fakeThis as unknown as { inlineAuthPanelClosers: unknown[] }).inlineAuthPanelClosers;
+
+	const panel = new Container();
+	const close = prototype.showInlineAuthPanel.call(fakeThis, panel);
+
+	expect(editorContainer.children).toEqual([panel]);
+	expect(closers()).toEqual([close]);
+
+	prototype.resetExtensionUI.call(fakeThis);
+
+	expect(editorContainer.children).toEqual([editor]);
+	expect(setFocus).toHaveBeenLastCalledWith(editor);
+	expect(closers()).toEqual([]);
+
+	// The auth flow's own close runs after the reset and must not restore the
+	// stale pre-panel content over a picker opened in the meantime.
+	const otherPicker = new Container();
+	editorContainer.clear();
+	editorContainer.addChild(otherPicker);
+	close();
+	expect(editorContainer.children).toEqual([otherPicker]);
+});
+
+test("session reset tears down stacked inline auth panels innermost first", () => {
+	initTheme("dark");
+	const editor = new Input();
+	const editorContainer = new Container();
+	editorContainer.addChild(editor);
+	const fakeThis = {
+		editor,
+		editorContainer,
+		ui: { requestRender: vi.fn(), setFocus: vi.fn(), hideOverlay: vi.fn(), terminal: { rows: 24 } } as unknown as TUI,
+		inlineAuthPanelClosers: [] as Array<() => void>,
+		cancelActiveConnectionExtensionUiRequests: vi.fn(),
+		closeHeartbeatManager: vi.fn(),
+		clearExtensionTerminalInputListeners: vi.fn(),
+		setExtensionFooter: vi.fn(),
+		setExtensionHeader: vi.fn(),
+		clearExtensionWidgets: vi.fn(),
+		footerDataProvider: { clearExtensionStatuses: vi.fn() },
+		footer: { invalidate: vi.fn() },
+		autocompleteProviderWrappers: [],
+		setCustomEditorComponent: vi.fn(),
+		setupAutocompleteProvider: vi.fn(),
+		defaultEditor: {},
+		updateTerminalTitle: vi.fn(),
+		refreshTopBarCost: vi.fn(),
+		setWorkingIndicator: vi.fn(),
+	} as unknown as InteractiveMode;
+	Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+	const prototype = InteractiveMode.prototype as unknown as {
+		showInlineAuthPanel(component: Component): () => void;
+		resetExtensionUI(): void;
+	};
+	const closers = () => (fakeThis as unknown as { inlineAuthPanelClosers: unknown[] }).inlineAuthPanelClosers;
+
+	const dialog = new Container();
+	const closeDialog = prototype.showInlineAuthPanel.call(fakeThis, dialog);
+	const teamSelector = new Container();
+	const closeSelector = prototype.showInlineAuthPanel.call(fakeThis, teamSelector);
+	expect(editorContainer.children).toEqual([teamSelector]);
+	expect(closers()).toEqual([closeDialog, closeSelector]);
+
+	prototype.resetExtensionUI.call(fakeThis);
+
+	expect(editorContainer.children).toEqual([editor]);
+	expect(closers()).toEqual([]);
+
+	// Late closes from the interrupted flows stay no-ops.
+	editorContainer.clear();
+	editorContainer.addChild(new Container());
+	closeSelector();
+	closeDialog();
+	expect(editorContainer.children).toHaveLength(1);
+});
+
+test("normal inline auth panel close unwinds the tracked session-reset stack", () => {
+	initTheme("dark");
+	const editor = new Input();
+	const editorContainer = new Container();
+	editorContainer.addChild(editor);
+	const fakeThis = {
+		editor,
+		editorContainer,
+		ui: { requestRender: vi.fn(), setFocus: vi.fn(), hideOverlay: vi.fn(), terminal: { rows: 24 } } as unknown as TUI,
+		inlineAuthPanelClosers: [] as Array<() => void>,
+		cancelActiveConnectionExtensionUiRequests: vi.fn(),
+		closeHeartbeatManager: vi.fn(),
+		clearExtensionTerminalInputListeners: vi.fn(),
+		setExtensionFooter: vi.fn(),
+		setExtensionHeader: vi.fn(),
+		clearExtensionWidgets: vi.fn(),
+		footerDataProvider: { clearExtensionStatuses: vi.fn() },
+		footer: { invalidate: vi.fn() },
+		autocompleteProviderWrappers: [],
+		setCustomEditorComponent: vi.fn(),
+		setupAutocompleteProvider: vi.fn(),
+		defaultEditor: {},
+		updateTerminalTitle: vi.fn(),
+		refreshTopBarCost: vi.fn(),
+		setWorkingIndicator: vi.fn(),
+	} as unknown as InteractiveMode;
+	Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+	const prototype = InteractiveMode.prototype as unknown as {
+		showInlineAuthPanel(component: Component): () => void;
+		resetExtensionUI(): void;
+	};
+	const closers = () => (fakeThis as unknown as { inlineAuthPanelClosers: unknown[] }).inlineAuthPanelClosers;
+
+	const dialog = new Container();
+	const closeDialog = prototype.showInlineAuthPanel.call(fakeThis, dialog);
+	const teamSelector = new Container();
+	const closeSelector = prototype.showInlineAuthPanel.call(fakeThis, teamSelector);
+
+	// The selector unwinds first and re-tracks the dialog underneath it.
+	closeSelector();
+	expect(editorContainer.children).toEqual([dialog]);
+	expect(closers()).toEqual([closeDialog]);
+
+	closeDialog();
+	expect(editorContainer.children).toEqual([editor]);
+	expect(closers()).toEqual([]);
+
+	// A session reset after the panels already closed restores nothing extra.
+	editorContainer.clear();
+	editorContainer.addChild(new Container());
+	prototype.resetExtensionUI.call(fakeThis);
+	expect(editorContainer.children).toHaveLength(1);
 });

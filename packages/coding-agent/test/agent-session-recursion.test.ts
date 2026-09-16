@@ -105,6 +105,7 @@ interface InspectableRlmRun {
 	error?: string;
 	abandonedForQuiescence?: boolean;
 	activity?: { kind: string };
+	progressNotes?: string[];
 	emitUpdate?: () => void;
 	publication?: { promise: Promise<void>; resolve(): void; reject(error: Error): void };
 	settlement?: { promise: Promise<void>; resolve(): void; reject(error: Error): void };
@@ -794,6 +795,7 @@ describe("AgentSession rlm recursion", () => {
 				abort: () => {},
 				status: index === 1 ? "queued" : "running",
 				settled: false,
+				progressNotes: [],
 			});
 
 			if (hiding === "detached") {
@@ -806,6 +808,7 @@ describe("AgentSession rlm recursion", () => {
 					abort: () => {},
 					status: "cancelled",
 					settled: false,
+					progressNotes: [],
 					detachedDeletion: {
 						rlm_child_id: id,
 						active_session_id: null,
@@ -2280,6 +2283,11 @@ describe("AgentSession rlm recursion", () => {
 					session_name: expectedSessionName,
 					session_dir: result.session_dir,
 					status: "completed",
+					answer_preview: "child answer: retained worker",
+					duration_ms: expect.any(Number),
+					label: "retained worker",
+					last_activity_at: expect.any(Number),
+					replied_since_task: false,
 				},
 			],
 		};
@@ -2551,6 +2559,10 @@ describe("AgentSession rlm recursion", () => {
 					session_name: createDefaultRlmSubagentSessionName("slow shard", rootRun.id),
 					session_dir: rootRun.sessionDir,
 					status: "running",
+					activity: { kind: "waiting" },
+					label: "slow shard",
+					last_activity_at: expect.any(Number),
+					replied_since_task: false,
 				},
 			],
 		});
@@ -3900,6 +3912,7 @@ describe("AgentSession rlm recursion", () => {
 			abort: () => {},
 			status: "running",
 			settled: false,
+			progressNotes: [],
 		});
 		const root = createSession();
 		const rootInternals = root as unknown as InspectableRlmSession;
@@ -3915,6 +3928,7 @@ describe("AgentSession rlm recursion", () => {
 			publication: deferred(),
 			settlement: deferred(),
 			session: child,
+			progressNotes: [],
 		};
 		rootInternals._activeRlmChildRuns.set(run.id, run);
 		rootInternals._unsettledRlmChildRuns.add(run);

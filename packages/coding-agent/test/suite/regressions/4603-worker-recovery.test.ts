@@ -95,6 +95,12 @@ const fixturePath = resolve(__dirname, "../../fixtures/eng-4600-supervisor-fixtu
 const fauxExtensionPath = resolve(__dirname, "../../fixtures/eng-4600-faux-extension.ts");
 const cliPath = resolve(__dirname, "../../../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/cli.mjs");
+// The fixture must run in the spawned process itself: the tsx CLI wrapper forks,
+// which would leave the spawned pid owning only tsx IPC pipes while the real
+// supervisor (and its daemon socket) hides in an untracked child pid — invisible
+// to the OS socket sweep this regression exercises. `--import` with tsx's ESM
+// loader runs the TypeScript fixture in-process.
+const tsxLoaderPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/esm/index.mjs");
 const tsconfigPath = resolve(__dirname, "../../../../../tsconfig.json");
 const supervisorRegistryDirEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 const handles = new Set<ProcessHandle>();
@@ -157,7 +163,7 @@ async function createPaths(): Promise<TestPaths> {
 
 function spawnSupervisor(paths: TestPaths): ProcessHandle {
 	return trackProcess(
-		spawn(paths.executablePath, [tsxPath, fixturePath], {
+		spawn(paths.executablePath, ["--import", tsxLoaderPath, fixturePath], {
 			cwd: paths.agentDir,
 			env: {
 				...process.env,
@@ -1069,6 +1075,8 @@ describe("ENG-4603 worker recovery convergence", () => {
 		client.close();
 		// Keep the process scan inside the fixture. A host `ss`/`lsof` would also
 		// expose unrelated live Prime Agent daemons to the destructive CLI pass.
+		// A predecessor may unlink the shared path while its successor still owns
+		// the listening socket; report fixture processes until they actually exit.
 		const unrelatedPaths = await createPaths();
 		const unrelated = spawnSupervisor(unrelatedPaths);
 		await waitForType(unrelated, "booted");
@@ -1078,9 +1086,6 @@ describe("ENG-4603 worker recovery convergence", () => {
 		writeFileSync(
 			ssPath,
 			`#!/bin/sh
-if [ ! -S "$ENG_4603_SCAN_SOCKET" ]; then
-  exit 0
-fi
 old_ifs="$IFS"
 IFS=,
 for pid in $ENG_4603_SCAN_PIDS; do
@@ -1121,7 +1126,17 @@ exit 0
 			{ pid: currentSupervisorPid, processStartId: currentSupervisorStartId },
 		].filter((identity) => exactProcessIsAlive(identity.pid, identity.processStartId));
 		if (survivingIdentities.length > 0) {
-			expect(shutdownResult.failed).not.toHaveLength(0);
+			expect(
+				shutdownResult.failed,
+				JSON.stringify({
+					shutdownResult,
+					survivingIdentities,
+					predecessor: predecessor.child.pid,
+					successor: successor.child.pid,
+					workerPid,
+					currentSupervisorPid,
+				}),
+			).not.toHaveLength(0);
 		}
 		expect(shutdownResult).toMatchObject({ stopped: expect.any(Array), failed: [] });
 		await waitForExactProcessExit(predecessor.child.pid!, predecessorStartId);

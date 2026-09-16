@@ -29,6 +29,7 @@ import {
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
+	isFocusable,
 	Loader,
 	type LoaderIndicatorOptions,
 	Markdown,
@@ -120,7 +121,7 @@ import {
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
 import { parseNewSessionCommand } from "../../core/new-session-command.js";
-import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
+import { PRIME_INFERENCE_PROVIDER_ID, resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
 import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
@@ -150,7 +151,7 @@ import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool, ensureToolWithStatus, formatMissingRipgrepMessage } from "../../utils/tools-manager.js";
-import { checkForNewPiVersion } from "../../utils/version-check.js";
+import { checkForNewPiVersion, resolveUpdateChannel } from "../../utils/version-check.js";
 import type {
 	AgentConnection,
 	AgentConnectionExtensionUiRequest,
@@ -222,6 +223,8 @@ import {
 } from "./components/keybinding-hints.js";
 import { createMermaidMarkdownTransform } from "./components/mermaid.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
+import { OnboardingChoiceComponent } from "./components/onboarding-choice.js";
+import { OnboardingPickerComponent } from "./components/onboarding-picker.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { PromptContextLine } from "./components/prompt-context-line.js";
 import { styleArgumentTokens } from "./components/prompt-highlight.js";
@@ -250,6 +253,7 @@ import {
 	ToolExecutionComponent,
 	type ToolExecutionDefinition,
 } from "./components/tool-execution.js";
+import { TopBar } from "./components/top-bar.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
@@ -266,12 +270,7 @@ import type {
 	InteractiveModeLocalToolRendererDefinition,
 	InteractiveModeUiServices,
 } from "./interactive-mode-services.js";
-import {
-	isOnboardingModelReady,
-	type OnboardingStartupState,
-	shouldRunOnboarding,
-	shouldRunPrimeCliOnboardingSplash,
-} from "./onboarding.js";
+import { isOnboardingModelReady, type OnboardingStartupState, shouldRunOnboarding } from "./onboarding.js";
 import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
 import { QueueSelection, type QueueSelectionItem } from "./queue-selection.js";
 import { formatResumeHint } from "./resume-hint.js";
@@ -432,6 +431,13 @@ export interface BrandSplashHeaderOptions {
 	topPadding?: boolean;
 	getModelId?: () => string | undefined;
 	getExtraMetadata?: () => readonly BrandSplashMetadataLine[];
+	/** Suppress the header entirely, e.g. while inline onboarding owns the top rows. */
+	getHidden?: () => boolean;
+}
+
+/** Flow panels that can settle their pending step when unmounted early. */
+function isAbortablePanel(component: Component): component is Component & { abort(): void } {
+	return typeof (component as { abort?: unknown }).abort === "function";
 }
 
 export class BrandSplashHeader implements Component {
@@ -454,6 +460,9 @@ export class BrandSplashHeader implements Component {
 	}
 
 	render(width: number): string[] {
+		if (this.options.getHidden?.()) {
+			return [];
+		}
 		const safeWidth = Math.max(1, width);
 		const paddingX = safeWidth > 1 ? 1 : 0;
 		const contentWidth = Math.max(1, safeWidth - paddingX * 2);
@@ -529,7 +538,6 @@ type GoalAnnouncementSnapshot = {
 type ModelFallbackWarningAction = "show" | "suppress";
 
 interface OnboardingSplashHandle {
-	showProgress(message: string): void;
 	dismiss(): void;
 }
 
@@ -579,6 +587,39 @@ const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 // evicted past the cap to keep a long session bounded.
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
 const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
+// Coalesce at most this many heartbeats_changed refreshes into one refresh
+// promise; sustained churn must not hold rebindCurrentSession in a drain loop.
+const HEARTBEAT_REFRESH_DRAIN_LIMIT = 25;
+// A busy daemon can serialize a catalog fetch behind session work or worker
+// recovery for minutes; the TUI waits at most this long before keeping the
+// last catalog and letting the next heartbeats_changed event retry.
+export const HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS = 10_000;
+// After a deadline expiry, retry the open manager's refresh on this short
+// cadence so the view always has a next scheduled retrieval even when no
+// heartbeats_changed event arrives and the catalog has no nextRunAt to
+// schedule from.
+export const HEARTBEAT_REFRESH_RETRY_DELAY_MS = 5_000;
+
+/** Race a catalog fetch against the refresh deadline; resolves undefined on expiry. */
+async function fetchHeartbeatsWithinDeadline(
+	fetch: Promise<AgentConnectionHeartbeat[]>,
+): Promise<AgentConnectionHeartbeat[] | undefined> {
+	// The deadline can settle first; a late failure must not surface as an
+	// unhandled rejection after this refresh has moved on.
+	void fetch.catch(() => undefined);
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			fetch,
+			new Promise<undefined>((resolve) => {
+				timeout = setTimeout(() => resolve(undefined), HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS);
+				timeout.unref?.();
+			}),
+		]);
+	} finally {
+		clearTimeout(timeout);
+	}
+}
 
 function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
 	if (messages.length <= INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
@@ -943,6 +984,7 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
+	private initializationPromise: Promise<void> | undefined;
 	private onInputCallback?: (text: string | undefined) => void;
 	private submittedInputBehavior: "steer" | "followUp" = "steer";
 	private latestEditorPromptStash: PromptStash | undefined;
@@ -953,6 +995,7 @@ export class InteractiveMode {
 	private readonly retainedSubmissionGenerations = new WeakMap<PromptStash, number>();
 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private agentsViewRequest: InteractiveModeRunResult["type"] | undefined;
+	private isReturningToAgentsView = false;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
 	private workingVisible = true;
@@ -1007,6 +1050,9 @@ export class InteractiveMode {
 
 	// Serializes session event handling; see subscribeToAgent
 	private sessionEventQueue: Promise<void> = Promise.resolve();
+	// The in-flight initial transcript render, if any. Session resync/replacement
+	// renders await it so they never interleave with a half-built transcript.
+	private initialRenderPromise: Promise<void> | undefined = undefined;
 	private sessionEventGeneration = 0;
 	private fastModeToggleQueue: Promise<void> = Promise.resolve();
 
@@ -1044,6 +1090,7 @@ export class InteractiveMode {
 	private connectionModelsRefreshVersion = 0;
 	private connectionModelsRefreshInFlight: { version: number; promise: Promise<AgentConnectionModel[]> } | undefined;
 	private closeConfigurationMenu: (() => void) | undefined;
+	private inlineAuthPanelClosers: ((reason?: "reset") => void)[] = [];
 	private configurationModelSelection: Promise<void> | undefined;
 	private connectionState: AgentConnectionState | undefined;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
@@ -1059,6 +1106,15 @@ export class InteractiveMode {
 	private heartbeatManagerHandle: OverlayHandle | undefined;
 	private heartbeatManagerRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	private heartbeatManagerRefreshAt: number | undefined;
+	private heartbeatManagerFetchRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	// Last catalog fetch failure surfaced in the open manager view; cleared by
+	// the next successful apply and on manager open.
+	private heartbeatCatalogFetchError: string | undefined;
+	// Monotonic issue-order sequence for catalog writes (fetches and heartbeat
+	// management actions). A fetch write sequenced behind an already-applied
+	// newer one is dropped, so a late/older snapshot cannot revert newer state.
+	private heartbeatCatalogSeq = 0;
+	private heartbeatCatalogAppliedSeq = 0;
 
 	// Registry of images pasted this session, keyed by the `[image #N]` marker
 	// shown to the user. Insertion-ordered; the bytes persist (bounded by
@@ -1106,8 +1162,26 @@ export class InteractiveMode {
 	private customFooter: (Component & { dispose?(): void }) | undefined = undefined;
 
 	private headerContainer: Container;
+	/** Pinned fullscreen top bar identifying the chat by name while scrolling. */
+	private topBar: TopBar;
+	/** Cached session spend (USD) for the top bar, keyed to the session it was fetched for. */
+	private topBarCost: { sessionId?: string; total?: number } = {};
+	/** Stale-discard state for top bar cost refreshes (mirrors contextUsageRefresh). */
+	private topBarCostRefresh = { generation: 0, lastSuccessGeneration: 0 };
 
 	private builtInHeader: Component | undefined = undefined;
+
+	/** True while the inline onboarding block owns the top rows (header stays hidden). */
+	private onboardingUiActive = false;
+
+	/** The mounted onboarding block, so flow panels can render inside it. */
+	private onboardingSplash: PrimeOnboardingSplashComponent | undefined = undefined;
+
+	/** Tears the block down and settles the pending flow, e.g. on a session reset. */
+	private onboardingAbort: (() => void) | undefined = undefined;
+
+	/** Aborted when onboarding is torn down so in-flight steps stop waiting. */
+	private onboardingFlowAbort: AbortController | undefined = undefined;
 
 	private customHeader: (Component & { dispose?(): void }) | undefined = undefined;
 
@@ -1154,6 +1228,14 @@ export class InteractiveMode {
 			void this.copyFullscreenSelection(text);
 		};
 		this.headerContainer = new Container();
+		this.topBar = new TopBar({
+			getChatName: () => this.getCurrentSessionName() ?? path.basename(this.getCurrentCwd()),
+			// Hide the cached spend unless it was fetched for the session now bound:
+			// a pending or failed refresh must not attribute the previous
+			// session's spend to the new chat.
+			getCostUsd: () =>
+				this.topBarCost.sessionId === this.connectionState?.sessionId ? this.topBarCost.total : undefined,
+		});
 		this.chatContainer = new Container();
 		this.shortcutGuideContainer = new Container();
 		this.pendingMessagesContainer = new Container();
@@ -1427,9 +1509,6 @@ export class InteractiveMode {
 		// fd powers autocomplete, and rg is available for shell commands.
 		const [fdPath, rgResult] = await Promise.all([ensureTool("fd"), ensureToolWithStatus("rg")]);
 		this.fdPath = fdPath;
-		if (rgResult.status === "unavailable") {
-			this.showWarning(formatMissingRipgrepMessage(rgResult));
-		}
 
 		this.ui.addChild(this.headerContainer);
 
@@ -1464,6 +1543,7 @@ export class InteractiveMode {
 			this.builtInHeader = new BrandSplashHeader(this.version, () => this.getCurrentCwd(), verboseInstructions, {
 				topPadding: true,
 				getModelId: () => this.getCurrentModelId(),
+				getHidden: () => this.onboardingUiActive,
 			});
 			this.headerContainer.addChild(this.builtInHeader);
 			this.headerContainer.addChild(new Spacer(1));
@@ -1507,6 +1587,9 @@ export class InteractiveMode {
 		await this.rebindCurrentSession();
 
 		await this.renderInitialMessages();
+		if (rgResult.status === "unavailable") {
+			this.showWarning(formatMissingRipgrepMessage(rgResult));
+		}
 
 		onThemeChange(() => {
 			this.ui.invalidate();
@@ -1521,6 +1604,43 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 	}
 
+	/**
+	 * Refresh the top bar's cached session spend from the context tree.
+	 * Results for a replaced session, or superseded by a newer successful
+	 * refresh, are discarded — mirroring refreshConnectionContextUsage.
+	 */
+	private refreshTopBarCost(): void {
+		// Partial-mode test harnesses skip the constructor, so the field
+		// initializer may be absent there; the refresh is cosmetic and must
+		// never crash a real flow on any `this`.
+		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0 };
+		const refresh = this.topBarCostRefresh;
+		const generation = ++refresh.generation;
+		const connection = this.agentConnection;
+		const sessionId = this.connectionState?.sessionId;
+		void (async () => {
+			try {
+				const tree = await connection.getContextTree();
+				const total = tree?.totalUsage?.cost?.total;
+				if (
+					typeof total !== "number" ||
+					!Number.isFinite(total) ||
+					generation < refresh.lastSuccessGeneration ||
+					this.agentConnection !== connection ||
+					this.connectionState?.sessionId !== sessionId
+				) {
+					return;
+				}
+				refresh.lastSuccessGeneration = generation;
+				this.topBarCost = { sessionId, total };
+				this.ui.requestRender();
+			} catch {
+				// Cost is cosmetic; a failed fetch keeps the previous value
+				// (the session-keyed getter still hides cross-session leaks).
+			}
+		})();
+	}
+
 	private updateTerminalTitle(): void {
 		const cwdBasename = path.basename(this.getCurrentCwd());
 		const sessionName = this.getCurrentSessionName();
@@ -1532,7 +1652,8 @@ export class InteractiveMode {
 	}
 
 	async run(): Promise<InteractiveModeRunResult> {
-		await this.init();
+		this.initializationPromise = this.init();
+		await this.initializationPromise;
 		this.restorePromptStashOnOpen();
 
 		// Global, environment-scoped notices (app update, extension updates, tmux setup)
@@ -1541,7 +1662,9 @@ export class InteractiveMode {
 		// `returnToAgentsView`, which is also set for direct daemon attaches that never
 		// rendered the agents view and still want the in-session fallback.)
 		const ownsGlobalStartupNotices = !this.options.agentsViewOwnsStartupNotices;
-		const newVersionPromise = ownsGlobalStartupNotices ? checkForNewPiVersion(this.version) : undefined;
+		const newVersionPromise = ownsGlobalStartupNotices
+			? checkForNewPiVersion(this.version, this.settingsManager.getUpdateChannel())
+			: undefined;
 		const packageUpdatesPromise = ownsGlobalStartupNotices
 			? checkForPackageUpdates({
 					cwd: this.getCurrentCwd(),
@@ -1706,14 +1829,16 @@ export class InteractiveMode {
 			}
 		};
 
-		await this.runStartupOnboarding();
-		showDeferredStartupNotifications();
-		showModelFallbackWarning();
-		void this.maybeWarnAboutAnthropicSubscriptionAuth();
-		void deliverStartupPrompts().then(
-			() => settleStartupPrompts("admitted"),
-			() => settleStartupPrompts("admitted"),
-		);
+		if (!this.isShuttingDown && !this.isReturningToAgentsView) {
+			await this.runStartupOnboarding();
+			showDeferredStartupNotifications();
+			showModelFallbackWarning();
+			void this.maybeWarnAboutAnthropicSubscriptionAuth();
+			void deliverStartupPrompts().then(
+				() => settleStartupPrompts("admitted"),
+				() => settleStartupPrompts("admitted"),
+			);
+		}
 
 		// Enter/Alt+Enter submit directly through AgentConnection. Wait for the
 		// lifecycle signal exactly once; a returned editor value has already been
@@ -1764,10 +1889,6 @@ export class InteractiveMode {
 		return shouldRunOnboarding(this.getOnboardingState());
 	}
 
-	private shouldRunPrimeCliOnboardingSplash(): boolean {
-		return shouldRunPrimeCliOnboardingSplash(this.getOnboardingState());
-	}
-
 	private markOnboardingShown(): void {
 		if (!this.settingsManager.getOnboardingShown()) {
 			this.settingsManager.setOnboardingShown(true);
@@ -1780,13 +1901,19 @@ export class InteractiveMode {
 		}
 
 		const startedAt = Date.now();
-		const showPrimeCliSplash = this.shouldRunPrimeCliOnboardingSplash();
 		let outcome: TelemetryOnboardingOutcome = "aborted";
 		try {
-			this.markOnboardingShown();
-			await this.settingsManager.flush();
-			await this.runOnboardingFlow(showPrimeCliSplash);
-			outcome = isOnboardingModelReady(this.getOnboardingState()) ? "success" : "aborted";
+			// The flow reports completion itself: a user who already had a working
+			// model would otherwise look "ready" straight after cancelling it, and
+			// the questions they never saw would be skipped for good.
+			const completed = await this.runOnboardingFlow();
+			outcome = completed && isOnboardingModelReady(this.getOnboardingState()) ? "success" : "aborted";
+			if (outcome === "success") {
+				// Only a completed onboarding counts as seen: a cancelled sign-in
+				// leaves the flag unset so the next launch retries the flow.
+				this.markOnboardingShown();
+				await this.settingsManager.flush();
+			}
 			return true;
 		} catch (error) {
 			outcome = "error";
@@ -1807,44 +1934,171 @@ export class InteractiveMode {
 		}
 	}
 
-	private async showOnboardingModelSelection(splash: OnboardingSplashHandle): Promise<void> {
-		splash.dismiss();
-		await this.showConfigurationMenu("models");
-	}
-
-	private async runOnboardingFlow(showPrimeCliSplash = this.shouldRunPrimeCliOnboardingSplash()): Promise<void> {
+	/** Runs the first-launch sequence. Resolves true only when every step ran. */
+	private async runOnboardingFlow(): Promise<boolean> {
 		this.modelRegistry.refresh();
-		if (showPrimeCliSplash) {
-			const splash = await this.showOnboardingSplash("choose a model");
-			if (!splash) {
-				return;
+
+		// Existing users (working model with configured auth) skip login and
+		// the provider picker entirely. They see only the trace question, or
+		// nothing at all when traces are already enabled.
+		if (isOnboardingModelReady(this.getOnboardingState())) {
+			if (this.settingsManager.getAgentTracesEnabled()) {
+				return true;
 			}
-
-			await this.showOnboardingModelSelection(splash);
-			return;
+			const abort = new AbortController();
+			this.onboardingFlowAbort = abort;
+			const splash = await this.showOnboardingSplash({ immediate: true });
+			if (!splash) {
+				return false;
+			}
+			await this.askOnboardingTraceOptIn();
+			if (abort.signal.aborted) {
+				return false;
+			}
+			splash.dismiss();
+			return true;
 		}
 
-		const availableModels = await this.getModelCandidates();
-		if (availableModels.length > 0) {
-			await this.showConfigurationMenu("models");
-			return;
-		}
-
+		const abort = new AbortController();
+		this.onboardingFlowAbort = abort;
 		const splash = await this.showOnboardingSplash();
 		if (!splash) {
-			return;
+			return false;
 		}
 
-		splash.showProgress("Signing in to Prime Intellect...");
+		// One sequence for every first launch. Signing in is instant when a Prime
+		// CLI token is already on disk, so users who arrive with credentials still
+		// reach the same account, provider and trace questions.
 		const authResult = await this.createAuthFlows().runPrimeInferenceLogin();
-		if (authResult.status !== "success") {
+		if (abort.signal.aborted || authResult.status !== "success") {
 			splash.dismiss();
-			return;
+			return false;
 		}
 
-		splash.showProgress("Preparing models...");
-		await this.prepareForModelSelectionAfterLogin(authResult);
-		await this.showOnboardingModelSelection(splash);
+		await this.prepareForModelSelectionAfterLogin(authResult, abort.signal);
+		if (abort.signal.aborted) {
+			return false;
+		}
+		await this.askOnboardingProviders(abort.signal);
+		if (abort.signal.aborted) {
+			return false;
+		}
+		await this.askOnboardingTraceOptIn();
+		if (abort.signal.aborted) {
+			return false;
+		}
+		splash.dismiss();
+		return true;
+	}
+
+	/**
+	 * Optional step: connect more providers before the first chat. The picker
+	 * stays mounted between logins so several can be connected in one pass.
+	 */
+	private async askOnboardingProviders(signal: AbortSignal): Promise<void> {
+		if (!this.onboardingSplash) {
+			return;
+		}
+		const authFlows = this.createAuthFlows();
+		for (;;) {
+			// A reset that cancels a provider login must end the question too,
+			// otherwise the next picker opens in the editor and waits for input.
+			// The signal is passed in: tearing the block down clears the field.
+			if (signal.aborted) {
+				return;
+			}
+			// One row per provider: a provider offering both a subscription and an
+			// API key would otherwise appear twice under the same name.
+			const options = [
+				...new Map(
+					authFlows
+						.getLoginProviderOptions()
+						.filter((option) => option.id !== PRIME_INFERENCE_PROVIDER_ID && option.category !== "service")
+						.map((option) => [option.id, option]),
+				).values(),
+			];
+			if (options.length === 0) {
+				return;
+			}
+			const items = options.map((option) => ({
+				id: option.id,
+				label: option.name,
+				...(this.modelRegistry.getProviderAuthStatus(option.id).configured ? { connected: true } : {}),
+			}));
+			const picked = await new Promise<string | undefined>((resolve) => {
+				let settled = false;
+				let close: (() => void) | undefined;
+				const settle = (id: string | undefined) => {
+					if (settled) {
+						return;
+					}
+					settled = true;
+					close?.();
+					resolve(id);
+				};
+				const picker = new OnboardingPickerComponent(
+					items,
+					(id) => settle(id),
+					() => settle(undefined),
+					() => settle(undefined),
+					{
+						prompt: "Connect other providers, or continue.",
+						searchPlaceholder: "Search providers",
+						note: "You can add providers anytime with /login.",
+						onExit: () => void this.shutdown(),
+						requestRender: () => this.ui.requestRender(),
+					},
+				);
+				close = this.showInlineAuthPanel(picker, { onReset: () => settle(undefined) });
+				this.ui.requestRender();
+			});
+			if (!picked) {
+				return;
+			}
+			const option = options.find((candidate) => candidate.id === picked);
+			if (option) {
+				await authFlows.loginProvider(option);
+			}
+		}
+	}
+
+	/** Final onboarding question: trace collection, with a reminder it is reversible. */
+	private askOnboardingTraceOptIn(): Promise<void> {
+		const splash = this.onboardingSplash;
+		if (!splash) {
+			return Promise.resolve();
+		}
+		return new Promise<void>((resolve) => {
+			let closed = false;
+			let close: (() => void) | undefined;
+			const finish = (enabled?: boolean) => {
+				if (closed) {
+					return;
+				}
+				closed = true;
+				if (enabled !== undefined) {
+					this.settingsManager.setAgentTracesEnabled(enabled);
+					void this.settingsManager.flush();
+				}
+				close?.();
+				resolve();
+			};
+			const choice = new OnboardingChoiceComponent(
+				[{ label: "Share" }, { label: "Not now" }],
+				(index) => finish(index === 0),
+				() => finish(undefined),
+				{
+					onExit: () => void this.shutdown(),
+					prompt: "Share agent traces with Prime Intellect?",
+					description:
+						"Trace sharing helps us train better open-source models and improve the open agent ecosystem for everyone.",
+					note: "You can change this anytime with /traces.",
+					requestRender: () => this.ui.requestRender(),
+				},
+			);
+			close = this.showInlineAuthPanel(choice, { onReset: () => finish(undefined) });
+			this.ui.requestRender();
+		});
 	}
 
 	private getMarkdownThemeWithSettings(): MarkdownTheme {
@@ -2541,7 +2795,6 @@ export class InteractiveMode {
 
 		const extensionRunner = localSessionHost.getExtensionRunner();
 		this.setupExtensionShortcuts(extensionRunner);
-		this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 	}
 
 	private applyRuntimeSettings(): void {
@@ -2591,11 +2844,32 @@ export class InteractiveMode {
 		const connection = this.agentConnection;
 		const epoch = this.heartbeatRefreshEpoch;
 		const refresh = (async () => {
-			do {
+			// Bound the drain loop: sustained heartbeats_changed churn must not
+			// starve an awaiting rebind (and its transcript render) indefinitely.
+			for (let drain = 0; drain <= HEARTBEAT_REFRESH_DRAIN_LIMIT; drain++) {
 				this.heartbeatRefreshRequested = false;
-				const heartbeats = await connection.listHeartbeats();
-				if (this.agentConnection !== connection || this.heartbeatRefreshEpoch !== epoch) return;
-				this.applyHeartbeatCatalog(heartbeats);
+				const fetchSeq = ++this.heartbeatCatalogSeq;
+				const fetch = connection.listHeartbeats();
+				const heartbeats = await fetchHeartbeatsWithinDeadline(fetch);
+				if (
+					this.isShuttingDown ||
+					this.isReturningToAgentsView ||
+					this.agentConnection !== connection ||
+					this.heartbeatRefreshEpoch !== epoch
+				)
+					return;
+				if (heartbeats === undefined) {
+					// The fetch deadline expired: keep the last catalog, retain the
+					// in-flight result so the open view still converges when the
+					// late answer lands, and arm a bounded retry so the open view
+					// always has a next scheduled retrieval even if it never does.
+					// A change event that arrived mid-fetch still re-triggers a
+					// refresh through the follow-up scheduling below.
+					this.retainHeartbeatCatalogFetch(fetch, connection, fetchSeq);
+					this.armHeartbeatManagerFetchRetry();
+					return;
+				}
+				this.applyHeartbeatCatalog(heartbeats, fetchSeq);
 				clearTimeout(this.heartbeatRetryTimer);
 				this.heartbeatRetryTimer = undefined;
 				this.heartbeatRetryAttempt = 0;
@@ -2603,10 +2877,17 @@ export class InteractiveMode {
 					this.heartbeatCatalogWaiting = false;
 					this.showStatus("Heartbeats loaded");
 				}
-			} while (this.heartbeatRefreshRequested);
+				if (!this.heartbeatRefreshRequested) return;
+			}
 		})().finally(() => {
 			if (this.heartbeatRefreshPromise === refresh) {
 				this.heartbeatRefreshPromise = undefined;
+				// The drain bound was hit with a newer heartbeats_changed
+				// pending: schedule the follow-up refresh so the catalog
+				// converges instead of staying stale until the next event.
+				if (this.heartbeatRefreshRequested) {
+					void this.refreshHeartbeatCatalog().catch(() => undefined);
+				}
 			}
 		});
 		this.heartbeatRefreshPromise = refresh;
@@ -2667,8 +2948,15 @@ export class InteractiveMode {
 		this.heartbeatRefreshRequested = false;
 	}
 
-	private applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[]): void {
+	private applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[], seq?: number): void {
+		// A sequenced fetch write that lost the race to a newer catalog write
+		// (a later fetch or a management action) must not revert it.
+		if (seq !== undefined) {
+			if (seq < this.heartbeatCatalogAppliedSeq) return;
+			this.heartbeatCatalogAppliedSeq = seq;
+		}
 		this.heartbeatCatalog = heartbeats;
+		this.heartbeatCatalogFetchError = undefined;
 		this.scheduleHeartbeatManagerRefresh();
 		this.updateSubagentSummaryLine();
 		this.ui.requestRender();
@@ -2914,20 +3202,34 @@ export class InteractiveMode {
 			await this.bindCurrentSessionExtensions();
 		} else {
 			setRegisteredThemes(this.uiServices.getThemes());
-			await this.refreshConnectionCatalog();
+			// Best-effort: the catalog enriches the composer (commands, models,
+			// resources). A transient control-plane failure must not abort the
+			// rebind and leave the transcript unrendered.
+			try {
+				await this.refreshConnectionCatalog();
+			} catch {
+				// Keep the previous catalog; reconnects re-fetch it.
+			}
 			this.setupAutocompleteProvider();
-			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		}
 		this.subscribeToAgent();
 		await this.subscribeToRosterBar();
 		// A session_action_update in the unsubscribed gap above is lost; re-sync the queue post-subscription.
-		this.patchConnectionState({ sessionActions: (await this.agentConnection.getState()).sessionActions });
+		// Best-effort: a transient control-plane failure must not abort the
+		// rebind and leave the transcript unrendered.
+		try {
+			this.patchConnectionState({ sessionActions: (await this.agentConnection.getState()).sessionActions });
+		} catch {
+			// Keep the attached snapshot's session actions; the next connection
+			// state update re-syncs them.
+		}
 		this.refreshQueueSelectionFromState();
 		this.updatePendingMessagesDisplay();
 		this.refreshHeartbeatCatalogInBackground();
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
+		this.refreshTopBarCost();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 		this.syncWorkingLoader();
@@ -3029,6 +3331,7 @@ export class InteractiveMode {
 		await this.renderSessionContext(this.getSessionContextFromConnectionSnapshot(snapshot), {
 			clearChat: true,
 			updateFooter: true,
+			limitTranscript: true,
 		});
 		await this.restoreStreamingMessageFromSnapshot(snapshot.streamingMessage);
 		this.updatePendingMessagesDisplay();
@@ -3051,6 +3354,7 @@ export class InteractiveMode {
 			this.sideQuestionBashDiscarded = undefined;
 		}
 		this.updateTerminalTitle();
+		this.refreshTopBarCost();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 		this.syncWorkingLoader();
@@ -3197,7 +3501,8 @@ export class InteractiveMode {
 		if (shortcuts.size === 0) return;
 
 		const localSessionHost = this.getLocalSessionHost();
-		const createContext = (): ExtensionContext => ({
+		const createContext = (ownerPath: string): ExtensionContext => ({
+			...extensionRunner.createTimerBindings(ownerPath),
 			ui: this.createExtensionUIContext(),
 			hasUI: true,
 			cwd: this.getCurrentCwd(),
@@ -3229,7 +3534,7 @@ export class InteractiveMode {
 		this.defaultEditor.onExtensionShortcut = (data: string) => {
 			for (const [shortcutStr, shortcut] of shortcuts) {
 				if (matchesKey(data, shortcutStr as KeyId)) {
-					Promise.resolve(shortcut.handler(createContext())).catch((err) => {
+					Promise.resolve(shortcut.handler(createContext(shortcut.extensionPath))).catch((err) => {
 						this.showError(`Shortcut handler error: ${err instanceof Error ? err.message : String(err)}`);
 					});
 					return true;
@@ -3566,6 +3871,15 @@ export class InteractiveMode {
 	}
 
 	private resetExtensionUI(): void {
+		// Close inline auth panels before the configuration menu so a restored
+		// menu is still torn down by the closeConfigurationMenu call below.
+		// Innermost panels close first, ending at the pre-login content.
+		for (const close of this.inlineAuthPanelClosers.splice(0).reverse()) {
+			close("reset");
+		}
+		// A reset mid-onboarding leaves the block with no flow to host: tear it
+		// down too, so the overlay, its animation and the pending step all end.
+		this.onboardingAbort?.();
 		this.closeConfigurationMenu?.();
 		this.cancelActiveConnectionExtensionUiRequests();
 		this.closeHeartbeatManager();
@@ -3590,6 +3904,7 @@ export class InteractiveMode {
 		this.setupAutocompleteProvider();
 		this.defaultEditor.onExtensionShortcut = undefined;
 		this.updateTerminalTitle();
+		this.refreshTopBarCost();
 		this.workingMessage = undefined;
 		this.workingVisible = true;
 		this.setWorkingIndicator();
@@ -4155,10 +4470,12 @@ export class InteractiveMode {
 			void this.handleDebugCommand();
 		};
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
+		this.defaultEditor.onAction("app.model.cycleForward", () => this.handleModelCycle("forward"));
+		this.defaultEditor.onAction("app.model.cycleBackward", () => this.handleModelCycle("backward"));
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
-			void this.showHeartbeatManager();
+			this.showHeartbeatManager();
 		});
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
 		this.defaultEditor.onAction("app.prompt.stash", () => this.handlePromptStash());
@@ -4681,12 +4998,22 @@ export class InteractiveMode {
 					await this.handleSideQuestion(commandArgs);
 					return;
 				}
-				if (commandName === "settings" && !commandArgs) {
+				if (commandName === "settings") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /settings");
+						return;
+					}
 					await this.showSettingsSelector();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "scoped-models" && !commandArgs) {
+				if (commandName === "scoped-models") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /scoped-models");
+						return;
+					}
 					this.editor.setText("");
 					await this.showModelsSelector();
 					return;
@@ -4721,12 +5048,22 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "share" && !commandArgs) {
+				if (commandName === "share") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /share");
+						return;
+					}
 					await this.handleShareCommand();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "copy" && !commandArgs) {
+				if (commandName === "copy") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /copy");
+						return;
+					}
 					await this.handleCopyCommand();
 					this.editor.setText("");
 					return;
@@ -4741,13 +5078,23 @@ export class InteractiveMode {
 					await this.handleRlmMaxDepthCommand(commandArgs);
 					return;
 				}
-				if (commandName === "session" && !commandArgs) {
+				if (commandName === "session") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /session");
+						return;
+					}
 					this.echoLocalCommand(text);
 					await this.handleSessionCommand();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "system-prompt" && !commandArgs) {
+				if (commandName === "system-prompt") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /system-prompt");
+						return;
+					}
 					this.echoLocalCommand(text);
 					await this.handleSystemPromptCommand();
 					this.editor.setText("");
@@ -4758,13 +5105,23 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "context" && !commandArgs) {
+				if (commandName === "context") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /context");
+						return;
+					}
 					this.echoLocalCommand(text);
 					await this.handleContextCommand();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "logs" && !commandArgs) {
+				if (commandName === "logs") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /logs");
+						return;
+					}
 					this.echoLocalCommand(text);
 					this.handleLogsCommand();
 					this.editor.setText("");
@@ -4776,44 +5133,84 @@ export class InteractiveMode {
 					return;
 				}
 				if (commandName === "heartbeats") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /heartbeats");
+						return;
+					}
 					this.editor.setText("");
 					await this.showHeartbeatManager();
 					return;
 				}
-				if (commandName === "changelog" && !commandArgs) {
+				if (commandName === "changelog") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /changelog");
+						return;
+					}
 					this.echoLocalCommand(text);
 					this.handleChangelogCommand();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "hotkeys" && !commandArgs) {
+				if (commandName === "hotkeys") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /hotkeys");
+						return;
+					}
 					this.echoLocalCommand(text);
 					this.handleHotkeysCommand();
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "fork" && !commandArgs) {
+				if (commandName === "fork") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /fork");
+						return;
+					}
 					this.editor.setText("");
 					await this.showUserMessageSelector();
 					return;
 				}
-				if (commandName === "clone" && !commandArgs) {
+				if (commandName === "clone") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /clone");
+						return;
+					}
 					this.editor.setText("");
 					await this.handleCloneCommand();
 					return;
 				}
-				if (commandName === "tree" && !commandArgs) {
+				if (commandName === "tree") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /tree");
+						return;
+					}
 					this.editor.setText("");
 					restorePromptStashAfterSubmit = false;
 					await this.showTreeSelector();
 					return;
 				}
-				if (commandName === "login" && !commandArgs) {
+				if (commandName === "login") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /login");
+						return;
+					}
 					this.editor.setText("");
 					await this.showConfigurationMenu("providers");
 					return;
 				}
-				if (commandName === "logout" && !commandArgs) {
+				if (commandName === "logout") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /logout");
+						return;
+					}
 					this.editor.setText("");
 					await this.showLogoutSelector();
 					return;
@@ -4851,9 +5248,45 @@ export class InteractiveMode {
 					await this.handleResumeCommand(commandArgs);
 					return;
 				}
-				if (commandName === "reload" && !commandArgs) {
+				if (commandName === "reload") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /reload");
+						return;
+					}
 					this.editor.setText("");
 					await this.handleReloadCommand();
+					return;
+				}
+				if (commandName === "nightly") {
+					this.editor.setText("");
+					const nightlyArg = commandArgs?.trim().toLowerCase();
+					if (nightlyArg === "status") {
+						const channel = resolveUpdateChannel(this.version, this.settingsManager.getUpdateChannel());
+						const source = this.settingsManager.getUpdateChannel()
+							? "set in settings"
+							: "inferred from the running version";
+						this.showStatus(`Updates follow the ${channel} channel (${source}). v${this.version} installed.`);
+						return;
+					}
+					if (nightlyArg === "off" || nightlyArg === "stable") {
+						this.settingsManager.setUpdateChannel("stable");
+						this.showStatus(
+							"Updates now follow the stable channel. Run /update to install the latest stable release.",
+						);
+						return;
+					}
+					if (nightlyArg && nightlyArg !== "on") {
+						this.showError("Usage: /nightly [on|off|status]");
+						return;
+					}
+					if (this.isAgentCompacting() || this.isAgentStreaming() || this.isBashRunning()) {
+						this.showWarning("Wait for the current work to finish before updating.");
+						return;
+					}
+					// The update command owns the nightly warning, the channel switch, and the
+					// busy-session confirmation, so declining either leaves settings untouched.
+					await this.handleUpdateCommand("--self --nightly");
 					return;
 				}
 				if (commandName === "update") {
@@ -4880,7 +5313,12 @@ export class InteractiveMode {
 					this.setFullscreenMode(enable);
 					return;
 				}
-				if (commandName === "debug" && !commandArgs) {
+				if (commandName === "debug") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /debug");
+						return;
+					}
 					await this.handleDebugCommand();
 					this.editor.setText("");
 					return;
@@ -5021,6 +5459,7 @@ export class InteractiveMode {
 				if (
 					submissionOutcome === "lifecycle-cancelled" ||
 					this.isShuttingDown ||
+					this.isReturningToAgentsView ||
 					this.agentsViewRequest ||
 					this.promptStashSessionId !== submissionSessionId
 				) {
@@ -5043,6 +5482,7 @@ export class InteractiveMode {
 					const rejectedDraft = submittedDraft ?? { text };
 					const canRestore =
 						!this.isShuttingDown &&
+						!this.isReturningToAgentsView &&
 						!this.agentsViewRequest &&
 						submissionGeneration === this.inputSubmissionGeneration &&
 						this.editor.getText().length === 0;
@@ -5066,7 +5506,7 @@ export class InteractiveMode {
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 			} finally {
-				if (this.isShuttingDown || this.agentsViewRequest) {
+				if (this.isShuttingDown || this.isReturningToAgentsView || this.agentsViewRequest) {
 					submissionOutcome = "lifecycle-cancelled";
 				}
 				if (
@@ -5114,6 +5554,10 @@ export class InteractiveMode {
 					const generation = ++this.sessionEventGeneration;
 					const run = this.sessionEventQueue.then(async () => {
 						if (generation !== this.sessionEventGeneration) return;
+						// Let an in-flight initial render finish before clearing the
+						// chat for the new session.
+						await this.initialRenderPromise?.catch(() => undefined);
+						if (generation !== this.sessionEventGeneration) return;
 						this.resetSideQuestion();
 						this.resetExtensionUI();
 						this.applyConnectionStateSnapshot(event.state);
@@ -5130,6 +5574,10 @@ export class InteractiveMode {
 						if (generation !== this.sessionEventGeneration) return false;
 						await this.refreshCommandCatalogForCurrentSession?.();
 						if (generation !== this.sessionEventGeneration) return false;
+						// Never rebuild the transcript while an initial render is
+						// mid-flight; queue behind it instead.
+						await this.initialRenderPromise?.catch(() => undefined);
+						if (generation !== this.sessionEventGeneration) return false;
 						await this.renderResyncedSession(event.snapshot);
 						return true;
 					});
@@ -5139,6 +5587,7 @@ export class InteractiveMode {
 					this.sessionRecap = event.recap;
 					this.patchConnectionState({ recap: event.recap });
 					this.renderRecap();
+					this.refreshTopBarCost();
 				} else if (event.type === "side_question_event") {
 					this.handleSideQuestionEvent(event.event);
 				} else if (event.type === "extension_ui_request") {
@@ -5387,6 +5836,7 @@ export class InteractiveMode {
 
 			case "session_info_changed":
 				this.updateTerminalTitle();
+				this.refreshTopBarCost();
 				this.footer.invalidate();
 				this.ui.requestRender();
 				break;
@@ -5631,6 +6081,7 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				this.turnStartedAt = undefined;
+				this.refreshTopBarCost();
 				// Drops the loader; background subagents are shown by the tree, not the loader.
 				this.syncWorkingLoader();
 				if (this.streamingComponent) {
@@ -5701,8 +6152,19 @@ export class InteractiveMode {
 				this.stopWorkingLoader();
 				this.statusContainer.clear();
 				this.retryCountdown?.dispose();
-				const retryMessage = (seconds: number) =>
-					`Retrying (${event.attempt}/${event.maxAttempts}) in ${seconds}s... (${keyText("app.clear")} to cancel)`;
+				const cancelHint = `(${keyText("app.clear")} to cancel)`;
+				const retryMessage =
+					event.reason === "backup"
+						? () =>
+								`Primary model unavailable (${event.errorMessage}) — retrying on backup model ${event.backupModel ?? "unknown"}... ${cancelHint}`
+						: event.reason === "usage"
+							? (seconds: number) =>
+									`Waiting for provider usage to recover (${event.attempt}/${event.maxAttempts}), next check in ${seconds}s... ${cancelHint}`
+							: event.reason === "unavailable"
+								? (seconds: number) =>
+										`Waiting for provider to recover (${event.attempt}/${event.maxAttempts}), next check in ${seconds}s... ${cancelHint}`
+								: (seconds: number) =>
+										`Retrying (${event.attempt}/${event.maxAttempts}) in ${seconds}s... ${cancelHint}`;
 				this.retryLoader = new Loader(
 					this.ui,
 					(spinner) => theme.fg("muted", spinner),
@@ -5739,6 +6201,8 @@ export class InteractiveMode {
 				// Show error only on final failure (success shows normal response)
 				if (!event.success) {
 					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+				} else if (event.restoredModel) {
+					this.showStatus(`Primary provider recovered — back on ${event.restoredModel}`);
 				}
 				this.ui.requestRender();
 				break;
@@ -6066,7 +6530,9 @@ export class InteractiveMode {
 	private async openScopedAgentsView(): Promise<void> {
 		if (!this.options.returnToAgentsView) {
 			this.focusEditor();
-			this.showStatus("The agents view needs the daemon; start without --no-daemon to browse sessions");
+			this.showStatus(
+				"The agents view needs a daemon-hosted session; start normally (without --no-session) to browse sessions",
+			);
 			return;
 		}
 		await this.returnToAgentsView("scoped_agents_view");
@@ -6122,6 +6588,8 @@ export class InteractiveMode {
 
 	private getPromptContextLabel(maxWidth: number): string | undefined {
 		if (maxWidth < 1) return undefined;
+		// Onboarding owns the screen; chat chrome under it reads as clutter.
+		if (this.onboardingUiActive) return undefined;
 		return theme.fg(
 			"dim",
 			truncateToWidth(formatConversationDetailStatus(this.toolOutputExpanded, this.editDiffsExpanded), maxWidth, ""),
@@ -6549,10 +7017,25 @@ export class InteractiveMode {
 				}
 			}
 		}
-		await this.preloadToolDefinitions(toolNames);
+		// Tool definitions only enrich rendering: components fall back to
+		// cached or missing definitions. A transient control-plane failure here
+		// must not abort the render (a resync render aborts into an empty chat).
+		let toolDefinitionWarning: string | undefined;
+		try {
+			await this.preloadToolDefinitions(toolNames);
+		} catch (error) {
+			toolDefinitionWarning = `Could not load tool definitions: ${
+				error instanceof Error ? error.message : String(error)
+			}`;
+		}
 
 		if (options.clearChat) {
 			this.chatContainer.clear();
+		}
+
+		// Shown after clearChat so rebuild/resync renders keep the warning.
+		if (toolDefinitionWarning) {
+			this.showWarning(toolDefinitionWarning);
 		}
 
 		if (options.updateFooter) {
@@ -6583,61 +7066,81 @@ export class InteractiveMode {
 		}
 
 		for (const message of messagesToRender) {
-			// Assistant messages need special handling for tool calls
-			if (message.role === "assistant") {
-				this.addMessageToChat(message);
-				// Render tool call components
-				for (const content of message.content) {
-					if (content.type === "toolCall") {
-						const spacing = createConversationSpacing(this.chatContainer.children);
-						const component = new ToolExecutionComponent(
-							content.name,
-							content.id,
-							content.arguments,
-							{
-								showImages: this.settingsManager.getShowImages(),
-								includeImageDimensions: false,
-								shouldAddLeadingSpace: () => spacing.shouldAddLeadingSpace(true),
-							},
-							this.getCachedToolDefinition(content.name),
-							this.ui,
-							this.getCurrentCwd(),
-						);
-						component.setExpanded(this.toolOutputExpanded);
-						component.setEditDiffsExpanded(this.editDiffsExpanded);
-						selectLatestToolExpandHint(this.chatContainer.children, component);
-						this.chatContainer.addChild(component);
-						this.registerIpythonToolComponent(content.name, content.id, component);
+			// One unrenderable message must not abort the whole transcript:
+			// the chat container may already be cleared for this render.
+			try {
+				// Assistant messages need special handling for tool calls
+				if (message.role === "assistant") {
+					this.addMessageToChat(message);
+					// Render tool call components
+					for (const content of message.content) {
+						if (content.type === "toolCall") {
+							const spacing = createConversationSpacing(this.chatContainer.children);
+							const component = new ToolExecutionComponent(
+								content.name,
+								content.id,
+								content.arguments,
+								{
+									showImages: this.settingsManager.getShowImages(),
+									includeImageDimensions: false,
+									shouldAddLeadingSpace: () => spacing.shouldAddLeadingSpace(true),
+								},
+								this.getCachedToolDefinition(content.name),
+								this.ui,
+								this.getCurrentCwd(),
+							);
+							component.setExpanded(this.toolOutputExpanded);
+							component.setEditDiffsExpanded(this.editDiffsExpanded);
+							selectLatestToolExpandHint(this.chatContainer.children, component);
+							this.chatContainer.addChild(component);
+							this.registerIpythonToolComponent(content.name, content.id, component);
 
-						if (message.stopReason === "aborted" || message.stopReason === "error") {
-							let errorMessage: string;
-							if (message.stopReason === "aborted") {
-								const retryAttempt = this.getRetryAttempt();
-								errorMessage =
-									retryAttempt > 0
-										? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
-										: message.errorMessage && message.errorMessage !== "Request was aborted"
-											? message.errorMessage
-											: "Operation aborted";
+							if (message.stopReason === "aborted" || message.stopReason === "error") {
+								let errorMessage: string;
+								if (message.stopReason === "aborted") {
+									const retryAttempt = this.getRetryAttempt();
+									errorMessage =
+										retryAttempt > 0
+											? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
+											: message.errorMessage && message.errorMessage !== "Request was aborted"
+												? message.errorMessage
+												: "Operation aborted";
+								} else {
+									errorMessage = message.errorMessage || "Error";
+								}
+								component.updateResult({ content: [{ type: "text", text: errorMessage }], isError: true });
 							} else {
-								errorMessage = message.errorMessage || "Error";
+								renderedPendingTools.set(content.id, component);
 							}
-							component.updateResult({ content: [{ type: "text", text: errorMessage }], isError: true });
-						} else {
-							renderedPendingTools.set(content.id, component);
 						}
 					}
+				} else if (message.role === "toolResult") {
+					// Match tool results to pending tool components
+					const component = renderedPendingTools.get(message.toolCallId);
+					if (component) {
+						// Delete first: a throwing updateResult must not leave the
+						// completed result reported as still pending.
+						renderedPendingTools.delete(message.toolCallId);
+						component.updateResult(message);
+					}
+				} else {
+					// All other messages use standard rendering
+					this.addMessageToChat(message, renderOptions);
 				}
-			} else if (message.role === "toolResult") {
-				// Match tool results to pending tool components
-				const component = renderedPendingTools.get(message.toolCallId);
-				if (component) {
-					component.updateResult(message);
-					renderedPendingTools.delete(message.toolCallId);
-				}
-			} else {
-				// All other messages use standard rendering
-				this.addMessageToChat(message, renderOptions);
+			} catch (error) {
+				// Render an inline placeholder instead of losing the transcript.
+				this.chatContainer.addChild(
+					new Text(
+						theme.fg(
+							"warning",
+							`Failed to render a ${message.role} message: ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+						),
+						1,
+						0,
+					),
+				);
 			}
 		}
 
@@ -6650,26 +7153,46 @@ export class InteractiveMode {
 	}
 
 	async renderInitialMessages(): Promise<void> {
-		const snapshot = await this.agentConnection.getInitialSnapshot();
-		const context = this.getSessionContextFromConnectionSnapshot(snapshot);
-		const state = snapshot.state;
-		const streamingMessage = snapshot.streamingMessage;
-		this.rlmNodeId = snapshot.parent?.childId;
-		this.seedSubagentSummary(snapshot.children);
-		this.applyConnectionStateSnapshot(state);
-		this.restoreTurnStartFromMessages(context.messages);
-		await this.renderSessionContext(context, {
-			updateFooter: true,
-			populateHistory: true,
-			limitTranscript: true,
-		});
-		await this.restoreStreamingMessageFromSnapshot(streamingMessage);
+		// Serialize with any in-flight initial render: resync/replacement handlers
+		// re-enter this method, and two concurrent transcript builds race the
+		// chat container.
+		const previousRender = this.initialRenderPromise;
+		const render = (async () => {
+			await previousRender?.catch(() => undefined);
+			const snapshot = await this.agentConnection.getInitialSnapshot();
+			const context = this.getSessionContextFromConnectionSnapshot(snapshot);
+			const state = snapshot.state;
+			const streamingMessage = snapshot.streamingMessage;
+			this.rlmNodeId = snapshot.parent?.childId;
+			this.seedSubagentSummary(snapshot.children);
+			this.applyConnectionStateSnapshot(state);
+			this.restoreTurnStartFromMessages(context.messages);
+			await this.renderSessionContext(context, {
+				clearChat: true,
+				updateFooter: true,
+				populateHistory: true,
+				limitTranscript: true,
+			});
+			await this.restoreStreamingMessageFromSnapshot(streamingMessage);
+			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 
-		// Show compaction info if session was compacted
-		const compactionCount = state.compactionCount;
-		if (compactionCount > 0) {
-			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
-			this.showStatus(`Session compacted ${times}`);
+			// Show compaction info if session was compacted
+			const compactionCount = state.compactionCount;
+			if (compactionCount > 0) {
+				const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
+				this.showStatus(`Session compacted ${times}`);
+			}
+		})();
+		this.initialRenderPromise = render;
+		try {
+			await render;
+		} finally {
+			if (this.initialRenderPromise === render) {
+				this.initialRenderPromise = undefined;
+				// Release deferred events even if the last queued render failed. Do not
+				// await listener delivery: session-replaced handlers share that queue.
+				void this.agentConnection.flushBufferedSessionEvents?.();
+			}
 		}
 	}
 
@@ -6713,7 +7236,7 @@ export class InteractiveMode {
 
 	private async rebuildChatFromMessages(): Promise<void> {
 		const context = await this.agentConnection.getSessionContext();
-		await this.renderSessionContext(context, { clearChat: true });
+		await this.renderSessionContext(context, { clearChat: true, limitTranscript: true });
 	}
 
 	private handleEscape(): void {
@@ -6906,17 +7429,22 @@ export class InteractiveMode {
 
 	private async requestAgentsView(): Promise<void> {
 		if (!this.options.returnToAgentsView) {
-			this.showStatus("The agents view needs the daemon; start without --no-daemon to browse sessions");
+			this.showStatus(
+				"The agents view needs a daemon-hosted session; start normally (without --no-session) to browse sessions",
+			);
 			return;
 		}
 		await this.returnToAgentsView();
 	}
 
 	private async returnToAgentsView(request: InteractiveModeRunResult["type"] = "agents_view"): Promise<void> {
-		if (this.isShuttingDown || this.agentsViewRequest) return;
-		this.stashDraftForAgentsView();
-		this.agentsViewRequest = request;
+		if (this.isShuttingDown || this.isReturningToAgentsView) return;
+		this.isReturningToAgentsView = true;
+		// Keep startup's connection alive without blocking an explicit shutdown.
+		await this.initializationPromise?.catch(() => undefined);
+		if (this.isShuttingDown) return;
 		this.isShuttingDown = true;
+		this.stashDraftForAgentsView();
 		this.unregisterSignalHandlers();
 
 		await this.teardownSessionUi({ preserveAltScreen: true });
@@ -6926,6 +7454,7 @@ export class InteractiveMode {
 				await this.agentConnection.dispose();
 			} finally {
 				await this.options.onShutdown?.();
+				this.agentsViewRequest = request;
 				this.onInputCallback?.(undefined);
 				handoffComplete = true;
 			}
@@ -7307,6 +7836,7 @@ export class InteractiveMode {
 					this.widgetContainerBelow,
 				],
 				dock: this.promptDock,
+				pin: this.topBar,
 				mouse: this.settingsManager.getFullscreenMouse(),
 			});
 		} else {
@@ -7442,7 +7972,7 @@ export class InteractiveMode {
 
 	showError(errorMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0));
+		this.chatContainer.addChild(new Text(theme.fg("error", `⚠ Error: ${errorMessage}`), 1, 0));
 		this.ui.requestRender();
 	}
 
@@ -7743,8 +8273,16 @@ export class InteractiveMode {
 			return;
 		}
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		this.applyModelSwitchUiState(state, model);
+	}
+
+	/** Patch model-derived connection state and refresh the UI that reads it. */
+	private applyModelSwitchUiState(
+		state: Pick<AgentConnectionState, "model" | "serviceTier" | "availableThinkingLevels">,
+		fallbackModel: AgentConnectionModel,
+	): void {
 		this.patchConnectionState({
-			model: state.model ?? model,
+			model: state.model ?? fallbackModel,
 			serviceTier: state.serviceTier,
 			availableThinkingLevels: state.availableThinkingLevels,
 		});
@@ -8098,6 +8636,32 @@ export class InteractiveMode {
 			});
 	}
 
+	private handleModelCycle(direction: "forward" | "backward"): void {
+		const connection = this.agentConnection;
+		const sessionId = this.connectionState?.sessionId;
+		void connection
+			.cycleModel(direction)
+			.then(async (result) => {
+				if (!result) {
+					this.showStatus("No other models available to cycle");
+					return;
+				}
+				const state = await connection.getState();
+				if (
+					this.agentConnection !== connection ||
+					this.connectionState?.sessionId !== sessionId ||
+					(sessionId !== undefined && state.sessionId !== sessionId)
+				) {
+					return;
+				}
+				this.applyModelSwitchUiState(state, result.model);
+				this.showStatus(`Model: ${result.model.provider}/${result.model.id}`);
+			})
+			.catch((error) => {
+				this.showError(error instanceof Error ? error.message : String(error));
+			});
+	}
+
 	private showModelSelector(initialSearchInput?: string): void {
 		void this.showConfigurationMenu("models", initialSearchInput);
 	}
@@ -8170,7 +8734,6 @@ export class InteractiveMode {
 							this.getCachedModelCandidates(),
 							this.connectionConfiguredProviders,
 						);
-						menu.setActiveTab("models");
 						refreshModels(true);
 					})
 					.catch((error) => {
@@ -8595,7 +9158,7 @@ export class InteractiveMode {
 		}
 	}
 
-	private showOnboardingSplash(continueActionLabel?: string): Promise<OnboardingSplashHandle | undefined> {
+	private showOnboardingSplash(options?: { immediate?: boolean }): Promise<OnboardingSplashHandle | undefined> {
 		return new Promise((resolve) => {
 			let settled = false;
 			let dismissed = false;
@@ -8615,41 +9178,69 @@ export class InteractiveMode {
 				dismissed = true;
 				selector?.dispose();
 				handle?.hide();
+				this.onboardingSplash = undefined;
+				this.onboardingAbort = undefined;
+				this.onboardingFlowAbort = undefined;
+				this.onboardingUiActive = false;
+				this.builtInHeader?.invalidate();
 				this.ui.requestRender();
 			};
 			selector = new PrimeOnboardingSplashComponent(
 				() => {
-					selector?.dispose();
-					settle({
-						showProgress: (message) => selector?.showProgress(message),
-						dismiss,
-					});
-				},
-				() => {
-					dismiss();
-					settle(undefined);
+					// The field keeps animating behind the flow panels; only dismissal
+					// stops it.
+					settle({ dismiss });
 				},
 				{
 					getRows: () => this.ui.terminal.rows,
+					// Nothing else owns Ctrl+C yet, so the block exits the app itself.
+					onExit: () => void this.shutdown(),
 					requestRender: () => this.ui.requestRender(),
-					...(continueActionLabel ? { continueActionLabel } : {}),
+					immediate: options?.immediate,
 				},
 			);
+			// The block owns the pane while onboarding runs: the brand header hides
+			// so the two marks never stack, and flow panels mount inside the block.
+			this.onboardingAbort = () => {
+				// Cancel the running step first: after Enter the splash promise is
+				// already settled, so dismissing alone would leave the login waiting
+				// on an unmounted dialog and remount later panels in the prompt dock.
+				this.onboardingFlowAbort?.abort();
+				dismiss();
+				settle(undefined);
+			};
+			this.onboardingUiActive = true;
+			this.onboardingSplash = selector;
+			this.builtInHeader?.invalidate();
 			handle = this.ui.showOverlay(selector, {
 				width: "100%",
 				maxHeight: "100%",
 				row: 0,
 				col: 0,
 			});
+			// Immediate mode: settle without waiting for the user to press Enter
+			// on the login action. The flow panels mount directly under the brand
+			// mark with no welcome text or action row flash.
+			if (options?.immediate) {
+				settle({ dismiss });
+			}
 		});
 	}
 
 	private createAuthFlows(): ProviderAuthFlows {
+		const showAuthPanel = (component: Component, options?: { heading?: string; onReset?: () => void }) =>
+			this.showInlineAuthPanel(component, options);
 		return new ProviderAuthFlows({
 			ui: this.ui,
 			modelRegistry: this.modelRegistry,
 			showStatus: (message) => this.showStatus(message),
 			showError: (message) => this.showError(message),
+			showAuthPanel,
+			exitApp: () => void this.shutdown(),
+			getAuthPanelRows: () => Math.max(1, Math.min(20, this.ui.terminal.rows - 3)),
+			// Onboarding renders its own heading above the panel and asks its
+			// questions in the onboarding selection language.
+			isOnboardingSurface: () => this.onboardingUiActive,
 			getAvailableModels: () => this.getConnectionAvailableModels(),
 			onAuthChanged: async () => {
 				await this.refreshConnectionModelsAfterAuthChange();
@@ -8663,7 +9254,90 @@ export class InteractiveMode {
 		});
 	}
 
-	private async prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean> {
+	/**
+	 * Mount a provider-auth panel inline in place of the prompt area, matching
+	 * the inline pickers. Returns a callback that unmounts the panel and
+	 * restores the previous content and focus. Closers are tracked in a stack
+	 * because in-flow selectors mount on top of the login dialog;
+	 * resetExtensionUI tears the whole stack down on session resets. Each
+	 * closer runs once, so a reset cannot stomp a picker opened afterwards.
+	 */
+	private showInlineAuthPanel(
+		component: Component,
+		options?: { heading?: string; onReset?: () => void },
+	): (reason?: "reset") => void {
+		// Onboarding owns the top of the screen: mount the panel inside its block
+		// rather than down in the prompt dock.
+		const splash = this.onboardingSplash;
+		if (splash) {
+			splash.setPanel(component, options?.heading);
+			this.ui.setFocus(component);
+			this.ui.requestRender();
+			let splashPanelClosed = false;
+			const closeSplashPanel = (reason?: "reset") => {
+				if (splashPanelClosed) return;
+				splashPanelClosed = true;
+				const index = this.inlineAuthPanelClosers.indexOf(closeSplashPanel);
+				if (index !== -1) {
+					this.inlineAuthPanelClosers.splice(index, 1);
+				}
+				// A reset unmounts the panel without its flow finishing: settle the
+				// step the caller is awaiting, or it waits on a dead panel forever.
+				if (reason === "reset") {
+					options?.onReset?.();
+					if (isAbortablePanel(component)) {
+						component.abort();
+					}
+				}
+				splash.setPanel(undefined);
+				// The splash ignores keys while a panel is mounted, so focus has to
+				// land on whichever panel the pop restored, not on the block itself.
+				this.ui.setFocus(splash.getActivePanel() ?? splash);
+				this.ui.requestRender();
+			};
+			this.inlineAuthPanelClosers.push(closeSplashPanel);
+			return closeSplashPanel;
+		}
+		const previousChildren = [...this.editorContainer.children];
+		const previousFocus = previousChildren.find((child) => isFocusable(child) && child.focused) ?? this.editor;
+		this.editorContainer.clear();
+		this.editorContainer.addChild(component);
+		this.ui.setFocus(component);
+		this.ui.requestRender();
+		let closed = false;
+		const close = (reason?: "reset") => {
+			if (closed) return;
+			closed = true;
+			if (reason === "reset") {
+				options?.onReset?.();
+				if (isAbortablePanel(component)) {
+					component.abort();
+				}
+			}
+			const index = this.inlineAuthPanelClosers.indexOf(close);
+			if (index !== -1) {
+				this.inlineAuthPanelClosers.splice(index, 1);
+			}
+			this.editorContainer.clear();
+			for (const child of previousChildren) {
+				this.editorContainer.addChild(child);
+			}
+			this.ui.setFocus(previousFocus);
+			this.ui.requestRender();
+		};
+		this.inlineAuthPanelClosers.push(close);
+		return close;
+	}
+
+	private async prepareForModelSelectionAfterLogin(
+		authResult: AuthenticationResult,
+		abortSignal?: AbortSignal,
+	): Promise<boolean> {
+		// A reset rebinds the session; selection prepared for the old one must
+		// not be applied to the new one.
+		if (abortSignal?.aborted) {
+			return false;
+		}
 		const currentModel = this.getCurrentModel();
 		// The agent core uses unknown/unknown as its no-model sentinel.
 		const selectedModel =
@@ -8687,6 +9361,9 @@ export class InteractiveMode {
 		}
 
 		if (action.fallbackModel) {
+			if (abortSignal?.aborted) {
+				return false;
+			}
 			try {
 				await this.applySelectedModel(action.fallbackModel);
 				await this.settingsManager.flush();
@@ -8895,6 +9572,10 @@ export class InteractiveMode {
 			this.applyFullscreen(true);
 		}
 		this.ui.requestRender(true);
+
+		// The updater ran in a child process and may have persisted settings, for example the
+		// update channel, without installing anything. Pick those up before reporting.
+		await this.settingsManager.reload().catch(() => undefined);
 
 		if (selfUpdateNotAttempted) {
 			this.showStatus(`Update did not change ${APP_NAME}. Reloading resources...`);
@@ -9667,19 +10348,22 @@ export class InteractiveMode {
 		}
 	}
 
-	private async showHeartbeatManager(): Promise<void> {
+	private showHeartbeatManager(): void {
 		if (this.heartbeatManagerHandle) {
 			this.heartbeatManagerHandle.focus();
 			return;
 		}
-		try {
-			await this.refreshHeartbeatCatalog();
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-			return;
-		}
+		// Stale-while-revalidate: open immediately with the cached catalog. A
+		// busy session can take minutes to answer the fetch, and the overlay
+		// must not wait for it; the background refresh updates the open view
+		// when fresh data lands (the component reads the catalog per render).
+		// A failed fetch surfaces inside the view instead of silently showing a
+		// possibly-stale catalog; each open starts with a clean notice state.
+		this.heartbeatCatalogFetchError = undefined;
+		void this.refreshHeartbeatCatalog().catch((error) => this.onHeartbeatCatalogFetchError(error));
 		const manager = new HeartbeatManagerComponent({
 			getHeartbeats: () => this.getScopedHeartbeats(),
+			getFetchError: () => this.heartbeatCatalogFetchError,
 			getRows: () => this.ui.terminal.rows,
 			onAction: (heartbeat, action) => this.manageHeartbeat(heartbeat, action),
 			onClose: () => this.closeHeartbeatManager(),
@@ -9695,6 +10379,7 @@ export class InteractiveMode {
 
 	private closeHeartbeatManager(): void {
 		this.clearHeartbeatManagerRefreshTimer();
+		this.clearHeartbeatManagerFetchRetryTimer();
 		this.heartbeatManagerHandle?.hide();
 		this.heartbeatManagerHandle = undefined;
 		this.heartbeatManager = undefined;
@@ -9749,10 +10434,64 @@ export class InteractiveMode {
 		this.heartbeatManagerRefreshAt = undefined;
 	}
 
+	private retainHeartbeatCatalogFetch(
+		fetch: Promise<AgentConnectionHeartbeat[]>,
+		connection: AgentConnection,
+		seq: number,
+	): void {
+		// The deadline expired while this fetch was still in flight: apply the
+		// late result when it lands so the open view converges even without a
+		// further heartbeats_changed event. Bounded by the same context guards
+		// as the drain loop and by the write sequence, so a superseded result
+		// cannot revert newer catalog state; a late failure is swallowed (the
+		// retry chain owns recovery from it).
+		void fetch
+			.then((heartbeats) => {
+				if (this.isShuttingDown || this.isReturningToAgentsView || this.agentConnection !== connection) {
+					return;
+				}
+				this.applyHeartbeatCatalog(heartbeats, seq);
+			})
+			.catch(() => undefined);
+	}
+
+	private armHeartbeatManagerFetchRetry(): void {
+		// Guarantee the open manager always has a next scheduled retrieval
+		// after a deadline expiry; a still-armed retry keeps the earliest slot.
+		if (!this.heartbeatManager || this.heartbeatManagerFetchRetryTimer) return;
+		this.heartbeatManagerFetchRetryTimer = setTimeout(() => {
+			this.heartbeatManagerFetchRetryTimer = undefined;
+			if (!this.heartbeatManager) return;
+			void this.refreshHeartbeatCatalog().catch((error) => this.onHeartbeatCatalogFetchError(error));
+		}, HEARTBEAT_REFRESH_RETRY_DELAY_MS);
+		this.heartbeatManagerFetchRetryTimer.unref?.();
+	}
+
+	private clearHeartbeatManagerFetchRetryTimer(): void {
+		if (this.heartbeatManagerFetchRetryTimer) {
+			clearTimeout(this.heartbeatManagerFetchRetryTimer);
+			this.heartbeatManagerFetchRetryTimer = undefined;
+		}
+	}
+
+	private onHeartbeatCatalogFetchError(error: unknown): void {
+		// Stale-while-revalidate opens the manager even when the fetch fails;
+		// surface the failure in the view instead of silently showing a stale
+		// catalog, and keep a next retrieval scheduled.
+		this.heartbeatCatalogFetchError = error instanceof Error ? error.message : String(error);
+		this.armHeartbeatManagerFetchRetry();
+		this.scheduleHeartbeatManagerRefresh();
+		this.ui.requestRender();
+	}
+
 	private async manageHeartbeat(
 		heartbeat: AgentConnectionHeartbeat,
 		action: AgentHeartbeatManagementAction,
 	): Promise<void> {
+		// Sequence the action by issue order so an older in-flight fetch
+		// cannot later revert its result; the action itself is authoritative
+		// and always applies.
+		const actionSeq = ++this.heartbeatCatalogSeq;
 		const updated = await this.agentConnection.manageHeartbeat(
 			heartbeat.job.activeSessionId,
 			heartbeat.job.id,
@@ -9761,6 +10500,7 @@ export class InteractiveMode {
 		if (updated.source === "heartbeat" && updated.activeSessionId === this.connectionState?.activeSessionId) {
 			this.patchConnectionState({ heartbeat: action === "stop" ? null : updated });
 		}
+		this.heartbeatCatalogAppliedSeq = Math.max(this.heartbeatCatalogAppliedSeq, actionSeq);
 		const remaining = this.heartbeatCatalog.filter((entry) => entry.job.id !== updated.id);
 		this.applyHeartbeatCatalog(
 			updated.status === "active" || updated.status === "paused"
