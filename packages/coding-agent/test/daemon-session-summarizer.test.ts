@@ -526,7 +526,6 @@ describe("daemon session summarizer", () => {
 			expect(state.summaryState?.taskState).toBe("error");
 			onStatusChanged.mockClear();
 
-			// The user prompts again and the agent is working.
 			const session = state.runtime.session as unknown as { messages: AgentMessage[]; isSessionActive: boolean };
 			session.messages = [...erroredTranscript(providerError), userMessage("try again")];
 			session.isSessionActive = true;
@@ -569,13 +568,30 @@ describe("daemon session summarizer", () => {
 				async () => undefined,
 			);
 			summarizer.seed(state);
-			expect(state.summaryState).toEqual(persisted);
+			// Superseded on restart: nothing is seeded, so an attach before the first
+			// sweep cannot overlay the stale failure recap either.
+			expect(state.summaryState).toBeUndefined();
 			const internal = summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> };
 
 			await internal.summarize(state);
 
 			expect(state.summaryState).toEqual({ summary: "", taskState: "needs_input", basedOnMessageCount: 4 });
 			expect(appended).toHaveLength(0);
+		});
+
+		test("a restart-seeded error verdict that is still the last event seeds as-is", () => {
+			const persisted: AgentStatus = {
+				summary: `Model request failed: ${providerError}`,
+				taskState: "error",
+				basedOnMessageCount: 2,
+			};
+			const { state } = erroredState({ messages: erroredTranscript(providerError), persistedStatus: persisted });
+			new DaemonSessionSummarizer(
+				() => [state],
+				undefined,
+				async () => undefined,
+			).seed(state);
+			expect(state.summaryState).toEqual(persisted);
 		});
 	});
 });

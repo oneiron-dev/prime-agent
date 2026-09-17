@@ -131,9 +131,7 @@ describe("AgentSession retry of mid-stream WebSocket transport failures", () => 
 
 		expect(harness.faux.state.callCount).toBe(2);
 		expect(retryEvents(harness)).toEqual([`start:1:${CLOSED}`, "end:true:1"]);
-		// The retried request carries no trace of the cut output.
 		expect(retryContexts).toEqual([[]]);
-		// The session context holds exactly one assistant message: the complete one.
 		const assistants = harness.session.messages.filter((message) => message.role === "assistant");
 		expect(assistants).toHaveLength(1);
 		expect(getAssistantTexts(harness)).toEqual(["the complete answer"]);

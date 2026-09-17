@@ -4,6 +4,7 @@ import { completeSimple } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "../../core/model-registry.js";
 import { completeWithProviderRetry, type ProviderRetryPolicy, providerRetryPolicy } from "../../core/provider-retry.js";
 import type { AgentStatus, AgentTaskState } from "../../core/session-manager.js";
+import { baselineRecap } from "../agent-connection/snapshot.js";
 import type { ActiveSessionState } from "./active-session-state.js";
 
 const SWEEP_INTERVAL_MS = 25_000;
@@ -307,8 +308,13 @@ export class DaemonSessionSummarizer {
 		if (state.summaryState) {
 			return;
 		}
-		const persisted = state.runtime.session.sessionManager.getLatestAgentStatus();
-		if (persisted) {
+		const session = state.runtime.session;
+		const persisted = session.sessionManager.getLatestAgentStatus();
+		// A persisted error verdict that later messages superseded is history: it
+		// must not become the live recap on restart, where an attach or the agents
+		// roster would show it until the first sweep replaces it. Same gate as the
+		// attach baseline.
+		if (persisted && baselineRecap(persisted, session.messages.length) !== undefined) {
 			state.summaryState = persisted;
 		}
 	}
