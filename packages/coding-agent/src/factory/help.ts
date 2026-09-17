@@ -11,8 +11,10 @@ export const FACTORY_HELP = `Usage:
   prime factory resume <directory>
   prime factory manage <directory> [action-id] [--role ticketOwner] [--evidence <file>] [--apply]
   prime factory manage <directory> --watch [--apply] [--evidence-directory <directory>] [--max-requests <count>] [--max-passes <count>] [--interval-ms <milliseconds>]
-  prime factory supersede <directory> <rejected-action> <replacement-action> --expected-revision <revision> --actor <actor> --reason <reason> --ref <evidence>
+  prime factory supersede <directory> <rejected-or-abandoned-action> <replacement-action> --expected-revision <revision> --actor <actor> --reason <reason> --ref <evidence>
   prime factory reconcile-management <directory> <request-id> --expected-revision <revision> --actor <actor> --reason <reason> --ref <absolute-reconciliation.json>
+  prime factory settle-no-retry <directory> <action-id> --expected-revision <revision> --expected-attempt <id> --actor <actor> --reason <reason> --ref <absolute-settlement.json>
+  prime factory withdraw <directory> <action-id> --expected-revision <revision> --actor <actor> --reason <reason> --ref <absolute-withdrawal.json>
   prime factory resolve <directory> <attempt-id> --actor <actor> --reason <reason> --ref <evidence>
   prime factory decide <directory> <action-id> <accept|reject> --actor <actor> --reason <reason> --ref <evidence> [--expected-revision <revision>] [--expected-attempt <id>] [--expected-wake <id>]
 
@@ -24,7 +26,11 @@ Hosts JSON: {"local":{"type":"local","runnerRoot":"/absolute/attempts"}}
 SSH host: {"type":"ssh","sshHost":"arch","runnerRoot":"/absolute/attempts","python":"python3"}
 Only foreground commands are supported; daemonized/detached descendants require another adapter.
 Plans use argv arrays and absolute cwd paths. Use fingerprint for verified Git source identity.
-resolve requires evidence that any previous process tree is gone; it does not kill or inspect it for you.
+resolve intentionally retries and requires evidence that any previous process tree is gone; it does not kill or inspect it for you.
+settle-no-retry closes proven-dead UNCERTAIN work as ABANDONED with outcome UNKNOWN; use settle-no-retry --help for exact evidence bindings.
+supersede explicitly replaces rejected or abandoned work; it preserves history and does not accept the replacement or dependencies.
+withdraw closes never-claimed QUEUED/READY work as WITHDRAWN with NOT_EXECUTED; use withdraw --help for exact plan/owner/source bindings.
+Neither closure launches work or satisfies dependencies. Withdrawal refuses any attempt history; settlement is not product acceptance.
 manage returns a proposal unless --apply is explicit; --watch opts into bounded automatic wake handling, separate from serve.
 Automatic handling needs exact per-wake evidence bindings. Requests are durably consumed, including defer/errors; crashes never authorize replay.
 Plan mutations wait for active/unconsumed judgments; no-op imports keep the revision. Rebind pending wakes after real mutations.

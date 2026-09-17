@@ -1,0 +1,4 @@
+- Added `factory settle-no-retry` to close proven-dead uncertain work and release its claim atomically without replay or a fabricated terminal outcome.
+- Added explicit supersession of abandoned factory actions while preserving unknown outcomes and duplicate settlement receipts.
+- Added `factory withdraw` to close never-started actions without execution, with plan and ownership checks.
+- Added factory help for both closure commands.
