@@ -511,5 +511,71 @@ describe("daemon session summarizer", () => {
 			});
 			expect(appended).toHaveLength(0);
 		});
+
+		// Observed 2026-09-17: the prompt line kept "Recap: Model request failed:
+		// WebSocket closed before response.completed" while the next turn ran tools,
+		// because the summary model had no auth and the fallback carried the old
+		// error summary forward.
+		test("resumed work replaces a stale error recap at once, even without a classifier", async () => {
+			const { state, appended } = erroredState({ messages: erroredTranscript(providerError) });
+			const noClassifier = vi.fn(async () => undefined);
+			const onStatusChanged = vi.fn();
+			const summarizer = new DaemonSessionSummarizer(() => [state], onStatusChanged, noClassifier);
+			const internal = summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> };
+			await internal.summarize(state);
+			expect(state.summaryState?.taskState).toBe("error");
+			onStatusChanged.mockClear();
+
+			// The user prompts again and the agent is working.
+			const session = state.runtime.session as unknown as { messages: AgentMessage[]; isSessionActive: boolean };
+			session.messages = [...erroredTranscript(providerError), userMessage("try again")];
+			session.isSessionActive = true;
+			await internal.summarize(state);
+
+			expect(state.summaryState).toEqual({ summary: "", basedOnMessageCount: 3 });
+			expect(onStatusChanged).toHaveBeenCalledOnce();
+			// The error verdict stays in the journal as history; nothing new is written.
+			expect(appended).toEqual([
+				{ summary: `Model request failed: ${providerError}`, taskState: "error", basedOnMessageCount: 2 },
+			]);
+
+			// The turn finishes and the classifier is still unavailable: the idle
+			// fallback settles to needs_input without resurrecting the error recap.
+			session.messages = [...session.messages, assistantMessage("Wrote the marker file")];
+			session.isSessionActive = false;
+			await internal.summarize(state);
+
+			expect(state.summaryState).toEqual({ summary: "", taskState: "needs_input", basedOnMessageCount: 4 });
+			expect(appended).toHaveLength(1);
+		});
+
+		test("a restart-seeded error verdict is not carried onto a transcript that recovered", async () => {
+			const persisted: AgentStatus = {
+				summary: `Model request failed: ${providerError}`,
+				taskState: "error",
+				basedOnMessageCount: 2,
+			};
+			const { state, appended } = erroredState({
+				messages: [
+					...erroredTranscript(providerError),
+					userMessage("try again"),
+					assistantMessage("Wrote the marker file"),
+				],
+				persistedStatus: persisted,
+			});
+			const summarizer = new DaemonSessionSummarizer(
+				() => [state],
+				undefined,
+				async () => undefined,
+			);
+			summarizer.seed(state);
+			expect(state.summaryState).toEqual(persisted);
+			const internal = summarizer as unknown as { summarize(state: ActiveSessionState): Promise<void> };
+
+			await internal.summarize(state);
+
+			expect(state.summaryState).toEqual({ summary: "", taskState: "needs_input", basedOnMessageCount: 4 });
+			expect(appended).toHaveLength(0);
+		});
 	});
 });

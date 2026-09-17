@@ -40,7 +40,12 @@ import {
 } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
-import { parseRetryAfterMs, recordStreamFailure } from "../utils/stream-failure.js";
+import {
+	parseRetryAfterMs,
+	recordStreamFailure,
+	type StreamTransportFailureCause,
+	WebSocketTransportError,
+} from "../utils/stream-failure.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
 import { buildBaseOptions } from "./simple-options.js";
 
@@ -687,13 +692,21 @@ function getWebSocketConstructor(): WebSocketConstructor | null {
 	return ctor as unknown as WebSocketConstructor;
 }
 
-class WebSocketCloseError extends Error {
+class WebSocketCloseError extends WebSocketTransportError {
 	readonly code?: number;
 	readonly reason?: string;
 	readonly wasClean?: boolean;
 
-	constructor(message: string, options?: { code?: number; reason?: string; wasClean?: boolean }) {
-		super(message);
+	constructor(
+		message: string,
+		options?: { code?: number; reason?: string; wasClean?: boolean; cause?: "connect" | "closed" },
+	) {
+		super(message, {
+			cause: options?.cause ?? "closed",
+			closeCode: options?.code,
+			closeReason: options?.reason,
+			wasClean: options?.wasClean,
+		});
 		this.name = "WebSocketCloseError";
 		this.code = options?.code;
 		this.reason = options?.reason;
@@ -758,14 +771,14 @@ async function connectWebSocket(url: string, headers: Headers, signal?: AbortSig
 			resolve(socket);
 		};
 		const onError: WebSocketListener = (event) => {
-			const error = extractWebSocketError(event);
+			const error = extractWebSocketError(event, "connect");
 			if (settled) return;
 			settled = true;
 			cleanup();
 			reject(error);
 		};
 		const onClose: WebSocketListener = (event) => {
-			const error = extractWebSocketCloseError(event);
+			const error = extractWebSocketCloseError(event, "connect");
 			if (settled) return;
 			settled = true;
 			cleanup();
@@ -880,28 +893,28 @@ async function acquireWebSocket(
 	};
 }
 
-function extractWebSocketError(event: unknown): Error {
+function extractWebSocketError(event: unknown, cause: StreamTransportFailureCause = "error"): Error {
 	if (event && typeof event === "object") {
 		const message = "message" in event ? (event as { message?: unknown }).message : undefined;
 		if (typeof message === "string" && message.length > 0) {
-			return new Error(message);
+			return new WebSocketTransportError(message, { cause });
 		}
 
 		const nestedError = "error" in event ? (event as { error?: unknown }).error : undefined;
 		if (nestedError instanceof Error && nestedError.message.length > 0) {
-			return nestedError;
+			return new WebSocketTransportError(nestedError.message, { cause }, { cause: nestedError });
 		}
 		if (nestedError && typeof nestedError === "object" && "message" in nestedError) {
 			const nestedMessage = (nestedError as { message?: unknown }).message;
 			if (typeof nestedMessage === "string" && nestedMessage.length > 0) {
-				return new Error(nestedMessage);
+				return new WebSocketTransportError(nestedMessage, { cause });
 			}
 		}
 	}
-	return new Error("WebSocket error");
+	return new WebSocketTransportError("WebSocket error", { cause });
 }
 
-function extractWebSocketCloseError(event: unknown): Error {
+function extractWebSocketCloseError(event: unknown, cause: "connect" | "closed" = "closed"): Error {
 	if (event && typeof event === "object") {
 		const code = "code" in event ? (event as { code?: unknown }).code : undefined;
 		const reason = "reason" in event ? (event as { reason?: unknown }).reason : undefined;
@@ -915,6 +928,7 @@ function extractWebSocketCloseError(event: unknown): Error {
 			code: typeof code === "number" ? code : undefined,
 			reason: typeof reason === "string" && reason.length > 0 ? reason : undefined,
 			wasClean: typeof wasClean === "boolean" ? wasClean : undefined,
+			cause,
 		});
 	}
 	return new Error("WebSocket closed");
@@ -1026,7 +1040,7 @@ async function* parseWebSocket(socket: WebSocketLike, signal?: AbortSignal): Asy
 			throw failed;
 		}
 		if (!sawCompletion) {
-			throw new Error("WebSocket stream closed before response.completed");
+			throw new WebSocketTransportError("WebSocket stream closed before response.completed", { cause: "eof" });
 		}
 	} finally {
 		socket.removeEventListener("message", onMessage);

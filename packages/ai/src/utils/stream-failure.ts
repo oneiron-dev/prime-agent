@@ -18,7 +18,24 @@ export type StreamFailureKind =
 	| "permission"
 	| "invalid_request"
 	| "malformed_response"
+	| "transport"
 	| "unknown";
+
+/** How a transport connection to the provider failed. */
+export type StreamTransportFailureCause = "connect" | "error" | "closed" | "eof";
+
+/**
+ * Structured detail for a `transport` failure: the connection itself failed
+ * before the provider delivered a verdict, so no provider error type exists.
+ */
+export interface StreamTransportFailureDetail {
+	protocol: "websocket";
+	cause: StreamTransportFailureCause;
+	/** Server close code, when the socket closed with one. */
+	closeCode?: number;
+	closeReason?: string;
+	wasClean?: boolean;
+}
 
 export interface StreamFailureInfo {
 	kind: StreamFailureKind;
@@ -32,15 +49,34 @@ export interface StreamFailureInfo {
 	retryAfterMs?: number;
 	/** Truncated raw provider payload for post-mortems. */
 	raw?: string;
+	/** Connection-level detail, present only for kind "transport". */
+	transport?: StreamTransportFailureDetail;
 }
 
 export class StreamFailureError extends Error {
 	readonly info: StreamFailureInfo;
 
-	constructor(message: string, info: StreamFailureInfo) {
-		super(message);
+	constructor(message: string, info: StreamFailureInfo, options?: ErrorOptions) {
+		super(message, options);
 		this.name = "StreamFailureError";
 		this.info = info;
+	}
+}
+
+/**
+ * A WebSocket transport failure: the socket errored, closed, or ended before
+ * `response.completed`. No provider verdict was received, so the failure is
+ * classified as `transport` (transient) instead of being inferred from the
+ * message text. The message is kept verbatim for logs and retry status.
+ */
+export class WebSocketTransportError extends StreamFailureError {
+	readonly transport: StreamTransportFailureDetail;
+
+	constructor(message: string, transport: Omit<StreamTransportFailureDetail, "protocol">, options?: ErrorOptions) {
+		const detail: StreamTransportFailureDetail = { protocol: "websocket", ...transport };
+		super(message, { kind: "transport", providerErrorType: `websocket_${detail.cause}`, transport: detail }, options);
+		this.name = "WebSocketTransportError";
+		this.transport = detail;
 	}
 }
 
@@ -54,6 +90,7 @@ const KIND_MESSAGES: Record<StreamFailureKind, string> = {
 	permission: "Provider denied access to the requested resource",
 	invalid_request: "Provider rejected the request",
 	malformed_response: "Provider returned a malformed response",
+	transport: "Connection to the provider was lost before the response completed",
 	unknown: "Provider stream failed",
 };
 

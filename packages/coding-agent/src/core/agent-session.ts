@@ -12762,12 +12762,15 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
 
-		// Context overflow is handled by compaction, not retry. A bare post-start
-		// WebSocket close is similarly terminal: retrying an identical payload only
-		// amplifies an upstream rejection whose error frame was lost in transit.
+		// Context overflow is handled by compaction, not retry. Everything else is
+		// decided from the structured provider_stream_failure kind below, never
+		// from the message text. A transport drop mid-stream (the WebSocket closed
+		// or errored before response.completed, e.g. an upstream proxy rotating
+		// accounts) carries no provider verdict: it is transient and retried under
+		// the bounded policy, and the retry re-issues the turn without the
+		// partial assistant message (see _retryAfterDelay).
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return false;
-		if (message.errorMessage.includes("WebSocket closed before response.completed")) return false;
 
 		if (this._isFauxProviderQueueExhausted(message)) {
 			return false;
@@ -13008,6 +13011,9 @@ export class AgentSession {
 			this._semanticEdges.prepareTurnRetry();
 		}
 
+		// Arm the cancel before announcing the retry: a subscriber that cancels
+		// from inside the auto_retry_start event must abort this sleep, not race it.
+		this._retryAbortController = new AbortController();
 		this._emit(emitStart);
 
 		const messages = this.agent.state.messages;
@@ -13015,7 +13021,6 @@ export class AgentSession {
 			this.agent.state.messages = messages.slice(0, -1);
 		}
 
-		this._retryAbortController = new AbortController();
 		try {
 			await sleep(delayMs, this._retryAbortController.signal);
 		} catch {

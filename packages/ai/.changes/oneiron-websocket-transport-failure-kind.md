@@ -1,0 +1,1 @@
+- Classified WebSocket transport drops (closed, errored, or ended before `response.completed`) as structured `transport` stream failures carrying the close code and reason, for both the generic Responses and the Codex transports.

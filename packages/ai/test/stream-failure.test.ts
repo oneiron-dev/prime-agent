@@ -8,6 +8,7 @@ import {
 	recordStreamFailure,
 	StreamFailureError,
 	streamFailureFromStopReason,
+	WebSocketTransportError,
 } from "../src/utils/stream-failure.js";
 
 afterEach(() => setLogSink(undefined));
@@ -203,5 +204,60 @@ describe("recordStreamFailure", () => {
 		recordStreamFailure(model, output, new Error("Request was aborted"));
 		expect(output.diagnostics).toBeUndefined();
 		expect(logged).toEqual([]);
+	});
+});
+
+describe("WebSocketTransportError", () => {
+	test.each([
+		["WebSocket closed before response.completed", "closed"],
+		["WebSocket stream closed before response.completed", "eof"],
+		["WebSocket error", "error"],
+		["WebSocket closed 1006", "connect"],
+	] as const)("classifies %s (%s) as a transport failure and keeps the message verbatim", (message, cause) => {
+		const error = new WebSocketTransportError(message, { cause });
+		expect(error.name).toBe("WebSocketTransportError");
+		expect(error).toBeInstanceOf(StreamFailureError);
+		expect(extractStreamFailureInfo(error)).toEqual({
+			kind: "transport",
+			providerErrorType: `websocket_${cause}`,
+			transport: { protocol: "websocket", cause },
+		});
+		expect(formatStreamFailureMessage(error)).toBe(message);
+	});
+
+	test("carries the server close code and reason", () => {
+		const error = new WebSocketTransportError("WebSocket closed before response.completed 1011 upstream rejected", {
+			cause: "closed",
+			closeCode: 1011,
+			closeReason: "upstream rejected",
+			wasClean: false,
+		});
+		expect(error.transport).toEqual({
+			protocol: "websocket",
+			cause: "closed",
+			closeCode: 1011,
+			closeReason: "upstream rejected",
+			wasClean: false,
+		});
+	});
+
+	test("records a transport diagnostic that downstream retry can classify without the message text", () => {
+		const output = makeOutput({ errorMessage: "WebSocket closed before response.completed" });
+		recordStreamFailure(
+			{ provider: "cpa-r", id: "gpt-6-astra", api: "openai-responses" },
+			output,
+			new WebSocketTransportError("WebSocket closed before response.completed", { cause: "closed" }),
+		);
+		expect(output.diagnostics).toEqual([
+			expect.objectContaining({
+				type: "provider_stream_failure",
+				error: expect.objectContaining({ name: "WebSocketTransportError" }),
+				details: {
+					kind: "transport",
+					providerErrorType: "websocket_closed",
+					transport: { protocol: "websocket", cause: "closed" },
+				},
+			}),
+		]);
 	});
 });

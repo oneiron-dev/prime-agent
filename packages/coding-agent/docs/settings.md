@@ -186,6 +186,16 @@ prime-agent --offline
 
 When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g. a usage-limit reset hours away), auto-retry stops immediately with an informative error instead of waiting. Set to `0` to disable the cap.
 
+Transport failures are retried under the same policy. When a WebSocket
+connection to the provider drops mid-response (closed, errored, or ended before
+`response.completed`, for example when an upstream proxy rotates accounts), the
+turn is classified as a transient `transport` failure and re-issued with the
+configured backoff. The partial output of the failed attempt is discarded first:
+nothing streams twice, and a half-received tool call never runs. The retry
+reconnects over the configured `transport`; there is no fallback to SSE once a
+WebSocket response has started. Root sessions and RLM subagents share this
+policy.
+
 ### Wait-for-usage and provider recovery
 
 | Setting | Type | Default | Description |

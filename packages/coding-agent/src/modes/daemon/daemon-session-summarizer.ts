@@ -341,6 +341,19 @@ export class DaemonSessionSummarizer {
 		}
 		const messageCount = messages.length;
 		const isWorking = isSessionWorking(state);
+		// Work resumed after an error verdict (a new turn, or an auto-retry of the
+		// failed one): that verdict is history now. Replace it at once instead of
+		// leaving "Model request failed" on screen until the classifier lands,
+		// which never happens when the summary model is unavailable. The
+		// transcript and the persisted status journal keep the actual error.
+		if (isWorking && state.summaryState?.taskState === "error") {
+			this.commitStatus(
+				state,
+				session,
+				{ summary: "", basedOnMessageCount: messageCount },
+				{ isWorking, previous: state.summaryState, persist: false },
+			);
+		}
 		const previous = state.summaryState;
 		// Idle sessions with a current verdict need no refresh — except a
 		// transcript whose terminal turn errored (owesErrorVerdict below) —
@@ -414,10 +427,13 @@ export class DaemonSessionSummarizer {
 			}
 			// A failed classification on an idle session would spin at "working"
 			// forever (the activity axis holds unjudged idle sessions there), so
-			// settle it to needs_input.
+			// settle it to needs_input. A prior error verdict's summary is never
+			// carried into it: reaching here means the transcript no longer ends
+			// in that error (terminalTurnError settled above otherwise), so the
+			// failure recap would be stale.
+			const carriedSummary = previous?.taskState === "error" ? "" : (previous?.summary ?? "");
 			const result =
-				generated ??
-				(owesIdleVerdict ? { summary: previous?.summary ?? "", taskState: "needs_input" as const } : undefined);
+				generated ?? (owesIdleVerdict ? { summary: carriedSummary, taskState: "needs_input" as const } : undefined);
 			if (!result) {
 				return;
 			}

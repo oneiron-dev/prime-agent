@@ -990,8 +990,95 @@ describe("generic OpenAI Responses WebSocket transport", () => {
 			await request([]);
 			throw new Error("expected close");
 		} catch (error) {
-			expect(error).toMatchObject({ name: "WebSocketTransportError" });
-			expect(String(error)).toContain("1011 upstream rejected");
+			expect(error).toMatchObject({
+				name: "WebSocketTransportError",
+				message: "WebSocket closed before response.completed 1011 upstream rejected",
+				info: {
+					kind: "transport",
+					providerErrorType: "websocket_closed",
+					transport: { protocol: "websocket", cause: "closed", closeCode: 1011, closeReason: "upstream rejected" },
+				},
+			});
 		}
+	});
+});
+
+describe("WebSocket transport failure classification", () => {
+	async function terminalMessage(): Promise<AssistantMessage> {
+		let message: AssistantMessage | undefined;
+		for await (const event of streamOpenAIResponses(model, { messages: [] }, { apiKey: "key", transport: "auto" })) {
+			if (event.type === "error") message = event.error;
+			if (event.type === "done") message = event.message;
+		}
+		if (!message) throw new Error("stream produced no terminal message");
+		return message;
+	}
+	function diagnostic(message: AssistantMessage, type: string) {
+		return message.diagnostics?.find((entry) => entry.type === type);
+	}
+
+	it("classifies a bare mid-stream close as a structured transport failure with the message kept verbatim", async () => {
+		class ClosingWebSocket extends MockWebSocket {
+			override send() {
+				queueMicrotask(() => {
+					this.message({ type: "response.created", response: { id: "ws" } } as ResponseStreamEvent);
+					this.emit("close", { code: 1006 });
+				});
+			}
+		}
+		setOpenAIResponsesWebSocketConstructorForTesting(ClosingWebSocket);
+		const message = await terminalMessage();
+		expect(sdk.calls).toBe(0);
+		expect(message.stopReason).toBe("error");
+		expect(message.errorMessage).toBe("WebSocket closed before response.completed");
+		expect(diagnostic(message, "provider_transport_failure")).toMatchObject({
+			error: { name: "WebSocketTransportError" },
+			details: { phase: "after_message_stream_start", eventsEmitted: true, fallbackTransport: undefined },
+		});
+		expect(diagnostic(message, "provider_stream_failure")).toMatchObject({
+			details: {
+				kind: "transport",
+				providerErrorType: "websocket_closed",
+				transport: { protocol: "websocket", cause: "closed", closeCode: 1006 },
+			},
+		});
+	});
+
+	it("classifies a mid-stream socket error event as a transport failure", async () => {
+		class ErroringWebSocket extends MockWebSocket {
+			override send() {
+				queueMicrotask(() => {
+					this.message({ type: "response.created", response: { id: "ws" } } as ResponseStreamEvent);
+					this.emit("error", {});
+				});
+			}
+		}
+		setOpenAIResponsesWebSocketConstructorForTesting(ErroringWebSocket);
+		const message = await terminalMessage();
+		expect(sdk.calls).toBe(0);
+		expect(message.errorMessage).toBe("WebSocket error");
+		expect(diagnostic(message, "provider_stream_failure")).toMatchObject({
+			details: { kind: "transport", providerErrorType: "websocket_error", transport: { cause: "error" } },
+		});
+	});
+
+	it("records a pre-start failure as a connect-phase transport diagnostic and still falls back to SSE", async () => {
+		class FailingWebSocket extends MockWebSocket {
+			override send() {
+				queueMicrotask(() => this.emit("close", { code: 1002, reason: "handshake rejected" }));
+			}
+		}
+		setOpenAIResponsesWebSocketConstructorForTesting(FailingWebSocket);
+		const message = await terminalMessage();
+		expect(sdk.calls).toBe(1);
+		expect(message.stopReason).toBe("stop");
+		expect(diagnostic(message, "provider_transport_failure")).toMatchObject({
+			error: {
+				name: "WebSocketTransportError",
+				message: "WebSocket closed before response.completed 1002 handshake rejected",
+			},
+			details: { phase: "before_message_stream_start", fallbackTransport: "sse" },
+		});
+		expect(diagnostic(message, "provider_stream_failure")).toBeUndefined();
 	});
 });
