@@ -701,21 +701,6 @@ describe("AgentSession retry and event characterization", () => {
 			expect(lastMessage.stopReason).toBe("aborted");
 		}
 	});
-	it("does not retry an incident-shaped bare WebSocket close", async () => {
-		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
-		harnesses.push(harness);
-		const retryEvents: string[] = [];
-		harness.session.subscribe((event) => {
-			if (event.type === "auto_retry_start") retryEvents.push(event.type);
-		});
-		harness.setResponses([
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "WebSocket closed before response.completed" }),
-		]);
-		await harness.session.prompt("incident payload");
-		expect(retryEvents).toEqual([]);
-		expect(harness.faux.state.callCount).toBe(1);
-	});
-
 	function quotaFailure(options?: { retryAfterMs?: number; errorMessage?: string }): AssistantMessage {
 		return {
 			...fauxAssistantMessage("", {

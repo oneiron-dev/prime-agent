@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
 	completeWithProviderRetry,
 	DEFAULT_PROVIDER_WAIT_POLICY,
+	isPermanentProviderFailureKind,
 	type ProviderWaitPolicy,
 	parseProviderResetMs,
 	providerRetryDelay,
@@ -93,6 +94,13 @@ describe("providerWaitClass", () => {
 		expect(providerWaitClass("unknown", undefined)).toBe("transient"); // network errors carry no kind
 		// A live model briefly 404s on routing blips (observed killing active sessions).
 		expect(providerWaitClass("invalid_request", 404)).toBe("transient");
+		// A WebSocket that closed/errored mid-response carries no provider verdict (CPA account rotation, 2026-09-17).
+		expect(providerWaitClass("transport", undefined)).toBe("transient");
+	});
+
+	it("never treats a transport drop as a permanent rejection", () => {
+		expect(isPermanentProviderFailureKind("transport", 0)).toBe(false);
+		expect(isPermanentProviderFailureKind("transport", 3)).toBe(false);
 	});
 
 	it("classifies permanent failures", () => {

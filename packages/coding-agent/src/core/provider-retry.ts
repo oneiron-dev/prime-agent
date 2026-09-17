@@ -161,11 +161,15 @@ export type ProviderWaitClass = "quota" | "transient" | "permanent";
  * - transient: provider unavailability. 404 counts: a live model briefly
  *   404s on routing blips (observed killing active sessions), and the same
  *   shape can also mean a genuinely missing model, so waits stay bounded.
+ *   A transport drop (the WebSocket closed or errored before the response
+ *   completed) is transient by construction: no provider verdict arrived.
  * - permanent: auth/permission/refusal/invalid requests. Waiting cannot help.
  */
 export function providerWaitClass(kind: string | undefined, status: number | undefined): ProviderWaitClass {
 	if (kind === "rate_limit" || kind === "quota") return "quota";
-	if (kind === "server_error" || kind === "overloaded" || kind === "unknown") return "transient";
+	if (kind === "server_error" || kind === "overloaded" || kind === "transport" || kind === "unknown") {
+		return "transient";
+	}
 	if (kind === "invalid_request" && status === 404) return "transient";
 	return "permanent";
 }
