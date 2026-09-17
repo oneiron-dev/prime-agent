@@ -1,5 +1,5 @@
-import * as childProcess from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -133,16 +133,13 @@ describe("ONE-1820 factory fingerprint timeout", () => {
 		"120001",
 		"1e100",
 		"9007199254740993",
-	])(
-		"rejects invalid CLI deadline %s without emitting a fingerprint",
-		async (timeout) => {
-			mockHost();
-			const output = vi.spyOn(console, "log").mockImplementation(() => {});
-			await expect(runFactoryCli(cliArgs(["--timeout-ms", timeout]))).rejects.toThrow(timeoutError);
-			expect(childProcess.spawn).not.toHaveBeenCalled();
-			expect(output).not.toHaveBeenCalled();
-		},
-	);
+	])("rejects invalid CLI deadline %s without emitting a fingerprint", async (timeout) => {
+		mockHost();
+		const output = vi.spyOn(console, "log").mockImplementation(() => {});
+		await expect(runFactoryCli(cliArgs(["--timeout-ms", timeout]))).rejects.toThrow(timeoutError);
+		expect(childProcess.spawn).not.toHaveBeenCalled();
+		expect(output).not.toHaveBeenCalled();
+	});
 
 	it("rejects missing and repeated CLI timeout values", async () => {
 		mockHost();
@@ -168,16 +165,13 @@ describe("ONE-1820 factory fingerprint timeout", () => {
 		"supersede",
 		"resolve",
 		"reconcile-management",
-	])(
-		"rejects --timeout-ms for %s before reading factory state",
-		async (command) => {
-			mockHost();
-			await expect(runFactoryCli([command, cwd, "--timeout-ms", "60000"])).rejects.toThrow(
-				"--timeout-ms is only supported for fingerprint",
-			);
-			expect(childProcess.spawn).not.toHaveBeenCalled();
-		},
-	);
+	])("rejects --timeout-ms for %s before reading factory state", async (command) => {
+		mockHost();
+		await expect(runFactoryCli([command, cwd, "--timeout-ms", "60000"])).rejects.toThrow(
+			"--timeout-ms is only supported for fingerprint",
+		);
+		expect(childProcess.spawn).not.toHaveBeenCalled();
+	});
 
 	it.each(["adapter", "cli"])("reports %s timeout failure, not a fingerprint or a launch result", async (entry) => {
 		const child = mockHost();
