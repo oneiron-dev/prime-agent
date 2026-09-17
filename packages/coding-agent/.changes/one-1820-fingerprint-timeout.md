@@ -1,0 +1,1 @@
+- Added a fingerprint-only `--timeout-ms` option bounded to 1–120000 ms, retaining the 20000 ms default and native Git source verification.
