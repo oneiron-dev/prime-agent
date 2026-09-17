@@ -76,11 +76,11 @@ describe("#858 daemon child profile rehydration", () => {
 			if (withPrivateModelAuth) authStorage.setRuntimeApiKey("prime-inference", "faux-prime-key");
 			return authStorage;
 		});
-		vi.spyOn(ModelRegistry.prototype, "refreshAvailableModels").mockImplementation(
-			async function (this: ModelRegistry) {
-				return this.getAvailable();
-			},
-		);
+		vi.spyOn(ModelRegistry.prototype, "refreshAvailableModels").mockImplementation(async function (
+			this: ModelRegistry,
+		) {
+			return this.getAvailable();
+		});
 		const settingsPath = join(spawn.tempDir, "settings.json");
 		const globalSettings = {
 			defaultProvider: spawn.getModel().provider,

@@ -1,0 +1,2 @@
+- Integrated upstream 0.9.5 chat-loading, catalog, subagent, and provider-wait improvements while preserving Oneiron pins, list ordering, saved collapse state, reasoning aliases, and remote compaction.
+- Fixed chat refresh retries after attachment deadlines so connected viewers continue receiving events.

@@ -44,9 +44,9 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
 }
 function recordFullReads(): string[] {
 	const reads: string[] = [];
-	vi.spyOn(fileLines, "readLinesAsBuffers").mockImplementation(async function* (file, start, end) {
+	vi.spyOn(fileLines, "readLinesAsBuffers").mockImplementation(async function* (file, range) {
 		reads.push(basename(file));
-		yield* originalReadLines(file, start, end);
+		yield* originalReadLines(file, range);
 	});
 	return reads;
 }
@@ -65,13 +65,13 @@ describe("pinned saved-session metadata loading", () => {
 		const backgroundStarted = deferred();
 		const releaseBackground = deferred();
 		const fullReads: string[] = [];
-		vi.spyOn(fileLines, "readLinesAsBuffers").mockImplementation(async function* (file, start, end) {
+		vi.spyOn(fileLines, "readLinesAsBuffers").mockImplementation(async function* (file, range) {
 			fullReads.push(basename(file));
 			if (basename(file) === "a-background.jsonl") {
 				backgroundStarted.resolve();
 				await releaseBackground.promise;
 			}
-			yield* originalReadLines(file, start, end);
+			yield* originalReadLines(file, range);
 		});
 		const discovered: string[] = [];
 		const progress: number[] = [];

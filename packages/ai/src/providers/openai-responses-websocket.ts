@@ -5,6 +5,11 @@ import type { Api, AssistantMessage, Model } from "../types.js";
 import type { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import {
+	type StreamTransportFailureCause,
+	type StreamTransportFailureDetail,
+	WebSocketTransportError,
+} from "../utils/stream-failure.js";
+import {
 	convertResponsesMessages,
 	type OpenAIResponsesStreamOptions,
 	processResponsesStream,
@@ -204,16 +209,31 @@ function logLifecycle(request: OwnedRequest, event: string, fields?: Record<stri
 		compactionId: request.compactionId,
 	});
 }
-function errorFromEvent(event: unknown, fallback: string): Error {
+/**
+ * Typed transport failure for a socket error/close event. The message keeps the
+ * historical wording (`fallback`, or the event's own message / close reason);
+ * the structured cause and close code live on the error for classification.
+ */
+function transportErrorFromEvent(
+	event: unknown,
+	fallback: string,
+	cause: StreamTransportFailureCause,
+): WebSocketTransportError {
+	const detail: Omit<StreamTransportFailureDetail, "protocol"> = { cause };
+	let message = fallback;
 	if (event && typeof event === "object") {
-		const message = "message" in event ? (event as { message?: unknown }).message : undefined;
-		if (typeof message === "string" && message) return new Error(message);
+		const eventMessage = "message" in event ? (event as { message?: unknown }).message : undefined;
 		const reason = "reason" in event ? (event as { reason?: unknown }).reason : undefined;
 		const code = "code" in event ? (event as { code?: unknown }).code : undefined;
-		if (typeof reason === "string" && reason)
-			return new Error(`${fallback}${typeof code === "number" ? ` ${code}` : ""} ${reason}`);
+		const wasClean = "wasClean" in event ? (event as { wasClean?: unknown }).wasClean : undefined;
+		if (typeof code === "number") detail.closeCode = code;
+		if (typeof reason === "string" && reason) detail.closeReason = reason;
+		if (typeof wasClean === "boolean") detail.wasClean = wasClean;
+		if (typeof eventMessage === "string" && eventMessage) message = eventMessage;
+		else if (detail.closeReason)
+			message = `${fallback}${detail.closeCode !== undefined ? ` ${detail.closeCode}` : ""} ${detail.closeReason}`;
 	}
-	return new Error(fallback);
+	return new WebSocketTransportError(message, detail);
 }
 async function connect(url: string, headers: Headers, signal?: AbortSignal): Promise<Socket> {
 	if (signal?.aborted) throw abortErrorFor(signal);
@@ -239,13 +259,13 @@ async function connect(url: string, headers: Headers, signal?: AbortSignal): Pro
 			if (settled) return;
 			settled = true;
 			cleanup();
-			reject(errorFromEvent(event, "WebSocket error"));
+			reject(transportErrorFromEvent(event, "WebSocket error", "connect"));
 		};
 		const onClose: Listener = (event) => {
 			if (settled) return;
 			settled = true;
 			cleanup();
-			reject(errorFromEvent(event, "WebSocket closed"));
+			reject(transportErrorFromEvent(event, "WebSocket closed", "connect"));
 		};
 		const onAbort = () => {
 			if (settled) return;
@@ -395,7 +415,12 @@ async function* events(socket: Socket, signal?: AbortSignal, send?: () => void):
 				if (!text) return;
 				const parsed = JSON.parse(text) as ResponseStreamEvent;
 				queue.push(parsed);
-				if (parsed.type === "response.completed" || parsed.type === "response.failed" || parsed.type === "error") {
+				if (
+					parsed.type === "response.completed" ||
+					parsed.type === "response.failed" ||
+					parsed.type === "response.incomplete" ||
+					parsed.type === "error"
+				) {
 					completed = true;
 					done = true;
 				}
@@ -408,15 +433,13 @@ async function* events(socket: Socket, signal?: AbortSignal, send?: () => void):
 		})();
 	};
 	const onError: Listener = (event) => {
-		failure = errorFromEvent(event, "WebSocket error");
+		failure = transportErrorFromEvent(event, "WebSocket error", "error");
 		done = true;
 		notify();
 	};
 	const onClose: Listener = (event) => {
 		if (!completed && !failure) {
-			const closeError = errorFromEvent(event, "WebSocket closed before response.completed");
-			closeError.name = "WebSocketTransportError";
-			failure = closeError;
+			failure = transportErrorFromEvent(event, "WebSocket closed before response.completed", "closed");
 		}
 		done = true;
 		notify();
@@ -448,7 +471,8 @@ async function* events(socket: Socket, signal?: AbortSignal, send?: () => void):
 			});
 		}
 		if (failure) throw failure;
-		if (!completed) throw new Error("WebSocket stream closed before response.completed");
+		if (!completed)
+			throw new WebSocketTransportError("WebSocket stream closed before response.completed", { cause: "eof" });
 	} finally {
 		socket.removeEventListener("message", onMessage);
 		socket.removeEventListener("error", onError);

@@ -3,6 +3,7 @@ import type { ManagementReconciliation } from "./management.js";
 import { verifyManagementReconciliation } from "./management-recovery.js";
 import type { FactoryStore } from "./store.js";
 import type {
+	ActionWithdrawal,
 	AttemptContext,
 	DecisionEvidence,
 	FactoryAdapter,
@@ -10,6 +11,7 @@ import type {
 	FactoryPlan,
 	FactoryStatus,
 	Inspection,
+	NonRetrySettlement,
 	TickResult,
 } from "./types.js";
 
@@ -84,6 +86,24 @@ export class FactoryEngine {
 	resolveForRetry(attemptId: string, evidence: DecisionEvidence, expectedRevision?: number): void {
 		this.requireUnpaused();
 		this.store.resolveForRetry(attemptId, evidence, expectedRevision);
+	}
+	settleWithoutRetry(
+		actionId: string,
+		settlement: NonRetrySettlement,
+		evidence: DecisionEvidence,
+		expectedRevision: number,
+	): boolean {
+		this.requireUnpaused();
+		return this.store.settleWithoutRetry(actionId, settlement, evidence, expectedRevision);
+	}
+	withdrawUnstarted(
+		actionId: string,
+		withdrawal: ActionWithdrawal,
+		evidence: DecisionEvidence,
+		expectedRevision: number,
+	): boolean {
+		this.requireUnpaused();
+		return this.store.withdrawUnstarted(actionId, withdrawal, evidence, expectedRevision);
 	}
 	status(): FactoryStatus {
 		const status = this.store.status();

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAgentSession } from "../../../src/core/sdk.js";
 import { SessionManager } from "../../../src/core/session-manager.js";
 import { createTestResourceLoader } from "../../utilities.js";
-import { createHarness } from "../harness.js";
+import { conversationMessages, createHarness } from "../harness.js";
 
 describe("#858 SDK persisted profile authorization", () => {
 	const cleanups: Array<() => void> = [];
@@ -78,9 +78,13 @@ describe("#858 SDK persisted profile authorization", () => {
 		expect(session.thinkingLevel).toBe("high");
 		expect(session.sessionId).toBe(saved.getSessionId());
 		expect(session.sessionFile).toBe(saved.getSessionFile());
-		expect(session.messages).toEqual(saved.buildSessionContext().messages);
+		expect(conversationMessages(session)).toEqual(saved.buildSessionContext().messages);
 		expect(fetchCatalog).toHaveBeenCalledWith("https://api.pinference.ai/api/v1/models", {
-			headers: { Authorization: "Bearer faux-prime-key", "X-Prime-Team-ID": "excluded-team" },
+			headers: {
+				Authorization: "Bearer faux-prime-key",
+				"X-Prime-Team-ID": "excluded-team",
+				accept: "application/json",
+			},
 			signal: expect.any(AbortSignal),
 		});
 		await settingsManager.flush();

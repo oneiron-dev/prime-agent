@@ -4,6 +4,16 @@ import { SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { DaemonErrorInfo, DaemonResponse } from "./daemon-protocol.js";
 import { StableFollowUpTargetError } from "./daemon-stable-target.js";
 
+/** A known session (a persisted descriptor names it) that cannot be routed to yet; retryable, unlike "Unknown active session". */
+export class DaemonSessionRecoveringError extends Error {
+	readonly code = "session_recovering" as const;
+
+	constructor(readonly activeSessionId: string) {
+		super(`Active session ${activeSessionId} is recovering; retry shortly`);
+		this.name = "DaemonSessionRecoveringError";
+	}
+}
+
 export function serializeDaemonError(error: unknown): DaemonErrorInfo | undefined {
 	if (error instanceof StableFollowUpTargetError) {
 		return { code: "stable_follow_up_target", reason: error.reason, target: error.target };
@@ -20,6 +30,9 @@ export function serializeDaemonError(error: unknown): DaemonErrorInfo | undefine
 			sessionPath: error.sessionPath,
 			activeSessionId: error.activeSessionId,
 		};
+	}
+	if (error instanceof DaemonSessionRecoveringError) {
+		return { code: "session_recovering", activeSessionId: error.activeSessionId };
 	}
 	return undefined;
 }
@@ -51,6 +64,9 @@ export function deserializeDaemonError(response: Extract<DaemonResponse, { succe
 	}
 	if (errorInfo?.code === "stable_follow_up_target") {
 		return new StableFollowUpTargetError(errorInfo.reason, errorInfo.target, response.error);
+	}
+	if (errorInfo?.code === "session_recovering") {
+		return new DaemonSessionRecoveringError(errorInfo.activeSessionId);
 	}
 	return new Error(response.error);
 }

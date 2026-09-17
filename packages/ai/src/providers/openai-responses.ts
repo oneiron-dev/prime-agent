@@ -31,6 +31,7 @@ import {
 	processOpenAIResponsesWebSocket,
 	resolveOpenAIResponsesWebSocketUrl,
 } from "./openai-responses-websocket.js";
+import { withOpenCodeHeaders } from "./opencode-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -103,7 +104,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			const compat = getCompat(model);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
-			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId);
+			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId, options?.sessionId);
 			let params = buildParams(model, context, options);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
@@ -125,7 +126,9 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			let websocketStarted = false;
 			if (websocketEnabled) {
 				// Mirror createClient session-affinity headers before user overrides.
-				const websocketHeaders = new Headers(model.headers);
+				const websocketHeaders = new Headers(
+					withOpenCodeHeaders(model.provider, options?.sessionId, model.headers ?? {}),
+				);
 				if (cacheSessionId) {
 					if (compat.sendSessionIdHeader) {
 						websocketHeaders.set("session_id", cacheSessionId);
@@ -185,7 +188,6 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
-				...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
 			};
 			const { data: openaiStream, response } = await client.responses.create(params, requestOptions).withResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -246,7 +248,8 @@ function createClient(
 	context: Context,
 	apiKey?: string,
 	optionsHeaders?: Record<string, string>,
-	sessionId?: string,
+	cacheSessionId?: string,
+	conversationId?: string,
 ) {
 	if (!apiKey) {
 		if (!process.env.OPENAI_API_KEY) {
@@ -268,11 +271,11 @@ function createClient(
 		Object.assign(headers, copilotHeaders);
 	}
 
-	if (sessionId) {
+	if (cacheSessionId) {
 		if (compat.sendSessionIdHeader) {
-			headers.session_id = sessionId;
+			headers.session_id = cacheSessionId;
 		}
-		headers["x-client-request-id"] = sessionId;
+		headers["x-client-request-id"] = cacheSessionId;
 	}
 
 	if (optionsHeaders) {
@@ -292,7 +295,8 @@ function createClient(
 		apiKey,
 		baseURL: isCloudflareProvider(model.provider) ? resolveCloudflareBaseUrl(model) : model.baseUrl,
 		dangerouslyAllowBrowser: true,
-		defaultHeaders,
+		defaultHeaders: withOpenCodeHeaders(model.provider, conversationId, defaultHeaders),
+		maxRetries: 0,
 	});
 }
 
@@ -318,7 +322,9 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		params.temperature = options?.temperature;
 	}
 
-	if (options?.serviceTier !== undefined) {
+	// GitHub Copilot rejects the service_tier FIELD itself (400) for every value.
+	// Elsewhere it is always sent: absence means "auto" (project tier), not "default".
+	if (options?.serviceTier !== undefined && model.provider !== "github-copilot") {
 		params.service_tier = options.serviceTier;
 	}
 
@@ -341,6 +347,7 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 				effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<typeof params.reasoning>["effort"],
 			};
 		}
+		if (model.provider === "xai") params.include = ["reasoning.encrypted_content"];
 	}
 
 	return params;

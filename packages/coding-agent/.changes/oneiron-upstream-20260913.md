@@ -1,0 +1,4 @@
+- Added the compact agent list layout while preserving pins, manual ordering, and saved section collapse state.
+- Preserved bounded kill requests during worker recovery and prefix validation when refreshing saved sessions.
+- Preserved remote compaction checkpoints alongside harness digests and stable identities for maintenance requests.
+- Preserved explicit child reasoning settings through the renamed Python `rlm.spawn` API.

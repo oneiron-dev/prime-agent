@@ -47,7 +47,11 @@ export type ActionState =
 	| "AWAITING_DECISION"
 	| "ACCEPTED"
 	| "REJECTED"
-	| "SUPERSEDED";
+	| "SUPERSEDED"
+	/** Deliberately closed with unknown execution outcome; dependencies are not satisfied. */
+	| "ABANDONED"
+	/** Owner withdrew work that has no attempt history; dependencies are not satisfied. */
+	| "WITHDRAWN";
 export interface ActionRecord extends ActionSpec {
 	state: ActionState;
 }
@@ -113,6 +117,42 @@ export interface DecisionEvidence {
 	actor: string;
 	reason: string;
 	ref: string;
+}
+/** Operator attestation of dead execution custody, not a terminal receipt or product judgment. */
+export interface NonRetrySettlement {
+	version: 1;
+	actionId: string;
+	attemptId: string;
+	planRevision: number;
+	wakeId: number;
+	ticketOwner: string;
+	slotId: string;
+	host: string;
+	cwd: string;
+	sourceFingerprint: string;
+	processIdentity: string;
+	uncertainty: string;
+	/** Hash-verified JSON repeats the bindings above and the four custody facts below. */
+	custody: {
+		ref: string;
+		sha256: string;
+		supervisorStopped: true;
+		processGroupStopped: true;
+		cannotExecute: true;
+		observedAt: string;
+	};
+	/** Preserved uncertainty, death observations and partial output; never inferred PASS. */
+	artifacts: { ref: string; sha256: string }[];
+}
+/** Exact current plan and ownership binding for work that has never been claimed. */
+export interface ActionWithdrawal {
+	version: 1;
+	actionId: string;
+	planRevision: number;
+	ticketId: string;
+	ticketOwner: string;
+	sourceFingerprint: string;
+	cwd: string;
 }
 export interface FactoryStatus {
 	schemaVersion: number;

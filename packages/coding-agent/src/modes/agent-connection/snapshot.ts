@@ -4,6 +4,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { AgentSession } from "../../core/agent-session.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import {
+	type AgentStatus,
 	projectAgentMessagesForExternalUse,
 	projectSessionContextForExternalUse,
 	projectSessionTreeForExternalUse,
@@ -18,10 +19,26 @@ import type {
 	AgentConnectionState,
 } from "./types.js";
 
-function persistedRecap(sessionManager: {
-	getLatestAgentStatus?: () => { summary: string } | undefined;
-}): string | undefined {
-	return sessionManager.getLatestAgentStatus?.()?.summary;
+/**
+ * Recap to seed a connection with from the persisted status, or undefined. A
+ * persisted error verdict is history once later messages exist (the session
+ * moved on, or a retry succeeded): it stays in the journal but must not be
+ * shown as the current recap. Non-error recaps carry across turns as before.
+ */
+export function baselineRecap(
+	status: Pick<AgentStatus, "summary" | "taskState" | "basedOnMessageCount"> | undefined,
+	messageCount: number,
+): string | undefined {
+	if (!status) return undefined;
+	if (status.taskState === "error" && status.basedOnMessageCount !== messageCount) return undefined;
+	return status.summary;
+}
+
+function persistedRecap(
+	sessionManager: { getLatestAgentStatus?: () => AgentStatus | undefined },
+	messageCount: number,
+): string | undefined {
+	return baselineRecap(sessionManager.getLatestAgentStatus?.(), messageCount);
 }
 
 export function createAgentConnectionState(
@@ -60,7 +77,7 @@ export function createAgentConnectionState(
 		activeToolNames: session.getActiveToolNames(),
 		contextUsage: session.getContextUsage(),
 		// Baseline recap; the daemon overlays the live summary when attaching.
-		recap: persistedRecap(sessionManager),
+		recap: persistedRecap(sessionManager, session.messages.length),
 	};
 }
 

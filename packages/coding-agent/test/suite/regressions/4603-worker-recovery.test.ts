@@ -8,10 +8,11 @@ import {
 	readFileSync,
 	renameSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { APP_NAME, ENV_AGENT_DIR } from "../../../src/config.js";
 import { getProcessStartId } from "../../../src/core/session-lease.js";
@@ -94,6 +95,12 @@ const fixturePath = resolve(__dirname, "../../fixtures/eng-4600-supervisor-fixtu
 const fauxExtensionPath = resolve(__dirname, "../../fixtures/eng-4600-faux-extension.ts");
 const cliPath = resolve(__dirname, "../../../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/cli.mjs");
+// The fixture must run in the spawned process itself: the tsx CLI wrapper forks,
+// which would leave the spawned pid owning only tsx IPC pipes while the real
+// supervisor (and its daemon socket) hides in an untracked child pid — invisible
+// to the OS socket sweep this regression exercises. `--import` with tsx's ESM
+// loader runs the TypeScript fixture in-process.
+const tsxLoaderPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/esm/index.mjs");
 const tsconfigPath = resolve(__dirname, "../../../../../tsconfig.json");
 const supervisorRegistryDirEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 const handles = new Set<ProcessHandle>();
@@ -128,6 +135,14 @@ async function createPaths(): Promise<TestPaths> {
 	const executablePath = join(harness.tempDir, APP_NAME);
 	copyFileSync(process.execPath, executablePath);
 	chmodSync(executablePath, 0o755);
+	if (process.platform === "darwin") {
+		const nodeLibDir = resolve(dirname(process.execPath), "../lib");
+		for (const name of readFixtureDirectory(nodeLibDir)) {
+			if (name.startsWith("libnode.") && name.endsWith(".dylib")) {
+				symlinkSync(join(nodeLibDir, name), join(harness.tempDir, name));
+			}
+		}
+	}
 	const socketTmpDir = `/tmp/eng-4603-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	mkdirSync(socketTmpDir, { recursive: true, mode: 0o700 });
 	socketTempDirs.add(socketTmpDir);
@@ -148,7 +163,7 @@ async function createPaths(): Promise<TestPaths> {
 
 function spawnSupervisor(paths: TestPaths): ProcessHandle {
 	return trackProcess(
-		spawn(paths.executablePath, [tsxPath, fixturePath], {
+		spawn(paths.executablePath, ["--import", tsxLoaderPath, fixturePath], {
 			cwd: paths.agentDir,
 			env: {
 				...process.env,
@@ -234,7 +249,7 @@ function registerFixtureProcess(
 	processStartId: string | undefined,
 	role: FixtureProcessIdentity["role"],
 ): FixtureProcessIdentity | undefined {
-	if (pid === undefined) return undefined;
+	if (pid === undefined || pid === process.pid) return undefined;
 	if (!Number.isSafeInteger(pid) || pid <= 0) {
 		throw new Error(`Invalid fixture process pid: ${String(pid)}`);
 	}
@@ -278,7 +293,11 @@ function registerFixtureOwnedProcesses(): void {
 	}
 }
 
-function registerFixtureRecord(value: unknown, role: "supervisor" | "worker", path: string): FixtureProcessIdentity {
+function registerFixtureRecord(
+	value: unknown,
+	role: "supervisor" | "worker",
+	path: string,
+): FixtureProcessIdentity | undefined {
 	if (!value || typeof value !== "object") {
 		throw new Error(`Invalid fixture process record: ${path}`);
 	}
@@ -292,7 +311,7 @@ function registerFixtureRecord(value: unknown, role: "supervisor" | "worker", pa
 	) {
 		throw new Error(`Invalid fixture process identity: ${path}`);
 	}
-	return registerFixtureProcess(record.pid, record.processStartId, role)!;
+	return registerFixtureProcess(record.pid, record.processStartId, role);
 }
 
 function readFixtureProcessSnapshot(): Map<number, FixtureProcessSnapshot> {
@@ -343,6 +362,7 @@ function isFixtureDescendant(pid: number, rootPid: number, processes: Map<number
 }
 
 function signalFixtureProcess(identity: FixtureProcessIdentity, signal: NodeJS.Signals): boolean {
+	if (identity.pid === process.pid) throw new Error("Refusing to signal the test runner during fixture cleanup");
 	const state = fixtureProcessState(identity);
 	if (state === "exited") return false;
 	if (state === "unverified") {
@@ -1055,13 +1075,17 @@ describe("ENG-4603 worker recovery convergence", () => {
 		client.close();
 		// Keep the process scan inside the fixture. A host `ss`/`lsof` would also
 		// expose unrelated live Prime Agent daemons to the destructive CLI pass.
+		// A predecessor may unlink the shared path while its successor still owns
+		// the listening socket; report fixture processes until they actually exit.
+		const unrelatedPaths = await createPaths();
+		const unrelated = spawnSupervisor(unrelatedPaths);
+		await waitForType(unrelated, "booted");
+		unrelated.child.send({ type: "go" });
+		await waitForType(unrelated, "ready", 60_000);
 		const ssPath = join(paths.agentDir, "ss");
 		writeFileSync(
 			ssPath,
 			`#!/bin/sh
-if [ ! -S "$ENG_4603_SCAN_SOCKET" ]; then
-  exit 0
-fi
 old_ifs="$IFS"
 IFS=,
 for pid in $ENG_4603_SCAN_PIDS; do
@@ -1092,6 +1116,9 @@ exit 0
 		const shutdown = await runCli(paths, ["shutdown", "--force", "--json"], 60_000, scanEnvironment);
 		expect(shutdown.code, JSON.stringify(shutdown)).toBe(0);
 		const shutdownResult = JSON.parse(shutdown.stdout) as { stopped: unknown[]; failed: unknown[] };
+		expect(exactProcessIsAlive(unrelated.child.pid!, unrelated.identity?.processStartId)).toBe(true);
+		const unrelatedClient = await connectEventually(unrelatedPaths.socketPath);
+		unrelatedClient.close();
 		const survivingIdentities = [
 			{ pid: predecessor.child.pid!, processStartId: predecessorStartId },
 			{ pid: successor.child.pid!, processStartId: successorStartId },
@@ -1099,7 +1126,17 @@ exit 0
 			{ pid: currentSupervisorPid, processStartId: currentSupervisorStartId },
 		].filter((identity) => exactProcessIsAlive(identity.pid, identity.processStartId));
 		if (survivingIdentities.length > 0) {
-			expect(shutdownResult.failed).not.toHaveLength(0);
+			expect(
+				shutdownResult.failed,
+				JSON.stringify({
+					shutdownResult,
+					survivingIdentities,
+					predecessor: predecessor.child.pid,
+					successor: successor.child.pid,
+					workerPid,
+					currentSupervisorPid,
+				}),
+			).not.toHaveLength(0);
 		}
 		expect(shutdownResult).toMatchObject({ stopped: expect.any(Array), failed: [] });
 		await waitForExactProcessExit(predecessor.child.pid!, predecessorStartId);

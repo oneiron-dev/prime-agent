@@ -14,6 +14,8 @@ import {
 	resolveOpenAIResponsesWebSocketUrl,
 } from "./openai-responses-websocket.js";
 
+import { withOpenCodeHeaders } from "./opencode-headers.js";
+
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 const COMPACTION_TRIGGER = { type: "compaction_trigger" } as const;
 // Lifecycle-only diagnostics: identifiers and outcomes, never credentials, URLs, or payloads.
@@ -87,7 +89,7 @@ function buildHeaders(
 	}
 	apply(options.headers ?? {}); // Caller headers deliberately override affinity.
 	set("x-codex-beta-features", [...features].join(", "));
-	return headers;
+	return withOpenCodeHeaders(model.provider, options.sessionId, headers);
 }
 function buildInstructions(context: Context, customInstructions?: string): string | undefined {
 	const parts = [
@@ -116,7 +118,10 @@ function buildParams(
 	};
 }
 function streamError(event: ResponseStreamEvent): Error {
-	const source = event.type === "response.failed" || event.type === "response.completed" ? event.response : event;
+	const source =
+		event.type === "response.failed" || event.type === "response.completed" || event.type === "response.incomplete"
+			? event.response
+			: event;
 	const details = isRecord(source) && isRecord(source.error) ? source.error : source;
 	const error = new Error(
 		isRecord(details) && typeof details.message === "string" ? details.message : "Remote Compaction V2 stream failed",
@@ -128,7 +133,8 @@ function streamError(event: ResponseStreamEvent): Error {
 async function collect(events: AsyncIterable<ResponseStreamEvent>): Promise<OpenAIResponsesCompactionItem[]> {
 	const checkpoints: OpenAIResponsesCompactionItem[] = [];
 	for await (const event of events) {
-		if (event.type === "error" || event.type === "response.failed") throw streamError(event);
+		if (event.type === "error" || event.type === "response.failed" || event.type === "response.incomplete")
+			throw streamError(event);
 		if (event.type === "response.output_item.done") {
 			const item = event.item as unknown;
 			if (isRecord(item) && (item.type === "compaction" || item.type === "compaction_summary"))
@@ -201,7 +207,8 @@ export async function compactOpenAIResponsesV2(
 					started = true;
 				},
 				onEvent: (event) => {
-					if (event.type === "error" || event.type === "response.failed") throw streamError(event);
+					if (event.type === "error" || event.type === "response.failed" || event.type === "response.incomplete")
+						throw streamError(event);
 					if (event.type === "response.output_item.done") {
 						const item = event.item as unknown;
 						if (isRecord(item) && (item.type === "compaction" || item.type === "compaction_summary"))

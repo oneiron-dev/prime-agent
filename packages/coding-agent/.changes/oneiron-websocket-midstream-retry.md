@@ -1,0 +1,2 @@
+- Fixed mid-stream WebSocket disconnects silently ending the turn: they now retry under the bounded `retry` policy with the partial output discarded, in root sessions and RLM subagents alike.
+- Fixed a stale `Model request failed` recap staying on the prompt line after work resumed; the failure remains in the transcript and the status history.

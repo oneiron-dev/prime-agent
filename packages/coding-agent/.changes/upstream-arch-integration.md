@@ -1,0 +1,1 @@
+- Preserved factory Python helpers and compiled adapters when packaging upstream updates with the Oneiron runtime.

@@ -1,0 +1,2 @@
+- Fixed incomplete WebSocket responses hanging after the provider stops generating.
+- Preserved OpenCode session headers across WebSocket requests and remote compaction.

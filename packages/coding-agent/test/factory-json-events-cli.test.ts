@@ -15,7 +15,7 @@ const requestedModel = "fixture-requested-alias";
 const responseModel = "fixture-native-model";
 const chunks = ["Native ", "completed ", "response."];
 
-type NativeEvent = { type: string; message?: AssistantMessage };
+type NativeEvent = { type: string; message?: AssistantMessage | { role: "custom"; customType: string } };
 
 afterEach(async () => {
 	for (const server of servers.splice(0)) {
@@ -250,8 +250,10 @@ test("real CLI owned frontend propagates factory-completed through main and prin
 	expect(result.requests[0].body.tools ?? []).toEqual([]);
 	expect(result.events[0]).toMatchObject({ type: "session", jsonEventProfile: "factory-completed" });
 	expect(result.events.map((event) => event.type)).not.toContain("message_update");
-	const lifecycle = result.events.filter((event) =>
-		["agent_start", "turn_start", "message_start", "message_end", "turn_end", "agent_end"].includes(event.type),
+	const lifecycle = result.events.filter(
+		(event) =>
+			["agent_start", "turn_start", "message_start", "message_end", "turn_end", "agent_end"].includes(event.type) &&
+			!(event.message?.role === "custom" && event.message.customType === "harness_digest"),
 	);
 	expect(lifecycle.map((event) => event.type)).toEqual([
 		"agent_start",
@@ -264,7 +266,8 @@ test("real CLI owned frontend propagates factory-completed through main and prin
 		"agent_end",
 	]);
 	const terminal = result.events.filter(
-		(event) => event.type === "message_end" && event.message?.role === "assistant",
+		(event): event is NativeEvent & { message: AssistantMessage } =>
+			event.type === "message_end" && event.message?.role === "assistant",
 	);
 	expect(terminal).toHaveLength(1);
 	expect(terminal[0].message).toMatchObject({
@@ -297,7 +300,8 @@ test("factory-completed retains native provider failure boundaries without succe
 	expect(result.requests).toHaveLength(1);
 	expect(result.events.map((event) => event.type)).not.toContain("message_update");
 	const terminal = result.events.filter(
-		(event) => event.type === "message_end" && event.message?.role === "assistant",
+		(event): event is NativeEvent & { message: AssistantMessage } =>
+			event.type === "message_end" && event.message?.role === "assistant",
 	);
 	expect(terminal).toHaveLength(1);
 	expect(terminal[0].message).toMatchObject({

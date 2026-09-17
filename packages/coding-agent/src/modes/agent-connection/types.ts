@@ -108,7 +108,7 @@ export interface AgentConnectionSavedSessionState {
 
 export interface AgentConnectionAgentStatus {
 	summary: string;
-	taskState?: "needs_input" | "completed";
+	taskState?: "needs_input" | "completed" | "error";
 	basedOnMessageCount: number;
 }
 
@@ -136,6 +136,8 @@ export interface AgentConnectionSavedSessionInfo {
 	allMessagesText: string;
 	agentStatus?: AgentConnectionAgentStatus;
 	usage?: SessionUsageSummary;
+	/** Last recorded provider/model selector; absent for sessions that never ran a model. */
+	model?: { provider: string; modelId: string };
 }
 
 export type AgentConnectionSessionListProgress = (loaded: number, total: number) => void;
@@ -567,6 +569,11 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	recap?: string;
 	sessionDir: string;
 	activity?: AgentConnectionRlmChildAgentActivity;
+	/** Latest child progress note (`rlm.progress.note`), newest wins. */
+	progressNote?: string;
+	lastActivityAt?: number;
+	/** Set when a running child has had no tracked activity for the staleness threshold. */
+	activityStaleMs?: number;
 	error?: string;
 }
 
@@ -594,10 +601,28 @@ export type AgentConnectionSessionEvent =
 			errorSeverity?: "warning" | "error";
 			customInstructions?: string;
 	  }
-	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
-	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| {
+			type: "auto_retry_start";
+			attempt: number;
+			maxAttempts: number;
+			delayMs: number;
+			errorMessage: string;
+			/** Why the retry loop re-issues the turn; absent = ordinary quick retry. */
+			reason?: "usage" | "unavailable" | "backup";
+			/** Present when reason is "backup": "provider/model-id" of the backup. */
+			backupModel?: string;
+	  }
+	| {
+			type: "auto_retry_end";
+			success: boolean;
+			attempt: number;
+			finalError?: string;
+			/** "provider/model-id" restored after a backup-model retry succeeded. */
+			restoredModel?: string;
+	  }
 	| { type: "auth_stale"; provider: string; sourceTokens?: readonly AuthSourceToken[] }
 	| { type: "rlm_child_update"; child: AgentConnectionRlmChildAgentSnapshot }
+	| { type: "rlm_progress_note"; message: string; timestamp: number }
 	| { type: "recap_update"; recap: string | undefined }
 	| { type: "goal_update"; goal: GoalState }
 	| { type: "bash_start"; command: string; excludeFromContext: boolean; transient?: boolean; runId?: string }
@@ -645,6 +670,13 @@ export interface AgentConnection {
 
 	getState(): Promise<AgentConnectionState>;
 	getInitialSnapshot(): Promise<AgentConnectionSnapshot>;
+	/**
+	 * Replay session events the adapter deferred between attach and this call.
+	 * Only deferring adapters implement it; the interactive UI calls it once
+	 * its initial transcript render is complete, so deferred events apply on
+	 * top of a fully rendered chat instead of racing the initial build.
+	 */
+	flushBufferedSessionEvents?(): Promise<void>;
 	getRlmChildSnapshots(): Promise<AgentConnectionRlmChildAgentSnapshot[]>;
 	getMessages(): Promise<AgentMessage[]>;
 	getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined>;

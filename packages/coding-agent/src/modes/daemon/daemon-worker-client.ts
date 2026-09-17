@@ -247,7 +247,18 @@ export class DaemonWorkerClient {
 					new DaemonWorkerProbeTimeoutError(`Timed out waiting for daemon worker response to ${command.type}`),
 				);
 			}, timeoutMs);
-			this.pending.set(id, { resolve, reject, timeout });
+			this.pending.set(id, {
+				resolve: (response) => {
+					try {
+						options.onResponse?.(response);
+						resolve(response);
+					} catch (error) {
+						reject(error);
+					}
+				},
+				reject,
+				timeout,
+			});
 		});
 		const rejectPending = (error: unknown) => {
 			const pending = this.pending.get(id);

@@ -4,6 +4,8 @@ import type { Context, Model, OpenAIResponsesCompactionItem, OpenAIResponsesComp
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { convertResponsesMessages } from "./openai-responses-shared.js";
 
+import { withOpenCodeHeaders } from "./opencode-headers.js";
+
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 
 export interface OpenAIResponsesCompactOptions {
@@ -88,7 +90,7 @@ async function createClient(model: Model<"openai-responses">, options: OpenAIRes
 		apiKey: options.apiKey,
 		baseURL: isCloudflareProvider(model.provider) ? resolveCloudflareBaseUrl(model) : model.baseUrl,
 		dangerouslyAllowBrowser: true,
-		defaultHeaders,
+		defaultHeaders: withOpenCodeHeaders(model.provider, options.sessionId, defaultHeaders),
 	});
 }
 

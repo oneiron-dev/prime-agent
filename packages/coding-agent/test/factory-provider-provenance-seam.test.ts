@@ -141,12 +141,10 @@ async function fixture(transport: Transport, reportedModel?: string) {
 			? streamAnthropic({ ...model, api: "anthropic-messages", baseUrl }, context, {
 					...options,
 					apiKey: "fixture-not-a-secret",
-					maxRetries: 0,
 				})
 			: streamOpenAIResponses({ ...model, api: "openai-responses", baseUrl }, context, {
 					...options,
 					apiKey: "fixture-not-a-secret",
-					maxRetries: 0,
 					transport: "sse",
 				});
 	const services = {

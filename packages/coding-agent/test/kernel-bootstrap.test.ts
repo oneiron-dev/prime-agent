@@ -9,6 +9,7 @@ import {
 	ensureKernelPython,
 	getKernelVenvDir,
 	type KernelPythonSkill,
+	kernelVenvPython,
 	resolveRuntimeIdentity,
 } from "../src/core/kernel/bootstrap.js";
 
@@ -518,7 +519,7 @@ dependencies = ["httpx"]
 		writeFakePython(overridePython, ["dill"]);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
-		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime with callable rlm\.run/);
+		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime with callable rlm\.spawn/);
 	});
 
 	it("rejects PRIME_AGENT_KERNEL_PYTHON with a legacy harness API", async () => {
@@ -541,7 +542,37 @@ dependencies = ["httpx"]
 		);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
-		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime with callable rlm\.run/);
+		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime with callable rlm\.spawn/);
+	});
+
+	it("rejects PRIME_AGENT_KERNEL_PYTHON with a pre-progress-note rlm runtime", async () => {
+		const overridePython = join(tempDir, "override-python");
+		// An rlm runtime older than rlm.progress_note: it satisfies every
+		// earlier readiness probe but fails any check that asserts the new
+		// API (regression: the readiness check skipped progress_note, so the
+		// doctrine's advertised call hit AttributeError mid-run instead of
+		// failing fast here).
+		writeExecutable(
+			overridePython,
+			[
+				"#!/bin/sh",
+				'if [ "$1" = "-c" ]; then',
+				'  case "$2" in',
+				'    "import rlm") exit 0 ;;',
+				'    *"progress_note"*) exit 1 ;;',
+				'    *"_harness_methods"*) exit 0 ;;',
+				"    *) exit 1 ;;",
+				"  esac",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
+
+		await expect(ensureKernelPython()).rejects.toThrow(
+			/current prime-agent-runtime with callable rlm\.spawn, rlm\.create_session, rlm\.host_request, rlm\.progress_note/,
+		);
 	});
 
 	it("fails an invalid PRIME_AGENT_KERNEL_PYTHON without bootstrapping", async () => {
@@ -550,5 +581,11 @@ dependencies = ["httpx"]
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
 		await expect(ensureKernelPython()).rejects.toThrow(/PRIME_AGENT_KERNEL_PYTHON points to a Python missing/);
+	});
+
+	it("resolves the venv python under Scripts\\python.exe on win32 (uv layout)", () => {
+		const venv = join(tempDir, "kernel-venv");
+		expect(kernelVenvPython(venv, "win32")).toBe(join(venv, "Scripts", "python.exe"));
+		expect(kernelVenvPython(venv, "linux")).toBe(join(venv, "bin", "python"));
 	});
 });

@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const packageDirectory = join(import.meta.dirname, "..");
@@ -16,10 +17,10 @@ const shims = readdirSync(adapterDirectory)
 const shx = join(packageDirectory, "..", "..", "node_modules", "shx", "lib", "cli.js");
 
 describe("factory package assets", () => {
-	it.each(["copy-assets", "copy-binary-assets"])("%s copies Python shims without generated cache files", (script) => {
+	it("copy-assets copies Python shims without generated cache files", () => {
 		expect(manifest.files).toContain("dist");
 		expect(shims).toEqual(["oneiron-corpus-foreground.py", "oneiron-push-guard.py"]);
-		const commands = manifest.scripts[script]!.split(" && ").filter((command) =>
+		const commands = manifest.scripts["copy-assets"]!.split(" && ").filter((command) =>
 			command.includes("factory/adapters"),
 		);
 		expect(commands).toEqual([
@@ -37,6 +38,27 @@ describe("factory package assets", () => {
 			}
 			const output = join(directory, "dist", "factory", "adapters");
 			expect(readdirSync(output).sort()).toEqual(shims);
+			for (const shim of shims) {
+				expect(readFileSync(join(output, shim))).toEqual(readFileSync(join(adapterDirectory, shim)));
+			}
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	it("includes Python shims in standalone binary assets", () => {
+		const directory = mkdtempSync(join(tmpdir(), "factory-binary-assets-"));
+		try {
+			const output = join(directory, "factory", "adapters");
+			mkdirSync(output, { recursive: true });
+			writeFileSync(join(output, "existing.js"), "export const compiled = true;");
+			const moduleUrl = pathToFileURL(join(packageDirectory, "scripts", "copy-binary-assets.mjs")).href;
+			execFileSync(process.execPath, [
+				"--input-type=module",
+				"-e",
+				`import { copyBinaryAssets, validateBinaryAssets } from ${JSON.stringify(moduleUrl)}; copyBinaryAssets(${JSON.stringify(directory)}); validateBinaryAssets(${JSON.stringify(directory)});`,
+			]);
+			expect(readdirSync(output).sort()).toEqual(["existing.js", ...shims].sort());
+			expect(readFileSync(join(output, "existing.js"), "utf8")).toBe("export const compiled = true;");
 			for (const shim of shims) {
 				expect(readFileSync(join(output, shim))).toEqual(readFileSync(join(adapterDirectory, shim)));
 			}
