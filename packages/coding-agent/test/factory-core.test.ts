@@ -14,6 +14,7 @@ import type {
 	FactoryPlan,
 	Inspection,
 } from "../src/factory/types.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 const directories: string[] = [];
 const stores: FactoryStore[] = [];
@@ -33,7 +34,7 @@ function action(id = "a", kind: ActionSpec["kind"] = "process", dependencies: st
 		kind,
 		sourceFingerprint: `source-${id}`,
 		command: { argv: ["true"], cwd: "/tmp" },
-		requirements: {},
+		requirements: { runtime: fixtureRuntimePin },
 	};
 }
 function plan(actions: ActionSpec[] = [action()]): FactoryPlan {
@@ -366,10 +367,10 @@ describe("portable factory journal", () => {
 	it("honors host, slot and capability requirements", () => {
 		const { store } = fixture();
 		const work = action();
-		work.requirements = { host: "other-host", capabilities: ["macos"] };
+		work.requirements = { runtime: fixtureRuntimePin, host: "other-host", capabilities: ["macos"] };
 		store.applyPlan(plan([work]));
 		expect(store.claim("a", "slot")).toBeUndefined();
-		work.requirements = { host: "host", slotId: "slot", capabilities: ["linux"] };
+		work.requirements = { runtime: fixtureRuntimePin, host: "host", slotId: "slot", capabilities: ["linux"] };
 		store.applyPlan(plan([work]));
 		expect(store.claim("a", "slot")).toBeDefined();
 	});

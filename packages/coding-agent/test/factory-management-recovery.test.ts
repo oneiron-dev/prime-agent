@@ -8,6 +8,7 @@ import type { ManagementPacket, ManagementReconciliation, ManagementRequest } fr
 import { type ManagementCallerFactory, manageFactoryWake } from "../src/factory/management-dispatch.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { FactoryAdapter, FactoryPlan } from "../src/factory/types.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 const directories: string[] = [];
 const stores: FactoryStore[] = [];
@@ -53,7 +54,7 @@ async function fixture() {
 			acceptanceCriteria: ["Exact review passed"],
 			sourceFingerprint: id,
 			command: { argv: ["fixture"], cwd: directory },
-			requirements: {},
+			requirements: { runtime: fixtureRuntimePin },
 		})),
 		roles: { ticketOwner: { provider: "mock", model: "mock" } },
 	};

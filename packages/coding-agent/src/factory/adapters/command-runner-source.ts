@@ -1,6 +1,73 @@
+import { createHash } from "node:crypto";
+import { FACTORY_RUNTIME_START_TOLERANCE_SECONDS } from "../runtime.js";
+
 // This portable host protocol uses only Python's standard library. It never evaluates job shell text.
-export const COMMAND_RUNNER_SOURCE = String.raw`
-import datetime, hashlib, json, os, re, signal, stat, subprocess, sys, time
+const COMMAND_RUNNER_BODY = String.raw`
+import datetime, hashlib, json, math, os, re, signal, stat, subprocess, sys, time
+
+RUNNER_STARTED_AT = time.time() * 1000
+
+START_TOLERANCE_MS = ${FACTORY_RUNTIME_START_TOLERANCE_SECONDS} * 1000
+
+def verify_runtime(manifest):
+    receipt = {"runtime_identity_ok": False, "delivery_intact": None, "local_start_time_ok": None}
+    check = "runtime_identity"
+    try:
+        timestamps = []
+        def pinned(pin, capture=False):
+            if not os.path.isabs(pin["path"]) or not re.fullmatch(r"[a-f0-9]{64}", pin["sha256"]):
+                raise ValueError("Invalid runtime pin")
+            with open(pin["path"], "rb") as f:
+                digest = hashlib.sha256()
+                captured = []
+                for chunk in iter(lambda: f.read(128 * 1024), b""):
+                    digest.update(chunk)
+                    if capture: captured.append(chunk)
+                info = os.fstat(f.fileno())
+            if digest.hexdigest() != pin["sha256"]:
+                raise ValueError("Runtime bundle hash mismatch: " + pin["path"])
+            if not capture: timestamps.append(max(info.st_mtime, info.st_ctime) * 1000)
+            return b"".join(captured)
+        runtime = json.loads(pinned(manifest["runtime"], True))
+        if runtime["version"] != 1 or not 1 < len(runtime["files"]) <= 4096:
+            raise ValueError("Invalid runtime identity")
+        paths = {pin["path"] for pin in runtime["files"]}
+        if not set(runtime["cliArgv"]).issubset(paths):
+            raise ValueError("Runtime omitted Node or CLI")
+        for pin in runtime["files"]:
+            pinned(pin)
+        for directory, dirs, files in os.walk(os.path.dirname(runtime["cliArgv"][1])):
+            for name in dirs + files:
+                path = os.path.join(directory, name)
+                if os.path.islink(path) or (re.search(r"\.(js|mjs|cjs)$", name) and path not in paths):
+                    raise ValueError("Runtime contains an unpinned bundle module or symlink")
+        receipt["runtime_identity_ok"] = True
+        check = "delivery_integrity"
+        receipt["delivery_intact"] = hashlib.sha256(_RUNNER_SOURCE.encode()).hexdigest() == manifest["runnerSha256"]
+        if not receipt["delivery_intact"]:
+            raise ValueError("Runner source delivery hash mismatch")
+        check = "local_start_time"
+        if not isinstance(manifest["daemonSharesHost"], bool):
+            raise ValueError("Missing daemon host relationship")
+        if manifest["daemonSharesHost"]:
+            receipt["local_start_time_ok"] = False
+            daemon_start = manifest["daemonStartedAt"]
+            if not isinstance(daemon_start, (int, float)) or not math.isfinite(daemon_start) or not 0 < daemon_start <= time.time() * 1000 + START_TOLERANCE_MS:
+                raise ValueError("Invalid daemon process start time")
+            newest = max(timestamps)
+            if daemon_start + START_TOLERANCE_MS < newest:
+                raise ValueError("Daemon start time predates the runtime bundle")
+            if RUNNER_STARTED_AT + START_TOLERANCE_MS < newest:
+                raise ValueError("Runner start time predates the runtime bundle")
+            receipt["local_start_time_ok"] = True
+    except Exception as error:
+        receipt["check"] = check
+        receipt["reason"] = "runtime_mismatch: " + check + ": " + " ".join(str(error).splitlines())
+    return receipt
+
+def refuse_runtime(reason):
+    print(reason, file=sys.stderr, flush=True)
+    raise SystemExit(78)
 
 def now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -42,8 +109,10 @@ def identity(pid):
 def inspect(directory, manifest):
     try:
         existing = load(directory + "/manifest.json")
-        if existing != manifest:
+        if {k:v for k,v in existing.items() if k not in ("daemonStartedAt", "daemonSharesHost", "runnerSha256")} != {k:v for k,v in manifest.items() if k not in ("daemonStartedAt", "daemonSharesHost", "runnerSha256")}:
             return {"kind": "uncertain", "reason": "Attempt manifest identity mismatch"}
+        if os.path.exists(directory + "/runtime-mismatch.json"):
+            return {"kind": "uncertain", "reason": load(directory + "/runtime-mismatch.json")["reason"], "runtimeMismatch": True}
         terminal = directory + "/terminal.json"
         if os.path.exists(terminal):
             receipt = load(terminal)
@@ -123,6 +192,11 @@ def supervise(directory, manifest):
             print("Source fingerprint changed before launch", flush=True)
             terminal(directory, manifest, 125, actual_source)
             os._exit(0)
+    verification = verify_runtime(manifest)
+    atomic(directory + "/runtime-admission.json", verification)
+    if "reason" in verification:
+        atomic(directory + "/runtime-mismatch.json", verification)
+        refuse_runtime(verification["reason"])
     try:
         with open(directory + "/stdout.log", "ab", buffering=0) as out, open(directory + "/stderr.log", "ab", buffering=0) as err:
             child_env = dict(os.environ)
@@ -179,6 +253,9 @@ def main():
         return inspect(directory, manifest)
     if request["operation"] != "launch":
         raise ValueError("Unknown operation")
+    verification = verify_runtime(manifest)
+    if "reason" in verification:
+        refuse_runtime(verification["reason"])
     os.makedirs(root, mode=0o700, exist_ok=True)
     try:
         os.mkdir(directory, 0o700)
@@ -190,6 +267,8 @@ def main():
     if pid == 0:
         try:
             supervise(directory, manifest)
+        except SystemExit as error:
+            os._exit(error.code)
         except BaseException:
             os._exit(1)
     for _ in range(50):
@@ -204,3 +283,6 @@ try:
 except Exception as error:
     print(json.dumps({"kind": "uncertain", "reason": "Host runner error: " + str(error)}), flush=True)
 `;
+
+export const COMMAND_RUNNER_SHA256 = createHash("sha256").update(COMMAND_RUNNER_BODY).digest("hex");
+export const COMMAND_RUNNER_SOURCE = `_RUNNER_SOURCE = ${JSON.stringify(COMMAND_RUNNER_BODY)}\nexec(_RUNNER_SOURCE)`;

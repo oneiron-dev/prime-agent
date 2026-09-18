@@ -15,6 +15,7 @@ import {
 } from "../src/factory/management-dispatch.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { FactoryAdapter, FactoryPlan } from "../src/factory/types.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 const directories: string[] = [];
 const stores: FactoryStore[] = [];
@@ -55,7 +56,7 @@ async function fixture(count = 1) {
 			sourceFingerprint: `source-${i}`,
 			acceptanceCriteria: ["Review passed for exact output"],
 			command: { argv: ["fixture"], cwd: directory },
-			requirements: {},
+			requirements: { runtime: fixtureRuntimePin },
 		})),
 		roles: { ticketOwner: { provider: "fixture", model: "mock", effort: "low" } },
 	};

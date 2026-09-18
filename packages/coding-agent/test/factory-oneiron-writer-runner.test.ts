@@ -18,6 +18,7 @@ import {
 } from "../src/factory/adapters/oneiron-writer.js";
 import { FactoryEngine } from "../src/factory/engine.js";
 import { FactoryStore } from "../src/factory/store.js";
+import { admitRuntimeFixture } from "./factory-runtime-fixture.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -76,6 +77,7 @@ describe("whole-attempt retry under the real factory supervisor", () => {
 				files: [node, cli].map((path) => ({ path, sha256: oneironSha(readFileSync(path)) })),
 				capabilities: ["provider-response-model-v1", "factory-completed-json-v1"],
 			});
+			admitRuntimeFixture(runtimePin);
 			const primaryProfile = defaultOneironWriterProfile(runtimePin);
 			const primaryProfilePin = pin(primaryProfile);
 			const authorization = pin({ fixtureOnly: true, approved: true });
@@ -223,7 +225,7 @@ describe("whole-attempt retry under the real factory supervisor", () => {
 					id: "competing-claim",
 					command: { argv: ["fixture-not-launched"], cwd: join(directory, "other-workspace") },
 					sourceFingerprint: "fixture:other",
-					requirements: { slotId: "other" },
+					requirements: { slotId: "other", runtime: runtimePin },
 				};
 				engine.applyPlan({ version: 1, tickets: [], slots: [], actions: competitor ? [action, other] : [action] });
 				if (competitor) {

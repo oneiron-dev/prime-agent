@@ -10,6 +10,7 @@ import { runFactoryCli } from "../src/factory/cli.js";
 import { FactoryEngine } from "../src/factory/engine.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { ActionSpec, FactoryAdapter, FactoryPlan, NonRetrySettlement } from "../src/factory/types.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 const directories: string[] = [];
 const stores: FactoryStore[] = [];
@@ -51,7 +52,7 @@ function fixture(kind: ActionSpec["kind"] = "process") {
 			kind,
 			sourceFingerprint: `fixture:${id}`,
 			command: { argv: ["NEVER-EXECUTE-FIXTURE"], cwd: join(directory, id) },
-			requirements: {},
+			requirements: { runtime: fixtureRuntimePin },
 		})),
 	};
 	for (const action of plan.actions) mkdirSync(action.command.cwd);

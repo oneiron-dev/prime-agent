@@ -45,6 +45,7 @@ import type * as Interlock from "../src/factory/adapters/oneiron-interlock.js";
 import type { OneironPin } from "../src/factory/adapters/oneiron-review.js";
 import { type FactoryRuntimeIdentity, hashFactoryRuntimeFile } from "../src/factory/runtime.js";
 import type { CompletionReceipt, FactoryStatus } from "../src/factory/types.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 // UNIT MOCK physical-lock authority only. The real prefix/pinned ELF validator stays active.
 // These impossible FD/process markers must never be presented as native lock evidence.
@@ -207,7 +208,7 @@ function mockOperator(
 				dependencies: [],
 				sourceFingerprint: input,
 				command: nativeCommand,
-				requirements: { host: "arch", slotId: "unit-mock-slot" },
+				requirements: { host: "arch", slotId: "unit-mock-slot", runtime: fixtureRuntimePin },
 				state: "ACCEPTED",
 			},
 		],

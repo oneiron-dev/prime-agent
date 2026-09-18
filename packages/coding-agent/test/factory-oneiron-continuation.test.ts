@@ -10,7 +10,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { classifyOwnedSessionWorkerInvocation, createOwnedWorkerLaunchSpec } from "../src/cli/owned-session-worker.js";
@@ -43,6 +43,8 @@ import type { ManagementCallerFactory } from "../src/factory/management-dispatch
 import { hashFactoryRuntimeFile } from "../src/factory/runtime.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { AttemptContext, FactoryAdapter, Inspection } from "../src/factory/types.js";
+
+import { admitRuntimeFixture } from "./factory-runtime-fixture.js";
 
 // Publication/network is mocked. Real Oneiron stages, binder, manager, engine and SQLite journal run below.
 vi.mock("../src/factory/adapters/oneiron-publication.js", () => ({
@@ -111,13 +113,20 @@ setTimeout(() => {
 	const runtime = pin(directory, "runtime.json", {
 		version: 1,
 		cliArgv: [node.path, cli.path],
-		files: [node, cli, adapter, continuationEntry],
+		files: [
+			node,
+			cli,
+			adapter,
+			continuationEntry,
+			{ path: resolve("src/factory/runtime.ts"), sha256: hashFactoryRuntimeFile(resolve("src/factory/runtime.ts")) },
+		],
 		capabilities: [
 			"provider-response-model-v1",
 			"oneiron-native-gate-capture-v1",
 			...(completedJson ? ["factory-completed-json-v1"] : []),
 		],
 	});
+	if (nativeCoordinator) admitRuntimeFixture(runtime);
 	const authorization = pin(directory, "authorization.json", {
 		fixtureOnly: true,
 		ownerAuthorized: "bounded signed commit/rebind and bot request; no product authorship/merge/close",

@@ -609,6 +609,7 @@ export class OneironContinuation {
 		const sourceFingerprint = `oneiron-coordinator:${oneironSha(prompt)}`;
 		const workspace = join(c.workspace, packet.requestId);
 		return {
+			runtime: this.engine.store.runtimePin(),
 			action: {
 				id: packet.requestId,
 				ticketId: this.config.ticketId,
@@ -616,7 +617,7 @@ export class OneironContinuation {
 				dependencies: [],
 				sourceFingerprint,
 				state: "RUNNING",
-				requirements: { host: c.host },
+				requirements: { host: c.host, runtime: c.runtime },
 				command: {
 					argv: [
 						...runtime.cliArgv,

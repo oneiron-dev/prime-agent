@@ -6,6 +6,7 @@ import {
 	proposeManagementDecision,
 } from "../src/factory/management.js";
 import type { FactoryStatus } from "../src/factory/types.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 function status(): FactoryStatus {
 	return {
@@ -25,7 +26,7 @@ function status(): FactoryStatus {
 				acceptanceCriteria: ["Independent review passed for the output"],
 				sourceFingerprint: "before",
 				command: { argv: ["writer"], cwd: "/workspace" },
-				requirements: {},
+				requirements: { runtime: fixtureRuntimePin },
 			},
 		],
 		attempts: [

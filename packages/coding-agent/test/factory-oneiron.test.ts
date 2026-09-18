@@ -21,6 +21,8 @@ import { FactoryEngine } from "../src/factory/engine.js";
 import { createManagementPacket, proposeManagementDecision } from "../src/factory/management.js";
 import { FactoryStore } from "../src/factory/store.js";
 
+import { admitRuntimeFixture, createRuntimeFixture } from "./factory-runtime-fixture.js";
+
 const roots: string[] = [];
 const head = "a".repeat(40);
 function frozenCorpus(commit = head) {
@@ -695,6 +697,8 @@ describe("Oneiron preparation and execution gates", () => {
 describe("Oneiron real journal and foreground command-runner integration", () => {
 	test("executes a mocked-model triage in a real supervised process and binds a bounded management decision", async () => {
 		const f = setup();
+		f.manifest.factoryRuntime = createRuntimeFixture(f.directory);
+		admitRuntimeFixture(f.manifest.factoryRuntime);
 		const cwd = f.manifest.source.workspace;
 		execFileSync("git", ["init", "-q", "--initial-branch=fixture", cwd]);
 		writeFileSync(join(cwd, "source"), "fixture");

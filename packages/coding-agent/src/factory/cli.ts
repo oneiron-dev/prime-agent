@@ -5,6 +5,7 @@ import { type FactoryConfig, readFactoryConfig, readFactoryHosts, readFactoryJso
 import { FactoryEngine } from "./engine.js";
 import { FACTORY_HELP } from "./help.js";
 import type { ManagementReconciliation } from "./management.js";
+import { recordFactoryRuntime } from "./runtime.js";
 import { FactoryStore } from "./store.js";
 import type { ActionWithdrawal, DecisionEvidence, FactoryPlan, NonRetrySettlement } from "./types.js";
 
@@ -136,7 +137,7 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 		const store = new FactoryStore(join(directory, "factory.db"));
 		try {
 			const engine = new FactoryEngine(store, new CommandAdapter(config.hosts), { enabled: false, pauseFile });
-			engine.applyPlan(plan);
+			engine.applyPlan(plan, 0, undefined, recordFactoryRuntime(directory));
 			engine.pause("Initialized; explicit factory resume required");
 			emit(engine.status());
 		} finally {

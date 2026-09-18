@@ -12,6 +12,7 @@ import {
 } from "../src/factory/adapters/oneiron-capture.js";
 import { ONEIRON_TRANSPORT_LIMITS, verifyOneironArtifact } from "../src/factory/adapters/oneiron-transport.js";
 import { runOneironWriterForeground } from "../src/factory/adapters/oneiron-writer.js";
+import { admitRuntimeFixture, createRuntimeFixture } from "./factory-runtime-fixture.js";
 
 // Local process fixtures and explicit filesystem faults are not production verification evidence.
 const ioFault = vi.hoisted(() => ({
@@ -374,7 +375,10 @@ try { await runOneironCapture(${JSON.stringify(argv)}, ${JSON.stringify(f.direct
 catch (error) { writeFileSync(${JSON.stringify(finalPath)}, JSON.stringify(error.capture), { flag: 'wx' }); process.exitCode = 1; }`,
 		);
 		const host = { type: "local" as const, runnerRoot: join(f.directory, "attempts") };
+		const runtime = createRuntimeFixture(f.directory);
+		admitRuntimeFixture(runtime);
 		const context: CommandContext = {
+			runtime,
 			attempt: {
 				id: "capture-timeout",
 				actionId: "capture",
@@ -393,7 +397,7 @@ catch (error) { writeFileSync(${JSON.stringify(finalPath)}, JSON.stringify(error
 				kind: "process",
 				dependencies: [],
 				sourceFingerprint: "opaque:capture-fixture",
-				requirements: {},
+				requirements: { runtime },
 				state: "RUNNING",
 				command: {
 					argv: [process.execPath, "--import", resolve("../../node_modules/tsx/dist/loader.mjs"), fixture],

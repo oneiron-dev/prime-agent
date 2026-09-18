@@ -1,3 +1,5 @@
+import type { FactoryFilePin } from "./runtime.js";
+
 /** Portable factory contracts. Host, model and UI integrations live outside this module. */
 export interface TicketSpec {
 	id: string;
@@ -21,7 +23,7 @@ export interface ActionSpec {
 	/** Only process actions may be accepted by a successful command alone. */
 	kind: "process" | "decision";
 	command: { argv: string[]; cwd: string; timeoutMs?: number; env?: Record<string, string> };
-	requirements: { host?: string; slotId?: string; capabilities?: string[] };
+	requirements: { runtime?: FactoryFilePin; host?: string; slotId?: string; capabilities?: string[] };
 }
 
 export interface FactoryPlan {
@@ -86,11 +88,12 @@ export interface AttemptContext {
 	attempt: AttemptRecord;
 	action: ActionRecord;
 	slot: SlotSpec;
+	runtime?: FactoryFilePin;
 }
 export type Inspection =
 	| { kind: "running"; processIdentity: string }
 	| { kind: "terminal"; receipt: CompletionReceipt }
-	| { kind: "uncertain"; reason: string };
+	| { kind: "uncertain"; reason: string; runtimeMismatch?: true };
 export interface FactoryAdapter {
 	/** The store records submission intent before calling launch. Launch must use attempt.id as its durable identity. */
 	launch(context: AttemptContext): Promise<Inspection>;

@@ -6,12 +6,15 @@ import { CommandAdapter, type CommandContext } from "../src/factory/adapters/com
 import { FactoryEngine } from "../src/factory/engine.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { FactoryPlan } from "../src/factory/types.js";
+import { admitRuntimeFixture, createRuntimeFixture } from "./factory-runtime-fixture.js";
 
 const roots: string[] = [];
 const stores: FactoryStore[] = [];
 function setup() {
 	const root = mkdtempSync(join(tmpdir(), "factory-environment-"));
 	roots.push(root);
+	const runtime = createRuntimeFixture(root);
+	admitRuntimeFixture(runtime);
 	const runnerRoot = join(root, "attempts");
 	const store = new FactoryStore(join(root, "factory.db"));
 	stores.push(store);
@@ -28,7 +31,7 @@ function setup() {
 				dependencies: [],
 				kind: "process",
 				sourceFingerprint: "opaque:input",
-				requirements: {},
+				requirements: { runtime },
 				command: {
 					argv: [
 						process.execPath,

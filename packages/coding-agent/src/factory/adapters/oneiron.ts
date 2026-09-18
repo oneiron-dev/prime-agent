@@ -440,7 +440,7 @@ export function prepareOneiron(
 				cwd: m.source.workspace,
 				timeoutMs: m.stage.kind === "writer" ? 1800000 : m.stage.kind === "gate" ? 3600000 : 300000,
 			},
-			requirements: { host: options.host, slotId: options.slotId },
+			requirements: { host: options.host, slotId: options.slotId, runtime: m.factoryRuntime! },
 		},
 	};
 }

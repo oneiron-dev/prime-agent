@@ -1,0 +1,1 @@
+- Fixed factory admission to pin the initializing runtime, allow explicit action overrides, and refuse changed runtime bytes or stale local processes with distinct journal reasons and worker delivery receipts.

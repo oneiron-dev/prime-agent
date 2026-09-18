@@ -19,6 +19,7 @@ import {
 	validateOneironWriterRetry,
 } from "../src/factory/adapters/oneiron-writer.js";
 import { readFactoryRuntime } from "../src/factory/runtime.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 const roots: string[] = [];
 function setup() {
@@ -313,7 +314,7 @@ describe("explicit pinned writer profile and factory model capture", () => {
 						argv: ["execute", priorManifest.path, "permit", priorManifest.sha256, "--execute"],
 						cwd: f.source.workspace,
 					},
-					requirements: {},
+					requirements: { runtime: fixtureRuntimePin },
 					state: "REJECTED",
 				},
 			],

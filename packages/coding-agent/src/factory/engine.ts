@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import type { ManagementReconciliation } from "./management.js";
 import { verifyManagementReconciliation } from "./management-recovery.js";
+import type { FactoryFilePin } from "./runtime.js";
 import type { FactoryStore } from "./store.js";
 import type {
 	ActionWithdrawal,
@@ -37,9 +38,14 @@ export class FactoryEngine {
 	private requireUnpaused(): void {
 		if (this.paused()) throw new Error("Factory is paused; changes are blocked");
 	}
-	applyPlan(plan: FactoryPlan, expectedRevision?: number, mutationId?: string): number {
+	applyPlan(
+		plan: FactoryPlan,
+		expectedRevision?: number,
+		mutationId?: string,
+		initialRuntime?: FactoryFilePin,
+	): number {
 		this.requireUnpaused();
-		return this.store.applyPlan(plan, expectedRevision, mutationId);
+		return this.store.applyPlan(plan, expectedRevision, mutationId, initialRuntime);
 	}
 	reconcileManagement(
 		requestId: string,
@@ -118,7 +124,8 @@ export class FactoryEngine {
 			if (result.receipt.attemptId !== context.attempt.id) throw new Error("Receipt attempt identity mismatch");
 			this.store.complete(result.receipt);
 		} else if (result.kind === "running") this.store.markRunning(context.attempt.id, result.processIdentity);
-		else if (result.kind === "uncertain") this.store.markUncertain(context.attempt.id, result.reason);
+		else if (result.kind === "uncertain")
+			this.store.markUncertain(context.attempt.id, result.reason, result.runtimeMismatch);
 		else throw new Error("Unknown adapter inspection result");
 	}
 	private async inspect(context: AttemptContext): Promise<void> {

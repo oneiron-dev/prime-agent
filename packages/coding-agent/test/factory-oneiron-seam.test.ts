@@ -34,6 +34,8 @@ import {
 import { hashFactoryRuntimeFile } from "../src/factory/runtime.js";
 import { FactoryStore } from "../src/factory/store.js";
 
+import { admitRuntimeFixture } from "./factory-runtime-fixture.js";
+
 const roots: string[] = [];
 const stores = new Set<FactoryStore>();
 const originalPath = process.env.PATH;
@@ -233,12 +235,19 @@ async function fixture() {
 	const factoryRuntime = pin(directory, "factory-runtime.json", {
 		version: 1,
 		cliArgv: [process.execPath, pinnedCli],
-		files: [process.execPath, pinnedCli, entry, resolve("src/factory/adapters/oneiron.ts")].map((path) => ({
+		files: [
+			process.execPath,
+			pinnedCli,
+			entry,
+			resolve("src/factory/adapters/oneiron.ts"),
+			resolve("src/factory/runtime.ts"),
+		].map((path) => ({
 			path,
 			sha256: hashFactoryRuntimeFile(path),
 		})),
 		capabilities: ["provider-response-model-v1"],
 	});
+	admitRuntimeFixture(factoryRuntime);
 	const manifest: OneironManifest = {
 		version: 1,
 		ticketId: "FIXTURE-1",

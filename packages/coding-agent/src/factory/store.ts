@@ -4,6 +4,7 @@ import { isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import type { ManagementClaim, ManagementReconciliation, ManagementRequest, ManagementResult } from "./management.js";
+import { type FactoryFilePin, factoryRuntimeMismatchCheck } from "./runtime.js";
 import type {
 	ActionRecord,
 	ActionSpec,
@@ -257,6 +258,10 @@ export class FactoryStore {
 	isPaused(): boolean {
 		return this.meta("paused") === "true";
 	}
+	runtimePin(): FactoryFilePin | undefined {
+		const value = this.meta("runtime_pin");
+		return value === undefined ? undefined : decode<FactoryFilePin>(value);
+	}
 	pause(reason: string): void {
 		required(reason, "pause reason");
 		this.transaction(() => {
@@ -273,7 +278,12 @@ export class FactoryStore {
 		});
 	}
 	/** Add/upsert a plan; omitted records remain. Started actions and all source fingerprints are immutable. */
-	applyPlan(plan: FactoryPlan, expectedRevision?: number, mutationId?: string): number {
+	applyPlan(
+		plan: FactoryPlan,
+		expectedRevision?: number,
+		mutationId?: string,
+		initialRuntime?: FactoryFilePin,
+	): number {
 		validatePlan(plan);
 		if (mutationId !== undefined) {
 			required(mutationId, "mutationId");
@@ -294,6 +304,11 @@ export class FactoryStore {
 			const revision = Number(this.meta("plan_revision"));
 			if (expectedRevision !== undefined && revision !== expectedRevision)
 				throw new Error("Factory plan revision changed");
+			const runtime = initialRuntime;
+			if (revision === 0 && runtime) {
+				this.setMeta("runtime_pin", JSON.stringify(runtime));
+				this.event("runtime_pinned", null, null, { runtime });
+			}
 			const existing = this.actions();
 			const unchanged =
 				revision > 0 &&
@@ -482,7 +497,7 @@ export class FactoryStore {
 		const action = this.action(attempt.actionId);
 		const slot = this.slot(attempt.slotId);
 		if (!action || !slot) throw new Error("Corrupt factory attempt references");
-		return { attempt, action, slot };
+		return { attempt, action, slot, runtime: this.runtimePin() };
 	}
 	/** Atomically claims action, slot and declared host/cwd. Paths are lexical identities, not symlink resolution. */
 	claim(actionId: string, slotId: string): AttemptContext | undefined {
@@ -568,7 +583,7 @@ export class FactoryStore {
 			this.event("attempt_running", action.id, attemptId, { processIdentity });
 		});
 	}
-	private uncertainInternal(attemptId: string, reason: string): void {
+	private uncertainInternal(attemptId: string, reason: string, runtimeMismatch = false): void {
 		const { attempt, action } = this.context(attemptId);
 		if (attempt.claimReleased || attempt.state === "PREPARED") return;
 		if (attempt.state === "UNCERTAIN" && attempt.uncertainty === reason) return;
@@ -577,11 +592,19 @@ export class FactoryStore {
 		this.db
 			.prepare("INSERT OR IGNORE INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,?,?,?)")
 			.run(action.id, attemptId, reason, now());
-		this.event("attempt_uncertain", action.id, attemptId, { reason });
+		this.event(runtimeMismatch ? "runtime_mismatch" : "attempt_uncertain", action.id, attemptId, {
+			reason,
+			...(runtimeMismatch
+				? {
+						runtime: action.requirements.runtime ?? this.runtimePin(),
+						runtime_check: factoryRuntimeMismatchCheck(reason),
+					}
+				: {}),
+		});
 	}
-	markUncertain(attemptId: string, reason: string): void {
+	markUncertain(attemptId: string, reason: string, runtimeMismatch = false): void {
 		required(reason, "uncertainty reason");
-		this.transaction(() => this.uncertainInternal(attemptId, reason));
+		this.transaction(() => this.uncertainInternal(attemptId, reason, runtimeMismatch));
 	}
 	private resolveWakes(attemptId: string): void {
 		this.db
