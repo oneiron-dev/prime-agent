@@ -281,7 +281,6 @@ export class FactoryStore {
 					return prior.revision;
 				}
 			}
-			if (this.isPaused()) throw new Error("Factory is paused; plan changes are blocked");
 			const revision = Number(this.meta("plan_revision"));
 			if (expectedRevision !== undefined && revision !== expectedRevision)
 				throw new Error("Factory plan revision changed");

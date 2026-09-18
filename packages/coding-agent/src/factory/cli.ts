@@ -4,6 +4,7 @@ import { CommandAdapter, fingerprintCommand } from "./adapters/command.js";
 import { type FactoryConfig, readFactoryConfig, readFactoryHosts, readFactoryJson } from "./config.js";
 import { FactoryEngine } from "./engine.js";
 import { FACTORY_HELP } from "./help.js";
+import { importSplits, launchTickets, readLauncherSettings, readLauncherTickets } from "./launcher.js";
 import { resumeFactory } from "./resume.js";
 import { recordFactoryRuntime } from "./runtime.js";
 import { FactoryStore } from "./store.js";
@@ -14,6 +15,7 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 	const options = new Map<string, string>();
 	const allowed = new Set([
 		"--hosts",
+		"--launcher",
 		"--pause-file",
 		"--after",
 		"--interval-ms",
@@ -128,6 +130,23 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 			pauseFile: config.pauseFile,
 		});
 		switch (command) {
+			case "launch": {
+				const launcherPath = options.get("--launcher");
+				if (!argument || !choice || !launcherPath)
+					throw new Error("launch requires <w7-manifest.json> <mint-plan.json> --launcher <launcher.json>");
+				const settings = readLauncherSettings(launcherPath);
+				if (!config.hosts[settings.host])
+					throw new Error(`launcher.host ${settings.host} is not a configured host`);
+				const { tickets, skipped } = readLauncherTickets(argument, choice);
+				const result = launchTickets(store, settings, tickets);
+				writeFileSync(
+					join(directory, "config.json"),
+					`${JSON.stringify({ ...config, launcher: settings }, null, 2)}\n`,
+					{ mode: 0o600 },
+				);
+				emit({ ...result, skipped, tickets: tickets.length });
+				break;
+			}
 			case "import":
 				if (!argument) throw new Error("import requires plan.json");
 				engine.applyPlan(
@@ -170,7 +189,11 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 				break;
 			case "serve":
 			case "run":
-				await serve(engine, integer(options.get("--interval-ms"), 1000, 50));
+				await serve(engine, integer(options.get("--interval-ms"), 1000, 50), () => {
+					if (!config.launcher || engine.status().paused) return;
+					const imported = importSplits(store, config.launcher);
+					if (imported.length) emit({ splitsImported: imported });
+				});
 				break;
 			default:
 				throw new Error(`Unknown factory command ${command}`);
@@ -180,7 +203,7 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 	}
 }
 
-async function serve(engine: FactoryEngine, intervalMs: number): Promise<void> {
+async function serve(engine: FactoryEngine, intervalMs: number, afterTick: () => void): Promise<void> {
 	let stopped = false;
 	let wake: (() => void) | undefined;
 	const stop = () => {
@@ -195,6 +218,11 @@ async function serve(engine: FactoryEngine, intervalMs: number): Promise<void> {
 		while (!stopped) {
 			emit(await engine.tick());
 			if (stopped) break;
+			try {
+				afterTick();
+			} catch (error) {
+				emit({ error: error instanceof Error ? error.message : String(error) });
+			}
 			await new Promise<void>((resolveWait) => {
 				const timer = setTimeout(() => {
 					wake = undefined;

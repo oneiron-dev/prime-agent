@@ -1,5 +1,6 @@
 export const FACTORY_HELP = `Usage:
   prime factory init <directory> <plan.json> --hosts <hosts.json> [--pause-file <absolute-path>]
+  prime factory launch <directory> <w7-manifest.json> <mint-plan.json> --launcher <launcher.json>
   prime factory import <directory> <plan.json> --expected-revision <revision> [--mutation-id <id>]
   prime factory status <directory>
   prime factory events <directory> [--after <sequence>]
@@ -14,6 +15,10 @@ export const FACTORY_HELP = `Usage:
 
 Factory mode is optional and runs separately from Prime sessions. State and results are JSON.
 The factory is a DAG launcher: an action is one foreground command; exit 0 accepts it and readies its dependents, any other exit rejects it.
+launch reads the ticket DAG (tickets with blocked_by) and the contracts, and imports two actions per ticket: submit and merge.
+submit cuts a worktree, has Muse write the context pack, runs the Astra writer until DONE, tests the touched crates, reviews by tier, publishes and closes the bot round.
+merge waits for the blockers, syncs the native stack or squash-merges the lone PR. A writer's SPLIT: leftover becomes one follow-up ticket while serve runs.
+launcher.json: {"host":"arch","repo":"/abs/oneiron","docs":"/abs/oneiron-docs","work":"/abs/w7-build","buildSlots":4,"diskFloorGiB":100,"seats":{...}}
 New factories start paused. Resume prints the ledger catch-up, recomputes the frontier, unpauses and runs one scheduling tick.
 Resume exits 1 for an owner pause or idle_with_backlog (READY work with nothing RUNNING after the tick); the latter opens a wake.
 A changed installed runtime is journaled at resume and never refused. Resume never removes an external owner pause file.

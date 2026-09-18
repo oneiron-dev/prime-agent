@@ -1,11 +1,14 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { CommandAdapter, type CommandHost } from "./adapters/command.js";
+import type { OneironLauncherSettings } from "./adapters/oneiron-ticket.js";
 
 export interface FactoryConfig {
 	version: 1;
 	hosts: Record<string, CommandHost>;
 	pauseFile?: string;
+	/** Written by `factory launch`; serve reads it to import split follow-ups. */
+	launcher?: OneironLauncherSettings;
 }
 
 export function readFactoryJson(path: string): unknown {
@@ -36,6 +39,11 @@ export function readFactoryConfig(directory: string): FactoryConfig {
 	if (value.pauseFile !== undefined && (typeof value.pauseFile !== "string" || !isAbsolute(value.pauseFile))) {
 		throw new Error("Owner pauseFile must be an absolute path");
 	}
+	if (
+		value.launcher !== undefined &&
+		(typeof value.launcher !== "object" || !value.launcher.work || !value.hosts[value.launcher.host])
+	)
+		throw new Error("Invalid launcher settings in factory config");
 	new CommandAdapter(value.hosts, { pauseFile: value.pauseFile });
 	return value;
 }
