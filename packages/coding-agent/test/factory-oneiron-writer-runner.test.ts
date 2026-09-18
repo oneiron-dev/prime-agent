@@ -274,7 +274,8 @@ describe("whole-attempt retry under the real factory supervisor", () => {
 					expect(invocation.argv[invocation.argv.indexOf("--session-dir") + 1]).toBe(
 						join(manifest.outputDirectory, "session"),
 					);
-					expect(invocation.argv.at(-1)).toBe(readFileSync(manifest.stage.prompt.path, "utf8"));
+					const launched = invocation.argv.at(-1)!;
+					expect(launched.startsWith(`${readFileSync(manifest.stage.prompt.path, "utf8")}\n\n`)).toBe(true);
 					const receipt = JSON.parse(
 						readFileSync(join(manifest.outputDirectory, "receipt.json"), "utf8"),
 					) as OneironReceipt;
