@@ -397,3 +397,17 @@ it("deduplicates idle wakes across repeated resumes and uses timestamp-only rece
 	for (const filename of receipts)
 		expect(filename).toMatch(/^resume-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z\.json$/);
 });
+
+it("bounds timestamp receipt collisions at 1000 candidates without overwriting evidence", async () => {
+	const f = fixture();
+	const started = Date.now();
+	vi.spyOn(Date, "now").mockReturnValue(started);
+	let last = "";
+	for (let offset = 0; offset < 1000; offset++) {
+		last = join(f.directory, `catch-up-${new Date(started + offset).toISOString().replaceAll(":", "-")}.json`);
+		writeFileSync(last, "retained");
+	}
+	await expect(resumeFactory(f.engine)).rejects.toThrow(`Receipt filename exhausted after 1000 attempts: ${last}`);
+	expect(readFileSync(last, "utf8")).toBe("retained");
+	expect(f.store.eventsOfKind("resumed")).toEqual([]);
+});

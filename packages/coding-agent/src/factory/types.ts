@@ -1,4 +1,5 @@
 import type { FactoryFilePin } from "./runtime.js";
+import type { FactoryCallCost } from "./usage.js";
 
 /** Portable factory contracts. Host, model and UI integrations live outside this module. */
 export interface TicketSpec {
@@ -64,6 +65,23 @@ export interface ArtifactReference {
 	ref: string;
 	sourceFingerprint: string;
 }
+export interface FactoryCapsuleReceipt {
+	pin: { path: string; sha256: string };
+	head: string;
+	packet: { path: string; sha256: string };
+	capsule_seat: string;
+	bytes: number;
+	accounting: FactoryCallCost;
+	wall_clock_ms: number;
+}
+export interface FactoryCapsuleFailure {
+	capsule_seat: "none";
+	bytes: 0;
+	failure: string;
+	wall_clock_ms: number;
+	accounting: FactoryCallCost;
+}
+export type FactoryCapsuleRecord = FactoryCapsuleReceipt | FactoryCapsuleFailure;
 export interface CompletionReceipt {
 	attemptId: string;
 	sourceFingerprint: string;
@@ -83,6 +101,7 @@ export interface AttemptRecord {
 	receipt: CompletionReceipt | null;
 	uncertainty: string | null;
 	claimReleased: boolean;
+	capsule_sha256?: string | null;
 }
 export interface AttemptContext {
 	attempt: AttemptRecord;

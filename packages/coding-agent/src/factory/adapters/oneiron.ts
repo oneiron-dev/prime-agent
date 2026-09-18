@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { type AdapterDecisionContext, codeDecisionBase, recordDecision } from "../decisions.js";
 import {
 	assertByteLimit,
+	capsuleFailureMessage,
 	FACTORY_EVIDENCE_LIMITS,
 	validateArtifactPin,
 	validateManagementEvidence,
@@ -18,8 +19,9 @@ import {
 	requireFactoryJsonEventProfile,
 } from "../runtime.js";
 import { FactoryStore } from "../store.js";
-import type { ActionSpec, FactoryStatus } from "../types.js";
+import type { ActionSpec, FactoryCapsuleRecord, FactoryStatus } from "../types.js";
 import { fingerprintCommand } from "./command.js";
+import { buildOneironCapsule, type CapsuleCaller, createCapsuleCaller } from "./oneiron-capsule.js";
 import { runOneironCapture } from "./oneiron-capture.js";
 import {
 	captureOneironGate,
@@ -48,6 +50,7 @@ import { readOneironTransport } from "./oneiron-transport.js";
 import {
 	type OneironWriterStage,
 	oneironWriterCli,
+	oneironWriterPrompt,
 	readOneironWriterProfile,
 	runOneironWriterForeground,
 	summarizeOneironWriter,
@@ -135,6 +138,8 @@ export interface OneironReceipt {
 }
 export interface OneironRuntime {
 	decisionContext?: AdapterDecisionContext;
+	capsuleCaller?: CapsuleCaller;
+	recordCapsule?: (receipt: FactoryCapsuleRecord) => void;
 	run(argv: string[], cwd: string, environment?: Record<string, string>): Promise<string>;
 	runWriter?(argv: string[], cwd: string, transcriptPath: string, environment?: Record<string, string>): Promise<void>;
 	source(manifest: OneironManifest): Promise<OneironSource>;
@@ -552,7 +557,7 @@ function nativeDecisionContext(
 	m: OneironManifest,
 	manifestPath: string,
 	manifestSha256: string,
-): AdapterDecisionContext & { close: () => void } {
+): AdapterDecisionContext & { close: () => void; recordCapsule: (receipt: FactoryCapsuleRecord) => void } {
 	const database = join(m.factoryDirectory, "factory.db");
 	requireThat(existsSync(database), "Typed decisions require the existing factory journal");
 	const store = new FactoryStore(database);
@@ -574,6 +579,7 @@ function nativeDecisionContext(
 			record: (decision) => {
 				recordDecision(store, action.id, decision, { staleCheck: false });
 			},
+			recordCapsule: (receipt) => store.recordCapsule(action.id, attemptId, receipt),
 			close: () => store.close(),
 		};
 	} catch (error) {
@@ -696,6 +702,37 @@ export async function executeOneiron(
 					runtime.now(),
 					{ attemptId: process.env.PRIME_FACTORY_ATTEMPT_ID, manifestSha256 },
 				);
+				const capsuleStarted = performance.now();
+				const recordCapsule = runtime.recordCapsule ?? nativeContext?.recordCapsule;
+				let capsule: Awaited<ReturnType<typeof buildOneironCapsule>> = null;
+				try {
+					capsule = await buildOneironCapsule({
+						workspace: m.source.workspace,
+						head: m.source.head,
+						packet: stage.prompt,
+						directory: m.outputDirectory,
+						caller: runtime.capsuleCaller ?? {
+							reduce: async (capsule) => ({
+								capsule,
+								accounting: {
+									calls: 0,
+									usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, total: 0 },
+									cost_usd: 0,
+									priced: true,
+								},
+							}),
+						},
+					});
+				} catch (error) {
+					recordCapsule?.({
+						capsule_seat: "none",
+						bytes: 0,
+						failure: capsuleFailureMessage(error),
+						wall_clock_ms: Math.max(0, Math.round(performance.now() - capsuleStarted)),
+						accounting: { calls: 0, usage: null, cost_usd: null, priced: false },
+					});
+				}
+				if (capsule) recordCapsule?.(capsule.receipt);
 				const cli = oneironWriterCli(profile, readOneironPin);
 				const transcriptPath = join(m.outputDirectory, "writer.jsonl");
 				requireThat(runtime.runWriter, "Writer runtime requires bounded file-backed stdout capture");
@@ -723,7 +760,7 @@ export async function executeOneiron(
 						"--append-system-prompt",
 						"Bounded repair only. Run tools in foreground and wait for all work. Do not spawn detached descendants, delegate, use daemon/session send/schedule, commit, publish, merge, or run Cargo. Report changed files and unresolved findings. Preserve historical provenance. The factory runs gates after source rebind.",
 						"--",
-						readOneironPin(stage.prompt),
+						oneironWriterPrompt(stage.prompt, readOneironPin, capsule?.receipt.pin),
 					],
 					m.source.workspace,
 					transcriptPath,
@@ -739,6 +776,8 @@ export async function executeOneiron(
 				);
 				result = {
 					writerProvenance,
+					capsule: capsule?.receipt ?? null,
+					capsule_sha256: capsule?.receipt.pin.sha256 ?? null,
 					requiresSourceRebind: true,
 					triage: stage.triage,
 					retryReconciliation: stage.retryReconciliation ?? null,
@@ -1151,6 +1190,7 @@ export function createOneironRuntime(
 		run,
 		capture: runOneironCapture,
 		runWriter: runOneironWriterForeground,
+		capsuleCaller: createCapsuleCaller(),
 		now: Date.now,
 		status: async (directory) => {
 			requireThat(

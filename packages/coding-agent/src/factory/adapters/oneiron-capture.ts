@@ -30,6 +30,7 @@ export interface CaptureOptions {
 	environment?: Record<string, string>;
 	/** Gate environments are complete; writer environments retain their existing inheritance. */
 	replaceEnvironment?: boolean;
+	omitEnvironment?: readonly string[];
 	label: string;
 	/** Gate-only interrupted snapshot. Outer runner still owns timeout and process-group cleanup. */
 	signalPath?: string;
@@ -62,11 +63,12 @@ export function runOneironCapture(argv: string[], cwd: string, options: CaptureO
 		for (const stream of streams) closeSync(stream.fd);
 		throw error;
 	}
-	const environment = {
+	const environment: NodeJS.ProcessEnv = {
 		...(options.replaceEnvironment ? {} : process.env),
 		...options.environment,
 		GIT_OPTIONAL_LOCKS: "0",
 	};
+	for (const name of options.omitEnvironment ?? []) delete environment[name];
 	const startedAt = new Date().toISOString();
 	return new Promise((resolve, reject) => {
 		let failure: string | undefined;

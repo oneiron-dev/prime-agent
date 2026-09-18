@@ -544,9 +544,7 @@ it("treats a false receipt file with an applied ledger decision as promotion mis
 	expect(reopened.typedDecisions()[0].applied).toBe(true);
 	expect(reopened.allEvents()).toEqual(before);
 	// A lagging file is promotion missing, not permission to apply the decision again.
-	expect(disk.applied === false && event.detail.applied === true ? "promotion missing" : "complete").toBe(
-		"promotion missing",
-	);
+	expect(reopened.typedDecisions()[0].applied).not.toBe(disk.applied);
 	expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(disk);
 	expect(apply).toHaveBeenCalledTimes(1);
 });

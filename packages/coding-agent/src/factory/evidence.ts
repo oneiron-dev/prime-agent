@@ -3,12 +3,28 @@ import { isAbsolute } from "node:path";
 /** Citation counts are not model-input budgets. All sizes below are UTF-8 bytes. */
 export const FACTORY_EVIDENCE_LIMITS = {
 	citations: 32,
+	capsuleBytes: 64 * 1024,
 	refBytes: 4000,
 	contentBytes: 64 * 1024,
 	packetBytes: 96 * 1024,
 	bindingBytes: 256 * 1024,
 	responseBytes: 256 * 1024,
 } as const;
+
+export const CAPSULE_FAILURE_MAX_LENGTH = 512;
+export function capsuleFailureMessage(error: unknown): string {
+	let message = error instanceof Error ? error.message : "Capsule generation failed";
+	for (const [name, value] of Object.entries(process.env))
+		if (value && /key|token|secret|password|credential/i.test(name))
+			message = message.replaceAll(value, "[redacted]");
+	return (
+		message
+			.replace(/(?:[A-Za-z]:[\\/]|\/)[^\s"'`<>]*/g, "[path]")
+			.replace(/(?:Bearer\s+|(?:key|token|secret|password)\s*[:=]\s*)[^\s,;]+/gi, "[redacted]")
+			.replace(/[\u0000-\u001f\u007f]/gu, " ")
+			.slice(0, CAPSULE_FAILURE_MAX_LENGTH) || "Capsule generation failed"
+	);
+}
 
 export function assertByteLimit(field: string, actual: number, limit: number): void {
 	if (actual > limit) throw new Error(`${field}: actual ${actual} UTF-8 bytes exceeds limit ${limit}`);

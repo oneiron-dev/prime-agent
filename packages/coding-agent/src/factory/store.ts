@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
@@ -11,6 +11,7 @@ import {
 	operatorDecisionBase,
 	recordDecision,
 } from "./decisions.js";
+import { CAPSULE_FAILURE_MAX_LENGTH, validateArtifactPin } from "./evidence.js";
 import type { ManagementClaim, ManagementReconciliation, ManagementRequest, ManagementResult } from "./management.js";
 import { type FactoryFilePin, factoryRuntimeMismatchCheck } from "./runtime.js";
 import type {
@@ -21,6 +22,8 @@ import type {
 	AttemptRecord,
 	CompletionReceipt,
 	DecisionEvidence,
+	FactoryCapsuleReceipt,
+	FactoryCapsuleRecord,
 	FactoryEvent,
 	FactoryPlan,
 	FactoryStatus,
@@ -30,6 +33,7 @@ import type {
 	TicketRecord,
 	WakeRecord,
 } from "./types.js";
+import { readFactoryUsage } from "./usage.js";
 
 type Row = Record<string, unknown>;
 const SCHEMA_VERSION = 2;
@@ -55,6 +59,61 @@ function settlementProof(proof: { ref: string; sha256: string }): string {
 	if (bytes.length > 1000000 || createHash("sha256").update(bytes).digest("hex") !== proof.sha256)
 		throw new Error(`Settlement artifact hash mismatch: ${proof.ref}`);
 	return bytes.toString("utf8");
+}
+function validateCapsuleReceipt(receipt: FactoryCapsuleReceipt): void {
+	validateArtifactPin(receipt.pin, "capsule.pin");
+	validateArtifactPin(receipt.packet, "capsule.packet");
+	required(receipt.head, "capsule.head");
+	required(receipt.capsule_seat, "capsule.capsule_seat");
+	const limit = 64 * 1024;
+	if (!Number.isSafeInteger(receipt.bytes) || receipt.bytes < 1 || receipt.bytes > limit)
+		throw new Error("Capsule bytes must be within 1..65536");
+	if (!Number.isFinite(receipt.wall_clock_ms) || receipt.wall_clock_ms < 0)
+		throw new Error("Invalid capsule wall_clock_ms");
+	const cost = receipt.accounting;
+	if (
+		!cost ||
+		!Number.isSafeInteger(cost.calls) ||
+		cost.calls < 0 ||
+		typeof cost.priced !== "boolean" ||
+		(cost.cost_usd !== null && (!Number.isFinite(cost.cost_usd) || cost.cost_usd < 0)) ||
+		(cost.priced && cost.cost_usd === null) ||
+		(cost.usage !== null && !readFactoryUsage(cost.usage))
+	)
+		throw new Error("Invalid capsule accounting");
+	const fd = openSync(receipt.pin.path, constants.O_RDONLY | constants.O_NONBLOCK);
+	let bytes: Buffer;
+	try {
+		const info = fstatSync(fd);
+		if (!info.isFile() || info.size > limit) throw new Error("Capsule must be a regular file of at most 65536 bytes");
+		const buffer = Buffer.alloc(limit + 1);
+		let length = 0;
+		while (length < buffer.length) {
+			const count = readSync(fd, buffer, length, buffer.length - length, null);
+			if (count === 0) break;
+			length += count;
+		}
+		if (length > limit || length !== receipt.bytes) throw new Error("Capsule byte count mismatch");
+		bytes = buffer.subarray(0, length);
+	} finally {
+		closeSync(fd);
+	}
+	if (createHash("sha256").update(bytes).digest("hex") !== receipt.pin.sha256)
+		throw new Error("Capsule pin hash mismatch");
+	const capsule: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+	if (
+		!capsule ||
+		typeof capsule !== "object" ||
+		!("version" in capsule) ||
+		capsule.version !== 1 ||
+		!("head" in capsule) ||
+		capsule.head !== receipt.head ||
+		!("packet" in capsule) ||
+		!isDeepStrictEqual(capsule.packet, receipt.packet) ||
+		!("capsule_seat" in capsule) ||
+		capsule.capsule_seat !== receipt.capsule_seat
+	)
+		throw new Error("Capsule JSON metadata does not match receipt");
 }
 /** Checks operator-supplied evidence, not remote process liveness. Missing PID or timeout alone is not proof. */
 function verifySettlement(settlement: NonRetrySettlement): void {
@@ -289,6 +348,43 @@ export class FactoryStore {
 		this.db
 			.prepare("INSERT INTO events(at,kind,action_id,attempt_id,detail) VALUES(?,?,?,?,?)")
 			.run(now(), kind, actionId, attemptId, JSON.stringify(detail));
+	}
+	recordCapsule(actionId: string, attemptId: string | null, receipt: FactoryCapsuleRecord): void {
+		this.transaction(() => {
+			if (!this.action(actionId)) throw new Error(`Unknown action ${actionId}`);
+			if (attemptId !== null) {
+				const { attempt, action } = this.context(attemptId);
+				const latest = this.db
+					.prepare("SELECT id FROM attempts WHERE action_id=? ORDER BY rowid DESC LIMIT 1")
+					.get(actionId);
+				if (
+					action.id !== actionId ||
+					latest?.id !== attemptId ||
+					attempt.claimReleased ||
+					!["SUBMITTED", "RUNNING"].includes(attempt.state)
+				)
+					throw new Error("Capsule requires the current live claimed attempt for this action");
+				if (this.db.prepare("SELECT 1 FROM events WHERE kind='capsule_built' AND attempt_id=?").get(attemptId))
+					throw new Error("Capsule already bound to attempt");
+			}
+			if ("failure" in receipt) {
+				if (
+					receipt.capsule_seat !== "none" ||
+					receipt.bytes !== 0 ||
+					typeof receipt.failure !== "string" ||
+					!receipt.failure.trim() ||
+					receipt.failure.length > CAPSULE_FAILURE_MAX_LENGTH ||
+					/[\u0000-\u001f\u007f]/u.test(receipt.failure) ||
+					!Number.isFinite(receipt.wall_clock_ms) ||
+					receipt.wall_clock_ms < 0
+				)
+					throw new Error("Invalid capsule failure");
+				this.event("capsule_built", actionId, attemptId, { ...receipt });
+			} else {
+				validateCapsuleReceipt(receipt);
+				this.event("capsule_built", actionId, attemptId, { ...receipt, capsule_sha256: receipt.pin.sha256 });
+			}
+		});
 	}
 	ledgerSequence(actionId?: string): number {
 		const row =
@@ -637,6 +733,9 @@ export class FactoryStore {
 			.map((r) => decode<SlotSpec>(r.spec));
 	}
 	private attemptRecord(r: Row): AttemptRecord {
+		const capsule = this.db
+			.prepare("SELECT detail FROM events WHERE kind='capsule_built' AND attempt_id=? AND action_id=?")
+			.get(String(r.id), String(r.action_id));
 		return {
 			id: String(r.id),
 			actionId: String(r.action_id),
@@ -648,6 +747,9 @@ export class FactoryStore {
 			receipt: r.receipt === null ? null : decode<CompletionReceipt>(r.receipt),
 			uncertainty: r.uncertainty === null ? null : String(r.uncertainty),
 			claimReleased: Number(r.claim_released) === 1,
+			...(capsule
+				? { capsule_sha256: decode<{ capsule_sha256?: string }>(capsule.detail).capsule_sha256 ?? null }
+				: {}),
 		};
 	}
 	attempts(activeOnly = false): AttemptRecord[] {

@@ -1,0 +1,1 @@
+- Added bounded, pinned context capsules before writer attempts, with optional cheap-seat reduction and per-attempt cost reporting.

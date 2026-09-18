@@ -9,8 +9,11 @@ import type { FactoryStore } from "./store.js";
 import { sumFactoryCosts } from "./usage.js";
 
 function saveTimestampedReceipt(directory: string, prefix: string, data: unknown): string {
-	for (let timestamp = Date.now(); ; timestamp++) {
-		const path = join(directory, `${prefix}-${new Date(timestamp).toISOString().replaceAll(":", "-")}.json`);
+	let path = "";
+	const started = Date.now();
+	for (let attempt = 0; attempt < 1000; attempt++) {
+		const timestamp = started + attempt;
+		path = join(directory, `${prefix}-${new Date(timestamp).toISOString().replaceAll(":", "-")}.json`);
 		try {
 			save(path, data);
 			return path;
@@ -18,6 +21,7 @@ function saveTimestampedReceipt(directory: string, prefix: string, data: unknown
 			if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
 		}
 	}
+	throw new Error(`Receipt filename exhausted after 1000 attempts: ${path}`);
 }
 
 export function resumeFrontier(store: FactoryStore) {

@@ -186,9 +186,18 @@ export function requireFactoryJsonEventProfile(runtime: FactoryRuntimeIdentity):
 	);
 }
 
-/** Native owned frontend, not a daemon-free CLI flag. Clear only inherited native worker authority in the child. */
+export const FACTORY_ONLY_API_KEYS = [
+	"FACTORY_CAPSULE_API_KEY",
+	"TYPESAFE_JEV_API_KEY",
+	"FACTORY_ADVISOR_API_KEY",
+] as const;
+
+/** Native owned frontend, not a daemon-free CLI flag. Clear worker authority and factory-only credentials. */
 export function factoryOwnedEnvironment(): Record<string, string> {
 	return {
+		FACTORY_CAPSULE_API_KEY: "",
+		TYPESAFE_JEV_API_KEY: "",
+		FACTORY_ADVISOR_API_KEY: "",
 		PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND: "1",
 		PRIME_AGENT_INTERNAL_OWNED_WORKER: "",
 		PRIME_AGENT_INTERNAL_OWNED_RECOVERY_DESCRIPTOR: "",

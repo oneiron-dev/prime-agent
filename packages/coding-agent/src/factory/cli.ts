@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { CommandAdapter, fingerprintCommand } from "./adapters/command.js";
+import { buildActionCapsule } from "./adapters/oneiron-capsule.js";
 import { type FactoryConfig, readFactoryConfig, readFactoryHosts, readFactoryJson } from "./config.js";
 import { factoryCost, formatFactoryCost } from "./cost.js";
 import { decideTyped } from "./decisions.js";
@@ -18,6 +19,7 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 	const options = new Map<string, string>();
 	const allowed = new Set([
 		"--hosts",
+		"--action",
 		"--accept-runtime-change",
 		"--object",
 		"--apply",
@@ -113,8 +115,10 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 	if (options.has("--timeout-ms") && command !== "fingerprint") {
 		throw new Error("--timeout-ms is only supported for fingerprint");
 	}
-	if (command !== "cost" && (options.has("--ticket") || options.has("--json")))
-		throw new Error("--ticket and --json are only supported for cost");
+	if (command !== "cost" && options.has("--ticket")) throw new Error("--ticket is only supported for cost");
+	if (!["cost", "capsule"].includes(command) && options.has("--json"))
+		throw new Error("--json is only supported for cost and capsule");
+	if (command !== "capsule" && options.has("--action")) throw new Error("--action is only supported for capsule");
 	if (command === "fingerprint") {
 		const hostsPath = options.get("--hosts");
 		if (!hostsPath || !rawDirectory || !argument)
@@ -178,6 +182,24 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 			pauseFile: config.pauseFile,
 		});
 		switch (command) {
+			case "capsule": {
+				const actionId = options.get("--action");
+				if (
+					!actionId ||
+					positionals.length !== 2 ||
+					[...options.keys()].some((key) => !["--action", "--json"].includes(key))
+				)
+					throw new Error("capsule requires <directory> --action <id> [--json]");
+				const built = await buildActionCapsule(store, actionId);
+				if (options.has("--json")) emit(built?.capsule ?? { capsule: false });
+				else
+					console.log(
+						built
+							? `${built.receipt.pin.path} sha256:${built.receipt.pin.sha256} (${built.receipt.bytes} bytes, ${built.receipt.capsule_seat})\n${JSON.stringify(built.capsule, null, 2)}`
+							: "capsule: false",
+					);
+				break;
+			}
 			case "import":
 				if (!argument) throw new Error("import requires plan.json");
 				engine.applyPlan(

@@ -5,7 +5,7 @@ import type { OneironManifest, OneironReceipt } from "./adapters/oneiron.js";
 import { verifyOneironArtifact } from "./adapters/oneiron-transport.js";
 import type { OneironWriterProvenance } from "./adapters/oneiron-writer.js";
 import type { ManagementResult } from "./management.js";
-import type { ActionSpec } from "./types.js";
+import type { ActionSpec, FactoryCapsuleRecord } from "./types.js";
 import { type FactoryCallCost, sumFactoryCosts } from "./usage.js";
 
 export interface FactoryCostRow extends FactoryCallCost {
@@ -20,7 +20,16 @@ export interface FactoryUnreadableCostRow {
 	path: string;
 	reason: string;
 }
+export interface FactoryCostAttempt {
+	attemptId: string;
+	actionId: string;
+	ticket: string;
+	writer: FactoryCallCost | null;
+	capsule_sha256: string | null;
+	capsule: { bytes: number; seat: string; cost_usd: number | null } | null;
+}
 export interface FactoryCostReport {
+	attempts: FactoryCostAttempt[];
 	rows: FactoryCostRow[];
 	total: FactoryCallCost;
 	missing: string[];
@@ -35,6 +44,8 @@ function receipt<T>(path: string): T | undefined {
 export function factoryCost(directory: string, ticket?: string): FactoryCostReport {
 	const db = new DatabaseSync(join(directory, "factory.db"), { readOnly: true });
 	const groups = new Map<string, FactoryCostRow[]>();
+	const attempts: FactoryCostAttempt[] = [];
+	const capsules = new Map<string, Pick<FactoryCostAttempt, "capsule_sha256" | "capsule">>();
 	const missing: string[] = [];
 	const unreadable: FactoryUnreadableCostRow[] = [];
 	const seen = new Set<string>();
@@ -60,6 +71,31 @@ export function factoryCost(directory: string, ticket?: string): FactoryCostRepo
 	};
 	try {
 		db.exec("BEGIN");
+		const capsuleEvents = db
+			.prepare(
+				"SELECT e.sequence,e.action_id,e.attempt_id,e.detail,a.ticket_id FROM events e JOIN actions a ON a.id=e.action_id WHERE e.kind='capsule_built' AND (? IS NULL OR a.ticket_id=?) ORDER BY e.sequence",
+			)
+			.all(ticket ?? null, ticket ?? null);
+		for (const row of capsuleEvents) {
+			const path = `factory:event:${String(row.sequence)}`;
+			let seat = "capsule";
+			try {
+				const detail = JSON.parse(String(row.detail)) as FactoryCapsuleRecord & { capsule_sha256?: string };
+				seat = detail.capsule_seat;
+				add(String(row.ticket_id), seat, detail.accounting, path);
+				if (row.attempt_id !== null)
+					capsules.set(JSON.stringify([row.action_id, row.attempt_id]), {
+						capsule_sha256: detail.capsule_sha256 ?? null,
+						capsule: {
+							bytes: detail.bytes,
+							seat,
+							cost_usd: detail.accounting?.priced ? detail.accounting.cost_usd : null,
+						},
+					});
+			} catch (error) {
+				recordUnreadable(String(row.ticket_id), seat, String(row.action_id), path, error);
+			}
+		}
 		const actions = db
 			.prepare(
 				"SELECT * FROM actions WHERE (? IS NULL OR ticket_id=?) AND EXISTS (SELECT 1 FROM attempts WHERE action_id=actions.id)",
@@ -75,12 +111,28 @@ export function factoryCost(directory: string, ticket?: string): FactoryCostRepo
 				verifyOneironArtifact(path, argv.at(-2));
 				const manifest = receipt<OneironManifest>(path)!;
 				if (manifest.stage.kind !== "writer") continue;
+				const writerAttempts = db.prepare("SELECT id FROM attempts WHERE action_id=? ORDER BY rowid").all(row.id);
+				for (const attempt of writerAttempts)
+					attempts.push({
+						attemptId: String(attempt.id),
+						actionId: action.id,
+						ticket: action.ticketId,
+						writer: null,
+						...(capsules.get(JSON.stringify([row.id, attempt.id])) ?? { capsule_sha256: null, capsule: null }),
+					});
 				path = join(manifest.outputDirectory, "receipt.json");
 				const saved = receipt<OneironReceipt>(path);
 				if (saved && (saved.ticketId !== action.ticketId || saved.manifestSha256 !== argv.at(-2)))
 					throw new Error(`Cost receipt binding mismatch: ${path}`);
 				if (seen.has(path)) continue;
 				const cost = saved?.result.writerProvenance as OneironWriterProvenance | undefined;
+				for (const attempt of attempts.filter((item) => item.actionId === action.id)) {
+					if (
+						writerAttempts.length === 1 ||
+						(attempt.capsule_sha256 !== null && saved?.result.capsule_sha256 === attempt.capsule_sha256)
+					)
+						attempt.writer = cost ?? null;
+				}
 				add(action.ticketId, "writer", cost, path);
 				seen.add(path);
 			} catch (error) {
@@ -124,7 +176,7 @@ export function factoryCost(directory: string, ticket?: string): FactoryCostRepo
 			total.cost_usd = null;
 			total.usage = null;
 		}
-		return { rows, total, missing, unreadable };
+		return { rows, total, missing, unreadable, attempts };
 	} finally {
 		db.close();
 	}
@@ -158,5 +210,23 @@ export function formatFactoryCost(report: FactoryCostReport): string {
 		),
 		...report.missing.map((ref) => `Missing cost receipt: ${ref}`),
 		`Unreadable rows: ${report.unreadable.length}`,
+		"",
+		"ATTEMPT\tACTION\tTICKET\tCAPSULE_SHA256\tCAPSULE\tWRITER_INPUT\tWRITER_CACHE_READ\tWRITER_COST_USD",
+		...report.attempts.map((attempt) =>
+			[
+				attempt.attemptId,
+				attempt.actionId,
+				attempt.ticket,
+				attempt.capsule_sha256 ?? "none",
+				attempt.capsule
+					? `${attempt.capsule.bytes} bytes; ${attempt.capsule.seat}; $${attempt.capsule.cost_usd?.toFixed(8) ?? "unknown"}`
+					: "none",
+				String(attempt.writer?.usage?.input ?? "unknown"),
+				String(attempt.writer?.usage?.cache_read ?? "unknown"),
+				attempt.writer?.cost_usd?.toFixed(8) ?? "unknown",
+			]
+				.map((value) => value.replace(/[\t\r\n]/g, " "))
+				.join("\t"),
+		),
 	].join("\n");
 }

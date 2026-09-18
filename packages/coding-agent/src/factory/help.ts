@@ -2,6 +2,7 @@ export const FACTORY_HELP = `Usage:
   prime factory init <directory> <plan.json> --hosts <hosts.json> [--pause-file <absolute-path>]
   prime factory import <directory> <plan.json> --expected-revision <revision> [--mutation-id <id>]
   prime factory status <directory>
+  prime factory capsule <directory> --action <id> [--json]
   prime factory cost <directory> [--ticket <id>] [--json]
   prime factory events <directory> [--after <sequence>]
   prime factory fingerprint <host> <absolute-cwd> --hosts <hosts.json> [--timeout-ms <milliseconds>]
@@ -32,6 +33,7 @@ Hosts JSON: {"local":{"type":"local","runnerRoot":"/absolute/attempts"}}
 SSH host: {"type":"ssh","sshHost":"arch","runnerRoot":"/absolute/attempts","python":"python3"}
 Only foreground commands are supported; daemonized/detached descendants require another adapter.
 Plans use argv arrays and absolute cwd paths. Use fingerprint for verified Git source identity.
+capsule builds a bounded, pinned code-map without running the writer; optional cheap-seat failure uses deterministic evidence.
 cost reads ledger-linked receipts without mutation; unknown usage or prices remain unknown, never zero.
 fingerprint --timeout-ms accepts integers 1..120000 (default 20000 ms); launch and inspect deadlines are unchanged.
 resolve intentionally retries and requires evidence that any previous process tree is gone; it does not kill or inspect it for you.
