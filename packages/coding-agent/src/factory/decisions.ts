@@ -25,6 +25,7 @@ const common = {
 	requested_profile: s,
 	served_profile: s,
 	decided_by: Type.Union([
+		Type.Literal("none"),
 		Type.Literal("jev"),
 		Type.Literal("advisor"),
 		Type.Literal("operator"),
@@ -200,7 +201,37 @@ export interface AdapterDecisionContext {
 	attemptId: string;
 	record: DecisionRecorder;
 }
-export interface DecisionReceipt {
+export interface DecisionInference {
+	outcome: string;
+	question_set: { version: string; sha256: string };
+	jev?: {
+		model: string;
+		probability?: number;
+		confidence?: number;
+		probabilities?: Record<string, number>;
+		usage: FactoryCallCost["usage"];
+		wall_clock_ms: number;
+	};
+	advisor?: {
+		model: string;
+		effort: "medium";
+		decision: string;
+		confidence: number | null;
+		reason: string;
+		usage: FactoryCallCost["usage"];
+		cost_usd: number | null;
+		wall_clock_ms: number;
+	};
+}
+export function decisionProfilesMatch(decision: FactoryDecision): boolean {
+	return (
+		decision.requested_profile === decision.served_profile ||
+		(decision.decided_by === "jev" &&
+			decision.requested_profile === "jev-latest" &&
+			/^jev-\d+\.\d+\.\d+$/.test(decision.served_profile))
+	);
+}
+export interface DecisionReceipt extends Partial<DecisionInference> {
 	wall_clock_ms: number;
 	request_id: string;
 	source_request_id?: string;
@@ -284,6 +315,9 @@ export function recordDecision(
 		apply?: () => void;
 		applied?: boolean;
 		staleCheck?: boolean;
+		inference?: DecisionInference;
+		accounting?: FactoryCallCost;
+		requireCurrent?: () => void;
 	} = {},
 ): DecisionReceipt {
 	const decision = validateDecision(value);
@@ -295,16 +329,20 @@ export function recordDecision(
 		requestId,
 		options.staleCheck !== false,
 		() => {
-			const drift = decision.requested_profile !== decision.served_profile;
+			options.requireCurrent?.();
+			if (options.inference?.outcome === "DEFERRED" && (options.apply || options.applied))
+				throw new Error("A deferred typed decision cannot be applied");
+			const drift = !decisionProfilesMatch(decision);
 			if (!drift) options.apply?.();
 			const receipt: DecisionReceipt = {
+				...options.inference,
 				wall_clock_ms: decision.wall_clock_ms,
 				request_id: requestId,
 				...(options.sourceRequestId ? { source_request_id: options.sourceRequestId } : {}),
 				action_id: actionId,
 				decision,
 				applied: !drift && (options.applied === true || !!options.apply),
-				accounting: {
+				accounting: options.accounting ?? {
 					calls: ["jev", "advisor"].includes(decision.decided_by) ? 1 : 0,
 					usage: decision.usage,
 					cost_usd: decision.cost_usd,
@@ -331,6 +369,7 @@ export function decideTyped(
 	apply = false,
 ): DecisionReceipt {
 	const decision = validateDecision(value, type);
+	if (apply && decision.decided_by === "none") throw new Error("An undecided object cannot be applied");
 	const transition = () => {
 		if (store.isPaused()) throw new Error("Factory is paused; decisions are blocked");
 		const attempt = store

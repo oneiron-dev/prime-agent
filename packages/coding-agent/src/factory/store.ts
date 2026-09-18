@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from "node:util";
 import {
 	codeDecisionBase,
 	type DecisionReceipt,
+	decisionProfilesMatch,
 	type FactoryDecision,
 	operatorDecisionBase,
 	recordDecision,
@@ -220,6 +221,7 @@ export class FactoryStore {
 					CREATE TABLE IF NOT EXISTS events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, action_id TEXT, attempt_id TEXT, detail TEXT NOT NULL);
 					CREATE TABLE IF NOT EXISTS wakes (id INTEGER PRIMARY KEY AUTOINCREMENT, action_id TEXT NOT NULL, attempt_id TEXT, reason TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT);
 					CREATE UNIQUE INDEX IF NOT EXISTS wakes_attempt_open ON wakes(attempt_id) WHERE resolved_at IS NULL;
+					CREATE INDEX IF NOT EXISTS wakes_open_reason ON wakes(reason) WHERE resolved_at IS NULL;
 					CREATE TABLE IF NOT EXISTS management_requests (id TEXT PRIMARY KEY, wake_id INTEGER REFERENCES wakes(id), action_id TEXT NOT NULL, attempt_id TEXT NOT NULL, plan_revision INTEGER NOT NULL, evidence_sha256 TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL, result TEXT, error TEXT, UNIQUE(wake_id,plan_revision,attempt_id,evidence_sha256));
 					CREATE UNIQUE INDEX IF NOT EXISTS management_wake_inflight ON management_requests(wake_id) WHERE state='CLAIMED';
 					CREATE TABLE IF NOT EXISTS plan_mutations (id TEXT PRIMARY KEY, payload_sha256 TEXT NOT NULL, previous_revision INTEGER NOT NULL, revision INTEGER NOT NULL);
@@ -350,7 +352,7 @@ export class FactoryStore {
 					.prepare("UPDATE management_requests SET result=? WHERE id=?")
 					.run(JSON.stringify({ ...result, typedDecision: receipt }), receipt.source_request_id);
 			}
-			if (decision.requested_profile !== decision.served_profile) {
+			if (!decisionProfilesMatch(decision)) {
 				this.event("profile_drift", actionId, attemptId, {
 					request_id: requestId,
 					requested_profile: decision.requested_profile,
@@ -360,9 +362,21 @@ export class FactoryStore {
 					.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
 					.run(actionId, `profile_drift: ${requestId}`, now());
 			}
+			if (receipt.outcome === "DEFERRED") {
+				this.db
+					.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
+					.run(actionId, `typed_decision_deferred: ${requestId}: ${decision.reason}`, now());
+			}
+			if (existing && receipt.question_set) {
+				const state =
+					receipt.outcome === "DEFERRED" ? "DEFERRED" : !decisionProfilesMatch(decision) ? "DRIFT" : "PROPOSED";
+				this.db.prepare("UPDATE management_requests SET state=? WHERE id=?").run(state, requestId);
+				this.event("management_finished", actionId, attemptId, { id: requestId, state, error: null });
+			}
 			this.event("decision", actionId, attemptId, {
 				...decision,
 				submitted_by: submittedBy,
+				...(receipt.question_set ? { outcome: receipt.outcome, question_set: receipt.question_set } : {}),
 				request_id: requestId,
 				...(receipt.source_request_id ? { source_request_id: receipt.source_request_id } : {}),
 				applied: receipt.applied,
@@ -1377,6 +1391,12 @@ export class FactoryStore {
 				attemptId: r.attempt_id === null ? null : String(r.attempt_id),
 				detail: decode<Record<string, unknown>>(r.detail),
 			}));
+	}
+	openWakeIdForReason(reason: string): number | undefined {
+		const row = this.db
+			.prepare("SELECT id FROM wakes WHERE reason=? AND resolved_at IS NULL ORDER BY id LIMIT 1")
+			.get(reason);
+		return row ? Number(row.id) : undefined;
 	}
 	wakes(): WakeRecord[] {
 		return this.db

@@ -11,6 +11,7 @@ export const FACTORY_HELP = `Usage:
   prime factory pause <directory> [reason]
   prime factory resume <directory>
   prime factory manage <directory> [action-id] [--role ticketOwner] [--evidence <file>] [--apply]
+  prime factory manage <directory> <action-id> --typed-object <absolute-json-file>
   prime factory manage <directory> --watch [--apply] [--evidence-directory <directory>] [--max-requests <count>] [--max-passes <count>] [--interval-ms <milliseconds>]
   prime factory supersede <directory> <rejected-or-abandoned-action> <replacement-action> --expected-revision <revision> --actor <actor> --reason <reason> --ref <evidence>
   prime factory reconcile-management <directory> <request-id> --expected-revision <revision> --actor <actor> --reason <reason> --ref <absolute-reconciliation.json>
@@ -38,6 +39,7 @@ Neither closure launches work or satisfies dependencies. Withdrawal refuses any 
 decide-typed validates the question-set object and refuses stale ledger_sequence values; profile drift opens a wake and never applies.
 Typed --apply supports terminal acceptance of a decision action and operator-proven attempt requeue; other types are record-only.
 manage returns a proposal unless --apply is explicit; --watch opts into bounded automatic wake handling, separate from serve.
+manage --typed-object invokes Jev and the band advisor on a validated object; records only, then apply through decide-typed.
 Automatic handling needs exact per-wake evidence bindings. Requests are durably consumed, including defer/errors; crashes never authorize replay.
 Plan mutations wait for active/unconsumed judgments; no-op imports keep the revision. Rebind pending wakes after real mutations.
 reconcile-management requires hash-verified actor/provider/output receipts; UNKNOWN, missing PID and timeout never authorize replay.
@@ -45,8 +47,10 @@ Opaque source fingerprints are labels only; use an explicit validating wrapper f
 
 export const FACTORY_MANAGE_HELP = `Usage:
   prime-agent factory manage <directory> [action-id] [--role ticketOwner] [--evidence <file>] [--apply]
+  prime-agent factory manage <directory> <action-id> --typed-object <absolute-json-file>
   prime-agent factory manage <directory> --watch [--role ticketOwner] [--apply] [--evidence-directory <directory>] [--max-requests <count>] [--max-passes <count>] [--interval-ms <milliseconds>]
 
+--typed-object records a Jev/advisor decision, never text management or automatic application; resolve DEFERRED via decide-typed.
 Reviews one wake by default; --watch consumes bound judgment wakes in a separate foreground process, never inside serve.
 Proposes unless --apply is explicit. A cached proposal can be applied without another model call. Defer/error preserves the wake and consumes that context.
 Automatic evidence: <directory>/management-evidence/<wake-id>.json, or --evidence-directory. See factory.md for the exact hash-validated envelope.

@@ -1,8 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { createJevTypedDecisionCaller, type JevTypedCaller } from "./adapters/jev-typed-decision.js";
 import { save } from "./decision-receipt.js";
-import { codeDecisionBase, type DecisionOf, type DecisionReceipt, recordDecision } from "./decisions.js";
+import {
+	codeDecisionBase,
+	type DecisionOf,
+	type DecisionReceipt,
+	type FactoryDecision,
+	recordDecision,
+	validateDecision,
+} from "./decisions.js";
 import type { FactoryEngine } from "./engine.js";
 import { assertByteLimit, FACTORY_EVIDENCE_LIMITS, validateManagementEvidence } from "./evidence.js";
 import {
@@ -22,6 +30,7 @@ import type { WakeRecord } from "./types.js";
 
 export interface ManageWakeOptions {
 	directory: string;
+	typedDecision?: FactoryDecision;
 	role?: string;
 	actionId?: string;
 	evidence?: ManagementEvidence[];
@@ -37,6 +46,7 @@ interface ManageWakeBase {
 	requestId?: string;
 	evidenceDirectory?: string;
 	result?: ManagementResult;
+	typedDecision?: DecisionReceipt;
 	error?: string;
 }
 export type ManageWakeResult = ManageWakeBase &
@@ -80,7 +90,13 @@ export async function manageFactoryWake(
 	engine: FactoryEngine,
 	options: ManageWakeOptions,
 	createCaller: ManagementCallerFactory,
+	createTypedCaller: (requireCurrent: () => void) => JevTypedCaller = createJevTypedDecisionCaller,
 ): Promise<ManageWakeResult> {
+	const typed = options.typedDecision === undefined ? undefined : validateDecision(options.typedDecision);
+	if (typed && (options.automatic || options.apply || !options.actionId))
+		throw new Error("Typed management requires one action and records only; apply later through decide-typed");
+	const observedSequence = engine.store.ledgerSequence();
+	if (typed && typed.ledger_sequence !== observedSequence) throw new Error("Typed decision ledger_sequence changed");
 	const status = engine.status();
 	if (status.paused || options.stopped?.()) return { kind: "paused", admitted: false };
 	if (options.automatic && (options.evidence !== undefined || options.actionId !== undefined))
@@ -104,7 +120,7 @@ export async function manageFactoryWake(
 		packet.wakes = [wake];
 		if (!packet.attempt || packet.attempt.id !== wake.attemptId) continue;
 		const role = options.role ?? "ticketOwner";
-		const profile = status.roles?.[role];
+		const profile = status.roles?.[role] ?? (typed ? { provider: "typesafe", model: "jev-latest" } : undefined);
 		if (!profile) throw new Error(`No model configured for factory role: ${role}`);
 		const evidenceHashes = packet.evidence.map((item) => ({ ref: item.ref, sha256: sha256(item.content) }));
 		const claim: ManagementClaim = {
@@ -113,7 +129,7 @@ export async function manageFactoryWake(
 			actionId: action.id,
 			attemptId: packet.attempt.id,
 			planRevision: packet.planRevision,
-			evidenceSha256: sha256(JSON.stringify(evidenceHashes)),
+			evidenceSha256: sha256(JSON.stringify(typed ? { evidenceHashes, typed } : evidenceHashes)),
 		};
 		const requireCurrent = (): void => {
 			if (options.stopped?.() || engine.status().paused)
@@ -213,8 +229,49 @@ export async function manageFactoryWake(
 				profile,
 				evidenceHashes,
 				packet,
+				...(typed ? { typedDecision: typed } : {}),
 			});
 			requireCurrent();
+			if (typed) {
+				const checkTypedCurrent = () => {
+					requireCurrent();
+					if (engine.store.ledgerSequence() !== ledgerSequence)
+						throw new Error("Typed decision journal moved during call");
+				};
+				checkTypedCurrent();
+				const caller = createTypedCaller(checkTypedCurrent);
+				const response = await caller.call(typed);
+				checkTypedCurrent();
+				save(join(output, "response.json"), response);
+				const receipt = recordDecision(engine.store, action.id, response.decision, {
+					requestId: claim.id,
+					staleCheck: false,
+					inference: response.inference,
+					accounting: response.accounting,
+					requireCurrent: checkTypedCurrent,
+				});
+				if (response.inference.outcome === "DRIFT") {
+					const wakeId = engine.store.openWakeIdForReason(`profile_drift: ${claim.id}`);
+					if (wakeId === undefined) throw new Error("Profile drift wake is missing");
+					return {
+						kind: "drift",
+						admitted: true,
+						requestId: claim.id,
+						evidenceDirectory: output,
+						typedDecision: receipt,
+						wakeId,
+						requestedProfile: receipt.decision.requested_profile,
+						servedProfile: receipt.decision.served_profile,
+					};
+				}
+				return {
+					kind: receipt.outcome === "DEFERRED" ? "deferred" : "proposed",
+					admitted: true,
+					requestId: claim.id,
+					evidenceDirectory: output,
+					typedDecision: receipt,
+				};
+			}
 			const call = createCaller(requireCurrent);
 			result = await proposeManagementDecision(
 				packet,
@@ -249,17 +306,15 @@ export async function manageFactoryWake(
 			let message = error instanceof Error ? error.message : String(error);
 			if (error instanceof ProfileDrift && typedDecision) {
 				try {
-					const driftWake = engine.store
-						.wakes()
-						.find((item) => item.reason === `profile_drift: ${claim.id}` && item.resolvedAt === null);
-					if (!driftWake) throw new Error("Profile drift wake is missing");
+					const wakeId = engine.store.openWakeIdForReason(`profile_drift: ${claim.id}`);
+					if (wakeId === undefined) throw new Error("Profile drift wake is missing");
 					engine.store.finishManagementDrift(claim.id);
 					return {
 						kind: "drift",
 						admitted: true,
 						requestId: claim.id,
 						evidenceDirectory: output,
-						wakeId: driftWake.id,
+						wakeId,
 						requestedProfile: typedDecision.decision.requested_profile,
 						servedProfile: typedDecision.decision.served_profile,
 					};
