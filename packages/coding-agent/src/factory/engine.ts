@@ -1,10 +1,7 @@
 import { existsSync } from "node:fs";
-import type { ManagementReconciliation } from "./management.js";
-import { verifyManagementReconciliation } from "./management-recovery.js";
 import type { FactoryFilePin } from "./runtime.js";
 import type { FactoryStore } from "./store.js";
 import type {
-	ActionWithdrawal,
 	AttemptContext,
 	DecisionEvidence,
 	FactoryAdapter,
@@ -12,7 +9,6 @@ import type {
 	FactoryPlan,
 	FactoryStatus,
 	Inspection,
-	NonRetrySettlement,
 	TickResult,
 } from "./types.js";
 
@@ -47,17 +43,6 @@ export class FactoryEngine {
 		this.requireUnpaused();
 		return this.store.applyPlan(plan, expectedRevision, mutationId, initialRuntime);
 	}
-	reconcileManagement(
-		requestId: string,
-		reconciliation: ManagementReconciliation,
-		evidence: DecisionEvidence,
-		expectedRevision: number,
-	): void {
-		this.requireUnpaused();
-		verifyManagementReconciliation(reconciliation);
-		this.requireUnpaused();
-		this.store.reconcileManagement(requestId, reconciliation, evidence, expectedRevision);
-	}
 	pause(reason: string): void {
 		this.store.pause(reason);
 	}
@@ -68,26 +53,6 @@ export class FactoryEngine {
 		this.requireOwnerUnpaused();
 		this.store.resume();
 	}
-	decide(
-		actionId: string,
-		outcome: "accept" | "reject",
-		evidence: DecisionEvidence,
-		expectedRevision?: number,
-		expectedAttemptId?: string,
-		expectedWakeId?: number,
-		expectedManagementRequestId?: string,
-	): void {
-		this.requireUnpaused();
-		this.store.decide(
-			actionId,
-			outcome,
-			evidence,
-			expectedRevision,
-			expectedAttemptId,
-			expectedWakeId,
-			expectedManagementRequestId,
-		);
-	}
 	supersede(actionId: string, replacementId: string, evidence: DecisionEvidence, expectedRevision?: number): number {
 		this.requireUnpaused();
 		return this.store.supersede(actionId, replacementId, evidence, expectedRevision);
@@ -95,24 +60,6 @@ export class FactoryEngine {
 	resolveForRetry(attemptId: string, evidence: DecisionEvidence, expectedRevision?: number): void {
 		this.requireUnpaused();
 		this.store.resolveForRetry(attemptId, evidence, expectedRevision);
-	}
-	settleWithoutRetry(
-		actionId: string,
-		settlement: NonRetrySettlement,
-		evidence: DecisionEvidence,
-		expectedRevision: number,
-	): boolean {
-		this.requireUnpaused();
-		return this.store.settleWithoutRetry(actionId, settlement, evidence, expectedRevision);
-	}
-	withdrawUnstarted(
-		actionId: string,
-		withdrawal: ActionWithdrawal,
-		evidence: DecisionEvidence,
-		expectedRevision: number,
-	): boolean {
-		this.requireUnpaused();
-		return this.store.withdrawUnstarted(actionId, withdrawal, evidence, expectedRevision);
 	}
 	status(): FactoryStatus {
 		const status = this.store.status();
@@ -127,8 +74,7 @@ export class FactoryEngine {
 			if (result.receipt.attemptId !== context.attempt.id) throw new Error("Receipt attempt identity mismatch");
 			this.store.complete(result.receipt);
 		} else if (result.kind === "running") this.store.markRunning(context.attempt.id, result.processIdentity);
-		else if (result.kind === "uncertain")
-			this.store.markUncertain(context.attempt.id, result.reason, result.runtimeMismatch);
+		else if (result.kind === "uncertain") this.store.markUncertain(context.attempt.id, result.reason);
 		else throw new Error("Unknown adapter inspection result");
 	}
 	private async inspect(context: AttemptContext): Promise<void> {

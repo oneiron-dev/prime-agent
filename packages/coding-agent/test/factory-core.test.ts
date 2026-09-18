@@ -1,10 +1,9 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { codeDecisionBase, type DecisionReceipt, recordDecision } from "../src/factory/decisions.js";
 import { FactoryEngine } from "../src/factory/engine.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type {
@@ -15,7 +14,6 @@ import type {
 	FactoryPlan,
 	Inspection,
 } from "../src/factory/types.js";
-import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 const directories: string[] = [];
 const stores: FactoryStore[] = [];
@@ -27,15 +25,14 @@ function fixture(): { directory: string; path: string; store: FactoryStore } {
 	stores.push(store);
 	return { directory, path, store };
 }
-function action(id = "a", kind: ActionSpec["kind"] = "process", dependencies: string[] = []): ActionSpec {
+function action(id = "a", dependencies: string[] = []): ActionSpec {
 	return {
 		id,
 		ticketId: id,
 		dependencies,
-		kind,
 		sourceFingerprint: `source-${id}`,
 		command: { argv: ["true"], cwd: "/tmp" },
-		requirements: { runtime: fixtureRuntimePin },
+		requirements: {},
 	};
 }
 function plan(actions: ActionSpec[] = [action()]): FactoryPlan {
@@ -91,53 +88,23 @@ describe("portable factory journal", () => {
 		expect(store.attempts()).toHaveLength(0);
 		expect(engine.status().roles?.manager.model).toBe("configured-model");
 	});
-	it("separates successful execution and output identity from semantic acceptance, then readies dependents before retirement", async () => {
+	it("accepts a successful process, readies its dependents before retirement and keeps the output identity", async () => {
 		const { store } = fixture();
 		const adapter = new FakeAdapter();
 		const engine = new FactoryEngine(store, adapter, { enabled: true });
-		engine.applyPlan(plan([action("a", "decision"), action("b", "process", ["a"])]));
+		engine.applyPlan(plan([action("a"), action("b", ["a"])]));
 		await engine.tick();
-		expect(adapter.launches).toHaveLength(1);
-		expect(store.actions().map((a) => a.state)).toEqual(["AWAITING_DECISION", "QUEUED"]);
-		expect(store.tickets()[0].state).toBe("ACTIVE");
+		// One tick drains the frontier: accepting a readies b, which launches in the same tick.
+		expect(adapter.launches.map((c) => c.action.id)).toEqual(["a", "b"]);
 		expect(store.attempts()[0].receipt?.artifact?.sourceFingerprint).toBe("changed-output-source");
-		engine.decide("a", "accept", evidence, 1);
 		const events = store.allEvents();
 		const ready = events.find((e) => e.actionId === "b" && e.kind === "action_ready_changed");
 		const retired = events.find((e) => e.detail.ticketId === "a" && e.detail.state === "RETIRED");
 		expect(ready?.sequence).toBeLessThan(retired?.sequence ?? 0);
-		await engine.tick();
 		expect(store.actions().map((a) => a.state)).toEqual(["ACCEPTED", "ACCEPTED"]);
+		expect(store.tickets().every((t) => t.state === "RETIRED")).toBe(true);
 	});
-	it("requires nonempty evidence and rejects stale decisions", async () => {
-		const { store } = fixture();
-		const engine = new FactoryEngine(store, new FakeAdapter(), { enabled: true });
-		engine.applyPlan(plan([action("a", "decision")]));
-		await engine.tick();
-		expect(() => engine.decide("a", "accept", { ...evidence, ref: "" })).toThrow("evidence.ref");
-		expect(() => engine.decide("a", "accept", evidence, 0)).toThrow("revision changed");
-		engine.decide("a", "reject", evidence, 1);
-		expect(store.actions()[0].state).toBe("REJECTED");
-	});
-	it("rejects a stale decision for an earlier attempt even when the plan revision is unchanged", async () => {
-		const { store } = fixture();
-		const adapter = new FakeAdapter();
-		adapter.launchResult = () => ({ kind: "uncertain", reason: "Lost submission result" });
-		const engine = new FactoryEngine(store, adapter, { enabled: true });
-		engine.applyPlan(plan([action("a", "decision")]));
-		await engine.tick();
-		const old = store.attempts()[0];
-		engine.resolveForRetry(old.id, evidence, 1);
-		adapter.launchResult = (c) => ({ kind: "terminal", receipt: receipt(c) });
-		await engine.tick();
-		const current = store.attempts().at(-1);
-		expect(current?.id).not.toBe(old.id);
-		expect(() => engine.decide("a", "accept", evidence, 1, old.id)).toThrow("Decision attempt changed");
-		expect(store.actions()[0].state).toBe("AWAITING_DECISION");
-		engine.decide("a", "accept", evidence, 1, current?.id);
-		expect(store.actions()[0].state).toBe("ACCEPTED");
-	});
-	it("records failed process gates without accepting them", async () => {
+	it("records failed processes without accepting them", async () => {
 		const { store } = fixture();
 		const adapter = new FakeAdapter();
 		adapter.launchResult = (c) => ({ kind: "terminal", receipt: receipt(c, 1) });
@@ -147,12 +114,12 @@ describe("portable factory journal", () => {
 		expect(store.actions()[0].state).toBe("REJECTED");
 		expect(store.wakes().filter((w) => !w.resolvedAt)).toHaveLength(1);
 	});
-	it("supersedes failed gates with evidence, readies repaired dependents and eventually retires the ticket", async () => {
+	it("supersedes failed work with evidence, readies repaired dependents and eventually retires the ticket", async () => {
 		const { store } = fixture();
 		const adapter = new FakeAdapter();
 		adapter.launchResult = (c) => ({ kind: "terminal", receipt: receipt(c, c.action.id === "a" ? 1 : 0) });
 		const engine = new FactoryEngine(store, adapter, { enabled: true });
-		engine.applyPlan(plan([action("a"), action("b", "process", ["a"])]));
+		engine.applyPlan(plan([action("a"), action("b", ["a"])]));
 		await engine.tick();
 		const replacement = action("repair");
 		replacement.ticketId = "a";
@@ -170,18 +137,18 @@ describe("portable factory journal", () => {
 		const adapter = new FakeAdapter();
 		adapter.launchResult = (c) => ({ kind: "terminal", receipt: receipt(c, 1) });
 		const engine = new FactoryEngine(store, adapter, { enabled: true });
-		engine.applyPlan(plan([action("a"), action("b", "process", ["a"])]));
+		engine.applyPlan(plan([action("a"), action("b", ["a"])]));
 		await engine.tick();
 		const replacement = { ...action("repair"), ticketId: "a" };
 		engine.applyPlan({ version: 1, tickets: [], slots: [], actions: [replacement] });
 		engine.supersede("a", "repair", evidence, 2);
-		const later = { ...action("later", "process", ["a"]), ticketId: "a" };
+		const later = { ...action("later", ["a"]), ticketId: "a" };
 		expect(() => engine.applyPlan({ version: 1, tickets: [], slots: [], actions: [later] }, 3)).toThrow(
 			"Dependency a is superseded",
 		);
-		expect(() =>
-			engine.applyPlan({ version: 1, tickets: [], slots: [], actions: [action("b", "process", ["a"])] }, 3),
-		).toThrow("Dependency a is superseded");
+		expect(() => engine.applyPlan({ version: 1, tickets: [], slots: [], actions: [action("b", ["a"])] }, 3)).toThrow(
+			"Dependency a is superseded",
+		);
 		expect(store.status().planRevision).toBe(3);
 		expect(store.actions().find((a) => a.id === "later")).toBeUndefined();
 		expect(store.actions().find((a) => a.id === "b")?.dependencies).toEqual(["repair"]);
@@ -196,7 +163,7 @@ describe("portable factory journal", () => {
 		const engine = new FactoryEngine(store, adapter, { enabled: true });
 		engine.applyPlan(plan());
 		await engine.tick();
-		const cyclic = action("repair", "process", ["a"]);
+		const cyclic = action("repair", ["a"]);
 		cyclic.ticketId = "a";
 		engine.applyPlan({
 			version: 1,
@@ -205,7 +172,7 @@ describe("portable factory journal", () => {
 			actions: [cyclic, { ...action("foreign"), ticketId: "foreign" }],
 		});
 		expect(() => engine.supersede("a", "repair", evidence)).toThrow("cycle");
-		expect(() => engine.supersede("a", "foreign", evidence)).toThrow("same ticket and kind");
+		expect(() => engine.supersede("a", "foreign", evidence)).toThrow("same ticket");
 		expect(store.actions()[0].state).toBe("REJECTED");
 		expect(store.status().planRevision).toBe(2);
 	});
@@ -223,7 +190,7 @@ describe("portable factory journal", () => {
 	});
 	it("preserves contradictory terminal evidence from concurrent controllers and pauses downstream dispatch", async () => {
 		const { store, path } = fixture();
-		store.applyPlan(plan([action("a"), action("b", "process", ["a"])]));
+		store.applyPlan(plan([action("a"), action("b", ["a"])]));
 		const context = store.claim("a", "slot");
 		if (!context) throw new Error("Missing claim");
 		store.markSubmitted(context.attempt.id);
@@ -237,7 +204,7 @@ describe("portable factory journal", () => {
 		await new FactoryEngine(store, adapter, { enabled: true }).tick();
 		expect(store.isPaused()).toBe(true);
 		expect(adapter.launches).toHaveLength(0);
-		expect(store.eventsOfKind("terminal_receipt_conflict").length > 0).toBe(true);
+		expect(store.allEvents().some((e) => e.kind === "terminal_receipt_conflict")).toBe(true);
 		expect(store.wakes().some((w) => !w.resolvedAt && w.reason === "Conflicting terminal receipt")).toBe(true);
 	});
 	it("retains ambiguous submission claims across restart until evidence authorizes retry", async () => {
@@ -309,20 +276,19 @@ describe("portable factory journal", () => {
 		expect(store.attempts()[0].state).toBe("UNCERTAIN");
 		expect(store.attempts()[0].claimReleased).toBe(false);
 	});
-	it("blocks launches and decisions during pause but still collects terminal receipts", async () => {
+	it("blocks launches and plan changes during pause but still collects terminal receipts", async () => {
 		const { directory, store } = fixture();
 		const adapter = new FakeAdapter();
 		adapter.launchResult = () => ({ kind: "running", processIdentity: "pid:start" });
 		const pauseFile = join(directory, "OWNER-PAUSE.json");
 		const engine = new FactoryEngine(store, adapter, { enabled: true, pauseFile });
-		engine.applyPlan(plan([action("a", "decision"), action("b")]));
+		engine.applyPlan(plan([action("a"), action("b", ["a"])]));
 		await engine.tick();
 		engine.pause("Owner review");
 		adapter.inspectResult = (c) => ({ kind: "terminal", receipt: receipt(c) });
 		await engine.tick();
 		expect(adapter.launches).toHaveLength(1);
-		expect(store.actions()[0].state).toBe("AWAITING_DECISION");
-		expect(() => engine.decide("a", "accept", evidence)).toThrow("paused");
+		expect(store.actions().map((a) => a.state)).toEqual(["ACCEPTED", "READY"]);
 		expect(() => engine.applyPlan(plan())).toThrow("paused");
 		engine.resume();
 		writeFileSync(pauseFile, "{}");
@@ -331,13 +297,12 @@ describe("portable factory journal", () => {
 		expect(adapter.launches).toHaveLength(1);
 		expect(engine.status().paused).toBe(true);
 		rmSync(pauseFile);
-		engine.decide("a", "accept", evidence);
 		await engine.tick();
 		expect(adapter.launches).toHaveLength(2);
 	});
 	it("only updates future work, keeps input identity immutable, and validates the dependency graph atomically", () => {
 		const { store } = fixture();
-		const initial = plan([action("a"), action("b", "process", ["a"])]);
+		const initial = plan([action("a"), action("b", ["a"])]);
 		store.applyPlan(initial);
 		const revised = structuredClone(initial);
 		revised.actions[1].command.argv = ["updated-command"];
@@ -369,10 +334,10 @@ describe("portable factory journal", () => {
 	it("honors host, slot and capability requirements", () => {
 		const { store } = fixture();
 		const work = action();
-		work.requirements = { runtime: fixtureRuntimePin, host: "other-host", capabilities: ["macos"] };
+		work.requirements = { host: "other-host", capabilities: ["macos"] };
 		store.applyPlan(plan([work]));
 		expect(store.claim("a", "slot")).toBeUndefined();
-		work.requirements = { runtime: fixtureRuntimePin, host: "host", slotId: "slot", capabilities: ["linux"] };
+		work.requirements = { host: "host", slotId: "slot", capabilities: ["linux"] };
 		store.applyPlan(plan([work]));
 		expect(store.claim("a", "slot")).toBeDefined();
 	});
@@ -462,89 +427,4 @@ describe("portable factory journal", () => {
 			expect(store.attempts(true)).toHaveLength(expectedClaims);
 		},
 	);
-});
-
-it("pages full decision history without loss, duplication or changing the bounded events API", () => {
-	const { store } = fixture();
-	store.applyPlan(plan());
-	const before = store.ledgerSequence();
-	for (let index = 0; index < 205; index++)
-		recordDecision(store, "a", {
-			...codeDecisionBase(store.ledgerSequence(), `Observation ${index}`),
-			type: "executability",
-			named_dependency: "none",
-			independent_work_available: true,
-			authority_covers: true,
-			hold_scope: null,
-		});
-	expect(store.events()).toHaveLength(100);
-	const full = store.allEvents();
-	expect(full).toHaveLength(before + 205);
-	expect(new Set(full.map((event) => event.sequence)).size).toBe(full.length);
-	expect(full.map((event) => event.sequence)).toEqual(Array.from({ length: full.length }, (_, index) => index + 1));
-	expect(store.allEvents(before)).toEqual(full.slice(before));
-	expect(store.eventsOfKind("decision", before)).toHaveLength(205);
-	expect(() => store.allEvents(-1)).toThrow("Invalid event range");
-});
-
-it("pages only the requested event kind through its entry snapshot", () => {
-	const { store } = fixture();
-	store.applyPlan(plan());
-	store.recordResumed({ old: true });
-	const after = store.ledgerSequence();
-	for (let index = 0; index < 205; index++) {
-		store.pause("unrelated");
-		store.recordResumed({ index });
-	}
-	const expected = store.events(after, 1000).filter((event) => event.kind === "resumed");
-	const all = vi.spyOn(store, "allEvents");
-	const sequence = store.ledgerSequence.bind(store);
-	vi.spyOn(store, "ledgerSequence").mockImplementationOnce(() => {
-		const through = sequence();
-		store.recordResumed({ afterSnapshot: true });
-		return through;
-	});
-	const actual = store.eventsOfKind("resumed", after);
-	expect(actual).toEqual(expected);
-	expect(actual).toHaveLength(205);
-	expect(new Set(actual.map((event) => event.sequence)).size).toBe(205);
-	expect(all).not.toHaveBeenCalled();
-	expect(store.eventsOfKind("absent")).toEqual([]);
-	expect(store.eventsOfKind("resumed", store.ledgerSequence())).toEqual([]);
-	expect(() => store.eventsOfKind("resumed", -1)).toThrow("Invalid event range");
-});
-
-it("treats a false receipt file with an applied ledger decision as promotion missing, never as a replay", () => {
-	const { directory, path, store } = fixture();
-	store.applyPlan(plan());
-	const apply = vi.fn();
-	vi.spyOn(store, "afterDecisionCommit").mockImplementationOnce(() => {});
-	const receipt = recordDecision(
-		store,
-		"a",
-		{
-			...codeDecisionBase(store.ledgerSequence(), "Audit authority"),
-			type: "executability",
-			named_dependency: "none",
-			independent_work_available: true,
-			authority_covers: true,
-			hold_scope: null,
-		},
-		{ requestId: "promotion-missing", apply },
-	);
-	const file = join(directory, "decisions", receipt.request_id, "decision.json");
-	const before = store.allEvents();
-	const reopened = new FactoryStore(path);
-	stores.push(reopened);
-	const disk = JSON.parse(readFileSync(file, "utf8")) as DecisionReceipt;
-	const event = reopened.eventsOfKind("decision").find((e) => e.detail.request_id === receipt.request_id)!;
-	expect(disk.applied).toBe(false);
-	expect(event.detail.applied).toBe(true);
-	expect(reopened.typedDecisions()).toEqual([{ ...disk, applied: event.detail.applied }]);
-	expect(reopened.typedDecisions()[0].applied).toBe(true);
-	expect(reopened.allEvents()).toEqual(before);
-	// A lagging file is promotion missing, not permission to apply the decision again.
-	expect(reopened.typedDecisions()[0].applied).not.toBe(disk.applied);
-	expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(disk);
-	expect(apply).toHaveBeenCalledTimes(1);
 });

@@ -3,31 +3,37 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, it, vi } from "vitest";
 import { runFactoryCli } from "../src/factory/cli.js";
-import { codeDecisionBase, recordDecision } from "../src/factory/decisions.js";
 import { FactoryEngine } from "../src/factory/engine.js";
-import type { ManagementRequest } from "../src/factory/management.js";
 import { resumeCatchUp, resumeFactory, resumeFrontier } from "../src/factory/resume.js";
+import { type FactoryFilePin, hashFactoryRuntimeFile } from "../src/factory/runtime.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { ActionSpec, AttemptContext, Inspection } from "../src/factory/types.js";
-import { admitRuntimeFixture, createRuntimeFixture } from "./factory-runtime-fixture.js";
 
 const roots: string[] = [],
 	stores: FactoryStore[] = [];
 function fixture(ids: string[] = []) {
 	const directory = mkdtempSync(join(tmpdir(), "factory-resume-"));
 	roots.push(directory);
-	const pin = createRuntimeFixture(directory);
-	admitRuntimeFixture(pin);
+	const component = join(directory, "component.js");
+	writeFileSync(component, "// installed component\n");
+	const pinPath = join(directory, "runtime.json");
+	writeFileSync(
+		pinPath,
+		JSON.stringify({
+			version: 1,
+			cliArgv: [process.execPath, component],
+			files: [{ path: component, sha256: hashFactoryRuntimeFile(component) }],
+		}),
+	);
+	const pin: FactoryFilePin = { path: pinPath, sha256: hashFactoryRuntimeFile(pinPath) };
 	const store = new FactoryStore(join(directory, "factory.db"));
 	stores.push(store);
 	const actions: ActionSpec[] = ids.map((id) => ({
 		id,
 		ticketId: id === "rejected" ? "other" : "ticket",
 		dependencies: id === "queued" ? ["rejected"] : [],
-		kind: id === "decision" ? "decision" : "process",
 		sourceFingerprint: id,
 		command: { argv: ["true"], cwd: join(directory, id) },
 		requirements: {},
@@ -66,7 +72,7 @@ function fixture(ids: string[] = []) {
 	);
 	const engine = new FactoryEngine(store, { launch, inspect }, { enabled: true, pauseFile });
 	vi.spyOn(console, "log").mockImplementation(() => {});
-	return { directory, store, engine, pin, pauseFile, launch, inspect };
+	return { directory, store, engine, pin, component, pauseFile, launch, inspect };
 }
 function finish(store: FactoryStore, id: string, exitCode = 0) {
 	const claim = store.claim(id, "s0")!;
@@ -78,21 +84,21 @@ function finish(store: FactoryStore, id: string, exitCode = 0) {
 		finishedAt: new Date().toISOString(),
 	});
 }
+function ofKind(store: FactoryStore, kind: string) {
+	return store.allEvents().filter((e) => e.kind === kind);
+}
 afterEach(() => {
 	for (const store of stores.splice(0)) store.close();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 	vi.restoreAllMocks();
 });
 
-it("refuses owner pause before runtime checking, unpausing or writing receipts", async () => {
+it("refuses owner pause before unpausing or writing receipts", async () => {
 	const f = fixture(["ready"]);
 	f.engine.pause("owner");
 	writeFileSync(f.pauseFile, "hold");
-	writeFileSync(f.pin.path, "changed");
 	const sequence = f.store.ledgerSequence();
-	await expect(runFactoryCli(["resume", f.directory, "--accept-runtime-change", "approved"])).rejects.toThrow(
-		"External owner pause",
-	);
+	await expect(runFactoryCli(["resume", f.directory])).rejects.toThrow("External owner pause");
 	expect(f.store.ledgerSequence()).toBe(sequence);
 	expect(f.store.isPaused()).toBe(true);
 	expect(existsSync(f.pauseFile)).toBe(true);
@@ -100,27 +106,23 @@ it("refuses owner pause before runtime checking, unpausing or writing receipts",
 	expect(readdirSync(f.directory).filter((n) => n.startsWith("resume-"))).toEqual([]);
 });
 
-it("refuses runtime mismatch, then accepts the flag with a reason and preserves the old pin", async () => {
+it("journals a changed installed runtime and continues instead of refusing", async () => {
 	const f = fixture();
 	f.engine.pause("restart");
-	writeFileSync(f.pin.path, "{}");
-	await expect(runFactoryCli(["resume", f.directory])).rejects.toThrow("Runtime mismatch");
-	await expect(runFactoryCli(["resume", f.directory, "--accept-runtime-change", " "])).rejects.toThrow("nonempty");
-	expect(f.store.isPaused()).toBe(true);
-	await runFactoryCli(["resume", f.directory, "--accept-runtime-change", "owner approved release"]);
+	writeFileSync(f.component, "// rebuilt component\n");
+	await runFactoryCli(["resume", f.directory]);
+	expect(f.store.isPaused()).toBe(false);
 	expect(f.store.runtimePin()).not.toEqual(f.pin);
-	expect(readFileSync(f.pin.path, "utf8")).toBe("{}");
-	expect(f.store.eventsOfKind("runtime_changed")[0]?.detail).toMatchObject({
+	expect(ofKind(f.store, "runtime_changed")[0]?.detail).toMatchObject({
 		previous: f.pin,
-		reason: "owner approved release",
+		reason: `runtime file changed: ${f.component}`,
 	});
-	await expect(runFactoryCli(["tick", f.directory, "--accept-runtime-change", "wrong verb"])).rejects.toThrow(
-		"only supported for resume",
-	);
+	await runFactoryCli(["resume", f.directory]);
+	expect(ofKind(f.store, "runtime_changed")).toHaveLength(1);
 });
 
-it("groups the full catch-up after the last resumed event, including typed drift/deferred requests", () => {
-	const { store } = fixture(["old", "accepted", "rejected", "uncertain", "decision"]);
+it("groups the full catch-up after the last resumed event", () => {
+	const { store } = fixture(["old", "accepted", "rejected", "uncertain"]);
 	finish(store, "old");
 	store.recordResumed({ fixture: true });
 	const after = store.ledgerSequence();
@@ -128,38 +130,6 @@ it("groups the full catch-up after the last resumed event, including typed drift
 	store.resume();
 	finish(store, "accepted");
 	finish(store, "rejected", 1);
-	finish(store, "decision");
-	const wake = store.wakes().find((w) => w.actionId === "decision")!;
-	for (const mode of ["PROPOSED", "DRIFT", "DEFERRED"]) {
-		store.claimManagement({
-			id: mode,
-			wakeId: wake.id,
-			actionId: "decision",
-			attemptId: wake.attemptId!,
-			planRevision: 1,
-			evidenceSha256: mode,
-		});
-		recordDecision(
-			store,
-			"decision",
-			{
-				...codeDecisionBase(store.ledgerSequence(), mode),
-				served_profile: mode === "DRIFT" ? "other" : "code",
-				type: "executability",
-				named_dependency: "none",
-				independent_work_available: true,
-				authority_covers: true,
-				hold_scope: null,
-			},
-			{
-				requestId: mode,
-				inference: {
-					outcome: mode === "DEFERRED" ? "DEFERRED" : "YES",
-					question_set: { version: "v8", sha256: "a".repeat(64) },
-				},
-			},
-		);
-	}
 	const attempt = store.claim("uncertain", "s0")!.attempt;
 	store.markSubmitted(attempt.id);
 	store.markUncertain(attempt.id, "lost");
@@ -169,22 +139,15 @@ it("groups the full catch-up after the last resumed event, including typed drift
 	const ticket = report.tickets[0];
 	expect(ticket.accepted.map((e) => e.actionId)).toEqual(["accepted"]);
 	expect(ticket.uncertain.map((e) => e.actionId)).toEqual(["uncertain"]);
+	expect(ticket.openWakes.map((w) => w.reason)).toEqual(["lost"]);
 	expect(report.tickets[1].rejected.map((e) => e.actionId)).toEqual(["rejected"]);
-	expect(ticket.openWakes.map((w) => w.reason).join(" ")).toMatch(/profile_drift.*typed_decision_deferred.*lost/);
-	expect(ticket.managementRequests.map((r) => r.state)).toEqual(["PROPOSED", "DRIFT", "DEFERRED"]);
-	const auditState: ManagementRequest["state"] = "RECORDED";
-	expect(ticket.managementRequests.some((r) => r.state === auditState)).toBe(false);
-	store.decide("decision", "accept", { actor: "operator", reason: "reviewed", ref: "fixture:review" });
-	const accepted = resumeCatchUp(store).tickets[0];
-	expect(accepted.openWakes.map((w) => w.actionId)).toEqual(["uncertain"]);
-	expect(accepted.managementRequests).toEqual([]);
+	expect(report.tickets[1].openWakes.map((w) => w.reason)).toEqual(["Process failed"]);
 });
 
 it("derives each frontier category, abandons only PREPARED and never re-admits UNCERTAIN", async () => {
-	const f = fixture(["accepted", "rejected", "decision", "uncertain", "prepared", "running", "ready", "queued"]);
+	const f = fixture(["accepted", "rejected", "uncertain", "prepared", "running", "ready", "queued"]);
 	finish(f.store, "accepted");
 	finish(f.store, "rejected", 1);
-	finish(f.store, "decision");
 	const uncertain = f.store.claim("uncertain", "s0")!.attempt.id;
 	f.store.markSubmitted(uncertain);
 	f.store.markUncertain(uncertain, "lost");
@@ -198,7 +161,7 @@ it("derives each frontier category, abandons only PREPARED and never re-admits U
 	expect(frontier.PREPARED.map((a) => a.id)).toEqual([prepared]);
 	expect(frontier.operatorWork.map((a) => a.id)).toEqual([uncertain]);
 	f.engine.pause("restart");
-	await resumeFactory(f.engine);
+	await resumeFactory(f.engine, f.directory);
 	expect(f.store.context(prepared).attempt.state).toBe("ABANDONED");
 	expect(f.launch.mock.calls.map(([c]) => c.action.id)).toEqual(["prepared"]);
 	expect(f.store.context(uncertain).attempt).toMatchObject({ state: "UNCERTAIN", claimReleased: false });
@@ -243,41 +206,7 @@ it("exits nonzero on idle_with_backlog and records counts, wake, resumed event a
 		runtime_pin: f.pin,
 		catch_up_sha: report.catch_up_sha,
 		catch_up_through: report.catch_up_through,
-		accounting: report.accounting,
 	});
-	expect(report.accounting).toMatchObject({ calls: 0, cost_usd: 0, priced: true });
-	expect(events.at(-1)?.detail).not.toHaveProperty("usage");
-});
-
-it("rehydrates cursor requests and their projections without calls, replay or state changes", async () => {
-	const f = fixture();
-	const db = new DatabaseSync(join(f.directory, "factory.db"));
-	db.exec(
-		"CREATE TABLE oneiron_continuation_cursor(id TEXT,action_id TEXT); CREATE TABLE oneiron_continuation_requests(id TEXT,cursor_id TEXT,action_id TEXT,state TEXT,packet TEXT,context TEXT,response TEXT); CREATE TABLE oneiron_continuation_supervision(receipt TEXT)",
-	);
-	for (const state of ["DISPATCHED", "RESPONDED", "WAITING"]) {
-		db.prepare("INSERT INTO oneiron_continuation_cursor VALUES(?,?)").run(state, "action");
-		db.prepare("INSERT INTO oneiron_continuation_requests VALUES(?,?,?,?,?,?,?)").run(
-			state,
-			state,
-			"action",
-			state,
-			JSON.stringify({ runnerRoot: f.directory, runtime: f.pin }),
-			JSON.stringify({ action: { command: { cwd: f.directory } } }),
-			state === "DISPATCHED" ? null : JSON.stringify({ next: { kind: "wait" } }),
-		);
-	}
-	const before = db.prepare("SELECT * FROM oneiron_continuation_requests").all();
-	const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("No network"));
-	const report = await resumeFactory(f.engine);
-	expect(report.continuation.requests).toHaveLength(3);
-	for (const state of ["DISPATCHED", "RESPONDED", "WAITING"])
-		expect(existsSync(join(f.directory, "continuation", state, state, "packet.json"))).toBe(true);
-	expect(existsSync(join(f.directory, "continuation", "RESPONDED", "RESPONDED", "response.json"))).toBe(true);
-	expect(db.prepare("SELECT * FROM oneiron_continuation_requests").all()).toEqual(before);
-	expect(f.launch).not.toHaveBeenCalled();
-	expect(fetch).not.toHaveBeenCalled();
-	db.close();
 });
 
 it("reports an acceptance settled by the previous resume tick in the next catch-up", async () => {
@@ -295,88 +224,21 @@ it("reports an acceptance settled by the previous resume tick in the next catch-
 			},
 		}),
 	);
-	const first = await resumeFactory(f.engine);
+	const first = await resumeFactory(f.engine, f.directory);
 	expect(f.store.actions()[0].state).toBe("ACCEPTED");
 	expect(JSON.parse(readFileSync(first.catchUpPath, "utf8")).tickets[0].accepted).toEqual([]);
-	const terminal = f.store.eventsOfKind("attempt_terminal")[0];
+	const terminal = ofKind(f.store, "attempt_terminal")[0];
 	expect(terminal.sequence).toBeGreaterThan(first.catch_up_through);
-	const resumed = f.store.eventsOfKind("resumed")[0];
+	const resumed = ofKind(f.store, "resumed")[0];
 	expect(resumed.sequence).toBeGreaterThan(terminal.sequence);
 	expect(f.store.lastResumeSequence()).toBe(first.catch_up_through);
-	const second = await resumeFactory(f.engine);
+	const second = await resumeFactory(f.engine, f.directory);
 	const catchUp = JSON.parse(readFileSync(second.catchUpPath, "utf8"));
 	expect(catchUp.afterSequence).toBe(first.catch_up_through);
 	expect(catchUp.tickets[0].accepted).toEqual([terminal]);
-	const third = await resumeFactory(f.engine);
+	const third = await resumeFactory(f.engine, f.directory);
 	expect(JSON.parse(readFileSync(third.catchUpPath, "utf8")).tickets[0].accepted).toEqual([]);
 	expect(f.launch).not.toHaveBeenCalled();
-});
-
-it("counts no pending requests after operator acceptance closes every wake", () => {
-	const { store } = fixture(["decision"]);
-	finish(store, "decision");
-	const wake = store.wakes()[0];
-	for (const mode of ["DRIFT", "DEFERRED"] as const) {
-		store.claimManagement({
-			id: mode,
-			wakeId: wake.id,
-			actionId: "decision",
-			attemptId: wake.attemptId!,
-			planRevision: 1,
-			evidenceSha256: mode,
-		});
-		recordDecision(
-			store,
-			"decision",
-			{
-				...codeDecisionBase(store.ledgerSequence(), mode),
-				served_profile: mode === "DRIFT" ? "other" : "code",
-				type: "executability",
-				named_dependency: "none",
-				independent_work_available: true,
-				authority_covers: true,
-				hold_scope: null,
-			},
-			{
-				requestId: mode,
-				inference: {
-					outcome: mode === "DEFERRED" ? "DEFERRED" : "YES",
-					question_set: { version: "v8", sha256: "a".repeat(64) },
-				},
-			},
-		);
-	}
-	expect(resumeCatchUp(store).tickets[0].managementRequests).toHaveLength(2);
-	store.decide("decision", "accept", { actor: "operator", reason: "reviewed", ref: "fixture:review" });
-	expect(store.wakes().filter((w) => w.resolvedAt === null)).toEqual([]);
-	expect(resumeCatchUp(store).tickets[0].managementRequests).toEqual([]);
-});
-
-it("excludes resolved wakes and terminal actions independently from pending resume requests", () => {
-	const f = fixture(["decision"]);
-	finish(f.store, "decision");
-	const wake = f.store.wakes()[0];
-	f.store.claimManagement({
-		id: "pending",
-		wakeId: wake.id,
-		actionId: "decision",
-		attemptId: wake.attemptId!,
-		planRevision: 1,
-		evidenceSha256: "proof",
-	});
-	const db = new DatabaseSync(join(f.directory, "factory.db"));
-	try {
-		expect(f.store.pendingResumeRequests()).toHaveLength(1);
-		db.prepare("UPDATE wakes SET resolved_at=? WHERE id=?").run(new Date().toISOString(), wake.id);
-		expect(f.store.pendingResumeRequests()).toEqual([]);
-		db.prepare("UPDATE wakes SET resolved_at=NULL WHERE id=?").run(wake.id);
-		for (const state of ["ACCEPTED", "REJECTED", "WITHDRAWN"]) {
-			db.prepare("UPDATE actions SET state=? WHERE id='decision'").run(state);
-			expect(f.store.pendingResumeRequests()).toEqual([]);
-		}
-	} finally {
-		db.close();
-	}
 });
 
 it("deduplicates idle wakes across repeated resumes and uses timestamp-only receipt filenames", async () => {
@@ -388,34 +250,17 @@ it("deduplicates idle wakes across repeated resumes and uses timestamp-only rece
 		actions: [{ ...f.store.actions()[0], requirements: { host: "absent" } }],
 	});
 	vi.spyOn(Date, "now").mockReturnValue(Date.now());
-	for (let i = 0; i < 3; i++) await expect(resumeFactory(f.engine)).rejects.toThrow("idle_with_backlog");
+	for (let i = 0; i < 3; i++) await expect(resumeFactory(f.engine, f.directory)).rejects.toThrow("idle_with_backlog");
 	expect(f.store.wakes().filter((w) => w.resolvedAt === null)).toHaveLength(1);
-	expect(f.store.eventsOfKind("idle_with_backlog")).toHaveLength(3);
-	expect(f.store.eventsOfKind("resumed")).toHaveLength(3);
+	expect(ofKind(f.store, "idle_with_backlog")).toHaveLength(3);
+	expect(ofKind(f.store, "resumed")).toHaveLength(3);
 	const receipts = readdirSync(f.directory).filter((n) => n.startsWith("resume-"));
 	expect(receipts).toHaveLength(3);
 	for (const filename of receipts)
 		expect(filename).toMatch(/^resume-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z\.json$/);
 });
 
-it.each(["catch-up", "resume"])("PR #7: %s reservation exhaustion fails before unpausing", async (prefix) => {
-	const f = fixture(["ready"]);
-	f.engine.pause("restart");
-	const started = Date.now();
-	vi.spyOn(Date, "now").mockReturnValue(started);
-	let last = "";
-	for (let offset = 0; offset < 1000; offset++) {
-		last = join(f.directory, `${prefix}-${new Date(started + offset).toISOString().replaceAll(":", "-")}.json`);
-		writeFileSync(last, "retained");
-	}
-	await expect(resumeFactory(f.engine)).rejects.toThrow(`Receipt filename exhausted after 1000 attempts: ${last}`);
-	expect(readFileSync(last, "utf8")).toBe("retained");
-	expect(f.store.eventsOfKind("resumed")).toEqual([]);
-	expect(f.store.isPaused()).toBe(true);
-	expect(f.store.attempts()).toEqual([]);
-});
-
-it("PR #7: final report failure reports the committed unpause and scheduling", async () => {
+it("final report failure reports the committed unpause and scheduling", async () => {
 	const f = fixture(["ready"]);
 	f.engine.pause("restart");
 	f.launch.mockImplementation(async (context) => {
@@ -425,10 +270,10 @@ it("PR #7: final report failure reports the committed unpause and scheduling", a
 		mkdirSync(path);
 		return { kind: "running", processIdentity: context.attempt.id };
 	});
-	await expect(resumeFactory(f.engine)).rejects.toThrow(
+	await expect(resumeFactory(f.engine, f.directory)).rejects.toThrow(
 		"Factory is unpaused and scheduled; only the report file failed:",
 	);
 	expect(f.store.isPaused()).toBe(false);
 	expect(f.store.actions()[0].state).toBe("RUNNING");
-	expect(f.store.eventsOfKind("resumed")).toHaveLength(1);
+	expect(ofKind(f.store, "resumed")).toHaveLength(1);
 });

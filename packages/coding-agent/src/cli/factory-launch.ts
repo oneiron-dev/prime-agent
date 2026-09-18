@@ -17,13 +17,12 @@ export function supportsFactoryRuntime(versions: { node?: string; bun?: string }
 	return major > 22 || (major === 22 && minor >= 13);
 }
 
-export function factoryEntrypoint(moduleUrl = import.meta.url, management = false): string {
+export function factoryEntrypoint(moduleUrl = import.meta.url): string {
 	const base = dirname(fileURLToPath(moduleUrl));
-	const name = management ? "manage-entry" : "cli-entry";
 	const candidates = [
-		join(base, management ? "factory-manage.js" : "factory-cli.js"),
-		join(base, "..", "factory", `${name}.js`),
-		join(base, "..", "factory", `${name}.ts`),
+		join(base, "factory-cli.js"),
+		join(base, "..", "factory", "cli-entry.js"),
+		join(base, "..", "factory", "cli-entry.ts"),
 	];
 	const entry = candidates.find((candidate) => existsSync(candidate));
 	if (!entry) throw new Error("Factory entrypoint is unavailable. Use the Node distribution of Prime Agent.");
@@ -48,11 +47,7 @@ export async function maybeRunFactory(args: readonly string[]): Promise<boolean>
 		await new Promise<void>((resolve, reject) => {
 			const child = spawn(
 				process.execPath,
-				[
-					...process.execArgv,
-					factoryEntrypoint(import.meta.url, factoryArgs[0] === "manage"),
-					...(factoryArgs[0] === "manage" ? factoryArgs.slice(1) : factoryArgs),
-				],
+				[...process.execArgv, factoryEntrypoint(import.meta.url), ...factoryArgs],
 				{
 					stdio: ["inherit", "inherit", "inherit", "ipc"],
 					env: { ...process.env, PRIME_FACTORY_PARENT: "1" },

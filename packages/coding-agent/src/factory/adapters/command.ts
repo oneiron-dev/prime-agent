@@ -1,14 +1,8 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
-import {
-	type FactoryFilePin,
-	FactoryRuntimeMismatch,
-	factoryRuntimeProcess,
-	verifyFactoryRuntimeAdmission,
-} from "../runtime.js";
 import type { ActionRecord, AttemptContext, CompletionReceipt, Inspection } from "../types.js";
-import { COMMAND_RUNNER_SHA256, COMMAND_RUNNER_SOURCE } from "./command-runner-source.js";
+import { COMMAND_RUNNER_SOURCE } from "./command-runner-source.js";
 
 export interface CommandHost {
 	type: "local" | "ssh";
@@ -28,10 +22,6 @@ export interface HostRequest {
 		attemptId: string;
 		sourceFingerprint: string;
 		command: ActionRecord["command"];
-		runtime?: FactoryFilePin;
-		daemonStartedAt?: number;
-		daemonSharesHost?: boolean;
-		runnerSha256?: string;
 	};
 }
 
@@ -100,7 +90,6 @@ function transportCommand(host: CommandHost, request: HostRequest, timeoutMs: nu
 		child.on("error", (error) => finish(error));
 		child.stdin.on("error", (error) => finish(error));
 		child.on("close", (code) => {
-			if (code === 78) return finish(new FactoryRuntimeMismatch(errorOutput.trim()));
 			if (code !== 0) return finish(new Error(`Host transport exited ${code}: ${errorOutput.trim()}`));
 			try {
 				finish(undefined, JSON.parse(output));
@@ -139,12 +128,6 @@ export class CommandAdapter {
 		const host = this.hosts[context.slot.host];
 		if (!host) return { kind: "uncertain", reason: `Unconfigured host ${context.slot.host}` };
 		try {
-			const live = factoryRuntimeProcess();
-			const expectedRuntime = context.action.requirements.runtime ?? context.runtime;
-			if (operation === "launch") {
-				if (!expectedRuntime) throw new FactoryRuntimeMismatch("runtime_identity: Missing ledger runtime pin");
-				verifyFactoryRuntimeAdmission(expectedRuntime, live);
-			}
 			const request: HostRequest = {
 				operation,
 				runnerRoot: host.runnerRoot,
@@ -153,10 +136,6 @@ export class CommandAdapter {
 					attemptId: context.attempt.id,
 					sourceFingerprint: context.action.sourceFingerprint,
 					command: context.action.command,
-					runtime: expectedRuntime,
-					daemonStartedAt: live.startedAt,
-					daemonSharesHost: host.type === "local",
-					runnerSha256: COMMAND_RUNNER_SHA256,
 				},
 			};
 			const value = await (this.options.transport ?? commandTransport)(host, request);
@@ -179,18 +158,10 @@ export class CommandAdapter {
 				return { kind: "terminal", receipt };
 			}
 			if (result.kind === "uncertain" && typeof result.reason === "string")
-				return {
-					kind: "uncertain",
-					reason: result.reason,
-					...(result.runtimeMismatch === true ? { runtimeMismatch: true } : {}),
-				};
+				return { kind: "uncertain", reason: result.reason };
 			throw new Error("Malformed host result");
 		} catch (error) {
-			return {
-				kind: "uncertain",
-				reason: error instanceof Error ? error.message : String(error),
-				...(error instanceof FactoryRuntimeMismatch ? { runtimeMismatch: true } : {}),
-			};
+			return { kind: "uncertain", reason: error instanceof Error ? error.message : String(error) };
 		}
 	}
 }

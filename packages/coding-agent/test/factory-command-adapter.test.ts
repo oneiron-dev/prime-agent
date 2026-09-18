@@ -11,20 +11,15 @@ import {
 	fingerprintCommand,
 	hostLaunchSpec,
 } from "../src/factory/adapters/command.js";
-import { COMMAND_RUNNER_SHA256 } from "../src/factory/adapters/command-runner-source.js";
-import { admitRuntimeFixture, createRuntimeFixture } from "./factory-runtime-fixture.js";
 
 const roots: string[] = [];
 function setup(): { root: string; host: CommandHost; context: CommandContext } {
 	const root = mkdtempSync(join(tmpdir(), "prime-factory-runner-"));
 	roots.push(root);
-	const runtime = createRuntimeFixture(root);
-	admitRuntimeFixture(runtime);
 	return {
 		root,
 		host: { type: "local", runnerRoot: join(root, "attempts") },
 		context: {
-			runtime,
 			attempt: {
 				id: "attempt-one",
 				actionId: "a",
@@ -40,11 +35,10 @@ function setup(): { root: string; host: CommandHost; context: CommandContext } {
 			action: {
 				id: "a",
 				ticketId: "t",
-				kind: "process",
 				dependencies: [],
 				sourceFingerprint: "opaque:test",
 				command: { argv: [process.execPath, "-e", "process.stdout.write('done')"], cwd: root },
-				requirements: { runtime },
+				requirements: {},
 				state: "RUNNING",
 			},
 			slot: { id: "local", host: "local" },
@@ -86,9 +80,6 @@ describe("durable factory command adapter", () => {
 				attemptId: context.attempt.id,
 				sourceFingerprint: context.action.sourceFingerprint,
 				command: context.action.command,
-				runtime: context.runtime,
-				daemonStartedAt: Date.now(),
-				runnerSha256: `${COMMAND_RUNNER_SHA256.slice(0, -1)}x`,
 			},
 		});
 		expect(changedController).toEqual({ kind: "terminal", receipt });

@@ -36,7 +36,6 @@ const result = await build({
 	entryPoints: {
 		cli: join(packageDir, "dist", "cli.js"),
 		"factory-cli": join(packageDir, "dist", "factory", "cli-entry.js"),
-		"factory-manage": join(packageDir, "dist", "factory", "manage-entry.js"),
 		// Keep the Node-only lazy Bedrock entry discoverable to esbuild.
 		"amazon-bedrock": join(packageDir, "dist", "node", "amazon-bedrock.js"),
 	},

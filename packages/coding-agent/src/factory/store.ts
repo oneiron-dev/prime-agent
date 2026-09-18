@@ -1,42 +1,26 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, statSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
-import {
-	codeDecisionBase,
-	type DecisionReceipt,
-	decisionProfilesMatch,
-	type FactoryDecision,
-	operatorDecisionBase,
-	recordDecision,
-} from "./decisions.js";
-import { CAPSULE_FAILURE_MAX_LENGTH, FACTORY_EVIDENCE_LIMITS, validateArtifactPin } from "./evidence.js";
-import type { ManagementClaim, ManagementReconciliation, ManagementRequest, ManagementResult } from "./management.js";
-import { type FactoryFilePin, factoryRuntimeMismatchCheck } from "./runtime.js";
+import type { FactoryFilePin } from "./runtime.js";
 import type {
 	ActionRecord,
 	ActionSpec,
-	ActionWithdrawal,
 	AttemptContext,
 	AttemptRecord,
 	CompletionReceipt,
 	DecisionEvidence,
-	FactoryCapsuleReceipt,
-	FactoryCapsuleRecord,
 	FactoryEvent,
 	FactoryPlan,
 	FactoryStatus,
-	NonRetrySettlement,
 	PlanMutationReceipt,
 	SlotSpec,
 	TicketRecord,
 	WakeRecord,
 } from "./types.js";
-import { readFactoryUsage } from "./usage.js";
 
 type Row = Record<string, unknown>;
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const now = (): string => new Date().toISOString();
 function decode<T>(value: unknown): T {
 	return JSON.parse(String(value)) as T;
@@ -49,128 +33,13 @@ function evidenceValid(evidence: DecisionEvidence): void {
 	required(evidence.reason, "evidence.reason");
 	required(evidence.ref, "evidence.ref");
 }
-function settlementProof(proof: { ref: string; sha256: string }): string {
-	if (!proof || typeof proof.ref !== "string" || !isAbsolute(proof.ref) || !/^[a-f0-9]{64}$/.test(proof.sha256))
-		throw new Error("Settlement proof requires an absolute artifact path and SHA-256");
-	const stat = statSync(proof.ref);
-	if (!stat.isFile() || stat.size > 1000000)
-		throw new Error("Settlement artifacts must be regular files of at most 1000000 bytes");
-	const bytes = readFileSync(proof.ref);
-	if (bytes.length > 1000000 || createHash("sha256").update(bytes).digest("hex") !== proof.sha256)
-		throw new Error(`Settlement artifact hash mismatch: ${proof.ref}`);
-	return bytes.toString("utf8");
-}
-function validateCapsuleAccounting(cost: FactoryCapsuleRecord["accounting"]): void {
-	if (
-		!cost ||
-		!Number.isSafeInteger(cost.calls) ||
-		cost.calls < 0 ||
-		typeof cost.priced !== "boolean" ||
-		(cost.cost_usd !== null && (!Number.isFinite(cost.cost_usd) || cost.cost_usd < 0)) ||
-		(cost.priced && cost.cost_usd === null) ||
-		(cost.usage !== null && !readFactoryUsage(cost.usage))
-	)
-		throw new Error("Invalid capsule accounting");
-}
-function readCapsuleArtifact(pin: FactoryFilePin, label: string, limit: number, expectedBytes?: number): Buffer {
-	let fd: number;
-	try {
-		fd = openSync(pin.path, constants.O_RDONLY | constants.O_NONBLOCK);
-	} catch (cause) {
-		throw new Error(`${label} unreadable`, { cause });
-	}
-	let bytes: Buffer;
-	try {
-		const info = fstatSync(fd);
-		if (!info.isFile() || info.size > limit)
-			throw new Error(`${label} must be a regular file of at most ${limit} bytes`);
-		const buffer = Buffer.alloc(limit + 1);
-		let length = 0;
-		while (length < buffer.length) {
-			const count = readSync(fd, buffer, length, buffer.length - length, null);
-			if (count === 0) break;
-			length += count;
-		}
-		if (length > limit) throw new Error(`${label} exceeds ${limit} bytes`);
-		if (expectedBytes !== undefined && length !== expectedBytes) throw new Error(`${label} byte count mismatch`);
-		bytes = buffer.subarray(0, length);
-	} finally {
-		closeSync(fd);
-	}
-	if (createHash("sha256").update(bytes).digest("hex") !== pin.sha256) throw new Error(`${label} pin hash mismatch`);
-	return bytes;
-}
-function validateCapsuleReceipt(receipt: FactoryCapsuleReceipt): void {
-	validateArtifactPin(receipt.pin, "capsule.pin");
-	validateArtifactPin(receipt.packet, "capsule.packet");
-	required(receipt.head, "capsule.head");
-	required(receipt.capsule_seat, "capsule.capsule_seat");
-	const limit = FACTORY_EVIDENCE_LIMITS.capsuleBytes;
-	if (!Number.isSafeInteger(receipt.bytes) || receipt.bytes < 1 || receipt.bytes > limit)
-		throw new Error(`Capsule bytes must be within 1..${limit}`);
-	if (!Number.isFinite(receipt.wall_clock_ms) || receipt.wall_clock_ms < 0)
-		throw new Error("Invalid capsule wall_clock_ms");
-	const bytes = readCapsuleArtifact(receipt.pin, "Capsule", limit, receipt.bytes);
-	readCapsuleArtifact(receipt.packet, "Capsule packet", FACTORY_EVIDENCE_LIMITS.packetBytes);
-	const capsule: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-	if (
-		!capsule ||
-		typeof capsule !== "object" ||
-		!("version" in capsule) ||
-		capsule.version !== 1 ||
-		!("head" in capsule) ||
-		capsule.head !== receipt.head ||
-		!("packet" in capsule) ||
-		!isDeepStrictEqual(capsule.packet, receipt.packet) ||
-		!("capsule_seat" in capsule) ||
-		capsule.capsule_seat !== receipt.capsule_seat
-	)
-		throw new Error("Capsule JSON metadata does not match receipt");
-}
-/** Checks operator-supplied evidence, not remote process liveness. Missing PID or timeout alone is not proof. */
-function verifySettlement(settlement: NonRetrySettlement): void {
-	if (!settlement || settlement.version !== 1) throw new Error("Invalid no-retry settlement");
-	for (const key of [
-		"actionId",
-		"attemptId",
-		"ticketOwner",
-		"slotId",
-		"host",
-		"cwd",
-		"sourceFingerprint",
-		"processIdentity",
-		"uncertainty",
-	] as const)
-		required(settlement[key], `settlement.${key}`);
-	const { custody, artifacts, ...binding } = settlement;
-	if (
-		!custody ||
-		custody.supervisorStopped !== true ||
-		custody.processGroupStopped !== true ||
-		custody.cannotExecute !== true ||
-		typeof custody.observedAt !== "string" ||
-		!Number.isFinite(Date.parse(custody.observedAt))
-	)
-		throw new Error("Settlement requires proven stopped execution custody; UNKNOWN is not safe");
-	const receipt = decode<Record<string, unknown>>(settlementProof(custody));
-	const { ref: _ref, sha256: _sha256, ...facts } = custody;
-	if (!isDeepStrictEqual(receipt, { ...binding, ...facts }))
-		throw new Error("Settlement custody receipt does not match the exact attempt and ownership");
-	if (!Array.isArray(artifacts) || artifacts.length < 1 || artifacts.length > 8)
-		throw new Error("Preserve one to eight settlement evidence artifacts");
-	if (new Set(artifacts.map((artifact) => artifact.ref)).size !== artifacts.length)
-		throw new Error("Settlement artifact refs must be unique");
-	for (const artifact of artifacts) settlementProof(artifact);
-}
 function actionSpec(action: ActionSpec): ActionSpec {
 	return {
 		id: action.id,
 		description: action.description,
-		acceptanceCriteria: action.acceptanceCriteria ? [...action.acceptanceCriteria] : undefined,
 		ticketId: action.ticketId,
 		dependencies: [...action.dependencies],
 		sourceFingerprint: action.sourceFingerprint,
-		kind: action.kind,
 		command: {
 			...action.command,
 			argv: [...action.command.argv],
@@ -210,18 +79,8 @@ function validatePlan(plan: FactoryPlan): void {
 			(typeof action.description !== "string" || !action.description.trim() || action.description.length > 16000)
 		)
 			throw new Error("Invalid action description");
-		if (
-			action.acceptanceCriteria !== undefined &&
-			(!Array.isArray(action.acceptanceCriteria) ||
-				action.acceptanceCriteria.length > 64 ||
-				action.acceptanceCriteria.some(
-					(criterion) => typeof criterion !== "string" || !criterion.trim() || criterion.length > 4000,
-				))
-		)
-			throw new Error("Invalid acceptance criteria");
 		required(action.ticketId, "action.ticketId");
 		required(action.sourceFingerprint, "action.sourceFingerprint");
-		if (action.kind !== "process" && action.kind !== "decision") throw new Error("Invalid action kind");
 		if (!Array.isArray(action.dependencies) || action.dependencies.some((d) => typeof d !== "string"))
 			throw new Error("Invalid action dependencies");
 		if (new Set(action.dependencies).size !== action.dependencies.length)
@@ -265,11 +124,8 @@ function validatePlan(plan: FactoryPlan): void {
 /** A short-transaction journal. No process, session, model or transport is owned here. */
 export class FactoryStore {
 	private readonly db: DatabaseSync;
-	readonly directory: string;
 	private inTransaction = false;
-	private commitEffects: Array<() => void> = [];
 	constructor(path: string) {
-		this.directory = dirname(path);
 		this.db = new DatabaseSync(path);
 		this.db.exec(
 			"PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
@@ -278,7 +134,7 @@ export class FactoryStore {
 			this.transaction(() => {
 				this.db.exec("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
 				const version = this.meta("schema_version");
-				if (version !== undefined && ![1, SCHEMA_VERSION].includes(Number(version)))
+				if (version !== undefined && ![1, 2, SCHEMA_VERSION].includes(Number(version)))
 					throw new Error(`Unsupported factory schema version ${version}`);
 				this.db.exec(`
 					CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, owner TEXT NOT NULL, state TEXT NOT NULL);
@@ -293,20 +149,8 @@ export class FactoryStore {
 					CREATE TABLE IF NOT EXISTS wakes (id INTEGER PRIMARY KEY AUTOINCREMENT, action_id TEXT NOT NULL, attempt_id TEXT, reason TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT);
 					CREATE UNIQUE INDEX IF NOT EXISTS wakes_attempt_open ON wakes(attempt_id) WHERE resolved_at IS NULL;
 					CREATE INDEX IF NOT EXISTS wakes_open_reason ON wakes(reason) WHERE resolved_at IS NULL;
-					CREATE TABLE IF NOT EXISTS management_requests (id TEXT PRIMARY KEY, wake_id INTEGER REFERENCES wakes(id), action_id TEXT NOT NULL, attempt_id TEXT NOT NULL, plan_revision INTEGER NOT NULL, evidence_sha256 TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL, result TEXT, error TEXT, UNIQUE(wake_id,plan_revision,attempt_id,evidence_sha256));
-					CREATE UNIQUE INDEX IF NOT EXISTS management_wake_inflight ON management_requests(wake_id) WHERE state='CLAIMED';
 					CREATE TABLE IF NOT EXISTS plan_mutations (id TEXT PRIMARY KEY, payload_sha256 TEXT NOT NULL, previous_revision INTEGER NOT NULL, revision INTEGER NOT NULL);
 				`);
-				if (version === "1") {
-					this.db.exec(`
-						ALTER TABLE management_requests RENAME TO management_requests_v1;
-						DROP INDEX management_wake_inflight;
-						CREATE TABLE management_requests (id TEXT PRIMARY KEY, wake_id INTEGER REFERENCES wakes(id), action_id TEXT NOT NULL, attempt_id TEXT NOT NULL, plan_revision INTEGER NOT NULL, evidence_sha256 TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL, result TEXT, error TEXT, UNIQUE(wake_id,plan_revision,attempt_id,evidence_sha256));
-						INSERT INTO management_requests SELECT * FROM management_requests_v1;
-						DROP TABLE management_requests_v1;
-						CREATE UNIQUE INDEX management_wake_inflight ON management_requests(wake_id) WHERE state='CLAIMED';
-					`);
-				}
 				this.setMeta("schema_version", String(SCHEMA_VERSION));
 				if (this.meta("plan_revision") === undefined) this.setMeta("plan_revision", "0");
 				if (this.meta("paused") === undefined) this.setMeta("paused", "false");
@@ -323,29 +167,16 @@ export class FactoryStore {
 		if (this.inTransaction) return fn();
 		this.db.exec("BEGIN IMMEDIATE");
 		this.inTransaction = true;
-		let value: T;
 		try {
-			value = fn();
+			const value = fn();
 			this.db.exec("COMMIT");
+			return value;
 		} catch (error) {
-			this.commitEffects = [];
 			this.db.exec("ROLLBACK");
 			throw error;
 		} finally {
 			this.inTransaction = false;
 		}
-		const effects = this.commitEffects.splice(0);
-		for (const effect of effects) effect();
-		return value;
-	}
-	afterDecisionCommit(effect: () => void): void {
-		if (!this.inTransaction) throw new Error("Decision receipt requires a journal transaction");
-		this.commitEffects.push(effect);
-	}
-	recordDecisionPublicationFailure(actionId: string, requestId: string, path: string, error: string): void {
-		this.transaction(() => {
-			this.event("decision_receipt_unpublished", actionId, null, { request_id: requestId, path, error });
-		});
 	}
 	private meta(key: string): string | undefined {
 		const row = this.db.prepare("SELECT value FROM metadata WHERE key=?").get(key);
@@ -366,144 +197,16 @@ export class FactoryStore {
 			.prepare("INSERT INTO events(at,kind,action_id,attempt_id,detail) VALUES(?,?,?,?,?)")
 			.run(now(), kind, actionId, attemptId, JSON.stringify(detail));
 	}
-	recordCapsule(actionId: string, attemptId: string | null, receipt: FactoryCapsuleRecord): void {
-		this.transaction(() => {
-			if (!this.action(actionId)) throw new Error(`Unknown action ${actionId}`);
-			if (attemptId !== null) {
-				const { attempt, action } = this.context(attemptId);
-				const latest = this.db
-					.prepare("SELECT id FROM attempts WHERE action_id=? ORDER BY rowid DESC LIMIT 1")
-					.get(actionId);
-				if (
-					action.id !== actionId ||
-					latest?.id !== attemptId ||
-					attempt.claimReleased ||
-					!["SUBMITTED", "RUNNING"].includes(attempt.state)
-				)
-					throw new Error("Capsule requires the current live claimed attempt for this action");
-				if (this.db.prepare("SELECT 1 FROM events WHERE kind='capsule_built' AND attempt_id=?").get(attemptId))
-					throw new Error("Capsule already bound to attempt");
-			}
-			validateCapsuleAccounting(receipt.accounting);
-			if ("failure" in receipt) {
-				if (
-					receipt.capsule_seat !== "none" ||
-					receipt.bytes !== 0 ||
-					typeof receipt.failure !== "string" ||
-					!receipt.failure.trim() ||
-					receipt.failure.length > CAPSULE_FAILURE_MAX_LENGTH ||
-					/[\u0000-\u001f\u007f]/u.test(receipt.failure) ||
-					!Number.isFinite(receipt.wall_clock_ms) ||
-					receipt.wall_clock_ms < 0
-				)
-					throw new Error("Invalid capsule failure");
-				this.event("capsule_built", actionId, attemptId, { ...receipt });
-			} else {
-				validateCapsuleReceipt(receipt);
-				this.event("capsule_built", actionId, attemptId, { ...receipt, capsule_sha256: receipt.pin.sha256 });
-			}
-		});
+	/** Journal a launcher observation outside the scheduling transitions, e.g. a split follow-up import. */
+	note(kind: string, actionId: string | null, detail: Record<string, unknown> = {}): void {
+		this.transaction(() => this.event(kind, actionId, null, detail));
 	}
-	ledgerSequence(actionId?: string): number {
-		const row =
-			actionId === undefined
-				? this.db.prepare("SELECT MAX(sequence) AS sequence FROM events").get()
-				: this.db.prepare("SELECT MAX(sequence) AS sequence FROM events WHERE action_id=?").get(actionId);
+	ledgerSequence(): number {
+		const row = this.db.prepare("SELECT MAX(sequence) AS sequence FROM events").get();
 		return Number(row?.sequence ?? 0);
 	}
-	commitTypedDecision(
-		actionId: string,
-		decision: FactoryDecision,
-		requestId: string,
-		staleCheck: boolean,
-		write: () => DecisionReceipt,
-		submittedBy: FactoryDecision["decided_by"],
-	): DecisionReceipt {
-		return this.transaction(() => {
-			if (!this.action(actionId)) throw new Error(`Unknown action ${actionId}`);
-			const last = this.ledgerSequence(actionId),
-				current = this.ledgerSequence();
-			if (staleCheck && (decision.ledger_sequence < last || decision.ledger_sequence > current))
-				throw new Error(
-					`Decision ledger_sequence ${decision.ledger_sequence}; action last event ${last}; ledger sequence ${current}`,
-				);
-			const existing = this.db.prepare("SELECT action_id,state FROM management_requests WHERE id=?").get(requestId);
-			if (existing && (existing.action_id !== actionId || existing.state !== "CLAIMED"))
-				throw new Error("Decision request binding changed");
-			const receipt = write();
-			const attemptId =
-				"attempt_id" in decision
-					? decision.attempt_id
-					: (this.attempts()
-							.filter((a) => a.actionId === actionId)
-							.at(-1)?.id ?? null);
-			if (existing)
-				this.db
-					.prepare("UPDATE management_requests SET result=? WHERE id=?")
-					.run(JSON.stringify(receipt), requestId);
-			else
-				this.db
-					.prepare(
-						"INSERT INTO management_requests(id,wake_id,action_id,attempt_id,plan_revision,evidence_sha256,created_at,state,result) VALUES(?,NULL,?,?,?,?,?,'RECORDED',?)",
-					)
-					.run(
-						requestId,
-						actionId,
-						attemptId ?? "",
-						Number(this.meta("plan_revision")),
-						createHash("sha256").update(JSON.stringify(decision)).digest("hex"),
-						now(),
-						JSON.stringify(receipt),
-					);
-			if (receipt.source_request_id) {
-				const source = this.db
-					.prepare("SELECT action_id,state,result FROM management_requests WHERE id=?")
-					.get(receipt.source_request_id);
-				if (source?.action_id !== actionId || source.state !== "APPLIED")
-					throw new Error("Typed application source request changed");
-				const result = decode<ManagementResult>(source.result);
-				this.db
-					.prepare("UPDATE management_requests SET result=? WHERE id=?")
-					.run(JSON.stringify({ ...result, typedDecision: receipt }), receipt.source_request_id);
-			}
-			if (!decisionProfilesMatch(decision)) {
-				this.event("profile_drift", actionId, attemptId, {
-					request_id: requestId,
-					requested_profile: decision.requested_profile,
-					served_profile: decision.served_profile,
-				});
-				this.db
-					.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
-					.run(actionId, `profile_drift: ${requestId}`, now());
-			}
-			if (receipt.outcome === "DEFERRED") {
-				this.db
-					.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
-					.run(actionId, `typed_decision_deferred: ${requestId}: ${decision.reason}`, now());
-			}
-			if (existing && receipt.question_set) {
-				const state =
-					receipt.outcome === "DEFERRED" ? "DEFERRED" : !decisionProfilesMatch(decision) ? "DRIFT" : "PROPOSED";
-				this.db.prepare("UPDATE management_requests SET state=? WHERE id=?").run(state, requestId);
-				this.event("management_finished", actionId, attemptId, { id: requestId, state, error: null });
-			}
-			this.event("decision", actionId, attemptId, {
-				...decision,
-				submitted_by: submittedBy,
-				...(receipt.question_set ? { outcome: receipt.outcome, question_set: receipt.question_set } : {}),
-				request_id: requestId,
-				...(receipt.source_request_id ? { source_request_id: receipt.source_request_id } : {}),
-				applied: receipt.applied,
-				...(receipt.predicate ? { predicate: receipt.predicate } : {}),
-			});
-			return receipt;
-		});
-	}
-	typedDecisions(): DecisionReceipt[] {
-		return this.db
-			.prepare("SELECT result FROM management_requests WHERE wake_id IS NULL ORDER BY rowid")
-			.all()
-			.map((row) => decode<DecisionReceipt>(row.result));
+	planRevision(): number {
+		return Number(this.meta("plan_revision"));
 	}
 	isPaused(): boolean {
 		return this.meta("paused") === "true";
@@ -533,6 +236,7 @@ export class FactoryStore {
 			.get();
 		return row ? Number(decode<Record<string, unknown>>(row.detail).catch_up_through ?? row.sequence) : 0;
 	}
+	/** The installed runtime changed since init. Recorded, never refused. */
 	repinRuntime(runtime: FactoryFilePin, reason: string): void {
 		required(reason, "runtime change reason");
 		this.transaction(() => {
@@ -540,17 +244,6 @@ export class FactoryStore {
 			this.setMeta("runtime_pin", JSON.stringify(runtime));
 			this.event("runtime_changed", null, null, { previous, runtime, reason });
 		});
-	}
-	pendingResumeRequests(): { id: string; actionId: string; state: string }[] {
-		return this.db
-			.prepare(`SELECT r.id,r.action_id,r.state FROM management_requests r
-			JOIN actions a ON a.id=r.action_id LEFT JOIN wakes w ON w.id=r.wake_id
-			WHERE r.state IN ('CLAIMED','PROPOSED','DRIFT','DEFERRED')
-			AND a.state NOT IN ('ACCEPTED','REJECTED','WITHDRAWN')
-			AND w.resolved_at IS NULL
-			AND COALESCE(json_extract(r.result,'$.applied'),0)=0 ORDER BY r.rowid`)
-			.all()
-			.map((row) => ({ id: String(row.id), actionId: String(row.action_id), state: String(row.state) }));
 	}
 	recordResumed(detail: Record<string, unknown>, idleActionId?: string): void {
 		this.transaction(() => {
@@ -592,10 +285,9 @@ export class FactoryStore {
 			const revision = Number(this.meta("plan_revision"));
 			if (expectedRevision !== undefined && revision !== expectedRevision)
 				throw new Error("Factory plan revision changed");
-			const runtime = initialRuntime;
-			if (revision === 0 && runtime) {
-				this.setMeta("runtime_pin", JSON.stringify(runtime));
-				this.event("runtime_pinned", null, null, { runtime });
+			if (revision === 0 && initialRuntime) {
+				this.setMeta("runtime_pin", JSON.stringify(initialRuntime));
+				this.event("runtime_pinned", null, null, { runtime: initialRuntime });
 			}
 			const existing = this.actions();
 			const unchanged =
@@ -619,7 +311,6 @@ export class FactoryStore {
 				recordMutation(revision);
 				return revision;
 			}
-			this.requireManagementDrained();
 			const invalidatedWakeIds = this.wakes()
 				.filter((wake) => wake.resolvedAt === null)
 				.map((wake) => wake.id);
@@ -751,9 +442,6 @@ export class FactoryStore {
 			.map((r) => decode<SlotSpec>(r.spec));
 	}
 	private attemptRecord(r: Row): AttemptRecord {
-		const capsule = this.db
-			.prepare("SELECT detail FROM events WHERE kind='capsule_built' AND attempt_id=? AND action_id=?")
-			.get(String(r.id), String(r.action_id));
 		return {
 			id: String(r.id),
 			actionId: String(r.action_id),
@@ -765,9 +453,6 @@ export class FactoryStore {
 			receipt: r.receipt === null ? null : decode<CompletionReceipt>(r.receipt),
 			uncertainty: r.uncertainty === null ? null : String(r.uncertainty),
 			claimReleased: Number(r.claim_released) === 1,
-			...(capsule
-				? { capsule_sha256: decode<{ capsule_sha256?: string }>(capsule.detail).capsule_sha256 ?? null }
-				: {}),
 		};
 	}
 	attempts(activeOnly = false): AttemptRecord[] {
@@ -791,7 +476,7 @@ export class FactoryStore {
 		const action = this.action(attempt.actionId);
 		const slot = this.slot(attempt.slotId);
 		if (!action || !slot) throw new Error("Corrupt factory attempt references");
-		return { attempt, action, slot, runtime: this.runtimePin() };
+		return { attempt, action, slot };
 	}
 	/** Atomically claims action, slot and declared host/cwd. Paths are lexical identities, not symlink resolution. */
 	claim(actionId: string, slotId: string): AttemptContext | undefined {
@@ -821,32 +506,6 @@ export class FactoryStore {
 					.get(slot.host, action.command.cwd)
 			)
 				return undefined;
-			recordDecision(
-				this,
-				actionId,
-				{
-					...codeDecisionBase(
-						this.ledgerSequence(),
-						"Slot matches host, slot, capabilities and exclusive workspace custody",
-					),
-					type: "build_host",
-					portable: !action.requirements.host,
-					platform_specific_proof: action.requirements.host ?? null,
-					candidate_fingerprint: action.sourceFingerprint,
-					forbidden_replay_of: null,
-					hosts: [
-						{
-							host: slot.host,
-							slot: slot.id,
-							free: true,
-							staged_workspace: null,
-							warm_cache: null,
-							receipt_age_s: null,
-						},
-					],
-				},
-				{ applied: true },
-			);
 			const id = randomUUID();
 			this.db
 				.prepare("INSERT INTO attempts(id,action_id,slot_id,state,created_at) VALUES(?,?,?,'PREPARED',?)")
@@ -903,7 +562,7 @@ export class FactoryStore {
 			this.event("attempt_running", action.id, attemptId, { processIdentity });
 		});
 	}
-	private uncertainInternal(attemptId: string, reason: string, runtimeMismatch = false): void {
+	private uncertainInternal(attemptId: string, reason: string): void {
 		const { attempt, action } = this.context(attemptId);
 		if (attempt.claimReleased || attempt.state === "PREPARED") return;
 		if (attempt.state === "UNCERTAIN" && attempt.uncertainty === reason) return;
@@ -912,19 +571,11 @@ export class FactoryStore {
 		this.db
 			.prepare("INSERT OR IGNORE INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,?,?,?)")
 			.run(action.id, attemptId, reason, now());
-		this.event(runtimeMismatch ? "runtime_mismatch" : "attempt_uncertain", action.id, attemptId, {
-			reason,
-			...(runtimeMismatch
-				? {
-						runtime: action.requirements.runtime ?? this.runtimePin(),
-						runtime_check: factoryRuntimeMismatchCheck(reason),
-					}
-				: {}),
-		});
+		this.event("attempt_uncertain", action.id, attemptId, { reason });
 	}
-	markUncertain(attemptId: string, reason: string, runtimeMismatch = false): void {
+	markUncertain(attemptId: string, reason: string): void {
 		required(reason, "uncertainty reason");
-		this.transaction(() => this.uncertainInternal(attemptId, reason, runtimeMismatch));
+		this.transaction(() => this.uncertainInternal(attemptId, reason));
 	}
 	private resolveWakes(attemptId: string): void {
 		this.db
@@ -967,50 +618,7 @@ export class FactoryStore {
 			this.db
 				.prepare("UPDATE attempts SET state='TERMINAL',receipt=?,claim_released=1,uncertainty=NULL WHERE id=?")
 				.run(JSON.stringify(receipt), attempt.id);
-			let state: ActionRecord["state"];
-			const base = codeDecisionBase(
-				this.ledgerSequence(),
-				"Terminal receipt classified; process success is not semantic acceptance",
-			);
-			if (action.kind === "decision") {
-				state = "AWAITING_DECISION";
-				recordDecision(this, action.id, {
-					...base,
-					type: "writer_terminal_accept",
-					attempt_id: attempt.id,
-					candidate_fingerprint: action.sourceFingerprint,
-					receipt_fingerprint: receipt.sourceFingerprint,
-					exit_code: receipt.exitCode,
-					agent_end: null,
-					stop_reason: null,
-					changed_paths: null,
-					allowed_paths_only: null,
-					receipt_ready: true,
-					receipt_sha: createHash("sha256").update(JSON.stringify(receipt)).digest("hex"),
-				});
-			} else {
-				state = receipt.exitCode === 0 ? "ACCEPTED" : "REJECTED";
-				recordDecision(
-					this,
-					action.id,
-					{
-						...base,
-						type: "test_gate_accept",
-						gate_kind: "process",
-						attempt_id: attempt.id,
-						candidate_fingerprint: action.sourceFingerprint,
-						receipt_fingerprint: receipt.sourceFingerprint,
-						exit_code: receipt.exitCode,
-						wrapper_rc: null,
-						tests: { run: null, passed: null, failed: null, skipped: null },
-						provenance_pass: null,
-						source_unchanged: null,
-						criteria: { min_tests: null, forbidden_replay_of: null, required_pin: null },
-						is_replay: null,
-					},
-					{ applied: true },
-				);
-			}
+			const state: ActionRecord["state"] = receipt.exitCode === 0 ? "ACCEPTED" : "REJECTED";
 			this.db.prepare("UPDATE actions SET state=? WHERE id=?").run(state, action.id);
 			this.resolveWakes(attempt.id);
 			this.event("attempt_terminal", action.id, attempt.id, {
@@ -1018,77 +626,17 @@ export class FactoryStore {
 				state,
 				artifactRef: receipt.artifact?.ref ?? null,
 			});
-			if (state !== "ACCEPTED")
+			if (state === "REJECTED")
 				this.db
 					.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,?,?,?)")
-					.run(
-						action.id,
-						attempt.id,
-						state === "AWAITING_DECISION" ? "Semantic decision required" : "Process gate failed",
-						now(),
-					);
+					.run(action.id, attempt.id, "Process failed", now());
 			this.refreshReadiness();
 			return true;
 		});
 		if (conflict) throw new Error("Conflicting terminal receipt; factory paused for review");
 		return changed;
 	}
-	decide(
-		actionId: string,
-		outcome: "accept" | "reject",
-		evidence: DecisionEvidence,
-		expectedRevision?: number,
-		expectedAttemptId?: string,
-		expectedWakeId?: number,
-		expectedManagementRequestId?: string,
-	): void {
-		evidenceValid(evidence);
-		this.transaction(() => {
-			if (this.isPaused()) throw new Error("Factory is paused; decisions are blocked");
-			if (expectedRevision !== undefined && Number(this.meta("plan_revision")) !== expectedRevision)
-				throw new Error("Factory plan revision changed");
-			const action = this.action(actionId);
-			if (!action || action.state !== "AWAITING_DECISION" || action.kind !== "decision")
-				throw new Error("Action is not awaiting a semantic decision");
-			const latest = this.db
-				.prepare("SELECT id,state FROM attempts WHERE action_id=? ORDER BY rowid DESC LIMIT 1")
-				.get(actionId);
-			if (
-				!latest ||
-				latest.state !== "TERMINAL" ||
-				(expectedAttemptId !== undefined && latest.id !== expectedAttemptId)
-			)
-				throw new Error("Decision attempt changed");
-			if (
-				expectedWakeId !== undefined &&
-				!this.db
-					.prepare("SELECT 1 FROM wakes WHERE id=? AND action_id=? AND attempt_id=? AND resolved_at IS NULL")
-					.get(expectedWakeId, actionId, String(latest.id))
-			)
-				throw new Error("Decision wake changed");
-			if (expectedManagementRequestId !== undefined) {
-				const request = this.db
-					.prepare("SELECT id,state FROM management_requests WHERE wake_id=? ORDER BY rowid DESC LIMIT 1")
-					.get(expectedWakeId ?? -1);
-				if (request?.id !== expectedManagementRequestId || request.state !== "PROPOSED")
-					throw new Error("Management evidence context changed");
-				this.db
-					.prepare("UPDATE management_requests SET state='APPLIED' WHERE id=?")
-					.run(expectedManagementRequestId);
-				this.event("management_applied", actionId, String(latest.id), { id: expectedManagementRequestId });
-			}
-			if (outcome !== "accept" && outcome !== "reject") throw new Error("Invalid decision outcome");
-			this.db
-				.prepare("UPDATE actions SET state=? WHERE id=?")
-				.run(outcome === "accept" ? "ACCEPTED" : "REJECTED", actionId);
-			this.db
-				.prepare("UPDATE wakes SET resolved_at=? WHERE action_id=? AND resolved_at IS NULL")
-				.run(now(), actionId);
-			this.event("action_decided", actionId, String(latest.id), { outcome, ...evidence });
-			this.refreshReadiness();
-		});
-	}
-	/** Replace rejected or deliberately abandoned work explicitly, retaining history and updating only future dependencies. */
+	/** Replace rejected work explicitly, retaining history and updating only future dependencies. */
 	supersede(actionId: string, replacementId: string, evidence: DecisionEvidence, expectedRevision?: number): number {
 		evidenceValid(evidence);
 		return this.transaction(() => {
@@ -1096,34 +644,19 @@ export class FactoryStore {
 			const revision = Number(this.meta("plan_revision"));
 			if (expectedRevision !== undefined && revision !== expectedRevision)
 				throw new Error("Factory plan revision changed");
-			this.requireManagementDrained();
 			const invalidatedWakeIds = this.wakes()
 				.filter((wake) => wake.resolvedAt === null && wake.actionId !== actionId)
 				.map((wake) => wake.id);
 			const old = this.action(actionId);
 			const replacement = this.action(replacementId);
-			if (!old || (old.state !== "REJECTED" && old.state !== "ABANDONED"))
-				throw new Error("Only rejected or abandoned work may be superseded");
-			if (old.state === "ABANDONED" && !Number.isSafeInteger(expectedRevision))
-				throw new Error("An exact expected plan revision is required for abandoned supersession");
+			if (!old || old.state !== "REJECTED") throw new Error("Only rejected work may be superseded");
 			if (
 				!replacement ||
 				replacement.id === old.id ||
 				replacement.ticketId !== old.ticketId ||
-				replacement.kind !== old.kind ||
-				["REJECTED", "ABANDONED", "WITHDRAWN", "SUPERSEDED"].includes(replacement.state)
+				["REJECTED", "SUPERSEDED"].includes(replacement.state)
 			)
-				throw new Error("Replacement must be a distinct current action of the same ticket and kind");
-			if (
-				old.state === "ABANDONED" &&
-				((replacement.state !== "QUEUED" && replacement.state !== "READY") ||
-					this.db.prepare("SELECT 1 FROM attempts WHERE action_id=? LIMIT 1").get(replacementId) ||
-					this.db.prepare("SELECT 1 FROM wakes WHERE action_id=? LIMIT 1").get(replacementId) ||
-					this.db.prepare("SELECT 1 FROM management_requests WHERE action_id=? LIMIT 1").get(replacementId))
-			)
-				throw new Error(
-					"Abandoned work requires an unstarted QUEUED or READY replacement with no execution history",
-				);
+				throw new Error("Replacement must be a distinct current action of the same ticket");
 			const actions = this.actions();
 			const changed: ActionSpec[] = [];
 			for (const action of actions) {
@@ -1185,175 +718,11 @@ export class FactoryStore {
 			const { attempt, action } = this.context(attemptId);
 			if (attempt.state !== "UNCERTAIN" || attempt.claimReleased)
 				throw new Error("Only an uncertain claimed attempt may be resolved for retry");
-			recordDecision(
-				this,
-				action.id,
-				{
-					...operatorDecisionBase(this.ledgerSequence(), evidence.reason),
-					type: "attempt_requeue",
-					attempt_id: attemptId,
-					core_state: attempt.state,
-					claim_released: attempt.claimReleased,
-					receipt_present: attempt.receipt !== null,
-					pid: null,
-					boot_id: null,
-					start_ticks: null,
-					census: { matches: null, unreadable: null },
-					equivalent_job: null,
-					successor: null,
-					partial_banked: null,
-					duplicate_of_event: null,
-				},
-				{ applied: true },
-			);
 			this.db.prepare("UPDATE attempts SET state='ABANDONED',claim_released=1 WHERE id=?").run(attemptId);
 			this.db.prepare("UPDATE actions SET state='QUEUED' WHERE id=?").run(action.id);
 			this.resolveWakes(attemptId);
 			this.event("uncertainty_resolved_for_retry", action.id, attemptId, { ...evidence });
 			this.refreshReadiness();
-		});
-	}
-	/** Close uncertain work without retry or judgment. The attempt ID is the exactly-once settlement identity. */
-	settleWithoutRetry(
-		actionId: string,
-		settlement: NonRetrySettlement,
-		evidence: DecisionEvidence,
-		expectedRevision: number,
-	): boolean {
-		evidenceValid(evidence);
-		if (
-			!Number.isSafeInteger(expectedRevision) ||
-			expectedRevision < 0 ||
-			settlement?.planRevision !== expectedRevision
-		)
-			throw new Error("An exact expected plan revision is required for settlement");
-		if (settlement.actionId !== actionId) throw new Error("Settlement action identity mismatch");
-		const detail = { settlement, ...evidence, outcome: "UNKNOWN" };
-		return this.transaction(() => {
-			if (this.isPaused()) throw new Error("Factory is paused; settlement is blocked");
-			const { attempt, action, slot } = this.context(settlement.attemptId);
-			const prior = this.db
-				.prepare("SELECT detail FROM events WHERE kind='uncertainty_settled_without_retry' AND attempt_id=?")
-				.get(attempt.id);
-			if (prior) {
-				if (!isDeepStrictEqual(decode(prior.detail), detail))
-					throw new Error("Settlement identity reused for a different payload");
-				const superseded =
-					action.state === "SUPERSEDED" &&
-					this.db
-						.prepare(
-							"SELECT 1 FROM events WHERE kind='action_superseded' AND action_id=? AND json_extract(detail,'$.previousState')='ABANDONED'",
-						)
-						.get(actionId);
-				if (
-					(!superseded && action.state !== "ABANDONED") ||
-					attempt.state !== "ABANDONED" ||
-					!attempt.claimReleased
-				)
-					throw new Error("Settlement state changed");
-				return false;
-			}
-			verifySettlement(settlement);
-			if (Number(this.meta("plan_revision")) !== expectedRevision) throw new Error("Factory plan revision changed");
-			if (
-				action.id !== actionId ||
-				attempt.slotId !== settlement.slotId ||
-				slot.host !== settlement.host ||
-				action.command.cwd !== settlement.cwd ||
-				action.sourceFingerprint !== settlement.sourceFingerprint ||
-				this.tickets().find((ticket) => ticket.id === action.ticketId)?.owner !== settlement.ticketOwner ||
-				!attempt.processIdentity ||
-				attempt.processIdentity !== settlement.processIdentity ||
-				attempt.uncertainty !== settlement.uncertainty
-			)
-				throw new Error("Settlement attempt or ownership changed");
-			const latest = this.db
-				.prepare("SELECT id FROM attempts WHERE action_id=? ORDER BY rowid DESC LIMIT 1")
-				.get(actionId);
-			if (
-				attempt.state !== "UNCERTAIN" ||
-				action.state !== "UNCERTAIN" ||
-				attempt.claimReleased ||
-				!attempt.submittedAt ||
-				attempt.receipt !== null ||
-				latest?.id !== attempt.id
-			)
-				throw new Error("Only the current uncertain claimed attempt and action may be settled without retry");
-			if (!Number.isSafeInteger(settlement.wakeId) || settlement.wakeId < 1)
-				throw new Error("Settlement wake changed");
-			const wake = this.db
-				.prepare("SELECT created_at FROM wakes WHERE id=? AND action_id=? AND attempt_id=? AND resolved_at IS NULL")
-				.get(settlement.wakeId, actionId, attempt.id);
-			if (!wake) throw new Error("Settlement wake changed");
-			const observedAt = Date.parse(settlement.custody.observedAt);
-			if (observedAt < Date.parse(String(wake.created_at)) || observedAt > Date.now())
-				throw new Error("Settlement custody observation must follow the current wake and not be in the future");
-			if (this.managementMutationBlockers().some((request) => request.actionId === actionId))
-				throw new Error("Settlement blocked by unconsumed management requests for this action");
-			this.db.prepare("UPDATE attempts SET state='ABANDONED',claim_released=1 WHERE id=?").run(attempt.id);
-			this.db.prepare("UPDATE actions SET state='ABANDONED' WHERE id=?").run(actionId);
-			this.resolveWakes(attempt.id);
-			this.event("uncertainty_settled_without_retry", actionId, attempt.id, detail);
-			return true;
-		});
-	}
-	/** Atomically close never-claimed work. No attempt, receipt, wake or management authority is manufactured. */
-	withdrawUnstarted(
-		actionId: string,
-		withdrawal: ActionWithdrawal,
-		evidence: DecisionEvidence,
-		expectedRevision: number,
-	): boolean {
-		evidenceValid(evidence);
-		if (!withdrawal || withdrawal.version !== 1) throw new Error("Invalid action withdrawal");
-		if (
-			!Number.isSafeInteger(expectedRevision) ||
-			expectedRevision < 0 ||
-			withdrawal.planRevision !== expectedRevision
-		)
-			throw new Error("An exact expected plan revision is required for withdrawal");
-		for (const key of ["actionId", "ticketId", "ticketOwner", "sourceFingerprint", "cwd"] as const)
-			required(withdrawal[key], `withdrawal.${key}`);
-		if (withdrawal.actionId !== actionId) throw new Error("Withdrawal action identity mismatch");
-		return this.transaction(() => {
-			if (this.isPaused()) throw new Error("Factory is paused; withdrawal is blocked");
-			const action = this.action(actionId);
-			const prior = this.db
-				.prepare("SELECT detail FROM events WHERE kind='action_withdrawn' AND action_id=?")
-				.get(actionId);
-			if (prior) {
-				const { previousState: _previousState, ...payload } = decode<Record<string, unknown>>(prior.detail);
-				if (!isDeepStrictEqual(payload, { withdrawal, ...evidence, outcome: "NOT_EXECUTED" }))
-					throw new Error("Withdrawal identity reused for a different payload");
-				if (action?.state !== "WITHDRAWN") throw new Error("Withdrawal state changed");
-				return false;
-			}
-			if (Number(this.meta("plan_revision")) !== expectedRevision) throw new Error("Factory plan revision changed");
-			if (
-				!action ||
-				action.ticketId !== withdrawal.ticketId ||
-				action.command.cwd !== withdrawal.cwd ||
-				action.sourceFingerprint !== withdrawal.sourceFingerprint ||
-				this.tickets().find((ticket) => ticket.id === action.ticketId)?.owner !== withdrawal.ticketOwner
-			)
-				throw new Error("Withdrawal action or ownership changed");
-			if (
-				(action.state !== "QUEUED" && action.state !== "READY") ||
-				this.db.prepare("SELECT 1 FROM attempts WHERE action_id=? LIMIT 1").get(actionId)
-			)
-				throw new Error("Only unstarted QUEUED or READY actions with zero attempts may be withdrawn");
-			if (this.db.prepare("SELECT 1 FROM management_requests WHERE action_id=? LIMIT 1").get(actionId))
-				throw new Error("Withdrawal requires zero management history for this action");
-			if (this.db.prepare("SELECT 1 FROM wakes WHERE action_id=? LIMIT 1").get(actionId))
-				throw new Error("Withdrawal requires unstarted work without wake history");
-			this.db.prepare("UPDATE actions SET state='WITHDRAWN' WHERE id=?").run(actionId);
-			this.event("action_withdrawn", actionId, null, {
-				withdrawal,
-				...evidence,
-				outcome: "NOT_EXECUTED",
-				previousState: action.state,
-			});
-			return true;
 		});
 	}
 	planMutation(id: string): PlanMutationReceipt | undefined {
@@ -1367,155 +736,6 @@ export class FactoryStore {
 				}
 			: undefined;
 	}
-	managementMutationBlockers(): ManagementRequest[] {
-		const requests = this.managementRequests();
-		const openWakes = new Set(
-			this.wakes()
-				.filter((wake) => wake.resolvedAt === null)
-				.map((wake) => wake.id),
-		);
-		const latest = new Map(requests.map((request) => [request.wakeId, request.id]));
-		return requests.filter(
-			(request) =>
-				request.state === "CLAIMED" ||
-				(request.state === "PROPOSED" &&
-					openWakes.has(request.wakeId) &&
-					latest.get(request.wakeId) === request.id),
-		);
-	}
-	private requireManagementDrained(): void {
-		const blockers = this.managementMutationBlockers();
-		if (blockers.length)
-			throw new Error(
-				`Plan mutation blocked by unconsumed management requests: ${blockers.map((request) => request.id).join(", ")}`,
-			);
-	}
-	/** Explicit evidence-backed release of judgment authority, never a model retry or process-custody resolution. */
-	reconcileManagement(
-		requestId: string,
-		reconciliation: ManagementReconciliation,
-		evidence: DecisionEvidence,
-		expectedRevision: number,
-	): void {
-		evidenceValid(evidence);
-		this.transaction(() => {
-			if (this.isPaused()) throw new Error("Factory is paused; management reconciliation is blocked");
-			if (!Number.isSafeInteger(expectedRevision) || Number(this.meta("plan_revision")) !== expectedRevision)
-				throw new Error("Factory plan revision changed");
-			const request = this.managementRequests().find((item) => item.id === requestId);
-			if (!request || (request.state !== "CLAIMED" && request.state !== "PROPOSED"))
-				throw new Error("Only an unconsumed management request may be reconciled");
-			if (
-				reconciliation.version !== 1 ||
-				reconciliation.requestId !== requestId ||
-				reconciliation.wakeId !== request.wakeId ||
-				reconciliation.attemptId !== request.attemptId ||
-				reconciliation.planRevision !== request.planRevision
-			)
-				throw new Error("Management reconciliation does not match the original request");
-			if (
-				reconciliation.priorActor?.stopped !== true ||
-				reconciliation.priorActor.authorityRevoked !== true ||
-				!["completed", "cancelled", "not-submitted"].includes(reconciliation.providerRequest?.disposition)
-			)
-				throw new Error("Actor and provider request custody must be reconciled first");
-			this.db.prepare("UPDATE management_requests SET state='RECONCILED' WHERE id=?").run(requestId);
-			this.event("management_reconciled", request.actionId, request.attemptId, {
-				id: requestId,
-				previousState: request.state,
-				reconciliation,
-				...evidence,
-			});
-		});
-	}
-	/** Claims never expire. An interrupted model request must not be replayed on timeout or process death. */
-	claimManagement(claim: ManagementClaim): boolean {
-		return this.transaction(() => {
-			this.assertManagementCurrent(claim);
-			if (
-				this.db
-					.prepare(
-						"SELECT id FROM management_requests WHERE wake_id=? AND attempt_id=? AND evidence_sha256=? LIMIT 1",
-					)
-					.get(claim.wakeId, claim.attemptId, claim.evidenceSha256)
-			)
-				return false;
-			const result = this.db
-				.prepare(
-					"INSERT OR IGNORE INTO management_requests(id,wake_id,action_id,attempt_id,plan_revision,evidence_sha256,created_at,state) VALUES(?,?,?,?,?,?,?,'CLAIMED')",
-				)
-				.run(
-					claim.id,
-					claim.wakeId,
-					claim.actionId,
-					claim.attemptId,
-					claim.planRevision,
-					claim.evidenceSha256,
-					now(),
-				);
-			if (!result.changes) return false;
-			this.event("management_claimed", claim.actionId, claim.attemptId, { ...claim });
-			return true;
-		});
-	}
-	assertManagementCurrent(claim: ManagementClaim): void {
-		const request = this.db.prepare("SELECT state FROM management_requests WHERE id=?").get(claim.id);
-		if (request && request.state !== "CLAIMED" && request.state !== "PROPOSED")
-			throw new Error("Management request authority is no longer active");
-		if (this.isPaused()) throw new Error("Factory is paused; management is blocked");
-		if (Number(this.meta("plan_revision")) !== claim.planRevision) throw new Error("Factory plan revision changed");
-		const wake = this.db.prepare("SELECT * FROM wakes WHERE id=? AND resolved_at IS NULL").get(claim.wakeId);
-		if (!wake || wake.action_id !== claim.actionId || wake.attempt_id !== claim.attemptId)
-			throw new Error("Management wake changed");
-		const action = this.action(claim.actionId);
-		const latest = this.db
-			.prepare("SELECT id FROM attempts WHERE action_id=? ORDER BY rowid DESC LIMIT 1")
-			.get(claim.actionId);
-		if (
-			!action ||
-			(action.state !== "AWAITING_DECISION" && action.state !== "UNCERTAIN") ||
-			latest?.id !== claim.attemptId
-		)
-			throw new Error("Management action or attempt changed");
-	}
-	managementRequests(): ManagementRequest[] {
-		return this.db
-			.prepare("SELECT * FROM management_requests WHERE wake_id IS NOT NULL ORDER BY rowid")
-			.all()
-			.map((row) => ({
-				id: String(row.id),
-				wakeId: Number(row.wake_id),
-				actionId: String(row.action_id),
-				attemptId: String(row.attempt_id),
-				planRevision: Number(row.plan_revision),
-				evidenceSha256: String(row.evidence_sha256),
-				createdAt: String(row.created_at),
-				state: String(row.state) as ManagementRequest["state"],
-				result: row.result === null ? null : decode<ManagementResult | DecisionReceipt>(row.result),
-				error: row.error === null ? null : String(row.error),
-			}));
-	}
-	finishManagementDrift(id: string): void {
-		this.transaction(() => {
-			const changed = this.db
-				.prepare("UPDATE management_requests SET state='DRIFT',error=NULL WHERE id=? AND state='CLAIMED'")
-				.run(id);
-			if (!changed.changes) throw new Error("Management claim is no longer active");
-			this.event("management_finished", null, null, { id, state: "DRIFT", error: null });
-		});
-	}
-	finishManagement(id: string, result: ManagementResult | null, error: string | null = null): void {
-		this.transaction(() => {
-			const state = error !== null ? "ERROR" : result?.proposal.decision === "defer" ? "DEFERRED" : "PROPOSED";
-			const changed = this.db
-				.prepare(
-					"UPDATE management_requests SET state=?,result=COALESCE(?,result),error=? WHERE id=? AND state='CLAIMED'",
-				)
-				.run(state, result ? JSON.stringify(result) : null, error, id);
-			if (!changed.changes) throw new Error("Management claim is no longer active");
-			this.event("management_finished", null, null, { id, state, error });
-		});
-	}
 	/** Complete history is snapshot-bounded at entry, but unbounded in size. */
 	allEvents(afterSequence = 0): FactoryEvent[] {
 		const throughSequence = this.ledgerSequence();
@@ -1527,21 +747,6 @@ export class FactoryStore {
 			const last = page.at(-1);
 			if (!last || last.sequence >= throughSequence) return history;
 			cursor = last.sequence;
-		}
-	}
-	eventsOfKind(kind: string, afterSequence = 0): FactoryEvent[] {
-		if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) throw new Error("Invalid event range");
-		const throughSequence = this.ledgerSequence();
-		const query = this.db.prepare(
-			"SELECT * FROM events WHERE kind=? AND sequence>? AND sequence<=? ORDER BY sequence LIMIT 100",
-		);
-		const history: FactoryEvent[] = [];
-		let cursor = afterSequence;
-		for (;;) {
-			const page = query.all(kind, cursor, throughSequence).map((row) => this.eventRecord(row));
-			history.push(...page);
-			if (page.length < 100) return history;
-			cursor = page[page.length - 1].sequence;
 		}
 	}
 	private eventRecord(row: Row): FactoryEvent {

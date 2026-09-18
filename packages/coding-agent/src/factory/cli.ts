@@ -1,30 +1,19 @@
-import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { CommandAdapter, fingerprintCommand } from "./adapters/command.js";
-import { buildActionCapsule } from "./adapters/oneiron-capsule.js";
 import { type FactoryConfig, readFactoryConfig, readFactoryHosts, readFactoryJson } from "./config.js";
-import { factoryCost, formatFactoryCost } from "./cost.js";
-import { decideTyped } from "./decisions.js";
 import { FactoryEngine } from "./engine.js";
-import { assertByteLimit, FACTORY_EVIDENCE_LIMITS } from "./evidence.js";
 import { FACTORY_HELP } from "./help.js";
-import type { ManagementReconciliation } from "./management.js";
 import { resumeFactory } from "./resume.js";
 import { recordFactoryRuntime } from "./runtime.js";
 import { FactoryStore } from "./store.js";
-import type { ActionWithdrawal, DecisionEvidence, FactoryPlan, NonRetrySettlement } from "./types.js";
+import type { DecisionEvidence, FactoryPlan } from "./types.js";
 
 function parseArguments(args: readonly string[]): { positionals: string[]; options: Map<string, string> } {
 	const positionals: string[] = [];
 	const options = new Map<string, string>();
 	const allowed = new Set([
 		"--hosts",
-		"--action",
-		"--accept-runtime-change",
-		"--object",
-		"--apply",
-		"--ticket",
-		"--json",
 		"--pause-file",
 		"--after",
 		"--interval-ms",
@@ -33,8 +22,6 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 		"--reason",
 		"--ref",
 		"--expected-revision",
-		"--expected-attempt",
-		"--expected-wake",
 		"--mutation-id",
 	]);
 	for (let index = 0; index < args.length; index++) {
@@ -44,7 +31,7 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 			continue;
 		}
 		if (!allowed.has(arg)) throw new Error(`Unknown factory option ${arg}`);
-		const value = arg === "--json" || arg === "--apply" ? "true" : args[++index];
+		const value = args[++index];
 		if (!value || value.startsWith("--")) throw new Error(`Missing value for ${arg}`);
 		if (options.has(arg)) throw new Error(`Repeated option ${arg}`);
 		options.set(arg, value);
@@ -81,44 +68,11 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 		console.log(FACTORY_HELP);
 		return;
 	}
-	if (args[0] === "settle-no-retry" && args.length === 2 && ["help", "--help", "-h"].includes(args[1]!)) {
-		console.log(`Usage:
-  prime factory settle-no-retry <directory> <action-id> --expected-revision <revision> --expected-attempt <id> --actor <actor> --reason <reason> --ref <absolute-settlement.json>
-
-Atomically abandons a proven-dead UNCERTAIN attempt and its action, releases its claim and closes its wake.
-The original outcome remains UNKNOWN; no terminal receipt, acceptance, rejection or retry is created.
-The version:1 bundle binds actionId, attemptId, planRevision, wakeId, ticketOwner, slotId, host, cwd, sourceFingerprint, processIdentity and uncertainty.
-Its custody object requires ref, sha256, observedAt, supervisorStopped:true, processGroupStopped:true and cannotExecute:true.
-The custody JSON artifact repeats the bundle bindings and the four custody facts, without ref, sha256 or artifacts.
-Preserve one to eight artifacts with absolute ref and sha256. Each proof file must be at most 1000000 bytes.
-This verifies operator evidence; it does not kill or inspect processes. A missing PID, deadline or partial output is not proof.
-Active management authority for this action must be reconciled separately. Dependencies remain blocked.`);
-		return;
-	}
-	if (args[0] === "withdraw" && args.length === 2 && ["help", "--help", "-h"].includes(args[1]!)) {
-		console.log(`Usage:
-  prime factory withdraw <directory> <action-id> --expected-revision <revision> --actor <actor> --reason <reason> --ref <absolute-withdrawal.json>
-
-Atomically closes truly unstarted QUEUED/READY work as WITHDRAWN and journals NOT_EXECUTED.
-The version:1 bundle binds actionId, planRevision, ticketId, ticketOwner, sourceFingerprint and cwd.
-Requires zero attempts, claims, wakes and management history for this action. Refuses if a scheduler claimed it first.
-No attempt, terminal receipt, product judgment or dependency acceptance is created. No process is inspected or launched.
-Preserve the owner directive as evidence and the exact bundle for duplicate delivery. Dependencies remain blocked.`);
-		return;
-	}
 	const { positionals, options } = parseArguments(args);
 	const [command, rawDirectory, argument, choice] = positionals;
-	if (command !== "resume" && options.has("--accept-runtime-change"))
-		throw new Error("--accept-runtime-change is only supported for resume");
-	if (command !== "decide-typed" && (options.has("--object") || options.has("--apply")))
-		throw new Error("--object and --apply are only supported for decide-typed");
 	if (options.has("--timeout-ms") && command !== "fingerprint") {
 		throw new Error("--timeout-ms is only supported for fingerprint");
 	}
-	if (command !== "cost" && options.has("--ticket")) throw new Error("--ticket is only supported for cost");
-	if (!["cost", "capsule"].includes(command) && options.has("--json"))
-		throw new Error("--json is only supported for cost and capsule");
-	if (command !== "capsule" && options.has("--action")) throw new Error("--action is only supported for capsule");
 	if (command === "fingerprint") {
 		const hostsPath = options.get("--hosts");
 		if (!hostsPath || !rawDirectory || !argument)
@@ -137,14 +91,6 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 	}
 	if (!rawDirectory) throw new Error("An explicit factory directory is required");
 	const directory = resolve(rawDirectory);
-	if (command === "cost") {
-		if (positionals.length !== 2 || [...options.keys()].some((key) => !["--ticket", "--json"].includes(key)))
-			throw new Error("cost requires <directory> [--ticket <id>] [--json]");
-		const report = factoryCost(directory, options.get("--ticket"));
-		if (options.has("--json")) emit(report);
-		else console.log(formatFactoryCost(report));
-		return;
-	}
 	if (command === "init") {
 		if (!argument || !options.get("--hosts")) throw new Error("init requires plan.json and --hosts hosts.json");
 		if (existsSync(directory)) throw new Error("init requires a new factory directory");
@@ -182,24 +128,6 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 			pauseFile: config.pauseFile,
 		});
 		switch (command) {
-			case "capsule": {
-				const actionId = options.get("--action");
-				if (
-					!actionId ||
-					positionals.length !== 2 ||
-					[...options.keys()].some((key) => !["--action", "--json"].includes(key))
-				)
-					throw new Error("capsule requires <directory> --action <id> [--json]");
-				const built = await buildActionCapsule(store, actionId);
-				if (options.has("--json")) emit(built?.capsule ?? { capsule: false });
-				else
-					console.log(
-						built
-							? `${built.receipt.pin.path} sha256:${built.receipt.pin.sha256} (${built.receipt.bytes} bytes, ${built.receipt.capsule_seat})\n${JSON.stringify(built.capsule, null, 2)}`
-							: "capsule: false",
-					);
-				break;
-			}
 			case "import":
 				if (!argument) throw new Error("import requires plan.json");
 				engine.applyPlan(
@@ -212,8 +140,6 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 			case "status":
 				emit({
 					...engine.status(),
-					managementRequests: store.managementRequests(),
-					managementMutationBlockers: store.managementMutationBlockers().map((request) => request.id),
 					ownerPauseFile: config.pauseFile ?? null,
 					ownerPaused: Boolean(config.pauseFile && existsSync(config.pauseFile)),
 				});
@@ -229,101 +155,14 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 				emit(engine.status());
 				break;
 			case "resume":
-				if (positionals.length !== 2 || [...options.keys()].some((key) => key !== "--accept-runtime-change"))
-					throw new Error("resume requires <directory> [--accept-runtime-change <reason>]");
-				await resumeFactory(engine, options.get("--accept-runtime-change"));
-				break;
-			case "decide-typed": {
-				const object = options.get("--object");
-				if (
-					!argument ||
-					!choice ||
-					!object ||
-					positionals.length !== 4 ||
-					[...options.keys()].some((key) => !["--object", "--apply"].includes(key))
-				)
-					throw new Error("decide-typed requires action-id, type and --object <json-or-@file> [--apply]");
-				if (options.has("--apply") && engine.status().paused)
-					throw new Error("Factory is paused; decisions are blocked");
-				if (object.startsWith("@")) {
-					const info = statSync(object.slice(1));
-					if (!info.isFile()) throw new Error("--object @file requires a regular JSON file");
-					assertByteLimit("decision", info.size, FACTORY_EVIDENCE_LIMITS.packetBytes);
-				}
-				const value: unknown = object.startsWith("@") ? readFactoryJson(object.slice(1)) : JSON.parse(object);
-				assertByteLimit(
-					"decision",
-					Buffer.byteLength(JSON.stringify(value), "utf8"),
-					FACTORY_EVIDENCE_LIMITS.packetBytes,
-				);
-				const receipt = decideTyped(store, argument, value, choice, options.has("--apply"));
-				emit(receipt);
-				if (receipt.decision.requested_profile !== receipt.decision.served_profile)
-					throw new Error("profile_drift: decision not applied");
-				break;
-			}
-			case "decide":
-				if (!argument || (choice !== "accept" && choice !== "reject"))
-					throw new Error("decide requires action-id and accept|reject");
-				engine.decide(
-					argument,
-					choice,
-					evidence(options),
-					options.has("--expected-revision") ? expectedRevision(options) : undefined,
-					options.get("--expected-attempt"),
-					options.has("--expected-wake") ? integer(options.get("--expected-wake"), 0, 1) : undefined,
-				);
-				emit(engine.status());
+				if (positionals.length !== 2 || options.size) throw new Error("resume requires only <directory>");
+				await resumeFactory(engine, directory);
 				break;
 			case "supersede":
-				if (!argument || !choice)
-					throw new Error("supersede requires rejected or abandoned and replacement action IDs");
+				if (!argument || !choice) throw new Error("supersede requires rejected and replacement action IDs");
 				engine.supersede(argument, choice, evidence(options), expectedRevision(options));
 				emit(engine.status());
 				break;
-			case "reconcile-management": {
-				if (!argument)
-					throw new Error("reconcile-management requires request-id and request-bound recovery evidence");
-				const proof = evidence(options);
-				if (!isAbsolute(proof.ref)) throw new Error("Management recovery --ref must be an absolute bundle path");
-				const bundle = statSync(proof.ref);
-				if (!bundle.isFile() || bundle.size > 1000000)
-					throw new Error("Management recovery bundle must be a regular file of at most 1000000 bytes");
-				const reconciliation = readFactoryJson(proof.ref) as ManagementReconciliation;
-				engine.reconcileManagement(argument, reconciliation, proof, expectedRevision(options));
-				emit({ ...engine.status(), managementRequests: store.managementRequests() });
-				break;
-			}
-			case "settle-no-retry": {
-				if (!argument || choice) throw new Error("settle-no-retry requires exactly one action-id");
-				const revision = expectedRevision(options);
-				const attemptId = options.get("--expected-attempt");
-				if (!attemptId) throw new Error("An explicit --expected-attempt is required");
-				const proof = evidence(options);
-				if (!isAbsolute(proof.ref)) throw new Error("Settlement --ref must be an absolute bundle path");
-				const bundle = statSync(proof.ref);
-				if (!bundle.isFile() || bundle.size > 1000000)
-					throw new Error("Settlement bundle must be a regular file of at most 1000000 bytes");
-				const settlement = readFactoryJson(proof.ref) as NonRetrySettlement;
-				if (settlement?.attemptId !== attemptId) throw new Error("Settlement attempt identity mismatch");
-				engine.settleWithoutRetry(argument, settlement, proof, revision);
-				emit(engine.status());
-				break;
-			}
-			case "withdraw": {
-				if (!argument || choice) throw new Error("withdraw requires exactly one action-id");
-				if (options.has("--expected-attempt") || options.has("--expected-wake"))
-					throw new Error("withdraw requires unstarted work, not an attempt or wake");
-				const revision = expectedRevision(options);
-				const proof = evidence(options);
-				if (!isAbsolute(proof.ref)) throw new Error("Withdrawal --ref must be an absolute bundle path");
-				const bundle = statSync(proof.ref);
-				if (!bundle.isFile() || bundle.size > 1000000)
-					throw new Error("Withdrawal bundle must be a regular file of at most 1000000 bytes");
-				engine.withdrawUnstarted(argument, readFactoryJson(proof.ref) as ActionWithdrawal, proof, revision);
-				emit(engine.status());
-				break;
-			}
 			case "resolve":
 				if (!argument) throw new Error("resolve requires attempt-id and evidence proving safe retry");
 				engine.resolveForRetry(argument, evidence(options));
