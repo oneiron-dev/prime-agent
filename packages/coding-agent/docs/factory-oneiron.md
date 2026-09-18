@@ -41,7 +41,7 @@ One `gh pr comment <pr> --body "@coderabbitai review"`; a failed request is reco
 
 ### Merge
 
-After every blocker's `merge` accepted: for a stack, `gh stack sync` then `gh stack merge --squash --yes`; a sync conflict gets one fix round (the writer rebases and resolves, then tests) and one more sync. For a lone pull request, `gh pr merge --squash --subject <key>: <title> --body-file PR-BODY.md`; a merge failure gets one fix round (rebase onto `origin/main`, tests) followed by `git push --force-with-lease` and one more merge. Merges on one host serialize through `<work>/merge-lock/`. A pull request GitHub already reports as merged is accepted as merged.
+After every blocker's `merge` accepted: for a stack, `gh stack sync` then `gh stack merge --squash --yes`; a sync conflict gets one fix round (the writer rebases and resolves, then tests) and one more sync. For a lone pull request, `gh pr merge --squash --subject <key>: <title> --body-file PR-BODY.md`; when that fails, a branch that is merely behind is updated with `gh pr update-branch`, otherwise one fix round merges `origin/main` into the branch (a merge commit, conflicts resolved, tests again) followed by a plain `git push`, then one more merge. There is no force push anywhere. Merges on one host serialize through `<work>/merge-lock/`. A pull request GitHub already reports as merged is accepted as merged.
 
 ## Files
 

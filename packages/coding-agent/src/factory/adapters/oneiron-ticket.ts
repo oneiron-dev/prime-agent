@@ -996,19 +996,29 @@ ${rendered || "(no bot comments)"}`;
 				];
 				let merge = await this.gh(args);
 				if (merge.code !== 0 && !(await this.mergedOnGitHub(repo))) {
-					this.log("merge", `squash failed; one rebase fix round: ${tail(merge.output, 5)}`);
-					await this.git(["fetch", "-q", this.settings.remote]);
-					await this.fixRound(
-						"fix-merge",
-						`The pull request does not merge. Rebase this worktree onto ${this.settings.remote}/${this.settings.trunk}, resolve the conflicts, keep every commit's intent, and do not push.`,
-						merge.output,
-					);
-					await this.tests("tests-after-merge-fix");
-					const push = await this.run(["git", "push", "--force-with-lease", this.settings.remote, this.branch], {
-						timeoutMs: this.t.ghMs,
-						logName: "git-push.log",
-					});
-					if (push.code !== 0) throw new TicketFailure(`push after the rebase failed: ${tail(push.output, 10)}`);
+					// Never a raw force push. A branch that is merely behind is updated natively; a conflict gets one
+					// writer round that merges the trunk into the branch, then a plain push.
+					const update = await this.gh(["pr", "update-branch", String(this.state.pr), "--repo", repo]);
+					if (update.code === 0) {
+						this.log("merge", "branch was behind; updated natively");
+						await this.git(["fetch", "-q", this.settings.remote]);
+						await this.git(["merge", "--ff-only", `${this.settings.remote}/${this.branch}`]);
+					} else {
+						this.log("merge", `squash failed; one merge fix round: ${tail(merge.output, 5)}`);
+						await this.git(["fetch", "-q", this.settings.remote]);
+						await this.fixRound(
+							"fix-merge",
+							`The pull request does not merge because this branch conflicts with ${this.settings.remote}/${this.settings.trunk}. Run \`git merge ${this.settings.remote}/${this.settings.trunk}\` in this worktree, resolve every conflict, keep every commit's intent, commit the merge, and do not push.`,
+							`${merge.output}\n${update.output}`,
+						);
+						await this.tests("tests-after-merge-fix");
+						const push = await this.run(["git", "push", this.settings.remote, this.branch], {
+							timeoutMs: this.t.ghMs,
+							logName: "git-push.log",
+						});
+						if (push.code !== 0)
+							throw new TicketFailure(`push after the merge fix failed: ${tail(push.output, 10)}`);
+					}
 					merge = await this.gh(args);
 					if (merge.code !== 0 && !(await this.mergedOnGitHub(repo)))
 						throw new TicketFailure(`gh pr merge failed: ${tail(merge.output, 15)}`);
