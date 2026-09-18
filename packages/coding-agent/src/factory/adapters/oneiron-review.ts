@@ -65,7 +65,7 @@ function reviewer(login: unknown): OneironReviewer | undefined {
 	return undefined;
 }
 const NOT_COMPLETED =
-	/^(?:(?:this |the )?review (?:was |is |has been )?)?(?:skipped|disabled|pending|queued|timed out|in progress|failed|currently processing new changes|bugbot (?:couldn['’]t|could not) run|quota(?:[- ]limited| exceeded| exhausted)|(?:usage|rate)[- ]limit|out of (?:usage|credits)|unable to review|not (?:run|performed)|maximum number of reviews)/i;
+	/^(?:(?:this |the )?review (?:was |is |has been )?)?(?:skipped|disabled|pending|queued|timed out|in progress|failed|currently processing new changes|bugbot (?:couldn['’]t|could not) run|quota(?:[- ]limited| exceeded| exhausted)|(?:usage|rate)[- ]limit(?:ed| (?:reached|exhausted|exceeded))?|out of (?:usage|credits)|unable to review|not (?:run|performed)|maximum number of reviews)(?=[ \t]*(?:$|[\r\n.!:])|[ \t]+(?:-[ \t]+)?(?:usage limit reached|in this PR|on this repository|please wait|try again)\b)/i;
 const REVIEW_STATUS_NOTICE_MAX_LENGTH = 600;
 const METADATA_TITLE =
 	/^(?:(?:pr )?summary(?: by qodo)?|run configuration|walkthrough|review info|commits|files (?:selected for processing|ignored due to path filters)(?: \(\d+\))?)$/i;

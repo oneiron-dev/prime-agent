@@ -116,7 +116,10 @@ test.each([
 		"codex",
 		"This handler ignores the usage limit returned by the provider and retries forever, so a throttled tenant will spin until the process is killed. Bound the retries.",
 	],
-])("CR-FIX-3 F1 retains %s findings about limits", (login, reviewer, body) => {
+	["codex", "codex", "Failed authentication requests bypass the retry limit and overwhelm the server."],
+	["codex", "codex", "Skipped validation checks allow untrusted paths to overwrite arbitrary files."],
+	["codex", "codex", "Rate limit handling drops writes when the provider rejects a request."],
+])("PR #9 / CR-FIX-3 F1 retains %s findings about limits and failures", (login, reviewer, body) => {
 	const result = inspectOneironCorpus(
 		corpus([item("review:1", login, { body, body_sha256: oneironSha(body) })]),
 		expected,
