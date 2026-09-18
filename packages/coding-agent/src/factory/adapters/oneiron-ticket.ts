@@ -377,7 +377,7 @@ export class OneironTicketRunner {
 	packPrompt(): string {
 		return `${this.ticketHeader()}
 
-Task (read-only): build the context pack for the writer of this ticket. Never write files. Never edit the docs repo.
+Task (read-only): build the context pack for the writer of this ticket. Read-only task; your final message is the pack.
 1. Canon: read the docs mirror for the registry row and the nouns of the contract; quote the exact sentences that bind this change, each with page path and line number.
 2. Code map of this worktree: the crates, modules, types, functions and existing tests the writer must touch or extend, each with file:line.
 3. What already exists, so nothing is rebuilt.
@@ -397,7 +397,7 @@ Context pack: .w7/CONTEXT.md (Muse wrote it; read it first). The docs are the in
 Rules:
 1. Work only in this worktree. Never touch another checkout, the docs repo, or anything outside it.
 2. Implement the contract until the acceptance line passes. Write the tests it names.
-3. Run the tests of the crates you touched (cargo test -p <crate>) before you stop; never the whole workspace.
+3. Run the tests of the crates you touched (cargo test -p <crate>) before you stop; the whole workspace only when your change crosses crates.
 4. Small commits, plain messages, commit everything before you stop. No attribution lines anywhere.
 5. Never restart, install or upgrade anything on this host. Never touch remotes or other branches.
 6. Before DONE, write \`PR BODY:\` and 3 to 8 lines: what changed, the canon page path that defines it, how the acceptance is tested.
