@@ -5,16 +5,19 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { codeDecisionBase, type DecisionOf } from "../src/factory/decisions.js";
 import { FactoryEngine } from "../src/factory/engine.js";
 import { FACTORY_EVIDENCE_LIMITS } from "../src/factory/evidence.js";
-import type { ManagementEvidenceBinding, ManagementPacket } from "../src/factory/management.js";
+import type { ManagementEvidenceBinding, ManagementPacket, ManagementResult } from "../src/factory/management.js";
 import {
 	type ManagementCallerFactory,
+	type ManageWakeResult,
 	manageFactoryWake,
 	watchFactoryManagement,
 } from "../src/factory/management-dispatch.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { FactoryAdapter, FactoryPlan } from "../src/factory/types.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 const directories: string[] = [];
 const stores: FactoryStore[] = [];
@@ -55,7 +58,7 @@ async function fixture(count = 1) {
 			sourceFingerprint: `source-${i}`,
 			acceptanceCriteria: ["Review passed for exact output"],
 			command: { argv: ["fixture"], cwd: directory },
-			requirements: {},
+			requirements: { runtime: fixtureRuntimePin },
 		})),
 		roles: { ticketOwner: { provider: "fixture", model: "mock", effort: "low" } },
 	};
@@ -88,6 +91,8 @@ function caller(decision: "accept" | "defer" | "reject" = "defer", during?: () =
 		const packet = JSON.parse(packetText) as ManagementPacket;
 		return {
 			model: "mock",
+			responseModel: "mock",
+			responseModelSource: "provider-response" as const,
 			text: JSON.stringify({
 				version: 1,
 				actionId: packet.action.id,
@@ -112,6 +117,131 @@ afterEach(() => {
 });
 
 describe("bounded factory judgment consumer", () => {
+	test("manage prints a typed drift result before exiting 1 without applying", async () => {
+		const f = await fixture();
+		writeFileSync(join(f.directory, "config.json"), JSON.stringify({ version: 1, hosts: {} }));
+		const decision: DecisionOf<"baseline_adoption"> = {
+			...codeDecisionBase(f.store.ledgerSequence(), "Structured retained revision facts"),
+			type: "baseline_adoption",
+			retained_revision: "head",
+			fingerprint: "source-0",
+			dirty_paths_count: 0,
+			authority_record: { path: "/owner/record", sha: "a".repeat(64) },
+			authorship_proof: "signed",
+			known_defects: [],
+			prior_green_candidate: null,
+		};
+		const path = join(f.directory, "typed.json");
+		writeFileSync(path, JSON.stringify(decision));
+		const preload = join(f.directory, "mock-fetch.mjs");
+		const response = {
+			model: "fixture-drifted-model",
+			answers: { q: { type: "noul", noul: 0.9 } },
+			usage: { input_tokens: 10, output_tokens: 2 },
+		};
+		writeFileSync(
+			preload,
+			`globalThis.fetch = async () => new Response(${JSON.stringify(JSON.stringify(response))}, { status: 200 });`,
+		);
+		const entry = resolve("src/factory/manage-entry.ts");
+		const child = spawn(
+			process.execPath,
+			["--import", "tsx", "--import", pathToFileURL(preload).href, entry, f.directory, "a0", "--typed-object", path],
+			{
+				env: { ...process.env, TYPESAFE_JEV_API_KEY: "fixture-not-a-secret" },
+				stdio: ["ignore", "pipe", "pipe"],
+			},
+		);
+		let output = "",
+			error = "";
+		child.stdout.setEncoding("utf8");
+		child.stdout.on("data", (text: string) => {
+			output += text;
+		});
+		child.stderr.setEncoding("utf8");
+		child.stderr.on("data", (text: string) => {
+			error += text;
+		});
+		const code = await new Promise<number | null>((resolveExit, reject) => {
+			child.once("error", reject);
+			child.once("close", resolveExit);
+		});
+		expect(code, error).toBe(1);
+		const result = JSON.parse(output) as ManageWakeResult;
+		expect(result).toMatchObject({
+			kind: "drift",
+			admitted: true,
+			requestedProfile: "jev-latest",
+			servedProfile: "fixture-drifted-model",
+			typedDecision: {
+				outcome: "DRIFT",
+				action_id: "a0",
+				applied: false,
+				decision: { type: decision.type, requested_profile: "jev-latest", served_profile: "fixture-drifted-model" },
+			},
+		});
+		expect(result.typedDecision).toEqual(f.store.managementRequests()[0].result);
+		expect(JSON.parse(readFileSync(join(result.evidenceDirectory!, "decision.json"), "utf8"))).toEqual(
+			result.typedDecision,
+		);
+		expect(f.store.managementRequests()[0].state).toBe("DRIFT");
+		expect(f.store.actions()[0].state).toBe("AWAITING_DECISION");
+		expect(f.store.attempts()).toHaveLength(1);
+		expect(
+			f.store.wakes().some((wake) => wake.reason === `profile_drift: ${result.requestId}` && !wake.resolvedAt),
+		).toBe(true);
+	});
+
+	test("preserves provider usage bytes beside accounting in results, receipts and the reopened ledger", async () => {
+		const f = await fixture();
+		f.engine.applyPlan({ ...f.plan, roles: { ticketOwner: { provider: "openai", model: "openai/gpt-4o" } } });
+		const model = caller();
+		const usage = {
+			input: 1000,
+			output: 10,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 1010,
+			cost: { input: 0.0025, output: 0.0001, total: 0.0026 },
+			providerDetails: { currency: "USD", note: "verbatim provider record" },
+		};
+		const usageBytes = Buffer.from(JSON.stringify(usage));
+		const proposed = await manageFactoryWake(
+			f.engine,
+			{ directory: f.directory, evidence },
+			(check) =>
+				async (...parameters) => ({
+					...(await model.create(check)(...parameters)),
+					model: "openai/gpt-4o",
+					responseModel: "openai/gpt-4o",
+					responseModelSource: "provider-response",
+					usage,
+				}),
+		);
+		expect(proposed.kind).toBe("deferred");
+		const reopened = new FactoryStore(f.path);
+		stores.push(reopened);
+		type CostReceipt = Pick<ManagementResult, "usage" | "accounting" | "wall_clock_ms">;
+		const saved: CostReceipt[] = [
+			proposed.result!,
+			...["response.json", "proposal.json"].map(
+				(name) => JSON.parse(readFileSync(join(proposed.evidenceDirectory!, name), "utf8")) as CostReceipt,
+			),
+			reopened.managementRequests()[0].result!,
+		];
+		for (const result of saved) {
+			expect(Buffer.from(JSON.stringify(result.usage))).toEqual(usageBytes);
+			expect(result.accounting).toEqual({
+				calls: 1,
+				usage: { input: 1000, output: 10, cache_read: 0, cache_write: 0, total: 1010 },
+				cost_usd: 0.0026,
+				priced: true,
+			});
+			expect(result.wall_clock_ms).toBeGreaterThanOrEqual(0);
+		}
+		expect(Buffer.from(JSON.stringify(usage))).toEqual(usageBytes);
+	});
+
 	test("consumes defer durably, including after reopening, and requires changed evidence for another call", async () => {
 		const f = await fixture();
 		bind(f);
@@ -204,6 +334,8 @@ describe("bounded factory judgment consumer", () => {
 			const packet = JSON.parse(text) as ManagementPacket;
 			return {
 				model: "mock",
+				responseModel: "mock",
+				responseModelSource: "provider-response" as const,
 				text: JSON.stringify({
 					version: 1,
 					actionId: binding.actionId,

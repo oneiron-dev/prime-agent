@@ -8,6 +8,8 @@ import {
 	validateOneironTriage,
 } from "../src/factory/adapters/oneiron-review.js";
 
+import { codeDecisionBase, type FactoryDecision, validateDecision } from "../src/factory/decisions.js";
+
 const head = "a".repeat(40);
 const expected = { repo: "org/repo", pr: 855, head, base: "main" };
 function item(key: string, login: string, overrides: Record<string, unknown> = {}) {
@@ -244,5 +246,65 @@ describe("Oneiron exact-commit review policy", () => {
 				refs,
 			).findings.at(-1)!.disposition,
 		).toBe("fixed");
+	});
+});
+
+test("records observed comment identity without inventing a successful request", () => {
+	const rows: FactoryDecision[] = [];
+	inspectOneironCorpus(
+		corpus([
+			item("review_comment:42", "qodo-code-review[bot]", {
+				sources: ["review_comment"],
+				url: "https://example.test/comment/42",
+				created_at: "2026-09-18T00:00:00Z",
+			}),
+		]),
+		expected,
+		{
+			base: codeDecisionBase(4, "review"),
+			attemptId: "attempt",
+			record: (d) => {
+				rows.push(validateDecision(d));
+			},
+		},
+	);
+	expect(rows[0]).toMatchObject({
+		type: "review_posting",
+		returned_comment_id: "42",
+		request_command_exit: null,
+		manual_request_exists: null,
+		posted_at: "2026-09-18T00:00:00Z",
+	});
+});
+
+test("records one posting per reviewer after aggregating all corpus items", () => {
+	const rows: FactoryDecision[] = [];
+	const report = inspectOneironCorpus(
+		corpus([
+			item("review_comment:1", "qodo-code-review[bot]", { sources: ["review_comment"] }),
+			item("review_comment:2", "qodo-code-review[bot]", { sources: ["review_comment"] }),
+			item("review:3", "qodo-code-review[bot]"),
+			item("review:4", "chatgpt-codex-connector[bot]"),
+		]),
+		expected,
+		{
+			base: codeDecisionBase(0, "review"),
+			attemptId: "attempt",
+			record: (value) => {
+				rows.push(validateDecision(value));
+			},
+		},
+	);
+	expect(report.items).toHaveLength(4);
+	expect(rows).toHaveLength(2);
+	expect(rows[0]).toMatchObject({
+		returned_comment_id: "1",
+		run_status: "completed_review_observed",
+		reason: expect.stringContaining("qodo:"),
+	});
+	expect(rows[1]).toMatchObject({
+		returned_comment_id: null,
+		run_status: "completed_review_observed",
+		reason: expect.stringContaining("codex:"),
 	});
 });

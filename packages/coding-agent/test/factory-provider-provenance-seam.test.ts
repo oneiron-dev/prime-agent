@@ -261,6 +261,11 @@ test.each([
 		expect(provenance.responseModels).toEqual([responseModel]);
 		expect(provenance.observations[0].family).toBe(family);
 		expect(provenance.upstreamIdentityAttested).toBe(false);
+		expect(provenance.usage).toEqual({ input: 2, output: 5, cache_read: 0, cache_write: 0, total: 7 });
+		expect(provenance.observations[0].usage).toEqual(provenance.usage);
+		expect(provenance.calls).toBe(1);
+		expect(provenance.cost_usd).toBeCloseTo(0.00027);
+		expect(provenance.priced).toBe(true);
 	},
 );
 

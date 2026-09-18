@@ -10,7 +10,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { classifyOwnedSessionWorkerInvocation, createOwnedWorkerLaunchSpec } from "../src/cli/owned-session-worker.js";
@@ -43,6 +43,8 @@ import type { ManagementCallerFactory } from "../src/factory/management-dispatch
 import { hashFactoryRuntimeFile } from "../src/factory/runtime.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { AttemptContext, FactoryAdapter, Inspection } from "../src/factory/types.js";
+
+import { admitRuntimeFixture } from "./factory-runtime-fixture.js";
 
 // Publication/network is mocked. Real Oneiron stages, binder, manager, engine and SQLite journal run below.
 vi.mock("../src/factory/adapters/oneiron-publication.js", () => ({
@@ -111,13 +113,20 @@ setTimeout(() => {
 	const runtime = pin(directory, "runtime.json", {
 		version: 1,
 		cliArgv: [node.path, cli.path],
-		files: [node, cli, adapter, continuationEntry],
+		files: [
+			node,
+			cli,
+			adapter,
+			continuationEntry,
+			{ path: resolve("src/factory/runtime.ts"), sha256: hashFactoryRuntimeFile(resolve("src/factory/runtime.ts")) },
+		],
 		capabilities: [
 			"provider-response-model-v1",
 			"oneiron-native-gate-capture-v1",
 			...(completedJson ? ["factory-completed-json-v1"] : []),
 		],
 	});
+	if (nativeCoordinator) admitRuntimeFixture(runtime);
 	const authorization = pin(directory, "authorization.json", {
 		fixtureOnly: true,
 		ownerAuthorized: "bounded signed commit/rebind and bot request; no product authorship/merge/close",
@@ -839,7 +848,7 @@ describe("durable Oneiron continuation", () => {
 		expect(f.verifyRebind).toHaveBeenCalledTimes(1);
 		expect(readFileSync(join(f.workspace, "source.txt"), "utf8")).toContain("repaired");
 		expect(f.store.attempts()).toHaveLength(7);
-		expect(f.store.events().filter((event) => event.kind === "action_decided")).toHaveLength(7);
+		expect(f.store.eventsOfKind("action_decided")).toHaveLength(7);
 		expect(f.store.status().planRevision).toBe(7);
 		const db = new DatabaseSync(join(f.factoryDirectory, "factory.db"), { readOnly: true });
 		expect(db.prepare("SELECT COUNT(*) AS n FROM oneiron_continuation_bindings").get()?.n).toBe(7);
@@ -1140,6 +1149,8 @@ describe("durable Oneiron continuation", () => {
 			const packet = JSON.parse(text) as ManagementPacket;
 			return {
 				model: "mock-manager",
+				responseModel: "mock-manager",
+				responseModelSource: "provider-response" as const,
 				text: JSON.stringify({
 					version: 1,
 					actionId: packet.action.id,
@@ -1219,7 +1230,7 @@ describe("durable Oneiron continuation", () => {
 		f.restart();
 		expect((await f.continuation.step()).reason).toContain("Recovered exact committed");
 		expect(f.store.actions()[0].state).toBe("REJECTED");
-		expect(f.store.events().filter((event) => event.kind === "action_decided")).toHaveLength(1);
+		expect(f.store.eventsOfKind("action_decided")).toHaveLength(1);
 		expect(f.coordinatorLaunches).toHaveBeenCalledTimes(1);
 	});
 

@@ -9,6 +9,7 @@ import { runFactoryCli } from "../src/factory/cli.js";
 import { FactoryEngine } from "../src/factory/engine.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { ActionWithdrawal, FactoryAdapter, FactoryPlan } from "../src/factory/types.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 const directories: string[] = [];
 const stores: FactoryStore[] = [];
@@ -40,7 +41,7 @@ function fixture(queued = false) {
 			dependencies: id === "dependent" ? ["old"] : id === "old" && queued ? ["other"] : [],
 			sourceFingerprint: `fixture:${id}`,
 			command: { argv: ["NEVER-EXECUTE-FIXTURE"], cwd: join(directory, id) },
-			requirements: {},
+			requirements: { runtime: fixtureRuntimePin },
 		})),
 	};
 	engine.applyPlan(plan, 0);
@@ -302,7 +303,7 @@ describe("explicit unstarted action withdrawal", () => {
 				expect(results[1].error).toContain("unstarted");
 				expect(f.store.actions()[0].state).toBe("RUNNING");
 				expect(f.store.attempts()).toHaveLength(1);
-				expect(f.store.events().some((event) => event.kind === "action_withdrawn")).toBe(false);
+				expect(f.store.eventsOfKind("action_withdrawn")).toHaveLength(0);
 			} else {
 				expect(f.store.actions()[0].state).toBe("WITHDRAWN");
 				expect(f.store.attempts()).toHaveLength(0);

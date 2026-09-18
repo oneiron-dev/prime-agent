@@ -1,10 +1,16 @@
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { CommandAdapter, fingerprintCommand } from "./adapters/command.js";
+import { buildActionCapsule } from "./adapters/oneiron-capsule.js";
 import { type FactoryConfig, readFactoryConfig, readFactoryHosts, readFactoryJson } from "./config.js";
+import { factoryCost, formatFactoryCost } from "./cost.js";
+import { decideTyped } from "./decisions.js";
 import { FactoryEngine } from "./engine.js";
+import { assertByteLimit, FACTORY_EVIDENCE_LIMITS } from "./evidence.js";
 import { FACTORY_HELP } from "./help.js";
 import type { ManagementReconciliation } from "./management.js";
+import { resumeFactory } from "./resume.js";
+import { recordFactoryRuntime } from "./runtime.js";
 import { FactoryStore } from "./store.js";
 import type { ActionWithdrawal, DecisionEvidence, FactoryPlan, NonRetrySettlement } from "./types.js";
 
@@ -13,6 +19,12 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 	const options = new Map<string, string>();
 	const allowed = new Set([
 		"--hosts",
+		"--action",
+		"--accept-runtime-change",
+		"--object",
+		"--apply",
+		"--ticket",
+		"--json",
 		"--pause-file",
 		"--after",
 		"--interval-ms",
@@ -32,7 +44,7 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 			continue;
 		}
 		if (!allowed.has(arg)) throw new Error(`Unknown factory option ${arg}`);
-		const value = args[++index];
+		const value = arg === "--json" || arg === "--apply" ? "true" : args[++index];
 		if (!value || value.startsWith("--")) throw new Error(`Missing value for ${arg}`);
 		if (options.has(arg)) throw new Error(`Repeated option ${arg}`);
 		options.set(arg, value);
@@ -96,9 +108,17 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 	}
 	const { positionals, options } = parseArguments(args);
 	const [command, rawDirectory, argument, choice] = positionals;
+	if (command !== "resume" && options.has("--accept-runtime-change"))
+		throw new Error("--accept-runtime-change is only supported for resume");
+	if (command !== "decide-typed" && (options.has("--object") || options.has("--apply")))
+		throw new Error("--object and --apply are only supported for decide-typed");
 	if (options.has("--timeout-ms") && command !== "fingerprint") {
 		throw new Error("--timeout-ms is only supported for fingerprint");
 	}
+	if (command !== "cost" && options.has("--ticket")) throw new Error("--ticket is only supported for cost");
+	if (!["cost", "capsule"].includes(command) && options.has("--json"))
+		throw new Error("--json is only supported for cost and capsule");
+	if (command !== "capsule" && options.has("--action")) throw new Error("--action is only supported for capsule");
 	if (command === "fingerprint") {
 		const hostsPath = options.get("--hosts");
 		if (!hostsPath || !rawDirectory || !argument)
@@ -117,6 +137,14 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 	}
 	if (!rawDirectory) throw new Error("An explicit factory directory is required");
 	const directory = resolve(rawDirectory);
+	if (command === "cost") {
+		if (positionals.length !== 2 || [...options.keys()].some((key) => !["--ticket", "--json"].includes(key)))
+			throw new Error("cost requires <directory> [--ticket <id>] [--json]");
+		const report = factoryCost(directory, options.get("--ticket"));
+		if (options.has("--json")) emit(report);
+		else console.log(formatFactoryCost(report));
+		return;
+	}
 	if (command === "init") {
 		if (!argument || !options.get("--hosts")) throw new Error("init requires plan.json and --hosts hosts.json");
 		if (existsSync(directory)) throw new Error("init requires a new factory directory");
@@ -136,7 +164,7 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 		const store = new FactoryStore(join(directory, "factory.db"));
 		try {
 			const engine = new FactoryEngine(store, new CommandAdapter(config.hosts), { enabled: false, pauseFile });
-			engine.applyPlan(plan);
+			engine.applyPlan(plan, 0, undefined, recordFactoryRuntime(directory));
 			engine.pause("Initialized; explicit factory resume required");
 			emit(engine.status());
 		} finally {
@@ -154,6 +182,24 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 			pauseFile: config.pauseFile,
 		});
 		switch (command) {
+			case "capsule": {
+				const actionId = options.get("--action");
+				if (
+					!actionId ||
+					positionals.length !== 2 ||
+					[...options.keys()].some((key) => !["--action", "--json"].includes(key))
+				)
+					throw new Error("capsule requires <directory> --action <id> [--json]");
+				const built = await buildActionCapsule(store, actionId);
+				if (options.has("--json")) emit(built?.capsule ?? { capsule: false });
+				else
+					console.log(
+						built
+							? `${built.receipt.pin.path} sha256:${built.receipt.pin.sha256} (${built.receipt.bytes} bytes, ${built.receipt.capsule_seat})\n${JSON.stringify(built.capsule, null, 2)}`
+							: "capsule: false",
+					);
+				break;
+			}
 			case "import":
 				if (!argument) throw new Error("import requires plan.json");
 				engine.applyPlan(
@@ -183,9 +229,39 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 				emit(engine.status());
 				break;
 			case "resume":
-				engine.resume();
-				emit(engine.status());
+				if (positionals.length !== 2 || [...options.keys()].some((key) => key !== "--accept-runtime-change"))
+					throw new Error("resume requires <directory> [--accept-runtime-change <reason>]");
+				await resumeFactory(engine, options.get("--accept-runtime-change"));
 				break;
+			case "decide-typed": {
+				const object = options.get("--object");
+				if (
+					!argument ||
+					!choice ||
+					!object ||
+					positionals.length !== 4 ||
+					[...options.keys()].some((key) => !["--object", "--apply"].includes(key))
+				)
+					throw new Error("decide-typed requires action-id, type and --object <json-or-@file> [--apply]");
+				if (options.has("--apply") && engine.status().paused)
+					throw new Error("Factory is paused; decisions are blocked");
+				if (object.startsWith("@")) {
+					const info = statSync(object.slice(1));
+					if (!info.isFile()) throw new Error("--object @file requires a regular JSON file");
+					assertByteLimit("decision", info.size, FACTORY_EVIDENCE_LIMITS.packetBytes);
+				}
+				const value: unknown = object.startsWith("@") ? readFactoryJson(object.slice(1)) : JSON.parse(object);
+				assertByteLimit(
+					"decision",
+					Buffer.byteLength(JSON.stringify(value), "utf8"),
+					FACTORY_EVIDENCE_LIMITS.packetBytes,
+				);
+				const receipt = decideTyped(store, argument, value, choice, options.has("--apply"));
+				emit(receipt);
+				if (receipt.decision.requested_profile !== receipt.decision.served_profile)
+					throw new Error("profile_drift: decision not applied");
+				break;
+			}
 			case "decide":
 				if (!argument || (choice !== "accept" && choice !== "reject"))
 					throw new Error("decide requires action-id and accept|reject");

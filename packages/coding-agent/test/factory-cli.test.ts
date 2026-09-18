@@ -1,15 +1,27 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import type * as NodeFs from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { factoryArguments, supportsFactoryRuntime } from "../src/cli/factory-launch.js";
+import { runFactoryCli } from "../src/factory/cli.js";
+import type { FactoryCostReport } from "../src/factory/cost.js";
+import { codeDecisionBase, type DecisionOf, type DecisionReceipt } from "../src/factory/decisions.js";
+import { FactoryEngine } from "../src/factory/engine.js";
 import { FACTORY_EVIDENCE_LIMITS } from "../src/factory/evidence.js";
+import type { ManagementPacket } from "../src/factory/management.js";
+import { manageFactoryWake } from "../src/factory/management-dispatch.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { FactoryPlan, FactoryStatus } from "../src/factory/types.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof NodeFs>();
+	return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
 
 const require = createRequire(import.meta.url);
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -61,6 +73,14 @@ function setup(kind: "process" | "decision" = "process") {
 	writeFileSync(hostsPath, JSON.stringify({ local: { type: "local", runnerRoot } }));
 	return { root, directory, runnerRoot, marker, planPath, hostsPath };
 }
+function unpauseFixture(directory: string): void {
+	const store = new FactoryStore(join(directory, "factory.db"));
+	try {
+		store.resume();
+	} finally {
+		store.close();
+	}
+}
 async function waitUntil(test: () => boolean) {
 	const deadline = Date.now() + 6000;
 	while (Date.now() < deadline) {
@@ -70,10 +90,339 @@ async function waitUntil(test: () => boolean) {
 	throw new Error("Condition did not become true");
 }
 afterEach(() => {
+	vi.restoreAllMocks();
+	vi.clearAllMocks();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("optional factory CLI", () => {
+	it("prints a typed drift receipt before exiting 1 and never applies the decision", () => {
+		const { directory, planPath, hostsPath } = setup("decision");
+		invoke(["init", directory, planPath, "--hosts", hostsPath]);
+		unpauseFixture(directory);
+		const store = new FactoryStore(join(directory, "factory.db"));
+		try {
+			const context = store.claim("a", "local-slot")!;
+			store.markSubmitted(context.attempt.id);
+			store.complete({
+				attemptId: context.attempt.id,
+				sourceFingerprint: context.action.sourceFingerprint,
+				exitCode: 0,
+				finishedAt: "2026-09-18T00:00:00Z",
+			});
+			const terminal = store.attempts()[0].receipt!;
+			const decision: DecisionOf<"writer_terminal_accept"> = {
+				...codeDecisionBase(store.ledgerSequence(), "Reviewed exact terminal output"),
+				type: "writer_terminal_accept",
+				decided_by: "advisor",
+				requested_profile: "expected-model",
+				served_profile: "fallback-model",
+				attempt_id: context.attempt.id,
+				candidate_fingerprint: context.action.sourceFingerprint,
+				receipt_fingerprint: terminal.sourceFingerprint,
+				exit_code: 0,
+				agent_end: true,
+				stop_reason: "stop",
+				changed_paths: [],
+				allowed_paths_only: true,
+				receipt_ready: true,
+				receipt_sha: createHash("sha256").update(JSON.stringify(terminal)).digest("hex"),
+			};
+			const result = spawnSync(
+				process.execPath,
+				[
+					...nodeArgs,
+					cli,
+					"factory",
+					"decide-typed",
+					directory,
+					"a",
+					decision.type,
+					"--object",
+					JSON.stringify(decision),
+					"--apply",
+				],
+				{ cwd: packageRoot, encoding: "utf8", timeout: 10000 },
+			);
+			expect(result.status, result.stderr).toBe(1);
+			expect(result.stderr).toContain("profile_drift: decision not applied");
+			const receipt = JSON.parse(result.stdout) as DecisionReceipt;
+			expect(receipt.decision).toEqual(decision);
+			expect(receipt.applied).toBe(false);
+			expect(receipt).toEqual(store.typedDecisions().at(-1));
+			expect(
+				JSON.parse(readFileSync(join(directory, "decisions", receipt.request_id, "decision.json"), "utf8")),
+			).toEqual(receipt);
+			expect(store.managementRequests()).toEqual([]);
+			expect(store.actions()[0].state).toBe("AWAITING_DECISION");
+			expect(store.attempts()).toHaveLength(1);
+			expect(
+				store.wakes().some((wake) => wake.reason === `profile_drift: ${receipt.request_id}` && !wake.resolvedAt),
+			).toBe(true);
+		} finally {
+			store.close();
+		}
+	});
+
+	it("rejects oversized decide-typed @file input before attempting to read it", async () => {
+		const { root, directory, planPath, hostsPath } = setup("decision");
+		invoke(["init", directory, planPath, "--hosts", hostsPath]);
+		const path = join(root, "oversized-decision.json");
+		writeFileSync(path, "{}".padEnd(FACTORY_EVIDENCE_LIMITS.packetBytes + 1, " "));
+		const store = new FactoryStore(join(directory, "factory.db"));
+		try {
+			const sequence = store.ledgerSequence();
+			vi.mocked(readFileSync).mockClear();
+			await expect(
+				runFactoryCli(["decide-typed", directory, "a", "executability", "--object", `@${path}`]),
+			).rejects.toThrow("decision: actual 98305 UTF-8 bytes exceeds limit 98304");
+			const readPaths = vi.mocked(readFileSync).mock.calls.map(([path]) => path);
+			expect(readPaths).toContain(join(directory, "config.json"));
+			expect(readPaths).not.toContain(path);
+			expect(store.ledgerSequence()).toBe(sequence);
+			expect(store.typedDecisions()).toEqual([]);
+			expect(existsSync(join(directory, "decisions"))).toBe(false);
+		} finally {
+			store.close();
+		}
+	});
+
+	it("accepts decide-typed @file at the 96 KiB limit and rejects non-file input", async () => {
+		const { root, directory, planPath, hostsPath } = setup("decision");
+		invoke(["init", directory, planPath, "--hosts", hostsPath]);
+		const store = new FactoryStore(join(directory, "factory.db"));
+		try {
+			const decision: DecisionOf<"executability"> = {
+				...codeDecisionBase(store.ledgerSequence(), "Current executable work"),
+				type: "executability",
+				named_dependency: "none",
+				independent_work_available: true,
+				authority_covers: true,
+				hold_scope: null,
+			};
+			const path = join(root, "decision.json");
+			writeFileSync(path, JSON.stringify(decision).padEnd(FACTORY_EVIDENCE_LIMITS.packetBytes, " "));
+			const output = vi.spyOn(console, "log").mockImplementation(() => {});
+			await runFactoryCli(["decide-typed", directory, "a", decision.type, "--object", `@${path}`]);
+			expect(JSON.parse(String(output.mock.calls[0][0])).decision).toEqual(decision);
+			expect(store.typedDecisions()).toHaveLength(1);
+			await expect(
+				runFactoryCli(["decide-typed", directory, "a", decision.type, "--object", `@${root}`]),
+			).rejects.toThrow("--object @file requires a regular JSON file");
+		} finally {
+			store.close();
+		}
+	});
+
+	it("reports two tickets and two seats from ledger and receipts without writes or double counting", async () => {
+		const f = setup("decision");
+		const plan = JSON.parse(readFileSync(f.planPath, "utf8")) as FactoryPlan;
+		plan.tickets.push({ id: "other-ticket", owner: "owner" });
+		plan.roles = { ticketOwner: { provider: "openai", model: "openai/gpt-4o" } };
+		const usage = { input: 10, output: 5, cache_read: 2, cache_write: 1, total: 18 };
+		const receiptPaths: string[] = [];
+		for (const [index, ticket] of plan.tickets.entries()) {
+			const outputDirectory = join(f.root, `output-${index}`);
+			mkdirSync(outputDirectory);
+			const manifestPath = join(f.root, `manifest-${index}.json`);
+			const manifest = JSON.stringify({ ticketId: ticket.id, stage: { kind: "writer" }, outputDirectory });
+			const sha = createHash("sha256").update(manifest).digest("hex");
+			writeFileSync(manifestPath, manifest);
+			const action = {
+				...plan.actions[0],
+				id: `action-${index}`,
+				ticketId: ticket.id,
+				command: { cwd: f.root, argv: ["execute", manifestPath, "permit", sha, "--execute"] },
+			};
+			if (index === 0) plan.actions[0] = action;
+			else plan.actions.push(action);
+			const path = join(outputDirectory, "receipt.json");
+			receiptPaths.push(path);
+			writeFileSync(
+				path,
+				JSON.stringify({
+					ticketId: ticket.id,
+					manifestSha256: sha,
+					result: { writerProvenance: { calls: 2, usage, cost_usd: 0.25, priced: true } },
+				}),
+			);
+		}
+		plan.actions.push({ ...plan.actions[0], id: "duplicate-receipt" });
+		writeFileSync(f.planPath, JSON.stringify(plan));
+		invoke(["init", f.directory, f.planPath, "--hosts", f.hostsPath]);
+		unpauseFixture(f.directory);
+		const store = new FactoryStore(join(f.directory, "factory.db"));
+		const noProcess = async (): Promise<never> => {
+			throw new Error("Cost must not execute work");
+		};
+		const engine = new FactoryEngine(store, { launch: noProcess, inspect: noProcess });
+		try {
+			for (const [index, action] of plan.actions.slice(0, 2).entries()) {
+				const context = store.claim(action.id, "local-slot")!;
+				store.markSubmitted(context.attempt.id);
+				store.complete({
+					attemptId: context.attempt.id,
+					sourceFingerprint: action.sourceFingerprint,
+					exitCode: 0,
+					finishedAt: new Date().toISOString(),
+				});
+				const result = await manageFactoryWake(
+					engine,
+					{ directory: f.directory, actionId: action.id },
+					() => async (_system, serialized) => {
+						const packet = JSON.parse(serialized) as ManagementPacket;
+						return {
+							model: "openai/gpt-4o",
+							responseModel: "openai/gpt-4o",
+							responseModelSource: "provider-response",
+							usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 },
+							text:
+								index === 1
+									? "invalid decision"
+									: JSON.stringify({
+											version: 1,
+											actionId: action.id,
+											planRevision: packet.planRevision,
+											attemptId: packet.attempt!.id,
+											decision: "defer",
+											reason: "fixture",
+											evidenceRefs: [],
+										}),
+						};
+					},
+				);
+				expect(result.kind).toBe(index === 0 ? "deferred" : "error");
+				const path = join(
+					f.directory,
+					"decisions",
+					result.requestId!,
+					index === 0 ? "proposal.json" : "response.json",
+				);
+				const saved = JSON.parse(readFileSync(path, "utf8"));
+				expect(saved.accounting).toMatchObject({ calls: 1, priced: true, cost_usd: 2.5 });
+				expect(saved.wall_clock_ms).toBeGreaterThanOrEqual(0);
+				receiptPaths.push(path);
+			}
+			const duplicate = store.claim("duplicate-receipt", "local-slot")!;
+			expect(duplicate.attempt.id).toBeTruthy();
+		} finally {
+			store.close();
+		}
+		const database = join(f.directory, "factory.db");
+		const before = [database, ...receiptPaths].map((path) => readFileSync(path));
+		const report = JSON.parse(invoke(["cost", f.directory, "--json"])) as FactoryCostReport;
+		expect(report.rows).toHaveLength(4);
+		expect(report.missing).toEqual([]);
+		expect(report.total).toEqual({
+			calls: 6,
+			cost_usd: 5.5,
+			priced: true,
+			usage: { input: 2_000_020, output: 10, cache_read: 4, cache_write: 2, total: 2_000_036 },
+		});
+		expect(report.rows.filter((row) => row.seat === "writer")).toHaveLength(2);
+		expect(report.rows.filter((row) => row.seat === "ticketOwner")).toHaveLength(2);
+		const filtered = JSON.parse(invoke(["cost", f.directory, "--ticket", "ticket", "--json"])) as FactoryCostReport;
+		expect(filtered.rows).toHaveLength(2);
+		expect(filtered.rows.every((row) => row.ticket === "ticket")).toBe(true);
+		expect(filtered.total).toMatchObject({ calls: 3, cost_usd: 2.75, priced: true });
+		const table = invoke(["cost", f.directory]);
+		expect(table).toContain("TICKET\tSEAT\tCALLS");
+		expect(table).toContain("CACHE_READ\tCACHE_WRITE");
+		expect(table).toContain("TOTAL\t*\t6");
+		expect(table).toContain("5.50000000");
+		expect([database, ...receiptPaths].map((path) => readFileSync(path))).toEqual(before);
+		expect(existsSync(f.marker)).toBe(false);
+		expect(JSON.parse(invoke(["cost", f.directory, "--ticket", "absent", "--json"])).rows).toEqual([]);
+		const unknown = JSON.parse(readFileSync(receiptPaths[0], "utf8"));
+		unknown.result.writerProvenance.cost_usd = null;
+		unknown.result.writerProvenance.priced = false;
+		writeFileSync(receiptPaths[0], JSON.stringify(unknown));
+		expect(JSON.parse(invoke(["cost", f.directory, "--json"])).total).toMatchObject({
+			cost_usd: null,
+			priced: false,
+		});
+		expect(invoke(["cost", f.directory])).toContain("unknown");
+		rmSync(receiptPaths[0]);
+		const missing = JSON.parse(invoke(["cost", f.directory, "--json"])) as FactoryCostReport;
+		expect(missing.missing).toContain(receiptPaths[0]);
+		expect(missing.total).toMatchObject({ cost_usd: null, usage: null, priced: false });
+		expect(() => invoke(["cost", f.directory, "--ticket"])).toThrow();
+		expect(() => invoke(["cost", f.directory, "--json", "--json"])).toThrow();
+		expect(() => invoke(["status", f.directory, "--json"])).toThrow();
+		expect(() => invoke(["cost", f.directory, "--actor", "owner"])).toThrow();
+	});
+
+	it.each(["missing", "directory"])("reports a %s manifest without losing the other ticket's totals", (failure) => {
+		const f = setup();
+		const plan = JSON.parse(readFileSync(f.planPath, "utf8")) as FactoryPlan;
+		plan.tickets.push({ id: "other-ticket", owner: "owner" });
+		const usage = { input: 10, output: 5, cache_read: 2, cache_write: 1, total: 18 };
+		const cost = { calls: 2, usage, cost_usd: 0.25, priced: true };
+		const paths: string[] = [];
+		plan.actions = plan.tickets.map((ticket, index) => {
+			const outputDirectory = join(f.root, `output-${index}`);
+			mkdirSync(outputDirectory);
+			const path = join(f.root, `manifest-${index}.json`);
+			paths.push(path);
+			const manifest = JSON.stringify({ stage: { kind: "writer" }, outputDirectory });
+			const sha = createHash("sha256").update(manifest).digest("hex");
+			writeFileSync(path, manifest);
+			writeFileSync(
+				join(outputDirectory, "receipt.json"),
+				JSON.stringify({ ticketId: ticket.id, manifestSha256: sha, result: { writerProvenance: cost } }),
+			);
+			return {
+				...plan.actions[0],
+				id: `action-${index}`,
+				ticketId: ticket.id,
+				command: { cwd: f.root, argv: ["execute", path, "permit", sha, "--execute"] },
+			};
+		});
+		writeFileSync(f.planPath, JSON.stringify(plan));
+		invoke(["init", f.directory, f.planPath, "--hosts", f.hostsPath]);
+		unpauseFixture(f.directory);
+		const store = new FactoryStore(join(f.directory, "factory.db"));
+		try {
+			for (const action of plan.actions) {
+				const context = store.claim(action.id, "local-slot")!;
+				store.markSubmitted(context.attempt.id);
+				store.complete({
+					attemptId: context.attempt.id,
+					sourceFingerprint: action.sourceFingerprint,
+					exitCode: 0,
+					finishedAt: new Date().toISOString(),
+				});
+			}
+		} finally {
+			store.close();
+		}
+		rmSync(paths[0]);
+		if (failure === "directory") mkdirSync(paths[0]);
+		const report = JSON.parse(invoke(["cost", f.directory, "--json"])) as FactoryCostReport;
+		expect(report.rows).toEqual([{ ticket: "other-ticket", seat: "writer", ...cost }]);
+		expect(report.unreadable).toHaveLength(1);
+		expect(report.unreadable[0]).toMatchObject({
+			status: "unreadable",
+			ticket: "ticket",
+			seat: "writer",
+			actionId: "action-0",
+			path: paths[0],
+		});
+		expect(report.unreadable[0].reason.length).toBeGreaterThan(0);
+		expect(report.total).toEqual({ calls: 2, usage: null, cost_usd: null, priced: false });
+		expect(report.missing).toEqual([]);
+		const table = invoke(["cost", f.directory]);
+		expect(table).toContain("other-ticket\twriter\t2\t10\t5\t2\t1\t18\t0.25000000\ttrue");
+		expect(table).toContain(`unreadable\t${paths[0]}\t${report.unreadable[0].reason}`);
+		expect(table).toContain("Unreadable rows: 1");
+		const filtered = JSON.parse(
+			invoke(["cost", f.directory, "--ticket", "other-ticket", "--json"]),
+		) as FactoryCostReport;
+		expect(filtered.total).toEqual(cost);
+		expect(filtered.unreadable).toEqual([]);
+		expect(existsSync(f.marker)).toBe(false);
+	});
+
 	it("keeps help independent of SQLite, sessions and daemon startup", () => {
 		const { root } = setup();
 		const help = invoke(["help"], root);
@@ -81,6 +430,9 @@ describe("optional factory CLI", () => {
 		expect(help).toContain("prime factory settle-no-retry");
 		expect(help).toContain("prime factory withdraw");
 		expect(help).toContain("NOT_EXECUTED");
+		expect(help).toContain("recomputes the frontier and runs one scheduling tick");
+		expect(help).toContain("Resume exits 1 for an owner pause, an unaccepted runtime mismatch or idle_with_backlog");
+		expect(help).toContain("decide-typed and manage print the typed result before exiting 1 for drift");
 		expect(existsSync(join(root, ".prime"))).toBe(false);
 		expect(factoryArguments(["factory", "status", "/tmp/test"])).toEqual(["status", "/tmp/test"]);
 		expect(factoryArguments(["help", "factory"])).toEqual(["help"]);
@@ -159,7 +511,7 @@ describe("optional factory CLI", () => {
 	it("requires explicit revision for imports and replays an import token without another revision", () => {
 		const { directory, planPath, hostsPath } = setup();
 		invoke(["init", directory, planPath, "--hosts", hostsPath]);
-		invoke(["resume", directory]);
+		unpauseFixture(directory);
 		expect(() => invoke(["import", directory, planPath])).toThrow();
 		expect(JSON.parse(invoke(["import", directory, planPath, "--expected-revision", "1"])).planRevision).toBe(1);
 		const plan = JSON.parse(readFileSync(planPath, "utf8")) as FactoryPlan;
@@ -174,7 +526,7 @@ describe("optional factory CLI", () => {
 	it("reconciles a proven unsubmitted management request through the CLI without inference or process retry", () => {
 		const { root, directory, marker, planPath, hostsPath } = setup("decision");
 		invoke(["init", directory, planPath, "--hosts", hostsPath]);
-		invoke(["resume", directory]);
+		unpauseFixture(directory);
 		const store = new FactoryStore(join(directory, "factory.db"));
 		let attemptId: string;
 		let wakeId: number;
@@ -277,7 +629,7 @@ describe("optional factory CLI", () => {
 		expect(initialized.paused).toBe(true);
 		expect(JSON.parse(invoke(["tick", directory])).launched).toEqual([]);
 		expect(existsSync(runnerRoot)).toBe(false);
-		invoke(["resume", directory]);
+		expect(invoke(["resume", directory])).toContain("TICKET\tACCEPTED");
 		const server = spawn(process.execPath, [...nodeArgs, factoryEntry, "serve", directory, "--interval-ms", "50"], {
 			cwd: packageRoot,
 			stdio: "ignore",
@@ -303,7 +655,7 @@ describe("optional factory CLI", () => {
 	it("pauses scheduling when its launcher disappears", async () => {
 		const { directory, marker, planPath, hostsPath } = setup();
 		invoke(["init", directory, planPath, "--hosts", hostsPath]);
-		invoke(["resume", directory]);
+		unpauseFixture(directory);
 		const launcher = spawn(
 			process.execPath,
 			[...nodeArgs, cli, "factory", "serve", directory, "--interval-ms", "50"],
@@ -328,7 +680,7 @@ describe("optional factory CLI", () => {
 		const { root, directory, marker, planPath, hostsPath } = setup();
 		const pauseFile = join(root, "OWNER-TRUST-PAUSE.json");
 		invoke(["init", directory, planPath, "--hosts", hostsPath, "--pause-file", pauseFile]);
-		invoke(["resume", directory]);
+		unpauseFixture(directory);
 		writeFileSync(pauseFile, "{}");
 		expect(JSON.parse(invoke(["tick", directory])).paused).toBe(true);
 		expect(existsSync(marker)).toBe(false);
@@ -339,7 +691,7 @@ describe("optional factory CLI", () => {
 	it("leaves semantic acceptance for an explicit evidence-backed decision", async () => {
 		const { directory, runnerRoot, planPath, hostsPath } = setup("decision");
 		invoke(["init", directory, planPath, "--hosts", hostsPath]);
-		invoke(["resume", directory]);
+		unpauseFixture(directory);
 		invoke(["tick", directory]);
 		const state = JSON.parse(invoke(["status", directory])) as FactoryStatus;
 		await waitUntil(() => existsSync(join(runnerRoot, state.attempts[0]!.id, "terminal.json")));

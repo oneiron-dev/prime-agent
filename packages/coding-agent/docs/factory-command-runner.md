@@ -25,9 +25,13 @@ Pass a hosts JSON file to `prime factory init`:
 
 Host keys must match plan slot hosts. SSH uses existing configuration and batch authentication. Job argv and cwd travel as JSON; the adapter never interpolates them into remote shell commands. The configured Python executable receives a fixed standard-library runner. No remote package installation is required.
 
-`init <directory> <plan.json> --hosts <hosts.json>` writes `config.json` and `factory.db` in a new, explicit directory and starts paused. Use `resume`, then `run` or `serve`. Keep runner roots outside source worktrees.
+`init <directory> <plan.json> --hosts <hosts.json>` writes `config.json` and `factory.db` in a new, explicit directory and starts paused. Keep runner roots outside source worktrees.
 
-An optional absolute `--pause-file` blocks every dispatch while that file exists. `resume` cannot remove or override it. `pause` stops future dispatch; already started commands keep running. SIGINT/SIGTERM or loss of the launching CLI persist a local scheduling pause. Resume explicitly after restarting. A hard scheduling-process crash is recovered from the journal.
+`resume <directory>` checks the controller runtime pin, prints and saves ledger catch-up, recomputes the frontier and runs one scheduling tick. It restores pending continuation artifacts without advancing a coordinator turn. It does not re-admit UNCERTAIN attempts. Resume is not a bare unpause; start `run` or `serve` afterward only for continuous scheduling.
+
+Resume exits with code 1 for an external owner pause, an unaccepted runtime mismatch, or `idle_with_backlog` (READY actions remain with none RUNNING after the tick). The idle case records a wake. Use `--accept-runtime-change <reason>` only for an intentional runtime replacement; it journals a new controller pin without rewriting action runtime requirements.
+
+An optional absolute `--pause-file` blocks every dispatch while that file exists. `resume` cannot remove or override it. `pause` stops future dispatch; already started commands keep running. SIGINT/SIGTERM or loss of the launching CLI persist a local scheduling pause. Resume explicitly after restarting to catch up from the journal and attempt one tick, not just clear that pause.
 
 ## Command and custody contract
 

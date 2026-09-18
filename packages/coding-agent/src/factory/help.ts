@@ -2,37 +2,50 @@ export const FACTORY_HELP = `Usage:
   prime factory init <directory> <plan.json> --hosts <hosts.json> [--pause-file <absolute-path>]
   prime factory import <directory> <plan.json> --expected-revision <revision> [--mutation-id <id>]
   prime factory status <directory>
+  prime factory capsule <directory> --action <id> [--json]
+  prime factory cost <directory> [--ticket <id>] [--json]
   prime factory events <directory> [--after <sequence>]
   prime factory fingerprint <host> <absolute-cwd> --hosts <hosts.json> [--timeout-ms <milliseconds>]
   prime factory tick <directory>
   prime factory run <directory> [--interval-ms <milliseconds>]
   prime factory serve <directory> [--interval-ms <milliseconds>]
   prime factory pause <directory> [reason]
-  prime factory resume <directory>
+  prime factory resume <directory> [--accept-runtime-change <reason>]
   prime factory manage <directory> [action-id] [--role ticketOwner] [--evidence <file>] [--apply]
+  prime factory manage <directory> <action-id> --typed-object <absolute-json-file>
   prime factory manage <directory> --watch [--apply] [--evidence-directory <directory>] [--max-requests <count>] [--max-passes <count>] [--interval-ms <milliseconds>]
   prime factory supersede <directory> <rejected-or-abandoned-action> <replacement-action> --expected-revision <revision> --actor <actor> --reason <reason> --ref <evidence>
   prime factory reconcile-management <directory> <request-id> --expected-revision <revision> --actor <actor> --reason <reason> --ref <absolute-reconciliation.json>
   prime factory settle-no-retry <directory> <action-id> --expected-revision <revision> --expected-attempt <id> --actor <actor> --reason <reason> --ref <absolute-settlement.json>
   prime factory withdraw <directory> <action-id> --expected-revision <revision> --actor <actor> --reason <reason> --ref <absolute-withdrawal.json>
   prime factory resolve <directory> <attempt-id> --actor <actor> --reason <reason> --ref <evidence>
+  prime factory decide-typed <directory> <action-id> <type> --object <json-or-@file> [--apply]
   prime factory decide <directory> <action-id> <accept|reject> --actor <actor> --reason <reason> --ref <evidence> [--expected-revision <revision>] [--expected-attempt <id>] [--expected-wake <id>]
 
 Factory mode is optional and runs separately from Prime sessions. State and results are JSON.
-New factories start paused. Resume is explicit and never removes an external owner pause file.
+New factories start paused. Resume checks the runtime pin, prints ledger catch-up, recomputes the frontier and runs one scheduling tick.
+Resume restores pending continuation artifacts but does not advance a coordinator turn or re-admit UNCERTAIN work.
+Resume exits 1 for an owner pause, an unaccepted runtime mismatch or idle_with_backlog; the latter opens a wake.
+Resume never removes an external owner pause file. --accept-runtime-change <reason> explicitly records a new controller runtime pin.
 run/serve stay in the foreground; SIGINT/SIGTERM persist a scheduling pause while detached attempts retain receipts; resume explicitly.
 Each configured host needs Python 3 on a POSIX system. Factory storage needs Node 22.13+ with node:sqlite.
 Hosts JSON: {"local":{"type":"local","runnerRoot":"/absolute/attempts"}}
 SSH host: {"type":"ssh","sshHost":"arch","runnerRoot":"/absolute/attempts","python":"python3"}
 Only foreground commands are supported; daemonized/detached descendants require another adapter.
 Plans use argv arrays and absolute cwd paths. Use fingerprint for verified Git source identity.
+capsule builds a bounded, pinned code-map without running the writer; optional cheap-seat failure uses deterministic evidence.
+cost reads ledger-linked receipts without mutation; unknown usage or prices remain unknown, never zero.
 fingerprint --timeout-ms accepts integers 1..120000 (default 20000 ms); launch and inspect deadlines are unchanged.
 resolve intentionally retries and requires evidence that any previous process tree is gone; it does not kill or inspect it for you.
 settle-no-retry closes proven-dead UNCERTAIN work as ABANDONED with outcome UNKNOWN; use settle-no-retry --help for exact evidence bindings.
 supersede explicitly replaces rejected or abandoned work; it preserves history and does not accept the replacement or dependencies.
 withdraw closes never-claimed QUEUED/READY work as WITHDRAWN with NOT_EXECUTED; use withdraw --help for exact plan/owner/source bindings.
 Neither closure launches work or satisfies dependencies. Withdrawal refuses any attempt history; settlement is not product acceptance.
+decide-typed validates the question-set object and refuses stale ledger_sequence values; @file is limited to 96 KiB before reading.
+Profile drift opens a wake and never applies. decide-typed and manage print the typed result before exiting 1 for drift.
+Typed --apply supports terminal acceptance of a decision action and operator-proven attempt requeue; other types are record-only.
 manage returns a proposal unless --apply is explicit; --watch opts into bounded automatic wake handling, separate from serve.
+manage --typed-object invokes Jev and the band advisor on a validated object; records only, then apply through decide-typed.
 Automatic handling needs exact per-wake evidence bindings. Requests are durably consumed, including defer/errors; crashes never authorize replay.
 Plan mutations wait for active/unconsumed judgments; no-op imports keep the revision. Rebind pending wakes after real mutations.
 reconcile-management requires hash-verified actor/provider/output receipts; UNKNOWN, missing PID and timeout never authorize replay.
@@ -40,8 +53,11 @@ Opaque source fingerprints are labels only; use an explicit validating wrapper f
 
 export const FACTORY_MANAGE_HELP = `Usage:
   prime-agent factory manage <directory> [action-id] [--role ticketOwner] [--evidence <file>] [--apply]
+  prime-agent factory manage <directory> <action-id> --typed-object <absolute-json-file>
   prime-agent factory manage <directory> --watch [--role ticketOwner] [--apply] [--evidence-directory <directory>] [--max-requests <count>] [--max-passes <count>] [--interval-ms <milliseconds>]
 
+--typed-object records a Jev/advisor decision, never text management or automatic application; resolve DEFERRED via decide-typed.
+Profile drift prints the typed result and exits 1 without applying; this also sets the exit code for --watch.
 Reviews one wake by default; --watch consumes bound judgment wakes in a separate foreground process, never inside serve.
 Proposes unless --apply is explicit. A cached proposal can be applied without another model call. Defer/error preserves the wake and consumes that context.
 Automatic evidence: <directory>/management-evidence/<wake-id>.json, or --evidence-directory. See factory.md for the exact hash-validated envelope.

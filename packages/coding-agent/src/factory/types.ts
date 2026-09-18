@@ -1,3 +1,6 @@
+import type { FactoryFilePin } from "./runtime.js";
+import type { FactoryCallCost } from "./usage.js";
+
 /** Portable factory contracts. Host, model and UI integrations live outside this module. */
 export interface TicketSpec {
 	id: string;
@@ -21,7 +24,7 @@ export interface ActionSpec {
 	/** Only process actions may be accepted by a successful command alone. */
 	kind: "process" | "decision";
 	command: { argv: string[]; cwd: string; timeoutMs?: number; env?: Record<string, string> };
-	requirements: { host?: string; slotId?: string; capabilities?: string[] };
+	requirements: { runtime?: FactoryFilePin; host?: string; slotId?: string; capabilities?: string[] };
 }
 
 export interface FactoryPlan {
@@ -62,6 +65,23 @@ export interface ArtifactReference {
 	ref: string;
 	sourceFingerprint: string;
 }
+export interface FactoryCapsuleReceipt {
+	pin: { path: string; sha256: string };
+	head: string;
+	packet: { path: string; sha256: string };
+	capsule_seat: string;
+	bytes: number;
+	accounting: FactoryCallCost;
+	wall_clock_ms: number;
+}
+export interface FactoryCapsuleFailure {
+	capsule_seat: "none";
+	bytes: 0;
+	failure: string;
+	wall_clock_ms: number;
+	accounting: FactoryCallCost;
+}
+export type FactoryCapsuleRecord = FactoryCapsuleReceipt | FactoryCapsuleFailure;
 export interface CompletionReceipt {
 	attemptId: string;
 	sourceFingerprint: string;
@@ -81,16 +101,18 @@ export interface AttemptRecord {
 	receipt: CompletionReceipt | null;
 	uncertainty: string | null;
 	claimReleased: boolean;
+	capsule_sha256?: string | null;
 }
 export interface AttemptContext {
 	attempt: AttemptRecord;
 	action: ActionRecord;
 	slot: SlotSpec;
+	runtime?: FactoryFilePin;
 }
 export type Inspection =
 	| { kind: "running"; processIdentity: string }
 	| { kind: "terminal"; receipt: CompletionReceipt }
-	| { kind: "uncertain"; reason: string };
+	| { kind: "uncertain"; reason: string; runtimeMismatch?: true };
 export interface FactoryAdapter {
 	/** The store records submission intent before calling launch. Launch must use attempt.id as its durable identity. */
 	launch(context: AttemptContext): Promise<Inspection>;

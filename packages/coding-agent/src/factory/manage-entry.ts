@@ -2,6 +2,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createPrimeManagementCaller } from "./adapters/prime-management.js";
 import { readFactoryConfig } from "./config.js";
+import { type FactoryDecision, validateDecision } from "./decisions.js";
 import { FactoryEngine } from "./engine.js";
 import { assertByteLimit, FACTORY_EVIDENCE_LIMITS, validateManagementEvidence } from "./evidence.js";
 import { FACTORY_MANAGE_HELP } from "./help.js";
@@ -37,9 +38,15 @@ async function main(args: string[]): Promise<void> {
 			continue;
 		}
 		if (
-			["--role", "--evidence", "--evidence-directory", "--max-requests", "--max-passes", "--interval-ms"].includes(
-				arg,
-			)
+			[
+				"--typed-object",
+				"--role",
+				"--evidence",
+				"--evidence-directory",
+				"--max-requests",
+				"--max-passes",
+				"--interval-ms",
+			].includes(arg)
 		) {
 			const value = args[++index];
 			if (!value || value.startsWith("--")) throw new Error(`Missing value for ${arg}`);
@@ -70,6 +77,19 @@ async function main(args: string[]): Promise<void> {
 		["--evidence-directory", "--max-requests", "--max-passes", "--interval-ms"].some((option) => values.has(option))
 	)
 		throw new Error("Automatic management options require --watch");
+	const typedPath = values.get("--typed-object");
+	if (typedPath && (watch || flags.has("--apply") || positional.length !== 2))
+		throw new Error("--typed-object requires one action, without --watch or --apply; apply through decide-typed");
+	let typedDecision: FactoryDecision | undefined;
+	if (typedPath) {
+		const path = resolve(typedPath);
+		const info = statSync(path);
+		if (!info.isFile()) throw new Error("--typed-object requires a regular JSON file");
+		assertByteLimit("decision", info.size, FACTORY_EVIDENCE_LIMITS.packetBytes);
+		const bytes = readFileSync(path);
+		assertByteLimit("decision", bytes.length, FACTORY_EVIDENCE_LIMITS.packetBytes);
+		typedDecision = validateDecision(JSON.parse(bytes.toString("utf8")));
+	}
 	validateManagementEvidence(evidence);
 	const directory = resolve(positional[0]);
 	const config = readFactoryConfig(directory);
@@ -102,17 +122,20 @@ async function main(args: string[]): Promise<void> {
 					signal: controller.signal,
 				},
 				createPrimeManagementCaller,
-				(result) => console.log(JSON.stringify(result)),
+				(result) => {
+					console.log(JSON.stringify(result));
+					if (result.kind === "drift") process.exitCode = 1;
+				},
 			);
 			console.log(JSON.stringify({ kind: "watch-finished", ...summary }));
 		} else {
 			const result = await manageFactoryWake(
 				engine,
-				{ ...options, actionId: positional[1], evidence },
+				{ ...options, actionId: positional[1], evidence, typedDecision },
 				createPrimeManagementCaller,
 			);
 			console.log(JSON.stringify(result, null, 2));
-			if (result.kind === "error") process.exitCode = 1;
+			if (result.kind === "error" || result.kind === "drift") process.exitCode = 1;
 		}
 	} finally {
 		process.off("SIGINT", stop);

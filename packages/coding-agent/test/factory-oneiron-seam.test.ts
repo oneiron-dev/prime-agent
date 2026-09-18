@@ -34,6 +34,8 @@ import {
 import { hashFactoryRuntimeFile } from "../src/factory/runtime.js";
 import { FactoryStore } from "../src/factory/store.js";
 
+import { admitRuntimeFixture } from "./factory-runtime-fixture.js";
+
 const roots: string[] = [];
 const stores = new Set<FactoryStore>();
 const originalPath = process.env.PATH;
@@ -233,12 +235,19 @@ async function fixture() {
 	const factoryRuntime = pin(directory, "factory-runtime.json", {
 		version: 1,
 		cliArgv: [process.execPath, pinnedCli],
-		files: [process.execPath, pinnedCli, entry, resolve("src/factory/adapters/oneiron.ts")].map((path) => ({
+		files: [
+			process.execPath,
+			pinnedCli,
+			entry,
+			resolve("src/factory/adapters/oneiron.ts"),
+			resolve("src/factory/runtime.ts"),
+		].map((path) => ({
 			path,
 			sha256: hashFactoryRuntimeFile(path),
 		})),
 		capabilities: ["provider-response-model-v1"],
 	});
+	admitRuntimeFixture(factoryRuntime);
 	const manifest: OneironManifest = {
 		version: 1,
 		ticketId: "FIXTURE-1",
@@ -354,6 +363,8 @@ function mockAcceptance() {
 		expect(stage.productAccepted).toBe(false);
 		return {
 			model: "mock-acceptance",
+			responseModel: "mock-acceptance",
+			responseModelSource: "provider-response" as const,
 			text: JSON.stringify({
 				version: 1,
 				actionId: packet.action.id,
@@ -463,6 +474,7 @@ describe("Oneiron foreground command to durable automatic management seam", () =
 			oneironSha(JSON.stringify([{ ref: binding.evidence[0].ref, sha256: binding.evidence[0].sha256 }])),
 		);
 		expect(readdirSync(join(options.directory, "decisions", request.id)).sort()).toEqual([
+			"decision.json",
 			"proposal.json",
 			"request.json",
 			"response.json",
@@ -481,7 +493,7 @@ describe("Oneiron foreground command to durable automatic management seam", () =
 		expect((await f.adapter.launch(recovered.context(attempt.id))).kind).toBe("terminal");
 		expect(recovered.attempts()).toHaveLength(1);
 		expect(recovered.managementRequests()).toHaveLength(1);
-		expect(recovered.events().filter((event) => event.kind === "action_decided")).toHaveLength(1);
+		expect(recovered.eventsOfKind("action_decided")).toHaveLength(1);
 		expect(readdirSync(f.host.runnerRoot)).toEqual([attempt.id]);
 		expect(model.invoke).toHaveBeenCalledTimes(1);
 	}, 30000);

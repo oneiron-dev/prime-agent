@@ -8,6 +8,7 @@ import type { ManagementPacket, ManagementReconciliation, ManagementRequest } fr
 import { type ManagementCallerFactory, manageFactoryWake } from "../src/factory/management-dispatch.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { FactoryAdapter, FactoryPlan } from "../src/factory/types.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 const directories: string[] = [];
 const stores: FactoryStore[] = [];
@@ -53,7 +54,7 @@ async function fixture() {
 			acceptanceCriteria: ["Exact review passed"],
 			sourceFingerprint: id,
 			command: { argv: ["fixture"], cwd: directory },
-			requirements: {},
+			requirements: { runtime: fixtureRuntimePin },
 		})),
 		roles: { ticketOwner: { provider: "mock", model: "mock" } },
 	};
@@ -74,6 +75,8 @@ function model(decision: "accept" | "defer", pending?: Promise<void>): Managemen
 		const packet = JSON.parse(serialized) as ManagementPacket;
 		return {
 			model: "mock",
+			responseModel: "mock",
+			responseModelSource: "provider-response" as const,
 			text: JSON.stringify({
 				version: 1,
 				actionId: packet.action.id,
@@ -153,9 +156,7 @@ test("serializes actual global mutations against CLAIMED and latest unresolved P
 		).kind,
 	).toBe("applied");
 	expect(other.applyPlan(changedPlan, 1, "next-stage")).toBe(2);
-	const event = f.store
-		.events(0, 100)
-		.find((item) => item.kind === "plan_applied" && item.detail.mutationId === "next-stage")!;
+	const event = f.store.eventsOfKind("plan_applied").find((item) => item.detail.mutationId === "next-stage")!;
 	expect(event.detail.previousRevision).toBe(1);
 	expect(event.detail.invalidatedWakeIds).toEqual(
 		f.store
@@ -288,11 +289,9 @@ test("handles proven no-submission recovery without fabricated output and permit
 	expect(f.store.actions()[0].state).toBe("ACCEPTED");
 	expect(f.store.attempts()).toHaveLength(4);
 	expect(f.store.managementRequests()).toHaveLength(1);
-	expect(
-		f.store
-			.events(0, 100)
-			.some((event) => event.kind === "management_reconciled" && event.detail.previousState === "CLAIMED"),
-	).toBe(true);
+	expect(f.store.eventsOfKind("management_reconciled").some((event) => event.detail.previousState === "CLAIMED")).toBe(
+		true,
+	);
 });
 
 test.each(["defer", "error"])(

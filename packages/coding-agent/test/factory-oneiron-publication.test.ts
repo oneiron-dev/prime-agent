@@ -10,6 +10,12 @@ import {
 	publishOneiron,
 } from "../src/factory/adapters/oneiron-publication.js";
 import { type OneironPin, oneironSha } from "../src/factory/adapters/oneiron-review.js";
+import {
+	codeDecisionBase,
+	type FactoryDecision,
+	mergeGatePredicate,
+	validateDecision,
+} from "../src/factory/decisions.js";
 import { factoryOwnedEnvironment } from "../src/factory/runtime.js";
 
 const roots: string[] = [];
@@ -257,4 +263,23 @@ describe("Oneiron native single-PR controlled publication", () => {
 		expect(() => invoke(valid)).toThrow();
 		expect(existsSync(guard.receipt)).toBe(false);
 	});
+});
+
+test("records publication separately from unproven merge approval", async () => {
+	const f = setup(),
+		rows: FactoryDecision[] = [];
+	const result = await publishOneiron(f.manifest, f.stage, f.run, readOneironPin, {
+		base: codeDecisionBase(4, "publication"),
+		attemptId: "attempt",
+		record: (d) => {
+			rows.push(validateDecision(d));
+		},
+	});
+	expect(result.pushed).toBe(true);
+	expect(rows[0].type).toBe("merge_gate_predicate");
+	if (rows[0].type !== "merge_gate_predicate") throw new Error("wrong decision");
+	expect(mergeGatePredicate(rows[0])).toMatchObject({ result: false });
+	expect(rows[0].owner_hold).toBeNull();
+	expect(mergeGatePredicate(rows[0]).failing_clauses).toContain("no_owner_hold");
+	expect(rows[0].provenance).toEqual({ signed: true, base_main_proof: null });
 });

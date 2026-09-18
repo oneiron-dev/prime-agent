@@ -1,9 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
+import {
+	codeDecisionBase,
+	type DecisionReceipt,
+	decisionProfilesMatch,
+	type FactoryDecision,
+	operatorDecisionBase,
+	recordDecision,
+} from "./decisions.js";
+import { CAPSULE_FAILURE_MAX_LENGTH, validateArtifactPin } from "./evidence.js";
 import type { ManagementClaim, ManagementReconciliation, ManagementRequest, ManagementResult } from "./management.js";
+import { type FactoryFilePin, factoryRuntimeMismatchCheck } from "./runtime.js";
 import type {
 	ActionRecord,
 	ActionSpec,
@@ -12,6 +22,8 @@ import type {
 	AttemptRecord,
 	CompletionReceipt,
 	DecisionEvidence,
+	FactoryCapsuleReceipt,
+	FactoryCapsuleRecord,
 	FactoryEvent,
 	FactoryPlan,
 	FactoryStatus,
@@ -21,9 +33,10 @@ import type {
 	TicketRecord,
 	WakeRecord,
 } from "./types.js";
+import { readFactoryUsage } from "./usage.js";
 
 type Row = Record<string, unknown>;
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const now = (): string => new Date().toISOString();
 function decode<T>(value: unknown): T {
 	return JSON.parse(String(value)) as T;
@@ -46,6 +59,62 @@ function settlementProof(proof: { ref: string; sha256: string }): string {
 	if (bytes.length > 1000000 || createHash("sha256").update(bytes).digest("hex") !== proof.sha256)
 		throw new Error(`Settlement artifact hash mismatch: ${proof.ref}`);
 	return bytes.toString("utf8");
+}
+function validateCapsuleAccounting(cost: FactoryCapsuleRecord["accounting"]): void {
+	if (
+		!cost ||
+		!Number.isSafeInteger(cost.calls) ||
+		cost.calls < 0 ||
+		typeof cost.priced !== "boolean" ||
+		(cost.cost_usd !== null && (!Number.isFinite(cost.cost_usd) || cost.cost_usd < 0)) ||
+		(cost.priced && cost.cost_usd === null) ||
+		(cost.usage !== null && !readFactoryUsage(cost.usage))
+	)
+		throw new Error("Invalid capsule accounting");
+}
+function validateCapsuleReceipt(receipt: FactoryCapsuleReceipt): void {
+	validateArtifactPin(receipt.pin, "capsule.pin");
+	validateArtifactPin(receipt.packet, "capsule.packet");
+	required(receipt.head, "capsule.head");
+	required(receipt.capsule_seat, "capsule.capsule_seat");
+	const limit = 64 * 1024;
+	if (!Number.isSafeInteger(receipt.bytes) || receipt.bytes < 1 || receipt.bytes > limit)
+		throw new Error("Capsule bytes must be within 1..65536");
+	if (!Number.isFinite(receipt.wall_clock_ms) || receipt.wall_clock_ms < 0)
+		throw new Error("Invalid capsule wall_clock_ms");
+	const fd = openSync(receipt.pin.path, constants.O_RDONLY | constants.O_NONBLOCK);
+	let bytes: Buffer;
+	try {
+		const info = fstatSync(fd);
+		if (!info.isFile() || info.size > limit) throw new Error("Capsule must be a regular file of at most 65536 bytes");
+		const buffer = Buffer.alloc(limit + 1);
+		let length = 0;
+		while (length < buffer.length) {
+			const count = readSync(fd, buffer, length, buffer.length - length, null);
+			if (count === 0) break;
+			length += count;
+		}
+		if (length > limit || length !== receipt.bytes) throw new Error("Capsule byte count mismatch");
+		bytes = buffer.subarray(0, length);
+	} finally {
+		closeSync(fd);
+	}
+	if (createHash("sha256").update(bytes).digest("hex") !== receipt.pin.sha256)
+		throw new Error("Capsule pin hash mismatch");
+	const capsule: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+	if (
+		!capsule ||
+		typeof capsule !== "object" ||
+		!("version" in capsule) ||
+		capsule.version !== 1 ||
+		!("head" in capsule) ||
+		capsule.head !== receipt.head ||
+		!("packet" in capsule) ||
+		!isDeepStrictEqual(capsule.packet, receipt.packet) ||
+		!("capsule_seat" in capsule) ||
+		capsule.capsule_seat !== receipt.capsule_seat
+	)
+		throw new Error("Capsule JSON metadata does not match receipt");
 }
 /** Checks operator-supplied evidence, not remote process liveness. Missing PID or timeout alone is not proof. */
 function verifySettlement(settlement: NonRetrySettlement): void {
@@ -185,7 +254,11 @@ function validatePlan(plan: FactoryPlan): void {
 /** A short-transaction journal. No process, session, model or transport is owned here. */
 export class FactoryStore {
 	private readonly db: DatabaseSync;
+	readonly directory: string;
+	private inTransaction = false;
+	private commitEffects: Array<() => void> = [];
 	constructor(path: string) {
+		this.directory = dirname(path);
 		this.db = new DatabaseSync(path);
 		this.db.exec(
 			"PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
@@ -194,7 +267,7 @@ export class FactoryStore {
 			this.transaction(() => {
 				this.db.exec("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
 				const version = this.meta("schema_version");
-				if (version !== undefined && Number(version) !== SCHEMA_VERSION)
+				if (version !== undefined && ![1, SCHEMA_VERSION].includes(Number(version)))
 					throw new Error(`Unsupported factory schema version ${version}`);
 				this.db.exec(`
 					CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, owner TEXT NOT NULL, state TEXT NOT NULL);
@@ -208,10 +281,21 @@ export class FactoryStore {
 					CREATE TABLE IF NOT EXISTS events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, action_id TEXT, attempt_id TEXT, detail TEXT NOT NULL);
 					CREATE TABLE IF NOT EXISTS wakes (id INTEGER PRIMARY KEY AUTOINCREMENT, action_id TEXT NOT NULL, attempt_id TEXT, reason TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT);
 					CREATE UNIQUE INDEX IF NOT EXISTS wakes_attempt_open ON wakes(attempt_id) WHERE resolved_at IS NULL;
-					CREATE TABLE IF NOT EXISTS management_requests (id TEXT PRIMARY KEY, wake_id INTEGER NOT NULL REFERENCES wakes(id), action_id TEXT NOT NULL, attempt_id TEXT NOT NULL, plan_revision INTEGER NOT NULL, evidence_sha256 TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL, result TEXT, error TEXT, UNIQUE(wake_id,plan_revision,attempt_id,evidence_sha256));
+					CREATE INDEX IF NOT EXISTS wakes_open_reason ON wakes(reason) WHERE resolved_at IS NULL;
+					CREATE TABLE IF NOT EXISTS management_requests (id TEXT PRIMARY KEY, wake_id INTEGER REFERENCES wakes(id), action_id TEXT NOT NULL, attempt_id TEXT NOT NULL, plan_revision INTEGER NOT NULL, evidence_sha256 TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL, result TEXT, error TEXT, UNIQUE(wake_id,plan_revision,attempt_id,evidence_sha256));
 					CREATE UNIQUE INDEX IF NOT EXISTS management_wake_inflight ON management_requests(wake_id) WHERE state='CLAIMED';
 					CREATE TABLE IF NOT EXISTS plan_mutations (id TEXT PRIMARY KEY, payload_sha256 TEXT NOT NULL, previous_revision INTEGER NOT NULL, revision INTEGER NOT NULL);
 				`);
+				if (version === "1") {
+					this.db.exec(`
+						ALTER TABLE management_requests RENAME TO management_requests_v1;
+						DROP INDEX management_wake_inflight;
+						CREATE TABLE management_requests (id TEXT PRIMARY KEY, wake_id INTEGER REFERENCES wakes(id), action_id TEXT NOT NULL, attempt_id TEXT NOT NULL, plan_revision INTEGER NOT NULL, evidence_sha256 TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL, result TEXT, error TEXT, UNIQUE(wake_id,plan_revision,attempt_id,evidence_sha256));
+						INSERT INTO management_requests SELECT * FROM management_requests_v1;
+						DROP TABLE management_requests_v1;
+						CREATE UNIQUE INDEX management_wake_inflight ON management_requests(wake_id) WHERE state='CLAIMED';
+					`);
+				}
 				this.setMeta("schema_version", String(SCHEMA_VERSION));
 				if (this.meta("plan_revision") === undefined) this.setMeta("plan_revision", "0");
 				if (this.meta("paused") === undefined) this.setMeta("paused", "false");
@@ -225,15 +309,32 @@ export class FactoryStore {
 		this.db.close();
 	}
 	private transaction<T>(fn: () => T): T {
+		if (this.inTransaction) return fn();
 		this.db.exec("BEGIN IMMEDIATE");
+		this.inTransaction = true;
+		let value: T;
 		try {
-			const value = fn();
+			value = fn();
 			this.db.exec("COMMIT");
-			return value;
 		} catch (error) {
+			this.commitEffects = [];
 			this.db.exec("ROLLBACK");
 			throw error;
+		} finally {
+			this.inTransaction = false;
 		}
+		const effects = this.commitEffects.splice(0);
+		for (const effect of effects) effect();
+		return value;
+	}
+	afterDecisionCommit(effect: () => void): void {
+		if (!this.inTransaction) throw new Error("Decision receipt requires a journal transaction");
+		this.commitEffects.push(effect);
+	}
+	recordDecisionPublicationFailure(actionId: string, requestId: string, path: string, error: string): void {
+		this.transaction(() => {
+			this.event("decision_receipt_unpublished", actionId, null, { request_id: requestId, path, error });
+		});
 	}
 	private meta(key: string): string | undefined {
 		const row = this.db.prepare("SELECT value FROM metadata WHERE key=?").get(key);
@@ -254,8 +355,151 @@ export class FactoryStore {
 			.prepare("INSERT INTO events(at,kind,action_id,attempt_id,detail) VALUES(?,?,?,?,?)")
 			.run(now(), kind, actionId, attemptId, JSON.stringify(detail));
 	}
+	recordCapsule(actionId: string, attemptId: string | null, receipt: FactoryCapsuleRecord): void {
+		this.transaction(() => {
+			if (!this.action(actionId)) throw new Error(`Unknown action ${actionId}`);
+			if (attemptId !== null) {
+				const { attempt, action } = this.context(attemptId);
+				const latest = this.db
+					.prepare("SELECT id FROM attempts WHERE action_id=? ORDER BY rowid DESC LIMIT 1")
+					.get(actionId);
+				if (
+					action.id !== actionId ||
+					latest?.id !== attemptId ||
+					attempt.claimReleased ||
+					!["SUBMITTED", "RUNNING"].includes(attempt.state)
+				)
+					throw new Error("Capsule requires the current live claimed attempt for this action");
+				if (this.db.prepare("SELECT 1 FROM events WHERE kind='capsule_built' AND attempt_id=?").get(attemptId))
+					throw new Error("Capsule already bound to attempt");
+			}
+			validateCapsuleAccounting(receipt.accounting);
+			if ("failure" in receipt) {
+				if (
+					receipt.capsule_seat !== "none" ||
+					receipt.bytes !== 0 ||
+					typeof receipt.failure !== "string" ||
+					!receipt.failure.trim() ||
+					receipt.failure.length > CAPSULE_FAILURE_MAX_LENGTH ||
+					/[\u0000-\u001f\u007f]/u.test(receipt.failure) ||
+					!Number.isFinite(receipt.wall_clock_ms) ||
+					receipt.wall_clock_ms < 0
+				)
+					throw new Error("Invalid capsule failure");
+				this.event("capsule_built", actionId, attemptId, { ...receipt });
+			} else {
+				validateCapsuleReceipt(receipt);
+				this.event("capsule_built", actionId, attemptId, { ...receipt, capsule_sha256: receipt.pin.sha256 });
+			}
+		});
+	}
+	ledgerSequence(actionId?: string): number {
+		const row =
+			actionId === undefined
+				? this.db.prepare("SELECT MAX(sequence) AS sequence FROM events").get()
+				: this.db.prepare("SELECT MAX(sequence) AS sequence FROM events WHERE action_id=?").get(actionId);
+		return Number(row?.sequence ?? 0);
+	}
+	commitTypedDecision(
+		actionId: string,
+		decision: FactoryDecision,
+		requestId: string,
+		staleCheck: boolean,
+		write: () => DecisionReceipt,
+		submittedBy: FactoryDecision["decided_by"],
+	): DecisionReceipt {
+		return this.transaction(() => {
+			if (!this.action(actionId)) throw new Error(`Unknown action ${actionId}`);
+			const last = this.ledgerSequence(actionId),
+				current = this.ledgerSequence();
+			if (staleCheck && (decision.ledger_sequence < last || decision.ledger_sequence > current))
+				throw new Error(
+					`Decision ledger_sequence ${decision.ledger_sequence}; action last event ${last}; ledger sequence ${current}`,
+				);
+			const existing = this.db.prepare("SELECT action_id,state FROM management_requests WHERE id=?").get(requestId);
+			if (existing && (existing.action_id !== actionId || existing.state !== "CLAIMED"))
+				throw new Error("Decision request binding changed");
+			const receipt = write();
+			const attemptId =
+				"attempt_id" in decision
+					? decision.attempt_id
+					: (this.attempts()
+							.filter((a) => a.actionId === actionId)
+							.at(-1)?.id ?? null);
+			if (existing)
+				this.db
+					.prepare("UPDATE management_requests SET result=? WHERE id=?")
+					.run(JSON.stringify(receipt), requestId);
+			else
+				this.db
+					.prepare(
+						"INSERT INTO management_requests(id,wake_id,action_id,attempt_id,plan_revision,evidence_sha256,created_at,state,result) VALUES(?,NULL,?,?,?,?,?,'RECORDED',?)",
+					)
+					.run(
+						requestId,
+						actionId,
+						attemptId ?? "",
+						Number(this.meta("plan_revision")),
+						createHash("sha256").update(JSON.stringify(decision)).digest("hex"),
+						now(),
+						JSON.stringify(receipt),
+					);
+			if (receipt.source_request_id) {
+				const source = this.db
+					.prepare("SELECT action_id,state,result FROM management_requests WHERE id=?")
+					.get(receipt.source_request_id);
+				if (source?.action_id !== actionId || source.state !== "APPLIED")
+					throw new Error("Typed application source request changed");
+				const result = decode<ManagementResult>(source.result);
+				this.db
+					.prepare("UPDATE management_requests SET result=? WHERE id=?")
+					.run(JSON.stringify({ ...result, typedDecision: receipt }), receipt.source_request_id);
+			}
+			if (!decisionProfilesMatch(decision)) {
+				this.event("profile_drift", actionId, attemptId, {
+					request_id: requestId,
+					requested_profile: decision.requested_profile,
+					served_profile: decision.served_profile,
+				});
+				this.db
+					.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
+					.run(actionId, `profile_drift: ${requestId}`, now());
+			}
+			if (receipt.outcome === "DEFERRED") {
+				this.db
+					.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
+					.run(actionId, `typed_decision_deferred: ${requestId}: ${decision.reason}`, now());
+			}
+			if (existing && receipt.question_set) {
+				const state =
+					receipt.outcome === "DEFERRED" ? "DEFERRED" : !decisionProfilesMatch(decision) ? "DRIFT" : "PROPOSED";
+				this.db.prepare("UPDATE management_requests SET state=? WHERE id=?").run(state, requestId);
+				this.event("management_finished", actionId, attemptId, { id: requestId, state, error: null });
+			}
+			this.event("decision", actionId, attemptId, {
+				...decision,
+				submitted_by: submittedBy,
+				...(receipt.question_set ? { outcome: receipt.outcome, question_set: receipt.question_set } : {}),
+				request_id: requestId,
+				...(receipt.source_request_id ? { source_request_id: receipt.source_request_id } : {}),
+				applied: receipt.applied,
+				...(receipt.predicate ? { predicate: receipt.predicate } : {}),
+			});
+			return receipt;
+		});
+	}
+	typedDecisions(): DecisionReceipt[] {
+		return this.db
+			.prepare("SELECT result FROM management_requests WHERE wake_id IS NULL ORDER BY rowid")
+			.all()
+			.map((row) => decode<DecisionReceipt>(row.result));
+	}
 	isPaused(): boolean {
 		return this.meta("paused") === "true";
+	}
+	runtimePin(): FactoryFilePin | undefined {
+		const value = this.meta("runtime_pin");
+		return value === undefined ? undefined : decode<FactoryFilePin>(value);
 	}
 	pause(reason: string): void {
 		required(reason, "pause reason");
@@ -269,11 +513,54 @@ export class FactoryStore {
 		this.transaction(() => {
 			this.setMeta("paused", "false");
 			this.setMeta("pause_reason", "");
-			this.event("resumed", null, null);
+			this.event("scheduling_unpaused", null, null);
+		});
+	}
+	lastResumeSequence(): number {
+		const row = this.db
+			.prepare("SELECT sequence,detail FROM events WHERE kind='resumed' ORDER BY sequence DESC LIMIT 1")
+			.get();
+		return row ? Number(decode<Record<string, unknown>>(row.detail).catch_up_through ?? row.sequence) : 0;
+	}
+	repinRuntime(runtime: FactoryFilePin, reason: string): void {
+		required(reason, "runtime change reason");
+		this.transaction(() => {
+			const previous = this.runtimePin();
+			this.setMeta("runtime_pin", JSON.stringify(runtime));
+			this.event("runtime_changed", null, null, { previous, runtime, reason });
+		});
+	}
+	pendingResumeRequests(): { id: string; actionId: string; state: string }[] {
+		return this.db
+			.prepare(`SELECT r.id,r.action_id,r.state FROM management_requests r
+			JOIN actions a ON a.id=r.action_id LEFT JOIN wakes w ON w.id=r.wake_id
+			WHERE r.state IN ('CLAIMED','PROPOSED','DRIFT','DEFERRED')
+			AND a.state NOT IN ('ACCEPTED','REJECTED','WITHDRAWN')
+			AND w.resolved_at IS NULL
+			AND COALESCE(json_extract(r.result,'$.applied'),0)=0 ORDER BY r.rowid`)
+			.all()
+			.map((row) => ({ id: String(row.id), actionId: String(row.action_id), state: String(row.state) }));
+	}
+	recordResumed(detail: Record<string, unknown>, idleActionId?: string): void {
+		this.transaction(() => {
+			if (idleActionId) {
+				this.event("idle_with_backlog", idleActionId, null, { counts: detail.counts });
+				const reason = `idle_with_backlog: ${JSON.stringify(detail.counts)}`;
+				if (this.openWakeIdForReason(reason) === undefined)
+					this.db
+						.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
+						.run(idleActionId, reason, now());
+			}
+			this.event("resumed", null, null, detail);
 		});
 	}
 	/** Add/upsert a plan; omitted records remain. Started actions and all source fingerprints are immutable. */
-	applyPlan(plan: FactoryPlan, expectedRevision?: number, mutationId?: string): number {
+	applyPlan(
+		plan: FactoryPlan,
+		expectedRevision?: number,
+		mutationId?: string,
+		initialRuntime?: FactoryFilePin,
+	): number {
 		validatePlan(plan);
 		if (mutationId !== undefined) {
 			required(mutationId, "mutationId");
@@ -294,6 +581,11 @@ export class FactoryStore {
 			const revision = Number(this.meta("plan_revision"));
 			if (expectedRevision !== undefined && revision !== expectedRevision)
 				throw new Error("Factory plan revision changed");
+			const runtime = initialRuntime;
+			if (revision === 0 && runtime) {
+				this.setMeta("runtime_pin", JSON.stringify(runtime));
+				this.event("runtime_pinned", null, null, { runtime });
+			}
 			const existing = this.actions();
 			const unchanged =
 				revision > 0 &&
@@ -448,6 +740,9 @@ export class FactoryStore {
 			.map((r) => decode<SlotSpec>(r.spec));
 	}
 	private attemptRecord(r: Row): AttemptRecord {
+		const capsule = this.db
+			.prepare("SELECT detail FROM events WHERE kind='capsule_built' AND attempt_id=? AND action_id=?")
+			.get(String(r.id), String(r.action_id));
 		return {
 			id: String(r.id),
 			actionId: String(r.action_id),
@@ -459,6 +754,9 @@ export class FactoryStore {
 			receipt: r.receipt === null ? null : decode<CompletionReceipt>(r.receipt),
 			uncertainty: r.uncertainty === null ? null : String(r.uncertainty),
 			claimReleased: Number(r.claim_released) === 1,
+			...(capsule
+				? { capsule_sha256: decode<{ capsule_sha256?: string }>(capsule.detail).capsule_sha256 ?? null }
+				: {}),
 		};
 	}
 	attempts(activeOnly = false): AttemptRecord[] {
@@ -482,7 +780,7 @@ export class FactoryStore {
 		const action = this.action(attempt.actionId);
 		const slot = this.slot(attempt.slotId);
 		if (!action || !slot) throw new Error("Corrupt factory attempt references");
-		return { attempt, action, slot };
+		return { attempt, action, slot, runtime: this.runtimePin() };
 	}
 	/** Atomically claims action, slot and declared host/cwd. Paths are lexical identities, not symlink resolution. */
 	claim(actionId: string, slotId: string): AttemptContext | undefined {
@@ -512,6 +810,32 @@ export class FactoryStore {
 					.get(slot.host, action.command.cwd)
 			)
 				return undefined;
+			recordDecision(
+				this,
+				actionId,
+				{
+					...codeDecisionBase(
+						this.ledgerSequence(),
+						"Slot matches host, slot, capabilities and exclusive workspace custody",
+					),
+					type: "build_host",
+					portable: !action.requirements.host,
+					platform_specific_proof: action.requirements.host ?? null,
+					candidate_fingerprint: action.sourceFingerprint,
+					forbidden_replay_of: null,
+					hosts: [
+						{
+							host: slot.host,
+							slot: slot.id,
+							free: true,
+							staged_workspace: null,
+							warm_cache: null,
+							receipt_age_s: null,
+						},
+					],
+				},
+				{ applied: true },
+			);
 			const id = randomUUID();
 			this.db
 				.prepare("INSERT INTO attempts(id,action_id,slot_id,state,created_at) VALUES(?,?,?,'PREPARED',?)")
@@ -568,7 +892,7 @@ export class FactoryStore {
 			this.event("attempt_running", action.id, attemptId, { processIdentity });
 		});
 	}
-	private uncertainInternal(attemptId: string, reason: string): void {
+	private uncertainInternal(attemptId: string, reason: string, runtimeMismatch = false): void {
 		const { attempt, action } = this.context(attemptId);
 		if (attempt.claimReleased || attempt.state === "PREPARED") return;
 		if (attempt.state === "UNCERTAIN" && attempt.uncertainty === reason) return;
@@ -577,11 +901,19 @@ export class FactoryStore {
 		this.db
 			.prepare("INSERT OR IGNORE INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,?,?,?)")
 			.run(action.id, attemptId, reason, now());
-		this.event("attempt_uncertain", action.id, attemptId, { reason });
+		this.event(runtimeMismatch ? "runtime_mismatch" : "attempt_uncertain", action.id, attemptId, {
+			reason,
+			...(runtimeMismatch
+				? {
+						runtime: action.requirements.runtime ?? this.runtimePin(),
+						runtime_check: factoryRuntimeMismatchCheck(reason),
+					}
+				: {}),
+		});
 	}
-	markUncertain(attemptId: string, reason: string): void {
+	markUncertain(attemptId: string, reason: string, runtimeMismatch = false): void {
 		required(reason, "uncertainty reason");
-		this.transaction(() => this.uncertainInternal(attemptId, reason));
+		this.transaction(() => this.uncertainInternal(attemptId, reason, runtimeMismatch));
 	}
 	private resolveWakes(attemptId: string): void {
 		this.db
@@ -624,8 +956,50 @@ export class FactoryStore {
 			this.db
 				.prepare("UPDATE attempts SET state='TERMINAL',receipt=?,claim_released=1,uncertainty=NULL WHERE id=?")
 				.run(JSON.stringify(receipt), attempt.id);
-			const state =
-				action.kind === "decision" ? "AWAITING_DECISION" : receipt.exitCode === 0 ? "ACCEPTED" : "REJECTED";
+			let state: ActionRecord["state"];
+			const base = codeDecisionBase(
+				this.ledgerSequence(),
+				"Terminal receipt classified; process success is not semantic acceptance",
+			);
+			if (action.kind === "decision") {
+				state = "AWAITING_DECISION";
+				recordDecision(this, action.id, {
+					...base,
+					type: "writer_terminal_accept",
+					attempt_id: attempt.id,
+					candidate_fingerprint: action.sourceFingerprint,
+					receipt_fingerprint: receipt.sourceFingerprint,
+					exit_code: receipt.exitCode,
+					agent_end: null,
+					stop_reason: null,
+					changed_paths: null,
+					allowed_paths_only: null,
+					receipt_ready: true,
+					receipt_sha: createHash("sha256").update(JSON.stringify(receipt)).digest("hex"),
+				});
+			} else {
+				state = receipt.exitCode === 0 ? "ACCEPTED" : "REJECTED";
+				recordDecision(
+					this,
+					action.id,
+					{
+						...base,
+						type: "test_gate_accept",
+						gate_kind: "process",
+						attempt_id: attempt.id,
+						candidate_fingerprint: action.sourceFingerprint,
+						receipt_fingerprint: receipt.sourceFingerprint,
+						exit_code: receipt.exitCode,
+						wrapper_rc: null,
+						tests: { run: null, passed: null, failed: null, skipped: null },
+						provenance_pass: null,
+						source_unchanged: null,
+						criteria: { min_tests: null, forbidden_replay_of: null, required_pin: null },
+						is_replay: null,
+					},
+					{ applied: true },
+				);
+			}
 			this.db.prepare("UPDATE actions SET state=? WHERE id=?").run(state, action.id);
 			this.resolveWakes(attempt.id);
 			this.event("attempt_terminal", action.id, attempt.id, {
@@ -800,6 +1174,27 @@ export class FactoryStore {
 			const { attempt, action } = this.context(attemptId);
 			if (attempt.state !== "UNCERTAIN" || attempt.claimReleased)
 				throw new Error("Only an uncertain claimed attempt may be resolved for retry");
+			recordDecision(
+				this,
+				action.id,
+				{
+					...operatorDecisionBase(this.ledgerSequence(), evidence.reason),
+					type: "attempt_requeue",
+					attempt_id: attemptId,
+					core_state: attempt.state,
+					claim_released: attempt.claimReleased,
+					receipt_present: attempt.receipt !== null,
+					pid: null,
+					boot_id: null,
+					start_ticks: null,
+					census: { matches: null, unreadable: null },
+					equivalent_job: null,
+					successor: null,
+					partial_banked: null,
+					duplicate_of_event: null,
+				},
+				{ applied: true },
+			);
 			this.db.prepare("UPDATE attempts SET state='ABANDONED',claim_released=1 WHERE id=?").run(attemptId);
 			this.db.prepare("UPDATE actions SET state='QUEUED' WHERE id=?").run(action.id);
 			this.resolveWakes(attemptId);
@@ -1074,7 +1469,7 @@ export class FactoryStore {
 	}
 	managementRequests(): ManagementRequest[] {
 		return this.db
-			.prepare("SELECT * FROM management_requests ORDER BY rowid")
+			.prepare("SELECT * FROM management_requests WHERE wake_id IS NOT NULL ORDER BY rowid")
 			.all()
 			.map((row) => ({
 				id: String(row.id),
@@ -1085,19 +1480,68 @@ export class FactoryStore {
 				evidenceSha256: String(row.evidence_sha256),
 				createdAt: String(row.created_at),
 				state: String(row.state) as ManagementRequest["state"],
-				result: row.result === null ? null : decode<ManagementResult>(row.result),
+				result: row.result === null ? null : decode<ManagementResult | DecisionReceipt>(row.result),
 				error: row.error === null ? null : String(row.error),
 			}));
+	}
+	finishManagementDrift(id: string): void {
+		this.transaction(() => {
+			const changed = this.db
+				.prepare("UPDATE management_requests SET state='DRIFT',error=NULL WHERE id=? AND state='CLAIMED'")
+				.run(id);
+			if (!changed.changes) throw new Error("Management claim is no longer active");
+			this.event("management_finished", null, null, { id, state: "DRIFT", error: null });
+		});
 	}
 	finishManagement(id: string, result: ManagementResult | null, error: string | null = null): void {
 		this.transaction(() => {
 			const state = error !== null ? "ERROR" : result?.proposal.decision === "defer" ? "DEFERRED" : "PROPOSED";
 			const changed = this.db
-				.prepare("UPDATE management_requests SET state=?,result=?,error=? WHERE id=? AND state='CLAIMED'")
+				.prepare(
+					"UPDATE management_requests SET state=?,result=COALESCE(?,result),error=? WHERE id=? AND state='CLAIMED'",
+				)
 				.run(state, result ? JSON.stringify(result) : null, error, id);
 			if (!changed.changes) throw new Error("Management claim is no longer active");
 			this.event("management_finished", null, null, { id, state, error });
 		});
+	}
+	/** Complete history is snapshot-bounded at entry, but unbounded in size. */
+	allEvents(afterSequence = 0): FactoryEvent[] {
+		const throughSequence = this.ledgerSequence();
+		const history: FactoryEvent[] = [];
+		let cursor = afterSequence;
+		for (;;) {
+			const page = this.events(cursor).filter((event) => event.sequence <= throughSequence);
+			history.push(...page);
+			const last = page.at(-1);
+			if (!last || last.sequence >= throughSequence) return history;
+			cursor = last.sequence;
+		}
+	}
+	eventsOfKind(kind: string, afterSequence = 0): FactoryEvent[] {
+		if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) throw new Error("Invalid event range");
+		const throughSequence = this.ledgerSequence();
+		const query = this.db.prepare(
+			"SELECT * FROM events WHERE kind=? AND sequence>? AND sequence<=? ORDER BY sequence LIMIT 100",
+		);
+		const history: FactoryEvent[] = [];
+		let cursor = afterSequence;
+		for (;;) {
+			const page = query.all(kind, cursor, throughSequence).map((row) => this.eventRecord(row));
+			history.push(...page);
+			if (page.length < 100) return history;
+			cursor = page[page.length - 1].sequence;
+		}
+	}
+	private eventRecord(row: Row): FactoryEvent {
+		return {
+			sequence: Number(row.sequence),
+			at: String(row.at),
+			kind: String(row.kind),
+			actionId: row.action_id === null ? null : String(row.action_id),
+			attemptId: row.attempt_id === null ? null : String(row.attempt_id),
+			detail: decode<Record<string, unknown>>(row.detail),
+		};
 	}
 	events(afterSequence = 0, limit = 100): FactoryEvent[] {
 		if (
@@ -1111,14 +1555,13 @@ export class FactoryStore {
 		return this.db
 			.prepare("SELECT * FROM events WHERE sequence>? ORDER BY sequence LIMIT ?")
 			.all(afterSequence, limit)
-			.map((r) => ({
-				sequence: Number(r.sequence),
-				at: String(r.at),
-				kind: String(r.kind),
-				actionId: r.action_id === null ? null : String(r.action_id),
-				attemptId: r.attempt_id === null ? null : String(r.attempt_id),
-				detail: decode<Record<string, unknown>>(r.detail),
-			}));
+			.map((row) => this.eventRecord(row));
+	}
+	openWakeIdForReason(reason: string): number | undefined {
+		const row = this.db
+			.prepare("SELECT id FROM wakes WHERE reason=? AND resolved_at IS NULL ORDER BY id LIMIT 1")
+			.get(reason);
+		return row ? Number(row.id) : undefined;
 	}
 	wakes(): WakeRecord[] {
 		return this.db

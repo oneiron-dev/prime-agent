@@ -45,7 +45,8 @@ import type { OneironPin } from "../src/factory/adapters/oneiron-review.js";
 import { FactoryEngine } from "../src/factory/engine.js";
 import { type FactoryRuntimeIdentity, hashFactoryRuntimeFile } from "../src/factory/runtime.js";
 import { FactoryStore } from "../src/factory/store.js";
-import type { CompletionReceipt, FactoryStatus } from "../src/factory/types.js";
+import type { CompletionReceipt, FactoryStatus, TickResult } from "../src/factory/types.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 // Native source-loader fixture only, NOT installed-runtime or production docs proof.
 // Real Git, transferred fixture custody, live isolated FactoryStore, default CommandAdapter,
@@ -162,7 +163,7 @@ function mockOperator(
 				dependencies: [],
 				sourceFingerprint: input,
 				command: recordedCommand,
-				requirements: { host: "arch", slotId: "unit-mock-slot" },
+				requirements: { host: "arch", slotId: "unit-mock-slot", runtime: fixtureRuntimePin },
 				state: "ACCEPTED",
 			},
 		],
@@ -530,6 +531,13 @@ setInterval(()=>{},1000);
 		host,
 		store,
 		engine,
+		tick: async (): Promise<TickResult> =>
+			JSON.parse(
+				execFileSync(NODE, [cli.path, "factory", "tick", manifest.factoryDirectory], {
+					encoding: "utf8",
+					timeout: 20000,
+				}),
+			) as TickResult,
 		action: prepared.action,
 		git,
 	};
@@ -635,11 +643,11 @@ async function busyPrivateSlot(directory: string, isolation: unknown) {
 			});
 		});
 		await directEntryWithoutCore(f);
-		const tick = await f.engine.tick();
+		const tick = await f.tick();
 		expect(tick.launched).toHaveLength(1);
 		const runnerDirectory = join(f.host.runnerRoot, tick.launched[0]!);
 		await awaitTerminal(runnerDirectory);
-		await f.engine.tick();
+		await f.tick();
 		const attempt = f.store.attempts()[0]!;
 		expect(attempt.state).toBe("TERMINAL");
 		expect(attempt.receipt?.exitCode).toBe(1);
@@ -704,12 +712,12 @@ async function nativeGate(directory: string) {
 			"--execute",
 		]);
 		expect(f.action.command.env).toEqual(ONEIRON_DOCS_ENTRY_ENVIRONMENT);
-		const tick = await f.engine.tick();
+		const tick = await f.tick();
 		expect(tick.launched, JSON.stringify(f.engine.status())).toHaveLength(1);
 		const attemptId = tick.launched[0]!;
 		const runnerDirectory = join(f.host.runnerRoot, attemptId);
 		await awaitTerminal(runnerDirectory);
-		expect((await f.engine.tick()).launched).toEqual([]);
+		expect((await f.tick()).launched).toEqual([]);
 		const state = f.engine.status();
 		const attempt = state.attempts[0]!;
 		const stdout = readFileSync(join(runnerDirectory, "stdout.log"), "utf8");
@@ -812,7 +820,7 @@ async function nativeForcedTimeout(directory: string) {
 	requirePrivateFixtureNamespace(directory);
 	const f = await fixture(directory, true);
 	try {
-		const tick = await f.engine.tick();
+		const tick = await f.tick();
 		expect(tick.launched).toHaveLength(1);
 		const runnerDirectory = join(f.host.runnerRoot, tick.launched[0]!);
 		json(join(directory, "forced-Core-started.json"), {

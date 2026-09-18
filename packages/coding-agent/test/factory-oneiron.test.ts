@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -20,6 +20,8 @@ import { defaultOneironWriterProfile, validateOneironWriterReceipt } from "../sr
 import { FactoryEngine } from "../src/factory/engine.js";
 import { createManagementPacket, proposeManagementDecision } from "../src/factory/management.js";
 import { FactoryStore } from "../src/factory/store.js";
+
+import { admitRuntimeFixture, createRuntimeFixture } from "./factory-runtime-fixture.js";
 
 const roots: string[] = [];
 const head = "a".repeat(40);
@@ -221,7 +223,7 @@ describe("Oneiron preparation and execution gates", () => {
 		writeFileSync(join(cwd, "src/lib.rs"), "pub fn value( )->i32{1}\n");
 		// Unit wrapper plumbing only. Runs genuine local rustfmt; never fabricates a successful v23 proof.
 		const wrapper = f.pin(
-			'import subprocess,sys\nsys.stderr.write("fmt fixture stderr prefix\\n")\nsys.exit(subprocess.call(["/home/lexi/.cargo/bin/cargo","fmt","--check"]))\n',
+			'import subprocess,sys\nsys.stderr.write("fmt fixture stderr prefix\\n")\nsys.exit(subprocess.call(["cargo","fmt","--check"]))\n',
 		);
 		const argv = ["cargo", "fmt", "--check"];
 		f.manifest.stage = {
@@ -611,6 +613,7 @@ describe("Oneiron preparation and execution gates", () => {
 				triage: f.pin(triage),
 				writerProfile: writerProfileFixture(f),
 			};
+			f.runtime.recordCapsule = vi.fn();
 			f.seal();
 			vi.mocked(f.runtime.runWriter!).mockImplementation(async (_argv, _cwd, transcriptPath) => {
 				writeFileSync(
@@ -632,6 +635,15 @@ describe("Oneiron preparation and execution gates", () => {
 			});
 			const result = (await f.execute()) as OneironReceipt;
 			expect(result.result.requiresSourceRebind).toBe(true);
+			const capsule = result.result.capsule as { pin: OneironPin };
+			expect(result.result.capsule_sha256).toBe(capsule.pin.sha256);
+			expect(f.runtime.recordCapsule).toHaveBeenCalledWith(result.result.capsule);
+			expect(vi.mocked(f.runtime.runWriter!).mock.calls[0][0].at(-1)).toContain(`sha256:${capsule.pin.sha256}`);
+			expect(JSON.parse(readFileSync(capsule.pin.path, "utf8"))).toMatchObject({
+				head,
+				capsule_seat: "none",
+				notes: [],
+			});
 			expect(vi.mocked(f.runtime.runWriter!).mock.calls[0]![0]).toEqual(
 				expect.arrayContaining([
 					"--print",
@@ -695,6 +707,8 @@ describe("Oneiron preparation and execution gates", () => {
 describe("Oneiron real journal and foreground command-runner integration", () => {
 	test("executes a mocked-model triage in a real supervised process and binds a bounded management decision", async () => {
 		const f = setup();
+		f.manifest.factoryRuntime = createRuntimeFixture(f.directory);
+		admitRuntimeFixture(f.manifest.factoryRuntime);
 		const cwd = f.manifest.source.workspace;
 		execFileSync("git", ["init", "-q", "--initial-branch=fixture", cwd]);
 		writeFileSync(join(cwd, "source"), "fixture");
@@ -820,4 +834,128 @@ describe("Oneiron real journal and foreground command-runner integration", () =>
 			store.close();
 		}
 	}, 20000);
+});
+
+test("runs a gate without PRIME_FACTORY_ATTEMPT_ID or a decision context", async () => {
+	const f = setup();
+	vi.stubEnv("PRIME_FACTORY_ATTEMPT_ID", undefined);
+	Object.defineProperty(f.runtime, "decisionContext", {
+		get: () => {
+			throw new Error("Gate must not open a decision context");
+		},
+	});
+	const argv = ["cargo", "test", "--lib"];
+	f.manifest.stage = {
+		kind: "gate",
+		host: "arch",
+		slot: 1,
+		argv,
+		wrapper: f.pin("UNIT MOCK wrapper"),
+		capacity: f.pin({
+			status: "PASS",
+			sourceFingerprint: f.manifest.source.fingerprint,
+			host: "arch",
+			slot: 1,
+			argv,
+			expiresAt: "2099-01-01",
+			duplicateFree: true,
+			resourcesPassed: true,
+		}),
+	};
+	vi.mocked(f.runtime.run).mockImplementation(async (command) => {
+		writeFileSync(
+			command[command.indexOf("--receipt") + 1],
+			JSON.stringify({
+				status: "COMPLETED",
+				command_rc: 0,
+				workspace_root: f.manifest.source.workspace,
+				command: argv,
+				provenance: { pass: true },
+			}),
+		);
+		return "UNIT MOCK proof";
+	});
+	f.seal();
+	try {
+		expect(process.env.PRIME_FACTORY_ATTEMPT_ID).toBeUndefined();
+		expect((await f.execute()) as OneironReceipt).toMatchObject({
+			stage: "gate",
+			result: { commandRc: 0, provenancePassed: true },
+		});
+	} finally {
+		vi.unstubAllEnvs();
+	}
+});
+
+test("a deterministic capsule failure records no pin and still launches the writer without capsule evidence", async () => {
+	const f = setup();
+	const triage = (await f.execute()) as OneironReceipt;
+	const finding = (triage.result.triage as { findings: Array<{ classification: string; disposition: string }> })
+		.findings[0]!;
+	finding.classification = "material";
+	finding.disposition = "open";
+	symlinkSync(f.manifest.custody.path, join(f.manifest.source.workspace, "unreadable.ts"));
+	const prompt = JSON.stringify({ touchedFiles: ["unreadable.ts"] });
+	f.manifest.outputDirectory = join(f.directory, "writer-failure");
+	f.manifest.stage = {
+		kind: "writer",
+		prompt: f.pin(prompt),
+		triage: f.pin(triage),
+		writerProfile: writerProfileFixture(f),
+	};
+	f.seal();
+	const action = prepareOneiron(f.manifest, {
+		manifestPath: f.manifestPath,
+		permitPath: f.permitPath,
+		adapterArgv: [process.execPath, "adapter.js"],
+		host: "local",
+		slotId: "slot",
+	}).action!;
+	const store = new FactoryStore(join(f.directory, "capsule-journal.db"));
+	try {
+		store.applyPlan({
+			version: 1,
+			tickets: [{ id: f.manifest.ticketId, owner: f.manifest.owner }],
+			slots: [{ id: "slot", host: "local" }],
+			actions: [action],
+		});
+		const attempt = store.claim(action.id, "slot")!.attempt;
+		store.markSubmitted(attempt.id);
+		f.runtime.recordCapsule = (receipt) => store.recordCapsule(action.id, attempt.id, receipt);
+		vi.mocked(f.runtime.runWriter!).mockImplementation(async (_argv, _cwd, transcriptPath) => {
+			writeFileSync(
+				transcriptPath,
+				JSON.stringify({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						provider: "cpa-r",
+						model: "gpt-6-astra",
+						responseModel: "gpt-6-astra",
+						responseModelSource: "provider-response",
+						responseId: "capsule_failure_fixture",
+						stopReason: "stop",
+					},
+				}),
+			);
+		});
+		const result = (await f.execute()) as OneironReceipt;
+		expect(f.runtime.runWriter).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(f.runtime.runWriter!).mock.calls[0][0].at(-1)).toBe(prompt);
+		expect(result.result.capsule).toBeNull();
+		expect(result.result.capsule_sha256).toBeNull();
+		expect(store.context(attempt.id).attempt.capsule_sha256).toBeNull();
+		const events = store.eventsOfKind("capsule_built");
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({
+			actionId: action.id,
+			attemptId: attempt.id,
+			detail: { capsule_seat: "none", bytes: 0, failure: "Capsule does not follow symlinks" },
+		});
+		expect(events[0].detail).not.toHaveProperty("pin");
+		expect(events[0].detail).not.toHaveProperty("capsule_sha256");
+		expect(existsSync(join(f.manifest.outputDirectory, "capsule.json"))).toBe(false);
+	} finally {
+		store.close();
+	}
 });

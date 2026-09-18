@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
+import type { AdapterDecisionContext } from "../decisions.js";
 import { factoryOwnedEnvironment, readFactoryRuntime } from "../runtime.js";
 import type { OneironManifest, OneironSource } from "./oneiron.js";
 import { type OneironPin, oneironSha } from "./oneiron-review.js";
@@ -71,6 +72,7 @@ export async function publishOneiron(
 	stage: OneironPublicationStage,
 	run: OneironCommand,
 	readPin: (pin: OneironPin) => string,
+	decisionContext?: AdapterDecisionContext,
 ): Promise<Record<string, unknown>> {
 	const source = m.source;
 	check(m.factoryRuntime, "Publication requires the shared pinned factory runtime");
@@ -138,6 +140,20 @@ export async function publishOneiron(
 			"Publication commit attribution/message policy mismatch",
 		);
 	}
+	decisionContext?.record({
+		...decisionContext.base,
+		type: "merge_gate_predicate",
+		candidate_head: source.head,
+		reviewed_head_is_tip: false,
+		gates: stage.gates.map((pin) => ({ name: pin.path, status: "green", head: source.head })),
+		review: { provider: null, status: "not_supplied", bugs: null, rules: null, comment_id: null, head: null },
+		open_threads: [],
+		provenance: { signed: true, base_main_proof: null },
+		owner_hold: null,
+		owner_waiver: null,
+		reason:
+			"Publication is not merge approval; gates verified by execution preflight, signature checked here, review, owner hold and base-main proof not supplied",
+	});
 	if (stage.kind === "publish-ready") {
 		if (before.isDraft) await run(["gh", "pr", "ready", String(stage.pr), "--repo", stage.repo]);
 		const after = validatePR(await run(query), source.head);

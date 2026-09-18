@@ -280,19 +280,19 @@ test("real CLI owned frontend propagates factory-completed through main and prin
 		content: [{ type: "text", text: chunks.join("") }],
 		usage: { input: 2, output: 3, totalTokens: 5 },
 	});
-	expect(readOneironTransport(result.transcript)).toMatchObject({
-		eventCount: result.events.length,
-		messages: [
-			{
-				provider: "fixture",
-				model: requestedModel,
-				responseId: "resp_terminal",
-				responseModel,
-				responseModelSource: "provider-response",
-				stopReason: "stop",
-			},
-		],
-	});
+	const transport = readOneironTransport(result.transcript);
+	expect(transport.eventCount).toBe(result.events.length);
+	expect(transport.messages).toEqual([
+		{
+			provider: "fixture",
+			model: requestedModel,
+			responseId: "resp_terminal",
+			responseModel,
+			responseModelSource: "provider-response",
+			stopReason: "stop",
+			usage: { input: 2, output: 3, cache_read: 0, cache_write: 0, total: 5 },
+		},
+	]);
 }, 30000);
 
 test("factory-completed retains native provider failure boundaries without successful identity", async () => {
@@ -314,8 +314,15 @@ test("factory-completed retains native provider failure boundaries without succe
 	expect(terminal[0].message?.responseModel).toBeUndefined();
 	expect(terminal[0].message?.responseModelSource).toBeUndefined();
 	expect(result.events.slice(-2).map((event) => event.type)).toEqual(["turn_end", "agent_end"]);
+	// Completed failure metadata still carries native usage for downstream cost receipts.
 	expect(readOneironTransport(result.transcript).messages).toEqual([
-		{ provider: "fixture", model: requestedModel, responseId: "resp_created", stopReason: "error" },
+		{
+			provider: "fixture",
+			model: requestedModel,
+			responseId: "resp_created",
+			stopReason: "error",
+			usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, total: 0 },
+		},
 	]);
 }, 30000);
 

@@ -1,6 +1,7 @@
 import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getModel, getModels, getProviders } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, test } from "vitest";
 import type { OneironManifest } from "../src/factory/adapters/oneiron.js";
 import { readOneironPin } from "../src/factory/adapters/oneiron.js";
@@ -8,17 +9,22 @@ import { type OneironPin, oneironSha } from "../src/factory/adapters/oneiron-rev
 import { readOneironTransport, verifyOneironArtifact } from "../src/factory/adapters/oneiron-transport.js";
 import {
 	defaultOneironWriterProfile,
+	FACTORY_PRICE_OVERRIDES,
+	factoryModelPrices,
 	type OneironWriterProfile,
 	type OneironWriterRetry,
 	type OneironWriterStage,
 	type OneironWriterStatus,
 	oneironWriterCli,
 	readOneironWriterProfile,
+	runOneironWriterForeground,
 	summarizeOneironWriter,
 	validateOneironWriterReceipt,
 	validateOneironWriterRetry,
 } from "../src/factory/adapters/oneiron-writer.js";
+import { codeDecisionBase, type FactoryDecision, validateDecision } from "../src/factory/decisions.js";
 import { readFactoryRuntime } from "../src/factory/runtime.js";
+import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
 const roots: string[] = [];
 function setup() {
@@ -97,6 +103,91 @@ afterEach(() => {
 });
 
 describe("explicit pinned writer profile and factory model capture", () => {
+	test("rolls up each priced response, cache categories, and explicit registry overrides", () => {
+		const f = setup();
+		const usage = {
+			input: 1_000_000,
+			output: 2_000_000,
+			cacheRead: 3_000_000,
+			cacheWrite: 4_000_000,
+			totalTokens: 10_000_000,
+		};
+		const summarize = (models: string[]) =>
+			summarizeOneironWriter(
+				f.manifest,
+				f.stage,
+				f.profile,
+				f.transport(
+					models
+						.map((model, index) =>
+							f.event(model, {
+								usage,
+								responseId: `r${index}`,
+								stopReason: index === models.length - 1 ? "stop" : "toolUse",
+							}),
+						)
+						.join("\n"),
+				),
+				"sha",
+			);
+		for (const provider of getProviders())
+			for (const model of getModels(provider))
+				expect(factoryModelPrices().get(`${provider}/${model.id}`)).toEqual(model.cost);
+		const prices = getModel("openai", "gpt-4o").cost;
+		const expected = prices.input + 2 * prices.output + 3 * prices.cacheRead + 4 * prices.cacheWrite;
+		const resolved = summarize(["openai/gpt-4o", "openai/gpt-4o"]);
+		expect(resolved.calls).toBe(2);
+		expect(resolved.cost_usd).toBe(expected * 2);
+		expect(resolved.priced).toBe(true);
+		expect(resolved.usage).toEqual({
+			input: 2_000_000,
+			output: 4_000_000,
+			cache_read: 6_000_000,
+			cache_write: 8_000_000,
+			total: 20_000_000,
+		});
+		expect(resolved.observations.map((item) => item.cost_usd)).toEqual([expected, expected]);
+		expect(factoryModelPrices().has("not-in-registry")).toBe(false);
+		const unresolved = summarize(["openai/gpt-4o", "not-in-registry"]);
+		expect(unresolved.cost_usd).toBeNull();
+		expect(unresolved.priced).toBe(false);
+		expect(unresolved.usage).toEqual(resolved.usage);
+		expect(FACTORY_PRICE_OVERRIDES.size).toBe(0);
+		FACTORY_PRICE_OVERRIDES.set("not-in-registry", { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 });
+		try {
+			const overridden = summarize(["not-in-registry"]);
+			expect(overridden.cost_usd).toBe(30);
+			expect(overridden.priced).toBe(true);
+			expect(overridden.identityAccepted).toBe(false);
+		} finally {
+			FACTORY_PRICE_OVERRIDES.clear();
+		}
+	});
+	test("does not turn missing usage into a free call or price an unqualified identity", () => {
+		const f = setup();
+		const result = summarizeOneironWriter(
+			f.manifest,
+			f.stage,
+			f.profile,
+			f.transport(f.event("openai/gpt-4o")),
+			"sha",
+		);
+		expect(result).toMatchObject({ calls: 1, usage: null, cost_usd: null, priced: false });
+		const unknown = summarizeOneironWriter(
+			f.manifest,
+			f.stage,
+			f.profile,
+			f.transport(
+				f.event("openai/gpt-4o", {
+					responseModelSource: undefined,
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+				}),
+			),
+			"sha",
+		);
+		expect(unknown).toMatchObject({ cost_usd: null, priced: false });
+	});
+
 	test("default is direct OAuth Astra xhigh and rejects undeployed legacy Fable profiles", () => {
 		const f = setup();
 		expect(f.profile.requested).toEqual({ provider: "cpa-r", model: "gpt-6-astra", effort: "xhigh" });
@@ -313,7 +404,7 @@ describe("explicit pinned writer profile and factory model capture", () => {
 						argv: ["execute", priorManifest.path, "permit", priorManifest.sha256, "--execute"],
 						cwd: f.source.workspace,
 					},
-					requirements: {},
+					requirements: { runtime: fixtureRuntimePin },
 					state: "REJECTED",
 				},
 			],
@@ -378,4 +469,44 @@ describe("explicit pinned writer profile and factory model capture", () => {
 			validateOneironWriterRetry(f.manifest, f.stage, retry, status, readOneironPin, Date.now(), execution),
 		).toThrow(/terminal/);
 	});
+});
+
+test("records terminal facts without inventing receipt readiness or changed paths", () => {
+	const f = setup(),
+		rows: FactoryDecision[] = [];
+	summarizeOneironWriter(f.manifest, f.stage, f.profile, f.transport(f.event("wrong-model")), "sha", {
+		base: codeDecisionBase(4, "writer"),
+		attemptId: "attempt",
+		record: (d) => {
+			rows.push(validateDecision(d));
+		},
+	});
+	expect(rows[0]).toMatchObject({
+		type: "writer_terminal_accept",
+		requested_profile: "gpt-6-astra",
+		served_profile: "wrong-model",
+		receipt_ready: false,
+		receipt_sha: null,
+		changed_paths: null,
+	});
+});
+
+test("each foreground writer is a fresh process with no prior child memory", async () => {
+	const f = setup();
+	const results: { pid: number; memory: number }[] = [];
+	for (let phase = 0; phase < 2; phase++) {
+		const path = join(f.directory, `phase-${phase}.json`);
+		await runOneironWriterForeground(
+			[
+				process.execPath,
+				"-e",
+				"globalThis.memory = (globalThis.memory ?? 0) + 1; console.log(JSON.stringify({pid:process.pid,memory:globalThis.memory}))",
+			],
+			f.directory,
+			path,
+		);
+		results.push(JSON.parse(readFileSync(path, "utf8")));
+	}
+	expect(results[0].pid).not.toBe(results[1].pid);
+	expect(results.map((r) => r.memory)).toEqual([1, 1]);
 });

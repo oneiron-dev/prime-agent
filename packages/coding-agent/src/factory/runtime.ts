@@ -1,6 +1,17 @@
 import { createHash } from "node:crypto";
-import { closeSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import {
+	closeSync,
+	existsSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	readSync,
+	realpathSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface FactoryFilePin {
 	path: string;
@@ -12,6 +23,86 @@ export interface FactoryRuntimeIdentity {
 	cliArgv: [string, string];
 	files: FactoryFilePin[];
 	capabilities: string[];
+}
+// Same-host start checks allow two seconds for filesystem timestamp precision; remote identity checks use hashes only.
+export const FACTORY_RUNTIME_START_TOLERANCE_SECONDS = 2;
+export class FactoryRuntimeMismatch extends Error {}
+export function factoryRuntimeMismatchCheck(reason: string): string {
+	return (
+		reason.match(/(?:^|runtime_mismatch: )(runtime_identity|local_start_time|delivery_integrity):/)?.[1] ??
+		"runtime_identity"
+	);
+}
+export interface FactoryRuntimeProcess {
+	executable: string;
+	module: string;
+	startedAt: number;
+}
+const processStartedAt = Date.now() - process.uptime() * 1000;
+export function factoryRuntimeProcess(): FactoryRuntimeProcess {
+	return { executable: process.execPath, module: fileURLToPath(import.meta.url), startedAt: processStartedAt };
+}
+export function verifyFactoryRuntimeAdmission(pin: FactoryFilePin, live: FactoryRuntimeProcess): void {
+	try {
+		const runtime = readFactoryRuntime(pin, (expected) => {
+			check(expected && isAbsolute(expected.path) && /^[a-f0-9]{64}$/.test(expected.sha256), "Missing runtime pin");
+			const bytes = readFileSync(expected.path);
+			check(createHash("sha256").update(bytes).digest("hex") === expected.sha256, "Runtime identity hash mismatch");
+			return bytes.toString("utf8");
+		});
+		check(
+			realpathSync(runtime.cliArgv[0]) === realpathSync(live.executable) &&
+				runtime.files.some((file) => realpathSync(file.path) === realpathSync(live.module)),
+			"Executing process is outside the pinned runtime",
+		);
+		// The identity document is created at init; only executable components must predate the process.
+		for (const file of runtime.files) {
+			const info = statSync(file.path);
+			check(
+				Number.isFinite(live.startedAt) &&
+					live.startedAt > 0 &&
+					live.startedAt <= Date.now() + FACTORY_RUNTIME_START_TOLERANCE_SECONDS * 1000 &&
+					live.startedAt + FACTORY_RUNTIME_START_TOLERANCE_SECONDS * 1000 >= Math.max(info.mtimeMs, info.ctimeMs),
+				"local_start_time: Daemon start time is invalid or predates the runtime bundle",
+			);
+		}
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		throw new FactoryRuntimeMismatch(reason.startsWith("local_start_time:") ? reason : `runtime_identity: ${reason}`);
+	}
+}
+export function recordFactoryRuntime(directory: string, filename = "runtime.json"): FactoryFilePin {
+	const live = factoryRuntimeProcess();
+	let root = dirname(live.module);
+	if (basename(root) === "factory") root = dirname(root);
+	while (!existsSync(join(root, "cli.js")) && !existsSync(join(root, "cli.ts"))) {
+		const parent = dirname(root);
+		check(parent !== root, "Cannot locate the initializing runtime CLI");
+		root = parent;
+	}
+	const cli = join(root, existsSync(join(root, "cli.js")) ? "cli.js" : "cli.ts");
+	const paths = new Set([live.executable, live.module, cli]);
+	const pending = [root];
+	while (pending.length) {
+		for (const entry of readdirSync(pending.pop()!, { withFileTypes: true })) {
+			check(!entry.isSymbolicLink(), "Factory bundle symlinks require a sealed explicit deployment");
+			const path = join(entry.parentPath, entry.name);
+			if (entry.isDirectory()) pending.push(path);
+			else if (/\.(?:js|mjs|cjs|ts)$/.test(entry.name)) paths.add(path);
+			check(paths.size <= 4096, "Factory runtime requires a narrower deployment");
+		}
+	}
+	const identity: FactoryRuntimeIdentity = {
+		version: 1,
+		cliArgv: [live.executable, cli],
+		files: [...paths].sort().map((path) => ({ path, sha256: hashFactoryRuntimeFile(path) })),
+		capabilities: ["provider-response-model-v1", "factory-completed-json-v1"],
+	};
+	const path = join(directory, filename);
+	writeFileSync(path, `${JSON.stringify(identity)}\n`, { flag: "wx", mode: 0o600 });
+	const pin = { path, sha256: hashFactoryRuntimeFile(path) };
+	verifyFactoryRuntimeAdmission(pin, live);
+	return pin;
 }
 export function hashFactoryRuntimeFile(path: string): string {
 	const descriptor = openSync(path, "r");
@@ -95,9 +186,18 @@ export function requireFactoryJsonEventProfile(runtime: FactoryRuntimeIdentity):
 	);
 }
 
-/** Native owned frontend, not a daemon-free CLI flag. Clear only inherited native worker authority in the child. */
+export const FACTORY_ONLY_API_KEYS = [
+	"FACTORY_CAPSULE_API_KEY",
+	"TYPESAFE_JEV_API_KEY",
+	"FACTORY_ADVISOR_API_KEY",
+] as const;
+
+/** Native owned frontend, not a daemon-free CLI flag. Clear worker authority and factory-only credentials. */
 export function factoryOwnedEnvironment(): Record<string, string> {
 	return {
+		FACTORY_CAPSULE_API_KEY: "",
+		TYPESAFE_JEV_API_KEY: "",
+		FACTORY_ADVISOR_API_KEY: "",
 		PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND: "1",
 		PRIME_AGENT_INTERNAL_OWNED_WORKER: "",
 		PRIME_AGENT_INTERNAL_OWNED_RECOVERY_DESCRIPTOR: "",

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { AdapterDecisionContext, DecisionOf } from "../decisions.js";
 
 export interface OneironPin {
 	path: string;
@@ -65,6 +66,7 @@ const NOT_COMPLETED =
 export function inspectOneironCorpus(
 	text: string,
 	expected: { repo: string; pr: number; head: string; base: string },
+	decisionContext?: AdapterDecisionContext,
 ): OneironReviewReport {
 	const corpus = object(JSON.parse(text));
 	if (
@@ -83,6 +85,7 @@ export function inspectOneironCorpus(
 		throw new Error("Corpus head/base mismatch");
 	const items: OneironReviewItem[] = [];
 	const completed = new Set<"qodo" | "codex">();
+	const postings = new Map<"qodo" | "codex", DecisionOf<"review_posting">>();
 	const seen = new Set<string>();
 	for (const raw of pr.items) {
 		const item = object(raw);
@@ -128,6 +131,26 @@ export function inspectOneironCorpus(
 			!NOT_COMPLETED.test(body)
 		)
 			completed.add(bot);
+		const isComment = item.sources.some((source) =>
+			["issue_comment", "review_comment", "review_thread_comment"].includes(String(source)),
+		);
+		if (decisionContext && (!postings.has(bot) || (!postings.get(bot)?.returned_comment_id && isComment)))
+			postings.set(bot, {
+				...decisionContext.base,
+				type: "review_posting",
+				request_command_exit: null,
+				returned_comment_id:
+					isComment && (typeof item.id === "string" || typeof item.id === "number") ? String(item.id) : null,
+				url: typeof item.url === "string" && item.url.trim() ? item.url : null,
+				posted_at:
+					typeof item.created_at === "string" && Number.isFinite(Date.parse(item.created_at))
+						? item.created_at
+						: null,
+				run_status: completed.has(bot) ? "completed_review_observed" : "incomplete_review_observed",
+				status_check_vs_comment_contradiction: null,
+				manual_request_exists: null,
+				reason: `${bot}: observed frozen bot corpus; request-command success and manual request custody are not supplied`,
+			});
 		if (!body.trim() || item.in_reply_to_id) continue;
 		if (
 			!item.sources.some((source) =>
@@ -146,6 +169,11 @@ export function inspectOneironCorpus(
 			threadOutdated: item.thread_outdated === true,
 		});
 	}
+	for (const [bot, posting] of postings)
+		decisionContext?.record({
+			...posting,
+			run_status: completed.has(bot) ? "completed_review_observed" : "incomplete_review_observed",
+		});
 	return {
 		candidateCommit: expected.head,
 		corpusSha256: oneironSha(text),
