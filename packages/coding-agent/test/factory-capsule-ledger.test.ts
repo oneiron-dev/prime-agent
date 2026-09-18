@@ -23,7 +23,7 @@ function accounting(cost_usd = 0.25): FactoryCallCost {
 		priced: true,
 	};
 }
-function fixture() {
+function fixture(packetBytes = "packet") {
 	const directory = mkdtempSync(join(tmpdir(), "factory-capsule-ledger-"));
 	directories.push(directory);
 	const path = join(directory, "factory.db");
@@ -72,7 +72,8 @@ function fixture() {
 		actions,
 	});
 	const capsule = (name = "capsule", cost = accounting()): FactoryCapsuleReceipt => {
-		const packet = { path: join(directory, "packet.json"), sha256: sha("packet") };
+		const packet = { path: join(directory, "packet.json"), sha256: sha(packetBytes) };
+		writeFileSync(packet.path, packetBytes);
 		const bytes = JSON.stringify({
 			version: 1,
 			head,
@@ -193,6 +194,13 @@ describe("factory capsule ledger", () => {
 	});
 
 	it.each<[string, (receipt: FactoryCapsuleReceipt) => FactoryCapsuleReceipt]>([
+		[
+			"packet bytes (PR #7 G2)",
+			(r) => {
+				writeFileSync(r.packet.path, "changed packet");
+				return r;
+			},
+		],
 		["pin hash", (r) => ({ ...r, pin: { ...r.pin, sha256: "f".repeat(64) } })],
 		["relative path", (r) => ({ ...r, pin: { ...r.pin, path: "capsule.json" } })],
 		["pin format", (r) => ({ ...r, pin: { ...r.pin, sha256: "bad" } })],
@@ -212,8 +220,8 @@ describe("factory capsule ledger", () => {
 		expect(store.context(attemptId).attempt.capsule_sha256).toBeUndefined();
 	});
 
-	it("bounds the disk file, accepts exactly 64 KiB, and uses UTF-8 byte counts", () => {
-		const { store, capsule, claim } = fixture();
+	it("PR #9: bounds the capsule at 64 KiB, accepts a 70 KiB packet, and uses UTF-8 byte counts", () => {
+		const { store, capsule, claim } = fixture("p".repeat(70 * 1024));
 		const receipt = capsule();
 		const original = readFileSync(receipt.pin.path, "utf8").replace('"notes":[]', '"notes":["日本語"]');
 		const bounded = original + " ".repeat(64 * 1024 - Buffer.byteLength(original));

@@ -569,7 +569,7 @@ function changedLineStats(base) {
 	const tracked = new Set();
 	// FORK: The factory subsystem is verified by independent reviewers who require its tests, and the upstream ratio does not apply to it.
 	const isFactoryLineBudgetExempt = (path) =>
-		/^packages\/coding-agent\/test\/factory-[^/]*$/.test(path) ||
+		/^packages\/coding-agent\/test\/(?:factory-[^/]*|fixtures\/factory-[^/]+\/.*)$/.test(path) ||
 		path.startsWith("packages/coding-agent/src/factory/");
 	const isSource = (path) =>
 		!isFactoryLineBudgetExempt(path) &&

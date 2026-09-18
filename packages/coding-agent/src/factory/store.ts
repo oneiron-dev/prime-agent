@@ -11,7 +11,7 @@ import {
 	operatorDecisionBase,
 	recordDecision,
 } from "./decisions.js";
-import { CAPSULE_FAILURE_MAX_LENGTH, validateArtifactPin } from "./evidence.js";
+import { CAPSULE_FAILURE_MAX_LENGTH, FACTORY_EVIDENCE_LIMITS, validateArtifactPin } from "./evidence.js";
 import type { ManagementClaim, ManagementReconciliation, ManagementRequest, ManagementResult } from "./management.js";
 import { type FactoryFilePin, factoryRuntimeMismatchCheck } from "./runtime.js";
 import type {
@@ -72,21 +72,18 @@ function validateCapsuleAccounting(cost: FactoryCapsuleRecord["accounting"]): vo
 	)
 		throw new Error("Invalid capsule accounting");
 }
-function validateCapsuleReceipt(receipt: FactoryCapsuleReceipt): void {
-	validateArtifactPin(receipt.pin, "capsule.pin");
-	validateArtifactPin(receipt.packet, "capsule.packet");
-	required(receipt.head, "capsule.head");
-	required(receipt.capsule_seat, "capsule.capsule_seat");
-	const limit = 64 * 1024;
-	if (!Number.isSafeInteger(receipt.bytes) || receipt.bytes < 1 || receipt.bytes > limit)
-		throw new Error("Capsule bytes must be within 1..65536");
-	if (!Number.isFinite(receipt.wall_clock_ms) || receipt.wall_clock_ms < 0)
-		throw new Error("Invalid capsule wall_clock_ms");
-	const fd = openSync(receipt.pin.path, constants.O_RDONLY | constants.O_NONBLOCK);
+function readCapsuleArtifact(pin: FactoryFilePin, label: string, limit: number, expectedBytes?: number): Buffer {
+	let fd: number;
+	try {
+		fd = openSync(pin.path, constants.O_RDONLY | constants.O_NONBLOCK);
+	} catch (cause) {
+		throw new Error(`${label} unreadable`, { cause });
+	}
 	let bytes: Buffer;
 	try {
 		const info = fstatSync(fd);
-		if (!info.isFile() || info.size > limit) throw new Error("Capsule must be a regular file of at most 65536 bytes");
+		if (!info.isFile() || info.size > limit)
+			throw new Error(`${label} must be a regular file of at most ${limit} bytes`);
 		const buffer = Buffer.alloc(limit + 1);
 		let length = 0;
 		while (length < buffer.length) {
@@ -94,13 +91,27 @@ function validateCapsuleReceipt(receipt: FactoryCapsuleReceipt): void {
 			if (count === 0) break;
 			length += count;
 		}
-		if (length > limit || length !== receipt.bytes) throw new Error("Capsule byte count mismatch");
+		if (length > limit) throw new Error(`${label} exceeds ${limit} bytes`);
+		if (expectedBytes !== undefined && length !== expectedBytes) throw new Error(`${label} byte count mismatch`);
 		bytes = buffer.subarray(0, length);
 	} finally {
 		closeSync(fd);
 	}
-	if (createHash("sha256").update(bytes).digest("hex") !== receipt.pin.sha256)
-		throw new Error("Capsule pin hash mismatch");
+	if (createHash("sha256").update(bytes).digest("hex") !== pin.sha256) throw new Error(`${label} pin hash mismatch`);
+	return bytes;
+}
+function validateCapsuleReceipt(receipt: FactoryCapsuleReceipt): void {
+	validateArtifactPin(receipt.pin, "capsule.pin");
+	validateArtifactPin(receipt.packet, "capsule.packet");
+	required(receipt.head, "capsule.head");
+	required(receipt.capsule_seat, "capsule.capsule_seat");
+	const limit = FACTORY_EVIDENCE_LIMITS.capsuleBytes;
+	if (!Number.isSafeInteger(receipt.bytes) || receipt.bytes < 1 || receipt.bytes > limit)
+		throw new Error(`Capsule bytes must be within 1..${limit}`);
+	if (!Number.isFinite(receipt.wall_clock_ms) || receipt.wall_clock_ms < 0)
+		throw new Error("Invalid capsule wall_clock_ms");
+	const bytes = readCapsuleArtifact(receipt.pin, "Capsule", limit, receipt.bytes);
+	readCapsuleArtifact(receipt.packet, "Capsule packet", FACTORY_EVIDENCE_LIMITS.packetBytes);
 	const capsule: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
 	if (
 		!capsule ||
