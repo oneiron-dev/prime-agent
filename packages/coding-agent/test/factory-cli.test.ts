@@ -65,6 +65,14 @@ function setup(kind: "process" | "decision" = "process") {
 	writeFileSync(hostsPath, JSON.stringify({ local: { type: "local", runnerRoot } }));
 	return { root, directory, runnerRoot, marker, planPath, hostsPath };
 }
+function unpauseFixture(directory: string): void {
+	const store = new FactoryStore(join(directory, "factory.db"));
+	try {
+		store.resume();
+	} finally {
+		store.close();
+	}
+}
 async function waitUntil(test: () => boolean) {
 	const deadline = Date.now() + 6000;
 	while (Date.now() < deadline) {
@@ -114,7 +122,7 @@ describe("optional factory CLI", () => {
 		plan.actions.push({ ...plan.actions[0], id: "duplicate-receipt" });
 		writeFileSync(f.planPath, JSON.stringify(plan));
 		invoke(["init", f.directory, f.planPath, "--hosts", f.hostsPath]);
-		invoke(["resume", f.directory]);
+		unpauseFixture(f.directory);
 		const store = new FactoryStore(join(f.directory, "factory.db"));
 		const noProcess = async (): Promise<never> => {
 			throw new Error("Cost must not execute work");
@@ -246,7 +254,7 @@ describe("optional factory CLI", () => {
 			});
 			writeFileSync(f.planPath, JSON.stringify(plan));
 			invoke(["init", f.directory, f.planPath, "--hosts", f.hostsPath]);
-			invoke(["resume", f.directory]);
+			unpauseFixture(f.directory);
 			const store = new FactoryStore(join(f.directory, "factory.db"));
 			try {
 				for (const action of plan.actions) {
@@ -376,7 +384,7 @@ describe("optional factory CLI", () => {
 	it("requires explicit revision for imports and replays an import token without another revision", () => {
 		const { directory, planPath, hostsPath } = setup();
 		invoke(["init", directory, planPath, "--hosts", hostsPath]);
-		invoke(["resume", directory]);
+		unpauseFixture(directory);
 		expect(() => invoke(["import", directory, planPath])).toThrow();
 		expect(JSON.parse(invoke(["import", directory, planPath, "--expected-revision", "1"])).planRevision).toBe(1);
 		const plan = JSON.parse(readFileSync(planPath, "utf8")) as FactoryPlan;
@@ -391,7 +399,7 @@ describe("optional factory CLI", () => {
 	it("reconciles a proven unsubmitted management request through the CLI without inference or process retry", () => {
 		const { root, directory, marker, planPath, hostsPath } = setup("decision");
 		invoke(["init", directory, planPath, "--hosts", hostsPath]);
-		invoke(["resume", directory]);
+		unpauseFixture(directory);
 		const store = new FactoryStore(join(directory, "factory.db"));
 		let attemptId: string;
 		let wakeId: number;
@@ -494,7 +502,7 @@ describe("optional factory CLI", () => {
 		expect(initialized.paused).toBe(true);
 		expect(JSON.parse(invoke(["tick", directory])).launched).toEqual([]);
 		expect(existsSync(runnerRoot)).toBe(false);
-		invoke(["resume", directory]);
+		expect(invoke(["resume", directory])).toContain("TICKET\tACCEPTED");
 		const server = spawn(process.execPath, [...nodeArgs, factoryEntry, "serve", directory, "--interval-ms", "50"], {
 			cwd: packageRoot,
 			stdio: "ignore",
@@ -520,7 +528,7 @@ describe("optional factory CLI", () => {
 	it("pauses scheduling when its launcher disappears", async () => {
 		const { directory, marker, planPath, hostsPath } = setup();
 		invoke(["init", directory, planPath, "--hosts", hostsPath]);
-		invoke(["resume", directory]);
+		unpauseFixture(directory);
 		const launcher = spawn(
 			process.execPath,
 			[...nodeArgs, cli, "factory", "serve", directory, "--interval-ms", "50"],
@@ -545,7 +553,7 @@ describe("optional factory CLI", () => {
 		const { root, directory, marker, planPath, hostsPath } = setup();
 		const pauseFile = join(root, "OWNER-TRUST-PAUSE.json");
 		invoke(["init", directory, planPath, "--hosts", hostsPath, "--pause-file", pauseFile]);
-		invoke(["resume", directory]);
+		unpauseFixture(directory);
 		writeFileSync(pauseFile, "{}");
 		expect(JSON.parse(invoke(["tick", directory])).paused).toBe(true);
 		expect(existsSync(marker)).toBe(false);
@@ -556,7 +564,7 @@ describe("optional factory CLI", () => {
 	it("leaves semantic acceptance for an explicit evidence-backed decision", async () => {
 		const { directory, runnerRoot, planPath, hostsPath } = setup("decision");
 		invoke(["init", directory, planPath, "--hosts", hostsPath]);
-		invoke(["resume", directory]);
+		unpauseFixture(directory);
 		invoke(["tick", directory]);
 		const state = JSON.parse(invoke(["status", directory])) as FactoryStatus;
 		await waitUntil(() => existsSync(join(runnerRoot, state.attempts[0]!.id, "terminal.json")));

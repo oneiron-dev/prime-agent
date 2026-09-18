@@ -406,7 +406,7 @@ export function validateOneironWriterReceipt(
 	);
 }
 
-/** Foreground only. Retain bounded raw stdout on disk, including incomplete output on failure. */
+/** Each call spawns a fresh foreground process; exclusive transcript creation prevents prior-attempt reuse. */
 export function runOneironWriterForeground(
 	argv: string[],
 	cwd: string,

@@ -9,7 +9,7 @@ export const FACTORY_HELP = `Usage:
   prime factory run <directory> [--interval-ms <milliseconds>]
   prime factory serve <directory> [--interval-ms <milliseconds>]
   prime factory pause <directory> [reason]
-  prime factory resume <directory>
+  prime factory resume <directory> [--accept-runtime-change <reason>]
   prime factory manage <directory> [action-id] [--role ticketOwner] [--evidence <file>] [--apply]
   prime factory manage <directory> <action-id> --typed-object <absolute-json-file>
   prime factory manage <directory> --watch [--apply] [--evidence-directory <directory>] [--max-requests <count>] [--max-passes <count>] [--interval-ms <milliseconds>]
@@ -22,7 +22,8 @@ export const FACTORY_HELP = `Usage:
   prime factory decide <directory> <action-id> <accept|reject> --actor <actor> --reason <reason> --ref <evidence> [--expected-revision <revision>] [--expected-attempt <id>] [--expected-wake <id>]
 
 Factory mode is optional and runs separately from Prime sessions. State and results are JSON.
-New factories start paused. Resume is explicit and never removes an external owner pause file.
+New factories start paused. Resume checks the runtime pin, prints ledger catch-up/frontier, restores pending continuation artifacts and runs one tick.
+Resume never removes an external owner pause file or re-admits UNCERTAIN work; idle_with_backlog opens a wake and exits nonzero.
 run/serve stay in the foreground; SIGINT/SIGTERM persist a scheduling pause while detached attempts retain receipts; resume explicitly.
 Each configured host needs Python 3 on a POSIX system. Factory storage needs Node 22.13+ with node:sqlite.
 Hosts JSON: {"local":{"type":"local","runnerRoot":"/absolute/attempts"}}

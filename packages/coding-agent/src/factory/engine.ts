@@ -61,8 +61,11 @@ export class FactoryEngine {
 	pause(reason: string): void {
 		this.store.pause(reason);
 	}
-	resume(): void {
+	requireOwnerUnpaused(): void {
 		if (this.externalPause()) throw new Error("External owner pause remains in place");
+	}
+	resume(): void {
+		this.requireOwnerUnpaused();
 		this.store.resume();
 	}
 	decide(

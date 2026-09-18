@@ -1,0 +1,1 @@
+- Added ledger-based `factory resume` with runtime verification, catch-up receipts, continuation recovery, and idle-backlog incidents.

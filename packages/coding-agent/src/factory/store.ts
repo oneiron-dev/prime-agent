@@ -410,7 +410,39 @@ export class FactoryStore {
 		this.transaction(() => {
 			this.setMeta("paused", "false");
 			this.setMeta("pause_reason", "");
-			this.event("resumed", null, null);
+			this.event("scheduling_unpaused", null, null);
+		});
+	}
+	lastResumeSequence(): number {
+		return Number(
+			this.db.prepare("SELECT MAX(sequence) AS sequence FROM events WHERE kind='resumed'").get()?.sequence ?? 0,
+		);
+	}
+	repinRuntime(runtime: FactoryFilePin, reason: string): void {
+		required(reason, "runtime change reason");
+		this.transaction(() => {
+			const previous = this.runtimePin();
+			this.setMeta("runtime_pin", JSON.stringify(runtime));
+			this.event("runtime_changed", null, null, { previous, runtime, reason });
+		});
+	}
+	pendingResumeRequests(): { id: string; actionId: string; state: string }[] {
+		return this.db
+			.prepare(`SELECT id,action_id,state FROM management_requests
+			WHERE state IN ('CLAIMED','RECORDED','PROPOSED','DRIFT','DEFERRED')
+			AND COALESCE(json_extract(result,'$.applied'),0)=0 ORDER BY rowid`)
+			.all()
+			.map((row) => ({ id: String(row.id), actionId: String(row.action_id), state: String(row.state) }));
+	}
+	recordResumed(detail: Record<string, unknown>, idleActionId?: string): void {
+		this.transaction(() => {
+			if (idleActionId) {
+				this.event("idle_with_backlog", idleActionId, null, { counts: detail.counts });
+				this.db
+					.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
+					.run(idleActionId, `idle_with_backlog: ${JSON.stringify(detail.counts)}`, now());
+			}
+			this.event("resumed", null, null, detail);
 		});
 	}
 	/** Add/upsert a plan; omitted records remain. Started actions and all source fingerprints are immutable. */

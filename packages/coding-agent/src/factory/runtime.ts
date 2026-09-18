@@ -71,7 +71,7 @@ export function verifyFactoryRuntimeAdmission(pin: FactoryFilePin, live: Factory
 		throw new FactoryRuntimeMismatch(reason.startsWith("local_start_time:") ? reason : `runtime_identity: ${reason}`);
 	}
 }
-export function recordFactoryRuntime(directory: string): FactoryFilePin {
+export function recordFactoryRuntime(directory: string, filename = "runtime.json"): FactoryFilePin {
 	const live = factoryRuntimeProcess();
 	let root = dirname(live.module);
 	if (basename(root) === "factory") root = dirname(root);
@@ -98,7 +98,7 @@ export function recordFactoryRuntime(directory: string): FactoryFilePin {
 		files: [...paths].sort().map((path) => ({ path, sha256: hashFactoryRuntimeFile(path) })),
 		capabilities: ["provider-response-model-v1", "factory-completed-json-v1"],
 	};
-	const path = join(directory, "runtime.json");
+	const path = join(directory, filename);
 	writeFileSync(path, `${JSON.stringify(identity)}\n`, { flag: "wx", mode: 0o600 });
 	const pin = { path, sha256: hashFactoryRuntimeFile(path) };
 	verifyFactoryRuntimeAdmission(pin, live);

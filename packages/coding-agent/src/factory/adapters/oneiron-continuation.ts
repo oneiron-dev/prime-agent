@@ -1502,3 +1502,24 @@ export function readOneironContinuationStatus(path: string): Record<string, unkn
 		db.close();
 	}
 }
+
+/** Restore local projections only; in-flight custody never authorizes a second launch or inference. */
+export function rehydrateOneironContinuation(path: string): Record<string, unknown> {
+	const db = new DatabaseSync(path, { readOnly: true });
+	try {
+		if (db.prepare("SELECT 1 FROM sqlite_master WHERE name='oneiron_continuation_requests'").get()) {
+			for (const row of db
+				.prepare(`SELECT r.id,r.cursor_id,r.packet,r.response
+				FROM oneiron_continuation_requests r JOIN oneiron_continuation_cursor c ON c.id=r.cursor_id
+				WHERE r.state IN ('DISPATCHED','RESPONDED','WAITING')`)
+				.all()) {
+				const output = join(dirname(path), "continuation", String(row.cursor_id), String(row.id));
+				saveOnce(join(output, "packet.json"), JSON.parse(String(row.packet)));
+				if (row.response !== null) saveOnce(join(output, "response.json"), JSON.parse(String(row.response)));
+			}
+		}
+	} finally {
+		db.close();
+	}
+	return readOneironContinuationStatus(path);
+}

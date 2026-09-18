@@ -17,6 +17,7 @@ import {
 	type OneironWriterStatus,
 	oneironWriterCli,
 	readOneironWriterProfile,
+	runOneironWriterForeground,
 	summarizeOneironWriter,
 	validateOneironWriterReceipt,
 	validateOneironWriterRetry,
@@ -488,4 +489,24 @@ test("records terminal facts without inventing receipt readiness or changed path
 		receipt_sha: null,
 		changed_paths: null,
 	});
+});
+
+test("each foreground writer is a fresh process with no prior child memory", async () => {
+	const f = setup();
+	const results: { pid: number; memory: number }[] = [];
+	for (let phase = 0; phase < 2; phase++) {
+		const path = join(f.directory, `phase-${phase}.json`);
+		await runOneironWriterForeground(
+			[
+				process.execPath,
+				"-e",
+				"globalThis.memory = (globalThis.memory ?? 0) + 1; console.log(JSON.stringify({pid:process.pid,memory:globalThis.memory}))",
+			],
+			f.directory,
+			path,
+		);
+		results.push(JSON.parse(readFileSync(path, "utf8")));
+	}
+	expect(results[0].pid).not.toBe(results[1].pid);
+	expect(results.map((r) => r.memory)).toEqual([1, 1]);
 });

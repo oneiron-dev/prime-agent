@@ -8,6 +8,7 @@ import { FactoryEngine } from "./engine.js";
 import { assertByteLimit, FACTORY_EVIDENCE_LIMITS } from "./evidence.js";
 import { FACTORY_HELP } from "./help.js";
 import type { ManagementReconciliation } from "./management.js";
+import { resumeFactory } from "./resume.js";
 import { recordFactoryRuntime } from "./runtime.js";
 import { FactoryStore } from "./store.js";
 import type { ActionWithdrawal, DecisionEvidence, FactoryPlan, NonRetrySettlement } from "./types.js";
@@ -17,6 +18,7 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 	const options = new Map<string, string>();
 	const allowed = new Set([
 		"--hosts",
+		"--accept-runtime-change",
 		"--object",
 		"--apply",
 		"--ticket",
@@ -104,6 +106,8 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 	}
 	const { positionals, options } = parseArguments(args);
 	const [command, rawDirectory, argument, choice] = positionals;
+	if (command !== "resume" && options.has("--accept-runtime-change"))
+		throw new Error("--accept-runtime-change is only supported for resume");
 	if (command !== "decide-typed" && (options.has("--object") || options.has("--apply")))
 		throw new Error("--object and --apply are only supported for decide-typed");
 	if (options.has("--timeout-ms") && command !== "fingerprint") {
@@ -203,8 +207,9 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 				emit(engine.status());
 				break;
 			case "resume":
-				engine.resume();
-				emit(engine.status());
+				if (positionals.length !== 2 || [...options.keys()].some((key) => key !== "--accept-runtime-change"))
+					throw new Error("resume requires <directory> [--accept-runtime-change <reason>]");
+				await resumeFactory(engine, options.get("--accept-runtime-change"));
 				break;
 			case "decide-typed": {
 				const object = options.get("--object");

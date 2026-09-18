@@ -120,7 +120,11 @@ describe("whole-attempt retry under the real factory supervisor", () => {
 			const priorPermit = pin({ unusedFixture: true });
 			const old = prepareOneiron(manifest, {
 				manifestPath: priorManifest.path,
-				adapterArgv: [process.execPath, "-e", "process.exit(1)"],
+				adapterArgv: [
+					process.execPath,
+					"-e",
+					`require("node:fs").writeFileSync(${JSON.stringify(join(directory, "prior-pid"))}, String(process.pid)); process.exit(1)`,
+				],
 				permitPath: priorPermit.path,
 				host: "local",
 				slotId: "writer",
@@ -211,7 +215,7 @@ describe("whole-attempt retry under the real factory supervisor", () => {
 				});
 				writeFileSync(
 					fixture,
-					`import {writeFileSync} from 'node:fs'; import {executeOneiron} from ${JSON.stringify(resolve("src/factory/adapters/oneiron.ts"))}; import {FactoryStore} from ${JSON.stringify(resolve("src/factory/store.ts"))}; const runtime={now:Date.now,source:async()=>(${JSON.stringify(source)}),status:async()=>{const store=new FactoryStore(${JSON.stringify(database)});try{return {...store.status(),ownerPaused:false}}finally{store.close()}},run:async()=>{throw Error('Writer must use file-backed capture')},runWriter:async(argv,cwd,transcriptPath)=>{writeFileSync(${JSON.stringify(marker)},JSON.stringify({attemptId:process.env.PRIME_FACTORY_ATTEMPT_ID,source:process.env.PRIME_FACTORY_SOURCE_FINGERPRINT,argv}));writeFileSync(transcriptPath,${JSON.stringify(response)},{flag:'wx'})},call:async()=>{throw Error('No model request permitted in fixture')}}; console.log(JSON.stringify(await executeOneiron(${JSON.stringify(retryManifest.path)},${JSON.stringify(permitPin.path)},true,runtime,${JSON.stringify(retryManifest.sha256)})));`,
+					`import {writeFileSync} from 'node:fs'; import {executeOneiron} from ${JSON.stringify(resolve("src/factory/adapters/oneiron.ts"))}; import {FactoryStore} from ${JSON.stringify(resolve("src/factory/store.ts"))}; const runtime={now:Date.now,source:async()=>(${JSON.stringify(source)}),status:async()=>{const store=new FactoryStore(${JSON.stringify(database)});try{return {...store.status(),ownerPaused:false}}finally{store.close()}},run:async()=>{throw Error('Writer must use file-backed capture')},runWriter:async(argv,cwd,transcriptPath)=>{writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid,attemptId:process.env.PRIME_FACTORY_ATTEMPT_ID,source:process.env.PRIME_FACTORY_SOURCE_FINGERPRINT,argv}));writeFileSync(transcriptPath,${JSON.stringify(response)},{flag:'wx'})},call:async()=>{throw Error('No model request permitted in fixture')}}; console.log(JSON.stringify(await executeOneiron(${JSON.stringify(retryManifest.path)},${JSON.stringify(permitPin.path)},true,runtime,${JSON.stringify(retryManifest.sha256)})));`,
 				);
 				const action = prepareOneiron(manifest, {
 					manifestPath: retryManifest.path,
@@ -220,6 +224,14 @@ describe("whole-attempt retry under the real factory supervisor", () => {
 					host: "local",
 					slotId: "writer",
 				}).action!;
+				expect(action.command.argv.slice(-5)).toEqual([
+					"execute",
+					retryManifest.path,
+					permitPin.path,
+					retryManifest.sha256,
+					"--execute",
+				]);
+				expect(action.requirements.runtime).toEqual(runtimePin);
 				const other = {
 					...old,
 					id: "competing-claim",
@@ -255,6 +267,14 @@ describe("whole-attempt retry under the real factory supervisor", () => {
 						attemptId: current.id,
 						source: source.fingerprint,
 					});
+					const invocation = JSON.parse(readFileSync(marker, "utf8")) as { pid: number; argv: string[] };
+					expect(invocation.pid).not.toBe(Number(readFileSync(join(directory, "prior-pid"), "utf8")));
+					expect(invocation.argv).not.toContain("--resume");
+					expect(invocation.argv).not.toContain("--continue");
+					expect(invocation.argv[invocation.argv.indexOf("--session-dir") + 1]).toBe(
+						join(manifest.outputDirectory, "session"),
+					);
+					expect(invocation.argv.at(-1)).toBe(readFileSync(manifest.stage.prompt.path, "utf8"));
 					const receipt = JSON.parse(
 						readFileSync(join(manifest.outputDirectory, "receipt.json"), "utf8"),
 					) as OneironReceipt;
