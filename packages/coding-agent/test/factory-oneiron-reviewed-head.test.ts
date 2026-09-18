@@ -19,7 +19,7 @@ import { inspectOneironCorpus, type OneironPin, oneironSha } from "../src/factor
 import { defaultOneironWriterProfile, validateOneironWriterReceipt } from "../src/factory/adapters/oneiron-writer.js";
 
 const transport = vi.hoisted(() => ({ auth: vi.fn(), complete: vi.fn() }));
-vi.mock("@earendil-works/pi-ai", () => ({ completeSimple: transport.complete }));
+vi.mock("@earendil-works/pi-ai", () => ({ completeSimple: transport.complete, getProviders: () => [] }));
 vi.mock("../src/core/auth-storage.js", () => ({ AuthStorage: { create: () => ({}) } }));
 vi.mock("../src/core/model-registry.js", () => ({
 	ModelRegistry: {
