@@ -101,6 +101,7 @@ function treeFiles(workspace: string, deadline: number): string[] {
 export function capsuleOwnsPath(path: string, text: string, metadata = readCapsulePacket(text)): boolean {
 	let mentioned = false;
 	for (let index = path ? text.indexOf(path) : -1; index >= 0; index = text.indexOf(path, index + path.length)) {
+		if (!/(?:^|[\s"'`()[\]{},;:!?])$/u.test(text.slice(0, index))) continue;
 		const suffix = text.slice(index + path.length);
 		if (/^(?:$|[\s"'`()[\]{},;:!?]|\.(?=$|[\s"'`()[\]{},;:!?]))/u.test(suffix)) {
 			mentioned = true;
@@ -392,6 +393,7 @@ export function generateOneironCapsule(
 	const ranked: Array<{ path: string; stem: boolean; matches: number }> = [];
 	for (const path of paths) {
 		if (performance.now() >= deadline) break;
+		if (extname(path) === ".json") continue;
 		if (!/(?:^|\/)(?:test|tests)\/|(?:[._-]test|[._-]spec)\.[^.]+$|(?:^|\/)test_[^/]+\.py$/.test(path)) continue;
 		const absolute = join(workspace, capsuleLocalPath(workspace, path));
 		if (!existsSync(absolute)) continue;

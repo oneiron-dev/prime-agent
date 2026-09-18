@@ -17,3 +17,5 @@
 - Fixed committed factory decisions to return an unpublished receipt with the publication error instead of reporting a failed decision.
 - Fixed failed capsule receipts to validate accounting before adding it to the ledger.
 - Fixed capsule ownership matching to distinguish exact file paths from longer path names.
+- Added advisory CodeRabbit, Cursor and Greptile findings and a one-shot CodeRabbit review request while keeping Qodo and Codex required and ignoring unavailable bot output.
+- Fixed capsule packet verification before ledger recording and path boundaries on both sides of packet-owned file names.

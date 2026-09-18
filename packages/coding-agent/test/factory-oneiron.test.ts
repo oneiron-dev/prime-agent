@@ -941,7 +941,9 @@ test("a deterministic capsule failure records no pin and still launches the writ
 		});
 		const result = (await f.execute()) as OneironReceipt;
 		expect(f.runtime.runWriter).toHaveBeenCalledTimes(1);
-		expect(vi.mocked(f.runtime.runWriter!).mock.calls[0][0].at(-1)).toBe(prompt);
+		const launched = vi.mocked(f.runtime.runWriter!).mock.calls[0][0].at(-1)!;
+		expect(launched.startsWith(`${prompt}\n\n`)).toBe(true);
+		expect(launched).not.toContain("Pinned capsule evidence");
 		expect(result.result.capsule).toBeNull();
 		expect(result.result.capsule_sha256).toBeNull();
 		expect(store.context(attempt.id).attempt.capsule_sha256).toBeNull();

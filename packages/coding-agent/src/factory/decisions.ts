@@ -136,6 +136,15 @@ export const FactoryDecisionSchema = Type.Union([
 		forbidden_replay_of: ns,
 	}),
 	variant("review_posting", {
+		reviewer: Type.Optional(
+			Type.Union([
+				Type.Literal("qodo"),
+				Type.Literal("codex"),
+				Type.Literal("coderabbit"),
+				Type.Literal("cursor"),
+				Type.Literal("greptile"),
+			]),
+		),
 		request_command_exit: exit,
 		returned_comment_id: ns,
 		url: ns,

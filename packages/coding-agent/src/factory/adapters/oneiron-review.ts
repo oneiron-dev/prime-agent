@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { AdapterDecisionContext, DecisionOf } from "../decisions.js";
 
+export type OneironReviewer = NonNullable<DecisionOf<"review_posting">["reviewer"]>;
+
 export interface OneironPin {
 	path: string;
 	sha256: string;
@@ -10,7 +12,7 @@ export interface OneironReviewItem {
 	body: string;
 	bodySha256: string;
 	commit: string | null;
-	reviewer: "qodo" | "codex";
+	reviewer: OneironReviewer;
 	url: string;
 	/** GitHub's outdated/resolved flags are context, not semantic disposition. */
 	threadResolved: boolean;
@@ -38,9 +40,9 @@ export interface OneironReviewReport {
 	candidateCommit: string;
 	/** Native triage projection only. Corpus inspection itself stays exact-head. */
 	reviewedHead?: string;
-	historicalCompletedReviewers?: ("qodo" | "codex")[];
+	historicalCompletedReviewers?: OneironReviewer[];
 	corpusSha256: string;
-	completedReviewers: ("qodo" | "codex")[];
+	completedReviewers: OneironReviewer[];
 	items: OneironReviewItem[];
 	blockers: string[];
 }
@@ -52,15 +54,82 @@ function object(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected review object");
 	return value as Record<string, unknown>;
 }
-function reviewer(login: unknown): "qodo" | "codex" | undefined {
+function reviewer(login: unknown): OneironReviewer | undefined {
 	if (["qodo-merge-pro[bot]", "qodo-merge-pro", "qodo-code-review[bot]", "qodo-code-review"].includes(String(login)))
 		return "qodo";
 	if (["chatgpt-codex-connector[bot]", "chatgpt-codex-connector", "codex[bot]", "codex"].includes(String(login)))
 		return "codex";
+	if (["coderabbitai[bot]", "coderabbitai"].includes(String(login))) return "coderabbit";
+	if (["cursor[bot]", "cursor"].includes(String(login))) return "cursor";
+	if (["greptile-apps[bot]", "greptile-apps"].includes(String(login))) return "greptile";
 	return undefined;
 }
 const NOT_COMPLETED =
-	/(?:review (?:was |is |has been )?(?:skipped|disabled|pending|queued|timed out)|quota(?:[- ]limited| exceeded| exhausted)|(?:usage|rate) limit|unable to review|review not (?:run|performed)|maximum number of reviews)/i;
+	/^(?:(?:this |the )?review (?:was |is |has been )?)?(?:skipped|disabled|pending|queued|timed out|in progress|failed|currently processing new changes|bugbot (?:couldn['’]t|could not) run|quota(?:[- ]limited| exceeded| exhausted)|(?:usage|rate)[- ]limit|out of (?:usage|credits)|unable to review|not (?:run|performed)|maximum number of reviews)/i;
+const REVIEW_STATUS_NOTICE_MAX_LENGTH = 600;
+const METADATA_TITLE =
+	/^(?:(?:pr )?summary(?: by qodo)?|run configuration|walkthrough|review info|commits|files (?:selected for processing|ignored due to path filters)(?: \(\d+\))?)$/i;
+
+/** Strip metadata blocks, not findings beside them or substantive details blocks. */
+function reviewContent(body: string): { text: string; incomplete: boolean } {
+	let text = body
+		.replace(
+			/<!-- (walkthrough|final_review_risk|pre_merge_checks_walkthrough|finishing_touch_checkbox|tips)_start -->[\s\S]*?<!-- \1_end -->/g,
+			"",
+		)
+		.replace(/<!--[\s\S]*?-->/g, "")
+		.replace(/^\s*>\s?/gm, "");
+	let depth = 0;
+	let hiddenDepth: number | undefined;
+	let start = 0;
+	let content = "";
+	const title = (value: string) =>
+		value
+			.replace(/<[^>]*>/g, "")
+			.replace(/^[^a-z]+/i, "")
+			.replace(/[\s#*_`]+$/, "")
+			.trim();
+	for (const tag of text.matchAll(/<\/?details\b[^>]*>/gi)) {
+		if (!tag[0].startsWith("</")) {
+			depth++;
+			const summary = text.slice(tag.index + tag[0].length).match(/^\s*<summary\b[^>]*>([\s\S]*?)<\/summary>/i);
+			if (hiddenDepth === undefined && summary && METADATA_TITLE.test(title(summary[1]))) {
+				content += text.slice(start, tag.index);
+				hiddenDepth = depth;
+			}
+		} else {
+			if (hiddenDepth === depth) {
+				start = tag.index + tag[0].length;
+				hiddenDepth = undefined;
+			}
+			depth = Math.max(0, depth - 1);
+		}
+	}
+	text = content + (hiddenDepth === undefined ? text.slice(start) : "");
+	let hiddenSection: number | undefined;
+	const lines: string[] = [];
+	for (const line of text
+		.replace(
+			/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi,
+			(_: string, level: string, text: string) => `${"#".repeat(Number(level))} ${text}`,
+		)
+		.split("\n")) {
+		const heading = line.match(/^\s*(#{1,6})\s+(.+)/);
+		const level = heading?.[1].length ?? 1;
+		if (heading && hiddenSection !== undefined && level <= hiddenSection) hiddenSection = undefined;
+		if (METADATA_TITLE.test(title(heading?.[2] ?? line))) hiddenSection ??= level;
+		if (hiddenSection === undefined) lines.push(line);
+	}
+	text = lines
+		.join("\n")
+		.replace(/<[^>]*>/g, "")
+		.replace(/here are some automated review suggestions[^\n]*|[^\n]*tips about codex[\s\S]*/gi, "")
+		.replace(/^[\s#*_>\-`]+$/gm, "")
+		.trim();
+	const notice = text.replace(/^(?:\[![A-Z]+\]\s*)?[\s#*_>\-`]+/, "");
+	const incomplete = notice.length < REVIEW_STATUS_NOTICE_MAX_LENGTH && NOT_COMPLETED.test(notice);
+	return { text: incomplete ? "" : text, incomplete };
+}
 
 /** Consume the existing helper's frozen schema. Check-run success is never a review. */
 export function inspectOneironCorpus(
@@ -84,8 +153,8 @@ export function inspectOneironCorpus(
 	if (pr.head_sha !== expected.head || pr.base_ref !== expected.base || !Array.isArray(pr.items))
 		throw new Error("Corpus head/base mismatch");
 	const items: OneironReviewItem[] = [];
-	const completed = new Set<"qodo" | "codex">();
-	const postings = new Map<"qodo" | "codex", DecisionOf<"review_posting">>();
+	const completed = new Set<OneironReviewer>();
+	const postings = new Map<OneironReviewer, DecisionOf<"review_posting">>();
 	const seen = new Set<string>();
 	for (const raw of pr.items) {
 		const item = object(raw);
@@ -109,16 +178,16 @@ export function inspectOneironCorpus(
 						comment.commit_id === expected.head &&
 						reviewer(object(comment.user).login) === bot &&
 						typeof comment.body === "string" &&
-						comment.body.trim().length >= 40 &&
-						!NOT_COMPLETED.test(comment.body),
+						reviewContent(comment.body).text.length >= 40,
 				);
-		const substantiveBody = body.trim().length >= 40 && !/automated review suggestions|tips about codex/i.test(body);
+		const { text: content, incomplete } = reviewContent(body);
+		const substantiveBody = content.length >= 40;
 		if (
 			isReview &&
 			item.commit_id === expected.head &&
 			["APPROVED", "COMMENTED", "CHANGES_REQUESTED"].includes(String(item.state)) &&
 			(substantiveBody || inline) &&
-			!NOT_COMPLETED.test(body)
+			!incomplete
 		)
 			completed.add(bot);
 		const qodoFooter = `<!-- https://github.com/${expected.repo}/commit/${expected.head} -->`;
@@ -128,7 +197,8 @@ export function inspectOneironCorpus(
 			body.includes("<h3>Code Review by Qodo</h3>") &&
 			body.includes(qodoFooter) &&
 			body.trim().length >= 100 &&
-			!NOT_COMPLETED.test(body)
+			substantiveBody &&
+			!incomplete
 		)
 			completed.add(bot);
 		const isComment = item.sources.some((source) =>
@@ -138,6 +208,7 @@ export function inspectOneironCorpus(
 			postings.set(bot, {
 				...decisionContext.base,
 				type: "review_posting",
+				reviewer: bot,
 				request_command_exit: null,
 				returned_comment_id:
 					isComment && (typeof item.id === "string" || typeof item.id === "number") ? String(item.id) : null,
@@ -151,7 +222,7 @@ export function inspectOneironCorpus(
 				manual_request_exists: null,
 				reason: `${bot}: observed frozen bot corpus; request-command success and manual request custody are not supplied`,
 			});
-		if (!body.trim() || item.in_reply_to_id) continue;
+		if (!content || item.in_reply_to_id) continue;
 		if (
 			!item.sources.some((source) =>
 				["review", "review_comment", "review_thread_comment", "issue_comment"].includes(String(source)),

@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import {
 	inspectOneironCorpus,
 	type OneironFinding,
+	type OneironReviewer,
 	oneironReviewBlockers,
 	oneironSha,
 	validateOneironTriage,
@@ -52,6 +53,77 @@ function disposition(id: string, hash: string, extra: Partial<OneironFinding> = 
 		...extra,
 	};
 }
+
+const bodies: { name: string; login: string; reviewer: OneironReviewer; body: string; completed: boolean }[] =
+	JSON.parse(readFileSync(new URL("./fixtures/factory-oneiron/review-bodies.json", import.meta.url), "utf8"));
+
+test.each(bodies)("2.12 classifies $name without adding advisory blockers", ({ login, reviewer, body, completed }) => {
+	const data = item("review:20", login, { body, body_sha256: oneironSha(body) });
+	const inline = { ...data, key: "review_comment:21", sources: ["review_comment"] };
+	const result = inspectOneironCorpus(corpus([data, inline]), expected);
+	expect(result.completedReviewers).toEqual(completed ? [reviewer] : []);
+	expect(result.items.map((entry) => [entry.reviewer, entry.body])).toEqual(
+		completed
+			? [
+					[reviewer, body],
+					[reviewer, body],
+				]
+			: [],
+	);
+	expect(result.blockers).toEqual(
+		["qodo", "codex"]
+			.filter((bot) => !completed || bot !== reviewer)
+			.map((bot) => `${bot}: no substantive completed exact-commit review`),
+	);
+	expect(inspectOneironCorpus(corpus([{ ...data, commit_id: "b".repeat(40) }]), expected).completedReviewers).toEqual(
+		[],
+	);
+	const covered = inspectOneironCorpus(
+		corpus([
+			item("review:1", "qodo-code-review[bot]"),
+			item("review:2", "chatgpt-codex-connector[bot]"),
+			data,
+			inline,
+		]),
+		expected,
+	);
+	const triage = validateOneironTriage(
+		{
+			version: 1,
+			candidateCommit: head,
+			corpusSha256: covered.corpusSha256,
+			sourceFingerprint: "git:test",
+			findings: covered.items.map((entry) =>
+				disposition(entry.id, entry.bodySha256, { evidenceRefs: [`sha256:${covered.corpusSha256}`] }),
+			),
+		},
+		covered,
+		"git:test",
+		[],
+		[`sha256:${covered.corpusSha256}`],
+	);
+	expect(oneironReviewBlockers(covered, triage)).toEqual([]);
+});
+
+test.each([
+	[
+		"qodo-code-review[bot]",
+		"qodo",
+		"The retry loop calls the upstream endpoint with no rate limit, so a burst of failures will exhaust the quota and drop user writes. Add a bounded backoff.",
+	],
+	[
+		"chatgpt-codex-connector[bot]",
+		"codex",
+		"This handler ignores the usage limit returned by the provider and retries forever, so a throttled tenant will spin until the process is killed. Bound the retries.",
+	],
+])("CR-FIX-3 F1 retains %s findings about limits", (login, reviewer, body) => {
+	const result = inspectOneironCorpus(
+		corpus([item("review:1", login, { body, body_sha256: oneironSha(body) })]),
+		expected,
+	);
+	expect(result.completedReviewers).toEqual([reviewer]);
+	expect(result.items.map((entry) => entry.body)).toEqual([body]);
+});
 
 describe("Oneiron exact-commit review policy", () => {
 	test("preserves the six actual PR855 roots and carries the docs CodeRabbit obligation", () => {
@@ -114,7 +186,9 @@ describe("Oneiron exact-commit review policy", () => {
 		(state) => {
 			const body = `This review was ${state}. The bot has not analyzed any changed source files yet.`;
 			const data = item("review:1", "qodo-code-review[bot]", { body, body_sha256: oneironSha(body) });
-			expect(inspectOneironCorpus(corpus([data]), expected).completedReviewers).not.toContain("qodo");
+			const result = inspectOneironCorpus(corpus([data]), expected);
+			expect(result.completedReviewers).not.toContain("qodo");
+			expect(result.items).toEqual([]);
 		},
 	);
 	test("green check, missing commit, stale review, empty envelope and boilerplate are not completion", () => {
@@ -136,11 +210,16 @@ describe("Oneiron exact-commit review policy", () => {
 			).not.toContain("qodo");
 		}
 	});
-	test("credits an empty review only via its own exact-head inline finding; handles GraphQL login aliases", () => {
+	test.each([
+		["qodo", "qodo-code-review[bot]"],
+		["coderabbit", "coderabbitai[bot]"],
+		["cursor", "cursor[bot]"],
+		["greptile", "greptile-apps[bot]"],
+	])("2.12 credits %s empty reviews only via their own exact-head inline findings", (bot, login) => {
 		const body = "This truncates the candidate before the filter, losing eligible search results.";
-		const review = item("review:1", "qodo-code-review[bot]", { body: "", body_sha256: oneironSha("") });
-		const comment = { pull_request_review_id: "1", commit_id: head, body, user: { login: "qodo-code-review[bot]" } };
-		const normalized = item("review_comment:4", "qodo-code-review", {
+		const review = item("review:1", login, { body: "", body_sha256: oneironSha("") });
+		const comment = { pull_request_review_id: "1", commit_id: head, body, user: { login } };
+		const normalized = item("review_comment:4", login.replace("[bot]", ""), {
 			sources: ["review_comment", "review_thread_comment"],
 			body,
 			body_sha256: oneironSha(body),
@@ -148,13 +227,13 @@ describe("Oneiron exact-commit review policy", () => {
 			thread_resolved: true,
 		});
 		const result = inspectOneironCorpus(corpus([review, normalized], [comment]), expected);
-		expect(result.completedReviewers).toContain("qodo");
+		expect(result.completedReviewers).toContain(bot);
 		expect(result.items).toHaveLength(1);
 		expect(result.items[0]!.threadOutdated).toBe(true);
 		expect(
 			inspectOneironCorpus(corpus([review], [{ ...comment, pull_request_review_id: "other" }]), expected)
 				.completedReviewers,
-		).not.toContain("qodo");
+		).not.toContain(bot);
 	});
 	test("Qodo no-findings comment requires its exact full-commit footer and actual review marker", () => {
 		const body = `<h3>Code Review by Qodo</h3> Qodo reviewed your code and found no material issues that require review. <!-- https://github.com/org/repo/commit/${head} -->`;
@@ -249,11 +328,17 @@ describe("Oneiron exact-commit review policy", () => {
 	});
 });
 
-test("records observed comment identity without inventing a successful request", () => {
+test.each([
+	["qodo", "qodo-code-review[bot]"],
+	["codex", "chatgpt-codex-connector[bot]"],
+	["coderabbit", "coderabbitai"],
+	["cursor", "cursor[bot]"],
+	["greptile", "greptile-apps[bot]"],
+])("2.12 records %s comment identity without inventing a successful request", (reviewer, login) => {
 	const rows: FactoryDecision[] = [];
 	inspectOneironCorpus(
 		corpus([
-			item("review_comment:42", "qodo-code-review[bot]", {
+			item("review_comment:42", login, {
 				sources: ["review_comment"],
 				url: "https://example.test/comment/42",
 				created_at: "2026-09-18T00:00:00Z",
@@ -270,11 +355,13 @@ test("records observed comment identity without inventing a successful request",
 	);
 	expect(rows[0]).toMatchObject({
 		type: "review_posting",
+		reviewer,
 		returned_comment_id: "42",
 		request_command_exit: null,
 		manual_request_exists: null,
 		posted_at: "2026-09-18T00:00:00Z",
 	});
+	expect(() => validateDecision({ ...rows[0], reviewer: "unknown" })).toThrow();
 });
 
 test("records one posting per reviewer after aggregating all corpus items", () => {

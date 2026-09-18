@@ -40,6 +40,8 @@ Initialization is paused. `resume` is a ledger recovery operation, not a bare un
 
 A `git:` fingerprint measures HEAD/tree, the tracked diff and nonignored untracked entries. Use `fingerprint` to calculate it on the selected host before planning the action. Runners check it before launch and record resulting output identity separately. Opaque fingerprints are identifiers only; they need a project-specific verification wrapper if used for code work. See [command runner contract](factory-command-runner.md) for the exact foreground/process and source boundaries.
 
+The Oneiron review gate requires substantive Qodo and Codex reviews on the exact published head. CodeRabbit, Cursor and Greptile are advisory: their substantive findings enter review-fix triage, but missing or unavailable reviews do not block. Skipped, failed, rate-limited, out-of-usage, in-progress and configuration-only or summary-only bot output is ignored. CodeRabbit is requested once after Qodo and Codex with `@coderabbitai review`, never with credits; a failed request is recorded without a retry or wake.
+
 ## Decisions and changing plans
 
 Models are configured per role, outside the engine. For example, a `ticketOwner` role may specify provider `cpa-r`, model `gpt-6-astra`, and effort `low`; a `coordinator` role may use the same model at `xhigh`. Existing first-party implementation/review tools run as foreground command actions. Role declarations do not by themselves launch models or import live tickets.

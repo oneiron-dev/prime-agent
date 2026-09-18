@@ -73,6 +73,7 @@ function fixture() {
 	});
 	const capsule = (name = "capsule", cost = accounting()): FactoryCapsuleReceipt => {
 		const packet = { path: join(directory, "packet.json"), sha256: sha("packet") };
+		writeFileSync(packet.path, "packet");
 		const bytes = JSON.stringify({
 			version: 1,
 			head,
@@ -193,6 +194,13 @@ describe("factory capsule ledger", () => {
 	});
 
 	it.each<[string, (receipt: FactoryCapsuleReceipt) => FactoryCapsuleReceipt]>([
+		[
+			"packet bytes (PR #7 G2)",
+			(r) => {
+				writeFileSync(r.packet.path, "changed packet");
+				return r;
+			},
+		],
 		["pin hash", (r) => ({ ...r, pin: { ...r.pin, sha256: "f".repeat(64) } })],
 		["relative path", (r) => ({ ...r, pin: { ...r.pin, path: "capsule.json" } })],
 		["pin format", (r) => ({ ...r, pin: { ...r.pin, sha256: "bad" } })],
