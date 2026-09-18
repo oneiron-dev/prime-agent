@@ -89,7 +89,7 @@ export function factoryCost(directory: string, ticket?: string): FactoryCostRepo
 		}
 		const requests = db
 			.prepare(
-				"SELECT m.id,m.result,m.action_id,a.ticket_id FROM management_requests m JOIN actions a ON a.id=m.action_id WHERE (? IS NULL OR a.ticket_id=?) ORDER BY m.rowid",
+				"SELECT m.id,m.result,m.action_id,a.ticket_id FROM management_requests m JOIN actions a ON a.id=m.action_id WHERE m.wake_id IS NOT NULL AND (? IS NULL OR a.ticket_id=?) ORDER BY m.rowid",
 			)
 			.all(ticket ?? null, ticket ?? null);
 		for (const row of requests) {

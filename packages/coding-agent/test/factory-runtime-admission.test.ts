@@ -78,7 +78,7 @@ afterEach(() => {
 function mismatch(store: FactoryStore, reason: RegExp) {
 	const attempt = store.attempts()[0];
 	expect(attempt).toMatchObject({ state: "UNCERTAIN", receipt: null, claimReleased: false });
-	expect(store.events().filter((event) => event.kind === "runtime_mismatch")).toEqual([
+	expect(store.allEvents().filter((event) => event.kind === "runtime_mismatch")).toEqual([
 		expect.objectContaining({
 			actionId: "action",
 			attemptId: attempt.id,
@@ -109,7 +109,7 @@ test("init without an action pin records its own runtime and preserves it across
 	const initializedPin = store.runtimePin()!;
 	expect(initializedPin.path).toBe(join(directory, "runtime.json"));
 	expect(() => runtime.verifyFactoryRuntimeAdmission(initializedPin, runtime.factoryRuntimeProcess())).not.toThrow();
-	expect(store.events().filter((event) => event.kind === "runtime_pinned")).toEqual([
+	expect(store.allEvents().filter((event) => event.kind === "runtime_pinned")).toEqual([
 		expect.objectContaining({ actionId: null, attemptId: null, detail: { runtime: initializedPin } }),
 	]);
 	store.resume();
@@ -179,7 +179,7 @@ test.each(["identity hash", "bundle hash", "stale start", "foreign process", "ac
 		expect(transport).not.toHaveBeenCalled();
 		expect(existsSync(f.marker)).toBe(false);
 		mismatch(f.store, /runtime|Runtime|Process/);
-		expect(f.store.events().find((event) => event.kind === "runtime_mismatch")?.detail.runtime_check).toBe(
+		expect(f.store.allEvents().find((event) => event.kind === "runtime_mismatch")?.detail.runtime_check).toBe(
 			fault === "stale start" ? "local_start_time" : "runtime_identity",
 		);
 	},
@@ -417,7 +417,7 @@ test("delivery integrity is separate from runtime identity in receipts and the j
 	engine.applyPlan(f.plan);
 	await engine.tick();
 	mismatch(f.store, /^runtime_mismatch: delivery_integrity: Runner source delivery hash mismatch/);
-	expect(f.store.events().find((event) => event.kind === "runtime_mismatch")?.detail.runtime_check).toBe(
+	expect(f.store.allEvents().find((event) => event.kind === "runtime_mismatch")?.detail.runtime_check).toBe(
 		"delivery_integrity",
 	);
 	expect(existsSync(f.marker)).toBe(false);

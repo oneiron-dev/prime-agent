@@ -9,8 +9,8 @@ import { type OneironPin, oneironSha } from "../src/factory/adapters/oneiron-rev
 import { readOneironTransport, verifyOneironArtifact } from "../src/factory/adapters/oneiron-transport.js";
 import {
 	defaultOneironWriterProfile,
-	FACTORY_MODEL_PRICES,
 	FACTORY_PRICE_OVERRIDES,
+	factoryModelPrices,
 	type OneironWriterProfile,
 	type OneironWriterRetry,
 	type OneironWriterStage,
@@ -21,6 +21,7 @@ import {
 	validateOneironWriterReceipt,
 	validateOneironWriterRetry,
 } from "../src/factory/adapters/oneiron-writer.js";
+import { codeDecisionBase, type FactoryDecision, validateDecision } from "../src/factory/decisions.js";
 import { readFactoryRuntime } from "../src/factory/runtime.js";
 import { fixtureRuntimePin } from "./factory-runtime-fixture.js";
 
@@ -130,7 +131,7 @@ describe("explicit pinned writer profile and factory model capture", () => {
 			);
 		for (const provider of getProviders())
 			for (const model of getModels(provider))
-				expect(FACTORY_MODEL_PRICES.get(`${provider}/${model.id}`)).toEqual(model.cost);
+				expect(factoryModelPrices().get(`${provider}/${model.id}`)).toEqual(model.cost);
 		const prices = getModel("openai", "gpt-4o").cost;
 		const expected = prices.input + 2 * prices.output + 3 * prices.cacheRead + 4 * prices.cacheWrite;
 		const resolved = summarize(["openai/gpt-4o", "openai/gpt-4o"]);
@@ -145,7 +146,7 @@ describe("explicit pinned writer profile and factory model capture", () => {
 			total: 20_000_000,
 		});
 		expect(resolved.observations.map((item) => item.cost_usd)).toEqual([expected, expected]);
-		expect(FACTORY_MODEL_PRICES.has("not-in-registry")).toBe(false);
+		expect(factoryModelPrices().has("not-in-registry")).toBe(false);
 		const unresolved = summarize(["openai/gpt-4o", "not-in-registry"]);
 		expect(unresolved.cost_usd).toBeNull();
 		expect(unresolved.priced).toBe(false);
@@ -466,5 +467,25 @@ describe("explicit pinned writer profile and factory model capture", () => {
 		expect(() =>
 			validateOneironWriterRetry(f.manifest, f.stage, retry, status, readOneironPin, Date.now(), execution),
 		).toThrow(/terminal/);
+	});
+});
+
+test("records terminal facts without inventing receipt readiness or changed paths", () => {
+	const f = setup(),
+		rows: FactoryDecision[] = [];
+	summarizeOneironWriter(f.manifest, f.stage, f.profile, f.transport(f.event("wrong-model")), "sha", {
+		base: codeDecisionBase(4, "writer"),
+		attemptId: "attempt",
+		record: (d) => {
+			rows.push(validateDecision(d));
+		},
+	});
+	expect(rows[0]).toMatchObject({
+		type: "writer_terminal_accept",
+		requested_profile: "gpt-6-astra",
+		served_profile: "wrong-model",
+		receipt_ready: false,
+		receipt_sha: null,
+		changed_paths: null,
 	});
 });

@@ -82,6 +82,7 @@ describe("optional factory CLI", () => {
 		const f = setup("decision");
 		const plan = JSON.parse(readFileSync(f.planPath, "utf8")) as FactoryPlan;
 		plan.tickets.push({ id: "other-ticket", owner: "owner" });
+		plan.roles = { ticketOwner: { provider: "openai", model: "openai/gpt-4o" } };
 		const usage = { input: 10, output: 5, cache_read: 2, cache_write: 1, total: 18 };
 		const receiptPaths: string[] = [];
 		for (const [index, ticket] of plan.tickets.entries()) {
@@ -135,7 +136,7 @@ describe("optional factory CLI", () => {
 					() => async (_system, serialized) => {
 						const packet = JSON.parse(serialized) as ManagementPacket;
 						return {
-							model: "gpt-6-astra",
+							model: "openai/gpt-4o",
 							responseModel: "openai/gpt-4o",
 							responseModelSource: "provider-response",
 							usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 },

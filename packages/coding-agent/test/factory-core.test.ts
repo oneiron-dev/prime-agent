@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { codeDecisionBase, recordDecision } from "../src/factory/decisions.js";
 import { FactoryEngine } from "../src/factory/engine.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type {
@@ -100,7 +101,7 @@ describe("portable factory journal", () => {
 		expect(store.tickets()[0].state).toBe("ACTIVE");
 		expect(store.attempts()[0].receipt?.artifact?.sourceFingerprint).toBe("changed-output-source");
 		engine.decide("a", "accept", evidence, 1);
-		const events = store.events(0, 100);
+		const events = store.allEvents();
 		const ready = events.find((e) => e.actionId === "b" && e.kind === "action_ready_changed");
 		const retired = events.find((e) => e.detail.ticketId === "a" && e.detail.state === "RETIRED");
 		expect(ready?.sequence).toBeLessThan(retired?.sequence ?? 0);
@@ -214,9 +215,9 @@ describe("portable factory journal", () => {
 		engine.applyPlan(plan());
 		await engine.tick();
 		const terminal = receipt(adapter.launches[0]);
-		const count = store.events().length;
+		const count = store.allEvents().length;
 		expect(store.complete(terminal)).toBe(false);
-		expect(store.events()).toHaveLength(count);
+		expect(store.allEvents()).toHaveLength(count);
 		expect(() => store.complete({ ...terminal, exitCode: 1 })).toThrow("Conflicting terminal");
 	});
 	it("preserves contradictory terminal evidence from concurrent controllers and pauses downstream dispatch", async () => {
@@ -235,7 +236,7 @@ describe("portable factory journal", () => {
 		await new FactoryEngine(store, adapter, { enabled: true }).tick();
 		expect(store.isPaused()).toBe(true);
 		expect(adapter.launches).toHaveLength(0);
-		expect(store.events().some((e) => e.kind === "terminal_receipt_conflict")).toBe(true);
+		expect(store.allEvents().some((e) => e.kind === "terminal_receipt_conflict")).toBe(true);
 		expect(store.wakes().some((w) => !w.resolvedAt && w.reason === "Conflicting terminal receipt")).toBe(true);
 	});
 	it("retains ambiguous submission claims across restart until evidence authorizes retry", async () => {
@@ -460,4 +461,27 @@ describe("portable factory journal", () => {
 			expect(store.attempts(true)).toHaveLength(expectedClaims);
 		},
 	);
+});
+
+it("pages full decision history without loss, duplication or changing the bounded events API", () => {
+	const { store } = fixture();
+	store.applyPlan(plan());
+	const before = store.ledgerSequence();
+	for (let index = 0; index < 205; index++)
+		recordDecision(store, "a", {
+			...codeDecisionBase(store.ledgerSequence(), `Observation ${index}`),
+			type: "executability",
+			named_dependency: "none",
+			independent_work_available: true,
+			authority_covers: true,
+			hold_scope: null,
+		});
+	expect(store.events()).toHaveLength(100);
+	const full = store.allEvents();
+	expect(full).toHaveLength(before + 205);
+	expect(new Set(full.map((event) => event.sequence)).size).toBe(full.length);
+	expect(full.map((event) => event.sequence)).toEqual(Array.from({ length: full.length }, (_, index) => index + 1));
+	expect(store.allEvents(before)).toEqual(full.slice(before));
+	expect(store.allEvents(before).filter((event) => event.kind === "decision")).toHaveLength(205);
+	expect(() => store.allEvents(-1)).toThrow("Invalid event range");
 });

@@ -3,7 +3,9 @@ import { isAbsolute, join, resolve } from "node:path";
 import { CommandAdapter, fingerprintCommand } from "./adapters/command.js";
 import { type FactoryConfig, readFactoryConfig, readFactoryHosts, readFactoryJson } from "./config.js";
 import { factoryCost, formatFactoryCost } from "./cost.js";
+import { decideTyped } from "./decisions.js";
 import { FactoryEngine } from "./engine.js";
+import { assertByteLimit, FACTORY_EVIDENCE_LIMITS } from "./evidence.js";
 import { FACTORY_HELP } from "./help.js";
 import type { ManagementReconciliation } from "./management.js";
 import { recordFactoryRuntime } from "./runtime.js";
@@ -15,6 +17,8 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 	const options = new Map<string, string>();
 	const allowed = new Set([
 		"--hosts",
+		"--object",
+		"--apply",
 		"--ticket",
 		"--json",
 		"--pause-file",
@@ -36,7 +40,7 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 			continue;
 		}
 		if (!allowed.has(arg)) throw new Error(`Unknown factory option ${arg}`);
-		const value = arg === "--json" ? "true" : args[++index];
+		const value = arg === "--json" || arg === "--apply" ? "true" : args[++index];
 		if (!value || value.startsWith("--")) throw new Error(`Missing value for ${arg}`);
 		if (options.has(arg)) throw new Error(`Repeated option ${arg}`);
 		options.set(arg, value);
@@ -100,6 +104,8 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 	}
 	const { positionals, options } = parseArguments(args);
 	const [command, rawDirectory, argument, choice] = positionals;
+	if (command !== "decide-typed" && (options.has("--object") || options.has("--apply")))
+		throw new Error("--object and --apply are only supported for decide-typed");
 	if (options.has("--timeout-ms") && command !== "fingerprint") {
 		throw new Error("--timeout-ms is only supported for fingerprint");
 	}
@@ -200,6 +206,30 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 				engine.resume();
 				emit(engine.status());
 				break;
+			case "decide-typed": {
+				const object = options.get("--object");
+				if (
+					!argument ||
+					!choice ||
+					!object ||
+					positionals.length !== 4 ||
+					[...options.keys()].some((key) => !["--object", "--apply"].includes(key))
+				)
+					throw new Error("decide-typed requires action-id, type and --object <json-or-@file> [--apply]");
+				if (options.has("--apply") && engine.status().paused)
+					throw new Error("Factory is paused; decisions are blocked");
+				const value: unknown = object.startsWith("@") ? readFactoryJson(object.slice(1)) : JSON.parse(object);
+				assertByteLimit(
+					"decision",
+					Buffer.byteLength(JSON.stringify(value), "utf8"),
+					FACTORY_EVIDENCE_LIMITS.packetBytes,
+				);
+				const receipt = decideTyped(store, argument, value, choice, options.has("--apply"));
+				emit(receipt);
+				if (receipt.decision.requested_profile !== receipt.decision.served_profile)
+					throw new Error("profile_drift: decision not applied");
+				break;
+			}
 			case "decide":
 				if (!argument || (choice !== "accept" && choice !== "reject"))
 					throw new Error("decide requires action-id and accept|reject");

@@ -825,3 +825,54 @@ describe("Oneiron real journal and foreground command-runner integration", () =>
 		}
 	}, 20000);
 });
+
+test("runs a gate without PRIME_FACTORY_ATTEMPT_ID or a decision context", async () => {
+	const f = setup();
+	vi.stubEnv("PRIME_FACTORY_ATTEMPT_ID", undefined);
+	Object.defineProperty(f.runtime, "decisionContext", {
+		get: () => {
+			throw new Error("Gate must not open a decision context");
+		},
+	});
+	const argv = ["cargo", "test", "--lib"];
+	f.manifest.stage = {
+		kind: "gate",
+		host: "arch",
+		slot: 1,
+		argv,
+		wrapper: f.pin("UNIT MOCK wrapper"),
+		capacity: f.pin({
+			status: "PASS",
+			sourceFingerprint: f.manifest.source.fingerprint,
+			host: "arch",
+			slot: 1,
+			argv,
+			expiresAt: "2099-01-01",
+			duplicateFree: true,
+			resourcesPassed: true,
+		}),
+	};
+	vi.mocked(f.runtime.run).mockImplementation(async (command) => {
+		writeFileSync(
+			command[command.indexOf("--receipt") + 1],
+			JSON.stringify({
+				status: "COMPLETED",
+				command_rc: 0,
+				workspace_root: f.manifest.source.workspace,
+				command: argv,
+				provenance: { pass: true },
+			}),
+		);
+		return "UNIT MOCK proof";
+	});
+	f.seal();
+	try {
+		expect(process.env.PRIME_FACTORY_ATTEMPT_ID).toBeUndefined();
+		expect((await f.execute()) as OneironReceipt).toMatchObject({
+			stage: "gate",
+			result: { commandRc: 0, provenancePassed: true },
+		});
+	} finally {
+		vi.unstubAllEnvs();
+	}
+});

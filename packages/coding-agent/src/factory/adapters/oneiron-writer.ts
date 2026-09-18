@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { getModels, getProviders } from "@earendil-works/pi-ai";
+import type { AdapterDecisionContext } from "../decisions.js";
 import { readFactoryRuntime, requireFactoryJsonEventProfile } from "../runtime.js";
 import type { ActionRecord, AttemptRecord } from "../types.js";
 import { type FactoryCallCost, type FactoryUsage, sumFactoryCosts } from "../usage.js";
@@ -84,17 +85,23 @@ const RESPONSE_MODELS = ["gpt-6-astra"];
 
 export type FactoryModelPrice = { input: number; output: number; cacheRead: number; cacheWrite: number };
 export const FACTORY_PRICE_OVERRIDES = new Map<string, FactoryModelPrice>();
-const registryModels = getProviders().flatMap((provider) => getModels(provider));
-export const FACTORY_MODEL_PRICES = new Map<string, FactoryModelPrice>();
-for (const model of registryModels) {
-	const matches = registryModels.filter((candidate) => candidate.id === model.id);
-	if (matches.every((candidate) => JSON.stringify(candidate.cost) === JSON.stringify(model.cost)))
-		FACTORY_MODEL_PRICES.set(model.id, model.cost);
+let modelPrices: Map<string, FactoryModelPrice> | undefined;
+export function factoryModelPrices(): ReadonlyMap<string, FactoryModelPrice> {
+	if (modelPrices) return modelPrices;
+	const registryModels = getProviders().flatMap((provider) => getModels(provider));
+	const prices = new Map<string, FactoryModelPrice>();
+	for (const model of registryModels) {
+		const matches = registryModels.filter((candidate) => candidate.id === model.id);
+		if (matches.every((candidate) => JSON.stringify(candidate.cost) === JSON.stringify(model.cost)))
+			prices.set(model.id, model.cost);
+	}
+	for (const model of registryModels) prices.set(`${model.provider}/${model.id}`, model.cost);
+	modelPrices = prices;
+	return prices;
 }
-for (const model of registryModels) FACTORY_MODEL_PRICES.set(`${model.provider}/${model.id}`, model.cost);
 export function priceFactoryCall(responseModel: string | null, usage?: FactoryUsage): FactoryCallCost {
 	const price = responseModel
-		? (FACTORY_PRICE_OVERRIDES.get(responseModel) ?? FACTORY_MODEL_PRICES.get(responseModel))
+		? (FACTORY_PRICE_OVERRIDES.get(responseModel) ?? factoryModelPrices().get(responseModel))
 		: undefined;
 	if (
 		price &&
@@ -281,9 +288,35 @@ export function summarizeOneironWriter(
 	profile: OneironWriterProfile,
 	transport: OneironTransportLog,
 	manifestSha256: string,
+	decisionContext?: AdapterDecisionContext,
 ): OneironWriterProvenance {
 	const { messages } = transport;
 	check(transport.transcript.path === join(m.outputDirectory, "writer.jsonl"), "Writer transcript path mismatch");
+	decisionContext?.record({
+		...decisionContext.base,
+		type: "writer_terminal_accept",
+		attempt_id: decisionContext.attemptId,
+		requested_profile: profile.requested.model,
+		served_profile:
+			messages.length > 0 &&
+			messages.every(
+				(message) =>
+					message.responseModelSource === "provider-response" && message.responseModel === profile.requested.model,
+			)
+				? profile.requested.model
+				: (messages.find((message) => message.responseModel !== profile.requested.model)?.responseModel ??
+					"unknown"),
+		candidate_fingerprint: m.source.fingerprint,
+		receipt_fingerprint: null,
+		exit_code: null,
+		agent_end: null,
+		stop_reason: messages.at(-1)?.stopReason ?? null,
+		changed_paths: null,
+		allowed_paths_only: null,
+		receipt_ready: false,
+		receipt_sha: null,
+		reason: "Writer transcript terminal check; factory receipt, changed paths and allowlist are not yet established",
+	});
 	check(
 		messages.length > 0 &&
 			messages.every(

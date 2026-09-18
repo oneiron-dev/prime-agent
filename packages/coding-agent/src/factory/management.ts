@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { priceFactoryCall } from "./adapters/oneiron-writer.js";
+import type { DecisionReceipt } from "./decisions.js";
 import {
 	assertByteLimit,
 	FACTORY_EVIDENCE_LIMITS,
@@ -32,8 +33,8 @@ export interface ManagementClaim {
 }
 export interface ManagementRequest extends ManagementClaim {
 	createdAt: string;
-	state: "CLAIMED" | "PROPOSED" | "DEFERRED" | "ERROR" | "APPLIED" | "RECONCILED";
-	result: ManagementResult | null;
+	state: "CLAIMED" | "PROPOSED" | "DEFERRED" | "DRIFT" | "ERROR" | "APPLIED" | "RECONCILED";
+	result: ManagementResult | DecisionReceipt | null;
 	error: string | null;
 }
 export interface ManagementReconciliation {
@@ -94,6 +95,7 @@ export type ManagementCaller = (
 	requestId: string,
 ) => Promise<ManagementModelResult>;
 export interface ManagementResult {
+	typedDecision?: DecisionReceipt;
 	usage?: Record<string, unknown>;
 	accounting: FactoryCallCost;
 	wall_clock_ms: number;

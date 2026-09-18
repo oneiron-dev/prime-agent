@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { type AdapterDecisionContext, codeDecisionBase, recordDecision } from "../decisions.js";
 import {
 	assertByteLimit,
 	FACTORY_EVIDENCE_LIMITS,
@@ -16,6 +17,7 @@ import {
 	readFactoryRuntime,
 	requireFactoryJsonEventProfile,
 } from "../runtime.js";
+import { FactoryStore } from "../store.js";
 import type { ActionSpec, FactoryStatus } from "../types.js";
 import { fingerprintCommand } from "./command.js";
 import { runOneironCapture } from "./oneiron-capture.js";
@@ -132,6 +134,7 @@ export interface OneironReceipt {
 	result: Record<string, unknown>;
 }
 export interface OneironRuntime {
+	decisionContext?: AdapterDecisionContext;
 	run(argv: string[], cwd: string, environment?: Record<string, string>): Promise<string>;
 	runWriter?(argv: string[], cwd: string, transcriptPath: string, environment?: Record<string, string>): Promise<void>;
 	source(manifest: OneironManifest): Promise<OneironSource>;
@@ -545,6 +548,40 @@ async function triageLineage(m: OneironManifest, reviewedHead: string, runtime: 
 	return `${JSON.stringify({ version: 1, source: m.source, candidateCommit: m.source.head, reviewedHead, relation: reviewedHead === m.source.head ? "same" : "ancestor", checks })}\n`;
 }
 
+function nativeDecisionContext(
+	m: OneironManifest,
+	manifestPath: string,
+	manifestSha256: string,
+): AdapterDecisionContext & { close: () => void } {
+	const database = join(m.factoryDirectory, "factory.db");
+	requireThat(existsSync(database), "Typed decisions require the existing factory journal");
+	const store = new FactoryStore(database);
+	try {
+		const attemptId = process.env.PRIME_FACTORY_ATTEMPT_ID;
+		requireThat(attemptId, "Typed decisions require the runner-bound attempt");
+		const { action, attempt } = store.context(attemptId);
+		requireThat(
+			!attempt.claimReleased &&
+				action.ticketId === m.ticketId &&
+				action.sourceFingerprint === m.source.fingerprint &&
+				action.command.argv.at(-4) === manifestPath &&
+				action.command.argv.at(-2) === manifestSha256,
+			"Typed decision execution identity mismatch",
+		);
+		return {
+			base: codeDecisionBase(store.ledgerSequence(), "Native adapter observation"),
+			attemptId,
+			record: (decision) => {
+				recordDecision(store, action.id, decision, { staleCheck: false });
+			},
+			close: () => store.close(),
+		};
+	} catch (error) {
+		store.close();
+		throw error;
+	}
+}
+
 /** One foreground stage. Factory command runner owns the process group and timeout. */
 export async function executeOneiron(
 	manifestPath: string,
@@ -630,352 +667,372 @@ export async function executeOneiron(
 		return runtime.run(argv, m.source.workspace, environment);
 	};
 	const stage = m.stage;
-	let result: Record<string, unknown>;
-	switch (stage.kind) {
-		case "writer": {
-			const profile = writerProfile!;
-			const prior = parsePin<OneironReceipt>(stage.triage);
-			const triage = prior.result.triage as OneironTriage;
-			requireThat(
-				prior.stage === "triage" &&
-					sameSource(prior.output, m.source) &&
-					triage.findings.some(
-						(finding) => ["material", "debt"].includes(finding.classification) && finding.disposition === "open",
-					),
-				"Repair writer requires accepted remaining material triage, never a blank implementation replay",
-			);
-			validateOneironWriterRetry(
-				m,
-				stage,
-				profile,
-				await runtime.status(m.factoryDirectory),
-				readOneironPin,
-				runtime.now(),
-				{ attemptId: process.env.PRIME_FACTORY_ATTEMPT_ID, manifestSha256 },
-			);
-			const cli = oneironWriterCli(profile, readOneironPin);
-			const transcriptPath = join(m.outputDirectory, "writer.jsonl");
-			requireThat(runtime.runWriter, "Writer runtime requires bounded file-backed stdout capture");
-			await authorize(m, manifestSha256, permitPath, runtime);
-			await runtime.runWriter(
-				[
-					...cli,
-					"--print",
-					"--mode",
-					"json",
-					"--json-event-profile",
-					FACTORY_JSON_EVENT_PROFILE,
-					"--offline",
-					"--provider",
-					profile.requested.provider,
-					"--model",
-					profile.requested.model,
-					"--thinking",
-					profile.requested.effort,
-					"--cwd",
-					m.source.workspace,
-					"--session-dir",
-					join(m.outputDirectory, "session"),
-					"--no-extensions",
-					"--append-system-prompt",
-					"Bounded repair only. Run tools in foreground and wait for all work. Do not spawn detached descendants, delegate, use daemon/session send/schedule, commit, publish, merge, or run Cargo. Report changed files and unresolved findings. Preserve historical provenance. The factory runs gates after source rebind.",
-					"--",
-					readOneironPin(stage.prompt),
-				],
-				m.source.workspace,
-				transcriptPath,
-				factoryOwnedEnvironment(),
-			);
-			const writerProvenance = summarizeOneironWriter(
-				m,
-				stage,
-				profile,
-				readOneironTransport(transcriptPath),
-				manifestSha256,
-			);
-			result = {
-				writerProvenance,
-				requiresSourceRebind: true,
-				triage: stage.triage,
-				retryReconciliation: stage.retryReconciliation ?? null,
-			};
-			break;
-		}
-		case "gate": {
-			const gateSeam = async () => {
+	const recordsDecisions = ["writer", "collect", "publish-ready", "publish-update"].includes(stage.kind);
+	const nativeContext =
+		recordsDecisions && !suppliedRuntime ? nativeDecisionContext(m, manifestPath, manifestSha256) : undefined;
+	try {
+		const decisionContext = recordsDecisions ? (suppliedRuntime?.decisionContext ?? nativeContext) : undefined;
+		let result: Record<string, unknown>;
+		switch (stage.kind) {
+			case "writer": {
+				const profile = writerProfile!;
+				const prior = parsePin<OneironReceipt>(stage.triage);
+				const triage = prior.result.triage as OneironTriage;
 				requireThat(
-					oneironSha(readFileSync(manifestPath)) === manifestSha256 &&
-						oneironSha(readFileSync(permitPath)) === oneironSha(permitBytes),
-					"Gate manifest/permit changed during execution",
+					prior.stage === "triage" &&
+						sameSource(prior.output, m.source) &&
+						triage.findings.some(
+							(finding) =>
+								["material", "debt"].includes(finding.classification) && finding.disposition === "open",
+						),
+					"Repair writer requires accepted remaining material triage, never a blank implementation replay",
 				);
-				await authorize(m, manifestSha256, permitPath, runtime);
-				if (stage.driver === "bun-docs-v1") {
-					const state = await runtime.status(m.factoryDirectory);
-					const attempt = state.attempts?.find((a) => a.id === process.env.PRIME_FACTORY_ATTEMPT_ID),
-						action = state.actions?.find((a) => a.id === attempt?.actionId);
-					requireThat(
-						action?.command.argv.at(-4) === manifestPath && action.command.argv.at(-3) === permitPath,
-						"Gate execution paths differ from current prepared action",
-					);
-				}
-			};
-			if (stage.driver === "bun-docs-v1") {
-				result = await executeOneironDocsGate(
+				validateOneironWriterRetry(
 					m,
 					stage,
-					{ path: manifestPath, sha256: manifestSha256 },
-					runtime,
+					profile,
+					await runtime.status(m.factoryDirectory),
 					readOneironPin,
-					gateSeam,
+					runtime.now(),
+					{ attemptId: process.env.PRIME_FACTORY_ATTEMPT_ID, manifestSha256 },
 				);
+				const cli = oneironWriterCli(profile, readOneironPin);
+				const transcriptPath = join(m.outputDirectory, "writer.jsonl");
+				requireThat(runtime.runWriter, "Writer runtime requires bounded file-backed stdout capture");
+				await authorize(m, manifestSha256, permitPath, runtime);
+				await runtime.runWriter(
+					[
+						...cli,
+						"--print",
+						"--mode",
+						"json",
+						"--json-event-profile",
+						FACTORY_JSON_EVENT_PROFILE,
+						"--offline",
+						"--provider",
+						profile.requested.provider,
+						"--model",
+						profile.requested.model,
+						"--thinking",
+						profile.requested.effort,
+						"--cwd",
+						m.source.workspace,
+						"--session-dir",
+						join(m.outputDirectory, "session"),
+						"--no-extensions",
+						"--append-system-prompt",
+						"Bounded repair only. Run tools in foreground and wait for all work. Do not spawn detached descendants, delegate, use daemon/session send/schedule, commit, publish, merge, or run Cargo. Report changed files and unresolved findings. Preserve historical provenance. The factory runs gates after source rebind.",
+						"--",
+						readOneironPin(stage.prompt),
+					],
+					m.source.workspace,
+					transcriptPath,
+					factoryOwnedEnvironment(),
+				);
+				const writerProvenance = summarizeOneironWriter(
+					m,
+					stage,
+					profile,
+					readOneironTransport(transcriptPath),
+					manifestSha256,
+					decisionContext,
+				);
+				result = {
+					writerProvenance,
+					requiresSourceRebind: true,
+					triage: stage.triage,
+					retryReconciliation: stage.retryReconciliation ?? null,
+				};
 				break;
 			}
-			const capacity = parsePin<{
-				sourceFingerprint: string;
-				host: string;
-				slot: number;
-				argv: string[];
-				expiresAt: string;
-				status: string;
-				duplicateFree: boolean;
-				resourcesPassed: boolean;
-			}>(stage.capacity);
-			requireThat(
-				capacity.status === "PASS" &&
-					capacity.sourceFingerprint === m.source.fingerprint &&
-					capacity.host === stage.host &&
-					capacity.slot === stage.slot &&
-					JSON.stringify(capacity.argv) === JSON.stringify(stage.argv) &&
-					capacity.duplicateFree === true &&
-					capacity.resourcesPassed === true &&
-					Date.parse(capacity.expiresAt) > runtime.now(),
-				"Fresh exact-command capacity/resource/global-duplicate evidence required",
-			);
-			const receiptPath = join(m.outputDirectory, "gate-provenance.json");
-			await gateSeam();
-			await captureOneironGate(
-				runtime,
-				[
-					"python3",
-					stage.wrapper.path,
-					"--slot",
-					String(stage.slot),
-					"--workspace",
-					m.source.workspace,
-					"--receipt",
-					receiptPath,
-					"--",
-					...stage.argv,
-				],
-				m.source.workspace,
-				m.outputDirectory,
-				0,
-			);
-			await gateSeam();
-			const proof = JSON.parse(readFileSync(receiptPath, "utf8")) as {
-				status: string;
-				command_rc: number;
-				workspace_root: string;
-				command: string[];
-				provenance: {
-					pass: boolean;
-					dep_info_files?: number;
-					exact_root_seen?: boolean;
-					foreign_wave_roots?: string[];
+			case "gate": {
+				const gateSeam = async () => {
+					requireThat(
+						oneironSha(readFileSync(manifestPath)) === manifestSha256 &&
+							oneironSha(readFileSync(permitPath)) === oneironSha(permitBytes),
+						"Gate manifest/permit changed during execution",
+					);
+					await authorize(m, manifestSha256, permitPath, runtime);
+					if (stage.driver === "bun-docs-v1") {
+						const state = await runtime.status(m.factoryDirectory);
+						const attempt = state.attempts?.find((a) => a.id === process.env.PRIME_FACTORY_ATTEMPT_ID),
+							action = state.actions?.find((a) => a.id === attempt?.actionId);
+						requireThat(
+							action?.command.argv.at(-4) === manifestPath && action.command.argv.at(-3) === permitPath,
+							"Gate execution paths differ from current prepared action",
+						);
+					}
 				};
-				schema?: string;
-				runner_version?: string;
-				slot?: number;
-				source_unchanged?: boolean;
-			};
-			requireThat(
-				proof.status === "COMPLETED" &&
-					proof.command_rc === 0 &&
-					proof.workspace_root === m.source.workspace &&
-					JSON.stringify(proof.command) === JSON.stringify(stage.argv) &&
-					proof.provenance?.pass === true &&
-					proof.source_unchanged !== false,
-				"Gate wrapper did not return completed matching provenance",
-			);
-			if (["nextest", "doc"].includes(stage.argv[1] ?? ""))
+				if (stage.driver === "bun-docs-v1") {
+					result = await executeOneironDocsGate(
+						m,
+						stage,
+						{ path: manifestPath, sha256: manifestSha256 },
+						runtime,
+						readOneironPin,
+						gateSeam,
+					);
+					break;
+				}
+				const capacity = parsePin<{
+					sourceFingerprint: string;
+					host: string;
+					slot: number;
+					argv: string[];
+					expiresAt: string;
+					status: string;
+					duplicateFree: boolean;
+					resourcesPassed: boolean;
+				}>(stage.capacity);
 				requireThat(
-					proof.schema === "oneiron.wave6.cargo-slot-v2.3-provenance.v1" &&
-						proof.runner_version === "v2.3-five-slot" &&
-						proof.slot === stage.slot &&
-						Number.isInteger(proof.provenance.dep_info_files) &&
-						proof.provenance.dep_info_files! > 0 &&
-						proof.provenance.exact_root_seen === true &&
-						Array.isArray(proof.provenance.foreign_wave_roots) &&
-						proof.provenance.foreign_wave_roots.length === 0,
-					"Extended Cargo gate requires substantive v23 dep-info provenance for this root",
+					capacity.status === "PASS" &&
+						capacity.sourceFingerprint === m.source.fingerprint &&
+						capacity.host === stage.host &&
+						capacity.slot === stage.slot &&
+						JSON.stringify(capacity.argv) === JSON.stringify(stage.argv) &&
+						capacity.duplicateFree === true &&
+						capacity.resourcesPassed === true &&
+						Date.parse(capacity.expiresAt) > runtime.now(),
+					"Fresh exact-command capacity/resource/global-duplicate evidence required",
 				);
-			result = {
-				commandRc: 0,
-				provenancePassed: true,
-				proof: { path: receiptPath, sha256: oneironSha(readFileSync(receiptPath)) },
-				capacity: stage.capacity,
-			};
-			break;
+				const receiptPath = join(m.outputDirectory, "gate-provenance.json");
+				await gateSeam();
+				await captureOneironGate(
+					runtime,
+					[
+						"python3",
+						stage.wrapper.path,
+						"--slot",
+						String(stage.slot),
+						"--workspace",
+						m.source.workspace,
+						"--receipt",
+						receiptPath,
+						"--",
+						...stage.argv,
+					],
+					m.source.workspace,
+					m.outputDirectory,
+					0,
+				);
+				await gateSeam();
+				const proof = JSON.parse(readFileSync(receiptPath, "utf8")) as {
+					status: string;
+					command_rc: number;
+					workspace_root: string;
+					command: string[];
+					provenance: {
+						pass: boolean;
+						dep_info_files?: number;
+						exact_root_seen?: boolean;
+						foreign_wave_roots?: string[];
+					};
+					schema?: string;
+					runner_version?: string;
+					slot?: number;
+					source_unchanged?: boolean;
+				};
+				requireThat(
+					proof.status === "COMPLETED" &&
+						proof.command_rc === 0 &&
+						proof.workspace_root === m.source.workspace &&
+						JSON.stringify(proof.command) === JSON.stringify(stage.argv) &&
+						proof.provenance?.pass === true &&
+						proof.source_unchanged !== false,
+					"Gate wrapper did not return completed matching provenance",
+				);
+				if (["nextest", "doc"].includes(stage.argv[1] ?? ""))
+					requireThat(
+						proof.schema === "oneiron.wave6.cargo-slot-v2.3-provenance.v1" &&
+							proof.runner_version === "v2.3-five-slot" &&
+							proof.slot === stage.slot &&
+							Number.isInteger(proof.provenance.dep_info_files) &&
+							proof.provenance.dep_info_files! > 0 &&
+							proof.provenance.exact_root_seen === true &&
+							Array.isArray(proof.provenance.foreign_wave_roots) &&
+							proof.provenance.foreign_wave_roots.length === 0,
+						"Extended Cargo gate requires substantive v23 dep-info provenance for this root",
+					);
+				result = {
+					commandRc: 0,
+					provenancePassed: true,
+					proof: { path: receiptPath, sha256: oneironSha(readFileSync(receiptPath)) },
+					capacity: stage.capacity,
+				};
+				break;
+			}
+			case "collect": {
+				const output = join(m.outputDirectory, "corpus");
+				await run([
+					"python3",
+					stage.foregroundShim.path,
+					stage.helper.path,
+					stage.helper.sha256,
+					"--repo",
+					stage.repo,
+					"--pr",
+					`${stage.pr}=${m.source.head}`,
+					"--base",
+					`${stage.pr}=${stage.base}`,
+					"--output-dir",
+					output,
+					"--timeout-seconds",
+					"180",
+				]);
+				const corpusPath = join(output, "corpus.json");
+				const report = inspectOneironCorpus(
+					readFileSync(corpusPath, "utf8"),
+					{
+						repo: stage.repo,
+						pr: stage.pr,
+						head: m.source.head,
+						base: stage.base,
+					},
+					decisionContext,
+				);
+				result = {
+					corpus: { path: corpusPath, sha256: report.corpusSha256 },
+					helper: stage.helper,
+					foregroundShim: stage.foregroundShim,
+					reviewBlockers: report.blockers,
+					productAccepted: false,
+				};
+				break;
+			}
+			case "triage": {
+				const { report, prior, evidenceRefs } = reviewInput(m, stage);
+				const lineageBytes = await triageLineage(m, stage.reviewedHead ?? m.source.head, runtime);
+				const lineageSha256 = oneironSha(lineageBytes);
+				lineage = { path: join(m.outputDirectory, "triage-lineage.json"), sha256: lineageSha256 };
+				writeFileSync(lineage.path, lineageBytes, { flag: "wx", mode: 0o600, flush: true });
+				requireThat(
+					!stage.evidence.some((pin) => pin.sha256 === lineageSha256),
+					"Triage lineage is identity-only, not repair/adjudication evidence",
+				);
+				const evidence = [
+					{ ref: evidenceRefs[0], content: "Full selected review items above; not proof of repair." },
+					...stage.evidence.map((pin) => ({ ref: `sha256:${pin.sha256}`, content: readOneironPin(pin) })),
+				];
+				validateManagementEvidence(evidence, "triage.evidence", 1);
+				const packet = JSON.stringify({
+					candidateCommit: m.source.head,
+					reviewedHead: report.reviewedHead,
+					sourceFingerprint: m.source.fingerprint,
+					corpusSha256: report.corpusSha256,
+					lineage,
+					completedReviewers: report.completedReviewers,
+					historicalCompletedReviewers: report.historicalCompletedReviewers,
+					reviewBlockers: report.blockers,
+					items: report.items,
+					prior,
+					evidence,
+				});
+				assertByteLimit("triage.packet", Buffer.byteLength(packet, "utf8"), FACTORY_EVIDENCE_LIMITS.packetBytes);
+				await authorize(m, manifestSha256, permitPath, runtime);
+				const requestId = randomUUID();
+				const profile = { provider: "cpa-r", model: "gpt-6-astra", effort: "low" };
+				const requestBytes = `${JSON.stringify({ version: 1, requestId, manifestSha256, sourceFingerprint: m.source.fingerprint, candidateCommit: m.source.head, reviewedHead: report.reviewedHead, corpusSha256: report.corpusSha256, lineage, profile, system: TRIAGE_SYSTEM, packet })}\n`;
+				writeFileSync(join(m.outputDirectory, "triage-request.json"), requestBytes, {
+					flag: "wx",
+					mode: 0o600,
+					flush: true,
+				});
+				const response = await runtime.call(TRIAGE_SYSTEM, packet, profile, requestId);
+				// Preserve the untouched result, including transport identity and usage, before any acceptance check can throw.
+				writeFileSync(
+					join(m.outputDirectory, "triage-response.json"),
+					`${JSON.stringify({ version: 1, requestId, requestSha256: oneironSha(requestBytes), manifestSha256, sourceFingerprint: m.source.fingerprint, candidateCommit: m.source.head, reviewedHead: report.reviewedHead, corpusSha256: report.corpusSha256, lineage, response })}\n`,
+					{ flag: "wx", mode: 0o600, flush: true },
+				);
+				requireThat(response.model === "gpt-6-astra", "Triage model identity differs from requested Astra");
+				const triage = validateOneironTriage(
+					JSON.parse(response.text),
+					report,
+					m.source.fingerprint,
+					prior,
+					evidenceRefs,
+				);
+				result = {
+					triage,
+					lineage,
+					reviewBlockers: oneironReviewBlockers(report, triage),
+					model: response.model,
+					effort: "low",
+					modelIdentitySource: response.modelIdentitySource ?? "caller",
+					servingIdentity: {
+						requestedSelector: "gpt-6-astra",
+						responseModel:
+							response.responseModelSource === "provider-response" ? (response.responseModel ?? null) : null,
+						responseId: response.responseId ?? null,
+						source: response.responseModelSource === "provider-response" ? "provider-response" : "unknown",
+						upstreamIdentityAttested: false,
+					},
+					usage: response.usage ?? {},
+					priorFindings: stage.priorFindings,
+				};
+				break;
+			}
+			case "review-acceptance": {
+				await gateEvidence(stage.gates, m, runtime);
+				const { report, prior, evidenceRefs } = reviewInput(m, stage);
+				const receipt = parsePin<OneironReceipt>(stage.triage);
+				requireThat(
+					receipt.stage === "triage" && sameSource(receipt.output, m.source),
+					"Triage receipt source mismatch",
+				);
+				const triage = validateOneironTriage(
+					receipt.result.triage,
+					report,
+					m.source.fingerprint,
+					prior,
+					evidenceRefs,
+				);
+				const blockers = oneironReviewBlockers(report, triage);
+				requireThat(blockers.length === 0, `Review acceptance blocked: ${blockers.join("; ")}`);
+				result = {
+					completedReviewers: report.completedReviewers,
+					triage: stage.triage,
+					gates: stage.gates,
+					acceptanceEligible: true,
+				};
+				break;
+			}
+			case "publish-ready":
+			case "publish-update": {
+				await gateEvidence(stage.gates, m, runtime);
+				result = await publishOneiron(m, stage, run, readOneironPin, decisionContext);
+				break;
+			}
 		}
-		case "collect": {
-			const output = join(m.outputDirectory, "corpus");
-			await run([
-				"python3",
-				stage.foregroundShim.path,
-				stage.helper.path,
-				stage.helper.sha256,
-				"--repo",
-				stage.repo,
-				"--pr",
-				`${stage.pr}=${m.source.head}`,
-				"--base",
-				`${stage.pr}=${stage.base}`,
-				"--output-dir",
-				output,
-				"--timeout-seconds",
-				"180",
-			]);
-			const corpusPath = join(output, "corpus.json");
-			const report = inspectOneironCorpus(readFileSync(corpusPath, "utf8"), {
-				repo: stage.repo,
-				pr: stage.pr,
-				head: m.source.head,
-				base: stage.base,
-			});
-			result = {
-				corpus: { path: corpusPath, sha256: report.corpusSha256 },
-				helper: stage.helper,
-				foregroundShim: stage.foregroundShim,
-				reviewBlockers: report.blockers,
-				productAccepted: false,
-			};
-			break;
-		}
-		case "triage": {
-			const { report, prior, evidenceRefs } = reviewInput(m, stage);
-			const lineageBytes = await triageLineage(m, stage.reviewedHead ?? m.source.head, runtime);
-			const lineageSha256 = oneironSha(lineageBytes);
-			lineage = { path: join(m.outputDirectory, "triage-lineage.json"), sha256: lineageSha256 };
-			writeFileSync(lineage.path, lineageBytes, { flag: "wx", mode: 0o600, flush: true });
+		const output = await runtime.source(m);
+		if (stage.kind !== "writer")
 			requireThat(
-				!stage.evidence.some((pin) => pin.sha256 === lineageSha256),
-				"Triage lineage is identity-only, not repair/adjudication evidence",
+				sameSource(output, m.source),
+				"Stage changed source; retain output as uncertain evidence, do not accept",
 			);
-			const evidence = [
-				{ ref: evidenceRefs[0], content: "Full selected review items above; not proof of repair." },
-				...stage.evidence.map((pin) => ({ ref: `sha256:${pin.sha256}`, content: readOneironPin(pin) })),
-			];
-			validateManagementEvidence(evidence, "triage.evidence", 1);
-			const packet = JSON.stringify({
-				candidateCommit: m.source.head,
-				reviewedHead: report.reviewedHead,
-				sourceFingerprint: m.source.fingerprint,
-				corpusSha256: report.corpusSha256,
-				lineage,
-				completedReviewers: report.completedReviewers,
-				historicalCompletedReviewers: report.historicalCompletedReviewers,
-				reviewBlockers: report.blockers,
-				items: report.items,
-				prior,
-				evidence,
-			});
-			assertByteLimit("triage.packet", Buffer.byteLength(packet, "utf8"), FACTORY_EVIDENCE_LIMITS.packetBytes);
-			await authorize(m, manifestSha256, permitPath, runtime);
-			const requestId = randomUUID();
-			const profile = { provider: "cpa-r", model: "gpt-6-astra", effort: "low" };
-			const requestBytes = `${JSON.stringify({ version: 1, requestId, manifestSha256, sourceFingerprint: m.source.fingerprint, candidateCommit: m.source.head, reviewedHead: report.reviewedHead, corpusSha256: report.corpusSha256, lineage, profile, system: TRIAGE_SYSTEM, packet })}\n`;
-			writeFileSync(join(m.outputDirectory, "triage-request.json"), requestBytes, {
-				flag: "wx",
-				mode: 0o600,
-				flush: true,
-			});
-			const response = await runtime.call(TRIAGE_SYSTEM, packet, profile, requestId);
-			// Preserve the untouched result, including transport identity and usage, before any acceptance check can throw.
-			writeFileSync(
-				join(m.outputDirectory, "triage-response.json"),
-				`${JSON.stringify({ version: 1, requestId, requestSha256: oneironSha(requestBytes), manifestSha256, sourceFingerprint: m.source.fingerprint, candidateCommit: m.source.head, reviewedHead: report.reviewedHead, corpusSha256: report.corpusSha256, lineage, response })}\n`,
-				{ flag: "wx", mode: 0o600, flush: true },
-			);
-			requireThat(response.model === "gpt-6-astra", "Triage model identity differs from requested Astra");
-			const triage = validateOneironTriage(
-				JSON.parse(response.text),
-				report,
-				m.source.fingerprint,
-				prior,
-				evidenceRefs,
-			);
-			result = {
-				triage,
-				lineage,
-				reviewBlockers: oneironReviewBlockers(report, triage),
-				model: response.model,
-				effort: "low",
-				modelIdentitySource: response.modelIdentitySource ?? "caller",
-				servingIdentity: {
-					requestedSelector: "gpt-6-astra",
-					responseModel:
-						response.responseModelSource === "provider-response" ? (response.responseModel ?? null) : null,
-					responseId: response.responseId ?? null,
-					source: response.responseModelSource === "provider-response" ? "provider-response" : "unknown",
-					upstreamIdentityAttested: false,
-				},
-				usage: response.usage ?? {},
-				priorFindings: stage.priorFindings,
-			};
-			break;
-		}
-		case "review-acceptance": {
-			await gateEvidence(stage.gates, m, runtime);
-			const { report, prior, evidenceRefs } = reviewInput(m, stage);
-			const receipt = parsePin<OneironReceipt>(stage.triage);
-			requireThat(
-				receipt.stage === "triage" && sameSource(receipt.output, m.source),
-				"Triage receipt source mismatch",
-			);
-			const triage = validateOneironTriage(receipt.result.triage, report, m.source.fingerprint, prior, evidenceRefs);
-			const blockers = oneironReviewBlockers(report, triage);
-			requireThat(blockers.length === 0, `Review acceptance blocked: ${blockers.join("; ")}`);
-			result = {
-				completedReviewers: report.completedReviewers,
-				triage: stage.triage,
-				gates: stage.gates,
-				acceptanceEligible: true,
-			};
-			break;
-		}
-		case "publish-ready":
-		case "publish-update": {
-			await gateEvidence(stage.gates, m, runtime);
-			result = await publishOneiron(m, stage, run, readOneironPin);
-			break;
-		}
+		const receipt: OneironReceipt = {
+			version: 1,
+			ticketId: m.ticketId,
+			stage: stage.kind,
+			stageSha256: stageSha(m),
+			manifestSha256,
+			input: m.source,
+			output,
+			custody: m.custody,
+			finishedAt: new Date(runtime.now()).toISOString(),
+			outcome: "stage-completed",
+			productAccepted: false,
+			result,
+		};
+		if (result.driver === "bun-docs-v1") validateOneironDocsProof(receipt, readOneironPin);
+		writeFileSync(join(m.outputDirectory, "receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`, {
+			flag: "wx",
+			mode: 0o600,
+		});
+		return receipt;
+	} finally {
+		nativeContext?.close();
 	}
-	const output = await runtime.source(m);
-	if (stage.kind !== "writer")
-		requireThat(
-			sameSource(output, m.source),
-			"Stage changed source; retain output as uncertain evidence, do not accept",
-		);
-	const receipt: OneironReceipt = {
-		version: 1,
-		ticketId: m.ticketId,
-		stage: stage.kind,
-		stageSha256: stageSha(m),
-		manifestSha256,
-		input: m.source,
-		output,
-		custody: m.custody,
-		finishedAt: new Date(runtime.now()).toISOString(),
-		outcome: "stage-completed",
-		productAccepted: false,
-		result,
-	};
-	if (result.driver === "bun-docs-v1") validateOneironDocsProof(receipt, readOneironPin);
-	writeFileSync(join(m.outputDirectory, "receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`, {
-		flag: "wx",
-		mode: 0o600,
-	});
-	return receipt;
 }
 
 export function bindOneironEvidence(

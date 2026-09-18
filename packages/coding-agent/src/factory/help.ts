@@ -17,6 +17,7 @@ export const FACTORY_HELP = `Usage:
   prime factory settle-no-retry <directory> <action-id> --expected-revision <revision> --expected-attempt <id> --actor <actor> --reason <reason> --ref <absolute-settlement.json>
   prime factory withdraw <directory> <action-id> --expected-revision <revision> --actor <actor> --reason <reason> --ref <absolute-withdrawal.json>
   prime factory resolve <directory> <attempt-id> --actor <actor> --reason <reason> --ref <evidence>
+  prime factory decide-typed <directory> <action-id> <type> --object <json-or-@file> [--apply]
   prime factory decide <directory> <action-id> <accept|reject> --actor <actor> --reason <reason> --ref <evidence> [--expected-revision <revision>] [--expected-attempt <id>] [--expected-wake <id>]
 
 Factory mode is optional and runs separately from Prime sessions. State and results are JSON.
@@ -34,6 +35,8 @@ settle-no-retry closes proven-dead UNCERTAIN work as ABANDONED with outcome UNKN
 supersede explicitly replaces rejected or abandoned work; it preserves history and does not accept the replacement or dependencies.
 withdraw closes never-claimed QUEUED/READY work as WITHDRAWN with NOT_EXECUTED; use withdraw --help for exact plan/owner/source bindings.
 Neither closure launches work or satisfies dependencies. Withdrawal refuses any attempt history; settlement is not product acceptance.
+decide-typed validates the question-set object and refuses stale ledger_sequence values; profile drift opens a wake and never applies.
+Typed --apply supports terminal acceptance of a decision action and operator-proven attempt requeue; other types are record-only.
 manage returns a proposal unless --apply is explicit; --watch opts into bounded automatic wake handling, separate from serve.
 Automatic handling needs exact per-wake evidence bindings. Requests are durably consumed, including defer/errors; crashes never authorize replay.
 Plan mutations wait for active/unconsumed judgments; no-op imports keep the revision. Rebind pending wakes after real mutations.

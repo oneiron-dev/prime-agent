@@ -75,6 +75,8 @@ function model(decision: "accept" | "defer", pending?: Promise<void>): Managemen
 		const packet = JSON.parse(serialized) as ManagementPacket;
 		return {
 			model: "mock",
+			responseModel: "mock",
+			responseModelSource: "provider-response" as const,
 			text: JSON.stringify({
 				version: 1,
 				actionId: packet.action.id,
@@ -155,7 +157,7 @@ test("serializes actual global mutations against CLAIMED and latest unresolved P
 	).toBe("applied");
 	expect(other.applyPlan(changedPlan, 1, "next-stage")).toBe(2);
 	const event = f.store
-		.events(0, 100)
+		.allEvents()
 		.find((item) => item.kind === "plan_applied" && item.detail.mutationId === "next-stage")!;
 	expect(event.detail.previousRevision).toBe(1);
 	expect(event.detail.invalidatedWakeIds).toEqual(
@@ -291,7 +293,7 @@ test("handles proven no-submission recovery without fabricated output and permit
 	expect(f.store.managementRequests()).toHaveLength(1);
 	expect(
 		f.store
-			.events(0, 100)
+			.allEvents()
 			.some((event) => event.kind === "management_reconciled" && event.detail.previousState === "CLAIMED"),
 	).toBe(true);
 });

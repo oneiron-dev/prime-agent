@@ -363,6 +363,8 @@ function mockAcceptance() {
 		expect(stage.productAccepted).toBe(false);
 		return {
 			model: "mock-acceptance",
+			responseModel: "mock-acceptance",
+			responseModelSource: "provider-response" as const,
 			text: JSON.stringify({
 				version: 1,
 				actionId: packet.action.id,
@@ -472,6 +474,7 @@ describe("Oneiron foreground command to durable automatic management seam", () =
 			oneironSha(JSON.stringify([{ ref: binding.evidence[0].ref, sha256: binding.evidence[0].sha256 }])),
 		);
 		expect(readdirSync(join(options.directory, "decisions", request.id)).sort()).toEqual([
+			"decision.json",
 			"proposal.json",
 			"request.json",
 			"response.json",
@@ -490,7 +493,7 @@ describe("Oneiron foreground command to durable automatic management seam", () =
 		expect((await f.adapter.launch(recovered.context(attempt.id))).kind).toBe("terminal");
 		expect(recovered.attempts()).toHaveLength(1);
 		expect(recovered.managementRequests()).toHaveLength(1);
-		expect(recovered.events().filter((event) => event.kind === "action_decided")).toHaveLength(1);
+		expect(recovered.allEvents().filter((event) => event.kind === "action_decided")).toHaveLength(1);
 		expect(readdirSync(f.host.runnerRoot)).toEqual([attempt.id]);
 		expect(model.invoke).toHaveBeenCalledTimes(1);
 	}, 30000);

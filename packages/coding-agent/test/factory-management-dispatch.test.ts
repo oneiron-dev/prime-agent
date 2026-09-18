@@ -89,6 +89,8 @@ function caller(decision: "accept" | "defer" | "reject" = "defer", during?: () =
 		const packet = JSON.parse(packetText) as ManagementPacket;
 		return {
 			model: "mock",
+			responseModel: "mock",
+			responseModelSource: "provider-response" as const,
 			text: JSON.stringify({
 				version: 1,
 				actionId: packet.action.id,
@@ -115,6 +117,7 @@ afterEach(() => {
 describe("bounded factory judgment consumer", () => {
 	test("preserves provider usage bytes beside accounting in results, receipts and the reopened ledger", async () => {
 		const f = await fixture();
+		f.engine.applyPlan({ ...f.plan, roles: { ticketOwner: { provider: "openai", model: "openai/gpt-4o" } } });
 		const model = caller();
 		const usage = {
 			input: 1000,
@@ -132,6 +135,7 @@ describe("bounded factory judgment consumer", () => {
 			(check) =>
 				async (...parameters) => ({
 					...(await model.create(check)(...parameters)),
+					model: "openai/gpt-4o",
 					responseModel: "openai/gpt-4o",
 					responseModelSource: "provider-response",
 					usage,
@@ -253,6 +257,8 @@ describe("bounded factory judgment consumer", () => {
 			const packet = JSON.parse(text) as ManagementPacket;
 			return {
 				model: "mock",
+				responseModel: "mock",
+				responseModelSource: "provider-response" as const,
 				text: JSON.stringify({
 					version: 1,
 					actionId: binding.actionId,

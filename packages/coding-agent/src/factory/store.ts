@@ -1,8 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
+import {
+	codeDecisionBase,
+	type DecisionReceipt,
+	type FactoryDecision,
+	operatorDecisionBase,
+	recordDecision,
+} from "./decisions.js";
 import type { ManagementClaim, ManagementReconciliation, ManagementRequest, ManagementResult } from "./management.js";
 import { type FactoryFilePin, factoryRuntimeMismatchCheck } from "./runtime.js";
 import type {
@@ -24,7 +31,7 @@ import type {
 } from "./types.js";
 
 type Row = Record<string, unknown>;
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const now = (): string => new Date().toISOString();
 function decode<T>(value: unknown): T {
 	return JSON.parse(String(value)) as T;
@@ -186,7 +193,11 @@ function validatePlan(plan: FactoryPlan): void {
 /** A short-transaction journal. No process, session, model or transport is owned here. */
 export class FactoryStore {
 	private readonly db: DatabaseSync;
+	readonly directory: string;
+	private inTransaction = false;
+	private commitEffects: Array<() => void> = [];
 	constructor(path: string) {
+		this.directory = dirname(path);
 		this.db = new DatabaseSync(path);
 		this.db.exec(
 			"PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
@@ -195,7 +206,7 @@ export class FactoryStore {
 			this.transaction(() => {
 				this.db.exec("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
 				const version = this.meta("schema_version");
-				if (version !== undefined && Number(version) !== SCHEMA_VERSION)
+				if (version !== undefined && ![1, SCHEMA_VERSION].includes(Number(version)))
 					throw new Error(`Unsupported factory schema version ${version}`);
 				this.db.exec(`
 					CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, owner TEXT NOT NULL, state TEXT NOT NULL);
@@ -209,10 +220,20 @@ export class FactoryStore {
 					CREATE TABLE IF NOT EXISTS events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, action_id TEXT, attempt_id TEXT, detail TEXT NOT NULL);
 					CREATE TABLE IF NOT EXISTS wakes (id INTEGER PRIMARY KEY AUTOINCREMENT, action_id TEXT NOT NULL, attempt_id TEXT, reason TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT);
 					CREATE UNIQUE INDEX IF NOT EXISTS wakes_attempt_open ON wakes(attempt_id) WHERE resolved_at IS NULL;
-					CREATE TABLE IF NOT EXISTS management_requests (id TEXT PRIMARY KEY, wake_id INTEGER NOT NULL REFERENCES wakes(id), action_id TEXT NOT NULL, attempt_id TEXT NOT NULL, plan_revision INTEGER NOT NULL, evidence_sha256 TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL, result TEXT, error TEXT, UNIQUE(wake_id,plan_revision,attempt_id,evidence_sha256));
+					CREATE TABLE IF NOT EXISTS management_requests (id TEXT PRIMARY KEY, wake_id INTEGER REFERENCES wakes(id), action_id TEXT NOT NULL, attempt_id TEXT NOT NULL, plan_revision INTEGER NOT NULL, evidence_sha256 TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL, result TEXT, error TEXT, UNIQUE(wake_id,plan_revision,attempt_id,evidence_sha256));
 					CREATE UNIQUE INDEX IF NOT EXISTS management_wake_inflight ON management_requests(wake_id) WHERE state='CLAIMED';
 					CREATE TABLE IF NOT EXISTS plan_mutations (id TEXT PRIMARY KEY, payload_sha256 TEXT NOT NULL, previous_revision INTEGER NOT NULL, revision INTEGER NOT NULL);
 				`);
+				if (version === "1") {
+					this.db.exec(`
+						ALTER TABLE management_requests RENAME TO management_requests_v1;
+						DROP INDEX management_wake_inflight;
+						CREATE TABLE management_requests (id TEXT PRIMARY KEY, wake_id INTEGER REFERENCES wakes(id), action_id TEXT NOT NULL, attempt_id TEXT NOT NULL, plan_revision INTEGER NOT NULL, evidence_sha256 TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL, result TEXT, error TEXT, UNIQUE(wake_id,plan_revision,attempt_id,evidence_sha256));
+						INSERT INTO management_requests SELECT * FROM management_requests_v1;
+						DROP TABLE management_requests_v1;
+						CREATE UNIQUE INDEX management_wake_inflight ON management_requests(wake_id) WHERE state='CLAIMED';
+					`);
+				}
 				this.setMeta("schema_version", String(SCHEMA_VERSION));
 				if (this.meta("plan_revision") === undefined) this.setMeta("plan_revision", "0");
 				if (this.meta("paused") === undefined) this.setMeta("paused", "false");
@@ -226,15 +247,27 @@ export class FactoryStore {
 		this.db.close();
 	}
 	private transaction<T>(fn: () => T): T {
+		if (this.inTransaction) return fn();
 		this.db.exec("BEGIN IMMEDIATE");
+		this.inTransaction = true;
+		let value: T;
 		try {
-			const value = fn();
+			value = fn();
 			this.db.exec("COMMIT");
-			return value;
 		} catch (error) {
+			this.commitEffects = [];
 			this.db.exec("ROLLBACK");
 			throw error;
+		} finally {
+			this.inTransaction = false;
 		}
+		const effects = this.commitEffects.splice(0);
+		for (const effect of effects) effect();
+		return value;
+	}
+	afterDecisionCommit(effect: () => void): void {
+		if (!this.inTransaction) throw new Error("Decision receipt requires a journal transaction");
+		this.commitEffects.push(effect);
 	}
 	private meta(key: string): string | undefined {
 		const row = this.db.prepare("SELECT value FROM metadata WHERE key=?").get(key);
@@ -254,6 +287,95 @@ export class FactoryStore {
 		this.db
 			.prepare("INSERT INTO events(at,kind,action_id,attempt_id,detail) VALUES(?,?,?,?,?)")
 			.run(now(), kind, actionId, attemptId, JSON.stringify(detail));
+	}
+	ledgerSequence(actionId?: string): number {
+		const row =
+			actionId === undefined
+				? this.db.prepare("SELECT MAX(sequence) AS sequence FROM events").get()
+				: this.db.prepare("SELECT MAX(sequence) AS sequence FROM events WHERE action_id=?").get(actionId);
+		return Number(row?.sequence ?? 0);
+	}
+	commitTypedDecision(
+		actionId: string,
+		decision: FactoryDecision,
+		requestId: string,
+		staleCheck: boolean,
+		write: () => DecisionReceipt,
+		submittedBy: FactoryDecision["decided_by"],
+	): DecisionReceipt {
+		return this.transaction(() => {
+			if (!this.action(actionId)) throw new Error(`Unknown action ${actionId}`);
+			const last = this.ledgerSequence(actionId),
+				current = this.ledgerSequence();
+			if (staleCheck && (decision.ledger_sequence < last || decision.ledger_sequence > current))
+				throw new Error(
+					`Decision ledger_sequence ${decision.ledger_sequence}; action last event ${last}; ledger sequence ${current}`,
+				);
+			const existing = this.db.prepare("SELECT action_id,state FROM management_requests WHERE id=?").get(requestId);
+			if (existing && (existing.action_id !== actionId || existing.state !== "CLAIMED"))
+				throw new Error("Decision request binding changed");
+			const receipt = write();
+			const attemptId =
+				"attempt_id" in decision
+					? decision.attempt_id
+					: (this.attempts()
+							.filter((a) => a.actionId === actionId)
+							.at(-1)?.id ?? null);
+			if (existing)
+				this.db
+					.prepare("UPDATE management_requests SET result=? WHERE id=?")
+					.run(JSON.stringify(receipt), requestId);
+			else
+				this.db
+					.prepare(
+						"INSERT INTO management_requests(id,wake_id,action_id,attempt_id,plan_revision,evidence_sha256,created_at,state,result) VALUES(?,NULL,?,?,?,?,?,'RECORDED',?)",
+					)
+					.run(
+						requestId,
+						actionId,
+						attemptId ?? "",
+						Number(this.meta("plan_revision")),
+						createHash("sha256").update(JSON.stringify(decision)).digest("hex"),
+						now(),
+						JSON.stringify(receipt),
+					);
+			if (receipt.source_request_id) {
+				const source = this.db
+					.prepare("SELECT action_id,state,result FROM management_requests WHERE id=?")
+					.get(receipt.source_request_id);
+				if (source?.action_id !== actionId || source.state !== "APPLIED")
+					throw new Error("Typed application source request changed");
+				const result = decode<ManagementResult>(source.result);
+				this.db
+					.prepare("UPDATE management_requests SET result=? WHERE id=?")
+					.run(JSON.stringify({ ...result, typedDecision: receipt }), receipt.source_request_id);
+			}
+			if (decision.requested_profile !== decision.served_profile) {
+				this.event("profile_drift", actionId, attemptId, {
+					request_id: requestId,
+					requested_profile: decision.requested_profile,
+					served_profile: decision.served_profile,
+				});
+				this.db
+					.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
+					.run(actionId, `profile_drift: ${requestId}`, now());
+			}
+			this.event("decision", actionId, attemptId, {
+				...decision,
+				submitted_by: submittedBy,
+				request_id: requestId,
+				...(receipt.source_request_id ? { source_request_id: receipt.source_request_id } : {}),
+				applied: receipt.applied,
+				...(receipt.predicate ? { predicate: receipt.predicate } : {}),
+			});
+			return receipt;
+		});
+	}
+	typedDecisions(): DecisionReceipt[] {
+		return this.db
+			.prepare("SELECT result FROM management_requests WHERE wake_id IS NULL ORDER BY rowid")
+			.all()
+			.map((row) => decode<DecisionReceipt>(row.result));
 	}
 	isPaused(): boolean {
 		return this.meta("paused") === "true";
@@ -527,6 +649,32 @@ export class FactoryStore {
 					.get(slot.host, action.command.cwd)
 			)
 				return undefined;
+			recordDecision(
+				this,
+				actionId,
+				{
+					...codeDecisionBase(
+						this.ledgerSequence(),
+						"Slot matches host, slot, capabilities and exclusive workspace custody",
+					),
+					type: "build_host",
+					portable: !action.requirements.host,
+					platform_specific_proof: action.requirements.host ?? null,
+					candidate_fingerprint: action.sourceFingerprint,
+					forbidden_replay_of: null,
+					hosts: [
+						{
+							host: slot.host,
+							slot: slot.id,
+							free: true,
+							staged_workspace: null,
+							warm_cache: null,
+							receipt_age_s: null,
+						},
+					],
+				},
+				{ applied: true },
+			);
 			const id = randomUUID();
 			this.db
 				.prepare("INSERT INTO attempts(id,action_id,slot_id,state,created_at) VALUES(?,?,?,'PREPARED',?)")
@@ -647,8 +795,50 @@ export class FactoryStore {
 			this.db
 				.prepare("UPDATE attempts SET state='TERMINAL',receipt=?,claim_released=1,uncertainty=NULL WHERE id=?")
 				.run(JSON.stringify(receipt), attempt.id);
-			const state =
-				action.kind === "decision" ? "AWAITING_DECISION" : receipt.exitCode === 0 ? "ACCEPTED" : "REJECTED";
+			let state: ActionRecord["state"];
+			const base = codeDecisionBase(
+				this.ledgerSequence(),
+				"Terminal receipt classified; process success is not semantic acceptance",
+			);
+			if (action.kind === "decision") {
+				state = "AWAITING_DECISION";
+				recordDecision(this, action.id, {
+					...base,
+					type: "writer_terminal_accept",
+					attempt_id: attempt.id,
+					candidate_fingerprint: action.sourceFingerprint,
+					receipt_fingerprint: receipt.sourceFingerprint,
+					exit_code: receipt.exitCode,
+					agent_end: null,
+					stop_reason: null,
+					changed_paths: null,
+					allowed_paths_only: null,
+					receipt_ready: true,
+					receipt_sha: createHash("sha256").update(JSON.stringify(receipt)).digest("hex"),
+				});
+			} else {
+				state = receipt.exitCode === 0 ? "ACCEPTED" : "REJECTED";
+				recordDecision(
+					this,
+					action.id,
+					{
+						...base,
+						type: "test_gate_accept",
+						gate_kind: "process",
+						attempt_id: attempt.id,
+						candidate_fingerprint: action.sourceFingerprint,
+						receipt_fingerprint: receipt.sourceFingerprint,
+						exit_code: receipt.exitCode,
+						wrapper_rc: null,
+						tests: { run: null, passed: null, failed: null, skipped: null },
+						provenance_pass: null,
+						source_unchanged: null,
+						criteria: { min_tests: null, forbidden_replay_of: null, required_pin: null },
+						is_replay: null,
+					},
+					{ applied: true },
+				);
+			}
 			this.db.prepare("UPDATE actions SET state=? WHERE id=?").run(state, action.id);
 			this.resolveWakes(attempt.id);
 			this.event("attempt_terminal", action.id, attempt.id, {
@@ -823,6 +1013,27 @@ export class FactoryStore {
 			const { attempt, action } = this.context(attemptId);
 			if (attempt.state !== "UNCERTAIN" || attempt.claimReleased)
 				throw new Error("Only an uncertain claimed attempt may be resolved for retry");
+			recordDecision(
+				this,
+				action.id,
+				{
+					...operatorDecisionBase(this.ledgerSequence(), evidence.reason),
+					type: "attempt_requeue",
+					attempt_id: attemptId,
+					core_state: attempt.state,
+					claim_released: attempt.claimReleased,
+					receipt_present: attempt.receipt !== null,
+					pid: null,
+					boot_id: null,
+					start_ticks: null,
+					census: { matches: null, unreadable: null },
+					equivalent_job: null,
+					successor: null,
+					partial_banked: null,
+					duplicate_of_event: null,
+				},
+				{ applied: true },
+			);
 			this.db.prepare("UPDATE attempts SET state='ABANDONED',claim_released=1 WHERE id=?").run(attemptId);
 			this.db.prepare("UPDATE actions SET state='QUEUED' WHERE id=?").run(action.id);
 			this.resolveWakes(attemptId);
@@ -1097,7 +1308,7 @@ export class FactoryStore {
 	}
 	managementRequests(): ManagementRequest[] {
 		return this.db
-			.prepare("SELECT * FROM management_requests ORDER BY rowid")
+			.prepare("SELECT * FROM management_requests WHERE wake_id IS NOT NULL ORDER BY rowid")
 			.all()
 			.map((row) => ({
 				id: String(row.id),
@@ -1108,19 +1319,43 @@ export class FactoryStore {
 				evidenceSha256: String(row.evidence_sha256),
 				createdAt: String(row.created_at),
 				state: String(row.state) as ManagementRequest["state"],
-				result: row.result === null ? null : decode<ManagementResult>(row.result),
+				result: row.result === null ? null : decode<ManagementResult | DecisionReceipt>(row.result),
 				error: row.error === null ? null : String(row.error),
 			}));
+	}
+	finishManagementDrift(id: string): void {
+		this.transaction(() => {
+			const changed = this.db
+				.prepare("UPDATE management_requests SET state='DRIFT',error=NULL WHERE id=? AND state='CLAIMED'")
+				.run(id);
+			if (!changed.changes) throw new Error("Management claim is no longer active");
+			this.event("management_finished", null, null, { id, state: "DRIFT", error: null });
+		});
 	}
 	finishManagement(id: string, result: ManagementResult | null, error: string | null = null): void {
 		this.transaction(() => {
 			const state = error !== null ? "ERROR" : result?.proposal.decision === "defer" ? "DEFERRED" : "PROPOSED";
 			const changed = this.db
-				.prepare("UPDATE management_requests SET state=?,result=?,error=? WHERE id=? AND state='CLAIMED'")
+				.prepare(
+					"UPDATE management_requests SET state=?,result=COALESCE(?,result),error=? WHERE id=? AND state='CLAIMED'",
+				)
 				.run(state, result ? JSON.stringify(result) : null, error, id);
 			if (!changed.changes) throw new Error("Management claim is no longer active");
 			this.event("management_finished", null, null, { id, state, error });
 		});
+	}
+	/** Read complete history up to the sequence observed at entry, without the default page limit. */
+	allEvents(afterSequence = 0): FactoryEvent[] {
+		const throughSequence = this.ledgerSequence();
+		const history: FactoryEvent[] = [];
+		let cursor = afterSequence;
+		for (;;) {
+			const page = this.events(cursor).filter((event) => event.sequence <= throughSequence);
+			history.push(...page);
+			const last = page.at(-1);
+			if (!last || last.sequence >= throughSequence) return history;
+			cursor = last.sequence;
+		}
 	}
 	events(afterSequence = 0, limit = 100): FactoryEvent[] {
 		if (
