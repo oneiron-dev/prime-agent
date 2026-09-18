@@ -50,6 +50,7 @@ import { readOneironTransport } from "./oneiron-transport.js";
 import {
 	type OneironWriterStage,
 	oneironWriterCli,
+	oneironWriterMode,
 	oneironWriterPrompt,
 	readOneironWriterProfile,
 	runOneironWriterForeground,
@@ -178,7 +179,8 @@ function stagePins(stage: OneironStage): OneironPin[] {
 		case "writer":
 			return [
 				stage.prompt,
-				stage.triage,
+				...(stage.triage ? [stage.triage] : []),
+				...(stage.contract ? [stage.contract] : []),
 				stage.writerProfile,
 				...(stage.retryReconciliation ? [stage.retryReconciliation] : []),
 			];
@@ -345,7 +347,10 @@ export function inspectOneiron(m: OneironManifest) {
 	const custody = parsePin<Record<string, unknown>>(m.custody);
 	if (m.factoryRuntime) readOneironPin(m.factoryRuntime);
 	for (const pin of stagePins(m.stage)) readOneironPin(pin);
-	if (m.stage.kind === "writer") readOneironWriterProfile(m.stage.writerProfile, readOneironPin);
+	if (m.stage.kind === "writer") {
+		oneironWriterMode(m.stage);
+		readOneironWriterProfile(m.stage.writerProfile, readOneironPin);
+	}
 	let review: ReturnType<typeof inspectOneironCorpus> | undefined;
 	if (m.stage.kind === "triage" || m.stage.kind === "review-acceptance") review = reviewInput(m, m.stage).report;
 	if (m.stage.kind === "gate") {
@@ -682,17 +687,26 @@ export async function executeOneiron(
 		switch (stage.kind) {
 			case "writer": {
 				const profile = writerProfile!;
-				const prior = parsePin<OneironReceipt>(stage.triage);
-				const triage = prior.result.triage as OneironTriage;
-				requireThat(
-					prior.stage === "triage" &&
-						sameSource(prior.output, m.source) &&
-						triage.findings.some(
-							(finding) =>
-								["material", "debt"].includes(finding.classification) && finding.disposition === "open",
-						),
-					"Repair writer requires accepted remaining material triage, never a blank implementation replay",
-				);
+				const mode = oneironWriterMode(stage);
+				if (mode === "repair") {
+					const prior = parsePin<OneironReceipt>(stage.triage!);
+					const triage = prior.result.triage as OneironTriage;
+					requireThat(
+						prior.stage === "triage" &&
+							sameSource(prior.output, m.source) &&
+							triage.findings.some(
+								(finding) =>
+									["material", "debt"].includes(finding.classification) && finding.disposition === "open",
+							),
+						"Repair writer requires accepted remaining material triage, never a blank implementation replay",
+					);
+				} else {
+					const contract = readOneironPin(stage.contract!, FACTORY_EVIDENCE_LIMITS.packetBytes, "contract").trim();
+					requireThat(
+						contract.length > 0 && readOneironPin(stage.prompt).includes(contract),
+						"Implementation writer requires a sealed non-empty step contract carried verbatim by the prompt",
+					);
+				}
 				validateOneironWriterRetry(
 					m,
 					stage,
@@ -758,7 +772,9 @@ export async function executeOneiron(
 						join(m.outputDirectory, "session"),
 						"--no-extensions",
 						"--append-system-prompt",
-						"Bounded repair only. Run tools in foreground and wait for all work. Do not spawn detached descendants, delegate, use daemon/session send/schedule, commit, publish, merge, or run Cargo. Report changed files and unresolved findings. Preserve historical provenance. The factory runs gates after source rebind.",
+						mode === "repair"
+							? "Bounded repair only. Run tools in foreground and wait for all work. Do not spawn detached descendants, delegate, use daemon/session send/schedule, commit, publish, merge, or run Cargo. Report changed files and unresolved findings. Preserve historical provenance. The factory runs gates after source rebind."
+							: "Bounded implementation of the pinned step contract only. Implement only that step; when it does not fit one change, propose the split in your report instead of narrowing silently. Run tools in foreground and wait for all work. Do not spawn detached descendants, delegate, use daemon/session send/schedule, commit, publish, merge, or run Cargo. Report changed files and unresolved findings. Preserve historical provenance. The factory runs gates after source rebind.",
 						"--",
 						oneironWriterPrompt(stage.prompt, readOneironPin, capsule?.receipt.pin),
 					],
@@ -775,11 +791,13 @@ export async function executeOneiron(
 					decisionContext,
 				);
 				result = {
+					mode,
 					writerProvenance,
 					capsule: capsule?.receipt ?? null,
 					capsule_sha256: capsule?.receipt.pin.sha256 ?? null,
 					requiresSourceRebind: true,
-					triage: stage.triage,
+					triage: stage.triage ?? null,
+					contract: stage.contract ?? null,
 					retryReconciliation: stage.retryReconciliation ?? null,
 				};
 				break;
