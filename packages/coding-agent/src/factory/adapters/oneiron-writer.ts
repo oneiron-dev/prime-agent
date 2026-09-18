@@ -27,9 +27,17 @@ export interface OneironWriterProfile {
 export interface OneironWriterStage {
 	kind: "writer";
 	prompt: OneironPin;
-	triage: OneironPin;
+	triage?: OneironPin;
+	/** The sealed step contract (scope, acceptance, dependencies) for a first implementation on a clean candidate. */
+	contract?: OneironPin;
 	writerProfile: OneironPin;
 	retryReconciliation?: OneironPin;
+}
+export type OneironWriterMode = "repair" | "implement";
+export function oneironWriterMode(stage: OneironWriterStage): OneironWriterMode {
+	if (stage.triage && !stage.contract) return "repair";
+	if (stage.contract && !stage.triage) return "implement";
+	throw new Error("Writer stage names exactly one of triage or contract");
 }
 export interface OneironWriterStatus {
 	paused: boolean;

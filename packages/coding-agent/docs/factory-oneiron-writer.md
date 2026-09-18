@@ -2,6 +2,13 @@
 
 The owner OAuth-only policy uses `cpa-r/gpt-6-astra` at `xhigh` for routine writing. CEO coordination uses `medium` routinely, `high` for broader replanning or difficult cross-ticket conflicts, and `xhigh` for unresolved architecture or correctness escalations. This supersedes the briefly ratified, undeployed Fable-default preparation. Fable is reserved for explicitly requested architecture/post-wave work, not routine writer stages. This policy does not resume Wave work or change historical receipts. Initial ONE-1914 triage remains Astra at `low`.
 
+## Two writer modes
+
+- Repair: `{kind: "writer", prompt, triage, writerProfile}` requires a prior same-source material triage receipt.
+- Implementation: `{kind: "writer", prompt, contract, writerProfile}` requires a sealed non-empty step contract whose trimmed text the prompt carries verbatim.
+- Exactly one of `triage` or `contract` must be set; both or neither are rejected before preparation creates an action.
+- Both modes share custody, retry, provenance and source-rebind requirements.
+
 ## Explicit pinned profile
 
 Every new writer stage requires `writerProfile: {path, sha256}`. Missing profiles do not silently select a model. `defaultOneironWriterProfile(runtimePin)` returns:

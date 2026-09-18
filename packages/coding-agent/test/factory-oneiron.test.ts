@@ -210,6 +210,26 @@ function setup() {
 function writerProfileFixture(f: ReturnType<typeof setup>): OneironPin {
 	return f.pin(defaultOneironWriterProfile(f.manifest.factoryRuntime!));
 }
+function mockWriterResponse(f: ReturnType<typeof setup>, responseModel: string): void {
+	vi.mocked(f.runtime.runWriter!).mockImplementation(async (_argv, _cwd, transcriptPath) => {
+		writeFileSync(
+			transcriptPath,
+			JSON.stringify({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					provider: "cpa-r",
+					model: "gpt-6-astra",
+					responseModel,
+					responseModelSource: "provider-response",
+					responseId: "msg_factory_transport",
+					stopReason: "stop",
+				},
+			}),
+			{ flag: "wx" },
+		);
+	});
+}
 afterEach(() => {
 	for (const directory of roots.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -597,6 +617,61 @@ describe("Oneiron preparation and execution gates", () => {
 		expect(receipt.result.merged).toBe(false);
 		expect(vi.mocked(f.runtime.run).mock.calls.flat(2)).not.toContain("merge");
 	});
+	test("writer implements a pinned step contract without triage", async () => {
+		const f = setup();
+		const contract = "Scope: add the step. Acceptance: step works. Dependencies: none.";
+		const prompt = `${contract}\n\nImplement only this step.`,
+			contractPin = f.pin(contract);
+		f.manifest.stage = {
+			kind: "writer",
+			prompt: f.pin(prompt),
+			contract: contractPin,
+			writerProfile: writerProfileFixture(f),
+		};
+		f.seal();
+		mockWriterResponse(f, "gpt-6-astra");
+		const receipt = (await f.execute()) as OneironReceipt;
+		expect(receipt.result).toMatchObject({
+			mode: "implement",
+			triage: null,
+			contract: contractPin,
+			requiresSourceRebind: true,
+		});
+		const argv = vi.mocked(f.runtime.runWriter!).mock.calls[0]![0];
+		expect(argv[argv.indexOf("--append-system-prompt") + 1]).toContain(
+			"Bounded implementation of the pinned step contract only. Implement only that step; when it does not fit one change, propose the split in your report instead of narrowing silently.",
+		);
+		expect(argv.at(-1)!.startsWith(prompt)).toBe(true);
+	});
+	test.each(["both", "neither", "paraphrase"])(
+		"writer refuses %s contract authority before launch",
+		async (invalid) => {
+			const f = setup(),
+				contract = f.pin("Implement only the sealed step.");
+			f.manifest.stage = {
+				kind: "writer",
+				prompt: f.pin("Build the requested feature."),
+				writerProfile: writerProfileFixture(f),
+				...(invalid === "both" ? { triage: f.pin({}), contract } : invalid === "paraphrase" ? { contract } : {}),
+			};
+			f.seal();
+			if (invalid === "paraphrase")
+				await expect(f.execute()).rejects.toThrow(
+					"Implementation writer requires a sealed non-empty step contract carried verbatim by the prompt",
+				);
+			else
+				expect(() =>
+					prepareOneiron(f.manifest, {
+						manifestPath: f.manifestPath,
+						permitPath: f.permitPath,
+						adapterArgv: [process.execPath, "adapter.js"],
+						host: "arch",
+						slotId: "light",
+					}),
+				).toThrow("Writer stage names exactly one of triage or contract");
+			expect(f.runtime.runWriter).not.toHaveBeenCalled();
+		},
+	);
 	test.each(["claude-fable-5.1", "gpt-6-astra"])(
 		"writer pins Astra and rejects gateway drift %s without self-report",
 		async (observed) => {
@@ -615,24 +690,7 @@ describe("Oneiron preparation and execution gates", () => {
 			};
 			f.runtime.recordCapsule = vi.fn();
 			f.seal();
-			vi.mocked(f.runtime.runWriter!).mockImplementation(async (_argv, _cwd, transcriptPath) => {
-				writeFileSync(
-					transcriptPath,
-					JSON.stringify({
-						type: "message_end",
-						message: {
-							role: "assistant",
-							provider: "cpa-r",
-							model: "gpt-6-astra",
-							responseModel: observed,
-							responseModelSource: "provider-response",
-							responseId: "msg_factory_transport",
-							stopReason: "stop",
-						},
-					}),
-					{ flag: "wx" },
-				);
-			});
+			mockWriterResponse(f, observed);
 			const result = (await f.execute()) as OneironReceipt;
 			expect(result.result.requiresSourceRebind).toBe(true);
 			const capsule = result.result.capsule as { pin: OneironPin };
@@ -922,23 +980,7 @@ test("a deterministic capsule failure records no pin and still launches the writ
 		const attempt = store.claim(action.id, "slot")!.attempt;
 		store.markSubmitted(attempt.id);
 		f.runtime.recordCapsule = (receipt) => store.recordCapsule(action.id, attempt.id, receipt);
-		vi.mocked(f.runtime.runWriter!).mockImplementation(async (_argv, _cwd, transcriptPath) => {
-			writeFileSync(
-				transcriptPath,
-				JSON.stringify({
-					type: "message_end",
-					message: {
-						role: "assistant",
-						provider: "cpa-r",
-						model: "gpt-6-astra",
-						responseModel: "gpt-6-astra",
-						responseModelSource: "provider-response",
-						responseId: "capsule_failure_fixture",
-						stopReason: "stop",
-					},
-				}),
-			);
-		});
+		mockWriterResponse(f, "gpt-6-astra");
 		const result = (await f.execute()) as OneironReceipt;
 		expect(f.runtime.runWriter).toHaveBeenCalledTimes(1);
 		const launched = vi.mocked(f.runtime.runWriter!).mock.calls[0][0].at(-1)!;
