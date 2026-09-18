@@ -261,27 +261,28 @@ test("runner refusal after local verification reaches the journal and wake", asy
 	expect(existsSync(f.marker)).toBe(false);
 });
 
+async function runToCompletion(request: HostRequest, prelude = ""): Promise<unknown> {
+	// Join the detached supervisor before resolving transport; the next tick reads its final receipt.
+	const joinSupervisor = `import atexit, os\nfork = os.fork\ndef joined_fork():\n pid = fork()\n if pid > 0: atexit.register(os.waitpid, pid, 0)\n return pid\nos.fork = joined_fork\n`;
+	const result = spawnSync("python3", ["-c", prelude + joinSupervisor + COMMAND_RUNNER_SOURCE], {
+		input: JSON.stringify(request),
+		encoding: "utf8",
+	});
+	expect(result.status, result.stderr).toBe(0);
+	return JSON.parse(result.stdout);
+}
+
 test("a bundle change after fork refuses child exec and retains a mismatch receipt", async () => {
 	const f = fixture();
 	admitRuntimeFixture(f.pin);
 	const target = join(f.directory, "runtime-bundle", "cli.js");
 	const prelude = `import os\noriginal_fork = os.fork\ndef changed_fork():\n pid = original_fork()\n if pid == 0:\n  with open(${JSON.stringify(target)}, "w") as f: f.write("changed after fork")\n return pid\nos.fork = changed_fork\n`;
-	const transport: HostTransport = async (host, request) => {
-		if (request.operation !== "launch") return commandTransport(host, request);
-		const result = spawnSync("python3", ["-c", prelude + COMMAND_RUNNER_SOURCE], {
-			input: JSON.stringify(request),
-			encoding: "utf8",
-		});
-		expect(result.status, result.stderr).toBe(0);
-		return JSON.parse(result.stdout);
-	};
+	const transport: HostTransport = (_host, request) => runToCompletion(request, prelude);
 	const engine = new FactoryEngine(f.store, new CommandAdapter({ local: f.host }, { transport }), { enabled: true });
 	engine.applyPlan(f.plan);
 	await engine.tick();
-	await vi.waitFor(async () => {
-		await engine.tick();
-		mismatch(f.store, /^runtime_mismatch: runtime_identity: Runtime bundle hash mismatch/);
-	});
+	await engine.tick();
+	mismatch(f.store, /^runtime_mismatch: runtime_identity: Runtime bundle hash mismatch/);
 	const attempt = f.store.attempts()[0];
 	expect(JSON.parse(readFileSync(join(f.host.runnerRoot, attempt.id, "runtime-mismatch.json"), "utf8"))).toMatchObject(
 		{
@@ -424,13 +425,12 @@ test("delivery integrity is separate from runtime identity in receipts and the j
 test("successful execution retains separate runtime identity and delivery receipts", async () => {
 	const f = fixture();
 	admitRuntimeFixture(f.pin);
-	const engine = new FactoryEngine(f.store, new CommandAdapter({ local: f.host }), { enabled: true });
+	const transport: HostTransport = (_host, request) => runToCompletion(request);
+	const engine = new FactoryEngine(f.store, new CommandAdapter({ local: f.host }, { transport }), { enabled: true });
 	engine.applyPlan(f.plan);
 	await engine.tick();
-	await vi.waitFor(async () => {
-		await engine.tick();
-		expect(f.store.attempts()[0].state).toBe("TERMINAL");
-	});
+	await engine.tick();
+	expect(f.store.attempts()[0].state).toBe("TERMINAL");
 	const receiptPath = join(f.host.runnerRoot, f.store.attempts()[0].id, "runtime-admission.json");
 	expect(JSON.parse(readFileSync(receiptPath, "utf8"))).toEqual({
 		runtime_identity_ok: true,

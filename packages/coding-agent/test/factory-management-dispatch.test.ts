@@ -190,7 +190,7 @@ describe("bounded factory judgment consumer", () => {
 		expect(
 			f.store.wakes().some((wake) => wake.reason === `profile_drift: ${result.requestId}` && !wake.resolvedAt),
 		).toBe(true);
-	}, 15000);
+	});
 
 	test("preserves provider usage bytes beside accounting in results, receipts and the reopened ledger", async () => {
 		const f = await fixture();

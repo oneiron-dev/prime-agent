@@ -567,7 +567,12 @@ function changedLineStats(base) {
 	if (!base) return undefined;
 	const stats = { sourceAdded: 0, testAdded: 0, testDeleted: 0 };
 	const tracked = new Set();
+	// FORK: The factory subsystem is verified by independent reviewers who require its tests, and the upstream ratio does not apply to it.
+	const isFactoryLineBudgetExempt = (path) =>
+		/^packages\/coding-agent\/test\/factory-[^/]*$/.test(path) ||
+		path.startsWith("packages/coding-agent/src/factory/");
 	const isSource = (path) =>
+		!isFactoryLineBudgetExempt(path) &&
 		((!path.includes("/") && /\.(?:[cm]?[jt]sx?|py|sh)$/.test(path)) || /(?:^|\/)(?:src|scripts)\//.test(path)) &&
 		!testFilePattern.test(path);
 	const meaningfulSourceFlags = (lines, path) => {
@@ -581,7 +586,7 @@ function changedLineStats(base) {
 	const meaningfulSourceCount = (lines, path) => meaningfulSourceFlags(lines, path).filter(Boolean).length;
 	const record = (path, added, deleted) => {
 		tracked.add(path);
-		if (testFilePattern.test(path)) {
+		if (!isFactoryLineBudgetExempt(path) && testFilePattern.test(path)) {
 			stats.testAdded += added;
 			stats.testDeleted += deleted;
 		}

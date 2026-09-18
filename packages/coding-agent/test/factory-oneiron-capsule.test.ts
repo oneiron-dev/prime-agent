@@ -432,31 +432,26 @@ test("uses only language-matched one-file AGENTS templates for Python and Rust t
 });
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-test.skipIf(!existsSync(join(repository, ".git")))(
-	"bounds a two-file prose capsule on this repository without unrelated substring admissions",
-	() => {
-		const paths = [
-			"packages/coding-agent/src/factory/adapters/oneiron-capsule.ts",
-			"packages/coding-agent/src/factory/adapters/oneiron-code-map.ts",
-		];
-		const text = `Update ${paths[0]} and ${paths[1]}.`;
-		const started = performance.now();
-		const capsule = generateOneironCapsule(
-			repository,
-			head,
-			{ path: join(repository, "packet.txt"), sha256: oneironSha(text) },
-			text,
-		);
-		expect(performance.now() - started).toBeLessThan(10_000);
-		expect(Buffer.byteLength(`${JSON.stringify(capsule)}\n`)).toBeLessThanOrEqual(
-			FACTORY_EVIDENCE_LIMITS.capsuleBytes,
-		);
-		expect(capsule.tests.map((test) => test.path)).toEqual([
-			"packages/coding-agent/test/factory-oneiron-capsule.test.ts",
-		]);
-		expect(capsule.tests.length).toBeLessThanOrEqual(CAPSULE_TEST_LIMIT);
-	},
-);
+test("bounds a two-file prose capsule on this repository without unrelated substring admissions", () => {
+	const paths = [
+		"packages/coding-agent/src/factory/adapters/oneiron-capsule.ts",
+		"packages/coding-agent/src/factory/adapters/oneiron-code-map.ts",
+	];
+	const text = `Update ${paths[0]} and ${paths[1]}.`;
+	const started = performance.now();
+	const capsule = generateOneironCapsule(
+		repository,
+		head,
+		{ path: join(repository, "packet.txt"), sha256: oneironSha(text) },
+		text,
+	);
+	expect(performance.now() - started).toBeLessThan(10_000);
+	expect(Buffer.byteLength(`${JSON.stringify(capsule)}\n`)).toBeLessThanOrEqual(FACTORY_EVIDENCE_LIMITS.capsuleBytes);
+	expect(capsule.tests.map((test) => test.path)).toEqual([
+		"packages/coding-agent/test/factory-oneiron-capsule.test.ts",
+	]);
+	expect(capsule.tests.length).toBeLessThanOrEqual(CAPSULE_TEST_LIMIT);
+});
 test("ranks stem relations first, then distinct packet-owned symbol names, and caps at 32", () => {
 	const f = fixture();
 	f.file(
