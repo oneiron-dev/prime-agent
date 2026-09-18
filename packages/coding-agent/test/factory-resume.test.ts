@@ -8,6 +8,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { runFactoryCli } from "../src/factory/cli.js";
 import { codeDecisionBase, recordDecision } from "../src/factory/decisions.js";
 import { FactoryEngine } from "../src/factory/engine.js";
+import type { ManagementRequest } from "../src/factory/management.js";
 import { resumeCatchUp, resumeFactory, resumeFrontier } from "../src/factory/resume.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { ActionSpec, AttemptContext, Inspection } from "../src/factory/types.js";
@@ -65,7 +66,7 @@ function fixture(ids: string[] = []) {
 	);
 	const engine = new FactoryEngine(store, { launch, inspect }, { enabled: true, pauseFile });
 	vi.spyOn(console, "log").mockImplementation(() => {});
-	return { directory, store, engine, pin, pauseFile, launch };
+	return { directory, store, engine, pin, pauseFile, launch, inspect };
 }
 function finish(store: FactoryStore, id: string, exitCode = 0) {
 	const claim = store.claim(id, "s0")!;
@@ -109,7 +110,7 @@ it("refuses runtime mismatch, then accepts the flag with a reason and preserves 
 	await runFactoryCli(["resume", f.directory, "--accept-runtime-change", "owner approved release"]);
 	expect(f.store.runtimePin()).not.toEqual(f.pin);
 	expect(readFileSync(f.pin.path, "utf8")).toBe("{}");
-	expect(f.store.allEvents().find((e) => e.kind === "runtime_changed")?.detail).toMatchObject({
+	expect(f.store.eventsOfKind("runtime_changed")[0]?.detail).toMatchObject({
 		previous: f.pin,
 		reason: "owner approved release",
 	});
@@ -170,7 +171,13 @@ it("groups the full catch-up after the last resumed event, including typed drift
 	expect(ticket.uncertain.map((e) => e.actionId)).toEqual(["uncertain"]);
 	expect(report.tickets[1].rejected.map((e) => e.actionId)).toEqual(["rejected"]);
 	expect(ticket.openWakes.map((w) => w.reason).join(" ")).toMatch(/profile_drift.*typed_decision_deferred.*lost/);
-	expect(ticket.managementRequests.map((r) => r.state)).toEqual(["RECORDED", "PROPOSED", "DRIFT", "DEFERRED"]);
+	expect(ticket.managementRequests.map((r) => r.state)).toEqual(["PROPOSED", "DRIFT", "DEFERRED"]);
+	const auditState: ManagementRequest["state"] = "RECORDED";
+	expect(ticket.managementRequests.some((r) => r.state === auditState)).toBe(false);
+	store.decide("decision", "accept", { actor: "operator", reason: "reviewed", ref: "fixture:review" });
+	const accepted = resumeCatchUp(store).tickets[0];
+	expect(accepted.openWakes.map((w) => w.actionId)).toEqual(["uncertain"]);
+	expect(accepted.managementRequests).toEqual([]);
 });
 
 it("derives each frontier category, abandons only PREPARED and never re-admits UNCERTAIN", async () => {
@@ -235,6 +242,7 @@ it("exits nonzero on idle_with_backlog and records counts, wake, resumed event a
 		counts: report.counts,
 		runtime_pin: f.pin,
 		catch_up_sha: report.catch_up_sha,
+		catch_up_through: report.catch_up_through,
 		accounting: report.accounting,
 	});
 	expect(report.accounting).toMatchObject({ calls: 0, cost_usd: 0, priced: true });
@@ -270,4 +278,122 @@ it("rehydrates cursor requests and their projections without calls, replay or st
 	expect(f.launch).not.toHaveBeenCalled();
 	expect(fetch).not.toHaveBeenCalled();
 	db.close();
+});
+
+it("reports an acceptance settled by the previous resume tick in the next catch-up", async () => {
+	const f = fixture(["accepted"]);
+	const attempt = f.store.claim("accepted", "s0")!.attempt;
+	f.store.markSubmitted(attempt.id);
+	f.inspect.mockImplementation(
+		async (c): Promise<Inspection> => ({
+			kind: "terminal",
+			receipt: {
+				attemptId: c.attempt.id,
+				sourceFingerprint: c.action.sourceFingerprint,
+				exitCode: 0,
+				finishedAt: new Date().toISOString(),
+			},
+		}),
+	);
+	const first = await resumeFactory(f.engine);
+	expect(f.store.actions()[0].state).toBe("ACCEPTED");
+	expect(JSON.parse(readFileSync(first.catchUpPath, "utf8")).tickets[0].accepted).toEqual([]);
+	const terminal = f.store.eventsOfKind("attempt_terminal")[0];
+	expect(terminal.sequence).toBeGreaterThan(first.catch_up_through);
+	const resumed = f.store.eventsOfKind("resumed")[0];
+	expect(resumed.sequence).toBeGreaterThan(terminal.sequence);
+	expect(f.store.lastResumeSequence()).toBe(first.catch_up_through);
+	const second = await resumeFactory(f.engine);
+	const catchUp = JSON.parse(readFileSync(second.catchUpPath, "utf8"));
+	expect(catchUp.afterSequence).toBe(first.catch_up_through);
+	expect(catchUp.tickets[0].accepted).toEqual([terminal]);
+	const third = await resumeFactory(f.engine);
+	expect(JSON.parse(readFileSync(third.catchUpPath, "utf8")).tickets[0].accepted).toEqual([]);
+	expect(f.launch).not.toHaveBeenCalled();
+});
+
+it("counts no pending requests after operator acceptance closes every wake", () => {
+	const { store } = fixture(["decision"]);
+	finish(store, "decision");
+	const wake = store.wakes()[0];
+	for (const mode of ["DRIFT", "DEFERRED"] as const) {
+		store.claimManagement({
+			id: mode,
+			wakeId: wake.id,
+			actionId: "decision",
+			attemptId: wake.attemptId!,
+			planRevision: 1,
+			evidenceSha256: mode,
+		});
+		recordDecision(
+			store,
+			"decision",
+			{
+				...codeDecisionBase(store.ledgerSequence(), mode),
+				served_profile: mode === "DRIFT" ? "other" : "code",
+				type: "executability",
+				named_dependency: "none",
+				independent_work_available: true,
+				authority_covers: true,
+				hold_scope: null,
+			},
+			{
+				requestId: mode,
+				inference: {
+					outcome: mode === "DEFERRED" ? "DEFERRED" : "YES",
+					question_set: { version: "v8", sha256: "a".repeat(64) },
+				},
+			},
+		);
+	}
+	expect(resumeCatchUp(store).tickets[0].managementRequests).toHaveLength(2);
+	store.decide("decision", "accept", { actor: "operator", reason: "reviewed", ref: "fixture:review" });
+	expect(store.wakes().filter((w) => w.resolvedAt === null)).toEqual([]);
+	expect(resumeCatchUp(store).tickets[0].managementRequests).toEqual([]);
+});
+
+it("excludes resolved wakes and terminal actions independently from pending resume requests", () => {
+	const f = fixture(["decision"]);
+	finish(f.store, "decision");
+	const wake = f.store.wakes()[0];
+	f.store.claimManagement({
+		id: "pending",
+		wakeId: wake.id,
+		actionId: "decision",
+		attemptId: wake.attemptId!,
+		planRevision: 1,
+		evidenceSha256: "proof",
+	});
+	const db = new DatabaseSync(join(f.directory, "factory.db"));
+	try {
+		expect(f.store.pendingResumeRequests()).toHaveLength(1);
+		db.prepare("UPDATE wakes SET resolved_at=? WHERE id=?").run(new Date().toISOString(), wake.id);
+		expect(f.store.pendingResumeRequests()).toEqual([]);
+		db.prepare("UPDATE wakes SET resolved_at=NULL WHERE id=?").run(wake.id);
+		for (const state of ["ACCEPTED", "REJECTED", "WITHDRAWN"]) {
+			db.prepare("UPDATE actions SET state=? WHERE id='decision'").run(state);
+			expect(f.store.pendingResumeRequests()).toEqual([]);
+		}
+	} finally {
+		db.close();
+	}
+});
+
+it("deduplicates idle wakes across repeated resumes and uses timestamp-only receipt filenames", async () => {
+	const f = fixture(["ready"]);
+	f.store.applyPlan({
+		version: 1,
+		tickets: [],
+		slots: [],
+		actions: [{ ...f.store.actions()[0], requirements: { host: "absent" } }],
+	});
+	vi.spyOn(Date, "now").mockReturnValue(Date.now());
+	for (let i = 0; i < 3; i++) await expect(resumeFactory(f.engine)).rejects.toThrow("idle_with_backlog");
+	expect(f.store.wakes().filter((w) => w.resolvedAt === null)).toHaveLength(1);
+	expect(f.store.eventsOfKind("idle_with_backlog")).toHaveLength(3);
+	expect(f.store.eventsOfKind("resumed")).toHaveLength(3);
+	const receipts = readdirSync(f.directory).filter((n) => n.startsWith("resume-"));
+	expect(receipts).toHaveLength(3);
+	for (const filename of receipts)
+		expect(filename).toMatch(/^resume-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z\.json$/);
 });

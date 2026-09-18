@@ -493,7 +493,7 @@ describe("Oneiron foreground command to durable automatic management seam", () =
 		expect((await f.adapter.launch(recovered.context(attempt.id))).kind).toBe("terminal");
 		expect(recovered.attempts()).toHaveLength(1);
 		expect(recovered.managementRequests()).toHaveLength(1);
-		expect(recovered.allEvents().filter((event) => event.kind === "action_decided")).toHaveLength(1);
+		expect(recovered.eventsOfKind("action_decided")).toHaveLength(1);
 		expect(readdirSync(f.host.runnerRoot)).toEqual([attempt.id]);
 		expect(model.invoke).toHaveBeenCalledTimes(1);
 	}, 30000);

@@ -303,7 +303,7 @@ describe("explicit unstarted action withdrawal", () => {
 				expect(results[1].error).toContain("unstarted");
 				expect(f.store.actions()[0].state).toBe("RUNNING");
 				expect(f.store.attempts()).toHaveLength(1);
-				expect(f.store.allEvents().some((event) => event.kind === "action_withdrawn")).toBe(false);
+				expect(f.store.eventsOfKind("action_withdrawn")).toHaveLength(0);
 			} else {
 				expect(f.store.actions()[0].state).toBe("WITHDRAWN");
 				expect(f.store.attempts()).toHaveLength(0);

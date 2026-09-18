@@ -1,19 +1,27 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import type * as NodeFs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { factoryArguments, supportsFactoryRuntime } from "../src/cli/factory-launch.js";
+import { runFactoryCli } from "../src/factory/cli.js";
 import type { FactoryCostReport } from "../src/factory/cost.js";
+import { codeDecisionBase, type DecisionOf, type DecisionReceipt } from "../src/factory/decisions.js";
 import { FactoryEngine } from "../src/factory/engine.js";
 import { FACTORY_EVIDENCE_LIMITS } from "../src/factory/evidence.js";
 import type { ManagementPacket } from "../src/factory/management.js";
 import { manageFactoryWake } from "../src/factory/management-dispatch.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { FactoryPlan, FactoryStatus } from "../src/factory/types.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof NodeFs>();
+	return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
 
 const require = createRequire(import.meta.url);
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -82,10 +90,130 @@ async function waitUntil(test: () => boolean) {
 	throw new Error("Condition did not become true");
 }
 afterEach(() => {
+	vi.restoreAllMocks();
+	vi.clearAllMocks();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("optional factory CLI", () => {
+	it("prints a typed drift receipt before exiting 1 and never applies the decision", () => {
+		const { directory, planPath, hostsPath } = setup("decision");
+		invoke(["init", directory, planPath, "--hosts", hostsPath]);
+		unpauseFixture(directory);
+		const store = new FactoryStore(join(directory, "factory.db"));
+		try {
+			const context = store.claim("a", "local-slot")!;
+			store.markSubmitted(context.attempt.id);
+			store.complete({
+				attemptId: context.attempt.id,
+				sourceFingerprint: context.action.sourceFingerprint,
+				exitCode: 0,
+				finishedAt: "2026-09-18T00:00:00Z",
+			});
+			const terminal = store.attempts()[0].receipt!;
+			const decision: DecisionOf<"writer_terminal_accept"> = {
+				...codeDecisionBase(store.ledgerSequence(), "Reviewed exact terminal output"),
+				type: "writer_terminal_accept",
+				decided_by: "advisor",
+				requested_profile: "expected-model",
+				served_profile: "fallback-model",
+				attempt_id: context.attempt.id,
+				candidate_fingerprint: context.action.sourceFingerprint,
+				receipt_fingerprint: terminal.sourceFingerprint,
+				exit_code: 0,
+				agent_end: true,
+				stop_reason: "stop",
+				changed_paths: [],
+				allowed_paths_only: true,
+				receipt_ready: true,
+				receipt_sha: createHash("sha256").update(JSON.stringify(terminal)).digest("hex"),
+			};
+			const result = spawnSync(
+				process.execPath,
+				[
+					...nodeArgs,
+					cli,
+					"factory",
+					"decide-typed",
+					directory,
+					"a",
+					decision.type,
+					"--object",
+					JSON.stringify(decision),
+					"--apply",
+				],
+				{ cwd: packageRoot, encoding: "utf8", timeout: 10000 },
+			);
+			expect(result.status, result.stderr).toBe(1);
+			expect(result.stderr).toContain("profile_drift: decision not applied");
+			const receipt = JSON.parse(result.stdout) as DecisionReceipt;
+			expect(receipt.decision).toEqual(decision);
+			expect(receipt.applied).toBe(false);
+			expect(receipt).toEqual(store.typedDecisions().at(-1));
+			expect(
+				JSON.parse(readFileSync(join(directory, "decisions", receipt.request_id, "decision.json"), "utf8")),
+			).toEqual(receipt);
+			expect(store.managementRequests()).toEqual([]);
+			expect(store.actions()[0].state).toBe("AWAITING_DECISION");
+			expect(store.attempts()).toHaveLength(1);
+			expect(
+				store.wakes().some((wake) => wake.reason === `profile_drift: ${receipt.request_id}` && !wake.resolvedAt),
+			).toBe(true);
+		} finally {
+			store.close();
+		}
+	});
+
+	it("rejects oversized decide-typed @file input before attempting to read it", async () => {
+		const { root, directory, planPath, hostsPath } = setup("decision");
+		invoke(["init", directory, planPath, "--hosts", hostsPath]);
+		const path = join(root, "oversized-decision.json");
+		writeFileSync(path, "{}".padEnd(FACTORY_EVIDENCE_LIMITS.packetBytes + 1, " "));
+		const store = new FactoryStore(join(directory, "factory.db"));
+		try {
+			const sequence = store.ledgerSequence();
+			vi.mocked(readFileSync).mockClear();
+			await expect(
+				runFactoryCli(["decide-typed", directory, "a", "executability", "--object", `@${path}`]),
+			).rejects.toThrow("decision: actual 98305 UTF-8 bytes exceeds limit 98304");
+			const readPaths = vi.mocked(readFileSync).mock.calls.map(([path]) => path);
+			expect(readPaths).toContain(join(directory, "config.json"));
+			expect(readPaths).not.toContain(path);
+			expect(store.ledgerSequence()).toBe(sequence);
+			expect(store.typedDecisions()).toEqual([]);
+			expect(existsSync(join(directory, "decisions"))).toBe(false);
+		} finally {
+			store.close();
+		}
+	});
+
+	it("accepts decide-typed @file at the 96 KiB limit and rejects non-file input", async () => {
+		const { root, directory, planPath, hostsPath } = setup("decision");
+		invoke(["init", directory, planPath, "--hosts", hostsPath]);
+		const store = new FactoryStore(join(directory, "factory.db"));
+		try {
+			const decision: DecisionOf<"executability"> = {
+				...codeDecisionBase(store.ledgerSequence(), "Current executable work"),
+				type: "executability",
+				named_dependency: "none",
+				independent_work_available: true,
+				authority_covers: true,
+				hold_scope: null,
+			};
+			const path = join(root, "decision.json");
+			writeFileSync(path, JSON.stringify(decision).padEnd(FACTORY_EVIDENCE_LIMITS.packetBytes, " "));
+			const output = vi.spyOn(console, "log").mockImplementation(() => {});
+			await runFactoryCli(["decide-typed", directory, "a", decision.type, "--object", `@${path}`]);
+			expect(JSON.parse(String(output.mock.calls[0][0])).decision).toEqual(decision);
+			expect(store.typedDecisions()).toHaveLength(1);
+			await expect(
+				runFactoryCli(["decide-typed", directory, "a", decision.type, "--object", `@${root}`]),
+			).rejects.toThrow("--object @file requires a regular JSON file");
+		} finally {
+			store.close();
+		}
+	});
+
 	it("reports two tickets and two seats from ledger and receipts without writes or double counting", async () => {
 		const f = setup("decision");
 		const plan = JSON.parse(readFileSync(f.planPath, "utf8")) as FactoryPlan;
@@ -306,6 +434,9 @@ describe("optional factory CLI", () => {
 		expect(help).toContain("prime factory settle-no-retry");
 		expect(help).toContain("prime factory withdraw");
 		expect(help).toContain("NOT_EXECUTED");
+		expect(help).toContain("recomputes the frontier and runs one scheduling tick");
+		expect(help).toContain("Resume exits 1 for an owner pause, an unaccepted runtime mismatch or idle_with_backlog");
+		expect(help).toContain("decide-typed and manage print the typed result before exiting 1 for drift");
 		expect(existsSync(join(root, ".prime"))).toBe(false);
 		expect(factoryArguments(["factory", "status", "/tmp/test"])).toEqual(["status", "/tmp/test"]);
 		expect(factoryArguments(["help", "factory"])).toEqual(["help"]);

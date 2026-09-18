@@ -122,7 +122,10 @@ async function main(args: string[]): Promise<void> {
 					signal: controller.signal,
 				},
 				createPrimeManagementCaller,
-				(result) => console.log(JSON.stringify(result)),
+				(result) => {
+					console.log(JSON.stringify(result));
+					if (result.kind === "drift") process.exitCode = 1;
+				},
 			);
 			console.log(JSON.stringify({ kind: "watch-finished", ...summary }));
 		} else {
@@ -132,7 +135,7 @@ async function main(args: string[]): Promise<void> {
 				createPrimeManagementCaller,
 			);
 			console.log(JSON.stringify(result, null, 2));
-			if (result.kind === "error") process.exitCode = 1;
+			if (result.kind === "error" || result.kind === "drift") process.exitCode = 1;
 		}
 	} finally {
 		process.off("SIGINT", stop);

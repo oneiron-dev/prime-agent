@@ -8,6 +8,18 @@ import { factoryRuntimeProcess, recordFactoryRuntime, verifyFactoryRuntimeAdmiss
 import type { FactoryStore } from "./store.js";
 import { sumFactoryCosts } from "./usage.js";
 
+function saveTimestampedReceipt(directory: string, prefix: string, data: unknown): string {
+	for (let timestamp = Date.now(); ; timestamp++) {
+		const path = join(directory, `${prefix}-${new Date(timestamp).toISOString().replaceAll(":", "-")}.json`);
+		try {
+			save(path, data);
+			return path;
+		} catch (error) {
+			if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+		}
+	}
+}
+
 export function resumeFrontier(store: FactoryStore) {
 	const actions = store.actions();
 	const attempts = store.attempts(true);
@@ -67,10 +79,8 @@ export async function resumeFactory(engine: FactoryEngine, acceptRuntimeChange?:
 		runtime_pin = recordFactoryRuntime(store.directory, `runtime-${randomUUID()}.json`);
 		store.repinRuntime(runtime_pin, acceptRuntimeChange);
 	}
-	const timestamp = `${new Date().toISOString().replaceAll(":", "-")}-${randomUUID()}`;
 	const catchUp = resumeCatchUp(store);
-	const catchUpPath = join(store.directory, `catch-up-${timestamp}.json`);
-	save(catchUpPath, catchUp);
+	const catchUpPath = saveTimestampedReceipt(store.directory, "catch-up", catchUp);
 	const catch_up_sha = createHash("sha256").update(readFileSync(catchUpPath)).digest("hex");
 	console.log("TICKET\tACCEPTED\tREJECTED\tUNCERTAIN\tOPEN_WAKES\tMANAGEMENT_REQUESTS");
 	for (const row of catchUp.tickets)
@@ -99,9 +109,14 @@ export async function resumeFactory(engine: FactoryEngine, acceptRuntimeChange?:
 		reconciled: tick.reconciled.length,
 	};
 	const incident = counts.READY > 0 && counts.RUNNING === 0;
-	const detail = { counts, runtime_pin, catch_up_sha, accounting: sumFactoryCosts([]) };
+	const detail = {
+		counts,
+		runtime_pin,
+		catch_up_sha,
+		catch_up_through: catchUp.throughSequence,
+		accounting: sumFactoryCosts([]),
+	};
 	store.recordResumed(detail, incident ? actions.find((a) => a.state === "READY")!.id : undefined);
-	const path = join(store.directory, `resume-${timestamp}.json`);
 	const report = {
 		...detail,
 		catchUpPath,
@@ -110,7 +125,7 @@ export async function resumeFactory(engine: FactoryEngine, acceptRuntimeChange?:
 		tick,
 		incident: incident ? "idle_with_backlog" : null,
 	};
-	save(path, report);
+	const path = saveTimestampedReceipt(store.directory, "resume", report);
 	console.log(JSON.stringify({ ...report, path }));
 	if (incident) throw new Error(`idle_with_backlog: ${JSON.stringify(counts)}`);
 	return report;

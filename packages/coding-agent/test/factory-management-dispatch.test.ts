@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { codeDecisionBase, type DecisionOf } from "../src/factory/decisions.js";
 import { FactoryEngine } from "../src/factory/engine.js";
 import { FACTORY_EVIDENCE_LIMITS } from "../src/factory/evidence.js";
 import type { ManagementEvidenceBinding, ManagementPacket, ManagementResult } from "../src/factory/management.js";
 import {
 	type ManagementCallerFactory,
+	type ManageWakeResult,
 	manageFactoryWake,
 	watchFactoryManagement,
 } from "../src/factory/management-dispatch.js";
@@ -115,6 +117,81 @@ afterEach(() => {
 });
 
 describe("bounded factory judgment consumer", () => {
+	test("manage prints a typed drift result before exiting 1 without applying", async () => {
+		const f = await fixture();
+		writeFileSync(join(f.directory, "config.json"), JSON.stringify({ version: 1, hosts: {} }));
+		const decision: DecisionOf<"baseline_adoption"> = {
+			...codeDecisionBase(f.store.ledgerSequence(), "Structured retained revision facts"),
+			type: "baseline_adoption",
+			retained_revision: "head",
+			fingerprint: "source-0",
+			dirty_paths_count: 0,
+			authority_record: { path: "/owner/record", sha: "a".repeat(64) },
+			authorship_proof: "signed",
+			known_defects: [],
+			prior_green_candidate: null,
+		};
+		const path = join(f.directory, "typed.json");
+		writeFileSync(path, JSON.stringify(decision));
+		const preload = join(f.directory, "mock-fetch.mjs");
+		const response = {
+			model: "fixture-drifted-model",
+			answers: { q: { type: "noul", noul: 0.9 } },
+			usage: { input_tokens: 10, output_tokens: 2 },
+		};
+		writeFileSync(
+			preload,
+			`globalThis.fetch = async () => new Response(${JSON.stringify(JSON.stringify(response))}, { status: 200 });`,
+		);
+		const entry = resolve("src/factory/manage-entry.ts");
+		const child = spawn(
+			process.execPath,
+			["--import", "tsx", "--import", pathToFileURL(preload).href, entry, f.directory, "a0", "--typed-object", path],
+			{
+				env: { ...process.env, TYPESAFE_JEV_API_KEY: "fixture-not-a-secret" },
+				stdio: ["ignore", "pipe", "pipe"],
+			},
+		);
+		let output = "",
+			error = "";
+		child.stdout.setEncoding("utf8");
+		child.stdout.on("data", (text: string) => {
+			output += text;
+		});
+		child.stderr.setEncoding("utf8");
+		child.stderr.on("data", (text: string) => {
+			error += text;
+		});
+		const code = await new Promise<number | null>((resolveExit, reject) => {
+			child.once("error", reject);
+			child.once("close", resolveExit);
+		});
+		expect(code, error).toBe(1);
+		const result = JSON.parse(output) as ManageWakeResult;
+		expect(result).toMatchObject({
+			kind: "drift",
+			admitted: true,
+			requestedProfile: "jev-latest",
+			servedProfile: "fixture-drifted-model",
+			typedDecision: {
+				outcome: "DRIFT",
+				action_id: "a0",
+				applied: false,
+				decision: { type: decision.type, requested_profile: "jev-latest", served_profile: "fixture-drifted-model" },
+			},
+		});
+		expect(result.typedDecision).toEqual(f.store.managementRequests()[0].result);
+		expect(JSON.parse(readFileSync(join(result.evidenceDirectory!, "decision.json"), "utf8"))).toEqual(
+			result.typedDecision,
+		);
+		expect(f.store.managementRequests()[0].state).toBe("DRIFT");
+		expect(f.store.actions()[0].state).toBe("AWAITING_DECISION");
+		expect(f.store.attempts()).toHaveLength(1);
+		expect(
+			f.store.wakes().some((wake) => wake.reason === `profile_drift: ${result.requestId}` && !wake.resolvedAt),
+		).toBe(true);
+	}, 15000);
+
 	test("preserves provider usage bytes beside accounting in results, receipts and the reopened ledger", async () => {
 		const f = await fixture();
 		f.engine.applyPlan({ ...f.plan, roles: { ticketOwner: { provider: "openai", model: "openai/gpt-4o" } } });

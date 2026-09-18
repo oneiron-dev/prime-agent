@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
-import { codeDecisionBase, recordDecision } from "../src/factory/decisions.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { codeDecisionBase, type DecisionReceipt, recordDecision } from "../src/factory/decisions.js";
 import { FactoryEngine } from "../src/factory/engine.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type {
@@ -72,6 +72,7 @@ class FakeAdapter implements FactoryAdapter {
 }
 const evidence = { actor: "owner", reason: "Reviewed exact artifact and required checks", ref: "file:///review.json" };
 afterEach(() => {
+	vi.restoreAllMocks();
 	for (const store of stores.splice(0)) store.close();
 	for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -236,7 +237,7 @@ describe("portable factory journal", () => {
 		await new FactoryEngine(store, adapter, { enabled: true }).tick();
 		expect(store.isPaused()).toBe(true);
 		expect(adapter.launches).toHaveLength(0);
-		expect(store.allEvents().some((e) => e.kind === "terminal_receipt_conflict")).toBe(true);
+		expect(store.eventsOfKind("terminal_receipt_conflict").length > 0).toBe(true);
 		expect(store.wakes().some((w) => !w.resolvedAt && w.reason === "Conflicting terminal receipt")).toBe(true);
 	});
 	it("retains ambiguous submission claims across restart until evidence authorizes retry", async () => {
@@ -482,6 +483,70 @@ it("pages full decision history without loss, duplication or changing the bounde
 	expect(new Set(full.map((event) => event.sequence)).size).toBe(full.length);
 	expect(full.map((event) => event.sequence)).toEqual(Array.from({ length: full.length }, (_, index) => index + 1));
 	expect(store.allEvents(before)).toEqual(full.slice(before));
-	expect(store.allEvents(before).filter((event) => event.kind === "decision")).toHaveLength(205);
+	expect(store.eventsOfKind("decision", before)).toHaveLength(205);
 	expect(() => store.allEvents(-1)).toThrow("Invalid event range");
+});
+
+it("pages only the requested event kind through its entry snapshot", () => {
+	const { store } = fixture();
+	store.applyPlan(plan());
+	store.recordResumed({ old: true });
+	const after = store.ledgerSequence();
+	for (let index = 0; index < 205; index++) {
+		store.pause("unrelated");
+		store.recordResumed({ index });
+	}
+	const expected = store.events(after, 1000).filter((event) => event.kind === "resumed");
+	const all = vi.spyOn(store, "allEvents");
+	const sequence = store.ledgerSequence.bind(store);
+	vi.spyOn(store, "ledgerSequence").mockImplementationOnce(() => {
+		const through = sequence();
+		store.recordResumed({ afterSnapshot: true });
+		return through;
+	});
+	const actual = store.eventsOfKind("resumed", after);
+	expect(actual).toEqual(expected);
+	expect(actual).toHaveLength(205);
+	expect(new Set(actual.map((event) => event.sequence)).size).toBe(205);
+	expect(all).not.toHaveBeenCalled();
+	expect(store.eventsOfKind("absent")).toEqual([]);
+	expect(store.eventsOfKind("resumed", store.ledgerSequence())).toEqual([]);
+	expect(() => store.eventsOfKind("resumed", -1)).toThrow("Invalid event range");
+});
+
+it("treats a false receipt file with an applied ledger decision as promotion missing, never as a replay", () => {
+	const { directory, path, store } = fixture();
+	store.applyPlan(plan());
+	const apply = vi.fn();
+	vi.spyOn(store, "afterDecisionCommit").mockImplementationOnce(() => {});
+	const receipt = recordDecision(
+		store,
+		"a",
+		{
+			...codeDecisionBase(store.ledgerSequence(), "Audit authority"),
+			type: "executability",
+			named_dependency: "none",
+			independent_work_available: true,
+			authority_covers: true,
+			hold_scope: null,
+		},
+		{ requestId: "promotion-missing", apply },
+	);
+	const file = join(directory, "decisions", receipt.request_id, "decision.json");
+	const before = store.allEvents();
+	const reopened = new FactoryStore(path);
+	stores.push(reopened);
+	const disk = JSON.parse(readFileSync(file, "utf8")) as DecisionReceipt;
+	const event = reopened.eventsOfKind("decision").find((e) => e.detail.request_id === receipt.request_id)!;
+	expect(disk.applied).toBe(false);
+	expect(event.detail.applied).toBe(true);
+	expect(reopened.typedDecisions()).toEqual([{ ...disk, applied: event.detail.applied }]);
+	expect(reopened.typedDecisions()[0].applied).toBe(true);
+	expect(reopened.allEvents()).toEqual(before);
+	// A lagging file is promotion missing, not permission to apply the decision again.
+	expect(disk.applied === false && event.detail.applied === true ? "promotion missing" : "complete").toBe(
+		"promotion missing",
+	);
+	expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(disk);
+	expect(apply).toHaveBeenCalledTimes(1);
 });

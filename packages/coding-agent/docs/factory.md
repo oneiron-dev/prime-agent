@@ -32,7 +32,11 @@ prime-agent factory resume /absolute/factory
 prime-agent factory serve /absolute/factory
 ```
 
-Initialization is paused. Resume is explicit. `--pause-file /absolute/owner-pause` adds an independent external fence: its existence blocks dispatch and mutations regardless of local resume. Archive that sentinel only as part of the owner's explicit resume procedure. Do not remove an existing wave pause to run an unrelated fixture.
+Initialization is paused. `resume` is a ledger recovery operation, not a bare unpause. It prints a per-ticket catch-up table, saves the catch-up as JSON, recomputes the scheduling frontier, restores pending continuation artifacts and runs one scheduling tick. Use `run` or `serve` afterward only when continuous scheduling is intended. Continuation restoration does not advance a coordinator turn or call a model. UNCERTAIN attempts remain operator work and are never automatically re-admitted.
+
+`resume` exits with code 1 while an external owner pause exists, for an unaccepted controller runtime mismatch, or when the tick leaves READY backlog with no RUNNING action (`idle_with_backlog`). The idle case records an incident wake; it is not a successful recovery. An intentional runtime replacement requires `resume <directory> --accept-runtime-change <reason>`, which journals the new controller pin. It does not rewrite existing per-action runtime requirements.
+
+`--pause-file /absolute/owner-pause` adds an independent external fence: its existence blocks dispatch and mutations, and `resume` neither removes nor overrides it. Archive that sentinel only as part of the owner's explicit resume procedure. Do not remove an existing wave pause to run an unrelated fixture.
 
 A `git:` fingerprint measures HEAD/tree, the tracked diff and nonignored untracked entries. Use `fingerprint` to calculate it on the selected host before planning the action. Runners check it before launch and record resulting output identity separately. Opaque fingerprints are identifiers only; they need a project-specific verification wrapper if used for code work. See [command runner contract](factory-command-runner.md) for the exact foreground/process and source boundaries.
 

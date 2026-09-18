@@ -33,7 +33,7 @@ export interface ManagementClaim {
 }
 export interface ManagementRequest extends ManagementClaim {
 	createdAt: string;
-	state: "CLAIMED" | "PROPOSED" | "DEFERRED" | "DRIFT" | "ERROR" | "APPLIED" | "RECONCILED";
+	state: "CLAIMED" | "RECORDED" | "PROPOSED" | "DEFERRED" | "DRIFT" | "ERROR" | "APPLIED" | "RECONCILED";
 	result: ManagementResult | DecisionReceipt | null;
 	error: string | null;
 }

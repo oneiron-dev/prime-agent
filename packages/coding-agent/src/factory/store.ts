@@ -414,9 +414,10 @@ export class FactoryStore {
 		});
 	}
 	lastResumeSequence(): number {
-		return Number(
-			this.db.prepare("SELECT MAX(sequence) AS sequence FROM events WHERE kind='resumed'").get()?.sequence ?? 0,
-		);
+		const row = this.db
+			.prepare("SELECT sequence,detail FROM events WHERE kind='resumed' ORDER BY sequence DESC LIMIT 1")
+			.get();
+		return row ? Number(decode<Record<string, unknown>>(row.detail).catch_up_through ?? row.sequence) : 0;
 	}
 	repinRuntime(runtime: FactoryFilePin, reason: string): void {
 		required(reason, "runtime change reason");
@@ -428,9 +429,12 @@ export class FactoryStore {
 	}
 	pendingResumeRequests(): { id: string; actionId: string; state: string }[] {
 		return this.db
-			.prepare(`SELECT id,action_id,state FROM management_requests
-			WHERE state IN ('CLAIMED','RECORDED','PROPOSED','DRIFT','DEFERRED')
-			AND COALESCE(json_extract(result,'$.applied'),0)=0 ORDER BY rowid`)
+			.prepare(`SELECT r.id,r.action_id,r.state FROM management_requests r
+			JOIN actions a ON a.id=r.action_id LEFT JOIN wakes w ON w.id=r.wake_id
+			WHERE r.state IN ('CLAIMED','PROPOSED','DRIFT','DEFERRED')
+			AND a.state NOT IN ('ACCEPTED','REJECTED','WITHDRAWN')
+			AND w.resolved_at IS NULL
+			AND COALESCE(json_extract(r.result,'$.applied'),0)=0 ORDER BY r.rowid`)
 			.all()
 			.map((row) => ({ id: String(row.id), actionId: String(row.action_id), state: String(row.state) }));
 	}
@@ -438,9 +442,11 @@ export class FactoryStore {
 		this.transaction(() => {
 			if (idleActionId) {
 				this.event("idle_with_backlog", idleActionId, null, { counts: detail.counts });
-				this.db
-					.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
-					.run(idleActionId, `idle_with_backlog: ${JSON.stringify(detail.counts)}`, now());
+				const reason = `idle_with_backlog: ${JSON.stringify(detail.counts)}`;
+				if (this.openWakeIdForReason(reason) === undefined)
+					this.db
+						.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
+						.run(idleActionId, reason, now());
 			}
 			this.event("resumed", null, null, detail);
 		});
@@ -1390,7 +1396,7 @@ export class FactoryStore {
 			this.event("management_finished", null, null, { id, state, error });
 		});
 	}
-	/** Read complete history up to the sequence observed at entry, without the default page limit. */
+	/** Complete history is snapshot-bounded at entry, but unbounded in size. */
 	allEvents(afterSequence = 0): FactoryEvent[] {
 		const throughSequence = this.ledgerSequence();
 		const history: FactoryEvent[] = [];
@@ -1402,6 +1408,31 @@ export class FactoryStore {
 			if (!last || last.sequence >= throughSequence) return history;
 			cursor = last.sequence;
 		}
+	}
+	eventsOfKind(kind: string, afterSequence = 0): FactoryEvent[] {
+		if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) throw new Error("Invalid event range");
+		const throughSequence = this.ledgerSequence();
+		const query = this.db.prepare(
+			"SELECT * FROM events WHERE kind=? AND sequence>? AND sequence<=? ORDER BY sequence LIMIT 100",
+		);
+		const history: FactoryEvent[] = [];
+		let cursor = afterSequence;
+		for (;;) {
+			const page = query.all(kind, cursor, throughSequence).map((row) => this.eventRecord(row));
+			history.push(...page);
+			if (page.length < 100) return history;
+			cursor = page[page.length - 1].sequence;
+		}
+	}
+	private eventRecord(row: Row): FactoryEvent {
+		return {
+			sequence: Number(row.sequence),
+			at: String(row.at),
+			kind: String(row.kind),
+			actionId: row.action_id === null ? null : String(row.action_id),
+			attemptId: row.attempt_id === null ? null : String(row.attempt_id),
+			detail: decode<Record<string, unknown>>(row.detail),
+		};
 	}
 	events(afterSequence = 0, limit = 100): FactoryEvent[] {
 		if (
@@ -1415,14 +1446,7 @@ export class FactoryStore {
 		return this.db
 			.prepare("SELECT * FROM events WHERE sequence>? ORDER BY sequence LIMIT ?")
 			.all(afterSequence, limit)
-			.map((r) => ({
-				sequence: Number(r.sequence),
-				at: String(r.at),
-				kind: String(r.kind),
-				actionId: r.action_id === null ? null : String(r.action_id),
-				attemptId: r.attempt_id === null ? null : String(r.attempt_id),
-				detail: decode<Record<string, unknown>>(r.detail),
-			}));
+			.map((row) => this.eventRecord(row));
 	}
 	openWakeIdForReason(reason: string): number | undefined {
 		const row = this.db

@@ -315,13 +315,58 @@ describe("merge gate predicate", () => {
 		d.review.comment_id = null;
 		expect(mergeGatePredicate(d)).toEqual({ result: false, failing_clauses: ["review_comment_id"] });
 	});
-	test("accepts only an explicit waiver naming this candidate/review pair and retains failures", () => {
+	test("accepts only an explicit matching waiver for missing review and retains review failures", () => {
 		const d = decision("merge_gate_predicate");
-		d.owner_hold = true;
+		d.reviewed_head_is_tip = false;
+		d.review = { provider: null, status: "missing", bugs: null, rules: null, comment_id: null, head: "head" };
+		const failing_clauses = ["external_review_on_tip", "review_comment_id", "findings_resolved"];
+		expect(mergeGatePredicate(d)).toEqual({ result: false, failing_clauses });
 		d.owner_waiver = { scope: { candidate_head: "head", review_head: "head" }, record: "/owner/waiver" };
-		expect(mergeGatePredicate(d)).toEqual({ result: true, failing_clauses: ["no_owner_hold"] });
+		expect(mergeGatePredicate(d)).toEqual({ result: true, failing_clauses });
 		d.owner_waiver.scope.candidate_head = "old";
-		expect(mergeGatePredicate(d).result).toBe(false);
+		expect(mergeGatePredicate(d)).toEqual({ result: false, failing_clauses });
+		d.owner_waiver.scope.candidate_head = "head";
+		d.owner_waiver.scope.review_head = "old";
+		expect(mergeGatePredicate(d)).toEqual({ result: false, failing_clauses });
+		d.owner_waiver.scope.review_head = "head";
+		d.owner_waiver.record = " ";
+		expect(mergeGatePredicate(d)).toEqual({ result: false, failing_clauses });
+	});
+	test("waives stale review and unresolved findings only for the named candidate/review pair", () => {
+		const d = decision("merge_gate_predicate");
+		d.reviewed_head_is_tip = false;
+		d.review.head = "old";
+		d.review.bugs = 1;
+		d.review.rules = 1;
+		d.open_threads = [{ id: "finding", head: "old", resolved_by: null, covered_by_ticket_regression: null }];
+		d.owner_waiver = { scope: { candidate_head: "head", review_head: "old" }, record: "/owner/waiver" };
+		expect(mergeGatePredicate(d)).toEqual({
+			result: true,
+			failing_clauses: ["external_review_on_tip", "findings_resolved"],
+		});
+	});
+	test.each([true, null])("does not waive a live or unknown owner hold (%s)", (hold) => {
+		const d = decision("merge_gate_predicate");
+		d.owner_hold = hold;
+		d.owner_waiver = { scope: { candidate_head: "head", review_head: "head" }, record: "/owner/waiver" };
+		expect(mergeGatePredicate(d)).toEqual({ result: false, failing_clauses: ["no_owner_hold"] });
+	});
+	test.each([
+		{ signed: false, base_main_proof: "signed-base-proof" },
+		{ signed: true, base_main_proof: null },
+	])("does not waive failed provenance ($signed, $base_main_proof)", (provenance) => {
+		const d = decision("merge_gate_predicate");
+		d.provenance = provenance;
+		d.owner_waiver = { scope: { candidate_head: "head", review_head: "head" }, record: "/owner/waiver" };
+		expect(mergeGatePredicate(d)).toEqual({ result: false, failing_clauses: ["provenance_bound"] });
+	});
+	test.each(["missing", "failed", "stale"] as const)("does not waive %s checks", (checks) => {
+		const d = decision("merge_gate_predicate");
+		if (checks === "missing") d.gates = [];
+		else if (checks === "failed") d.gates[0].status = "red";
+		else d.gates[0].head = "old";
+		d.owner_waiver = { scope: { candidate_head: "head", review_head: "head" }, record: "/owner/waiver" };
+		expect(mergeGatePredicate(d)).toEqual({ result: false, failing_clauses: ["gates_on_tip"] });
 	});
 	test("never infers regression coverage or credits stale checks", () => {
 		const d = decision("merge_gate_predicate");
@@ -335,6 +380,26 @@ describe("merge gate predicate", () => {
 });
 
 describe("durable typed writer and dispatcher verb", () => {
+	test("retains a matching review waiver alongside a blocking hold in the journal and receipt", () => {
+		const f = fixture();
+		const d = { ...decision("merge_gate_predicate"), ledger_sequence: f.store.ledgerSequence() };
+		d.review.status = "missing";
+		d.owner_hold = true;
+		d.owner_waiver = { scope: { candidate_head: "head", review_head: "head" }, record: "/owner/waiver" };
+		const receipt = recordDecision(f.store, "a", d, { requestId: "held-waiver" });
+		expect(receipt.predicate).toEqual({
+			result: false,
+			failing_clauses: ["external_review_on_tip", "no_owner_hold"],
+		});
+		expect(receipt.decision).toEqual(d);
+		expect(f.store.eventsOfKind("decision")[0].detail).toMatchObject({
+			owner_waiver: d.owner_waiver,
+			predicate: receipt.predicate,
+		});
+		expect(JSON.parse(readFileSync(join(f.directory, "decisions/held-waiver/decision.json"), "utf8"))).toEqual(
+			receipt,
+		);
+	});
 	test.each(["inline", "file"] as const)("rejects an oversized %s object before recording", async (input) => {
 		const f = fixture();
 		const value = {
@@ -374,7 +439,7 @@ describe("durable typed writer and dispatcher verb", () => {
 			};
 			vi.spyOn(console, "log").mockImplementation(() => {});
 			await runFactoryCli(["decide-typed", f.directory, "a", type, "--object", JSON.stringify(value)]);
-			expect(f.store.allEvents().find((event) => event.kind === "decision")?.detail).toMatchObject({
+			expect(f.store.eventsOfKind("decision")[0]?.detail).toMatchObject({
 				decided_by: "code",
 				submitted_by: "advisor",
 			});
@@ -394,7 +459,7 @@ describe("durable typed writer and dispatcher verb", () => {
 		expect(apply).not.toHaveBeenCalled();
 		expect(receipt.applied).toBe(false);
 		expect(JSON.parse(readFileSync(join(f.directory, "decisions/drift/decision.json"), "utf8"))).toEqual(receipt);
-		expect(f.store.allEvents().find((e) => e.kind === "profile_drift")?.detail).toEqual({
+		expect(f.store.eventsOfKind("profile_drift")[0]?.detail).toEqual({
 			request_id: "drift",
 			requested_profile: "expected",
 			served_profile: "fallback",
@@ -448,11 +513,12 @@ describe("durable typed writer and dispatcher verb", () => {
 			});
 			expect(f.store.managementRequests()[0]).toMatchObject({ state: "DRIFT", error: null });
 			expect(f.store.actions()[0].state).toBe("AWAITING_DECISION");
-			expect(f.store.allEvents().some((e) => e.kind === "profile_drift")).toBe(true);
+			expect(f.store.eventsOfKind("profile_drift").length > 0).toBe(true);
 			const saved = JSON.parse(readFileSync(join(result.evidenceDirectory!, "decision.json"), "utf8"));
 			expect(saved.applied).toBe(false);
 			expect(saved.decision.served_profile).toBe("fallback");
 			expect(f.store.managementRequests()[0].result).toEqual(saved);
+			expect(result.typedDecision).toEqual(saved);
 		},
 	);
 	test("does not accept setter/SDK identity when response metadata is absent", async () => {
@@ -579,7 +645,7 @@ test("rolls back the ledger with only an unapplied file after a post-save journa
 	).toThrow("injected journal failure");
 	expect(f.store.isPaused()).toBe(false);
 	expect(f.store.typedDecisions()).toEqual([]);
-	expect(f.store.allEvents().some((e) => e.kind === "decision")).toBe(false);
+	expect(f.store.eventsOfKind("decision").length > 0).toBe(false);
 	expect(JSON.parse(readFileSync(join(f.directory, "decisions/rollback/decision.json"), "utf8")).applied).toBe(false);
 });
 
@@ -650,13 +716,8 @@ test.each([false, true])(
 		).toEqual(receipt);
 		expect(
 			f.store
-				.allEvents()
-				.some(
-					(e) =>
-						e.kind === "decision" &&
-						e.detail.applied === true &&
-						e.detail.source_request_id === applied.requestId,
-				),
+				.eventsOfKind("decision")
+				.some((e) => e.detail.applied === true && e.detail.source_request_id === applied.requestId),
 		).toBe(true);
 	},
 );

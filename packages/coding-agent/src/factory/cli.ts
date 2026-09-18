@@ -223,6 +223,11 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 					throw new Error("decide-typed requires action-id, type and --object <json-or-@file> [--apply]");
 				if (options.has("--apply") && engine.status().paused)
 					throw new Error("Factory is paused; decisions are blocked");
+				if (object.startsWith("@")) {
+					const info = statSync(object.slice(1));
+					if (!info.isFile()) throw new Error("--object @file requires a regular JSON file");
+					assertByteLimit("decision", info.size, FACTORY_EVIDENCE_LIMITS.packetBytes);
+				}
 				const value: unknown = object.startsWith("@") ? readFactoryJson(object.slice(1)) : JSON.parse(object);
 				assertByteLimit(
 					"decision",

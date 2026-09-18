@@ -303,7 +303,11 @@ export function mergeGatePredicate(d: DecisionOf<"merge_gate_predicate">): {
 		!!d.owner_waiver?.record.trim() &&
 		d.owner_waiver.scope.candidate_head === d.candidate_head &&
 		d.owner_waiver.scope.review_head === d.review.head;
-	return { result: failing_clauses.length === 0 || waived, failing_clauses };
+	const reviewClauses = ["external_review_on_tip", "review_comment_id", "findings_resolved"];
+	return {
+		result: failing_clauses.every((clause) => waived && reviewClauses.includes(clause)),
+		failing_clauses,
+	};
 }
 export function recordDecision(
 	store: FactoryStore,

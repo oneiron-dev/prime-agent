@@ -22,8 +22,10 @@ export const FACTORY_HELP = `Usage:
   prime factory decide <directory> <action-id> <accept|reject> --actor <actor> --reason <reason> --ref <evidence> [--expected-revision <revision>] [--expected-attempt <id>] [--expected-wake <id>]
 
 Factory mode is optional and runs separately from Prime sessions. State and results are JSON.
-New factories start paused. Resume checks the runtime pin, prints ledger catch-up/frontier, restores pending continuation artifacts and runs one tick.
-Resume never removes an external owner pause file or re-admits UNCERTAIN work; idle_with_backlog opens a wake and exits nonzero.
+New factories start paused. Resume checks the runtime pin, prints ledger catch-up, recomputes the frontier and runs one scheduling tick.
+Resume restores pending continuation artifacts but does not advance a coordinator turn or re-admit UNCERTAIN work.
+Resume exits 1 for an owner pause, an unaccepted runtime mismatch or idle_with_backlog; the latter opens a wake.
+Resume never removes an external owner pause file. --accept-runtime-change <reason> explicitly records a new controller runtime pin.
 run/serve stay in the foreground; SIGINT/SIGTERM persist a scheduling pause while detached attempts retain receipts; resume explicitly.
 Each configured host needs Python 3 on a POSIX system. Factory storage needs Node 22.13+ with node:sqlite.
 Hosts JSON: {"local":{"type":"local","runnerRoot":"/absolute/attempts"}}
@@ -37,7 +39,8 @@ settle-no-retry closes proven-dead UNCERTAIN work as ABANDONED with outcome UNKN
 supersede explicitly replaces rejected or abandoned work; it preserves history and does not accept the replacement or dependencies.
 withdraw closes never-claimed QUEUED/READY work as WITHDRAWN with NOT_EXECUTED; use withdraw --help for exact plan/owner/source bindings.
 Neither closure launches work or satisfies dependencies. Withdrawal refuses any attempt history; settlement is not product acceptance.
-decide-typed validates the question-set object and refuses stale ledger_sequence values; profile drift opens a wake and never applies.
+decide-typed validates the question-set object and refuses stale ledger_sequence values; @file is limited to 96 KiB before reading.
+Profile drift opens a wake and never applies. decide-typed and manage print the typed result before exiting 1 for drift.
 Typed --apply supports terminal acceptance of a decision action and operator-proven attempt requeue; other types are record-only.
 manage returns a proposal unless --apply is explicit; --watch opts into bounded automatic wake handling, separate from serve.
 manage --typed-object invokes Jev and the band advisor on a validated object; records only, then apply through decide-typed.
@@ -52,6 +55,7 @@ export const FACTORY_MANAGE_HELP = `Usage:
   prime-agent factory manage <directory> --watch [--role ticketOwner] [--apply] [--evidence-directory <directory>] [--max-requests <count>] [--max-passes <count>] [--interval-ms <milliseconds>]
 
 --typed-object records a Jev/advisor decision, never text management or automatic application; resolve DEFERRED via decide-typed.
+Profile drift prints the typed result and exits 1 without applying; this also sets the exit code for --watch.
 Reviews one wake by default; --watch consumes bound judgment wakes in a separate foreground process, never inside serve.
 Proposes unless --apply is explicit. A cached proposal can be applied without another model call. Defer/error preserves the wake and consumes that context.
 Automatic evidence: <directory>/management-evidence/<wake-id>.json, or --evidence-directory. See factory.md for the exact hash-validated envelope.

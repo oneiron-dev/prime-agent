@@ -156,9 +156,7 @@ test("serializes actual global mutations against CLAIMED and latest unresolved P
 		).kind,
 	).toBe("applied");
 	expect(other.applyPlan(changedPlan, 1, "next-stage")).toBe(2);
-	const event = f.store
-		.allEvents()
-		.find((item) => item.kind === "plan_applied" && item.detail.mutationId === "next-stage")!;
+	const event = f.store.eventsOfKind("plan_applied").find((item) => item.detail.mutationId === "next-stage")!;
 	expect(event.detail.previousRevision).toBe(1);
 	expect(event.detail.invalidatedWakeIds).toEqual(
 		f.store
@@ -291,11 +289,9 @@ test("handles proven no-submission recovery without fabricated output and permit
 	expect(f.store.actions()[0].state).toBe("ACCEPTED");
 	expect(f.store.attempts()).toHaveLength(4);
 	expect(f.store.managementRequests()).toHaveLength(1);
-	expect(
-		f.store
-			.allEvents()
-			.some((event) => event.kind === "management_reconciled" && event.detail.previousState === "CLAIMED"),
-	).toBe(true);
+	expect(f.store.eventsOfKind("management_reconciled").some((event) => event.detail.previousState === "CLAIMED")).toBe(
+		true,
+	);
 });
 
 test.each(["defer", "error"])(

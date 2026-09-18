@@ -406,7 +406,7 @@ export function validateOneironWriterReceipt(
 	);
 }
 
-/** Each call spawns a fresh foreground process; exclusive transcript creation prevents prior-attempt reuse. */
+/** Each call spawns a fresh foreground process; exclusive transcript creation prevents prior-attempt reuse. Foreground only. Retain bounded raw stdout on disk, including incomplete output on failure. */
 export function runOneironWriterForeground(
 	argv: string[],
 	cwd: string,

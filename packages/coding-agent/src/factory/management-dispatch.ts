@@ -314,6 +314,7 @@ export async function manageFactoryWake(
 						admitted: true,
 						requestId: claim.id,
 						evidenceDirectory: output,
+						typedDecision,
 						wakeId,
 						requestedProfile: typedDecision.decision.requested_profile,
 						servedProfile: typedDecision.decision.served_profile,

@@ -848,7 +848,7 @@ describe("durable Oneiron continuation", () => {
 		expect(f.verifyRebind).toHaveBeenCalledTimes(1);
 		expect(readFileSync(join(f.workspace, "source.txt"), "utf8")).toContain("repaired");
 		expect(f.store.attempts()).toHaveLength(7);
-		expect(f.store.allEvents().filter((event) => event.kind === "action_decided")).toHaveLength(7);
+		expect(f.store.eventsOfKind("action_decided")).toHaveLength(7);
 		expect(f.store.status().planRevision).toBe(7);
 		const db = new DatabaseSync(join(f.factoryDirectory, "factory.db"), { readOnly: true });
 		expect(db.prepare("SELECT COUNT(*) AS n FROM oneiron_continuation_bindings").get()?.n).toBe(7);
@@ -1230,7 +1230,7 @@ describe("durable Oneiron continuation", () => {
 		f.restart();
 		expect((await f.continuation.step()).reason).toContain("Recovered exact committed");
 		expect(f.store.actions()[0].state).toBe("REJECTED");
-		expect(f.store.allEvents().filter((event) => event.kind === "action_decided")).toHaveLength(1);
+		expect(f.store.eventsOfKind("action_decided")).toHaveLength(1);
 		expect(f.coordinatorLaunches).toHaveBeenCalledTimes(1);
 	});
 
