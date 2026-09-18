@@ -1,0 +1,1 @@
+- Fixed duplicate harness-digest delivery after resuming a remotely compacted session.

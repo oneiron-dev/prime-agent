@@ -31,6 +31,16 @@ import {
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("daemon protocol helpers", () => {
+	it("capability-gates queued abort without changing legacy abort", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.abort_and_send_queued).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 30,
+			capability: "abort_and_send_queued",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("abort_and_send_queued");
+		expect(DAEMON_COMMAND_COMPATIBILITY.abort).toEqual({ minProtocol: 7 });
+	});
+
 	it("serializes worker descriptors as identity-only version 2 state", () => {
 		const descriptor = {
 			version: 1,

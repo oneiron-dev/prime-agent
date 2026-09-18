@@ -71,12 +71,14 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 23 lets workers query the supervisor agent roster on demand.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds capability-gated direct worker peer transport discovery.
-// Revision 26 adds stable-target follow-up addressing in the fork and usage totals upstream.
-// Revision 27 combines capability-gated stable targets with optional own-session usage totals.
-// Revision 28 adds capability-gated deadlines and request-scoped attachment cancellation.
-// Revision 29 combines attachment deadlines with recovery errors and saved-session models.
-export const DAEMON_SCHEMA_REVISION = 29;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-29-ecca1b51cd60";
+// Revision 26 adds stable-target follow-ups in the fork and own-session usage totals upstream.
+// Revision 27 combines both in the fork; upstream adds structured session_recovering errors.
+// Revision 28 adds attachment deadlines/cancellation in the fork and saved-session models upstream.
+// Fork revision 29 combines targeting, attachment cancellation, recovery errors, and saved-session models.
+// Upstream revision 29 adds abort_and_send_queued; its tip also includes update_restarting errors.
+// Revision 30 is the union of fork revision 29 with upstream queued abort and update_restarting errors.
+export const DAEMON_SCHEMA_REVISION = 30;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-d314044e0463";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -131,7 +133,8 @@ export type DaemonServerCapability =
 	// rather than silently downgraded to an active-id-only request.
 	| "stable_target_follow_up"
 	| "direct_peer_transport"
-	| "attach_cancellation";
+	| "attach_cancellation"
+	| "abort_and_send_queued";
 
 /**
  * Durable coordinates of a follow-up target.
@@ -210,6 +213,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"acp_mcp_servers",
 	"stable_target_follow_up",
 	"attach_cancellation",
+	"abort_and_send_queued",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -583,6 +587,7 @@ export type DaemonCommand =
 	| { id?: string; type: "agent_messages_resume"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_clear"; activeSessionId: string }
 	| { id?: string; type: "abort"; activeSessionId: string }
+	| { id?: string; type: "abort_and_send_queued"; activeSessionId: string }
 	| {
 			id?: string;
 			type: "start_side_question";
@@ -873,6 +878,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
 	agent_messages_clear: LEGACY_DAEMON_COMMAND,
 	abort: LEGACY_DAEMON_COMMAND,
+	abort_and_send_queued: { minProtocol: 7, minSchemaRevision: 30, capability: "abort_and_send_queued" },
 	start_side_question: LEGACY_DAEMON_COMMAND,
 	abort_side_question: LEGACY_DAEMON_COMMAND,
 	execute_bash: LEGACY_DAEMON_COMMAND,
@@ -992,6 +998,7 @@ export const DAEMON_COMMAND_PLANE = {
 	agent_messages_resume: "control",
 	agent_messages_clear: "control",
 	abort: "session",
+	abort_and_send_queued: "session",
 	start_side_question: "session",
 	abort_side_question: "session",
 	execute_bash: "session",
@@ -1135,6 +1142,7 @@ export type DaemonErrorInfo =
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
 	| { code: "session_recovering"; activeSessionId: string }
+	| { code: "update_restarting" }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId }
 	| {
 			code: "stable_follow_up_target";

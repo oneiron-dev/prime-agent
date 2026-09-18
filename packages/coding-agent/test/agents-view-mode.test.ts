@@ -18,6 +18,7 @@ import {
 	combineAgentsViewStartupNotices,
 	createInitialAgentsViewPersistentState,
 	runAgentsViewMode,
+	waitThroughDaemonUpdateRestart,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import * as agentsViewState from "../src/modes/agents-view/agents-view-state.js";
 import {
@@ -31,6 +32,9 @@ import {
 	resolveAgentsViewLeftResult,
 	type UnifiedSessionRecord,
 } from "../src/modes/agents-view/agents-view-state.js";
+import type * as DaemonClientModule from "../src/modes/daemon/daemon-client.js";
+import { DaemonSessionRecoveringError, DaemonUpdateRestartingError } from "../src/modes/daemon/daemon-errors.js";
+import { DaemonControlPlaneTransportError } from "../src/modes/daemon/daemon-routed-client.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import * as savedSessionCatalog from "../src/modes/daemon/saved-session-catalog.js";
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
@@ -50,14 +54,17 @@ vi.mock("../src/config.js", async (importOriginal) => {
 	return { ...actual, appendRotatingLog: vi.fn() };
 });
 
-vi.mock("../src/modes/daemon/daemon-client.js", () => ({
-	DaemonClient: class {
-		connect = vi.fn(async () => undefined);
-		close = vi.fn();
-		request = modeMocks.clientRequest;
-	},
-	getDaemonSocketCloseReason: vi.fn(),
-}));
+vi.mock("../src/modes/daemon/daemon-client.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof DaemonClientModule>();
+	return {
+		...actual,
+		DaemonClient: class {
+			connect = vi.fn(async () => undefined);
+			close = vi.fn();
+			request = modeMocks.clientRequest;
+		},
+	};
+});
 
 vi.mock("../src/modes/agent-connection/daemon-agent-connection.js", () => ({
 	DaemonAgentConnection: Object.assign(function DaemonAgentConnection() {}, {
@@ -2834,5 +2841,121 @@ describe("Agents View durable operation recovery", () => {
 		Object.setPrototypeOf(self, AgentsViewMode.prototype);
 		invoke("finish", self, { type: "exit" });
 		expect(self.persistentState.pendingAgentsViewStateOperations).toHaveLength(1);
+	});
+});
+
+describe("agents view open during a daemon update restart", () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	it.each([
+		[
+			"waits through the update restart and surfaces the wait notice",
+			true,
+			"Waited for the Prime Agent daemon update restart to finish",
+		],
+		[
+			"surfaces a permanent create failure unmasked by the wait",
+			false,
+			"Failed to open agent: File not found: /tmp/scope.jsonl",
+		],
+	] as const)("%s", async (_name, reachesSession, expectedMessage) => {
+		const saved = summary({ activeSessionId: undefined, lifecycle: "archived" });
+		let runs = 0;
+		vi.spyOn(AgentsViewMode.prototype, "run").mockImplementation(async function (this: AgentsViewMode) {
+			runs += 1;
+			if (runs === 1) return { type: "open", summary: saved, hasChildren: false };
+			expect(String(Reflect.get(this, "persistentState").statusMessage)).toContain(expectedMessage);
+			return { type: "exit" };
+		});
+		modeMocks.clientRequest
+			.mockResolvedValueOnce({
+				success: false,
+				error: "Daemon is preparing an update restart",
+			})
+			.mockResolvedValueOnce(
+				reachesSession
+					? { success: true, data: { ...saved, activeSessionId: "resumed-after-update", lifecycle: "live" } }
+					: { success: false, error: "File not found: /tmp/scope.jsonl" },
+			);
+		modeMocks.interactiveRun.mockResolvedValue({
+			type: "agents_view",
+			source: { activeSessionId: "resumed-after-update", sessionId: saved.sessionId, cwd: saved.cwd },
+		} as never);
+
+		await runAgentsViewMode({
+			config: { cwd: process.cwd() },
+			socketPath: "/tmp/agents-view-test.sock",
+			uiServices: createUiServices(),
+		});
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledTimes(2);
+		expect(modeMocks.interactiveRun).toHaveBeenCalledTimes(reachesSession ? 1 : 0);
+		expect(runs).toBe(2);
+	});
+});
+
+describe("waitThroughDaemonUpdateRestart", () => {
+	const updateRestartDeadline =
+		/The Prime Agent daemon did not finish its update restart within \d+ seconds\. Try opening this agent again once the update finishes\. Last error: Daemon is preparing an update restart/;
+
+	// Post-arm transient shapes only; arming is pinned at the loop/deadline layers.
+	it("retries every restart-transient failure and reports that it waited", async () => {
+		const transientFailures = [
+			() => new Error("Failed to connect to the Prime Agent daemon: connect ENOENT"),
+			() => Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }),
+			() => new Error("Connection to the Prime Agent daemon closed."),
+			() => new Error('Timed out after 30000ms waiting for the Prime Agent daemon response to "create".'),
+			() => new DaemonControlPlaneTransportError(new Error("Connection to the Prime Agent daemon closed.")),
+			() => new Error("Unknown active session: update-restart-session"),
+			() => new DaemonSessionRecoveringError("update-restart-session"),
+		];
+		let attempts = 0;
+		const outcome = await waitThroughDaemonUpdateRestart(
+			async () => {
+				attempts += 1;
+				if (attempts === 1) throw new DaemonUpdateRestartingError();
+				const failure = transientFailures[attempts - 2];
+				if (failure) throw failure();
+				return "opened";
+			},
+			{ waitMs: 5_000, retryMs: 1 },
+		);
+		expect(outcome).toEqual({ result: "opened", waitedForUpdateRestart: true });
+	});
+
+	it("propagates a non-update failure before any update-restart signal", async () => {
+		let attempts = 0;
+		await expect(
+			waitThroughDaemonUpdateRestart(async () => {
+				attempts += 1;
+				throw new Error("spawn EMFILE");
+			}),
+		).rejects.toThrow("spawn EMFILE");
+		expect(attempts).toBe(1);
+	});
+
+	// The deadline races every attempt so an in-flight create cannot hold the open past the budget.
+	it("fails at the deadline even when an in-flight attempt would block past it", async () => {
+		vi.useFakeTimers();
+		const inFlight = new Promise<string>(() => {});
+		let attempts = 0;
+		try {
+			const opening = waitThroughDaemonUpdateRestart(
+				async () => {
+					attempts += 1;
+					if (attempts === 1) throw new DaemonUpdateRestartingError();
+					return inFlight;
+				},
+				{ waitMs: 60, retryMs: 5 },
+			).then(
+				() => "unexpectedly opened",
+				(error: Error) => error.message,
+			);
+			await vi.advanceTimersByTimeAsync(60);
+			expect(await opening).toMatch(updateRestartDeadline);
+			expect(attempts).toBe(2);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
