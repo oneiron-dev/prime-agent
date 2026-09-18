@@ -1,168 +1,80 @@
-# Oneiron factory project adapter
+# Oneiron ticket loop
 
-For the current explicit OAuth-only Astra writer profile, automatic transport provenance, shared runtime pins and reconciled retries, see [Oneiron writer policy](factory-oneiron-writer.md). That policy governs new routine writer actions; historical receipts remain unchanged.
+The factory is a DAG launcher; this adapter is the one command it launches per ticket stage. There is no dispatcher seat, no permit, no custody record and no typed decision. Tests are the only gate. Every seat prompt carries the same three sentences on initiative, so the passivity fix lives in words, not in checks.
 
-This is a preparation-stage adapter, not another scheduler. The portable factory still owns dependencies, capacity claims, process supervision, receipts and decision wakes. No Oneiron policy was added to the portable engine.
+## The loop
 
-The accepted September 5 policy replaces the routine Opus writer with `cpa-r/gpt-6-astra` at `xhigh`. The normal independent-review route is completed Qodo/Codex review. Grok is conditional, not a mandatory double pass. Historical Opus/Grok receipts and findings remain unchanged.
+`factory launch` reads the ticket DAG (`w7-manifest.json`: tickets with `blocked_by`) and the contracts (`mint-plan.json`: `creates[]` with `contract` and `acceptance`) and imports two actions per ticket:
 
-## Commands and preparation
+- `<key>:submit` depends on every blocker's `submit`. It cuts a worktree, has Muse write the context pack, runs one Astra xhigh writer until it says `DONE <key>`, runs the tests of the touched crates, reviews the head by tier, publishes, requests CodeRabbit, waits bounded for Qodo and Codex, and runs a fresh writer round over every bot comment.
+- `<key>:merge` depends on `<key>:submit` and every blocker's `merge`. It waits for the blockers, syncs the native stack or squash-merges the lone pull request under one merge mutex, and removes the worktree.
 
-Run from `packages/coding-agent` in the source checkout's existing environment:
+There is no lane cap: every ready action launches in the same tick. Only cargo runs queue, on the four build slots, and only merges serialize.
 
-```sh
-node --import tsx src/factory/adapters/oneiron-entry.ts help
-node --import tsx src/factory/adapters/oneiron-entry.ts inspect /absolute/manifest.json
-node --import tsx src/factory/adapters/oneiron-entry.ts prepare /absolute/manifest.json /absolute/options.json
-```
+### The worktree
 
-`inspect`, `prepare` and `bind` only read local files and print JSON. They do not open/import the factory journal, query GitHub, invoke a model, run Cargo, clear pauses or transfer custody. A pending-transfer manifest can be prepared while both pauses remain set. Printing an action is not admission or authorization. Save the output only in an explicit preparation/report directory, never over production state.
+`git worktree add -B w7/<key> <work>/wt/<key> <base>` after `git fetch origin`. The base is `origin/main`, or the blocker's branch when exactly one blocker is unmerged and submitted; then `gh stack init --base main <chain...> w7/<key>` adopts the chain in this worktree, so the chain is a native GitHub stack. With two or more unmerged blockers the runner waits until at most one remains. `.w7/` is excluded from git; it holds the pack.
 
-`OneironManifest` in `src/factory/adapters/oneiron.ts` is the exact schema. Every evidence pin is `{path:absolutePath,sha256:64hex}`. Pins verify the actual file bytes. A minimal review continuation is:
+### The pack
 
-```json
-{
-  "version": 1,
-  "ticketId": "ONE-1914",
-  "owner": "pending-transfer/factory-owner",
-  "source": {
-    "workspace": "/absolute/canonical/published-worktree",
-    "head": "FULL_40_HEX_HEAD",
-    "tree": "FULL_40_HEX_TREE",
-    "branch": "HEAD",
-    "remoteUrl": "git@github.com:oneiron-dev/oneiron.git",
-    "fingerprint": "git:FACTORY_NATIVE_64_HEX_FINGERPRINT"
-  },
-  "factoryDirectory": "/absolute/factory",
-  "ownerPauseFile": "/absolute/OWNER-TRUST-PAUSE.json",
-  "custody": {"path":"/absolute/audit.json","sha256":"SHA256"},
-  "outputDirectory": "/absolute/new-stage-output",
-  "stage": {
-    "kind": "triage",
-    "repo": "oneiron-dev/oneiron",
-    "pr": 855,
-    "base": "main",
-    "corpus": {"path":"/absolute/corpus.json","sha256":"SHA256"},
-    "priorFindings": {"path":"/absolute/prior-findings.json","sha256":"SHA256"},
-    "evidence": [{"path":"/absolute/review-context.json","sha256":"SHA256"}]
-  }
-}
-```
+Muse (`cpa-r/muse-spark-1.3-contributor`, thinking `max`) reads the docs mirror, `impl-notes/` and the worktree and returns the pack as its final message; the runner writes it to `.w7/CONTEXT.md`. The prompt says: "Docs might be stale. Implementation notes live in impl-notes/. Read them too when gathering context."
 
-The capitals above describe required identities, not runnable example values. `prepare` rejects missing/invalid identities. Use `prime-agent factory fingerprint` for the source fingerprint. A legacy workspace patch CAS is not interchangeable with that fingerprint. A detached `branch: "HEAD"` is valid for read-only triage/collection and deterministic gates. Writer and readiness stages require an attached, isolated feature branch, not `HEAD`, `main` or `master`.
+### The writer
 
-Preparation options have concrete `manifestPath`, `adapterArgv`, `permitPath`, `host`, `slotId` and optional `dependencies`. The CLI supplies `manifestPath` from its argument. `adapterArgv` is the exact Node executable, `--import`, absolute installed `tsx` loader, and absolute `oneiron-entry.ts` path. Remote hosts must have the same explicitly staged source/adapter/evidence files available at their bound paths. This adapter does not copy worktrees or install runtimes.
+Astra (`cpa-r/gpt-6-astra`, thinking `xhigh`) through prime-agent print mode with the owned frontend, one session continued with `-c` until the final message contains `DONE <key>` (at most `writerRounds`, default 12). `BLOCKED <key>` fails the stage. The system prompt carries the seat policy sentence ("Use cpa-r/muse-spark-1.3-contributor with thinking max for context-gathering RLM subagents, never Astra; an Astra xhigh child only for a genuinely hard sub-task."), the initiative sentences and the writer rules (one coherent implementation, the smallest falsifying test, a plan is not work, do the whole contract, never edit the docs repo, notes in `impl-notes/<ticket>.md`, no attribution lines). A `SPLIT: <what remains>` line in the final message is written to `split.json`; `serve` imports it as one follow-up ticket `<key>-split` blocked by `<key>`. The machine never judges size.
 
-`prepareOneiron` returns one `decision` action for the requested remaining stage. Its argv binds the original manifest byte hash. It has a finite deadline: 30 minutes for the writer, 60 minutes for a gate, five minutes otherwise. An exact matching `completed` stage receipt returns `action: null` and a reuse pointer. A process exit is never product acceptance.
+### Tests
 
-## Execution fences
+`cargo test --no-fail-fast -p <crate>...` for every crate under `crates/` touched since the base, with `CARGO_TARGET_DIR=<work>/target/<key>` and `CARGO_BUILD_JOBS`. The run takes one of `buildSlots` pid-lock files under `<work>/build-slots/` and waits while free space is under `diskFloorGiB`. A run that reports zero tests is not a pass. A failure gets one fix round by a fresh writer session, then the tests again; a second failure rejects the stage.
 
-Only after an explicit owner resume and transfer procedure:
+### Review by tier
+
+The tier comes from the ticket (`tier`: one/bots, two, three), else from routing: a touched seam (custody, auth, persistence, migration, crypto, concurrency, abi, public_api by path) forces both reviewers; otherwise Jev decides above the band, the Grok advisor takes the band, and a size default answers when neither is reachable. Tier two is Grok 4.6 xhigh; tier three is Grok plus Opus xhigh in parallel; tier one runs no reviewer. Each reviewer reads the diff once and answers `VERDICT: LANDABLE` or `VERDICT: DEFECTS`. An unavailable reviewer is recorded and skipped, never a blocker. Defects get one fix round, tests again, then the reviewers once more on the new head unless routing calls the delta trivial. A second DEFECTS verdict is recorded in the pull request body; it does not loop. Routing answers land in `routing.jsonl`.
+
+### Publication
+
+A lone ticket: `git push -u origin w7/<key>`, `gh pr create --base main`, an existing open pull request is reused. A stacked ticket: `gh stack submit --auto --open --remote origin`, then `gh pr edit` sets the title and body. The body is the writer's `PR BODY:` section plus contract, acceptance, row, tier and verdicts; attribution lines are stripped from it. Commit messages are scanned for attribution and the hits are logged in `state.json`. No raw force push happens in this stage.
+
+### Bots
+
+One `gh pr comment <pr> --body "@coderabbitai review"`; a failed request is recorded and ignored. The runner then polls `gh api` every minute for up to `botsMs` (default 45 minutes) until Qodo and Codex have each posted a substantive review on the head or a not-completed notice (skipped, rate-limited, processing). Every bot comment on the pull request, from every bot, then goes unfiltered to a fresh writer session, which fixes what is real, replies on each inline thread with `gh api .../replies`, and posts one summary comment. If the head moved, the tests run again and the branch is pushed (`gh stack push` for a stack).
+
+### Merge
+
+After every blocker's `merge` accepted: for a stack, `gh stack sync` then `gh stack merge --squash --yes`; a sync conflict gets one fix round (the writer rebases and resolves, then tests) and one more sync. For a lone pull request, `gh pr merge --squash --subject <key>: <title> --body-file PR-BODY.md`; a merge failure gets one fix round (rebase onto `origin/main`, tests) followed by `git push --force-with-lease` and one more merge. Merges on one host serialize through `<work>/merge-lock/`. A pull request GitHub already reports as merged is accepted as merged.
+
+## Files
+
+- `launcher.json` (passed to `factory launch`, stored in `config.json`): `host` (a configured factory host), `repo` (the engine checkout that owns the worktrees), `docs` (optional docs mirror), `work` (worktrees, targets, ticket directories), `remote` (`origin`), `trunk` (`main`), `githubRepo` (`owner/name`, else derived from the remote URL), `buildSlots` (4), `cargoJobs` (4), `diskFloorGiB` (100), `seats` (`writer`, `pack`, `grok`, `opus`: `{provider, model, thinking}` for prime-agent, or `{command: [...]}` for any executable that takes the prompt as its last argument), `timeouts` (`seatMs` 1 h, `testMs` 40 min, `ghMs` 5 min, `botsMs` 45 min, `writerRounds` 12).
+- `<work>/tickets/<key>/ticket.json`: the ticket run the launcher wrote (contract, acceptance, tier, blockers, launcher settings).
+- `<work>/tickets/<key>/state.json`: base, stack chain, writer final text, tests, review tier and verdicts, pull request, bots, bot round, merged, failure.
+- `<work>/tickets/<key>/run.log`, `logs/` (seat streams, cargo, gh), `routing.jsonl`, `split.json`, `PR-BODY.md`.
+- `<work>/wt/<key>`: the worktree; `<work>/target/<key>`: its cargo target.
+
+Routing reads `TYPESAFE_JEV_API_KEY` (and optional `TYPESAFE_JEV_URL`), `FACTORY_ADVISOR_BASE_URL`, `FACTORY_ADVISOR_API_KEY`, `FACTORY_ADVISOR_MODEL` from the runner's environment. Bearer keys only travel to HTTPS or private HTTP endpoints. Seat children never receive those keys.
+
+## Running one ticket
 
 ```sh
-node --import tsx src/factory/adapters/oneiron-entry.ts execute /absolute/manifest.json /absolute/permit.json MANIFEST_SHA256 --execute
+# once per host: a factory with one local host
+echo '{"arch":{"type":"local","runnerRoot":"/home/lexi/w7-build/attempts"}}' > hosts.json
+echo '{"version":1,"tickets":[],"slots":[],"actions":[]}' > empty-plan.json
+prime-agent factory init /home/lexi/w7-build/factory empty-plan.json --hosts hosts.json
+
+# the DAG and the contracts, from the wave pack
+prime-agent factory launch /home/lexi/w7-build/factory w7-manifest.json mint-plan.json --launcher launcher.json
+
+# catch up from the ledger, unpause, one tick; then keep scheduling
+prime-agent factory resume /home/lexi/w7-build/factory
+prime-agent factory serve /home/lexi/w7-build/factory
 ```
 
-Normally the existing factory command runner invokes this command. Do not launch it as a detached shell job or create a second scheduler. Its foreground descendants must finish before it exits. The factory timeout applies to the whole inherited process group. This is not arbitrary-process containment: deliberately daemonized descendants are unsupported. The writer prompt prohibits detached work, delegation, scheduling, commits, publication and Cargo; the adapter does not claim a sandbox against a writer that ignores that contract.
-
-The separate permit must have `version:1`, `permission:"execute"`, exact `manifestSha256`, `ticketId`, `stage`, `sourceFingerprint`, `custodySha256`, `owner`, future `expiresAt`, and a pinned `ownerAuthorization` artifact. This is an operator-controlled authorization record, not a cryptographic owner signature.
-
-Execution additionally requires a pinned custody record with:
-
-- `version:1`, `state:"transferred"`, exact `ticketId`, `owner`, `sourceFingerprint`, and future `expiresAt`.
-- `activeOwners:[owner]`, `liveProcesses:[]`, `duplicateAuthorityDisabled:true`, and `sharedGitClear:true`.
-- Nonempty `priorOwners:[{id,release:{path,sha256}}]` covering the audited old authority. The activation operator must verify complete membership against the custody audit; a list is not a fresh process census by itself.
-
-The external owner fence must be absent and `prime-agent factory status` must report both local and external pauses clear. The manifest/permit cannot clear either pause. Source checks verify canonical workspace, HEAD, tree, branch, remote and full factory fingerprint before effects and verify the output separately. The native modeled-triage caller repeats local/external pause and authorization checks immediately before inference, after credential resolution.
-
-Output directories must be outside the product worktree and exclusively new. The adapter never recycles a directory with an interrupted intent. Preserve it and reconcile custody through the factory; a missing terminal receipt is not permission to rerun.
-
-## Supported stages
-
-| Stage | Primitive and acceptance boundary |
-| --- | --- |
-| `triage` | One bounded Astra `low` call through the existing Prime management caller. Returns structured item dispositions, evidence refs and preserved material obligations. This completes triage, not the product. |
-| `writer` | Foreground `prime-agent --print --mode json --offline --provider cpa-r --model gpt-6-astra --thinking xhigh --session-dir ...`. Requires exactly one of a prior same-source material triage receipt (repair) or a sealed step contract whose text the pinned prompt carries verbatim (implementation). Validates completed assistant model events. Records SDK model identity, not independent gateway wire identity. Output always needs explicit source rebind. |
-| `gate` | Runs the hash-pinned existing host Cargo slot wrapper with its real `--slot --workspace --receipt -- argv` interface. Requires fresh exact-command resource/global-duplicate admission evidence, wrapper success and provenance, plus unchanged full source. Linux slots 1–4, MacBook 1–6, Mini 1–2. Existing wrapper limits, targets and locks remain authoritative. |
-| `collect` | Runs the existing hash-pinned `fetch-github-bot-corpus.py` through `oneiron-corpus-foreground.py`. Reuses its full pagination/normalization/receipt logic. Collecting a corpus does not complete review or accept findings. |
-| `review-acceptance` | Requires exact-source gate receipts, completed substantive Qodo **and** Codex coverage, complete modeled triage and no unresolved finding. Emits eligibility for a separate factory decision; it never merges. |
-| `publish-update` | One existing PR, one natively tracked feature branch, signed clean fast-forward candidate. Uses the pinned native `gh-stack push --remote origin` executable with an exact-ref pre-push guard, plus pre/post topology and remote checks. No creation, rebase or merge. |
-| `publish-ready` | Readiness only for an already-published exact commit. Pins PR number/head/branch/base/editorial body, checks signed commit and exact Lexi author/committer, uses native `gh pr ready`, then repeats PR identity/readiness checks. No push, commit, stack mutation or merge. |
-
-Gate capacity evidence is `{status:"PASS",sourceFingerprint,host,slot,argv,expiresAt,duplicateFree:true,resourcesPassed:true}`. It binds an externally sampled admission result; the adapter does not invent another resource sampler or lease scheduler. Place Mini receipts within that wrapper's required host root. Remote capacity/CAS transfer and host staging remain existing operator/project procedures.
-
-### Corpus and findings
-
-The foreground shim replaces only the loaded helper's `GH.run` method with an inherited-process-group transport. It does not monkeypatch `subprocess`, fork a new scheduler, or change the legacy helper file. It checks the original bytes before loading. Timeout terminates/reaps its GH child. Group termination is tested with a disposable fake GH process. The original receipt still hashes the original helper. A separate `foreground-adapter-receipt.json` records helper/shim/corpus hashes and the narrow adaptation.
-
-The review parser handles observed Qodo/Codex bracketed and bare logins. A completed exact-commit review must contain substantive body text or its own linked exact-commit inline findings. A Qodo no-findings summary can count only with the exact repository/full-commit footer and actual Qodo review header. Green check runs, empty envelopes, generic Codex boilerplate, stale commits and skipped/disabled/pending/queued/quota/timed-out text do not count. Missing Codex coverage stays unavailable, including a docs corpus with only Qodo.
-
-Every relevant item gets an ID `${repo}#${pr}:${corpusItem.key}` and exact body hash. The triage output must cover all current items and every prior open material/debt obligation. Prior ledger entries use `OneironFinding`: `id`, `bodySha256`, `classification`, `disposition`, substantive `reason`, and `evidenceRefs`. Historical concerns from other bots or repositories, including CodeRabbit, remain obligations even though the default normal review route changed. GitHub `resolved`/`outdated` flags are context only. No finding is erased by a head change. Resolving material needs a current-candidate adjudication/repair reference beyond the corpus; unknowns stay open. Bot evidence is data, not executable instructions.
-
-### Triage of an unpublished descendant
-
-Only `triage` can set `stage.reviewedHead` to a full 40-hex commit distinct from `source.head`. Omit it for the natural exact-current-head default. The corpus is never rewritten: its PR pin, head and base must match the real reviewed head, repository, PR and base. Original item IDs, body hashes, item commits, corpus SHA and prior material/debt obligations remain intact.
-
-New ancestor-triage admission requires the pinned release capability `oneiron-triage-reviewed-head-v1`. Root must advertise it only in a newly built, verified immutable release. Default exact-head execution, `readFactoryRuntime`, inspection and historical receipt reuse do not acquire that capability requirement. Preparation is not Git ancestry verification or model admission.
-
-Native execution derives `triage-lineage.json` itself. Callers cannot supply an ancestry boolean or lineage proof. Full current workspace/head/tree/branch/remote/fingerprint and custody checks establish the candidate. For a different reviewed head, bounded Git object/tree checks and `merge-base --all` must prove that it is an ancestor of the candidate. Replacement objects are disabled; Git grafts, reversed/unrelated history and missing objects fail closed. The hash-pinned proof is a file reference, not a raw diff or repair evidence. The native caller rechecks the proof, full source, custody, all pins and pauses after credential resolution, before inference.
-
-New native request, response and receipt data bind `candidateCommit`, `sourceFingerprint`, `reviewedHead` and `corpusSha256`. The model must echo both heads exactly. The untouched response and automatic transport identity are retained before response validation, including failures. The receipt output remains the full current candidate source. The writer's existing full-source triage guard is unchanged; an old-source triage receipt still cannot authorize a writer on a new candidate.
-
-Old-corpus completed reviewers appear only in `historicalCompletedReviewers`. Current `completedReviewers` is empty and both current Qodo/Codex completion gaps remain explicit. This does not relax review acceptance or publication: `reviewedHead` is rejected on those stages, exact-current-head corpus and full real green gates are still required. Triage completion is not approval and cannot waive a failed gate. Operator-origin prerequisite findings belong in the prior material/debt ledger and bounded current evidence, never fabricated bot items. All existing evidence, packet, raw-stream, line and output caps and Astra effort/routing rules remain unchanged.
-
-### Binding a terminal wake
-
-After the stage terminates, obtain a fresh read-only `factory status` snapshot. Bind its action/wake/attempt/revision to the exact receipt:
-
-```sh
-node --import tsx src/factory/adapters/oneiron-entry.ts bind /absolute/manifest.json /absolute/status.json /absolute/stage-output/receipt.json ACTION_ID
-```
-
-Save that JSON as `<evidence-directory>/<wakeId>.json` for the separate bounded management watcher. The binder checks the prepared command's original manifest hash, custody pin, stage contract, current successful terminal attempt and full output identity. It includes a UTF-8 hash for the substantive evidence snapshot. It never calls a model or applies a decision. Generating/storing this binding remains an explicit deterministic operator step; there is no automatic project artifact watcher in this adapter.
-
-The factory manager accepts or rejects the **stage** against its criteria. Acceptance of triage with open material findings means the triage is complete and the findings require repair. It does not mean review settlement, code acceptance or permission to publish. The caller must prepare a new, evidence-based stage/action after that result.
-
-## Scope limits and canary
-
-The prepared ONE-1914 canary begins at frozen-corpus triage. It must not restart the H2 implementation or falsely credit dirty-H2 gates against its published commit. Existing engine/docs work, historical full-lib RED, six finding clusters, old owners and source/custody records remain preserved. The production factory stays empty and paused during preparation.
-
-This adapter is **not** a fully autonomous writer-to-merge workflow. It does not commit writer output, replan after a new head, stage remote workspaces, request fresh bot reviews, create native tracking/topology, publish multi-PR stacks, or merge. It does support a controlled one-existing-PR repair-head update once the operator binds a signed clean candidate and native tracking. After repair, an operator must bind/commit the authorized output through the existing project workflow, run affected exact-source gates, publish that exact repair head, and collect relevant independent review. Do not credit old reviews as current coverage; carry their unresolved findings forward.
-
-### One-existing-PR repair publication
-
-Native publication help and the installed source were inspected. `cmd/push.go` refreshes remote-tracking refs just before its explicit per-branch lease push. A precheck alone is therefore **not** strict old-head CAS. The command-scoped `oneiron-push-guard.py` rejects that widened grant: Git must advertise exactly the sealed old head on exactly one matching feature ref. The native explicit lease then protects the race after the hook. The guard never pushes.
-
-`publish-update` extends the readiness fields with `expectedRemoteHead`, pinned `pushGuard`, pinned `nativeTool`, and pinned `dependencyAudit`. It requires exact-source gate receipts but does not require completed new-head bot review before publishing the new head for review. It records `requiresCurrentHeadReview:true`, never semantic acceptance or merge.
-
-`nativeTool` is a pinned provenance JSON: `{executable:{path,sha256},version,sources:[{path,sha256}],explicitPerBranchLease:true,refreshesTrackingBeforePush:true}`. The adapter invokes that exact native extension executable (`--version`, `view --json`, `push --remote origin`), rather than a PATH-dependent substitute. The source/version receipt is operator-verified build provenance, not a reproducible-build attestation. `dependencyAudit` is `{repo,pr,branch,expectedRemoteHead,candidateHead,noUnknownDependents:true,expiresAt}` and must be fresh.
-
-The update requires all of the following:
-
-- Exactly one natively tracked active/current branch, one existing open PR, pinned trunk, no queued/merged branch and no rebase requirement.
-- Clean bound candidate, fast-forward ancestry from the expected remote head, signed commits over the entire exclusive range, and Lexi author/committer with product-only messages.
-- Exact live PR head/base/branch/editorial identity, exact remote-tracking and advertised remote head, an unprotected feature branch, and no unknown dependents.
-- No executable non-`.sample` Git hooks in the resolved existing hook directory. This includes `pre-push` and `reference-transaction`. Intentional hooks require explicit integration, not silent replacement.
-- No inherited command-scoped `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*` or `GIT_CONFIG_PARAMETERS`. Incompatible inherited settings are rejected, not dropped. Other environment/config values remain intact.
-- A hash-bound pre-push descriptor that denies wrong remotes/refs/heads, creation/deletion, protected branches, extra updates and owner/local pause. The hook runs in the factory process group.
-- Native view and PR/remote checks after push. A partial/error result preserves the intent directory and requires reconciliation; it is never blindly retried.
-
-The operator protocol after owner release is explicit:
-
-1. Reconcile the isolated repair worktree and signed commit with the intended feature ref. Do not modify the detached published canary workspace just to satisfy writer setup. Bind the new source and run affected gates.
-2. If local native tracking is absent, verify exactly one existing feature branch/PR and use the supported `gh stack init --base main w6/one-1914` in that authorized worktree. This is a separate explicit operator mutation. Do not run it during preparation. Never fabricate a remote multi-PR stack from branch names.
-3. Read `gh stack view --json` and the existing PR. Seal the exact one-branch topology, signed candidate, old remote head, current dependency audit and native executable/source receipt. The adapter checks these again at execution.
-4. Prepare/authorize `publish-update`. The adapter uses the pinned native extension's `push --remote origin` with the scoped guard, then verifies the new remote head. Run `publish-ready` separately if that already-published head is still a draft.
-5. Collect the new exact-head corpus, retain previous material findings, triage and repair. Missing/pending/skipped bots are not completed. A ready PR or pushed commit is not merge permission.
-
-The same one-PR protocol applies separately to docs PR457 in its own repository. Engine PR855 plus docs PR457 is not one native cross-repository stack. For a real multi-PR stack the existing native command is `gh stack submit --auto --open`, with `gh stack view --json` before/after and full-stack editorial/identity validation. There is no `--yes` on submit. That broader operation remains outside this adapter.
+`status` shows `<key>:submit` and `<key>:merge` per ticket. A rejected stage leaves `state.json` with `failure`; fix the cause, then `supersede` it with a replacement action or `resolve` an uncertain attempt. Restart after a crash with `resume` then `serve`; a live runner is reattached, a finished one is read from its receipt, and a running ticket resumes from its `state.json` steps.
 
 ## Tests
 
-Run only focused tests from the package root, using the existing project dependencies:
-
 ```sh
-node --import tsx ../../node_modules/vitest/dist/cli.js --run test/factory-oneiron-review.test.ts test/factory-oneiron.test.ts test/factory-oneiron-corpus.test.ts test/factory-oneiron-publication.test.ts
+node --import tsx ../../node_modules/vitest/dist/cli.js --run test/factory-oneiron-ticket.test.ts test/factory-launcher.test.ts test/factory-routing.test.ts test/factory-oneiron-review.test.ts
 ```
 
-Tests mock model, Cargo and GitHub effects. They include exact identity/pause/custody/review gates, stage success, inherited-group helper timeout/forced-stop proof, a real factory command-runner/journal with a mocked triage model, and observed PR855 review-shape regression. Fixtures are disposable and do not touch the live Wave factory or product worktrees.
+The runner test uses a real git repository with a local bare remote, fake `gh` and `cargo` executables on `PATH`, and a fake seat command; it runs one ticket from worktree to merge and stacks a child on its submitted parent. No model, GitHub or cargo call happens.

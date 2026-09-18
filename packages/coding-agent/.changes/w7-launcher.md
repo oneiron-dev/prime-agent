@@ -1,0 +1,6 @@
+- Changed factory mode into a DAG launcher: an action is one foreground command, exit 0 accepts it, and the ledger keeps tickets, dependencies, slots, attempts, events and wakes.
+- Removed factory management, typed decisions, cost receipts, the coordinator continuation, the Oneiron stage adapter, permits, custody records and the docs gate.
+- Changed the factory runtime pin into a journaled log line at resume; nothing refuses a worker for a changed runtime.
+- Added `factory launch`, which reads the ticket DAG and contracts and imports a submit and a merge action per ticket, and split follow-up import in `serve`.
+- Added the Oneiron ticket runner: worktree, Muse context pack, Astra writer until DONE, touched-crate tests under four build slots, tiered review, native stack or squash publication, CodeRabbit request, bounded Qodo and Codex wait, and a bot-comment writer round.
+- Added routing that asks Jev, then the Grok advisor, for the review tier and the trivial-fix call, with a deterministic default and no refusal.

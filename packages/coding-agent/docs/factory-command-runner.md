@@ -27,9 +27,9 @@ Host keys must match plan slot hosts. SSH uses existing configuration and batch 
 
 `init <directory> <plan.json> --hosts <hosts.json>` writes `config.json` and `factory.db` in a new, explicit directory and starts paused. Keep runner roots outside source worktrees.
 
-`resume <directory>` checks the controller runtime pin, prints and saves ledger catch-up, recomputes the frontier and runs one scheduling tick. It restores pending continuation artifacts without advancing a coordinator turn. It does not re-admit UNCERTAIN attempts. Resume is not a bare unpause; start `run` or `serve` afterward only for continuous scheduling.
+`resume <directory>` prints and saves the ledger catch-up, recomputes the frontier, unpauses and runs one scheduling tick. It does not re-admit UNCERTAIN attempts. Start `run` or `serve` afterward for continuous scheduling.
 
-Resume exits with code 1 for an external owner pause, an unaccepted runtime mismatch, or `idle_with_backlog` (READY actions remain with none RUNNING after the tick). The idle case records a wake. Use `--accept-runtime-change <reason>` only for an intentional runtime replacement; it journals a new controller pin without rewriting action runtime requirements.
+Resume exits with code 1 for an external owner pause or `idle_with_backlog` (READY actions remain with none RUNNING after the tick). The idle case records a wake. A changed installed runtime is journaled as `runtime_changed` and never refused.
 
 An optional absolute `--pause-file` blocks every dispatch while that file exists. `resume` cannot remove or override it. `pause` stops future dispatch; already started commands keep running. SIGINT/SIGTERM or loss of the launching CLI persist a local scheduling pause. Resume explicitly after restarting to catch up from the journal and attempt one tick, not just clear that pause.
 
@@ -49,6 +49,6 @@ Optional `command.timeoutMs` sends TERM and then KILL to the command process gro
 
 When such a command finishes, its receipt preserves the submitted input fingerprint and records a separate output artifact fingerprint. Opaque fingerprints are labels only and require an explicitly validating wrapper for source formats other than Git.
 
-Process exit is distinct from semantic acceptance. A `decision` action waits for an evidence-backed decision even after exit zero. `manage` runs a model in a separate process and proposes a decision; `--apply` is explicit. Role configuration belongs in the plan, with Astra low for ticket ownership and xhigh/max for escalations.
+Exit 0 accepts the action and readies its dependents; any other exit rejects it and opens a wake. The command itself carries whatever test is the gate.
 
 Use `factory help` for the JSON command interface. `events --after <sequence>` pages the durable journal. Plan imports preserve existing attempts; rejected actions can be explicitly superseded with a replacement and an evidence reference.
