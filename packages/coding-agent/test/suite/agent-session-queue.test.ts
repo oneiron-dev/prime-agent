@@ -12,6 +12,7 @@ import {
 	createAgentSessionMessagePrompt,
 } from "../../src/core/agent-messages.js";
 import { type AgentCronJob, shouldDeferHeartbeatCronJob } from "../../src/core/cron-jobs.js";
+import type { HostRequestHandlers } from "../../src/core/kernel/index.js";
 import {
 	createSessionSlashCommandMessage,
 	HARNESS_DIGEST_PREFIX,
@@ -115,6 +116,43 @@ function heartbeatJob(): AgentCronJob {
 const skipReviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
 
 describe("AgentSession queue characterization", () => {
+	it("ENG-5991: interrupt delivers every queued steering message in one new turn and stays abort-only at the edges", async () => {
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = await createWaitingHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("queued handled"),
+			fauxAssistantMessage("injected handled"),
+			fauxAssistantMessage("later handled"),
+		]);
+		await waitForToolStart;
+		await harness.session.steer("first");
+		const handlers = (
+			harness.session as unknown as { _createKernelHostHandlers(): HostRequestHandlers }
+		)._createKernelHostHandlers();
+		await handlers["bash.completed"]!({ pid: 42, command: "echo queued", exitCode: 0 });
+		await harness.session.steer("second");
+		expect(harness.session.abortAndSendQueued()).toBe(true);
+		await harness.session.steer("later", undefined, { priority: "background" });
+		releaseToolExecution();
+		await Promise.all([promptPromise, harness.session.waitForIdle()]);
+		expect(getUserTexts(harness)).toEqual(["start", "first", "second", "later"]);
+		expect(getAssistantTexts(harness)).toEqual(["", "queued handled", "injected handled", "later handled"]);
+		expect(harness.session.steeringMode).toBe("one-at-a-time");
+		await harness.session.followUp("follow-up boundary");
+		expect(harness.session.abortAndSendQueued()).toBe(false);
+		expect(harness.session.getFollowUpMessages()).toEqual(["follow-up boundary"]);
+		harness.session.clearQueue();
+		harness.session.resumeQueuedWork();
+		await harness.session.steer("queued for restart");
+		harness.session.abortForUpdateRestart();
+		expect(harness.session.abortAndSendQueued()).toBe(false);
+		expect(harness.session.getSteeringMessages()).toEqual(["queued for restart"]);
+		await expect(
+			harness.session.sendCustomMessage({ customType: "g", content: "t", display: false }, { triggerTurn: true }),
+		).rejects.toThrow("queued session input is suspended");
+	});
+
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {

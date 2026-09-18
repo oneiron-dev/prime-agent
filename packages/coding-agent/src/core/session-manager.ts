@@ -172,6 +172,8 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	usage?: Usage;
 	/** Harness digest snapshot taken at compaction time; rendered before the summary in LLM context. */
 	harnessDigest?: string;
+	/** Fingerprint of the harness state behind `harnessDigest` at compaction time; lets cold boundaries skip re-delivery. */
+	harnessStateFingerprint?: string;
 }
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
@@ -690,7 +692,13 @@ export function buildSessionContext(
 
 		if (compaction.mechanism === "remote" && compaction.remoteCompaction) {
 			if (compaction.harnessDigest)
-				messages.push(createHarnessDigestMessage(compaction.harnessDigest, Date.parse(compaction.timestamp)));
+				messages.push(
+					createHarnessDigestMessage(
+						compaction.harnessDigest,
+						Date.parse(compaction.timestamp),
+						compaction.harnessStateFingerprint,
+					),
+				);
 			messages.push(createRemoteCompactionMessage(compaction.remoteCompaction, compaction.timestamp));
 		} else {
 			messages.push(
@@ -701,6 +709,7 @@ export function buildSessionContext(
 					compaction.customInstructions,
 					retainedMessages.length,
 					compaction.harnessDigest,
+					compaction.harnessStateFingerprint,
 				),
 			);
 		}
@@ -2041,6 +2050,7 @@ export class SessionManager {
 		metadata?: CompactionMetadata,
 		usage?: Usage,
 		harnessDigest?: string,
+		harnessStateFingerprint?: string,
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -2056,6 +2066,7 @@ export class SessionManager {
 			...metadata,
 			usage,
 			harnessDigest,
+			harnessStateFingerprint,
 		};
 		this._appendEntry(entry);
 		return entry.id;

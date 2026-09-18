@@ -141,7 +141,11 @@ function truncateForSummary(text: string, maxChars: number): string {
  *
  * Tool results are truncated to keep the summarization request within
  * reasonable token budgets. Full content is not needed for summarization.
+ *
+ * Tool calls are serialized with a sequential `#N` prefix and results repeat
+ * the matching index, so repeated calls of the same tool pair unambiguously.
  */
+
 const TOOL_ARGUMENT_MAX_CHARS = 2_000;
 const ORDINARY_MESSAGE_MAX_CHARS = 64 * 1024;
 
@@ -151,8 +155,12 @@ function boundedText(text: string, maxChars: number): string {
 	return `${text.slice(0, kept)}\n\n[... ${text.length - kept * 2} characters elided ...]\n\n${text.slice(-kept)}`;
 }
 
-/** Serialize one message. Tool inputs and outputs are bounded independently. */
-function serializeMessageForSummary(msg: Message, bounded = false): string | undefined {
+interface SummaryToolContext {
+	indices: Map<string, number>;
+	nextIndex: number;
+}
+
+function serializeMessageForSummary(msg: Message, bounded: boolean, tools: SummaryToolContext): string | undefined {
 	if (msg.role === "user") {
 		const content =
 			typeof msg.content === "string"
@@ -164,19 +172,29 @@ function serializeMessageForSummary(msg: Message, bounded = false): string | und
 		return content ? `[User]: ${bounded ? boundedText(content, ORDINARY_MESSAGE_MAX_CHARS) : content}` : undefined;
 	}
 	if (msg.role === "assistant") {
-		const parts: string[] = [];
+		const textParts: string[] = [];
+		const thinkingParts: string[] = [];
+		const toolCalls: string[] = [];
 		for (const block of msg.content) {
-			if (block.type === "text")
-				parts.push(`[Assistant]: ${bounded ? boundedText(block.text, ORDINARY_MESSAGE_MAX_CHARS) : block.text}`);
-			else if (block.type === "thinking")
-				parts.push(
-					`[Assistant thinking]: ${bounded ? boundedText(block.thinking, ORDINARY_MESSAGE_MAX_CHARS) : block.thinking}`,
-				);
-			else if (block.type === "toolCall")
-				parts.push(
-					`[Assistant tool call]: ${block.name}(${boundedText(JSON.stringify(block.arguments), TOOL_ARGUMENT_MAX_CHARS)})`,
-				);
+			if (block.type === "text") textParts.push(block.text);
+			else if (block.type === "thinking") thinkingParts.push(block.thinking);
+			else if (block.type === "toolCall") {
+				const args = Object.entries(block.arguments)
+					.map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+					.join(", ");
+				tools.nextIndex += 1;
+				tools.indices.set(block.id, tools.nextIndex);
+				toolCalls.push(`#${tools.nextIndex} ${block.name}(${boundedText(args, TOOL_ARGUMENT_MAX_CHARS)})`);
+			}
 		}
+		const parts: string[] = [];
+		const thinking = thinkingParts.join("\n");
+		const text = textParts.join("\n");
+		if (thinkingParts.length)
+			parts.push(`[Assistant thinking]: ${bounded ? boundedText(thinking, ORDINARY_MESSAGE_MAX_CHARS) : thinking}`);
+		if (textParts.length)
+			parts.push(`[Assistant]: ${bounded ? boundedText(text, ORDINARY_MESSAGE_MAX_CHARS) : text}`);
+		if (toolCalls.length) parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
 		return parts.join("\n") || undefined;
 	}
 	if (msg.role === "toolResult") {
@@ -184,23 +202,23 @@ function serializeMessageForSummary(msg: Message, bounded = false): string | und
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
 			.map((c) => c.text)
 			.join("");
-		return content ? `[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}` : undefined;
+		if (!content) return undefined;
+		const index = tools.indices.get(msg.toolCallId);
+		const indexSuffix = index === undefined ? "" : ` #${index}`;
+		const status = msg.isError ? ", error" : "";
+		return `[Tool result (${msg.toolName}${status})${indexSuffix}]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`;
 	}
 	return undefined;
 }
 
-/** Serialize messages into a bounded, non-conversational transcript. */
 export function serializeConversation(messages: Message[]): string {
+	const tools: SummaryToolContext = { indices: new Map(), nextIndex: 0 };
 	return messages
-		.map((message) => serializeMessageForSummary(message))
-		.filter((part): part is string => Boolean(part))
+		.map((message) => serializeMessageForSummary(message, false, tools))
+		.filter(Boolean)
 		.join("\n\n");
 }
 
-/**
- * Split a transcript only between complete messages. Oversized individual messages
- * are deterministically elided, so a provider request can never exceed its byte cap.
- */
 export function splitConversationForSummary(
 	messages: Message[],
 	maxBytes: number,
@@ -208,9 +226,10 @@ export function splitConversationForSummary(
 ): string[] {
 	if (maxBytes <= 0) throw new Error("Summary byte budget must be positive");
 	const chunks: string[] = [];
+	const tools: SummaryToolContext = { indices: new Map(), nextIndex: 0 };
 	let chunk = "";
 	for (const message of messages) {
-		let part = serializeMessageForSummary(message, true);
+		let part = serializeMessageForSummary(message, true, tools);
 		if (!part) continue;
 		if (Buffer.byteLength(part, "utf8") > maxBytes) {
 			part = `[Elided oversized ${message.role} message: ${Buffer.byteLength(part, "utf8")} UTF-8 bytes]`;

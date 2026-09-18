@@ -143,6 +143,16 @@ function fixture(): { entries: SessionEntry[]; compaction: CompactionEntry } {
 }
 
 describe("remote compaction session replay", () => {
+	it("retains harness state identity before a restored remote checkpoint", () => {
+		const { entries, compaction } = fixture();
+		compaction.harnessDigest = "retained harness state";
+		compaction.harnessStateFingerprint = "stable-state";
+		expect(buildSessionContext(entries).messages[0]).toMatchObject({
+			role: "custom",
+			details: { digest: "retained harness state", stateFingerprint: "stable-state" },
+		});
+	});
+
 	it("round-trips opaque items exactly and keeps tool call/result boundaries", () => {
 		const { entries } = fixture();
 		const fileEntries = parseSessionEntries(

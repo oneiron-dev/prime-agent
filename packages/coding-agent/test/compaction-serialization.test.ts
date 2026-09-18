@@ -27,7 +27,7 @@ describe("serializeConversation", () => {
 
 		const result = serializeConversation(messages);
 
-		expect(result).toContain("[Tool result]:");
+		expect(result).toContain("[Tool result (ipython)]:");
 		// The head (setup/output context) survives...
 		expect(result).toContain(head);
 		// ...the tail survives (errors and log tails live at the end)...
@@ -36,7 +36,7 @@ describe("serializeConversation", () => {
 		expect(result).toContain("[... 3069 characters truncated; first 1431 and last 500 kept ...]");
 		expect(result).not.toContain("B".repeat(10));
 		// ...and the truncated result stays within the summary budget.
-		expect(result.length).toBeLessThanOrEqual("[Tool result]: ".length + 2000);
+		expect(result.length).toBeLessThanOrEqual("[Tool result (ipython)]: ".length + 2000);
 	});
 
 	it("should not truncate short tool results", () => {
@@ -54,7 +54,7 @@ describe("serializeConversation", () => {
 
 		const result = serializeConversation(messages);
 
-		expect(result).toBe(`[Tool result]: ${shortContent}`);
+		expect(result).toBe(`[Tool result (ipython)]: ${shortContent}`);
 		expect(result).not.toContain("truncated");
 	});
 

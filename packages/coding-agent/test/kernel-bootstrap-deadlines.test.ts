@@ -1,8 +1,9 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_RLM_EXTRA_UV_ARGS, ensureKernelPython, resolveRuntimeIdentity } from "../src/core/kernel/bootstrap.js";
 
 let tempDir = "";
@@ -177,17 +178,61 @@ describe("kernel bootstrap deadlines", () => {
 		await until(() => recordedPids().every((pid) => !running(pid)));
 	});
 
-	it("bounds the total setup across individually successful import checks", async () => {
-		const python = join(tempDir, "python");
-		executable(python, trackedProgram("setTimeout(() => process.exit(0), 80);"));
-		process.env.PRIME_AGENT_KERNEL_PYTHON = python;
-
-		await expect(
-			ensureKernelPython({ onProgress: silent, timeouts: { ...timeouts, validationMs: 2_000, totalMs: 400 } }),
-		).rejects.toThrow("kernel setup timed out");
-
-		expect(recordedPids().length).toBeGreaterThan(1);
-		await until(() => recordedPids().every((pid) => !running(pid)));
+	it("bounds total setup after a successful import check while another is pending", async () => {
+		const sockets = new Set<Socket>();
+		let connected = 0;
+		let secondStarted!: () => void;
+		const ready = new Promise<void>((resolve) => {
+			secondStarted = resolve;
+		});
+		const server = createServer((socket) => {
+			sockets.add(socket);
+			socket.once("close", () => sockets.delete(socket));
+			connected += 1;
+			if (connected === 1) socket.end("complete");
+			else secondStarted();
+		});
+		const controller = new AbortController();
+		try {
+			await new Promise<void>((resolve, reject) => {
+				server.once("error", reject);
+				server.listen(0, "127.0.0.1", resolve);
+			});
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Missing fixture address");
+			const python = join(tempDir, "python");
+			executable(
+				python,
+				trackedProgram(
+					`const socket = require('node:net').connect(${address.port}, '127.0.0.1'); socket.on('data', () => process.exit(0));`,
+				),
+			);
+			process.env.PRIME_AGENT_KERNEL_PYTHON = python;
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			const outcome = ensureKernelPython({
+				onProgress: silent,
+				signal: controller.signal,
+				timeouts: { ...timeouts, validationMs: 2_000, totalMs: 400 },
+			}).then(
+				() => "unexpected success",
+				(error: Error) => error.message,
+			);
+			await Promise.race([
+				ready,
+				outcome.then((message) => {
+					throw new Error(message);
+				}),
+			]);
+			await vi.advanceTimersByTimeAsync(400);
+			controller.abort(new Error("total deadline did not fire"));
+			expect(await outcome).toContain("kernel setup timed out");
+			expect(connected).toBe(2);
+		} finally {
+			controller.abort();
+			vi.useRealTimers();
+			for (const socket of sockets) socket.destroy();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
 	});
 
 	it("revalidates a previously completed environment instead of caching success", async () => {
