@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { TextDecoder } from "node:util";
+import { type FactoryUsage, readFactoryUsage } from "../usage.js";
 import type { OneironPin } from "./oneiron-review.js";
 
 export const ONEIRON_TRANSPORT_LIMITS = Object.freeze({
@@ -14,6 +15,7 @@ export const ONEIRON_TRANSPORT_LIMITS = Object.freeze({
 });
 
 export interface OneironTransportMessage {
+	usage?: FactoryUsage;
 	provider?: string;
 	model?: string;
 	responseId?: string;
@@ -150,6 +152,8 @@ export function readOneironTransport(path: string, expectedSha256?: string): One
 			bound(`metadata[${key}]Bytes`, Buffer.byteLength(value), ONEIRON_TRANSPORT_LIMITS.metadataStringBytes);
 			message[key] = value;
 		}
+		const usage = readFactoryUsage(source.usage);
+		if (usage) message.usage = usage;
 		derivedBytes += Buffer.byteLength(JSON.stringify(message)) + (messages.length > 0 ? 1 : 0);
 		bound("derivedBytes", derivedBytes, ONEIRON_TRANSPORT_LIMITS.derivedBytes);
 		messages.push(message);

@@ -76,6 +76,41 @@ function proposal(overrides: Record<string, unknown> = {}): string {
 }
 
 describe("factory management boundary", () => {
+	test("records normalized call cost and elapsed time using only the served model", async () => {
+		const clock = vi.spyOn(performance, "now").mockReturnValueOnce(100).mockReturnValueOnce(137);
+		try {
+			const input = status();
+			const result = await proposeManagementDecision(
+				createManagementPacket(input),
+				input.roles!.ticketOwner,
+				async () => ({
+					text: proposal(),
+					model: "configured",
+					responseModel: "openai/gpt-4o",
+					responseModelSource: "provider-response",
+					usage: {
+						input: 1_000_000,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 1_000_000,
+						cost: { total: 999 },
+					},
+				}),
+			);
+			expect(result).toMatchObject({ accounting: { calls: 1, priced: true, cost_usd: 2.5 }, wall_clock_ms: 37 });
+			expect(result.accounting.usage).toEqual({
+				input: 1_000_000,
+				output: 0,
+				cache_read: 0,
+				cache_write: 0,
+				total: 1_000_000,
+			});
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
 	test("builds a compact wake without unrelated ticket histories", () => {
 		const input = status();
 		input.actions.push({ ...input.actions[0], id: "unrelated", state: "READY" });
@@ -247,7 +282,11 @@ describe("factory management boundary", () => {
 			input.roles!.ticketOwner,
 			async (_system, _packet, profile) => {
 				calls++;
-				return { text: proposal(), model: profile.model, usage: { output: 1 } };
+				return {
+					text: proposal(),
+					model: profile.model,
+					usage: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 1 },
+				};
 			},
 		);
 		expect(calls).toBe(1);

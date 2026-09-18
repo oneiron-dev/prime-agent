@@ -52,6 +52,41 @@ afterEach(() => {
 });
 
 describe("bounded file-backed native transport provenance", () => {
+	describe("fixed token usage tuple", () => {
+		const usage = { input: 10, output: 4, cacheRead: 3, cacheWrite: 2, totalTokens: 19 };
+		test.each([-1, 1.5, Number.MAX_SAFE_INTEGER + 1, "4", null, true, {}, []])(
+			"rejects invalid numeric value %j",
+			(value) => {
+				const f = setup();
+				for (const key of Object.keys(usage)) {
+					f.write(ended({ usage: { ...usage, [key]: value } }));
+					expect(() => readOneironTransport(f.path)).toThrow(/Token usage/);
+				}
+			},
+		);
+		test("retains only five bounded numbers and counts them against derivedBytes", () => {
+			const f = setup();
+			const raw = { ...usage, cost: { total: 999 }, extra: "x".repeat(10000) };
+			f.write(ended({ usage: raw }));
+			const parsed = readOneironTransport(f.path);
+			expect(parsed.messages[0].usage).toEqual({ input: 10, output: 4, cache_read: 3, cache_write: 2, total: 19 });
+			expect(JSON.stringify(parsed)).not.toContain("extra");
+			expect(JSON.stringify(parsed)).not.toContain("cost");
+			const message = ended({ usage: raw, responseId: "x".repeat(1024), responseModel: "y".repeat(1024) });
+			f.write(`${message}\n`.repeat(128));
+			expect(() => readOneironTransport(f.path)).toThrow(/derivedBytes=.*exceeds limit=262144/);
+		});
+		test("rejects missing, infinite, and non-object usage without coercion", () => {
+			const f = setup();
+			for (const value of [null, [], "usage", { input: 0 }]) {
+				f.write(ended({ usage: value }));
+				expect(() => readOneironTransport(f.path)).toThrow(/usage/);
+			}
+			f.write(ended({ usage }).replace('"input":10', '"input":1e999'));
+			expect(() => readOneironTransport(f.path)).toThrow(/Token usage/);
+		});
+	});
+
 	test("streams and hashes more than 39 MiB of repetitive snapshots but retains only completed metadata", () => {
 		const f = setup();
 		const update = `${JSON.stringify({ type: "message_update", message: { role: "assistant", model: "spoofed-snapshot", responseId: "not-completed", content: [{ type: "text", text: "x".repeat(64 * 1024) }] } })}\n`;

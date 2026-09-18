@@ -1,6 +1,7 @@
 import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getModel, getModels, getProviders } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, test } from "vitest";
 import type { OneironManifest } from "../src/factory/adapters/oneiron.js";
 import { readOneironPin } from "../src/factory/adapters/oneiron.js";
@@ -8,6 +9,8 @@ import { type OneironPin, oneironSha } from "../src/factory/adapters/oneiron-rev
 import { readOneironTransport, verifyOneironArtifact } from "../src/factory/adapters/oneiron-transport.js";
 import {
 	defaultOneironWriterProfile,
+	FACTORY_MODEL_PRICES,
+	FACTORY_PRICE_OVERRIDES,
 	type OneironWriterProfile,
 	type OneironWriterRetry,
 	type OneironWriterStage,
@@ -98,6 +101,91 @@ afterEach(() => {
 });
 
 describe("explicit pinned writer profile and factory model capture", () => {
+	test("rolls up each priced response, cache categories, and explicit registry overrides", () => {
+		const f = setup();
+		const usage = {
+			input: 1_000_000,
+			output: 2_000_000,
+			cacheRead: 3_000_000,
+			cacheWrite: 4_000_000,
+			totalTokens: 10_000_000,
+		};
+		const summarize = (models: string[]) =>
+			summarizeOneironWriter(
+				f.manifest,
+				f.stage,
+				f.profile,
+				f.transport(
+					models
+						.map((model, index) =>
+							f.event(model, {
+								usage,
+								responseId: `r${index}`,
+								stopReason: index === models.length - 1 ? "stop" : "toolUse",
+							}),
+						)
+						.join("\n"),
+				),
+				"sha",
+			);
+		for (const provider of getProviders())
+			for (const model of getModels(provider))
+				expect(FACTORY_MODEL_PRICES.get(`${provider}/${model.id}`)).toEqual(model.cost);
+		const prices = getModel("openai", "gpt-4o").cost;
+		const expected = prices.input + 2 * prices.output + 3 * prices.cacheRead + 4 * prices.cacheWrite;
+		const resolved = summarize(["openai/gpt-4o", "openai/gpt-4o"]);
+		expect(resolved.calls).toBe(2);
+		expect(resolved.cost_usd).toBe(expected * 2);
+		expect(resolved.priced).toBe(true);
+		expect(resolved.usage).toEqual({
+			input: 2_000_000,
+			output: 4_000_000,
+			cache_read: 6_000_000,
+			cache_write: 8_000_000,
+			total: 20_000_000,
+		});
+		expect(resolved.observations.map((item) => item.cost_usd)).toEqual([expected, expected]);
+		expect(FACTORY_MODEL_PRICES.has("not-in-registry")).toBe(false);
+		const unresolved = summarize(["openai/gpt-4o", "not-in-registry"]);
+		expect(unresolved.cost_usd).toBeNull();
+		expect(unresolved.priced).toBe(false);
+		expect(unresolved.usage).toEqual(resolved.usage);
+		expect(FACTORY_PRICE_OVERRIDES.size).toBe(0);
+		FACTORY_PRICE_OVERRIDES.set("not-in-registry", { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 });
+		try {
+			const overridden = summarize(["not-in-registry"]);
+			expect(overridden.cost_usd).toBe(30);
+			expect(overridden.priced).toBe(true);
+			expect(overridden.identityAccepted).toBe(false);
+		} finally {
+			FACTORY_PRICE_OVERRIDES.clear();
+		}
+	});
+	test("does not turn missing usage into a free call or price an unqualified identity", () => {
+		const f = setup();
+		const result = summarizeOneironWriter(
+			f.manifest,
+			f.stage,
+			f.profile,
+			f.transport(f.event("openai/gpt-4o")),
+			"sha",
+		);
+		expect(result).toMatchObject({ calls: 1, usage: null, cost_usd: null, priced: false });
+		const unknown = summarizeOneironWriter(
+			f.manifest,
+			f.stage,
+			f.profile,
+			f.transport(
+				f.event("openai/gpt-4o", {
+					responseModelSource: undefined,
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+				}),
+			),
+			"sha",
+		);
+		expect(unknown).toMatchObject({ cost_usd: null, priced: false });
+	});
+
 	test("default is direct OAuth Astra xhigh and rejects undeployed legacy Fable profiles", () => {
 		const f = setup();
 		expect(f.profile.requested).toEqual({ provider: "cpa-r", model: "gpt-6-astra", effort: "xhigh" });

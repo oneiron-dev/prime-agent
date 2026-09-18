@@ -1,13 +1,17 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { factoryArguments, supportsFactoryRuntime } from "../src/cli/factory-launch.js";
+import type { FactoryCostReport } from "../src/factory/cost.js";
+import { FactoryEngine } from "../src/factory/engine.js";
 import { FACTORY_EVIDENCE_LIMITS } from "../src/factory/evidence.js";
+import type { ManagementPacket } from "../src/factory/management.js";
+import { manageFactoryWake } from "../src/factory/management-dispatch.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { FactoryPlan, FactoryStatus } from "../src/factory/types.js";
 
@@ -74,6 +78,218 @@ afterEach(() => {
 });
 
 describe("optional factory CLI", () => {
+	it("reports two tickets and two seats from ledger and receipts without writes or double counting", async () => {
+		const f = setup("decision");
+		const plan = JSON.parse(readFileSync(f.planPath, "utf8")) as FactoryPlan;
+		plan.tickets.push({ id: "other-ticket", owner: "owner" });
+		const usage = { input: 10, output: 5, cache_read: 2, cache_write: 1, total: 18 };
+		const receiptPaths: string[] = [];
+		for (const [index, ticket] of plan.tickets.entries()) {
+			const outputDirectory = join(f.root, `output-${index}`);
+			mkdirSync(outputDirectory);
+			const manifestPath = join(f.root, `manifest-${index}.json`);
+			const manifest = JSON.stringify({ ticketId: ticket.id, stage: { kind: "writer" }, outputDirectory });
+			const sha = createHash("sha256").update(manifest).digest("hex");
+			writeFileSync(manifestPath, manifest);
+			const action = {
+				...plan.actions[0],
+				id: `action-${index}`,
+				ticketId: ticket.id,
+				command: { cwd: f.root, argv: ["execute", manifestPath, "permit", sha, "--execute"] },
+			};
+			if (index === 0) plan.actions[0] = action;
+			else plan.actions.push(action);
+			const path = join(outputDirectory, "receipt.json");
+			receiptPaths.push(path);
+			writeFileSync(
+				path,
+				JSON.stringify({
+					ticketId: ticket.id,
+					manifestSha256: sha,
+					result: { writerProvenance: { calls: 2, usage, cost_usd: 0.25, priced: true } },
+				}),
+			);
+		}
+		plan.actions.push({ ...plan.actions[0], id: "duplicate-receipt" });
+		writeFileSync(f.planPath, JSON.stringify(plan));
+		invoke(["init", f.directory, f.planPath, "--hosts", f.hostsPath]);
+		invoke(["resume", f.directory]);
+		const store = new FactoryStore(join(f.directory, "factory.db"));
+		const noProcess = async (): Promise<never> => {
+			throw new Error("Cost must not execute work");
+		};
+		const engine = new FactoryEngine(store, { launch: noProcess, inspect: noProcess });
+		try {
+			for (const [index, action] of plan.actions.slice(0, 2).entries()) {
+				const context = store.claim(action.id, "local-slot")!;
+				store.markSubmitted(context.attempt.id);
+				store.complete({
+					attemptId: context.attempt.id,
+					sourceFingerprint: action.sourceFingerprint,
+					exitCode: 0,
+					finishedAt: new Date().toISOString(),
+				});
+				const result = await manageFactoryWake(
+					engine,
+					{ directory: f.directory, actionId: action.id },
+					() => async (_system, serialized) => {
+						const packet = JSON.parse(serialized) as ManagementPacket;
+						return {
+							model: "gpt-6-astra",
+							responseModel: "openai/gpt-4o",
+							responseModelSource: "provider-response",
+							usage: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000_000 },
+							text:
+								index === 1
+									? "invalid decision"
+									: JSON.stringify({
+											version: 1,
+											actionId: action.id,
+											planRevision: packet.planRevision,
+											attemptId: packet.attempt!.id,
+											decision: "defer",
+											reason: "fixture",
+											evidenceRefs: [],
+										}),
+						};
+					},
+				);
+				expect(result.kind).toBe(index === 0 ? "deferred" : "error");
+				const path = join(
+					f.directory,
+					"decisions",
+					result.requestId!,
+					index === 0 ? "proposal.json" : "response.json",
+				);
+				const saved = JSON.parse(readFileSync(path, "utf8"));
+				expect(saved.accounting).toMatchObject({ calls: 1, priced: true, cost_usd: 2.5 });
+				expect(saved.wall_clock_ms).toBeGreaterThanOrEqual(0);
+				receiptPaths.push(path);
+			}
+			const duplicate = store.claim("duplicate-receipt", "local-slot")!;
+			expect(duplicate.attempt.id).toBeTruthy();
+		} finally {
+			store.close();
+		}
+		const database = join(f.directory, "factory.db");
+		const before = [database, ...receiptPaths].map((path) => readFileSync(path));
+		const report = JSON.parse(invoke(["cost", f.directory, "--json"])) as FactoryCostReport;
+		expect(report.rows).toHaveLength(4);
+		expect(report.missing).toEqual([]);
+		expect(report.total).toEqual({
+			calls: 6,
+			cost_usd: 5.5,
+			priced: true,
+			usage: { input: 2_000_020, output: 10, cache_read: 4, cache_write: 2, total: 2_000_036 },
+		});
+		expect(report.rows.filter((row) => row.seat === "writer")).toHaveLength(2);
+		expect(report.rows.filter((row) => row.seat === "ticketOwner")).toHaveLength(2);
+		const filtered = JSON.parse(invoke(["cost", f.directory, "--ticket", "ticket", "--json"])) as FactoryCostReport;
+		expect(filtered.rows).toHaveLength(2);
+		expect(filtered.rows.every((row) => row.ticket === "ticket")).toBe(true);
+		expect(filtered.total).toMatchObject({ calls: 3, cost_usd: 2.75, priced: true });
+		const table = invoke(["cost", f.directory]);
+		expect(table).toContain("TICKET\tSEAT\tCALLS");
+		expect(table).toContain("CACHE_READ\tCACHE_WRITE");
+		expect(table).toContain("TOTAL\t*\t6");
+		expect(table).toContain("5.50000000");
+		expect([database, ...receiptPaths].map((path) => readFileSync(path))).toEqual(before);
+		expect(existsSync(f.marker)).toBe(false);
+		expect(JSON.parse(invoke(["cost", f.directory, "--ticket", "absent", "--json"])).rows).toEqual([]);
+		const unknown = JSON.parse(readFileSync(receiptPaths[0], "utf8"));
+		unknown.result.writerProvenance.cost_usd = null;
+		unknown.result.writerProvenance.priced = false;
+		writeFileSync(receiptPaths[0], JSON.stringify(unknown));
+		expect(JSON.parse(invoke(["cost", f.directory, "--json"])).total).toMatchObject({
+			cost_usd: null,
+			priced: false,
+		});
+		expect(invoke(["cost", f.directory])).toContain("unknown");
+		rmSync(receiptPaths[0]);
+		const missing = JSON.parse(invoke(["cost", f.directory, "--json"])) as FactoryCostReport;
+		expect(missing.missing).toContain(receiptPaths[0]);
+		expect(missing.total).toMatchObject({ cost_usd: null, usage: null, priced: false });
+		expect(() => invoke(["cost", f.directory, "--ticket"])).toThrow();
+		expect(() => invoke(["cost", f.directory, "--json", "--json"])).toThrow();
+		expect(() => invoke(["status", f.directory, "--json"])).toThrow();
+		expect(() => invoke(["cost", f.directory, "--actor", "owner"])).toThrow();
+	}, 15_000);
+
+	it.each(["missing", "directory"])(
+		"reports a %s manifest without losing the other ticket's totals",
+		(failure) => {
+			const f = setup();
+			const plan = JSON.parse(readFileSync(f.planPath, "utf8")) as FactoryPlan;
+			plan.tickets.push({ id: "other-ticket", owner: "owner" });
+			const usage = { input: 10, output: 5, cache_read: 2, cache_write: 1, total: 18 };
+			const cost = { calls: 2, usage, cost_usd: 0.25, priced: true };
+			const paths: string[] = [];
+			plan.actions = plan.tickets.map((ticket, index) => {
+				const outputDirectory = join(f.root, `output-${index}`);
+				mkdirSync(outputDirectory);
+				const path = join(f.root, `manifest-${index}.json`);
+				paths.push(path);
+				const manifest = JSON.stringify({ stage: { kind: "writer" }, outputDirectory });
+				const sha = createHash("sha256").update(manifest).digest("hex");
+				writeFileSync(path, manifest);
+				writeFileSync(
+					join(outputDirectory, "receipt.json"),
+					JSON.stringify({ ticketId: ticket.id, manifestSha256: sha, result: { writerProvenance: cost } }),
+				);
+				return {
+					...plan.actions[0],
+					id: `action-${index}`,
+					ticketId: ticket.id,
+					command: { cwd: f.root, argv: ["execute", path, "permit", sha, "--execute"] },
+				};
+			});
+			writeFileSync(f.planPath, JSON.stringify(plan));
+			invoke(["init", f.directory, f.planPath, "--hosts", f.hostsPath]);
+			invoke(["resume", f.directory]);
+			const store = new FactoryStore(join(f.directory, "factory.db"));
+			try {
+				for (const action of plan.actions) {
+					const context = store.claim(action.id, "local-slot")!;
+					store.markSubmitted(context.attempt.id);
+					store.complete({
+						attemptId: context.attempt.id,
+						sourceFingerprint: action.sourceFingerprint,
+						exitCode: 0,
+						finishedAt: new Date().toISOString(),
+					});
+				}
+			} finally {
+				store.close();
+			}
+			rmSync(paths[0]);
+			if (failure === "directory") mkdirSync(paths[0]);
+			const report = JSON.parse(invoke(["cost", f.directory, "--json"])) as FactoryCostReport;
+			expect(report.rows).toEqual([{ ticket: "other-ticket", seat: "writer", ...cost }]);
+			expect(report.unreadable).toHaveLength(1);
+			expect(report.unreadable[0]).toMatchObject({
+				status: "unreadable",
+				ticket: "ticket",
+				seat: "writer",
+				actionId: "action-0",
+				path: paths[0],
+			});
+			expect(report.unreadable[0].reason.length).toBeGreaterThan(0);
+			expect(report.total).toEqual({ calls: 2, usage: null, cost_usd: null, priced: false });
+			expect(report.missing).toEqual([]);
+			const table = invoke(["cost", f.directory]);
+			expect(table).toContain("other-ticket\twriter\t2\t10\t5\t2\t1\t18\t0.25000000\ttrue");
+			expect(table).toContain(`unreadable\t${paths[0]}\t${report.unreadable[0].reason}`);
+			expect(table).toContain("Unreadable rows: 1");
+			const filtered = JSON.parse(
+				invoke(["cost", f.directory, "--ticket", "other-ticket", "--json"]),
+			) as FactoryCostReport;
+			expect(filtered.total).toEqual(cost);
+			expect(filtered.unreadable).toEqual([]);
+			expect(existsSync(f.marker)).toBe(false);
+		},
+		15_000,
+	);
+
 	it("keeps help independent of SQLite, sessions and daemon startup", () => {
 		const { root } = setup();
 		const help = invoke(["help"], root);

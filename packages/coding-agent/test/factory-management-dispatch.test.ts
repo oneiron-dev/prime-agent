@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { FactoryEngine } from "../src/factory/engine.js";
 import { FACTORY_EVIDENCE_LIMITS } from "../src/factory/evidence.js";
-import type { ManagementEvidenceBinding, ManagementPacket } from "../src/factory/management.js";
+import type { ManagementEvidenceBinding, ManagementPacket, ManagementResult } from "../src/factory/management.js";
 import {
 	type ManagementCallerFactory,
 	manageFactoryWake,
@@ -113,6 +113,54 @@ afterEach(() => {
 });
 
 describe("bounded factory judgment consumer", () => {
+	test("preserves provider usage bytes beside accounting in results, receipts and the reopened ledger", async () => {
+		const f = await fixture();
+		const model = caller();
+		const usage = {
+			input: 1000,
+			output: 10,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 1010,
+			cost: { input: 0.0025, output: 0.0001, total: 0.0026 },
+			providerDetails: { currency: "USD", note: "verbatim provider record" },
+		};
+		const usageBytes = Buffer.from(JSON.stringify(usage));
+		const proposed = await manageFactoryWake(
+			f.engine,
+			{ directory: f.directory, evidence },
+			(check) =>
+				async (...parameters) => ({
+					...(await model.create(check)(...parameters)),
+					responseModel: "openai/gpt-4o",
+					responseModelSource: "provider-response",
+					usage,
+				}),
+		);
+		expect(proposed.kind).toBe("deferred");
+		const reopened = new FactoryStore(f.path);
+		stores.push(reopened);
+		type CostReceipt = Pick<ManagementResult, "usage" | "accounting" | "wall_clock_ms">;
+		const saved: CostReceipt[] = [
+			proposed.result!,
+			...["response.json", "proposal.json"].map(
+				(name) => JSON.parse(readFileSync(join(proposed.evidenceDirectory!, name), "utf8")) as CostReceipt,
+			),
+			reopened.managementRequests()[0].result!,
+		];
+		for (const result of saved) {
+			expect(Buffer.from(JSON.stringify(result.usage))).toEqual(usageBytes);
+			expect(result.accounting).toEqual({
+				calls: 1,
+				usage: { input: 1000, output: 10, cache_read: 0, cache_write: 0, total: 1010 },
+				cost_usd: 0.0026,
+				priced: true,
+			});
+			expect(result.wall_clock_ms).toBeGreaterThanOrEqual(0);
+		}
+		expect(Buffer.from(JSON.stringify(usage))).toEqual(usageBytes);
+	});
+
 	test("consumes defer durably, including after reopening, and requires changed evidence for another call", async () => {
 		const f = await fixture();
 		bind(f);

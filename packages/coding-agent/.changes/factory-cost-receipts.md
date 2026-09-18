@@ -1,0 +1,1 @@
+- Added per-call token and cost receipts for factory writers and management decisions, with read-only `factory cost` totals by ticket and seat.

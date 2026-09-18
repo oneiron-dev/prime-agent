@@ -1,7 +1,9 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { getModels, getProviders } from "@earendil-works/pi-ai";
 import { readFactoryRuntime, requireFactoryJsonEventProfile } from "../runtime.js";
 import type { ActionRecord, AttemptRecord } from "../types.js";
+import { type FactoryCallCost, type FactoryUsage, sumFactoryCosts } from "../usage.js";
 import type { OneironManifest, OneironSource } from "./oneiron.js";
 import { runOneironCapture } from "./oneiron-capture.js";
 import type { OneironPin } from "./oneiron-review.js";
@@ -51,7 +53,7 @@ export interface OneironWriterRetry {
 	noDuplicateExecution: true;
 	expiresAt: string;
 }
-export interface OneironWriterProvenance {
+export interface OneironWriterProvenance extends FactoryCallCost {
 	version: 1;
 	requested: OneironWriterProfile["requested"];
 	profile: OneironPin;
@@ -62,13 +64,15 @@ export interface OneironWriterProvenance {
 	sessionDirectory: string;
 	identityAccepted: boolean;
 	responseModels: string[];
-	observations: Array<{
-		responseId: string | null;
-		requestedSelector: string;
-		responseModel: string | null;
-		source: "provider-response" | "unknown";
-		family: "fable" | "astra" | "unknown";
-	}>;
+	observations: Array<
+		FactoryCallCost & {
+			responseId: string | null;
+			requestedSelector: string;
+			responseModel: string | null;
+			source: "provider-response" | "unknown";
+			family: "fable" | "astra" | "unknown";
+		}
+	>;
 	blockers: string[];
 	upstreamIdentityAttested: false;
 }
@@ -77,6 +81,40 @@ function check(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new Error(message);
 }
 const RESPONSE_MODELS = ["gpt-6-astra"];
+
+export type FactoryModelPrice = { input: number; output: number; cacheRead: number; cacheWrite: number };
+export const FACTORY_PRICE_OVERRIDES = new Map<string, FactoryModelPrice>();
+const registryModels = getProviders().flatMap((provider) => getModels(provider));
+export const FACTORY_MODEL_PRICES = new Map<string, FactoryModelPrice>();
+for (const model of registryModels) {
+	const matches = registryModels.filter((candidate) => candidate.id === model.id);
+	if (matches.every((candidate) => JSON.stringify(candidate.cost) === JSON.stringify(model.cost)))
+		FACTORY_MODEL_PRICES.set(model.id, model.cost);
+}
+for (const model of registryModels) FACTORY_MODEL_PRICES.set(`${model.provider}/${model.id}`, model.cost);
+export function priceFactoryCall(responseModel: string | null, usage?: FactoryUsage): FactoryCallCost {
+	const price = responseModel
+		? (FACTORY_PRICE_OVERRIDES.get(responseModel) ?? FACTORY_MODEL_PRICES.get(responseModel))
+		: undefined;
+	if (
+		price &&
+		![price.input, price.output, price.cacheRead, price.cacheWrite].every(
+			(value) => Number.isFinite(value) && value >= 0,
+		)
+	)
+		throw new Error("Invalid factory model price");
+	const cost =
+		price && usage
+			? (usage.input * price.input +
+					usage.output * price.output +
+					usage.cache_read * price.cacheRead +
+					usage.cache_write * price.cacheWrite) /
+				1_000_000
+			: null;
+	if (cost !== null && !Number.isFinite(cost)) throw new Error("Factory cost overflow");
+	return { calls: 1, usage: usage ?? null, cost_usd: cost, priced: cost !== null };
+}
+
 export function defaultOneironWriterProfile(runtime: OneironPin): OneironWriterProfile {
 	return {
 		version: 1,
@@ -273,6 +311,7 @@ export function summarizeOneironWriter(
 				`response ${index}: ${responseModel === null || responseModel === profile.requested.model ? "unknown" : "unapproved"} gateway-reported model identity`,
 			);
 		return {
+			...priceFactoryCall(responseModel, message.usage),
 			responseId: id,
 			requestedSelector: message.model!,
 			responseModel,
@@ -281,6 +320,7 @@ export function summarizeOneironWriter(
 		};
 	});
 	const result: OneironWriterProvenance = {
+		...sumFactoryCosts(observations),
 		version: 1,
 		requested: { ...profile.requested },
 		profile: stage.writerProfile,

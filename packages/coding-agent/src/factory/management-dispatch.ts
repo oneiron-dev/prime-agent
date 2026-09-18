@@ -11,6 +11,7 @@ import {
 	type ManagementEvidenceBinding,
 	type ManagementPacket,
 	type ManagementResult,
+	managementCallCost,
 	parseManagementProposal,
 	proposeManagementDecision,
 } from "./management.js";
@@ -188,8 +189,12 @@ export async function manageFactoryWake(
 				profile,
 				async (...parameters) => {
 					requireCurrent();
+					const started = performance.now();
 					const response = await call(...parameters);
-					save(join(output, "response.json"), response);
+					save(join(output, "response.json"), {
+						...response,
+						...managementCallCost(response, performance.now() - started),
+					});
 					return response;
 				},
 				claim.id,

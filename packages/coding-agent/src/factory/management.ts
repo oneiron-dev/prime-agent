@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { priceFactoryCall } from "./adapters/oneiron-writer.js";
 import {
 	assertByteLimit,
 	FACTORY_EVIDENCE_LIMITS,
@@ -6,6 +7,7 @@ import {
 	validateManagementEvidence,
 } from "./evidence.js";
 import type { ActionRecord, AttemptRecord, FactoryStatus, TicketRecord, WakeRecord } from "./types.js";
+import { type FactoryCallCost, readFactoryUsage } from "./usage.js";
 
 export interface ManagementEvidence {
 	ref: string;
@@ -92,6 +94,9 @@ export type ManagementCaller = (
 	requestId: string,
 ) => Promise<ManagementModelResult>;
 export interface ManagementResult {
+	usage?: Record<string, unknown>;
+	accounting: FactoryCallCost;
+	wall_clock_ms: number;
 	id: string;
 	createdAt: string;
 	packetSha256: string;
@@ -101,7 +106,6 @@ export interface ManagementResult {
 	/** Absent in historical receipts. Never reconstruct serving identity from the SDK selector. */
 	servingIdentity?: ManagementServingIdentity;
 	proposal: ManagementProposal;
-	usage?: Record<string, unknown>;
 }
 
 export const MANAGEMENT_SYSTEM_PROMPT = `Review one factory wake and return only a JSON object with version:1, actionId, planRevision, attemptId, decision:"accept"|"reject"|"defer", reason, evidenceRefs:string[].
@@ -199,10 +203,12 @@ export async function proposeManagementDecision(
 	validateManagementEvidence(packet.evidence);
 	const serialized = JSON.stringify(packet);
 	assertByteLimit("packet", Buffer.byteLength(serialized, "utf8"), FACTORY_EVIDENCE_LIMITS.packetBytes);
+	const started = performance.now();
 	const result = await call(MANAGEMENT_SYSTEM_PROMPT, serialized, profile, id);
 	if (result.model !== profile.model)
 		throw new Error(`Configured model ${profile.model} differs from response model ${result.model}`);
 	return {
+		...managementCallCost(result, performance.now() - started),
 		id,
 		createdAt: new Date().toISOString(),
 		packetSha256: createHash("sha256").update(serialized).digest("hex"),
@@ -224,5 +230,18 @@ export async function proposeManagementDecision(
 		},
 		proposal: parseManagementProposal(result.text, packet),
 		usage: result.usage,
+	};
+}
+
+export function managementCallCost(
+	result: ManagementModelResult,
+	wallClockMs: number,
+): Pick<ManagementResult, "accounting" | "wall_clock_ms"> {
+	return {
+		accounting: priceFactoryCall(
+			result.responseModelSource === "provider-response" ? (result.responseModel ?? null) : null,
+			readFactoryUsage(result.usage),
+		),
+		wall_clock_ms: Math.max(0, Math.round(wallClockMs)),
 	};
 }

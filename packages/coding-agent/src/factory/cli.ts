@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { CommandAdapter, fingerprintCommand } from "./adapters/command.js";
 import { type FactoryConfig, readFactoryConfig, readFactoryHosts, readFactoryJson } from "./config.js";
+import { factoryCost, formatFactoryCost } from "./cost.js";
 import { FactoryEngine } from "./engine.js";
 import { FACTORY_HELP } from "./help.js";
 import type { ManagementReconciliation } from "./management.js";
@@ -14,6 +15,8 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 	const options = new Map<string, string>();
 	const allowed = new Set([
 		"--hosts",
+		"--ticket",
+		"--json",
 		"--pause-file",
 		"--after",
 		"--interval-ms",
@@ -33,7 +36,7 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 			continue;
 		}
 		if (!allowed.has(arg)) throw new Error(`Unknown factory option ${arg}`);
-		const value = args[++index];
+		const value = arg === "--json" ? "true" : args[++index];
 		if (!value || value.startsWith("--")) throw new Error(`Missing value for ${arg}`);
 		if (options.has(arg)) throw new Error(`Repeated option ${arg}`);
 		options.set(arg, value);
@@ -100,6 +103,8 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 	if (options.has("--timeout-ms") && command !== "fingerprint") {
 		throw new Error("--timeout-ms is only supported for fingerprint");
 	}
+	if (command !== "cost" && (options.has("--ticket") || options.has("--json")))
+		throw new Error("--ticket and --json are only supported for cost");
 	if (command === "fingerprint") {
 		const hostsPath = options.get("--hosts");
 		if (!hostsPath || !rawDirectory || !argument)
@@ -118,6 +123,14 @@ Preserve the owner directive as evidence and the exact bundle for duplicate deli
 	}
 	if (!rawDirectory) throw new Error("An explicit factory directory is required");
 	const directory = resolve(rawDirectory);
+	if (command === "cost") {
+		if (positionals.length !== 2 || [...options.keys()].some((key) => !["--ticket", "--json"].includes(key)))
+			throw new Error("cost requires <directory> [--ticket <id>] [--json]");
+		const report = factoryCost(directory, options.get("--ticket"));
+		if (options.has("--json")) emit(report);
+		else console.log(formatFactoryCost(report));
+		return;
+	}
 	if (command === "init") {
 		if (!argument || !options.get("--hosts")) throw new Error("init requires plan.json and --hosts hosts.json");
 		if (existsSync(directory)) throw new Error("init requires a new factory directory");
