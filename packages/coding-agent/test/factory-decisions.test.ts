@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { runFactoryCli } from "../src/factory/cli.js";
+import * as decisionReceipt from "../src/factory/decision-receipt.js";
+import { publishAppliedReceipt } from "../src/factory/decision-receipt.js";
 import {
 	codeDecisionBase,
 	type DecisionOf,
@@ -719,5 +721,71 @@ test.each([false, true])(
 				.eventsOfKind("decision")
 				.some((e) => e.detail.applied === true && e.detail.source_request_id === applied.requestId),
 		).toBe(true);
+	},
+);
+
+test("PR #7: stale applied stages do not block publication or get deleted", () => {
+	const f = fixture(),
+		path = join(f.directory, "decision.json"),
+		stale = `${path}.applied`;
+	writeFileSync(path, JSON.stringify({ applied: false }));
+	writeFileSync(stale, "retained");
+	publishAppliedReceipt(path, { applied: true });
+	expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ applied: true });
+	expect(readFileSync(stale, "utf8")).toBe("retained");
+});
+
+test.each(["record", "cli"].flatMap((caller) => [false, true].map((late) => ({ caller, late }))))(
+	"PR #7 Q4: $caller preserves a committed decision when publication fails (late=$late)",
+	async ({ caller, late }) => {
+		const f = fixture();
+		await f.engine.tick();
+		const attempt = f.store.attempts()[0];
+		const d = {
+			...decision("writer_terminal_accept"),
+			ledger_sequence: f.store.ledgerSequence(),
+			attempt_id: attempt.id,
+			receipt_sha: createHash("sha256").update(JSON.stringify(attempt.receipt)).digest("hex"),
+		};
+		const publish = decisionReceipt.publishAppliedReceipt;
+		vi.spyOn(decisionReceipt, "publishAppliedReceipt").mockImplementation((path, data) => {
+			if (late) publish(path, data);
+			throw new Error("injected publication failure");
+		});
+		const output = vi.spyOn(console, "log").mockImplementation(() => {});
+		const receipt =
+			caller === "record"
+				? recordDecision(f.store, "a", d, {
+						apply: () =>
+							f.store.decide("a", "accept", { actor: "operator", reason: "Proof passed", ref: "/proof" }),
+					})
+				: await runFactoryCli([
+						"decide-typed",
+						f.directory,
+						"a",
+						d.type,
+						"--object",
+						JSON.stringify(d),
+						"--apply",
+					]).then(() => JSON.parse(String(output.mock.calls.at(-1)![0])));
+		expect(receipt).toMatchObject({
+			applied: false,
+			publish_error: expect.stringContaining(
+				"Decision committed; receipt unpublished: injected publication failure",
+			),
+		});
+		const path = join(f.directory, "decisions", receipt.request_id, "decision.json");
+		expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ applied: false });
+		const reopened = new FactoryStore(f.path);
+		stores.push(reopened);
+		expect(reopened.actions()[0].state).toBe("ACCEPTED");
+		expect(reopened.typedDecisions().at(-1)).toMatchObject({ request_id: receipt.request_id, applied: true });
+		expect(reopened.eventsOfKind("decision").at(-1)!.detail.applied).toBe(true);
+		expect(reopened.eventsOfKind("decision_receipt_unpublished")).toEqual([
+			expect.objectContaining({
+				actionId: "a",
+				detail: { request_id: receipt.request_id, path, error: receipt.publish_error },
+			}),
+		]);
 	},
 );

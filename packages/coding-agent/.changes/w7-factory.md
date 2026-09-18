@@ -1,0 +1,19 @@
+- Fixed factory admission to pin the initializing runtime, allow explicit action overrides, and refuse changed runtime bytes or stale local processes with distinct journal reasons and worker delivery receipts.
+- Added per-call token and cost receipts for factory writers and management decisions, with read-only `factory cost` totals by ticket and seat.
+- Added typed factory decision receipts, served-profile drift checks, and `factory decide-typed` with ledger freshness and explicit application.
+- Added typed Jev decisions with a medium-effort advisor, pinned question receipts, and explicit deferred wakes.
+- Added ledger-based `factory resume` with runtime verification, catch-up receipts, continuation recovery, and idle-backlog incidents.
+- Fixed merge-gate review waivers to leave checks, provenance, and owner holds required while retaining failing clauses in receipts.
+- Fixed factory profile-drift refusal to report the typed result without applying the decision.
+- Fixed factory decision and event reads to enforce size limits and page through matching ledger events.
+- Added audit coverage for typed decisions and JSON event output.
+- Fixed resume catch-up boundaries so work settled by the scheduling tick is reported once and idle resumes do not duplicate wakes.
+- Changed resume reports and catch-up receipts to use timestamp-only filenames.
+- Added bounded, pinned context capsules before writer attempts, with optional cheap-seat reduction and per-attempt cost reporting.
+- Fixed factory bearer endpoints to require HTTPS or private HTTP.
+- Fixed factory cost reports to reject malformed persisted accounting.
+- Fixed decision receipt publication to use exclusive, unique staging files without deleting foreign stages.
+- Fixed resume report failures to distinguish scheduling success from report publication failure.
+- Fixed committed factory decisions to return an unpublished receipt with the publication error instead of reporting a failed decision.
+- Fixed failed capsule receipts to validate accounting before adding it to the ledger.
+- Fixed capsule ownership matching to distinguish exact file paths from longer path names.

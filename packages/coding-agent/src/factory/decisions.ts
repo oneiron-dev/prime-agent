@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Static, type TProperties, Type } from "typebox";
 import { Value } from "typebox/value";
@@ -238,6 +238,7 @@ export interface DecisionReceipt extends Partial<DecisionInference> {
 	action_id: string;
 	decision: FactoryDecision;
 	applied: boolean;
+	publish_error?: string;
 	accounting: FactoryCallCost;
 	predicate?: ReturnType<typeof mergeGatePredicate>;
 }
@@ -358,7 +359,26 @@ export function recordDecision(
 			mkdirSync(directory, { recursive: true, mode: 0o700 });
 			const path = join(directory, "decision.json");
 			save(path, { ...receipt, applied: false });
-			if (receipt.applied) store.afterDecisionCommit(() => publishAppliedReceipt(path, receipt));
+			if (receipt.applied)
+				store.afterDecisionCommit(() => {
+					try {
+						publishAppliedReceipt(path, receipt);
+					} catch (error) {
+						receipt.applied = false;
+						receipt.publish_error = `Decision committed; receipt unpublished: ${error instanceof Error ? error.message : String(error)}`;
+						try {
+							// Publication can fail at directory fsync after the rename.
+							writeFileSync(path, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600, flush: true });
+						} catch (restoreError) {
+							receipt.publish_error += `; receipt reset failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`;
+						}
+						try {
+							store.recordDecisionPublicationFailure(actionId, requestId, path, receipt.publish_error);
+						} catch (journalError) {
+							receipt.publish_error += `; journal note failed: ${journalError instanceof Error ? journalError.message : String(journalError)}`;
+						}
+					}
+				});
 			return receipt;
 		},
 		value.decided_by,

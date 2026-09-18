@@ -588,3 +588,23 @@ test("manage --typed-object reaches the unconfigured deferred path without an SD
 	expect(f.requests).toHaveLength(0);
 	expect(f.store.managementRequests()[0].state).toBe("DEFERRED");
 });
+
+test.each(["Jev", "Advisor"])("PR #7: refuses unsafe %s transport before fetch", async (stage) => {
+	const f = await fixture();
+	f.setJev(noul(0.5));
+	const realFetch = globalThis.fetch;
+	const fetch = vi.spyOn(globalThis, "fetch").mockImplementation((url, options) => {
+		if (!String(url).startsWith(f.base)) throw new Error("No external network");
+		return realFetch(url, options);
+	});
+	vi.stubEnv("FACTORY_ADVISOR_BASE_URL", "http://public.example");
+	const caller =
+		stage === "Jev"
+			? createJevTypedDecisionCaller(() => {}, { jevUrl: "http://public.example" })
+			: f.create(() => {});
+	const result = await caller.call(f.state);
+	expect(result.inference.outcome).toBe("DEFERRED");
+	expect(result.decision.reason).toContain(`${stage} unreachable`);
+	expect(result.accounting.calls).toBe(stage === "Jev" ? 0 : 1);
+	expect(fetch.mock.calls.map(([url]) => url)).toEqual(stage === "Jev" ? [] : [`${f.base}/v1/systemone`]);
+});

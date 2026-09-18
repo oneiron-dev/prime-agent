@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { factoryBearerEndpoint } from "../bearer-endpoint.js";
 import { assertByteLimit, FACTORY_EVIDENCE_LIMITS } from "../evidence.js";
 import type { FactoryStore } from "../store.js";
 import type { FactoryCapsuleReceipt } from "../types.js";
@@ -53,7 +54,7 @@ function usage(value: unknown): FactoryCallCost["usage"] {
 	}
 }
 export function createCapsuleCaller(options: { timeoutMs?: number } = {}): CapsuleCaller {
-	const base = process.env.FACTORY_CAPSULE_PROVIDER_BASE_URL?.trim().replace(/\/$/, "");
+	const base = factoryBearerEndpoint(process.env.FACTORY_CAPSULE_PROVIDER_BASE_URL);
 	const key = process.env.FACTORY_CAPSULE_API_KEY?.trim();
 	const model = process.env.FACTORY_CAPSULE_MODEL?.trim() || "muse-spark-1.3-contributor";
 	const thinking = process.env.FACTORY_CAPSULE_THINKING?.trim() || "max";

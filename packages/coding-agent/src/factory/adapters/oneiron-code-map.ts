@@ -99,8 +99,16 @@ function treeFiles(workspace: string, deadline: number): string[] {
 	return files;
 }
 export function capsuleOwnsPath(path: string, text: string, metadata = readCapsulePacket(text)): boolean {
+	let mentioned = false;
+	for (let index = path ? text.indexOf(path) : -1; index >= 0; index = text.indexOf(path, index + path.length)) {
+		const suffix = text.slice(index + path.length);
+		if (/^(?:$|[\s"'`()[\]{},;:!?]|\.(?=$|[\s"'`()[\]{},;:!?]))/u.test(suffix)) {
+			mentioned = true;
+			break;
+		}
+	}
 	return (
-		text.includes(path) ||
+		mentioned ||
 		[...(metadata.allowedFiles ?? []), ...(metadata.touchedFiles ?? [])].some((entry) => {
 			const normalized = normalize(entry);
 			return normalized === path || (isAbsolute(normalized) && normalized.endsWith(`${sep}${path}`));

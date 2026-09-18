@@ -60,17 +60,7 @@ function settlementProof(proof: { ref: string; sha256: string }): string {
 		throw new Error(`Settlement artifact hash mismatch: ${proof.ref}`);
 	return bytes.toString("utf8");
 }
-function validateCapsuleReceipt(receipt: FactoryCapsuleReceipt): void {
-	validateArtifactPin(receipt.pin, "capsule.pin");
-	validateArtifactPin(receipt.packet, "capsule.packet");
-	required(receipt.head, "capsule.head");
-	required(receipt.capsule_seat, "capsule.capsule_seat");
-	const limit = 64 * 1024;
-	if (!Number.isSafeInteger(receipt.bytes) || receipt.bytes < 1 || receipt.bytes > limit)
-		throw new Error("Capsule bytes must be within 1..65536");
-	if (!Number.isFinite(receipt.wall_clock_ms) || receipt.wall_clock_ms < 0)
-		throw new Error("Invalid capsule wall_clock_ms");
-	const cost = receipt.accounting;
+function validateCapsuleAccounting(cost: FactoryCapsuleRecord["accounting"]): void {
 	if (
 		!cost ||
 		!Number.isSafeInteger(cost.calls) ||
@@ -81,6 +71,17 @@ function validateCapsuleReceipt(receipt: FactoryCapsuleReceipt): void {
 		(cost.usage !== null && !readFactoryUsage(cost.usage))
 	)
 		throw new Error("Invalid capsule accounting");
+}
+function validateCapsuleReceipt(receipt: FactoryCapsuleReceipt): void {
+	validateArtifactPin(receipt.pin, "capsule.pin");
+	validateArtifactPin(receipt.packet, "capsule.packet");
+	required(receipt.head, "capsule.head");
+	required(receipt.capsule_seat, "capsule.capsule_seat");
+	const limit = 64 * 1024;
+	if (!Number.isSafeInteger(receipt.bytes) || receipt.bytes < 1 || receipt.bytes > limit)
+		throw new Error("Capsule bytes must be within 1..65536");
+	if (!Number.isFinite(receipt.wall_clock_ms) || receipt.wall_clock_ms < 0)
+		throw new Error("Invalid capsule wall_clock_ms");
 	const fd = openSync(receipt.pin.path, constants.O_RDONLY | constants.O_NONBLOCK);
 	let bytes: Buffer;
 	try {
@@ -330,6 +331,11 @@ export class FactoryStore {
 		if (!this.inTransaction) throw new Error("Decision receipt requires a journal transaction");
 		this.commitEffects.push(effect);
 	}
+	recordDecisionPublicationFailure(actionId: string, requestId: string, path: string, error: string): void {
+		this.transaction(() => {
+			this.event("decision_receipt_unpublished", actionId, null, { request_id: requestId, path, error });
+		});
+	}
 	private meta(key: string): string | undefined {
 		const row = this.db.prepare("SELECT value FROM metadata WHERE key=?").get(key);
 		return row ? String(row.value) : undefined;
@@ -367,6 +373,7 @@ export class FactoryStore {
 				if (this.db.prepare("SELECT 1 FROM events WHERE kind='capsule_built' AND attempt_id=?").get(attemptId))
 					throw new Error("Capsule already bound to attempt");
 			}
+			validateCapsuleAccounting(receipt.accounting);
 			if ("failure" in receipt) {
 				if (
 					receipt.capsule_seat !== "none" ||

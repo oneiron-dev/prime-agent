@@ -6,7 +6,11 @@ import * as runtime from "../src/factory/runtime.js";
 
 export const fixtureRuntimePin: runtime.FactoryFilePin = { path: "/fixture/runtime.json", sha256: "0".repeat(64) };
 const modulePath = fileURLToPath(new URL("../src/factory/runtime.ts", import.meta.url));
-const nodePin = { path: process.execPath, sha256: runtime.hashFactoryRuntimeFile(process.execPath) };
+let cachedNodePin: runtime.FactoryFilePin | undefined;
+function nodePin(): runtime.FactoryFilePin {
+	cachedNodePin ??= { path: process.execPath, sha256: runtime.hashFactoryRuntimeFile(process.execPath) };
+	return cachedNodePin;
+}
 
 export function createRuntimeFixture(directory: string): runtime.FactoryFilePin {
 	const bundle = join(directory, "runtime-bundle");
@@ -16,7 +20,7 @@ export function createRuntimeFixture(directory: string): runtime.FactoryFilePin 
 	const identity: runtime.FactoryRuntimeIdentity = {
 		version: 1,
 		cliArgv: [process.execPath, cli],
-		files: [nodePin, ...[cli, modulePath].map((path) => ({ path, sha256: runtime.hashFactoryRuntimeFile(path) }))],
+		files: [nodePin(), ...[cli, modulePath].map((path) => ({ path, sha256: runtime.hashFactoryRuntimeFile(path) }))],
 		capabilities: ["provider-response-model-v1", "factory-completed-json-v1"],
 	};
 	const path = join(directory, "runtime.json");

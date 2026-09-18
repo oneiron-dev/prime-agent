@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { closeSync, fsyncSync, openSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -18,7 +19,7 @@ export function save(path: string, data: unknown): void {
 }
 
 export function publishAppliedReceipt(path: string, data: unknown): void {
-	const staged = `${path}.applied`;
+	const staged = `${path}.applied.${process.pid}.${randomUUID()}`;
 	save(staged, data);
 	renameSync(staged, path);
 	const directory = openSync(dirname(path), "r");

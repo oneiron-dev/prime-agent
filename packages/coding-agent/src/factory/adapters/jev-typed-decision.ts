@@ -1,3 +1,4 @@
+import { factoryBearerEndpoint } from "../bearer-endpoint.js";
 import type { DecisionInference, FactoryDecision } from "../decisions.js";
 import { codeDecisionBase, validateDecision } from "../decisions.js";
 import { assertByteLimit, FACTORY_EVIDENCE_LIMITS } from "../evidence.js";
@@ -188,10 +189,12 @@ export function createJevTypedDecisionCaller(
 			};
 			let stage = "Jev",
 				callStarted = performance.now();
-			costs.push({ calls: 1, usage: null, cost_usd: null, priced: false });
 			try {
+				const jevUrl = factoryBearerEndpoint(optionsUrl());
+				if (!jevUrl) throw new TransportFailure("unreachable: unsafe endpoint");
+				costs.push({ calls: 1, usage: null, cost_usd: null, priced: false });
 				const wire = await post(
-					optionsUrl(),
+					jevUrl,
 					key,
 					{ state: serialized, model: "jev-latest", questions: { q: wireQuestion } },
 					10_000,
@@ -251,6 +254,7 @@ export function createJevTypedDecisionCaller(
 				decidedBy = "none";
 				confidence = null;
 				if (!advisorBase || !advisorKey) throw new TransportFailure("unconfigured");
+				if (!factoryBearerEndpoint(advisorBase)) throw new TransportFailure("unreachable: unsafe endpoint");
 				const advisorUrl = advisorBase.endsWith("/v1")
 					? `${advisorBase}/chat/completions`
 					: `${advisorBase}/v1/chat/completions`;

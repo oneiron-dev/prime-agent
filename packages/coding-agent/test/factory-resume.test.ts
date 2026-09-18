@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -398,16 +398,37 @@ it("deduplicates idle wakes across repeated resumes and uses timestamp-only rece
 		expect(filename).toMatch(/^resume-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z\.json$/);
 });
 
-it("bounds timestamp receipt collisions at 1000 candidates without overwriting evidence", async () => {
-	const f = fixture();
+it.each(["catch-up", "resume"])("PR #7: %s reservation exhaustion fails before unpausing", async (prefix) => {
+	const f = fixture(["ready"]);
+	f.engine.pause("restart");
 	const started = Date.now();
 	vi.spyOn(Date, "now").mockReturnValue(started);
 	let last = "";
 	for (let offset = 0; offset < 1000; offset++) {
-		last = join(f.directory, `catch-up-${new Date(started + offset).toISOString().replaceAll(":", "-")}.json`);
+		last = join(f.directory, `${prefix}-${new Date(started + offset).toISOString().replaceAll(":", "-")}.json`);
 		writeFileSync(last, "retained");
 	}
 	await expect(resumeFactory(f.engine)).rejects.toThrow(`Receipt filename exhausted after 1000 attempts: ${last}`);
 	expect(readFileSync(last, "utf8")).toBe("retained");
 	expect(f.store.eventsOfKind("resumed")).toEqual([]);
+	expect(f.store.isPaused()).toBe(true);
+	expect(f.store.attempts()).toEqual([]);
+});
+
+it("PR #7: final report failure reports the committed unpause and scheduling", async () => {
+	const f = fixture(["ready"]);
+	f.engine.pause("restart");
+	f.launch.mockImplementation(async (context) => {
+		const path = join(f.directory, readdirSync(f.directory).find((name) => name.startsWith("resume-"))!);
+		expect(JSON.parse(readFileSync(path, "utf8"))).toBeNull();
+		rmSync(path);
+		mkdirSync(path);
+		return { kind: "running", processIdentity: context.attempt.id };
+	});
+	await expect(resumeFactory(f.engine)).rejects.toThrow(
+		"Factory is unpaused and scheduled; only the report file failed:",
+	);
+	expect(f.store.isPaused()).toBe(false);
+	expect(f.store.actions()[0].state).toBe("RUNNING");
+	expect(f.store.eventsOfKind("resumed")).toHaveLength(1);
 });

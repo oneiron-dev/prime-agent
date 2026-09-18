@@ -6,7 +6,7 @@ import { verifyOneironArtifact } from "./adapters/oneiron-transport.js";
 import type { OneironWriterProvenance } from "./adapters/oneiron-writer.js";
 import type { ManagementResult } from "./management.js";
 import type { ActionSpec, FactoryCapsuleRecord } from "./types.js";
-import { type FactoryCallCost, sumFactoryCosts } from "./usage.js";
+import { type FactoryCallCost, readFactoryUsage, sumFactoryCosts } from "./usage.js";
 
 export interface FactoryCostRow extends FactoryCallCost {
 	ticket: string;
@@ -50,14 +50,28 @@ export function factoryCost(directory: string, ticket?: string): FactoryCostRepo
 	const unreadable: FactoryUnreadableCostRow[] = [];
 	const seen = new Set<string>();
 	const add = (ticketId: string, seat: string, cost: FactoryCallCost | undefined, ref: string) => {
-		if (!cost || !Number.isSafeInteger(cost.calls)) {
+		if (cost === undefined || cost === null) {
 			missing.push(ref);
 			return;
 		}
+		let usage: FactoryCallCost["usage"];
+		try {
+			if (
+				!Number.isSafeInteger(cost.calls) ||
+				cost.calls < 0 ||
+				typeof cost.priced !== "boolean" ||
+				(cost.cost_usd !== null &&
+					(typeof cost.cost_usd !== "number" || !Number.isFinite(cost.cost_usd) || cost.cost_usd < 0)) ||
+				(cost.priced && cost.cost_usd === null)
+			)
+				throw new Error("Invalid calls, price or priced flag");
+			usage = cost.usage === null ? null : (readFactoryUsage(cost.usage) ?? null);
+			if (cost.usage !== null && usage === null) throw new Error("Missing token usage");
+		} catch (error) {
+			throw new Error(`Invalid cost accounting: ${ref}`, { cause: error });
+		}
 		const key = JSON.stringify([ticketId, seat]);
-		const items = [...(groups.get(key) ?? []), { ...cost, ticket: ticketId, seat }];
-		sumFactoryCosts(items);
-		groups.set(key, items);
+		groups.set(key, [...(groups.get(key) ?? []), { ...cost, usage, ticket: ticketId, seat }]);
 	};
 	const recordUnreadable = (ticketId: string, seat: string, actionId: string, path: string, error: unknown) => {
 		unreadable.push({
@@ -126,6 +140,7 @@ export function factoryCost(directory: string, ticket?: string): FactoryCostRepo
 					throw new Error(`Cost receipt binding mismatch: ${path}`);
 				if (seen.has(path)) continue;
 				const cost = saved?.result.writerProvenance as OneironWriterProvenance | undefined;
+				add(action.ticketId, "writer", cost, path);
 				for (const attempt of attempts.filter((item) => item.actionId === action.id)) {
 					if (
 						writerAttempts.length === 1 ||
@@ -133,7 +148,6 @@ export function factoryCost(directory: string, ticket?: string): FactoryCostRepo
 					)
 						attempt.writer = cost ?? null;
 				}
-				add(action.ticketId, "writer", cost, path);
 				seen.add(path);
 			} catch (error) {
 				recordUnreadable(String(row.ticket_id), "writer", String(row.id), path, error);
@@ -162,7 +176,7 @@ export function factoryCost(directory: string, ticket?: string): FactoryCostRepo
 					path = `factory:management:${String(row.id)}`;
 					result = JSON.parse(String(row.result)) as ManagementResult;
 				}
-				add(String(row.ticket_id), seat, result?.accounting, directoryPath);
+				add(String(row.ticket_id), seat, result?.accounting, path);
 			} catch (error) {
 				recordUnreadable(String(row.ticket_id), seat, String(row.action_id), path, error);
 			}

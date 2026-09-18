@@ -370,3 +370,99 @@ it("joins a failed capsule event with a null attempt hash and zero capsule bytes
 	});
 	expect(formatFactoryCost(factoryCost(directory))).toContain("0 bytes; none; $unknown");
 });
+
+it.each(
+	["capsule", "writer", "management"].flatMap((source) =>
+		[
+			'{"calls":-1}',
+			'{"calls":1.5}',
+			'{"priced":"true"}',
+			'{"cost_usd":1e400}',
+			'{"priced":true,"cost_usd":null}',
+			'{"cost_usd":"missing"}',
+			'{"usage":{}}',
+			'{"usage":"bad"}',
+		].map((patch) => ({ source, patch })),
+	),
+)("PR #7: invalid $source accounting $patch is unreadable without changing totals", ({ source, patch }) => {
+	const f = fixture();
+	f.store.recordCapsule("debug", null, f.capsule("valid"));
+	const db = new DatabaseSync(f.path);
+	try {
+		if (source === "capsule") f.store.recordCapsule("writer-a", null, f.capsule("invalid"));
+		else {
+			f.finish(f.claim());
+			if (source === "management")
+				f.store.claimManagement({
+					id: "invalid",
+					wakeId: f.store.wakes()[0].id,
+					actionId: "writer-a",
+					attemptId: f.store.attempts()[0].id,
+					planRevision: 1,
+					evidenceSha256: "proof",
+				});
+		}
+		const persist = (cost: string) => {
+			if (source === "capsule")
+				db.prepare("UPDATE events SET detail=? WHERE kind='capsule_built' AND action_id='writer-a'").run(
+					`{"capsule_seat":"${seat}","accounting":${cost}}`,
+				);
+			else if (source === "management")
+				db.prepare("UPDATE management_requests SET result=? WHERE id='invalid'").run(`{"accounting":${cost}}`);
+			else {
+				const path = join(f.directory, "writer-a-output/receipt.json");
+				const saved = JSON.parse(readFileSync(path, "utf8"));
+				writeFileSync(
+					path,
+					JSON.stringify({ ...saved, result: {} }).replace('"result":{}', `"result":{"writerProvenance":${cost}}`),
+				);
+			}
+		};
+		persist("null");
+		const before = factoryCost(f.directory);
+		const invalid = { ...accounting(), ...JSON.parse(patch) };
+		const encoded = JSON.stringify(invalid)
+			.replace('"cost_usd":"missing",', "")
+			.replace('"cost_usd":null', patch.includes("1e400") ? '"cost_usd":1e400' : '"cost_usd":null');
+		persist(encoded);
+		const report = factoryCost(f.directory);
+		expect(report.unreadable).toHaveLength(1);
+		expect(report.unreadable[0].reason).toContain(report.unreadable[0].path);
+		expect(report.rows).toEqual(before.rows);
+		expect(report.total).toEqual(before.total);
+		expect(report.missing).toEqual([]);
+	} finally {
+		db.close();
+	}
+});
+
+it.each([
+	null,
+	{ calls: -1 },
+	{ calls: 1.5 },
+	{ calls: Number.MAX_SAFE_INTEGER + 1 },
+	{ priced: "true" },
+	{ cost_usd: -1 },
+	{ cost_usd: Number.POSITIVE_INFINITY },
+	{ cost_usd: "bad" },
+	{ priced: true, cost_usd: null },
+	{ usage: {} },
+	{ usage: { input: -1, output: 0, cache_read: 0, cache_write: 0, total: 0 } },
+])("PR #7 Q6: refuses failed-capsule accounting %j without changing cost totals", (patch) => {
+	const f = fixture();
+	f.store.recordCapsule("debug", null, f.capsule("valid"));
+	const attemptId = f.claim(),
+		before = factoryCost(f.directory),
+		sequence = f.store.ledgerSequence();
+	expect(() =>
+		f.store.recordCapsule("writer-a", attemptId, {
+			capsule_seat: "none",
+			bytes: 0,
+			failure: "Capsule unavailable",
+			wall_clock_ms: 1,
+			accounting: (patch === null ? null : { ...accounting(), ...patch }) as FactoryCallCost,
+		}),
+	).toThrow();
+	expect(f.store.ledgerSequence()).toBe(sequence);
+	expect(factoryCost(f.directory).total).toEqual(before.total);
+});

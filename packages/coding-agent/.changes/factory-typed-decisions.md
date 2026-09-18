@@ -1,1 +1,0 @@
-- Added typed factory decision receipts, served-profile drift checks, and `factory decide-typed` with ledger freshness and explicit application.

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { rehydrateOneironContinuation } from "./adapters/oneiron-continuation.js";
 import { save } from "./decision-receipt.js";
@@ -101,6 +101,7 @@ export async function resumeFactory(engine: FactoryEngine, acceptRuntimeChange?:
 	const frontier = resumeFrontier(store);
 	console.log(JSON.stringify({ frontier }));
 	const continuation = rehydrateOneironContinuation(join(store.directory, "factory.db"));
+	const path = saveTimestampedReceipt(store.directory, "resume", null);
 	engine.resume();
 	const tick = await engine.tick();
 	const actions = store.actions();
@@ -129,7 +130,11 @@ export async function resumeFactory(engine: FactoryEngine, acceptRuntimeChange?:
 		tick,
 		incident: incident ? "idle_with_backlog" : null,
 	};
-	const path = saveTimestampedReceipt(store.directory, "resume", report);
+	try {
+		writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`, { flag: "r+", flush: true });
+	} catch (error) {
+		throw new Error(`Factory is unpaused and scheduled; only the report file failed: ${path}`, { cause: error });
+	}
 	console.log(JSON.stringify({ ...report, path }));
 	if (incident) throw new Error(`idle_with_backlog: ${JSON.stringify(counts)}`);
 	return report;

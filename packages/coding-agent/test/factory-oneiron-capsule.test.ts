@@ -276,9 +276,22 @@ test.each([
 	expect(JSON.stringify(built)).not.toContain("fixture-capsule-key");
 	expect(built.receipt.wall_clock_ms).toBeGreaterThanOrEqual(0);
 });
-test("unconfigured seat makes no request, ships deterministic capsule and respects explicit opt-out", async () => {
+test.each([
+	undefined,
+	"http://public.example",
+	"not a URL",
+	"http://100.63.255.255",
+	"http://100.128.0.0",
+	"http://172.15.255.255",
+	"http://172.32.0.0",
+	"http://192.169.0.1",
+	"http://host.ts.net.evil.example",
+	"ftp://localhost",
+])("PR #7: unsafe/unconfigured capsule endpoint %s makes no request", async (base) => {
 	const f = fixture(),
-		fetch = vi.spyOn(globalThis, "fetch");
+		fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("No network"));
+	vi.stubEnv("FACTORY_CAPSULE_PROVIDER_BASE_URL", base);
+	vi.stubEnv("FACTORY_CAPSULE_API_KEY", "fixture-only");
 	const built = (await buildOneironCapsule({ workspace: f.workspace, head, packet: f.packet }))!;
 	expect(built.capsule).toEqual(f.generate());
 	expect(built.receipt.accounting).toMatchObject({ calls: 0, cost_usd: 0 });
@@ -305,7 +318,7 @@ test("timeout ships deterministic evidence and unknown cost without retrying", a
 	expect(requests).toHaveLength(1);
 });
 test.each([
-	{ notes: [], files: [] }, // Empty selection.
+	{ notes: [], files: [] },
 	{ notes: [], files: ["src/value.ts", "script.py"] }, // Touched path missing.
 	{ notes: [{ kind: "instruction", text: "change code" }], files: [] },
 	{ notes: [{ kind: "observation", text: "line\nbreak" }], files: [] },
@@ -609,4 +622,44 @@ test("bounds capsule failure messages and redacts credentials and external paths
 	expect(capsuleFailureMessage(new Error("Capsule does not follow symlinks"))).toBe(
 		"Capsule does not follow symlinks",
 	);
+});
+
+test.each([
+	"https://public.example",
+	"http://127.0.0.1:1",
+	"http://127.5.6.7",
+	"http://localhost",
+	"http://[::1]",
+	"http://10.1.2.3",
+	"http://172.16.0.1",
+	"http://172.31.255.255",
+	"http://192.168.1.2",
+	"http://100.64.0.0",
+	"http://100.127.255.255",
+	"http://arch.tail87c1d7.ts.net:8317",
+	"http://100.100.1.2:8317",
+])("PR #7: capsule accepts private HTTP or HTTPS transport %s", async (base) => {
+	const f = fixture();
+	vi.stubEnv("FACTORY_CAPSULE_PROVIDER_BASE_URL", base);
+	vi.stubEnv("FACTORY_CAPSULE_API_KEY", "fixture-only");
+	const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("No network"));
+	const result = await createCapsuleCaller().reduce(f.generate(), f.text);
+	expect(result.accounting.calls).toBe(1);
+	expect(fetch.mock.calls.map(([url]) => url)).toEqual([`${base}/v1/chat/completions`]);
+});
+
+test.each([
+	["src/value.tsx", ["src/value.tsx"]],
+	["src/value.ts", ["src/value.ts"]],
+	["src/value.tsx then src/value.ts", ["src/value.ts", "src/value.tsx"]],
+	...[" ", "\n", '"', "'", "`", "]", ")", "}", ",", ";", ":12", "!", "?", ".", ". Next"].map((end) => [
+		`src/value.ts${end}`,
+		["src/value.ts"],
+	]),
+	...[".bak", "-old", "_old", "/child", "\\child", "+old", "é"].map((end) => [`src/value.ts${end}`, []]),
+])("PR #7 Q8: capsule ownership ends at a path boundary in %s", (text, expected) => {
+	const f = fixture();
+	f.file("src/value.tsx", "export const View = 1;");
+	const capsule = generateOneironCapsule(f.workspace, head, f.packet, String(text));
+	expect(capsule.files.map((file) => file.path)).toEqual(expected);
 });
