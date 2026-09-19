@@ -87,6 +87,7 @@ const parseCases: Array<[string, string[], Expected]> = [
 	["--thinking", ["--thinking", "high"], { thinking: "high" }],
 	["--models is comma separated", ["--models", "gpt-4o,claude-sonnet"], { models: ["gpt-4o", "claude-sonnet"] }],
 	["--no-session", ["--no-session"], { noSession: true }],
+	["--daemon-hosted", ["--mode", "json", "--daemon-hosted"], { mode: "json", daemonHosted: true }],
 	["--extension", ["--extension", "./a.ts"], { extensions: ["./a.ts"] }],
 	["-e", ["-e", "./a.ts"], { extensions: ["./a.ts"] }],
 	["repeated extension flags", ["--extension", "./a.ts", "-e", "./b.ts"], { extensions: ["./a.ts", "./b.ts"] }],
@@ -226,6 +227,7 @@ const parseCases: Array<[string, string[], Expected]> = [
 
 /** argv -> one diagnostic the parser must report as a hard error. */
 const errorCases: Array<[string, string[], string]> = [
+	["hosted + no-session", ["--daemon-hosted", "--no-session"], "--daemon-hosted cannot be combined with --no-session"],
 	[
 		"--export was removed",
 		["--export", "session.jsonl"],

@@ -213,6 +213,7 @@ const TOP_LEVEL_OPTION_GROUPS: ReadonlyArray<{ heading: string; options: readonl
 			["--offline", "Disable startup network operations"],
 			["--verbose", "Force verbose startup"],
 			["--daemon-socket <path>", "Use a specific daemon socket"],
+			["--daemon-hosted", "Let the daemon own this non-interactive session so it can be attached"],
 		],
 	},
 	{

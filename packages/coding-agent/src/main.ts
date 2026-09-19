@@ -182,7 +182,14 @@ function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc" | "acp" | "dae
 	return appMode === "json" ? "json" : "text";
 }
 
-export function isClientOwnedDaemonSession(appMode: AppMode, noSession?: boolean): boolean {
+/**
+ * A non-ACP session is owned by its client and disappears with it, which is why a print or json run never shows up
+ * in the agents view. `--daemon-hosted` hands it to the daemon instead: the session is resident, listed as running
+ * and attachable from another terminal while this process keeps consuming its stream. A session-less run has
+ * nothing to host, so it stays client-owned.
+ */
+export function isClientOwnedDaemonSession(appMode: AppMode, noSession?: boolean, daemonHosted?: boolean): boolean {
+	if (daemonHosted === true && noSession !== true) return false;
 	return appMode !== "acp" || noSession === true;
 }
 
@@ -1623,7 +1630,7 @@ export async function main(args: string[], options?: MainOptions) {
 				config: defaultSessionConfig,
 				sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile(),
 				continueRecent: parsed.continue,
-				clientOwned: isClientOwnedDaemonSession(appMode, parsed.noSession),
+				clientOwned: isClientOwnedDaemonSession(appMode, parsed.noSession, parsed.daemonHosted),
 				noSession: parsed.noSession,
 				supportsExtensionUi: appMode === "rpc",
 			}));

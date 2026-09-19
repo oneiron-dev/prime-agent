@@ -60,6 +60,7 @@ const GLOBAL_BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
 	"--version",
 	"--continue",
 	"--no-session",
+	"--daemon-hosted",
 	"--no-tools",
 	"--no-builtin-tools",
 	"--no-extensions",

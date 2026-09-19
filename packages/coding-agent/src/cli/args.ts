@@ -25,6 +25,8 @@ export interface Args {
 	jsonEventProfile?: JsonEventProfile;
 	daemonSocket?: string;
 	noSession?: boolean;
+	/** Let the daemon own this non-interactive session, so it is listed as running and can be attached. */
+	daemonHosted?: boolean;
 	fork?: string;
 	sessionDir?: string;
 	models?: string[];
@@ -182,6 +184,8 @@ export function parseArgs(args: string[]): Args {
 			}
 		} else if (arg === "--no-session") {
 			result.noSession = true;
+		} else if (arg === "--daemon-hosted") {
+			result.daemonHosted = true;
 		} else if (arg === "--fork") {
 			if (hasRequiredOptionValue(args, i, arg, result)) {
 				result.fork = args[++i];
@@ -383,6 +387,9 @@ export function parseArgs(args: string[]): Args {
 
 	if (result.jsonEventProfile !== undefined && result.mode !== "json") {
 		result.diagnostics.push({ type: "error", message: "--json-event-profile requires --mode json" });
+	}
+	if (result.daemonHosted && result.noSession) {
+		result.diagnostics.push({ type: "error", message: "--daemon-hosted cannot be combined with --no-session" });
 	}
 	return result;
 }

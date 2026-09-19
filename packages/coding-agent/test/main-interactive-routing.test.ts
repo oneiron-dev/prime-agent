@@ -30,12 +30,16 @@ import type { SessionSummary } from "../src/modes/index.js";
 
 describe("interactive startup routing", () => {
 	test.each([
-		["acp", false, false],
-		["acp", true, true],
-		["rpc", false, true],
-		["print", false, true],
-	] as const)("classifies %s noSession=%s ownership", (appMode, noSession, expected) => {
-		expect(isClientOwnedDaemonSession(appMode, noSession)).toBe(expected);
+		["acp", false, undefined, false],
+		["acp", true, undefined, true],
+		["rpc", false, undefined, true],
+		["print", false, undefined, true],
+		// A factory seat is a json print run that must still be listed and attachable, so the daemon owns it.
+		["json", undefined, true, false],
+		["print", undefined, true, false],
+		["json", true, true, true],
+	] as const)("classifies %s noSession=%s hosted=%s ownership", (appMode, noSession, hosted, expected) => {
+		expect(isClientOwnedDaemonSession(appMode, noSession, hosted)).toBe(expected);
 	});
 
 	test.each(["interactive", "print", "json", "rpc"] as const)(
