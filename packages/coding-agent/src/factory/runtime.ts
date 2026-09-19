@@ -89,6 +89,15 @@ export function factoryRuntimeChange(pin: FactoryFilePin): string | undefined {
 
 export const FACTORY_JSON_EVENT_PROFILE = "factory-completed";
 
+/**
+ * The directory holding the factory's own executables, shipped beside this module: `bin/cargo` is the wrapper that
+ * sends a worktree's cargo call to a build host. Prepending this directory to PATH is how both the ticket runner
+ * and every seat child reach it.
+ */
+export function factoryCargoBinDirectory(module = factoryRuntimeProcess().module): string {
+	return join(dirname(module), "bin");
+}
+
 /** Native owned frontend, not a daemon-free CLI flag. Clear worker authority and the launcher's own credentials. */
 export function factoryOwnedEnvironment(): Record<string, string> {
 	return {

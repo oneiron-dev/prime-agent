@@ -1,0 +1,121 @@
+#!/bin/bash
+# Factory cargo wrapper. The ticket runner puts this directory first on PATH for itself and for every seat, so
+# both its own test step and the writers' own `cargo ...` calls land here.
+#
+# Rule (owner, 2026-09-17): portable work runs on a Mac first, then the next Mac, then the ticket host. Builds never
+# run on the writers' host while a build host is reachable.
+#
+# A call is offloaded only when the git toplevel of the current directory is $W7_CARGO_WORK/wt/<KEY>. The worktree is
+# synced to <root>/wt/<KEY> on the first reachable build host (target and .git excluded, so the remote target/ is a
+# persistent per-ticket cache), the same arguments run in the same relative directory, output streams back, and the
+# exit code is the remote one. Source-changing subcommands (fmt, fix, clippy) sync the tree back first.
+# Outside a worktree, with no build host configured, when none can be reached, or with W7_CARGO_LOCAL=1, the real
+# cargo runs here.
+#
+# Environment, set by the factory: W7_CARGO_WORK (absolute work root), W7_CARGO_HOSTS (`sshHost:root` entries joined
+# by ';', in order), W7_CARGO_REAL (optional explicit path to the real cargo), W7_CARGO_LOCAL=1 (force local).
+# Login shells on the build hosts are fish, so every remote command is `/bin/bash -s` with the script on stdin.
+set -u
+
+self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+
+real_cargo() {
+	if [ -n "${W7_CARGO_REAL:-}" ]; then
+		printf '%s' "$W7_CARGO_REAL"
+		return
+	fi
+	local part
+	local IFS=:
+	for part in $PATH; do
+		[ -n "$part" ] || part=.
+		[ "$part" = "$self_dir" ] && continue
+		if [ -x "$part/cargo" ]; then
+			printf '%s' "$part/cargo"
+			return
+		fi
+	done
+	printf '%s' "$HOME/.cargo/bin/cargo"
+}
+
+local_cargo() { exec "$(real_cargo)" "$@"; }
+
+[ "${W7_CARGO_LOCAL:-}" = "1" ] && local_cargo "$@"
+[ -n "${W7_CARGO_WORK:-}" ] && [ -n "${W7_CARGO_HOSTS:-}" ] || local_cargo "$@"
+
+top=$(git rev-parse --show-toplevel 2>/dev/null) || local_cargo "$@"
+top=$(cd -- "$top" && pwd -P) || local_cargo "$@"
+work=$(cd -- "$W7_CARGO_WORK" 2>/dev/null && pwd -P) || work=$W7_CARGO_WORK
+case "$top" in
+"$work"/wt/*) ;;
+*) local_cargo "$@" ;;
+esac
+key=${top#"$work"/wt/}
+case "$key" in */* | "") local_cargo "$@" ;; esac
+
+# Path of the caller's directory relative to the worktree root; "." at the root.
+here=$(pwd -P)
+rel=${here#"$top"}
+[ "$rel" = "$here" ] && [ "$here" != "$top" ] && local_cargo "$@"
+rel=${rel#/}
+[ -n "$rel" ] || rel=.
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30)
+
+# One cargo call per ticket at a time, so two seats on the same worktree never race the same remote tree.
+lock_dir=$W7_CARGO_WORK/locks
+mkdir -p "$lock_dir" 2>/dev/null
+if command -v flock >/dev/null 2>&1; then
+	exec 9>"$lock_dir/cargo-$key.lock" && flock 9
+fi
+
+# The remote run inherits nothing from here, so the knobs that matter travel explicitly.
+forward=""
+for name in CARGO_BUILD_JOBS RUST_TEST_THREADS RUSTFLAGS RUSTDOCFLAGS CARGO_INCREMENTAL CARGO_PROFILE; do
+	value=${!name:-}
+	[ -n "$value" ] && forward="$forward export $name=$(printf '%q' "$value");"
+done
+args=$(printf '%q ' "$@")
+
+IFS=';' read -ra entries <<<"$W7_CARGO_HOSTS"
+for entry in "${entries[@]}"; do
+	[ -n "$entry" ] || continue
+	host=${entry%%:*}
+	root=${entry#*:}
+	[ -n "$host" ] && [ -n "$root" ] && [ "$host" != "$entry" ] || continue
+	dst=$root/wt/$key
+	err=$(mktemp 2>/dev/null) || err=$lock_dir/cargo-$key.err
+	if ! ssh "${SSH_OPTS[@]}" "$host" /bin/bash -s <<-REMOTE 2>"$err"
+		set -eu
+		mkdir -p $(printf '%q' "$dst")
+	REMOTE
+	then
+		echo "[factory-cargo] $host unreachable ($(tail -n 1 "$err" 2>/dev/null)); trying the next build host" >&2
+		rm -f "$err" 2>/dev/null
+		continue
+	fi
+	if ! rsync -a --delete --exclude target --exclude .git -e "ssh ${SSH_OPTS[*]}" "$top/" "$host:$dst/" 2>>"$err"; then
+		echo "[factory-cargo] sync to $host failed ($(tail -n 1 "$err" 2>/dev/null)); trying the next build host" >&2
+		rm -f "$err" 2>/dev/null
+		continue
+	fi
+	rm -f "$err" 2>/dev/null
+	ssh "${SSH_OPTS[@]}" "$host" /bin/bash -s <<-REMOTE
+		set -u
+		export PATH="\$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+		export CARGO_TERM_COLOR=never
+		unset CARGO_TARGET_DIR
+		$forward
+		cd $(printf '%q' "$dst/$rel") || exit 1
+		exec cargo $args
+	REMOTE
+	rc=$?
+	case "${1:-}" in
+	fmt | fix | clippy)
+		rsync -a --exclude target --exclude .git -e "ssh ${SSH_OPTS[*]}" "$host:$dst/" "$top/" 2>/dev/null
+		;;
+	esac
+	exit $rc
+done
+
+echo "[factory-cargo] no build host could be reached; running cargo on this host" >&2
+local_cargo "$@"
