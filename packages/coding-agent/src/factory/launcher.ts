@@ -73,6 +73,17 @@ export function readLauncherSettings(path: string): OneironLauncherSettings {
 		throw new Error("launcher.docs must be an absolute path");
 	if (typeof value.host !== "string" || !value.host.trim())
 		throw new Error("launcher.host must name a configured host");
+	if (value.idleMs !== undefined && (!Number.isSafeInteger(value.idleMs) || value.idleMs < 60_000))
+		throw new Error("launcher.idleMs must be at least 60000; it is silence detection, never a work limit");
+	if (value.buildHosts !== undefined) {
+		if (!Array.isArray(value.buildHosts)) throw new Error("launcher.buildHosts must be an array");
+		for (const host of value.buildHosts) {
+			if (!host || typeof host.sshHost !== "string" || !host.sshHost.trim() || host.sshHost.includes(":"))
+				throw new Error("launcher.buildHosts[].sshHost must be an ssh destination without a colon");
+			if (typeof host.root !== "string" || !isAbsolute(host.root))
+				throw new Error("launcher.buildHosts[].root must be an absolute path");
+		}
+	}
 	return value;
 }
 
@@ -86,8 +97,12 @@ export function ticketEntryArgv(): string[] {
 	return [process.execPath, ...process.execArgv, entry];
 }
 
-export const SUBMIT_TIMEOUT_MS = 12 * 3_600_000;
-export const MERGE_TIMEOUT_MS = 6 * 3_600_000;
+/**
+ * A backstop far beyond any real ticket, never a work limit. A ticket ends because its writer finished, its tests
+ * settled or a seat went silent (the runner's own idle detector), never because a clock ran out while it worked.
+ */
+export const SUBMIT_TIMEOUT_MS = 72 * 3_600_000;
+export const MERGE_TIMEOUT_MS = 72 * 3_600_000;
 
 /** Two actions per ticket: submit (writer through bots) and merge. blocked_by edges become dependencies on both. */
 export function launcherPlan(

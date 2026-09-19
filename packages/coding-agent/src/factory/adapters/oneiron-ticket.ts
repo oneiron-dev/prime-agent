@@ -14,6 +14,7 @@ import {
 	writeSync,
 } from "node:fs";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
 	type FixCategory,
 	pinnedReviewTier,
@@ -25,7 +26,12 @@ import {
 	routeTrivialFix,
 	routingSeatsFromEnvironment,
 } from "../routing.js";
-import { FACTORY_JSON_EVENT_PROFILE, factoryOwnedEnvironment, locateFactoryCli } from "../runtime.js";
+import {
+	FACTORY_JSON_EVENT_PROFILE,
+	factoryCargoBinDirectory,
+	factoryOwnedEnvironment,
+	locateFactoryCli,
+} from "../runtime.js";
 import { fetchOneironBotReviews, type OneironBotComment, REQUIRED_REVIEWERS } from "./oneiron-review.js";
 
 /** One model seat: a prime-agent print session, or any command that takes the prompt as its last argument. */
@@ -47,7 +53,21 @@ export interface OneironLauncherSettings {
 	cargoJobs?: number;
 	diskFloorGiB?: number;
 	seats?: Partial<Record<"writer" | "pack" | "grok" | "opus", OneironSeat>>;
-	timeouts?: Partial<{ seatMs: number; testMs: number; ghMs: number; botsMs: number; writerRounds: number }>;
+	/**
+	 * Silence, never a clock. A seat or cargo run whose stream produces nothing for this long is killed and the
+	 * round continues in the same session. A model that is still working is never interrupted.
+	 */
+	idleMs?: number;
+	/** Ordered build hosts for cargo. The first reachable one runs it; an empty list keeps cargo on this host. */
+	buildHosts?: OneironBuildHost[];
+	timeouts?: Partial<{ ghMs: number; botsMs: number }>;
+}
+/** A host that runs cargo for this factory: the worktree is synced to `<root>/wt/<key>` and cargo runs there. */
+export interface OneironBuildHost {
+	/** ssh destination, e.g. `olety@100.124.216.116`. */
+	sshHost: string;
+	/** Absolute directory on that host; build trees live under `<root>/wt/<key>`. */
+	root: string;
 }
 export interface OneironTicketRun {
 	version: 1;
@@ -71,6 +91,8 @@ export interface OneironTicketState {
 	writer?: { rounds: number; final: string };
 	split?: string;
 	tests?: { crates: string[]; ran: number; rounds: number };
+	/** Seats killed for silence, newest last. A working model never lands here. */
+	idleKills?: Array<{ at: string; step: string; idleMs: number }>;
 	review?: { tier: RoutingAnswer<ReviewTier>; verdicts: Record<string, string>; fixRound?: boolean; recheck?: string };
 	attribution?: string[];
 	pr?: number;
@@ -90,7 +112,14 @@ export const DEFAULT_SEATS: Record<"writer" | "pack" | "grok" | "opus", OneironS
 	grok: { provider: "cpa-r", model: "grok-4.6", thinking: "xhigh" },
 	opus: { provider: "cpa-r", model: "claude-opus-5", thinking: "xhigh" },
 };
-const DEFAULT_TIMEOUTS = { seatMs: 3_600_000, testMs: 2_400_000, ghMs: 300_000, botsMs: 2_700_000, writerRounds: 12 };
+/** gh and git are network calls, not models; they keep a wall clock. Nothing that runs a model does. */
+const DEFAULT_TIMEOUTS = { ghMs: 300_000, botsMs: 2_700_000 };
+/** No event on a seat's stream for this long means the seat is gone, not thinking. */
+export const DEFAULT_IDLE_MS = 30 * 60_000;
+/** A round that writes nothing at all and exits non-zero is a seat that cannot start; enough of them is a failure. */
+const MAX_SILENT_ROUNDS = 20;
+/** The exit code the runner reports for a stream that went silent. Distinct from 124, which no longer happens. */
+export const SEAT_IDLE_EXIT_CODE = 125;
 
 /** Every seat prompt carries these sentences; the passivity fix lives in words, not checks. */
 export const INITIATIVE_LINES = [
@@ -215,6 +244,8 @@ export class OneironTicketRunner {
 			env?: NodeJS.ProcessEnv;
 			routing?: RoutingSeats;
 			now?: () => number;
+			/** Pause after a round whose seat process failed to start or died. Never a limit on the work itself. */
+			retryDelayMs?: number;
 		} = {},
 	) {
 		const l = ticket.launcher;
@@ -230,6 +261,8 @@ export class OneironTicketRunner {
 			cargoJobs: l.cargoJobs ?? 4,
 			diskFloorGiB: l.diskFloorGiB ?? 100,
 			seats: { ...DEFAULT_SEATS, ...l.seats },
+			idleMs: l.idleMs ?? DEFAULT_IDLE_MS,
+			buildHosts: l.buildHosts ?? [],
 			timeouts: { ...DEFAULT_TIMEOUTS, ...l.timeouts },
 		};
 		this.directory = join(this.settings.work, "tickets", ticket.key);
@@ -255,14 +288,43 @@ export class OneironTicketRunner {
 	private stateOf(key: string): OneironTicketState | undefined {
 		return readState(join(this.settings.work, "tickets", key, "state.json"));
 	}
+	/**
+	 * The blockers as the launcher last wrote them, re-read on every wait iteration. A relaunch that corrects a
+	 * ticket's DAG therefore reaches a runner that is already waiting, with no restart.
+	 */
+	private blockers(): string[] {
+		try {
+			const run = readTicketRun(join(this.directory, "ticket.json"));
+			if (!isDeepStrictEqual(run.blockedBy, this.ticket.blockedBy)) {
+				this.log(
+					"blockers",
+					`ticket.json changed: ${this.ticket.blockedBy.join(",") || "-"} → ${run.blockedBy.join(",") || "-"}`,
+				);
+				this.ticket.blockedBy = run.blockedBy;
+			}
+		} catch {}
+		return this.ticket.blockedBy;
+	}
 
-	/** Every external command has a hard deadline; on expiry the child is terminated and the failure recorded. */
+	/**
+	 * gh and git get a wall clock because they are network calls. A model or a build gets `idleMs` instead: the
+	 * deadline moves forward on every byte the child writes, so work that is still producing is never interrupted
+	 * and only silence ends it.
+	 */
 	async run(
 		argv: string[],
-		options: { cwd?: string; timeoutMs?: number; env?: Record<string, string>; logName?: string } = {},
+		options: {
+			cwd?: string;
+			timeoutMs?: number;
+			idleMs?: number;
+			env?: Record<string, string>;
+			logName?: string;
+			onIdle?: (idleMs: number) => void;
+		} = {},
 	): Promise<Exec> {
 		const cwd = options.cwd ?? this.worktree;
-		const timeoutMs = options.timeoutMs ?? this.t.ghMs;
+		const idleMs = options.idleMs;
+		const timeoutMs = idleMs === undefined ? (options.timeoutMs ?? this.t.ghMs) : idleMs;
 		return new Promise((resolve) => {
 			const child = spawn(argv[0]!, argv.slice(1), {
 				cwd,
@@ -270,13 +332,22 @@ export class OneironTicketRunner {
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			let output = "";
-			let timedOut = false;
-			const timer = setTimeout(() => {
-				timedOut = true;
-				child.kill("SIGTERM");
-				setTimeout(() => child.kill("SIGKILL"), 10_000).unref();
-			}, timeoutMs);
+			let expired = false;
+			let timer: NodeJS.Timeout;
+			const arm = () => {
+				timer = setTimeout(() => {
+					expired = true;
+					if (idleMs !== undefined) options.onIdle?.(idleMs);
+					child.kill("SIGTERM");
+					setTimeout(() => child.kill("SIGKILL"), 10_000).unref();
+				}, timeoutMs);
+			};
+			arm();
 			const collect = (chunk: Buffer) => {
+				if (idleMs !== undefined && !expired) {
+					clearTimeout(timer);
+					arm();
+				}
 				output += chunk.toString();
 				if (output.length > 64 * 1024 * 1024) output = output.slice(-32 * 1024 * 1024);
 			};
@@ -290,12 +361,28 @@ export class OneironTicketRunner {
 				clearTimeout(timer);
 				if (options.logName)
 					appendFileSync(join(this.directory, "logs", options.logName), `\n=== ${argv.join(" ")}\n${output}`);
+				const note = idleMs === undefined ? "TIMEOUT" : `IDLE ${Math.round(idleMs / 1000)}s`;
 				resolve({
-					code: timedOut ? 124 : (code ?? (signal ? 128 : 1)),
-					output: timedOut ? `${output}\nTIMEOUT` : output,
+					code: expired ? (idleMs === undefined ? 124 : SEAT_IDLE_EXIT_CODE) : (code ?? (signal ? 128 : 1)),
+					output: expired ? `${output}\n${note}` : output,
 				});
 			});
 		});
+	}
+	/**
+	 * The ruled build order, as environment. The wrapper shipped beside this module goes first on PATH, so both
+	 * this runner's own cargo and every cargo the writers call from their worktree land on a build host.
+	 * With no build hosts configured nothing is prepended and cargo stays on this host.
+	 */
+	cargoEnvironment(): Record<string, string> {
+		const hosts = this.settings.buildHosts;
+		if (!hosts.length) return {};
+		const path = (this.options.env ?? process.env).PATH ?? "";
+		return {
+			PATH: `${factoryCargoBinDirectory()}:${path}`,
+			W7_CARGO_WORK: this.settings.work,
+			W7_CARGO_HOSTS: hosts.map((h) => `${h.sshHost}:${h.root}`).join(";"),
+		};
 	}
 	private async git(args: string[], cwd = this.worktree): Promise<string> {
 		const result = await this.run(["git", ...args], { cwd, timeoutMs: this.t.ghMs });
@@ -318,12 +405,15 @@ export class OneironTicketRunner {
 		return match[1]!;
 	}
 
-	/** One seat call. prime-agent print mode with the owned frontend, or an explicit command. */
+	/**
+	 * One seat call. prime-agent print mode with the owned frontend, daemon-hosted so the session is attachable
+	 * from another terminal while this stream is consumed, or an explicit command. The only guard is silence.
+	 */
 	async seat(
 		name: "writer" | "pack" | "grok" | "opus",
 		prompt: string,
 		options: { system?: string; session?: string; continueSession?: boolean; logName: string },
-	): Promise<{ code: number; final: string }> {
+	): Promise<{ code: number; final: string; bytes: number; idle: boolean }> {
 		const spec = this.settings.seats[name] ?? DEFAULT_SEATS[name];
 		const logPath = join(this.directory, "logs", options.logName);
 		let argv: string[];
@@ -337,6 +427,7 @@ export class OneironTicketRunner {
 				"json",
 				"--json-event-profile",
 				FACTORY_JSON_EVENT_PROFILE,
+				"--daemon-hosted",
 				"--offline",
 				"--provider",
 				spec.provider,
@@ -355,11 +446,28 @@ export class OneironTicketRunner {
 				prompt,
 			];
 		}
-		const result = await this.run(argv, { timeoutMs: this.t.seatMs, env: factoryOwnedEnvironment() });
+		const step = options.logName.replace(/\.jsonl$/, "");
+		const result = await this.run(argv, {
+			idleMs: this.settings.idleMs,
+			env: { ...factoryOwnedEnvironment(), ...this.cargoEnvironment() },
+			onIdle: (idleMs) => this.noteIdle(step, idleMs),
+		});
 		writeFileSync(logPath, result.output, { flag: "a" });
 		const final =
 			"command" in spec ? result.output.trim() : finalAssistantText(result.output) || tail(result.output, 40);
-		return { code: result.code, final };
+		return {
+			code: result.code,
+			final,
+			bytes: Buffer.byteLength(result.output),
+			idle: result.code === SEAT_IDLE_EXIT_CODE,
+		};
+	}
+	/** A seat that went silent is killed and journaled; the round continues in the same session. */
+	private noteIdle(step: string, idleMs: number): void {
+		this.log("seat idle", `${step}: no event for ${Math.round(idleMs / 60_000)} min; killing the seat process`);
+		this.save({
+			idleKills: [...(this.state.idleKills ?? []), { at: new Date().toISOString(), step, idleMs }],
+		});
 	}
 
 	// ---- prompts -------------------------------------------------------------------------------------------------
@@ -447,7 +555,7 @@ ${rendered || "(no bot comments)"}`;
 	private async chooseBase(): Promise<{ base: string; stacked: boolean; chain: string[] }> {
 		const remoteTrunk = `${this.settings.remote}/${this.settings.trunk}`;
 		for (let waited = 0; ; waited++) {
-			const parents = this.ticket.blockedBy.map((key) => ({ key, state: this.stateOf(key) }));
+			const parents = this.blockers().map((key) => ({ key, state: this.stateOf(key) }));
 			const unmerged = parents.filter((p) => !p.state?.merged);
 			if (unmerged.length === 0) return { base: remoteTrunk, stacked: false, chain: [] };
 			if (unmerged.length === 1 && unmerged[0]!.state?.pr) {
@@ -514,11 +622,17 @@ ${rendered || "(no bot comments)"}`;
 		this.save({ pack: true });
 		this.log("pack", `rc=${result.code} bytes=${Buffer.byteLength(result.final)}`);
 	}
-	/** Rounds of one session until the writer says DONE; a fresh session name starts a fresh writer. */
-	private async writerRounds(session: string, prompt: string, continueLine: string): Promise<string> {
+	/**
+	 * Rounds of one session until the writer says DONE; a fresh session name starts a fresh writer. Rounds are
+	 * unbounded: a writer holding an ultralarge packet may work for many hours and no count may end it. The only
+	 * exit that is not the writer's own is a run of rounds that produced no stream at all, which is a seat that
+	 * cannot start rather than a model that is still working.
+	 */
+	async writerRounds(session: string, prompt: string, continueLine: string): Promise<string> {
 		const { key } = this.ticket;
 		let final = "";
-		for (let round = 1; round <= this.t.writerRounds; round++) {
+		let silent = 0;
+		for (let round = 1; ; round++) {
 			const result = await this.seat("writer", round === 1 ? prompt : continueLine, {
 				system: this.writerSystem(),
 				session,
@@ -526,12 +640,17 @@ ${rendered || "(no bot comments)"}`;
 				logName: `${session}.r${round}.jsonl`,
 			});
 			final = result.final;
-			this.log(`writer:${session}`, `round ${round} rc=${result.code} final=${JSON.stringify(final.slice(-160))}`);
+			this.log(
+				`writer:${session}`,
+				`round ${round} rc=${result.code}${result.idle ? " (seat idle)" : ""} bytes=${result.bytes} final=${JSON.stringify(final.slice(-160))}`,
+			);
 			if (final.includes(`DONE ${key}`)) return final;
 			if (final.includes(`BLOCKED ${key}`)) throw new TicketFailure(`writer BLOCKED: ${final.slice(-600)}`);
-			if (result.code !== 0) await sleep(30_000);
+			silent = result.bytes === 0 && result.code !== 0 ? silent + 1 : 0;
+			if (silent >= MAX_SILENT_ROUNDS)
+				throw new TicketFailure(`the writer seat produced no output in ${silent} consecutive rounds`);
+			if (result.code !== 0) await sleep(this.options.retryDelayMs ?? 30_000);
 		}
-		throw new TicketFailure(`writer did not finish in ${this.t.writerRounds} rounds`);
 	}
 	private continueLine(): string {
 		return `Continue the same ticket. Finish and end with the exact line \`DONE ${this.ticket.key}\` or \`BLOCKED ${this.ticket.key}\`. ${INITIATIVE_LINES}`;
@@ -582,13 +701,15 @@ ${rendered || "(no bot comments)"}`;
 			const target = join(this.settings.work, "target", this.ticket.key);
 			const argv = ["cargo", "test", "--no-fail-fast", ...crates.flatMap((c) => ["-p", c])];
 			const result = await this.run(argv, {
-				timeoutMs: this.t.testMs,
+				idleMs: this.settings.idleMs,
 				env: {
+					...this.cargoEnvironment(),
 					CARGO_TARGET_DIR: target,
 					CARGO_BUILD_JOBS: String(this.settings.cargoJobs),
 					RUST_TEST_THREADS: String(this.settings.cargoJobs),
 				},
 				logName: "cargo-test.log",
+				onIdle: (idleMs) => this.noteIdle("cargo-test", idleMs),
 			});
 			let ran = 0;
 			for (const match of result.output.matchAll(/^test result: \w+\. (\d+) passed; (\d+) failed;/gm))
@@ -939,7 +1060,7 @@ ${rendered || "(no bot comments)"}`;
 
 	private async waitForParents(): Promise<void> {
 		for (let waited = 0; ; waited++) {
-			const pending = this.ticket.blockedBy.filter((key) => !this.stateOf(key)?.merged);
+			const pending = this.blockers().filter((key) => !this.stateOf(key)?.merged);
 			if (!pending.length) return;
 			if (waited % 10 === 0) this.log("merge", `waiting for blockers to merge: ${pending.join(", ")}`);
 			await sleep(60_000);

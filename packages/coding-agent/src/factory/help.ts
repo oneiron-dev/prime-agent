@@ -18,7 +18,10 @@ The factory is a DAG launcher: an action is one foreground command; exit 0 accep
 launch reads the ticket DAG (tickets with blocked_by) and the contracts, and imports two actions per ticket: submit and merge.
 submit cuts a worktree, has Muse write the context pack, runs the Astra writer until DONE, tests the touched crates, reviews by tier, publishes and closes the bot round.
 merge waits for the blockers, syncs the native stack or squash-merges the lone PR. A writer's SPLIT: leftover becomes one follow-up ticket while serve runs.
-launcher.json: {"host":"arch","repo":"/abs/oneiron","docs":"/abs/oneiron-docs","work":"/abs/w7-build","buildSlots":4,"diskFloorGiB":100,"seats":{...}}
+launcher.json: {"host":"arch","repo":"/abs/oneiron","docs":"/abs/oneiron-docs","work":"/abs/w7-build","buildSlots":4,"diskFloorGiB":100,"idleMs":1800000,"buildHosts":[{"sshHost":"user@host","root":"/abs/build"}],"seats":{...}}
+launch on known tickets rewrites every ticket.json and re-imports the actions that have not started; started ones keep their spec.
+No clock ever ends a working seat: idleMs kills a seat or cargo run only after its stream has been silent that long, and writer rounds are unbounded.
+buildHosts, in order, run every cargo call made inside <work>/wt/<key>, the runner's own and the writers'; the first reachable one wins, else cargo runs here.
 New factories start paused. Resume prints the ledger catch-up, recomputes the frontier, unpauses and runs one scheduling tick.
 Resume exits 1 for an owner pause or idle_with_backlog (READY work with nothing RUNNING after the tick); the latter opens a wake.
 A changed installed runtime is journaled at resume and never refused. Resume never removes an external owner pause file.

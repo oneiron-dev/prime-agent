@@ -10,9 +10,11 @@ import {
 	type OneironLauncherSettings,
 	type OneironTicketRun,
 	OneironTicketRunner,
+	SEAT_IDLE_EXIT_CODE,
 	SEAT_POLICY_LINE,
 	WRITER_LINES,
 } from "../src/factory/adapters/oneiron-ticket.js";
+import { factoryCargoBinDirectory } from "../src/factory/runtime.js";
 
 const roots: string[] = [];
 const FAKE_GH = `#!/usr/bin/env node
@@ -118,7 +120,8 @@ function setup() {
 		githubRepo: "org/repo",
 		diskFloorGiB: 0,
 		seats: { writer: seat, pack: seat, grok: seat, opus: seat },
-		timeouts: { seatMs: 60_000, testMs: 60_000, ghMs: 60_000, botsMs: 0, writerRounds: 3 },
+		idleMs: 60_000,
+		timeouts: { ghMs: 60_000, botsMs: 0 },
 	};
 	const ticket = (key: string, blockedBy: string[] = []): OneironTicketRun => ({
 		version: 1,
@@ -216,6 +219,80 @@ describe("Oneiron ticket runner", () => {
 		expect(after).toContain("stack sync");
 		expect(after).toContain("stack merge --squash --yes");
 		expect(beta.state.merged).toBe(true);
+	});
+
+	it("kills a silent seat, keeps a talking one, and lets the writer run past any round count", async () => {
+		const f = setup();
+		// A seat that prints nothing and outlives the idle window, and one that keeps talking through it.
+		writeFileSync(join(f.root, "quiet.js"), "setTimeout(() => process.stdout.write('too late'), 60_000);\n");
+		writeFileSync(
+			join(f.root, "chatty.js"),
+			`let n = 0;
+const tick = 60;
+const t = setInterval(() => {
+  process.stdout.write('{"type":"tool_execution_end"}\\n');
+  if (++n === 8) { clearInterval(t); process.stdout.write("DONE chatty\\n"); }
+}, tick);
+`,
+		);
+		const runner = new OneironTicketRunner(f.ticket("idle-one"), { env: f.env, routing: {} });
+		mkdirSync(runner.worktree, { recursive: true });
+
+		// idleMs is the only guard: silence ends the seat, output past it does not.
+		const silent = await runner.run([process.execPath, join(f.root, "quiet.js")], {
+			cwd: runner.worktree,
+			idleMs: 300,
+			onIdle: (ms) => runner.log("seat idle", `write.r1: no event for ${ms} ms`),
+		});
+		expect(silent.code).toBe(SEAT_IDLE_EXIT_CODE);
+		expect(silent.output).toContain("IDLE");
+		expect(readFileSync(runner.logPath, "utf8")).toContain("seat idle");
+		const talking = await runner.run([process.execPath, join(f.root, "chatty.js")], {
+			cwd: runner.worktree,
+			idleMs: 300,
+		});
+		expect([talking.code, talking.output.includes("DONE chatty")]).toEqual([0, true]);
+
+		// Rounds are unbounded: the old cap was 12, so a writer that only finishes on round 15 must still finish.
+		writeFileSync(
+			join(f.root, "late.js"),
+			`const fs = require("node:fs"), p = process.env.FAKE_ROOT + "/rounds";
+const n = (fs.existsSync(p) ? Number(fs.readFileSync(p, "utf8")) : 0) + 1;
+fs.writeFileSync(p, String(n));
+process.stdout.write("round " + n + "\\n");
+if (n < 15) process.exit(1);
+process.stdout.write("DONE late-one\\n");
+`,
+		);
+		const late = f.ticket("late-one");
+		late.launcher = {
+			...f.launcher,
+			seats: { ...f.launcher.seats, writer: { command: [process.execPath, join(f.root, "late.js")] } },
+		};
+		const writer = new OneironTicketRunner(late, { env: f.env, routing: {}, retryDelayMs: 0 });
+		mkdirSync(writer.worktree, { recursive: true });
+		const final = await writer.writerRounds("write", "start", "continue");
+		expect([final.includes("DONE late-one"), readFileSync(join(f.root, "rounds"), "utf8")]).toEqual([true, "15"]);
+	});
+
+	it("sends cargo to the ruled build hosts and leaves it alone with none configured", () => {
+		const f = setup();
+		const plain = new OneironTicketRunner(f.ticket("plain"), { env: f.env, routing: {} });
+		expect(plain.cargoEnvironment()).toEqual({});
+		const offloaded = f.ticket("offloaded");
+		offloaded.launcher = {
+			...f.launcher,
+			buildHosts: [
+				{ sshHost: "olety@100.124.216.116", root: "/Volumes/Cinema/w7-build" },
+				{ sshHost: "olety@100.81.227.117", root: "/Users/olety/w7-build" },
+			],
+		};
+		const environment = new OneironTicketRunner(offloaded, { env: f.env, routing: {} }).cargoEnvironment();
+		expect(environment.W7_CARGO_HOSTS).toBe(
+			"olety@100.124.216.116:/Volumes/Cinema/w7-build;olety@100.81.227.117:/Users/olety/w7-build",
+		);
+		expect(environment.W7_CARGO_WORK).toBe(f.work);
+		expect(environment.PATH?.startsWith(`${factoryCargoBinDirectory()}:`)).toBe(true);
 	});
 
 	it("reads the final assistant text from a factory-completed stream and reclaims dead slot locks", async () => {
