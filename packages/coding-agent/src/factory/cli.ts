@@ -182,11 +182,20 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 				engine.supersede(argument, choice, evidence(options), expectedRevision(options));
 				emit(engine.status());
 				break;
-			case "resolve":
-				if (!argument) throw new Error("resolve requires attempt-id and evidence proving safe retry");
-				engine.resolveForRetry(argument, evidence(options));
-				emit(engine.status());
+			case "resolve": {
+				// A mass restart resolves every vanished attempt at once, under one piece of evidence.
+				const attempts = positionals.slice(2);
+				if (!attempts.length)
+					throw new Error("resolve requires one or more attempt ids and evidence proving safe retry");
+				const shared = evidence(options);
+				const resolved: string[] = [];
+				for (const attempt of attempts) {
+					engine.resolveForRetry(attempt, shared);
+					resolved.push(attempt);
+				}
+				emit({ resolved, ...engine.status() });
 				break;
+			}
 			case "serve":
 			case "run":
 				await serve(engine, integer(options.get("--interval-ms"), 1000, 50), () => {

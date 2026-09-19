@@ -11,7 +11,7 @@ export const FACTORY_HELP = `Usage:
   prime factory pause <directory> [reason]
   prime factory resume <directory>
   prime factory supersede <directory> <rejected-action> <replacement-action> --expected-revision <revision> --actor <actor> --reason <reason> --ref <evidence>
-  prime factory resolve <directory> <attempt-id> --actor <actor> --reason <reason> --ref <evidence>
+  prime factory resolve <directory> <attempt-id...> --actor <actor> --reason <reason> --ref <evidence>
 
 Factory mode is optional and runs separately from Prime sessions. State and results are JSON.
 The factory is a DAG launcher: an action is one foreground command; exit 0 accepts it and readies its dependents, any other exit rejects it.
@@ -33,6 +33,7 @@ Only foreground commands are supported; daemonized/detached descendants require 
 Plans use argv arrays and absolute cwd paths. Use fingerprint for verified Git source identity.
 fingerprint --timeout-ms accepts integers 1..120000 (default 20000 ms); launch and inspect deadlines are unchanged.
 resolve intentionally retries and requires evidence that any previous process tree is gone; it does not kill or inspect it for you.
+resolve accepts several attempt ids so one mass restart carries one piece of evidence.
 supersede explicitly replaces rejected work; it preserves history and does not accept the replacement or dependencies.
 Plan imports keep started actions and source identities immutable; no-op imports keep the revision.
 Opaque source fingerprints are labels only; use an explicit validating wrapper for other source formats.`;
