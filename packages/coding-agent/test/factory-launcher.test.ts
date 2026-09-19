@@ -56,7 +56,13 @@ it("turns the ticket DAG into submit and merge actions, then stacks a writer's S
 	store.pause("initialized");
 	const entry = [process.execPath, "/entry.js"];
 	const launched = launchTickets(store, settings, tickets, entry);
-	expect(launched).toEqual({ imported: ["OF-1-a", "OF-1-b"], existing: [], revision: 1 });
+	expect(launched).toEqual({
+		imported: ["OF-1-a", "OF-1-b"],
+		existing: [],
+		rewritten: ["OF-1-a", "OF-1-b"],
+		frozen: [],
+		revision: 1,
+	});
 	const actions = Object.fromEntries(store.actions().map((a) => [a.id, a]));
 	expect(Object.keys(actions)).toEqual(["OF-1-a:submit", "OF-1-a:merge", "OF-1-b:submit", "OF-1-b:merge"]);
 	expect(actions["OF-1-b:submit"]).toMatchObject({
@@ -80,8 +86,33 @@ it("turns the ticket DAG into submit and merge actions, then stacks a writer's S
 	expect(launchTickets(store, settings, tickets, entry)).toEqual({
 		imported: [],
 		existing: ["OF-1-a", "OF-1-b"],
+		rewritten: ["OF-1-a", "OF-1-b"],
+		frozen: [],
 		revision: 1,
 	});
+
+	// A relaunch with a corrected DAG rewrites ticket.json and re-imports the actions that have not started.
+	const corrected = tickets.map((t) => (t.key === "OF-1-b" ? { ...t, blockedBy: [] } : t));
+	const relaunched = launchTickets(store, settings, corrected, entry);
+	expect(relaunched).toMatchObject({ imported: [], rewritten: ["OF-1-a", "OF-1-b"], frozen: [], revision: 2 });
+	expect(store.actions().find((a) => a.id === "OF-1-b:submit")).toMatchObject({
+		state: "READY",
+		dependencies: [],
+	});
+	expect(store.actions().find((a) => a.id === "OF-1-b:merge")?.dependencies).toEqual(["OF-1-b:submit"]);
+	expect(JSON.parse(readFileSync(join(root, "work", "tickets", "OF-1-b", "ticket.json"), "utf8")).blockedBy).toEqual(
+		[],
+	);
+
+	// A started action keeps its spec: the relaunch reports it frozen instead of failing the whole launch.
+	store.resume();
+	const claimed = store.claim("OF-1-a:submit", "slot:OF-1-a:submit");
+	expect(store.markSubmitted(claimed!.attempt.id)).toBe(true);
+	const afterStart = launchTickets(store, settings, tickets, entry);
+	expect(afterStart).toMatchObject({ frozen: ["OF-1-a:submit"], rewritten: ["OF-1-a", "OF-1-b"] });
+	expect(store.actions().find((a) => a.id === "OF-1-a:submit")?.dependencies).toEqual([]);
+	expect(store.actions().find((a) => a.id === "OF-1-b:submit")?.dependencies).toEqual(["OF-1-a:submit"]);
+	store.pause("initialized");
 
 	mkdirSync(join(root, "work", "tickets", "OF-1-a"), { recursive: true });
 	writeFileSync(

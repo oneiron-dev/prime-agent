@@ -154,20 +154,33 @@ export function launcherPlan(
 	return { version: 1, tickets: tickets.map((t) => ({ id: t.key, owner: "launcher" })), slots, actions };
 }
 
-/** Import the DAG. Tickets already in the ledger are left alone; new ones join with their edges. */
+/**
+ * Import the DAG, and re-import it on every later launch. Every ticket's `ticket.json` is rewritten with today's
+ * blockers and launcher settings, and every action that has not started is re-imported so a corrected dependency
+ * reaches the queue. Actions that already started keep their spec; the store treats it as immutable and their
+ * slot is left alone so a claimed slot is never rewritten either.
+ */
 export function launchTickets(
 	store: FactoryStore,
 	settings: OneironLauncherSettings,
 	tickets: LauncherTicket[],
 	entryArgv = ticketEntryArgv(),
-): { imported: string[]; existing: string[]; revision: number } {
+): { imported: string[]; existing: string[]; rewritten: string[]; frozen: string[]; revision: number } {
 	const known = new Set(store.tickets().map((t) => t.id));
-	const fresh = tickets.filter((t) => !known.has(t.key));
-	const plan = launcherPlan(fresh, settings, entryArgv, known);
-	const revision = fresh.length ? store.applyPlan(plan, store.planRevision()) : store.planRevision();
+	const plan = launcherPlan(tickets, settings, entryArgv, known);
+	const frozen = plan.actions.filter((action) => store.actionStarted(action.id)).map((action) => action.id);
+	const kept = new Set(frozen);
+	const next: FactoryPlan = {
+		...plan,
+		actions: plan.actions.filter((action) => !kept.has(action.id)),
+		slots: plan.slots.filter((slot) => !kept.has(slot.id.replace(/^slot:/, ""))),
+	};
+	const revision = next.actions.length ? store.applyPlan(next, store.planRevision()) : store.planRevision();
 	return {
-		imported: fresh.map((t) => t.key),
+		imported: tickets.filter((t) => !known.has(t.key)).map((t) => t.key),
 		existing: tickets.filter((t) => known.has(t.key)).map((t) => t.key),
+		rewritten: tickets.map((t) => t.key),
+		frozen,
 		revision,
 	};
 }

@@ -208,6 +208,20 @@ export class FactoryStore {
 	planRevision(): number {
 		return Number(this.meta("plan_revision"));
 	}
+	/**
+	 * Whether `applyPlan` would refuse a changed spec for this action. The same two conditions it enforces: the
+	 * action left the queue, or an attempt for it was ever submitted. A relaunch asks this before rewriting.
+	 */
+	actionStarted(actionId: string): boolean {
+		const action = this.db.prepare("SELECT state FROM actions WHERE id=?").get(actionId);
+		if (!action) return false;
+		if (action.state !== "QUEUED" && action.state !== "READY") return true;
+		return (
+			this.db
+				.prepare("SELECT id FROM attempts WHERE action_id=? AND submitted_at IS NOT NULL LIMIT 1")
+				.get(actionId) !== undefined
+		);
+	}
 	isPaused(): boolean {
 		return this.meta("paused") === "true";
 	}
