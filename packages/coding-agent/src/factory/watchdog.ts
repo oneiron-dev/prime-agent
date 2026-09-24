@@ -85,23 +85,24 @@ export function reduceSignals(
 	const latest = new Map(snapshot.status.attempts.map((attempt) => [attempt.actionId, attempt]));
 	for (const action of snapshot.status.actions) {
 		const attempt = latest.get(action.id);
-		const key = `action:${action.id}:${attempt?.id ?? "none"}`;
+		// One key per exception class, so a lost runner or a provider failure never hides a later rejection.
+		const key = `${action.id}:${attempt?.id ?? "none"}`;
 		if (action.state === "REJECTED" || action.state === "UNCERTAIN" || attempt?.state === "UNCERTAIN")
 			signal(
-				key,
+				`action:${key}`,
 				`${action.id}: ${action.state === "UNCERTAIN" || attempt?.state === "UNCERTAIN" ? "UNCERTAIN" : "REJECTED"}; inspect tickets/${action.ticketId}/state.json and attempt ${attempt?.id ?? "unknown"}. No automatic retry performed.`,
 			);
 		if (attempt?.state === "RUNNING" || attempt?.state === "SUBMITTED") {
 			suspects[attempt.id] = snapshot.lost.includes(attempt.id) ? (suspects[attempt.id] ?? 0) + 1 : 0;
 			if (suspects[attempt.id]! >= 2)
 				signal(
-					key,
+					`lost:${key}`,
 					`${action.id}: the runner identity was missing twice with no terminal receipt (${attempt.id}); reconcile custody before any retry.`,
 				);
 			const failure = snapshot.failures[action.ticketId];
 			if (failure && failure !== state.failures?.[action.ticketId])
 				signal(
-					key,
+					`provider:${key}:${failure}`,
 					`${action.id}: new structured provider failure (${failure}); inspect the retained ticket evidence. No provider bypass or retry performed.`,
 				);
 		}
@@ -349,7 +350,7 @@ export async function runFactoryWatchdogCli(args: string[]): Promise<number> {
 		!isAbsolute(factory) ||
 		!session?.trim() ||
 		(stateDirectory !== undefined && !isAbsolute(stateDirectory)) ||
-		(diskLowGiB !== undefined && !(diskLowGiB >= 0))
+		(diskLowGiB !== undefined && !(Number.isFinite(diskLowGiB) && diskLowGiB >= 0))
 	) {
 		console.error(USAGE);
 		return 2;

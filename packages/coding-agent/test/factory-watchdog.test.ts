@@ -40,14 +40,29 @@ it("alerts once per new exception, baselines known ones, confirms a lost runner 
 	expect(reduceSignals(state, fresh, options)).toHaveLength(0);
 	const disk = (freeGiB: number) => reduceSignals(state, snapshot([], [], freeGiB), options).length;
 	expect([disk(29), disk(35), disk(29), disk(41), disk(29)]).toEqual([1, 0, 0, 0, 1]);
-	const lost = snapshot([["a", "RUNNING"]], [["attempt-2", "RUNNING"]], 50, ["attempt-2"]);
+	// A provider failure, then a lost runner, then a rejection of the same attempt: each alerts once.
+	const failing = {
+		...snapshot([["a", "RUNNING"]], [["attempt-2", "RUNNING"]]),
+		failures: { "T-a": "user_prompt_too_long" },
+	};
+	expect(reduceSignals(state, failing, options).map((alert) => alert.key)).toEqual([
+		"provider:a:attempt-2:user_prompt_too_long",
+	]);
+	const lost = {
+		...snapshot([["a", "RUNNING"]], [["attempt-2", "RUNNING"]], 50, ["attempt-2"]),
+		failures: failing.failures,
+	};
 	expect([lost, lost, lost].map((next) => reduceSignals(state, next, options).length)).toEqual([0, 1, 0]);
+	const rejected = snapshot([["a", "REJECTED"]], [["attempt-2", "TERMINAL"]]);
+	expect(reduceSignals(state, rejected, options).map((alert) => alert.key)).toEqual(["action:a:attempt-2"]);
 	const serveGone = { ...snapshot([], []), serve: false };
 	expect(reduceSignals(state, serveGone, options).map((alert) => alert.key)).toEqual(["serve-lost:0"]);
 	expect(state.outbox?.map((alert) => alert.key)).toEqual([
 		"action:b:none",
 		"disk-low:1",
 		"disk-low:2",
+		"provider:a:attempt-2:user_prompt_too_long",
+		"lost:a:attempt-2",
 		"action:a:attempt-2",
 		"serve-lost:0",
 	]);
