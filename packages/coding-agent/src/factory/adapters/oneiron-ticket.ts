@@ -678,10 +678,11 @@ ${diff}`;
 			)
 			.join("\n\n");
 		return `Same ticket ${this.ticket.key}, same worktree, pull request ${repo}#${pr} (branch ${this.branch}).
-Below is EVERY bot comment on the pull request, unfiltered. Read each one and decide it on the merits.
-For every real defect: fix it in this worktree, commit with a plain message, and run the tests of the crates you touched.
+Below is EVERY bot comment on the pull request, unfiltered. It is a snapshot, not proof that all current feedback is gathered.
+Before any fix, fetch and read the latest complete Qodo, Codex and CodeRabbit reviews, pull request comments, inline comments and review threads (with pagination), and this ticket's internal reviewer findings. Read every finding in full, deduplicate overlapping defects across sources, and decide each distinct finding on its merits before editing. Keep the source comment ids when deduplicating so no feedback disappears. A pending or queued bot review is not an unavailable one.
+For every real defect: fix it in this worktree, commit with a plain message, and run the tests of the crates you touched. Skip an invalid or inapplicable finding only with an explicit reason.
 Reply on each inline thread with what you did or why not: \`gh api repos/${repo}/pulls/${pr}/comments/<id>/replies -f body=<text>\` for review_comment entries.
-Then post exactly one summary comment on the pull request: \`gh pr comment ${pr} --repo ${repo} --body <text>\` listing each comment id and its disposition.
+After the fixes, post exactly one summary comment on the pull request: \`gh pr comment ${pr} --repo ${repo} --body <text>\`. Map each source comment id and each internal finding to its disposition, say what changed, what was skipped and why, and the validation you ran with its actual result. Never claim validation that did not run.
 Never push, never merge, never close the pull request; the launcher pushes after you stop.
 ${WRITER_LINES}
 ${INITIATIVE_LINES}
@@ -897,9 +898,20 @@ ${rendered || "(no bot comments)"}`;
 			release();
 		}
 	}
+	/**
+	 * A cargo run that went silent proves nothing about the source: it is an infrastructure failure, never a test
+	 * verdict and never a reason for a fix round. The retained log stays the evidence.
+	 */
+	private idleCargo(result: { code: number; ran: number; output: string }, when: string): void {
+		if (result.code === SEAT_IDLE_EXIT_CODE)
+			throw new TicketFailure(
+				`infrastructure: the cargo run ${when} went idle (rc=${result.code}, ran=${result.ran}); no source verdict and no passing gate. Check the build host and slot custody before a retry; logs/cargo-test.log is the evidence. ${tail(result.output, 12)}`,
+			);
+	}
 	private async tests(label: string): Promise<void> {
 		let result = await this.cargoTest();
 		this.log(label, `rc=${result.code} ran=${result.ran} crates=${result.crates.join(",")}`);
+		this.idleCargo(result, `for ${label}`);
 		let rounds = 0;
 		if (result.code !== 0) {
 			rounds = 1;
@@ -912,6 +924,7 @@ ${rendered || "(no bot comments)"}`;
 			);
 			result = await this.cargoTest();
 			this.log(`${label}:2`, `rc=${result.code} ran=${result.ran}`);
+			this.idleCargo(result, `after the ${label} fix round, whose source failure stays unresolved`);
 			if (result.code !== 0)
 				throw new TicketFailure(
 					result.ran === 0
