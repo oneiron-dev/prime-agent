@@ -135,7 +135,7 @@ export interface OneironTicketState {
 }
 
 export type SeatName = "writer" | "pack" | "grok" | "opus";
-/** The review seat the pre-merge review uses. */
+/** Tier two's single reviewer slot, so the pre-merge review runs on the model that reviewed at PR open. */
 const PRE_MERGE_SEAT = "grok";
 /** The seats a review tier can name. `grok` is only the slot name; the launcher decides its model. */
 export type ReviewSeat = "grok" | "opus";
@@ -1681,11 +1681,13 @@ ${rendered || "(no bot comments)"}`;
 					"the pull request head changed while its required checks were read; retry the merge",
 				);
 			const pending = rows.filter((row) => !["pass", "skipping"].includes(row.bucket ?? ""));
-			if (view.mergeable === "MERGEABLE" && !pending.length && checks.code !== 8) {
+			// Under skipFactoryTests the required checks are the only tests: none reported is not a pass.
+			const ungated = this.settings.skipFactoryTests && rows.length === 0;
+			if (view.mergeable === "MERGEABLE" && !pending.length && !ungated && checks.code !== 8) {
 				if (view.mergeStateStatus === "BEHIND") return "behind";
 				if (["CLEAN", "HAS_HOOKS", "UNSTABLE"].includes(view.mergeStateStatus ?? "")) return "ready";
 			}
-			const status = `head=${head} mergeable=${view.mergeable} state=${view.mergeStateStatus} requiredPending=${pending.map((row) => row.name).join(",") || "-"}`;
+			const status = `head=${head} mergeable=${view.mergeable} state=${view.mergeStateStatus} requiredPending=${pending.map((row) => row.name).join(",") || (ungated ? "none reported, and skipFactoryTests needs one" : "-")}`;
 			if (status !== last) {
 				this.log("merge:wait", status);
 				last = status;

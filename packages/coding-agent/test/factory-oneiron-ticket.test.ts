@@ -303,7 +303,14 @@ describe("Oneiron ticket runner", () => {
 		const f = setup();
 		const ticket = f.ticket("docs-one");
 		ticket.contract = "docs only: describe the flag.";
-		ticket.launcher = { ...f.launcher, noStacks: true, skipFactoryTests: true, skipBots: true, preMergeReview: true };
+		ticket.launcher = {
+			...f.launcher,
+			noStacks: true,
+			skipFactoryTests: true,
+			skipBots: true,
+			preMergeReview: true,
+			timeouts: { ...f.launcher.timeouts, ciMs: 0 },
+		};
 		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
 		// A ticket that touches no crate is not "zero tests ran": the factory runs no cargo at all.
 		await runner.submit();
@@ -318,6 +325,8 @@ describe("Oneiron ticket runner", () => {
 			const state = JSON.parse(readFileSync(join(f.root, "gh-state.json"), "utf8"));
 			writeFileSync(join(f.root, "gh-state.json"), JSON.stringify({ ...state, checks: rows }));
 		};
+		// With no factory tests, a pull request with no required check reported has nothing gating it.
+		await expect(runner.merge()).rejects.toThrow("requiredPending=none reported, and skipFactoryTests needs one");
 		const check = {
 			name: "Test",
 			state: "FAILURE",
