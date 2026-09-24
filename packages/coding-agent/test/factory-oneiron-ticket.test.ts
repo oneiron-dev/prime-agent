@@ -13,6 +13,7 @@ import {
 	SEAT_IDLE_EXIT_CODE,
 	SEAT_POLICY_LINE,
 	WRITER_LINES,
+	writerTerminal,
 } from "../src/factory/adapters/oneiron-ticket.js";
 import { factoryCargoBinDirectory } from "../src/factory/runtime.js";
 
@@ -271,8 +272,51 @@ process.stdout.write("DONE late-one\\n");
 		};
 		const writer = new OneironTicketRunner(late, { env: f.env, routing: {}, retryDelayMs: 0 });
 		mkdirSync(writer.worktree, { recursive: true });
-		const final = await writer.writerRounds("write", "start", "continue");
+		const { final } = await writer.writerRounds("write", "start", "continue");
 		expect([final.includes("DONE late-one"), readFileSync(join(f.root, "rounds"), "utf8")]).toEqual([true, "15"]);
+	});
+
+	it.each([
+		["DONE T1", { kind: "done", line: "DONE T1" }],
+		["Work finished.\nPR BODY:\nx\n\nDONE T1  \n\n", { kind: "done", line: "DONE T1" }],
+		["No token.\nBLOCKED T1: the fixture host is gone", { kind: "blocked", why: "the fixture host is gone" }],
+		["I will print DONE T1 when the build ends.", undefined],
+		["DONE T1\nStill running the tests.", undefined],
+		["DONE T1.", undefined],
+		["  DONE T1", undefined],
+		["BLOCKED T1", undefined],
+		["DONE T10", undefined],
+		["Example:\n```\nDONE T1\n```", undefined],
+		["Unclosed fence:\n~~~\nDONE T1", undefined],
+	])("a writer reply is terminal only on its exact last line outside a fence: %j", (final, expected) => {
+		const terminal = writerTerminal(final, "T1");
+		if (expected) expect(terminal).toMatchObject(expected);
+		else expect(terminal).toBeUndefined();
+	});
+
+	it("keeps a writer session going when DONE is only quoted, and ends it on the exact line", async () => {
+		const f = setup();
+		writeFileSync(
+			join(f.root, "quoting.js"),
+			`const fs = require("node:fs"), p = process.env.FAKE_ROOT + "/quoting";
+const n = (fs.existsSync(p) ? Number(fs.readFileSync(p, "utf8")) : 0) + 1;
+fs.writeFileSync(p, String(n));
+if (n === 1) process.stdout.write("The build is running; I will end with DONE quote-one once it passes.\\n");
+else if (n === 2) process.stdout.write("Template:\\n\`\`\`\\nDONE quote-one\\n\`\`\`\\n");
+else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
+`,
+		);
+		const quoting = f.ticket("quote-one");
+		quoting.launcher = {
+			...f.launcher,
+			seats: { ...f.launcher.seats, writer: { command: [process.execPath, join(f.root, "quoting.js")] } },
+		};
+		const writer = new OneironTicketRunner(quoting, { env: f.env, routing: {}, retryDelayMs: 0 });
+		mkdirSync(writer.worktree, { recursive: true });
+		const { final } = await writer.writerRounds("write", "start", "continue");
+		expect([final, readFileSync(join(f.root, "quoting"), "utf8")]).toEqual(["Tests pass.\nDONE quote-one", "3"]);
+		const intents = readFileSync(join(writer.directory, "routing.jsonl"), "utf8").trim().split("\n");
+		expect(intents.map((line) => JSON.parse(line).choice)).toEqual(["continue", "continue", "done"]);
 	});
 
 	it("sends cargo to the ruled build hosts and leaves it alone with none configured", () => {
@@ -295,20 +339,32 @@ process.stdout.write("DONE late-one\\n");
 		expect(environment.PATH?.startsWith(`${factoryCargoBinDirectory()}:`)).toBe(true);
 	});
 
-	it("reads the final assistant text from a factory-completed stream and reclaims dead slot locks", async () => {
+	it("reads the final assistant text only from an ended turn and reclaims dead slot locks", async () => {
+		const reply = (text: string, extra: Record<string, unknown> = {}) =>
+			JSON.stringify({
+				type: "message_end",
+				message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }], ...extra },
+			});
 		const stream = [
+			JSON.stringify({ type: "agent_start" }),
 			JSON.stringify({ type: "message_end", message: { role: "user", content: [{ type: "text", text: "no" }] } }),
-			JSON.stringify({
-				type: "message_end",
-				message: { role: "assistant", content: [{ type: "text", text: "first" }] },
-			}),
+			reply("first"),
 			"not json",
-			JSON.stringify({
-				type: "message_end",
-				message: { role: "assistant", content: [{ type: "text", text: "DONE x" }] },
-			}),
+			reply("DONE x"),
+			JSON.stringify({ type: "agent_end" }),
+			JSON.stringify({ type: "message_end", message: { role: "custom", content: [] } }),
 		].join("\n");
 		expect(finalAssistantText(stream)).toBe("DONE x");
+		// No agent_end, a tool call or a cut-off reply leaves no final text: earlier commentary is never reused.
+		expect(finalAssistantText(stream.split("\n").slice(0, 5).join("\n"))).toBe("");
+		expect(
+			finalAssistantText(
+				[reply("DONE x"), reply("", { content: [{ type: "toolCall" }] }), '{"type":"agent_end"}'].join("\n"),
+			),
+		).toBe("");
+		expect(finalAssistantText([reply("DONE x", { stopReason: "length" }), '{"type":"agent_end"}'].join("\n"))).toBe(
+			"",
+		);
 		const directory = mkdtempSync(join(tmpdir(), "factory-slots-"));
 		roots.push(directory);
 		writeFileSync(join(directory, "slot-1.lock"), "999999999");

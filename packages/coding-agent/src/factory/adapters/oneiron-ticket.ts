@@ -24,6 +24,7 @@ import {
 	type RoutingSeats,
 	routeReviewTier,
 	routeTrivialFix,
+	routeWriterContinuation,
 	routingSeatsFromEnvironment,
 } from "../routing.js";
 import {
@@ -149,8 +150,21 @@ interface Exec {
 	output: string;
 }
 
+type ContentBlock = { type?: unknown; text?: unknown };
+function contentText(content: ContentBlock[]): string {
+	return content
+		.filter((block) => block?.type === "text" && typeof block.text === "string")
+		.map((block) => block.text as string)
+		.join("");
+}
+
+/**
+ * The text of the last assistant reply of a turn that ended. A reply that called a tool, was cut off or errored
+ * leaves nothing, and so does a stream without `agent_end`: earlier commentary is never reused as the final.
+ */
 export function finalAssistantText(jsonl: string): string {
 	let final = "";
+	let ended = false;
 	for (const line of jsonl.split("\n")) {
 		if (!line.trim()) continue;
 		let event: unknown;
@@ -160,19 +174,70 @@ export function finalAssistantText(jsonl: string): string {
 			continue;
 		}
 		if (!event || typeof event !== "object") continue;
-		const record = event as Record<string, unknown>;
+		const record = event as { type?: unknown; message?: Record<string, unknown> };
+		// Compaction and harness metadata can arrive after agent_end; it is not a new turn.
+		if ((record.type === "message_start" || record.type === "message_end") && record.message?.role === "custom")
+			continue;
+		if (record.type === "agent_start" || record.type === "message_start") {
+			ended = false;
+			final = "";
+		}
+		if (record.type === "agent_end") {
+			ended = true;
+			continue;
+		}
 		if (record.type !== "message_end") continue;
-		const message = record.message as Record<string, unknown> | undefined;
-		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
-		const text = message.content
-			.filter(
-				(block: unknown) => !!block && typeof block === "object" && (block as { type?: string }).type === "text",
-			)
-			.map((block: unknown) => String((block as { text?: unknown }).text ?? ""))
-			.join("");
-		if (text.trim()) final = text;
+		ended = false;
+		final = "";
+		const message = record.message;
+		if (
+			message?.role !== "assistant" ||
+			message.stopReason !== "stop" ||
+			!Array.isArray(message.content) ||
+			(message.content as ContentBlock[]).some((block) => block?.type === "toolCall")
+		)
+			continue;
+		final = contentText(message.content as ContentBlock[]);
 	}
-	return final;
+	return ended ? final : "";
+}
+
+/** Lines of `text` that sit outside fenced code blocks; fence markers themselves are dropped. */
+function unfencedLines(text: string): { lines: string[]; open: boolean } {
+	const lines: string[] = [];
+	let fence: string | undefined;
+	for (const line of text.split(/\r?\n/)) {
+		const marker = line.match(/^ {0,3}(`{3,}|~{3,})/)?.[1];
+		if (marker) {
+			if (!fence) fence = marker;
+			else if (marker[0] === fence[0] && marker.length >= fence.length) fence = undefined;
+			lines.push("");
+			continue;
+		}
+		lines.push(fence ? "" : line);
+	}
+	return { lines, open: fence !== undefined };
+}
+
+export type WriterTerminal = { kind: "done"; line: string } | { kind: "blocked"; line: string; why: string };
+/**
+ * A writer reply is terminal only when its last non-empty line, outside any code fence, is exactly `DONE <key>` or
+ * `BLOCKED <key>: <why>`. The same words anywhere else, inside a fence or with other text on the line are not.
+ */
+export function writerTerminal(final: string, key: string): WriterTerminal | undefined {
+	const { lines, open } = unfencedLines(final);
+	if (open) return undefined;
+	const raw = final.split(/\r?\n/);
+	for (let index = lines.length - 1; index >= 0; index--) {
+		if (!raw[index]!.trim()) continue;
+		const line = lines[index]!.trimEnd();
+		if (line === `DONE ${key}`) return { kind: "done", line };
+		const blocked = `BLOCKED ${key}: `;
+		if (line.startsWith(blocked) && line.slice(blocked.length).trim())
+			return { kind: "blocked", line, why: line.slice(blocked.length).trim() };
+		return undefined;
+	}
+	return undefined;
 }
 
 function readState(path: string): OneironTicketState | undefined {
@@ -453,8 +518,8 @@ export class OneironTicketRunner {
 			onIdle: (idleMs) => this.noteIdle(step, idleMs),
 		});
 		writeFileSync(logPath, result.output, { flag: "a" });
-		const final =
-			"command" in spec ? result.output.trim() : finalAssistantText(result.output) || tail(result.output, 40);
+		// Never the raw stream: it carries the prompts, which quote the completion line.
+		const final = "command" in spec ? result.output.trim() : finalAssistantText(result.output);
 		return {
 			code: result.code,
 			final,
@@ -498,7 +563,6 @@ Return the pack as markdown under 5000 words. Your final message is the pack.`;
 		return `You are the Astra coding seat for one ticket. ${SEAT_POLICY_LINE} ${INITIATIVE_LINES} ${WRITER_LINES}`;
 	}
 	writerPrompt(): string {
-		const { key } = this.ticket;
 		return `${this.ticketHeader()}
 Context pack: .w7/CONTEXT.md (Muse wrote it; read it first). The docs are the intent; the code is what is.
 
@@ -512,10 +576,16 @@ Rules:
 7. If something cannot be done, one line \`COULD NOT: <what and why>\`, and still commit what works.
 ${WRITER_LINES}
 ${INITIATIVE_LINES}
-End your final reply with the exact line \`DONE ${key}\` (or \`BLOCKED ${key}\` with one reason).`;
+${this.completionRule()}`;
+	}
+	/** The only words that end a writer's rounds; see `writerTerminal`. */
+	completionRule(): string {
+		const { key } = this.ticket;
+		return `The last line of your final reply, outside any code fence, is exactly \`DONE ${key}\`, or \`BLOCKED ${key}: <why>\` when no useful authorized path remains. Nothing after it. Any other reply continues this session.`;
 	}
 	fixPrompt(what: string, output: string): string {
-		return `Same ticket ${this.ticket.key}, same worktree. ${what} Fix it, keep commits small, commit, run the tests of the crates you touched, and stop with the exact line \`DONE ${this.ticket.key}\`.
+		return `Same ticket ${this.ticket.key}, same worktree. ${what} Fix it, keep commits small, commit and run the tests of the crates you touched.
+${this.completionRule()}
 ${INITIATIVE_LINES}
 Output tail:
 ${tail(output, 160)}`;
@@ -546,7 +616,7 @@ Then post exactly one summary comment on the pull request: \`gh pr comment ${pr}
 Never push, never merge, never close the pull request; the launcher pushes after you stop.
 ${WRITER_LINES}
 ${INITIATIVE_LINES}
-End with the exact line \`DONE ${this.ticket.key}\`.
+${this.completionRule()}
 
 ${rendered || "(no bot comments)"}`;
 	}
@@ -622,15 +692,25 @@ ${rendered || "(no bot comments)"}`;
 		this.save({ pack: true });
 		this.log("pack", `rc=${result.code} bytes=${Buffer.byteLength(result.final)}`);
 	}
+	private routing(): RoutingSeats {
+		return this.options.routing ?? routingSeatsFromEnvironment(this.options.env ?? process.env);
+	}
 	/**
-	 * Rounds of one session until the writer says DONE; a fresh session name starts a fresh writer. Rounds are
-	 * unbounded: a writer holding an ultralarge packet may work for many hours and no count may end it. The only
-	 * exit that is not the writer's own is a run of rounds that produced no stream at all, which is a seat that
-	 * cannot start rather than a model that is still working.
+	 * Rounds of one session until the writer's last line is `DONE <key>` or `BLOCKED <key>: <why>`; a fresh session
+	 * name starts a fresh writer. Any other reply continues the session: Jev and the Grok advisor only tell a plain
+	 * continuation from a named split remainder, never a terminal verdict. Rounds are unbounded: a writer holding an
+	 * ultralarge packet may work for many hours and no count may end it. The only exit that is not the writer's own
+	 * is a run of rounds that produced no stream at all, which is a seat that cannot start rather than a model that
+	 * is still working.
 	 */
-	async writerRounds(session: string, prompt: string, continueLine: string): Promise<string> {
+	async writerRounds(
+		session: string,
+		prompt: string,
+		continueLine: string,
+	): Promise<{ final: string; split?: string }> {
 		const { key } = this.ticket;
 		let final = "";
+		let split: string | undefined;
 		let silent = 0;
 		for (let round = 1; ; round++) {
 			const result = await this.seat("writer", round === 1 ? prompt : continueLine, {
@@ -644,22 +724,51 @@ ${rendered || "(no bot comments)"}`;
 				`writer:${session}`,
 				`round ${round} rc=${result.code}${result.idle ? " (seat idle)" : ""} bytes=${result.bytes} final=${JSON.stringify(final.slice(-160))}`,
 			);
-			if (final.includes(`DONE ${key}`)) return final;
-			if (final.includes(`BLOCKED ${key}`)) throw new TicketFailure(`writer BLOCKED: ${final.slice(-600)}`);
+			const terminal = writerTerminal(final, key);
+			if (terminal) {
+				this.journalIntent(session, round, {
+					choice: terminal.kind,
+					decided_by: "code",
+					confidence: null,
+					reason: `exact last line: ${terminal.line}`,
+					wall_clock_ms: 0,
+				});
+				if (terminal.kind === "done") return { final, ...(split ? { split } : {}) };
+				throw new TicketFailure(`writer BLOCKED: ${terminal.line}\n${final.slice(-600)}`);
+			}
+			const intent =
+				result.code === 0 && !result.idle
+					? await routeWriterContinuation({ key, session, final }, this.routing())
+					: {
+							choice: "continue" as const,
+							decided_by: "code" as const,
+							confidence: null,
+							reason: "the seat did not end its turn cleanly",
+							wall_clock_ms: 0,
+						};
+			this.journalIntent(session, round, intent);
+			if (intent.choice === "split") split = final.match(/^SPLIT:\s*(.+)$/m)?.[1]?.trim() || tail(final, 20);
 			silent = result.bytes === 0 && result.code !== 0 ? silent + 1 : 0;
 			if (silent >= MAX_SILENT_ROUNDS)
 				throw new TicketFailure(`the writer seat produced no output in ${silent} consecutive rounds`);
 			if (result.code !== 0) await sleep(this.options.retryDelayMs ?? 30_000);
 		}
 	}
+	private journalIntent(session: string, round: number, answer: RoutingAnswer<string>): void {
+		appendFileSync(
+			join(this.directory, "routing.jsonl"),
+			`${JSON.stringify({ stage: "writer_completion", session, round, ...answer })}\n`,
+		);
+		this.log(`writer:${session}:intent`, `${answer.choice} by ${answer.decided_by}: ${answer.reason}`);
+	}
 	private continueLine(): string {
-		return `Continue the same ticket. Finish and end with the exact line \`DONE ${this.ticket.key}\` or \`BLOCKED ${this.ticket.key}\`. ${INITIATIVE_LINES}`;
+		return `Continue the same ticket. ${this.completionRule()} ${INITIATIVE_LINES}`;
 	}
 	private async write(): Promise<void> {
 		if (this.state.writer) return;
-		const final = await this.writerRounds("write", this.writerPrompt(), this.continueLine());
+		const { final, split: routed } = await this.writerRounds("write", this.writerPrompt(), this.continueLine());
 		await this.commitLeftovers(`${this.ticket.key}: writer leftovers`);
-		const split = final.match(/^SPLIT:\s*(.+)$/m)?.[1]?.trim();
+		const split = final.match(/^SPLIT:\s*(.+)$/m)?.[1]?.trim() || routed;
 		if (split) {
 			writeFileSync(
 				join(this.directory, "split.json"),
@@ -802,7 +911,7 @@ ${rendered || "(no bot comments)"}`;
 	}
 	private async review(): Promise<void> {
 		if (this.state.review) return;
-		const routing = this.options.routing ?? routingSeatsFromEnvironment(this.options.env ?? process.env);
+		const routing = this.routing();
 		const before = await this.diffAgainstBase();
 		const stat = this.numstat(before.stat);
 		const tier = await routeReviewTier(
@@ -1023,7 +1132,7 @@ ${rendered || "(no bot comments)"}`;
 	private async botRound(comments: OneironBotComment[]): Promise<void> {
 		if (this.state.botRound) return;
 		const repo = await this.githubRepo();
-		const final = await this.writerRounds(
+		const { final } = await this.writerRounds(
 			"bots",
 			this.botRoundPrompt(repo, this.state.pr!, comments),
 			this.continueLine(),
