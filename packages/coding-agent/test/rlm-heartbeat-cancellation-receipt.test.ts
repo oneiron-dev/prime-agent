@@ -23,12 +23,12 @@ describe("RLM heartbeat cancellation receipts", () => {
 		}
 	});
 
-	it("returns and persists an immutable receipt for an unrun owned heartbeat", () => {
+	it("returns and persists an immutable receipt for an unrun owned heartbeat", async () => {
 		const storePath = makeStorePath(tempDirs);
 		const store = new AgentCronJobStore(storePath);
-		const heartbeat = createHeartbeat(store);
+		const heartbeat = await createHeartbeat(store);
 
-		const receipt = store.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id, cancelledAt);
+		const receipt = await store.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id, cancelledAt);
 
 		expect(receipt).toEqual({
 			id: heartbeat.id,
@@ -51,12 +51,12 @@ describe("RLM heartbeat cancellation receipts", () => {
 
 	it("records run_count 0 and null last_run when the first firing deletes itself", async () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
-		const heartbeat = createHeartbeat(store);
-		let receipt: ReturnType<AgentCronJobStore["deleteRlmHeartbeat"]>;
+		const heartbeat = await createHeartbeat(store);
+		let receipt: Awaited<ReturnType<AgentCronJobStore["deleteRlmHeartbeat"]>>;
 		const scheduler = new AgentCronScheduler(store, {
 			now: () => new Date("2026-01-01T12:34:30.000Z"),
 			runJob: async () => {
-				receipt = store.deleteRlmHeartbeat(
+				receipt = await store.deleteRlmHeartbeat(
 					owner.activeSessionId,
 					heartbeat.id,
 					new Date("2026-01-01T12:34:30.100Z"),
@@ -76,12 +76,12 @@ describe("RLM heartbeat cancellation receipts", () => {
 		expect(store.listRlmHeartbeats(owner.activeSessionId)).toEqual([]);
 	});
 
-	it("snapshots the run count and last run after a heartbeat has fired", () => {
+	it("snapshots the run count and last run after a heartbeat has fired", async () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
-		const heartbeat = createHeartbeat(store);
-		store.recordRunResult(heartbeat.id, { now: new Date("2026-01-01T12:34:30.000Z") });
+		const heartbeat = await createHeartbeat(store);
+		await store.recordRunResult(heartbeat.id, { now: new Date("2026-01-01T12:34:30.000Z") });
 
-		const receipt = store.deleteRlmHeartbeat(
+		const receipt = await store.deleteRlmHeartbeat(
 			owner.activeSessionId,
 			heartbeat.id,
 			new Date("2026-01-01T12:34:40.000Z"),
@@ -96,12 +96,12 @@ describe("RLM heartbeat cancellation receipts", () => {
 		});
 	});
 
-	it("keeps the receipt when session shutdown cancels the heartbeat first", () => {
+	it("keeps the receipt when session shutdown cancels the heartbeat first", async () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
-		const heartbeat = createHeartbeat(store);
+		const heartbeat = await createHeartbeat(store);
 
-		store.cancelRlmHeartbeatsForSession(owner.activeSessionId, cancelledAt);
-		const receipt = store.deleteRlmHeartbeat(
+		await store.cancelRlmHeartbeatsForSession(owner.activeSessionId, cancelledAt);
+		const receipt = await store.deleteRlmHeartbeat(
 			owner.activeSessionId,
 			heartbeat.id,
 			new Date("2026-01-02T00:00:00.000Z"),
@@ -115,46 +115,46 @@ describe("RLM heartbeat cancellation receipts", () => {
 		});
 	});
 
-	it("fails closed for an unknown id or a heartbeat owned by another session", () => {
+	it("fails closed for an unknown id or a heartbeat owned by another session", async () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
-		const heartbeat = createHeartbeat(store);
+		const heartbeat = await createHeartbeat(store);
 
-		expect(store.deleteRlmHeartbeat(owner.activeSessionId, "missing", cancelledAt)).toBeUndefined();
-		expect(store.deleteRlmHeartbeat("other-active-session", heartbeat.id, cancelledAt)).toBeUndefined();
+		expect(await store.deleteRlmHeartbeat(owner.activeSessionId, "missing", cancelledAt)).toBeUndefined();
+		expect(await store.deleteRlmHeartbeat("other-active-session", heartbeat.id, cancelledAt)).toBeUndefined();
 		expect(store.listRlmHeartbeats(owner.activeSessionId)).toEqual([
 			expect.objectContaining({ id: heartbeat.id, status: "active" }),
 		]);
 	});
 
-	it("keeps prior owner identity immutable when the session gets a new active id", () => {
+	it("keeps prior owner identity immutable when the session gets a new active id", async () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
-		const heartbeat = createHeartbeat(store);
-		const receipt = store.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id, cancelledAt);
-		store.rebindSessionJobs({
+		const heartbeat = await createHeartbeat(store);
+		const receipt = await store.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id, cancelledAt);
+		await store.rebindSessionJobs({
 			activeSessionId: "child-active-2",
 			sessionId: owner.sessionId,
 			sessionFile: owner.sessionFile,
 			cwd: owner.cwd,
 		});
 
-		expect(store.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id)).toBeUndefined();
-		expect(store.deleteRlmHeartbeat("child-active-2", heartbeat.id)).toEqual(receipt);
+		expect(await store.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id)).toBeUndefined();
+		expect(await store.deleteRlmHeartbeat("child-active-2", heartbeat.id)).toEqual(receipt);
 		expect(receipt).toMatchObject({
 			ownerActiveSessionId: owner.activeSessionId,
 			ownerSessionId: owner.sessionId,
 		});
 	});
 
-	it("returns the same receipt after the authoritative session artifact store is reopened", () => {
+	it("returns the same receipt after the authoritative session artifact store is reopened", async () => {
 		const artifactDir = makeTempDir(tempDirs);
 		const firstStore = AgentCronJobStore.forSessionArtifacts();
 		firstStore.registerSessionArtifact(owner.sessionId, artifactDir);
-		const heartbeat = createHeartbeat(firstStore);
-		const firstReceipt = firstStore.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id, cancelledAt);
+		const heartbeat = await createHeartbeat(firstStore);
+		const firstReceipt = await firstStore.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id, cancelledAt);
 
 		const reopenedStore = AgentCronJobStore.forSessionArtifacts();
 		reopenedStore.registerSessionArtifact(owner.sessionId, artifactDir);
-		const reopenedReceipt = reopenedStore.deleteRlmHeartbeat(
+		const reopenedReceipt = await reopenedStore.deleteRlmHeartbeat(
 			owner.activeSessionId,
 			heartbeat.id,
 			new Date("2026-01-02T00:00:00.000Z"),
@@ -164,10 +164,10 @@ describe("RLM heartbeat cancellation receipts", () => {
 		expect(reopenedReceipt).toMatchObject({ cancelledAt: cancelledAt.toISOString() });
 	});
 
-	it("promotes a persisted cancelled entry into a receipt without replaying it", () => {
+	it("promotes a persisted cancelled entry into a receipt without replaying it", async () => {
 		const storePath = makeStorePath(tempDirs);
 		const initialStore = new AgentCronJobStore(storePath);
-		const heartbeat = createHeartbeat(initialStore);
+		const heartbeat = await createHeartbeat(initialStore);
 		const { nextRunAt: _nextRunAt, ...cancelledHeartbeat } = heartbeat;
 		writeFileSync(
 			storePath,
@@ -189,7 +189,7 @@ describe("RLM heartbeat cancellation receipts", () => {
 		);
 
 		const reopenedStore = new AgentCronJobStore(storePath);
-		const receipt = reopenedStore.deleteRlmHeartbeat(
+		const receipt = await reopenedStore.deleteRlmHeartbeat(
 			owner.activeSessionId,
 			heartbeat.id,
 			new Date("2026-01-02T00:00:00.000Z"),
@@ -201,13 +201,13 @@ describe("RLM heartbeat cancellation receipts", () => {
 			runCount: 0,
 			cancelledAt: cancelledAt.toISOString(),
 		});
-		expect(reopenedStore.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id)).toEqual(receipt);
+		expect(await reopenedStore.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id)).toEqual(receipt);
 	});
 
 	it("never executes a heartbeat after its cancellation receipt is committed", async () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
-		const heartbeat = createHeartbeat(store);
-		const receipt = store.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id, cancelledAt);
+		const heartbeat = await createHeartbeat(store);
+		const receipt = await store.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id, cancelledAt);
 		const prompts: string[] = [];
 		const scheduler = new AgentCronScheduler(store, {
 			now: () => new Date("2026-01-01T12:35:00.000Z"),
@@ -219,7 +219,7 @@ describe("RLM heartbeat cancellation receipts", () => {
 
 		expect(await scheduler.runDue(new Date("2026-01-01T12:35:00.000Z"))).toBe(0);
 		expect(prompts).toEqual([]);
-		expect(store.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id)).toEqual(receipt);
+		expect(await store.deleteRlmHeartbeat(owner.activeSessionId, heartbeat.id)).toEqual(receipt);
 	});
 });
 

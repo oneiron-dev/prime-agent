@@ -1,7 +1,6 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getModel } from "@earendil-works/pi-ai";
 import { setKeybindings } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -40,6 +39,7 @@ import * as savedSessionCatalog from "../src/modes/daemon/saved-session-catalog.
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
 import { initTheme, stopThemeWatcher, theme } from "../src/modes/interactive/theme/theme.js";
 import { WORKING_ICON_INTERVAL_MS } from "../src/modes/interactive/theme/working-icon.js";
+import { getCodingAgentFixtureModel } from "./fixture-models.js";
 
 const modeMocks = vi.hoisted(() => ({
 	interactiveRun: vi.fn<() => Promise<never>>(),
@@ -1157,7 +1157,7 @@ describe("AgentsViewMode", () => {
 			sessionName: "spender",
 			// Provider path deliberately mismatches the catalog provider: only the id's
 			// embedded path matters to the column stripper.
-			model: { ...getModel("openai", "gpt-4o"), id: "moonshotai/gpt-5.6-sol" },
+			model: { ...getCodingAgentFixtureModel("openai", "gpt-5"), id: "moonshotai/gpt-5.6-sol" },
 			thinkingLevel: "high",
 			created,
 			summary: "Analyzing runtime composition",
@@ -1170,7 +1170,7 @@ describe("AgentsViewMode", () => {
 			sessionFile: "/tmp/child.jsonl",
 			runtimeKind: "subagent",
 			parentActiveSessionId: "spender",
-			model: { ...getModel("openai", "gpt-4o"), provider: "prime-inference", id: "glm-5.2-fast" },
+			model: { ...getCodingAgentFixtureModel("openai", "gpt-5"), provider: "prime-inference", id: "glm-5.2-fast" },
 			thinkingLevel: "off",
 			created,
 			usage: { inputTokens: 500, outputTokens: 50, cost: 0.68 },
@@ -1182,7 +1182,7 @@ describe("AgentsViewMode", () => {
 			sessionFile: "/tmp/saved.jsonl",
 			rosterStatus: "inactive",
 			created,
-			model: { ...getModel("openai", "gpt-4o"), provider: "prime-inference", id: "glm-5.2-fast" },
+			model: { ...getCodingAgentFixtureModel("openai", "gpt-5"), provider: "prime-inference", id: "glm-5.2-fast" },
 			usage: { inputTokens: 900, outputTokens: 80, cost: 123.45 },
 		});
 		// Expand the parent so the child's "off" level renders on a real row.
@@ -1551,7 +1551,11 @@ describe("AgentsViewMode", () => {
 		try {
 			Reflect.set(view, "lastListedSummaries", [
 				summary({
-					model: { ...getModel("openai", "gpt-4o"), provider: "prime-inference", id: "internal/glm-5.3-fast" },
+					model: {
+						...getCodingAgentFixtureModel("openai", "gpt-5"),
+						provider: "prime-inference",
+						id: "internal/glm-5.3-fast",
+					},
 					usage: { inputTokens: 100, outputTokens: 10, cost: 0.12 },
 				}),
 			]);
@@ -2326,6 +2330,7 @@ describe("AgentsViewMode catalog performance", () => {
 			refreshHeartbeats: vi.fn(async () => true),
 			loadStartupNotices: vi.fn(),
 			loadAgentsViewState: vi.fn(),
+			refreshIncidentNotices: vi.fn(),
 			rebuildRows: vi.fn(),
 			clearCtrlCExitHint: vi.fn(),
 			clearDeleteConfirmation: vi.fn(),

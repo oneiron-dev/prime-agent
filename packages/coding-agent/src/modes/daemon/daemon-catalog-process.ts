@@ -10,7 +10,14 @@ import { ENV_AGENT_DIR, getAgentDir, getAgentsViewStatePath, getPackageDir, isBu
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readPinnedSessionIds } from "../../core/session-list-priority.js";
-import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
+import {
+	appendCustomMessageToExistingFile,
+	appendSessionInfoToExistingFile,
+	appendSessionStateToExistingFile,
+	readSessionInfo,
+	type SessionInfo,
+	SessionManager,
+} from "../../core/session-manager.js";
 import { spawnHidden } from "../../utils/child-process.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
@@ -266,8 +273,8 @@ export async function handleCatalogRequest(
 				});
 				return;
 			case "rename":
-				SessionManager.open(request.sessionPath).appendSessionInfo(request.name.trim());
-				send({ type: "response", id: request.id, success: true });
+				appendSessionInfoToExistingFile(request.sessionPath, request.name.trim());
+				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				return;
 			case "delete":
 				send({
@@ -289,7 +296,7 @@ export async function handleCatalogRequest(
 					return;
 				}
 				if (session.state?.status !== "archived") {
-					SessionManager.open(request.sessionPath).appendSessionState({ status: "archived" });
+					appendSessionStateToExistingFile(request.sessionPath, { status: "archived" });
 				}
 				send({
 					type: "response",
@@ -300,7 +307,8 @@ export async function handleCatalogRequest(
 				return;
 			}
 			case "mark_interrupted":
-				SessionManager.open(request.sessionPath).appendCustomMessageEntry(
+				appendCustomMessageToExistingFile(
+					request.sessionPath,
 					"prime-agent.worker_recovery",
 					"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
 					false,

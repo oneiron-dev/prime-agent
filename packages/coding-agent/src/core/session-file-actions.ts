@@ -8,7 +8,7 @@ import { getSessionArtifactPathForFile } from "./session-manager.js";
 export type DeleteSessionFileResult = { ok: true; method: "trash" | "unlink" } | { ok: false; error: string };
 
 export interface DeleteSessionFileOptions {
-	afterFileRemoved?: () => void;
+	afterFileRemoved?: () => void | Promise<void>;
 }
 
 export type ChildKernelCacheCleanupResult =
@@ -141,7 +141,7 @@ export async function deleteSessionFile(
 ): Promise<DeleteSessionFileResult> {
 	const result = await removeSessionFile(sessionPath);
 	if (result.ok) {
-		options.afterFileRemoved?.();
+		await options.afterFileRemoved?.();
 		await deleteSessionArtifacts(sessionPath);
 	}
 	return result;

@@ -7,7 +7,6 @@ import {
 	type AssistantMessage,
 	type Context,
 	createAssistantMessageEventStream,
-	getModel,
 	type TextContent,
 	type Usage,
 } from "@earendil-works/pi-ai";
@@ -19,7 +18,12 @@ import {
 	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 } from "../src/core/agent-messages.js";
-import { AgentSession, type RlmChildAgentSnapshot } from "../src/core/agent-session.js";
+import {
+	AgentSession,
+	compactRlmText,
+	RLM_CHILD_UPDATE_MIN_INTERVAL_MS,
+	type RlmChildAgentSnapshot,
+} from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { computeOwnAndTotalUsage } from "../src/core/context-tree.js";
 import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
@@ -39,10 +43,11 @@ import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import type { BashOperations } from "../src/core/tools/bash.js";
 import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
+import { getCodingAgentFixtureModel } from "./fixture-models.js";
 import { getMessageText } from "./suite/harness.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
-const model = getModel("anthropic", "claude-sonnet-4-5")!;
+const model = getCodingAgentFixtureModel("anthropic", "claude-sonnet-4-5");
 
 function userText(context: Context): string {
 	const lastMessage = context.messages[context.messages.length - 1] as AgentMessage | undefined;
@@ -106,7 +111,8 @@ interface InspectableRlmRun {
 	error?: string;
 	abandonedForQuiescence?: boolean;
 	activity?: { kind: string };
-	progressNotes?: string[];
+	lastStreamedUpdateMonotonicAt?: number;
+	progressNotes: string[];
 	emitUpdate?: () => void;
 	publication?: { promise: Promise<void>; resolve(): void; reject(error: Error): void };
 	settlement?: { promise: Promise<void>; resolve(): void; reject(error: Error): void };
@@ -170,6 +176,30 @@ function deferred<T = void>(): {
 }
 
 describe("AgentSession rlm recursion", () => {
+	/** Root whose hosted child runtime creation blocks until released. */
+	function createStartupGatedRoot(host: Partial<SubagentRuntimeHost> = {}): {
+		root: AgentSession;
+		hostedChild: AgentSession;
+		releaseStartup: () => void;
+		hasStarted: () => boolean;
+	} {
+		const gate = deferred<void>();
+		let started = false;
+		const hostedChild = createSession();
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					started = true;
+					await gate.promise;
+					return { session: hostedChild };
+				},
+				deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
+				...host,
+			},
+		});
+		return { root, hostedChild, releaseStartup: () => gate.resolve(), hasStarted: () => started };
+	}
+
 	it("holds a spawn name reservation until admission settles, then frees it", async () => {
 		const releaseAdmission = deferred<void>();
 		const root = createSession({
@@ -659,6 +689,27 @@ describe("AgentSession rlm recursion", () => {
 		);
 		releaseChild();
 		await runPromise;
+	});
+
+	it("admits a same-name respawn while the deleted child still unwinds", async () => {
+		const unblockUnwind = deferred<void>();
+		const root = createSession();
+		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
+		const firstRun = (root as unknown as InspectableRlmSession)._activeRlmChildRuns.get(first.rlm_child_id)!;
+		await firstRun.publication!.promise;
+		const firstChild = firstRun.session!;
+		// The blocked dispose holds the unwind open past the receipt.
+		vi.spyOn(firstChild, "disposeAsync").mockImplementation(() => unblockUnwind.promise);
+		await root.deleteRlmSubagent(first.rlm_child_id);
+		const forwarded = (
+			root as unknown as {
+				_createRlmSubagentRuntimeOptions(options: Record<string, unknown>): { ignoreSessionIds?: string[] };
+			}
+		)._createRlmSubagentRuntimeOptions({ id: "probe", prompt: "p", sessionName: "reused-worker", model });
+		// The freed id rides along for the daemon host's own name re-assert.
+		expect(forwarded.ignoreSessionIds).toContain(firstChild.sessionId);
+		await root.runRlmChild("second shard", { name: "reused-worker" });
+		unblockUnwind.resolve();
 	});
 
 	it("makes an externally restored retained child listable and deletable", async () => {
@@ -1514,6 +1565,33 @@ describe("AgentSession rlm recursion", () => {
 				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
 			),
 		).toHaveLength(0);
+	});
+
+	it("skips rlm_child_update re-emission for streamed deltas that change no observable state", async () => {
+		const { root, hostedChild: child, releaseStartup } = createStartupGatedRoot();
+		child.agent.streamFn = () => createAssistantMessageEventStream(); // held open: no terminal event
+		await root.runRlmChild("stream one long answer", { name: "saturating-worker" });
+		releaseStartup();
+		const run = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0]!;
+		await run.publication!.promise;
+		const childUpdates: RlmChildAgentSnapshot[] = [];
+		root.subscribe((event) => event.type === "rlm_child_update" && childUpdates.push(event.child));
+		const emit = (child as unknown as { _emit(event: unknown): void })._emit.bind(child);
+		for (const l of [50, 200, 210, 220]) {
+			// Hold the streamed-delta window open on every delta: this case pins the
+			// observable-state dedup, while coalescing inside one window is covered by
+			// the rlm-progress-notes cases.
+			run.lastStreamedUpdateMonotonicAt = performance.now() - RLM_CHILD_UPDATE_MIN_INTERVAL_MS - 1;
+			emit({ type: "message_start", message: assistantMessage("w".repeat(l)) });
+		}
+		// The preview keeps only the 160-char message tail, so both deltas past the cap
+		// reproduce the previous preview byte for byte and emit nothing.
+		expect(childUpdates.map((snapshot) => snapshot.answerPreview)).toEqual([
+			compactRlmText("w".repeat(50)),
+			compactRlmText("w".repeat(160)),
+		]);
+		emit({ type: "agent_end", messages: [] }); // a real change (the activity) emits again
+		expect(childUpdates.at(-1)?.activity).toBeUndefined();
 	});
 
 	it("does not inject a terminal notice when a parent follow-up resets reply state after a reply", async () => {

@@ -7,6 +7,7 @@ import type { ModelRegistry } from "../src/core/model-registry.js";
 import type { SessionInfo } from "../src/core/session-manager.js";
 import type { SettingsManager } from "../src/core/settings-manager.js";
 import {
+	AgentsViewMode,
 	createAgentsViewListCommand,
 	createAgentsViewReplyHeadline,
 	createAgentsViewResumeConfig,
@@ -28,6 +29,7 @@ import {
 	summaryForUnifiedRecord,
 } from "../src/modes/agents-view/agents-view-state.js";
 import * as agentRoster from "../src/modes/daemon/agent-roster.js";
+import { DaemonSocketClosedError } from "../src/modes/daemon/daemon-client.js";
 import {
 	type AgentsViewScopeFrame,
 	aggregateSessionHeartbeats,
@@ -2375,5 +2377,69 @@ describe("agents view pin and ordering regressions", () => {
 			rows.filter((row) => row.depth === 0 && row.displaySection === "running").map((row) => row.sessionId),
 		).toEqual(["a", "c"]);
 		expect(rows.find((row) => row.sessionId === "b")?.displaySection).toBe("idle");
+	});
+});
+
+describe("#502 agents view catalog refresh races", () => {
+	function privateMethod<T>(name: string): T {
+		const member = Reflect.get(AgentsViewMode.prototype, name) as T;
+		if (typeof member !== "function") {
+			throw new Error(`AgentsViewMode.${name} no longer exists; update this regression harness`);
+		}
+		return member;
+	}
+
+	function refreshHarness() {
+		const persistentState: {
+			savedSessions?: unknown[];
+			lastSuccessfulSavedSessions?: unknown[];
+			heartbeats?: unknown[];
+			savedCatalogGeneration?: number;
+		} = {};
+		return {
+			reconnectPromise: undefined,
+			daemonShutdownReceived: false,
+			options: {},
+			savedCatalogGeneration: 0,
+			heartbeatCatalogGeneration: 0,
+			savedCatalogRefreshPending: false,
+			heartbeats: [] as unknown[],
+			savedSearchFetchStarted: false,
+			persistentState,
+			applySessionList: vi.fn(),
+			reconcileCatalogs: vi.fn(),
+			resolveMissingSelectionAnchor: vi.fn(),
+			setStatusMessage: vi.fn(),
+			startClientReconnect: vi.fn(),
+			rearmSavedSearchFetch: privateMethod<(this: unknown) => void>("rearmSavedSearchFetch"),
+		};
+	}
+
+	test("an update-restart close polls without relaunching the daemon", async () => {
+		const recoverDaemon = vi.fn(async () => undefined);
+		const client = {
+			hello: { protocol: { version: 3 } },
+			supportsServerCapability: () => true,
+			reconnect: vi.fn(async () => {}),
+		};
+		const harness = {
+			...refreshHarness(),
+			stopped: false,
+			client,
+			options: { reconnectTimeoutMs: 10_000, recoverDaemon },
+			requireClient: () => client,
+			rosterStore: { attach: vi.fn(async () => true), summaries: () => [] },
+			refreshHeartbeats: vi.fn(async () => true),
+			armSavedSearchFetch: vi.fn(),
+		};
+		const reconnectClient =
+			privateMethod<(this: typeof harness, reconnectingClient: unknown, initialError: unknown) => Promise<void>>(
+				"reconnectClient",
+			);
+		// The update-restart coordinator owns the relaunch: this loop only polls.
+		await reconnectClient.call(harness, client, new DaemonSocketClosedError("/tmp/prime-agent.sock", "update"));
+		expect(recoverDaemon).not.toHaveBeenCalled();
+		await reconnectClient.call(harness, client, new Error("Daemon socket closed"));
+		expect(recoverDaemon).toHaveBeenCalled();
 	});
 });

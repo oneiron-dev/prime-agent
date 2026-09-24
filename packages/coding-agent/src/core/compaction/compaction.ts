@@ -44,7 +44,9 @@ import {
 	isCompactionIntegrityMarker,
 	MAX_SPLIT_SIDE_SUMMARY_CHUNKS,
 	SUMMARIZATION_SYSTEM_PROMPT,
+	serializeConversation,
 	splitConversationForSummary,
+	stripFileListBlocks,
 } from "./utils.js";
 /** Details stored in CompactionEntry.details for file tracking */
 export interface CompactionDetails {
@@ -649,6 +651,9 @@ export function buildSummarizationPrompt(customInstructions?: string, previousSu
 /**
  * Generate a summary of the conversation using the LLM.
  * If previousSummary is provided, uses the update prompt to merge.
+ * If recentStateAnchor is provided (newest retained assistant text), the
+ * prompt marks it as the current state so the summary cannot lag behind the
+ * kept tail.
  */
 /** Largest transcript supplied to one request. Keeps room for framing and provider overhead. */
 const MAX_SUMMARY_REQUEST_BYTES = 1_000_000;
@@ -793,6 +798,7 @@ export async function generateSummary(
 	summaryCall?: SummaryCallRunner,
 	retry?: ProviderRetryPolicy,
 	sessionId?: string,
+	recentStateAnchor?: string,
 ): Promise<SummarySlice> {
 	return runRollingSummary({
 		messages: currentMessages,
@@ -802,15 +808,16 @@ export async function generateSummary(
 		sessionId,
 		model,
 		reserveTokens,
-		maxTokens: Math.floor(0.8 * reserveTokens),
+		maxTokens: historySummaryCompletionBudget(reserveTokens),
 		apiKey,
 		headers,
 		signal,
 		thinkingLevel,
 		previousSummary,
 		prompts: {
-			initial: () => buildSummarizationPrompt(customInstructions),
-			update: (previous) => buildSummarizationPrompt(customInstructions, previous),
+			initial: () => recentStateAnchorBlock(recentStateAnchor) + buildSummarizationPrompt(customInstructions),
+			update: (previous) =>
+				recentStateAnchorBlock(recentStateAnchor) + buildSummarizationPrompt(customInstructions, previous),
 		},
 		emptyResult: "No compactable conversation content.",
 		failurePrefix: "Summarization failed",
@@ -832,6 +839,8 @@ export interface CompactionPreparation {
 	previousRemoteCompaction?: RemoteCompactionState;
 	previousRemoteTokensBefore?: number;
 	previousRemoteTimestamp?: string;
+	/** Newest retained assistant text anchors the kept-tail state. */
+	recentStateAnchor?: string;
 	/** File operations extracted from messagesToSummarize */
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
@@ -905,7 +914,8 @@ export function prepareCompaction(
 				boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : seedCompactionIndex + 1;
 			}
 		} else {
-			previousSummary = prevCompaction.summary;
+			const strippedSummary = stripFileListBlocks(prevCompaction.summary);
+			previousSummary = strippedSummary.length > 0 ? strippedSummary : undefined;
 			const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
 			boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : seedCompactionIndex + 1;
 		}
@@ -935,6 +945,12 @@ export function prepareCompaction(
 		}
 	}
 
+	// Recency anchor: the summarizer sees only messages before the cut, so its
+	// summary would describe pre-tail state. The newest retained assistant
+	// text is the state the next turn actually sees; pass it to the summarizer.
+	const recentStateAnchor = extractRecentStateAnchor(pathEntries, cutPoint.firstKeptEntryIndex, pathEntries.length);
+
+	// Avoid a compaction that would summarize no history.
 	// Everything fits in the keep-recent window and there is no previous summary
 	// to carry forward — compacting would summarize an empty conversation.
 	if (
@@ -963,10 +979,50 @@ export function prepareCompaction(
 		previousRemoteCompaction,
 		previousRemoteTokensBefore,
 		previousRemoteTimestamp,
+		recentStateAnchor,
 		fileOps,
 		settings,
 	};
 }
+
+/**
+ * Maximum characters kept from the retained tail for the recency anchor.
+ * The end of a message holds the newest state, so long text keeps its tail.
+ */
+const RECENT_STATE_ANCHOR_MAX_CHARS = 2000;
+
+/**
+ * Extract the newest retained assistant text (the recency anchor) from the
+ * kept tail [keptStart, keptEnd). Returns undefined when the tail has no
+ * assistant text; long text is tail-truncated to the anchor budget.
+ */
+function extractRecentStateAnchor(entries: SessionEntry[], keptStart: number, keptEnd: number): string | undefined {
+	for (let i = keptEnd - 1; i >= keptStart; i--) {
+		const msg = getMessageFromEntryForCompaction(entries[i]);
+		if (!msg || msg.role !== "assistant" || !("content" in msg) || !Array.isArray(msg.content)) continue;
+		const text = msg.content
+			.filter((block): block is { type: "text"; text: string } => block.type === "text")
+			.map((block) => block.text)
+			.join("\n")
+			.trim();
+		if (!text) continue;
+		return text.length > RECENT_STATE_ANCHOR_MAX_CHARS
+			? text.slice(text.length - RECENT_STATE_ANCHOR_MAX_CHARS)
+			: text;
+	}
+	return undefined;
+}
+/**
+ * The `<recent-state-anchor>` block `generateSummary` appends when the kept
+ * tail has assistant text. The window estimator reuses it so its mirror of
+ * the wire request stays exact.
+ */
+function recentStateAnchorBlock(recentStateAnchor?: string): string {
+	return recentStateAnchor
+		? `<recent-state-anchor>\nNewest assistant message that stays retained below the summary. The conversation to summarize is older than this anchor; the retained messages below are authoritative, so treat this anchor, not the conversation above, as the current state.\n\n${recentStateAnchor}\n</recent-state-anchor>\n\n`
+		: "";
+}
+
 const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
 
 Summarize the prefix to provide context for the retained suffix:
@@ -1003,6 +1059,55 @@ Keep this EXACT format:
 Be concise. Focus on what's needed to understand the kept suffix.`;
 
 /**
+ * Completion budget for the history summary: 0.8 of the token reserve.
+ * Shared with `estimateSummaryRequestTokens` so the window estimate cannot
+ * drift from the wire request.
+ */
+function historySummaryCompletionBudget(reserveTokens: number): number {
+	return Math.floor(0.8 * reserveTokens);
+}
+
+/**
+ * Completion budget for the split-turn prefix summary: a tighter 0.5 draw on
+ * the reserve. Shared with `estimateSummaryRequestTokens` so the window
+ * estimate cannot drift from the wire request.
+ */
+function turnPrefixSummaryCompletionBudget(reserveTokens: number): number {
+	return Math.floor(0.5 * reserveTokens);
+}
+
+/**
+ * Build the history-summary prompt: the serialized conversation in its
+ * `<conversation>` wrapper, the previous summary on iterative updates, the
+ * recency anchor, and the summarization instructions. Shared with
+ * `estimateSummaryRequestTokens` so the window estimate cannot drift from
+ * the wire request `generateSummary` issues.
+ */
+function buildHistorySummaryPrompt(
+	conversationText: string,
+	previousSummary?: string,
+	recentStateAnchor?: string,
+	customInstructions?: string,
+): string {
+	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
+	if (previousSummary) {
+		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+	}
+	promptText += recentStateAnchorBlock(recentStateAnchor);
+	promptText += buildSummarizationPrompt(customInstructions, previousSummary);
+	return promptText;
+}
+
+/**
+ * Build the split-turn prefix-summary prompt. Shared with
+ * `estimateSummaryRequestTokens` so the window estimate cannot drift from
+ * the wire request `generateTurnPrefixSummary` issues.
+ */
+function buildTurnPrefixSummaryPrompt(conversationText: string): string {
+	return `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
+}
+
+/**
  * Generate summaries for compaction using prepared data.
  * Returns CompactionResult - SessionManager adds uuid/parentUuid when saving.
  *
@@ -1030,6 +1135,7 @@ export async function compact(
 		previousSummary,
 		previousRemoteCompaction,
 		previousRemoteTimestamp,
+		recentStateAnchor,
 		fileOps,
 		settings,
 	} = preparation;
@@ -1077,6 +1183,7 @@ export async function compact(
 						summaryCall,
 						retry,
 						sessionId,
+						recentStateAnchor,
 					)
 				: Promise.resolve<SummarySlice>({ summary: effectivePreviousSummary ?? "No prior history." }),
 			generateTurnPrefixSummary(
@@ -1110,6 +1217,7 @@ export async function compact(
 			summaryCall,
 			retry,
 			sessionId,
+			recentStateAnchor,
 		);
 		slices.push(result);
 		summary = result.summary;
@@ -1501,7 +1609,7 @@ async function generateTurnPrefixSummary(
 		sessionId,
 		model,
 		reserveTokens,
-		maxTokens: Math.floor(0.5 * reserveTokens), // Smaller budget for turn prefix
+		maxTokens: turnPrefixSummaryCompletionBudget(reserveTokens), // Smaller budget for turn prefix
 		apiKey,
 		headers,
 		signal,
@@ -1513,4 +1621,52 @@ async function generateTurnPrefixSummary(
 		emptyResult: "No turn prefix content.",
 		failurePrefix: "Turn prefix summarization failed",
 	});
+}
+
+/**
+ * Estimate the context window the summary model needs for the wire requests
+ * `compact` builds from this preparation, using the chars/4 heuristic this
+ * module already uses for pre-LLM token math. Builds the exact request
+ * bodies through the same prompt builders and completion budgets as
+ * `generateSummary` and the split turn's prefix summary (the serialized
+ * conversation, plus the previous summary and recency anchor when set), so
+ * the estimate cannot drift from the requests on the wire; both carry
+ * SUMMARIZATION_SYSTEM_PROMPT as the system prompt, so its size counts too.
+ * The largest slice wins: routing must fit every request the compaction will
+ * issue, not the average. 0 means no summary request is applicable.
+ */
+export function estimateSummaryRequestTokens(preparation: CompactionPreparation, customInstructions?: string): number {
+	const { messagesToSummarize, turnPrefixMessages, isSplitTurn, previousSummary, recentStateAnchor, settings } =
+		preparation;
+	const systemPromptTokens = Math.ceil(SUMMARIZATION_SYSTEM_PROMPT.length / 4);
+	let required = 0;
+	// compact() issues the history slice for every compaction except a split
+	// turn with a non-empty prefix and nothing to summarize ("No prior history"
+	// needs no wire call); a stale previousSummary alone never adds a request
+	// compact() skips.
+	const issuesHistoryCall = messagesToSummarize.length > 0 || !(isSplitTurn && turnPrefixMessages.length > 0);
+	if (issuesHistoryCall) {
+		const promptText = buildHistorySummaryPrompt(
+			serializeConversation(convertToLlm(messagesToSummarize)),
+			previousSummary,
+			recentStateAnchor,
+			customInstructions,
+		);
+		required = Math.max(
+			required,
+			systemPromptTokens + Math.ceil(promptText.length / 4) + historySummaryCompletionBudget(settings.reserveTokens),
+		);
+	}
+	// A split turn's prefix summary is a separate request with its own body and
+	// a smaller completion budget, so it can exceed the history slice.
+	if (turnPrefixMessages.length > 0) {
+		const promptText = buildTurnPrefixSummaryPrompt(serializeConversation(convertToLlm(turnPrefixMessages)));
+		required = Math.max(
+			required,
+			systemPromptTokens +
+				Math.ceil(promptText.length / 4) +
+				turnPrefixSummaryCompletionBudget(settings.reserveTokens),
+		);
+	}
+	return required;
 }

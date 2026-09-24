@@ -102,6 +102,8 @@ function createHarness(records: ScheduledCandidate[]): { supervisor: WakeHarness
 		scheduledWakeRecompute: undefined,
 		scheduledWakeRecomputeQueued: false,
 		scheduledWakeRevision: 0,
+		passiveScheduledJobsEpoch: 0,
+		sessionFileCovered: (path: string) => resident.has(path),
 		scheduledWakeDrain: undefined,
 		scheduledWakeFailures: new Map<string, number>(),
 		collectPassiveScheduledJobs: vi.fn(async (_includeInactive?: boolean, rootKey?: string) =>
@@ -278,24 +280,26 @@ describe("daemon supervisor scheduled wake single flight", () => {
 		const sessionDir = join(directory, "sessions");
 		mkdirSync(sessionDir);
 		const records = [candidate("first"), candidate("next")];
-		const stores = records.map((record) => {
-			const sessionFile = join(sessionDir, `${record.info.id}.jsonl`);
-			writeFileSync(sessionFile, "");
-			record.rootSessionFile = sessionFile;
-			record.info.path = sessionFile;
-			const store = AgentCronJobStore.forSessionArtifacts();
-			store.registerSessionArtifact(record.info.id, getSessionArtifactPathForFile(sessionFile, record.info.id));
-			store.createHeartbeat({
-				activeSessionId: record.job.activeSessionId,
-				sessionId: record.info.id,
-				sessionFile,
-				cwd: "/tmp/project",
-				scheduleText: "every 5m",
-				prompt: "scheduled test tick",
-				now: new Date(now - 600_000),
-			});
-			return store;
-		});
+		const stores = await Promise.all(
+			records.map(async (record) => {
+				const sessionFile = join(sessionDir, `${record.info.id}.jsonl`);
+				writeFileSync(sessionFile, "");
+				record.rootSessionFile = sessionFile;
+				record.info.path = sessionFile;
+				const store = AgentCronJobStore.forSessionArtifacts();
+				store.registerSessionArtifact(record.info.id, getSessionArtifactPathForFile(sessionFile, record.info.id));
+				await store.createHeartbeat({
+					activeSessionId: record.job.activeSessionId,
+					sessionId: record.info.id,
+					sessionFile,
+					cwd: "/tmp/project",
+					scheduleText: "every 5m",
+					prompt: "scheduled test tick",
+					now: new Date(now - 600_000),
+				});
+				return store;
+			}),
+		);
 		const { supervisor, resident } = createHarness(records);
 		Reflect.deleteProperty(supervisor, "collectPassiveScheduledJobs");
 		const family = vi.fn(async () => records.map((record) => record.info));
@@ -307,7 +311,7 @@ describe("daemon supervisor scheduled wake single flight", () => {
 		const creation = createDeferred();
 		const entered = createDeferred();
 		supervisor.createOrReuseWorker.mockImplementation(async (_clientId, command) => {
-			stores[1]!.pauseHeartbeat(records[1]!.job.activeSessionId);
+			await stores[1]!.pauseHeartbeat(records[1]!.job.activeSessionId);
 			entered.resolve();
 			await creation.promise;
 			resident.add(command.sessionPath);
@@ -331,6 +335,27 @@ describe("daemon supervisor scheduled wake single flight", () => {
 			sessionPath: records[0]!.rootSessionFile,
 		});
 		expect(supervisor.scheduledWakeTimer).toBeUndefined();
+	});
+
+	it.each(["paused", "rescheduled"])("invalidates stale due candidates after a job is %s on disk", async (change) => {
+		const record = candidate("stale");
+		const { supervisor } = createHarness([record]);
+		Reflect.set(supervisor, "passiveScheduledJobs", {
+			rows: [{ ...record, job: { ...record.job } }],
+			scannedAt: now,
+		});
+		if (change === "paused") record.job.status = "paused";
+		else record.job.nextRunAt = new Date(now + 60_000).toISOString();
+		await supervisor.wakeDueScheduledSessions(now);
+		await supervisor.scheduledWakeRecompute;
+		expect(supervisor.createOrReuseWorker).not.toHaveBeenCalled();
+		if (change === "paused") expect(supervisor.scheduledWakeTimer).toBeUndefined();
+		else {
+			await vi.advanceTimersByTimeAsync(59_999);
+			expect(supervisor.createOrReuseWorker).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(1);
+			expect(supervisor.createOrReuseWorker).toHaveBeenCalledOnce();
+		}
 	});
 
 	it("keeps a failed root on its retry floor while waking healthy roots on time", async () => {

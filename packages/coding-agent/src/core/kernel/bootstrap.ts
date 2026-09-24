@@ -208,12 +208,16 @@ function fileContentHash(filePath: string): string {
 	}
 }
 
+function pythonSkillKey(skill: Pick<BootstrapPythonSkill, "importName" | "packagePath">): string {
+	return `${skill.importName}\0${skill.packagePath}`;
+}
+
 function normalizePythonSkills(pythonSkills: readonly KernelPythonSkill[] | undefined): BootstrapPythonSkill[] {
 	const byKey = new Map<string, BootstrapPythonSkill>();
 	const addSkill = (skill: Pick<KernelPythonSkill, "importName" | "packagePath" | "pyprojectPath">): void => {
 		const packagePath = path.resolve(skill.packagePath);
 		const pyprojectPath = path.resolve(skill.pyprojectPath);
-		const key = `${skill.importName}\0${packagePath}`;
+		const key = pythonSkillKey({ importName: skill.importName, packagePath });
 		if (byKey.has(key)) {
 			return;
 		}
@@ -761,18 +765,16 @@ function extraUvArgsMatch(a: string[] | undefined, b: string[] | undefined): boo
 	return a.every((v, i) => v === b[i]);
 }
 
+// The marker lists skills in install order and the caller in path order, so compare by key, not index.
 function pythonSkillsMatch(a: BootstrapPythonSkill[] | undefined, b: readonly BootstrapPythonSkill[]): boolean {
-	const left = a ?? [];
-	if (left.length !== b.length) return false;
-	return left.every((skill, index) => {
-		const expected = b[index];
-		return (
-			skill.importName === expected.importName &&
-			skill.packagePath === expected.packagePath &&
-			skill.pyprojectPath === expected.pyprojectPath &&
-			skill.pyprojectHash === expected.pyprojectHash
-		);
-	});
+	const recorded = new Map((a ?? []).map((skill) => [pythonSkillKey(skill), skill]));
+	return (
+		recorded.size === b.length &&
+		b.every((skill) => {
+			const match = recorded.get(pythonSkillKey(skill));
+			return match?.pyprojectPath === skill.pyprojectPath && match.pyprojectHash === skill.pyprojectHash;
+		})
+	);
 }
 
 function bootstrapVersionCurrent(
@@ -846,11 +848,9 @@ async function writeMergedBootstrapVersion(
 	pythonSkills: readonly BootstrapPythonSkill[],
 ): Promise<void> {
 	const version = await readBootstrapVersion(venv);
-	const merged = new Map(
-		(version?.pythonSkills ?? []).map((skill) => [`${skill.importName}\0${skill.packagePath}`, skill]),
-	);
+	const merged = new Map((version?.pythonSkills ?? []).map((skill) => [pythonSkillKey(skill), skill]));
 	for (const skill of pythonSkills) {
-		merged.set(`${skill.importName}\0${skill.packagePath}`, skill);
+		merged.set(pythonSkillKey(skill), skill);
 	}
 	await writeBootstrapVersion(venv, runtimeIdentity, [...merged.values()]);
 }
@@ -961,9 +961,7 @@ async function syncPythonSkills(
 ): Promise<void> {
 	const version = await readBootstrapVersion(venv);
 	const installedPythonSkills: BootstrapPythonSkill[] = [];
-	const currentPythonSkills = new Map(
-		(version?.pythonSkills ?? []).map((skill) => [`${skill.importName}\0${skill.packagePath}`, skill]),
-	);
+	const currentPythonSkills = new Map((version?.pythonSkills ?? []).map((skill) => [pythonSkillKey(skill), skill]));
 	const pythonSkillsByProjectName = new Map(
 		pythonSkills.map((skill) => [readPythonSkillProjectName(skill).replaceAll("_", "-").toLowerCase(), skill]),
 	);
@@ -981,7 +979,7 @@ async function syncPythonSkills(
 	);
 
 	for (const skill of sortPythonSkillsForInstall(pythonSkills)) {
-		const existingSkill = currentPythonSkills.get(`${skill.importName}\0${skill.packagePath}`);
+		const existingSkill = currentPythonSkills.get(pythonSkillKey(skill));
 		if (existingSkill?.pyprojectPath === skill.pyprojectPath && existingSkill.pyprojectHash === skill.pyprojectHash) {
 			installedPythonSkills.push(skill);
 			continue;
@@ -990,7 +988,7 @@ async function syncPythonSkills(
 		const localDependencies = dependenciesBySkill.get(skill) ?? [];
 		const localDependencyArgs = localDependencies
 			.filter((dependency) => {
-				const installedDependency = currentPythonSkills.get(`${dependency.importName}\0${dependency.packagePath}`);
+				const installedDependency = currentPythonSkills.get(pythonSkillKey(dependency));
 				const installedThisSync = installedPythonSkills.some(
 					(installed) =>
 						installed.importName === dependency.importName &&

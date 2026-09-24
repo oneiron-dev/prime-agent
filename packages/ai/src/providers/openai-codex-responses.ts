@@ -31,7 +31,6 @@ import type {
 	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
-	Usage,
 } from "../types.js";
 import {
 	appendAssistantMessageDiagnostic,
@@ -47,6 +46,7 @@ import {
 	WebSocketTransportError,
 } from "../utils/stream-failure.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
+import { applyServiceTierPricing } from "./service-tier-pricing.js";
 import { buildBaseOptions } from "./simple-options.js";
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
@@ -179,10 +179,13 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						return;
 					} catch (error) {
 						const aborted = options?.signal?.aborted;
-						// Only reset the chain while nothing was streamed yet: after the
-						// first event the retry would duplicate "start"/content events.
+						// Only reset the chain before visible output starts; retrying after
+						// content events would duplicate streamed assistant output.
 						if (!aborted && !websocketStarted && !chainResetRetried && isStaleCodexContinuationError(error)) {
 							chainResetRetried = true;
+							// A failed attempt may have supplied response metadata before
+							// rejecting the continuation. Do not retain that dead anchor.
+							delete output.responseId;
 							continue;
 						}
 						if (aborted || isCodexNonTransportError(error)) {
@@ -334,36 +337,6 @@ function buildRequestBody(
 	return body;
 }
 
-// Multipliers per https://developers.openai.com/api/docs/pricing (retrieved 2026-08-21)
-function getServiceTierCostMultiplier(
-	model: Pick<Model<"openai-codex-responses">, "id">,
-	serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
-): number {
-	switch (serviceTier) {
-		case "flex":
-			return 0.5;
-		case "priority":
-			return model.id.startsWith("gpt-5.5") ? 2.5 : 2;
-		default:
-			return 1;
-	}
-}
-
-function applyServiceTierPricing(
-	usage: Usage,
-	serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
-	model: Pick<Model<"openai-codex-responses">, "id">,
-) {
-	const multiplier = getServiceTierCostMultiplier(model, serviceTier);
-	if (multiplier === 1) return;
-
-	usage.cost.input *= multiplier;
-	usage.cost.output *= multiplier;
-	usage.cost.cacheRead *= multiplier;
-	usage.cost.cacheWrite *= multiplier;
-	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
-}
-
 function resolveCodexServiceTier(
 	responseServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
 	requestServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
@@ -399,7 +372,7 @@ async function processStream(
 	await processResponsesStream(mapCodexEvents(parseSSE(response)), output, stream, model, {
 		serviceTier: options?.serviceTier,
 		resolveServiceTier: resolveCodexServiceTier,
-		applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+		applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model.id),
 	});
 }
 
@@ -1111,7 +1084,19 @@ function buildCachedWebSocketRequestBody(entry: CachedWebSocketConnection, body:
 	};
 }
 
-async function* startWebSocketOutputOnFirstEvent(
+function isCodexVisibleResponseEvent(event: ResponseStreamEvent): boolean {
+	return (
+		event.type === "response.completed" ||
+		event.type === "response.incomplete" ||
+		event.type.startsWith("response.output_") ||
+		event.type.startsWith("response.reasoning_") ||
+		event.type.startsWith("response.content_") ||
+		event.type.startsWith("response.refusal.") ||
+		event.type.startsWith("response.function_")
+	);
+}
+
+async function* startWebSocketOutputOnFirstVisibleEvent(
 	events: AsyncIterable<ResponseStreamEvent>,
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
@@ -1119,7 +1104,10 @@ async function* startWebSocketOutputOnFirstEvent(
 ): AsyncGenerator<ResponseStreamEvent> {
 	let started = false;
 	for await (const event of events) {
-		if (!started) {
+		// Codex can emit lifecycle, telemetry, or vendor metadata before rejecting
+		// a stale continuation. Keep the attempt retryable until an event can
+		// produce output consumed by processResponsesStream.
+		if (!started && isCodexVisibleResponseEvent(event)) {
 			started = true;
 			onStart();
 			stream.push({ type: "start", partial: output });
@@ -1166,7 +1154,7 @@ async function processWebSocketStream(
 	try {
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
-			startWebSocketOutputOnFirstEvent(
+			startWebSocketOutputOnFirstVisibleEvent(
 				mapCodexEvents(parseWebSocket(socket, options?.signal)),
 				output,
 				stream,
@@ -1178,7 +1166,7 @@ async function processWebSocketStream(
 			{
 				serviceTier: options?.serviceTier,
 				resolveServiceTier: resolveCodexServiceTier,
-				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model.id),
 			},
 		);
 		if (options?.signal?.aborted) {

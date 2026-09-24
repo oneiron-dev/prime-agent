@@ -32,6 +32,7 @@ import {
 	resolveOpenAIResponsesWebSocketUrl,
 } from "./openai-responses-websocket.js";
 import { withOpenCodeHeaders } from "./opencode-headers.js";
+import { applyServiceTierPricing } from "./service-tier-pricing.js";
 import { buildBaseOptions } from "./simple-options.js";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -115,7 +116,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 				applyServiceTierPricing: (
 					usage: Usage,
 					serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
-				) => applyServiceTierPricing(usage, serviceTier, model),
+				) => applyServiceTierPricing(usage, serviceTier, model.id),
 			};
 			const transport = options?.transport ?? "auto";
 			const websocketEnabled =
@@ -351,34 +352,4 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 	}
 
 	return params;
-}
-
-// Multipliers per https://developers.openai.com/api/docs/pricing (retrieved 2026-08-21)
-function getServiceTierCostMultiplier(
-	model: Pick<Model<"openai-responses">, "id">,
-	serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
-): number {
-	switch (serviceTier) {
-		case "flex":
-			return 0.5;
-		case "priority":
-			return model.id === "gpt-5.5" ? 2.5 : 2;
-		default:
-			return 1;
-	}
-}
-
-function applyServiceTierPricing(
-	usage: Usage,
-	serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
-	model: Pick<Model<"openai-responses">, "id">,
-) {
-	const multiplier = getServiceTierCostMultiplier(model, serviceTier);
-	if (multiplier === 1) return;
-
-	usage.cost.input *= multiplier;
-	usage.cost.output *= multiplier;
-	usage.cost.cacheRead *= multiplier;
-	usage.cost.cacheWrite *= multiplier;
-	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
 }

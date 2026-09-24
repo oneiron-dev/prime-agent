@@ -68,6 +68,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 19 adds daemon-held session input pauses.
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
+// Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
 // Revision 23 lets workers query the supervisor agent roster on demand.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds capability-gated direct worker peer transport discovery.
@@ -77,8 +78,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Fork revision 29 combines targeting, attachment cancellation, recovery errors, and saved-session models.
 // Upstream revision 29 adds abort_and_send_queued; its tip also includes update_restarting errors.
 // Revision 30 is the union of fork revision 29 with upstream queued abort and update_restarting errors.
-export const DAEMON_SCHEMA_REVISION = 30;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-d314044e0463";
+// Revision 31 combines upstream catalog and provider state changes with the fork protocol.
+export const DAEMON_SCHEMA_REVISION = 31;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-d314044e0463";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -96,7 +98,9 @@ export type DaemonClientCapability =
 	| "extension_ui"
 	| "slim_attach"
 	| "chunked_snapshot"
-	| "client_owned_sessions";
+	| "client_owned_sessions"
+	// Client declaration, not a command gate: attach with it opts into heartbeats_changed pushes.
+	| "heartbeat_catalog";
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
@@ -192,12 +196,12 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"slim_attach",
 	"chunked_snapshot",
 	"client_owned_sessions",
+	"heartbeat_catalog",
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	"delete_rlm_subagent",
-	"heartbeat_catalog",
 	"heartbeat_management",
 	"model_catalog",
 	"side_question_transcript",
@@ -1380,6 +1384,26 @@ export function isDaemonCommandEnvelope(value: unknown): value is DaemonCommandE
 		(candidate.clientId === undefined || typeof candidate.clientId === "string") &&
 		typeof candidate.command === "object" &&
 		candidate.command !== null
+	);
+}
+
+export function isSessionSummary(value: unknown): value is SessionSummary {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as { id?: unknown; sessionId?: unknown; cwd?: unknown };
+	return (
+		typeof candidate.id === "string" && typeof candidate.sessionId === "string" && typeof candidate.cwd === "string"
+	);
+}
+
+export function isDaemonResponse(value: unknown): value is DaemonResponse {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as { type?: unknown; success?: unknown; command?: unknown };
+	return (
+		candidate.type === "response" && typeof candidate.success === "boolean" && typeof candidate.command === "string"
 	);
 }
 

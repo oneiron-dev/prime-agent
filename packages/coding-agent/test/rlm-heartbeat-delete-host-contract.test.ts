@@ -27,10 +27,12 @@ describe("rlm_heartbeat.delete host contract", () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 		harness.session.setRlmHeartbeatController(
-			controller((id) => (id === cancellation.id ? cancellation : undefined)),
+			controller(async (id) => (id === cancellation.id ? cancellation : undefined)),
 		);
 
-		expect(harness.session.handleRlmHeartbeatHostRequest("rlm_heartbeat.delete", { id: cancellation.id })).toEqual({
+		expect(
+			await harness.session.handleRlmHeartbeatHostRequest("rlm_heartbeat.delete", { id: cancellation.id }),
+		).toEqual({
 			cancellation: {
 				id: cancellation.id,
 				source: "rlm_heartbeat",
@@ -51,10 +53,10 @@ describe("rlm_heartbeat.delete host contract", () => {
 	it("throws the same closed error for unknown and unowned ids", async () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
-		harness.session.setRlmHeartbeatController(controller(() => undefined));
+		harness.session.setRlmHeartbeatController(controller(async () => undefined));
 
 		for (const id of ["missing", "owned-by-another-session"]) {
-			expect(() => harness.session.handleRlmHeartbeatHostRequest("rlm_heartbeat.delete", { id })).toThrow(
+			await expect(harness.session.handleRlmHeartbeatHostRequest("rlm_heartbeat.delete", { id })).rejects.toThrow(
 				"RLM heartbeat was not found for this session",
 			);
 		}
@@ -69,7 +71,7 @@ function controller(
 		createRlmHeartbeat: () => {
 			throw new Error("not used");
 		},
-		updateRlmHeartbeat: () => undefined,
+		updateRlmHeartbeat: async () => undefined,
 		deleteRlmHeartbeat,
 	};
 }

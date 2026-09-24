@@ -1,3 +1,4 @@
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import type { SessionBeforeCompactEvent } from "../src/core/extensions/index.js";
 import { createHarness } from "./suite/harness.js";
@@ -74,6 +75,7 @@ describe("remote compaction extension-event opacity", () => {
 			);
 
 			// Grow past the keep-recent window so prepareCompaction succeeds.
+			harness.setResponses([fauxAssistantMessage("fresh response"), fauxAssistantMessage("second response")]);
 			await harness.session.prompt("fresh user turn after remote compaction");
 			await harness.session.prompt("second fresh turn");
 

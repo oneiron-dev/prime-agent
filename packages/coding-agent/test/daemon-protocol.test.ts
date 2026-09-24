@@ -23,6 +23,7 @@ import {
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 	isSessionPlaneDaemonCommand,
+	isSessionSummary,
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
 import {
@@ -517,5 +518,10 @@ describe("daemon protocol helpers", () => {
 		expect(salvageDaemonCommandId(JSON.stringify({ type: "command", id: 7 }))).toBeUndefined();
 		expect(salvageDaemonCommandId(JSON.stringify("command"))).toBeUndefined();
 		expect(salvageDaemonCommandId("{ not json")).toBeUndefined();
+	});
+
+	it("requires cwd before a wire payload counts as a session summary", () => {
+		expect(isSessionSummary({ id: "worker-1", sessionId: "session-1", cwd: "/repo" })).toBe(true);
+		expect(isSessionSummary({ id: "worker-1", sessionId: "session-1" })).toBe(false);
 	});
 });

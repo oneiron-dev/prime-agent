@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
-import { type Context, createAssistantMessageEventStream, getModel } from "@earendil-works/pi-ai";
+import { type Context, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
@@ -13,13 +13,14 @@ import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
+import { getCodingAgentFixtureModel } from "./fixture-models.js";
 import { assistantMsg, createTestResourceLoader } from "./utilities.js";
 
 interface InspectableSession {
 	_buildRuntime(options: { activeToolNames?: string[] }): void;
 }
 
-const model = getModel("anthropic", "claude-sonnet-4-5")!;
+const model = getCodingAgentFixtureModel("anthropic", "claude-sonnet-4-5");
 
 describe("AgentSession lazy child snapshot restoration", () => {
 	let tempDir: string;
@@ -116,7 +117,7 @@ describe("AgentSession lazy child snapshot restoration", () => {
 		expect(events).toEqual([]);
 		expect(contexts, JSON.stringify(session.messages)).toHaveLength(1);
 		expect(JSON.stringify(contexts[0].messages)).toContain("<ipython_state_restore_pending>");
-		expect(JSON.stringify(contexts[0].messages)).not.toContain("<ipython_state_restored>");
+		expect(JSON.stringify(contexts[0].messages)).not.toContain("[python-state-restored]");
 	});
 
 	it("restores on first Python use before executing code and preserves the notice across reload", async () => {
@@ -133,7 +134,7 @@ describe("AgentSession lazy child snapshot restoration", () => {
 		expect(events).toEqual(["start", "restore", "bootstrap", "print(saved_value)"]);
 
 		await session.prompt("Report the restored state.");
-		expect(JSON.stringify(contexts.at(-1)!.messages)).toContain("<ipython_state_restored>");
+		expect(JSON.stringify(contexts.at(-1)!.messages)).toContain("[python-state-restored]");
 		expect(JSON.stringify(contexts.at(-1)!.messages)).toContain("saved_value");
 		expect(ReplKernelManager.prototype.start).toHaveBeenCalledTimes(1);
 	});
