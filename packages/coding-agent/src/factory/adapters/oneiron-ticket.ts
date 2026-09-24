@@ -150,6 +150,17 @@ const ATTRIBUTION =
 
 export class TicketFailure extends Error {}
 export type MergeReadiness = "merged" | "conflicting" | "behind" | "ready" | "pending";
+const SHA = /^[0-9a-f]{40}$/;
+interface MergeRepairReceipt {
+	head?: string;
+	remoteHead?: string;
+	fixSessionPath?: string;
+	messageId?: string;
+	mode?: "initial-fix-merge" | "post-ci-repair";
+	failedCiHead?: string;
+	runId?: number;
+	jobId?: number;
+}
 
 type Logger = (step: string, message?: string) => void;
 interface Exec {
@@ -1679,6 +1690,204 @@ ${rendered || "(no bot comments)"}`;
 			throw new TicketFailure(`the push after candidate preparation failed: ${tail(push.output, 10)}`);
 		await this.waitForPushedHead(repo, testedHead);
 	}
+	/**
+	 * Owner recovery for a committed merge repair interrupted before its push: `sessions/merge-repair.resume.json`
+	 * with `head` (the unpushed repair), `remoteHead` (the pull request head it builds on), `fixSessionPath` and, per
+	 * mode, `messageId`. Mode `post-ci-repair` answers a failed required check on the pushed head and also carries
+	 * `failedCiHead`, `runId` and `jobId`, verified against GitHub. Mode `initial-fix-merge` recovers a fix-merge
+	 * writer that ended BLOCKED and later completed with its exact DONE line. No mode recovers a failed merge-test
+	 * gate after the fix session finished. The repair head then takes the full gate, an ordinary push of the exact
+	 * tested head and the propagation wait; nothing is pushed on older evidence.
+	 */
+	private async resumeLocalMergeRepair(repo: string): Promise<void> {
+		const receiptPath = join(this.directory, "sessions", "merge-repair.resume.json");
+		if (!existsSync(receiptPath)) return;
+		const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as MergeRepairReceipt;
+		const fail = (reason: string) => new TicketFailure(`local merge repair recovery: ${reason}`);
+		const { head, remoteHead, fixSessionPath, mode } = receipt;
+		if (!head || !SHA.test(head) || !remoteHead || !SHA.test(remoteHead) || typeof fixSessionPath !== "string")
+			throw fail("invalid owner recovery receipt");
+		if (mode !== undefined && mode !== "initial-fix-merge" && mode !== "post-ci-repair")
+			throw fail("unknown merge repair recovery mode");
+		const sessionDir = join(this.directory, "sessions", mode ? "fix-merge" : "fix-tests-after-merge-fix");
+		if (!fixSessionPath.startsWith(`${sessionDir}/`) || !existsSync(fixSessionPath))
+			throw fail("the original merge fix session is missing");
+		const entries = sessionEntries(fixSessionPath);
+		if (
+			entries[0]?.type !== "session" ||
+			entries[0].cwd !== this.worktree ||
+			entries[0].rlmDepth !== 0 ||
+			!readFileSync(fixSessionPath, "utf8").includes(head.slice(0, 8))
+		)
+			throw fail("the retained fix session does not bind this worktree and repair commit");
+		const runLog = readFileSync(this.logPath, "utf8");
+		const loggedAt = (line: string | undefined) => Date.parse(line?.match(/^\[([^\]]+)\]/)?.[1] ?? "");
+		if (mode) {
+			const terminal = entries
+				.filter((entry) => entry.type === "message" && entry.message?.role === "assistant")
+				.at(-1);
+			const message = terminal?.message;
+			if (
+				!receipt.messageId ||
+				!terminal ||
+				terminal.id !== receipt.messageId ||
+				message?.stopReason !== "stop" ||
+				!Array.isArray(message.content) ||
+				message.content.some((block) => block?.type === "toolCall")
+			)
+				throw fail("the recovery needs the latest native terminal completion of the fix session");
+			const final = contentText(message.content);
+			if (writerTerminal(final, this.ticket.key)?.kind !== "done" || !final.includes(head.slice(0, 8)))
+				throw fail("the completion does not end with its exact DONE line and name the retained repair head");
+			if (mode === "post-ci-repair") await this.verifyPostCiRepair(receipt, repo, terminal, runLog, loggedAt);
+			else {
+				const interrupted = loggedAt(
+					runLog
+						.split("\n")
+						.filter((line) => line.includes(`FAILED writer BLOCKED: BLOCKED ${this.ticket.key}`))
+						.at(-1),
+				);
+				if (
+					!runLog.includes("writer:fix-merge:intent blocked") ||
+					!Number.isFinite(interrupted) ||
+					!(Date.parse(terminal.timestamp ?? "") > interrupted)
+				)
+					throw fail("no blocked merge interruption precedes the recovered completion");
+			}
+		} else {
+			if (
+				!runLog.includes("tests-after-merge-fix:2 rc=") ||
+				!runLog.includes("writer:fix-tests-after-merge-fix:intent done")
+			)
+				throw fail("missing interrupted merge-test fix evidence");
+			const priorTest = runLog
+				.split("\n")
+				.filter((line) => /tests-after-merge-fix(?::2)? rc=/.test(line))
+				.at(-1);
+			if (!priorTest || / rc=0(?: |$)/.test(priorTest))
+				throw fail("the receipt is not for a failed full merge-test gate");
+		}
+		if ((await this.head()) !== head || (await this.dirty()))
+			throw fail("the repair head changed or the worktree is dirty");
+		const boundary = async () =>
+			this.prView<{ headRefOid?: string; headRefName?: string; state?: string }>(
+				repo,
+				"headRefOid,headRefName,state",
+			);
+		const remote = await boundary();
+		if (
+			remote.state !== "OPEN" ||
+			remote.headRefName !== this.branch ||
+			remote.headRefOid !== remoteHead ||
+			head === remoteHead
+		)
+			throw fail("the pull request branch or the unpushed repair boundary changed");
+		await this.git(["fetch", "-q", this.settings.remote]);
+		if ((await this.git(["rev-parse", `${this.settings.remote}/${this.branch}`])) !== remoteHead)
+			throw fail("the pull request and the remote branch disagree");
+		await this.git(["merge-base", "--is-ancestor", remoteHead, head]);
+		this.log("merge:resume", `full gate for the retained repair ${head}; no scoped result stands in for it`);
+		await this.tests("tests-after-merge-fix");
+		const testedHead = await this.head();
+		if (await this.dirty()) throw fail("the full gate left uncommitted changes");
+		await this.git(["merge-base", "--is-ancestor", head, testedHead]);
+		const current = await boundary();
+		if (current.state !== "OPEN" || current.headRefName !== this.branch || current.headRefOid !== remoteHead)
+			throw fail("the remote branch changed during validation; no push");
+		if ((await this.head()) !== testedHead) throw fail("the local head changed after the full gate");
+		const push = await this.run(["git", "push", this.settings.remote, `${testedHead}:refs/heads/${this.branch}`], {
+			timeoutMs: this.t.ghMs,
+			logName: "git-push.log",
+		});
+		if (push.code !== 0) throw fail(`the ordinary push failed: ${tail(push.output, 10)}`);
+		appendFileSync(
+			join(this.directory, "merge-repair-recovery.jsonl"),
+			`${JSON.stringify({ at: new Date().toISOString(), ...receipt, testedHead, pushed: true })}\n`,
+		);
+		// The journal keeps the receipt; its executable marker is consumed once the push succeeded.
+		unlinkSync(receiptPath);
+		this.log(
+			"merge:resume",
+			`full gate passed; pushed the exact repair ${testedHead}; waiting for the required checks`,
+		);
+		await this.waitForPushedHead(repo, testedHead);
+	}
+	/** The repair answers the failed required check the state recorded: the run, the job and their order must agree. */
+	private async verifyPostCiRepair(
+		receipt: MergeRepairReceipt,
+		repo: string,
+		terminal: SessionEntry,
+		runLog: string,
+		loggedAt: (line: string | undefined) => number,
+	): Promise<void> {
+		const fail = (reason: string) => new TicketFailure(`post-CI repair evidence rejected: ${reason}`);
+		const { failedCiHead, runId, jobId } = receipt;
+		if (
+			!failedCiHead ||
+			failedCiHead !== receipt.remoteHead ||
+			!SHA.test(failedCiHead) ||
+			!Number.isSafeInteger(runId) ||
+			!Number.isSafeInteger(jobId) ||
+			runId! <= 0 ||
+			jobId! <= 0
+		)
+			throw fail("the failed head, run or job identity is missing or differs from the retained remote head");
+		const jobUrl = `https://github.com/${repo}/actions/runs/${runId}/job/${jobId}`;
+		const prefix = `required checks failed at ${failedCiHead}:`;
+		if (
+			typeof this.state.failure !== "string" ||
+			!this.state.failure.startsWith(prefix) ||
+			!this.state.failure.includes(jobUrl)
+		)
+			throw fail("the retained state does not bind the failed CI head and job");
+		const failedAt = loggedAt(
+			runLog
+				.split("\n")
+				.filter((line) => line.includes(`FAILED ${prefix}`) && line.includes(jobUrl))
+				.at(-1),
+		);
+		const completedAt = Date.parse(terminal.timestamp ?? "");
+		if (!Number.isFinite(failedAt) || !Number.isFinite(completedAt) || completedAt <= failedAt)
+			throw fail("the repair completion must follow the recorded CI failure");
+		// Job and workflow-run REST schemas differ; the run carries the authoritative head_sha.
+		const job = (await this.ghJson(["api", `repos/${repo}/actions/jobs/${jobId}`])) as {
+			id?: number;
+			run_id?: number;
+			html_url?: string;
+			status?: string;
+			conclusion?: string;
+			head_sha?: string;
+			completed_at?: string;
+		};
+		const run = (await this.ghJson(["api", `repos/${repo}/actions/runs/${runId}`])) as {
+			id?: number;
+			repository?: { full_name?: string };
+			head_sha?: string;
+			status?: string;
+			conclusion?: string;
+		};
+		if (
+			job.id !== jobId ||
+			job.run_id !== runId ||
+			job.html_url !== jobUrl ||
+			job.status !== "completed" ||
+			job.conclusion !== "failure"
+		)
+			throw fail("the GitHub job is not the exact completed failed job");
+		if (
+			run.id !== runId ||
+			run.repository?.full_name !== repo ||
+			run.head_sha !== failedCiHead ||
+			run.status !== "completed" ||
+			run.conclusion !== "failure"
+		)
+			throw fail("the GitHub run's repository, head or conclusion does not match the failed candidate");
+		if (job.head_sha !== undefined && job.head_sha !== failedCiHead)
+			throw fail("the job head conflicts with its workflow run head");
+		const jobCompletedAt = Date.parse(job.completed_at ?? "");
+		if (!Number.isFinite(jobCompletedAt) || jobCompletedAt > failedAt || jobCompletedAt >= completedAt)
+			throw fail("the job's completion does not precede the recorded failure and the repair");
+	}
 	/** Outside the global mutex: a clean head that contains the fetched trunk and whose required checks are green. */
 	private async prepareNonstackedCandidate(repo: string): Promise<{ head: string; base: string } | undefined> {
 		for (;;) {
@@ -1770,6 +1979,7 @@ ${rendered || "(no bot comments)"}`;
 	private async mergeNonstacked(repo: string): Promise<void> {
 		const releaseTicket = await acquireSlot(join(this.directory, "merge-preparation-lock"), 1, this.log);
 		try {
+			await this.resumeLocalMergeRepair(repo);
 			const args = [
 				"pr",
 				"merge",
