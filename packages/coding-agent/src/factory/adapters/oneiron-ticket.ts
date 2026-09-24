@@ -73,6 +73,15 @@ export interface OneironLauncherSettings {
 	 * `gh pr create --base <trunk>` and merges with `gh pr merge --squash`. No `gh stack` call runs. Default off.
 	 */
 	noStacks?: boolean;
+	/**
+	 * The factory runs no cargo tests of its own: the pull request's required checks gate the merge, which waits for
+	 * them at the exact head. A ticket that touches no crate no longer fails "zero tests ran". Needs `noStacks`.
+	 */
+	skipFactoryTests?: boolean;
+	/** No CodeRabbit request, no bot wait and no bot round. */
+	skipBots?: boolean;
+	/** One more review on the review seat (`grok`) of the exact head right before the merge; only LANDABLE merges. */
+	preMergeReview?: boolean;
 }
 /** A host that runs cargo for this factory: the worktree is synced to `<root>/wt/<key>` and cargo runs there. */
 export interface OneironBuildHost {
@@ -107,7 +116,7 @@ export interface OneironTicketState {
 	pack?: boolean;
 	writer?: { rounds: number; final: string };
 	split?: string;
-	tests?: { crates: string[]; ran: number; rounds: number };
+	tests?: { crates: string[]; ran: number; rounds: number; skipped?: true };
 	/** Seats killed for silence, newest last. A working model never lands here. */
 	idleKills?: Array<{ at: string; step: string; idleMs: number }>;
 	review?: { tier: RoutingAnswer<ReviewTier>; verdicts: Record<string, string>; fixRound?: boolean; recheck?: string };
@@ -119,11 +128,15 @@ export interface OneironTicketState {
 	coderabbit?: "requested" | "failed";
 	bots?: { completed: string[]; unavailable: string[]; comments: number; waitedMs: number };
 	botRound?: { final: string; head: string };
+	/** The last pre-merge review: the head it read and its verdict line. */
+	preMerge?: { head: string; verdict: string };
 	merged?: boolean;
 	failure?: string;
 }
 
 export type SeatName = "writer" | "pack" | "grok" | "opus";
+/** The review seat the pre-merge review uses. */
+const PRE_MERGE_SEAT = "grok";
 /** The seats a review tier can name. `grok` is only the slot name; the launcher decides its model. */
 export type ReviewSeat = "grok" | "opus";
 export const DEFAULT_SEATS: Record<SeatName, OneironSeat> = {
@@ -403,6 +416,9 @@ export class OneironTicketRunner {
 			seats: { ...DEFAULT_SEATS, ...l.seats },
 			idleMs: l.idleMs ?? DEFAULT_IDLE_MS,
 			noStacks: l.noStacks ?? false,
+			skipFactoryTests: l.skipFactoryTests ?? false,
+			skipBots: l.skipBots ?? false,
+			preMergeReview: l.preMergeReview ?? false,
 			buildHosts: l.buildHosts ?? [],
 			timeouts: { ...DEFAULT_TIMEOUTS, ...l.timeouts },
 		};
@@ -1013,6 +1029,11 @@ ${rendered || "(no bot comments)"}`;
 			);
 	}
 	private async tests(label: string): Promise<void> {
+		if (this.settings.skipFactoryTests) {
+			this.log(label, "skipped (skipFactoryTests): the pull request's required checks gate the merge");
+			this.save({ tests: { crates: [], ran: 0, rounds: 0, skipped: true } });
+			return;
+		}
 		let result = await this.cargoTest();
 		this.log(label, `rc=${result.code} ran=${result.ran} crates=${result.crates.join(",")}`);
 		this.idleCargo(result, `for ${label}`);
@@ -1529,6 +1550,10 @@ ${rendered || "(no bot comments)"}`;
 		await this.tests("tests");
 		await this.review();
 		await this.publish();
+		if (this.settings.skipBots) {
+			this.log("bots", "skipped (skipBots): no CodeRabbit request, no bot wait, no bot round");
+			return;
+		}
 		await this.requestCodeRabbit();
 		const comments = await this.waitForBots();
 		await this.botRound(comments);
@@ -2000,6 +2025,20 @@ ${rendered || "(no bot comments)"}`;
 			release();
 		}
 	}
+	/**
+	 * `preMergeReview`: one more review of the exact head about to merge, on the review seat, with the same verdict
+	 * line. Only LANDABLE merges; a head already found LANDABLE is not reviewed again.
+	 */
+	private async preMergeReview(head: string): Promise<void> {
+		if (this.state.preMerge?.head === head && this.state.preMerge.verdict === "LANDABLE") return;
+		const { diff } = await this.diffAgainstBase();
+		const verdict = (await this.reviewers([PRE_MERGE_SEAT], diff, `-premerge-${head.slice(0, 12)}`))[PRE_MERGE_SEAT]!;
+		this.save({ preMerge: { head, verdict: verdict.split("\n")[0]! } });
+		if ((await this.head()) !== head)
+			throw new TicketFailure(`the head moved during the pre-merge review of ${head}; merge again`);
+		if (verdict !== "LANDABLE")
+			throw new TicketFailure(`the pre-merge review of ${head} is not LANDABLE: ${verdict.slice(0, 4000)}`);
+	}
 	/** A lone pull request: prepare under a per-ticket lock, merge under the short global mutex, repeat on a stale base. */
 	private async mergeNonstacked(repo: string): Promise<void> {
 		const releaseTicket = await acquireSlot(join(this.directory, "merge-preparation-lock"), 1, this.log);
@@ -2020,6 +2059,8 @@ ${rendered || "(no bot comments)"}`;
 			for (;;) {
 				const candidate = await this.prepareNonstackedCandidate(repo);
 				if (!candidate) return;
+				// The review runs outside the global mutex, on the candidate whose required checks are green.
+				if (this.settings.preMergeReview) await this.preMergeReview(candidate.head);
 				const outcome = await this.finalizePreparedMerge(repo, args, candidate);
 				if (outcome === "merged") return;
 				this.log(
@@ -2061,6 +2102,7 @@ ${rendered || "(no bot comments)"}`;
 					const again = await this.gh(["stack", "sync"]);
 					if (again.code !== 0) throw new TicketFailure(`gh stack sync still failing: ${tail(again.output, 10)}`);
 				}
+				if (this.settings.preMergeReview) await this.preMergeReview(await this.head());
 				const merge = await this.gh(["stack", "merge", "--squash", "--yes"]);
 				if (merge.code !== 0 && !(await this.mergedOnGitHub(repo)))
 					throw new TicketFailure(`gh stack merge failed: ${tail(merge.output, 15)}`);

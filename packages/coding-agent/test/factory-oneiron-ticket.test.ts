@@ -78,9 +78,13 @@ const prompt = process.argv[process.argv.length - 1];
 fs.appendFileSync(path.join(process.env.FAKE_ROOT, "seat.log"), "---\\n" + prompt + "\\n");
 const key = (prompt.match(/Ticket ([-\\w.]+):/) || prompt.match(/ticket ([-\\w.]+)/))[1];
 if (prompt.includes("build the context pack")) process.stdout.write("PACK: crates/alpha/src/lib.rs:1 add_one\\n");
-else if (prompt.includes("Review this diff")) process.stdout.write("VERDICT: LANDABLE\\n");
+else if (prompt.includes("Review this diff")) process.stdout.write(fs.existsSync(path.join(process.env.FAKE_ROOT, "defects")) ? "VERDICT: DEFECTS\\ndocs/x.md:1 wrong\\n" : "VERDICT: LANDABLE\\n");
 else if (prompt.includes("EVERY bot comment")) process.stdout.write("replied to 11 and posted the summary\\nDONE " + key + "\\n");
-else {
+else if (prompt.includes("docs only")) {
+  fs.mkdirSync("docs", { recursive: true }); fs.writeFileSync("docs/" + key + ".md", "note\\n");
+  execFileSync("git", ["add", "-A"]); execFileSync("git", ["commit", "-qm", key + ": note"]);
+  process.stdout.write("Documented.\\nDONE " + key + "\\n");
+} else {
   fs.appendFileSync("crates/alpha/src/lib.rs", "pub fn " + key.replace(/[^a-z0-9]/g, "_") + "() -> u8 { 1 }\\n");
   execFileSync("git", ["add", "-A"]); execFileSync("git", ["commit", "-qm", key + ": implement"]);
   process.stdout.write("Implemented.\\nPR BODY:\\nAdded the function.\\nSPLIT: the follow-up half\\nDONE " + key + "\\n");
@@ -293,6 +297,42 @@ describe("Oneiron ticket runner", () => {
 		expect(gh).toContain("--base main --head w7/child");
 		expect(gh).toMatch(/^pr merge 7 --repo org\/repo --squash .* --match-head-commit [0-9a-f]{40}$/m);
 		expect(runner.state.merged).toBe(true);
+	});
+
+	it("with CI-only tests, no bots and a pre-merge review, merges only a head whose checks and review pass", async () => {
+		const f = setup();
+		const ticket = f.ticket("docs-one");
+		ticket.contract = "docs only: describe the flag.";
+		ticket.launcher = { ...f.launcher, noStacks: true, skipFactoryTests: true, skipBots: true, preMergeReview: true };
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		// A ticket that touches no crate is not "zero tests ran": the factory runs no cargo at all.
+		await runner.submit();
+		expect([existsSync(join(f.root, "cargo.log")), runner.state.tests?.skipped, runner.state.bots]).toEqual([
+			false,
+			true,
+			undefined,
+		]);
+		const gh = () => readFileSync(join(f.root, "gh.log"), "utf8");
+		expect(gh()).not.toMatch(/@coderabbitai|api --paginate/);
+		const checks = (rows: unknown[]) => {
+			const state = JSON.parse(readFileSync(join(f.root, "gh-state.json"), "utf8"));
+			writeFileSync(join(f.root, "gh-state.json"), JSON.stringify({ ...state, checks: rows }));
+		};
+		const check = {
+			name: "Test",
+			state: "FAILURE",
+			bucket: "fail",
+			link: "https://github.com/org/repo/actions/runs/1/job/2",
+		};
+		checks([check]);
+		await expect(runner.merge()).rejects.toThrow(/required checks failed at [0-9a-f]{40}: Test \(FAILURE\)/);
+		checks([{ ...check, state: "SUCCESS", bucket: "pass" }]);
+		writeFileSync(join(f.root, "defects"), "");
+		await expect(runner.merge()).rejects.toThrow("is not LANDABLE");
+		rmSync(join(f.root, "defects"));
+		await runner.merge();
+		expect(runner.state).toMatchObject({ merged: true, preMerge: { verdict: "LANDABLE" } });
+		expect(gh()).toMatch(/^pr merge 7 .* --match-head-commit [0-9a-f]{40}$/m);
 	});
 
 	it("kills a silent seat, keeps a talking one, and lets the writer run past any round count", async () => {

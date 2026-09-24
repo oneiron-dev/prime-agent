@@ -79,6 +79,11 @@ export function readLauncherSettings(path: string): OneironLauncherSettings {
 	for (const field of ["noStacks", "skipFactoryTests", "skipBots", "preMergeReview"])
 		if (flags[field] !== undefined && typeof flags[field] !== "boolean")
 			throw new Error(`launcher.${field} must be true or false`);
+	// Only a lone pull request's merge waits for its required checks; a stack merge would go untested.
+	if (value.skipFactoryTests && !value.noStacks)
+		throw new Error(
+			"launcher.skipFactoryTests needs launcher.noStacks: the required-check gate covers lone pull requests",
+		);
 	if (value.buildHosts !== undefined) {
 		if (!Array.isArray(value.buildHosts)) throw new Error("launcher.buildHosts must be an array");
 		for (const host of value.buildHosts) {
