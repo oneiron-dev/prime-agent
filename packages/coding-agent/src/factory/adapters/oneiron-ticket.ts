@@ -385,6 +385,8 @@ export class OneironTicketRunner {
 			env?: Record<string, string>;
 			logName?: string;
 			onIdle?: (idleMs: number) => void;
+			/** Written to the child's stdin, then closed; without it stdin is /dev/null. */
+			input?: string;
 		} = {},
 	): Promise<Exec> {
 		const cwd = options.cwd ?? this.worktree;
@@ -394,9 +396,16 @@ export class OneironTicketRunner {
 			const child = spawn(argv[0]!, argv.slice(1), {
 				cwd,
 				env: { ...(this.options.env ?? process.env), ...options.env, GIT_OPTIONAL_LOCKS: "0" },
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 			});
 			let output = "";
+			let inputError: Error | undefined;
+			if (options.input !== undefined) {
+				child.stdin?.on("error", (error) => {
+					inputError = error;
+				});
+				child.stdin?.end(options.input);
+			}
 			let expired = false;
 			let timer: NodeJS.Timeout;
 			const arm = () => {
@@ -416,8 +425,8 @@ export class OneironTicketRunner {
 				output += chunk.toString();
 				if (output.length > 64 * 1024 * 1024) output = output.slice(-32 * 1024 * 1024);
 			};
-			child.stdout.on("data", collect);
-			child.stderr.on("data", collect);
+			child.stdout!.on("data", collect);
+			child.stderr!.on("data", collect);
 			child.on("error", (error) => {
 				clearTimeout(timer);
 				resolve({ code: 127, output: `${output}\n${error.message}` });
@@ -428,8 +437,14 @@ export class OneironTicketRunner {
 					appendFileSync(join(this.directory, "logs", options.logName), `\n=== ${argv.join(" ")}\n${output}`);
 				const note = idleMs === undefined ? "TIMEOUT" : `IDLE ${Math.round(idleMs / 1000)}s`;
 				resolve({
-					code: expired ? (idleMs === undefined ? 124 : SEAT_IDLE_EXIT_CODE) : (code ?? (signal ? 128 : 1)),
-					output: expired ? `${output}\n${note}` : output,
+					code: expired
+						? idleMs === undefined
+							? 124
+							: SEAT_IDLE_EXIT_CODE
+						: inputError
+							? 127
+							: (code ?? (signal ? 128 : 1)),
+					output: expired ? `${output}\n${note}` : inputError ? `${output}\nstdin: ${inputError.message}` : output,
 				});
 			});
 		});
@@ -507,12 +522,12 @@ export class OneironTicketRunner {
 				...(options.session ? ["--session-dir", join(this.directory, "sessions", options.session)] : []),
 				...(options.continueSession ? ["-c"] : []),
 				...(options.system ? ["--append-system-prompt", options.system] : []),
-				"--",
-				prompt,
 			];
 		}
 		const step = options.logName.replace(/\.jsonl$/, "");
 		const result = await this.run(argv, {
+			// Print mode reads a piped prompt; a review diff in argv can exceed the per-argument limit (E2BIG).
+			input: "command" in spec ? undefined : prompt,
 			idleMs: this.settings.idleMs,
 			env: { ...factoryOwnedEnvironment(), ...this.cargoEnvironment() },
 			onIdle: (idleMs) => this.noteIdle(step, idleMs),

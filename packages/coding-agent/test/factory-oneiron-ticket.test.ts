@@ -319,6 +319,31 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		expect(intents.map((line) => JSON.parse(line).choice)).toEqual(["continue", "continue", "done"]);
 	});
 
+	it("sends a prime seat its prompt on stdin, never in argv", async () => {
+		const f = setup();
+		writeFileSync(
+			join(f.root, "cli.js"),
+			`const input = require("node:fs").readFileSync(0, "utf8");
+const say = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+const text = "argv " + process.argv.includes(input) + " stdin " + input.length;
+say({ type: "agent_start" });
+say({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } });
+say({ type: "agent_end" });
+`,
+		);
+		const ticket = f.ticket("stdin-one");
+		ticket.launcher = { ...f.launcher, seats: { writer: { provider: "p", model: "m", thinking: "low" } } };
+		const runner = new OneironTicketRunner(ticket, {
+			env: f.env,
+			routing: {},
+			cli: [process.execPath, join(f.root, "cli.js")],
+		});
+		mkdirSync(runner.worktree, { recursive: true });
+		const prompt = "x".repeat(300_000);
+		const result = await runner.seat("writer", prompt, { logName: "stdin.jsonl" });
+		expect([result.code, result.final]).toEqual([0, `argv false stdin ${prompt.length}`]);
+	});
+
 	it("sends cargo to the ruled build hosts and leaves it alone with none configured", () => {
 		const f = setup();
 		const plain = new OneironTicketRunner(f.ticket("plain"), { env: f.env, routing: {} });
