@@ -104,6 +104,28 @@ describe("portable factory journal", () => {
 		expect(store.actions().map((a) => a.state)).toEqual(["ACCEPTED", "ACCEPTED"]);
 		expect(store.tickets().every((t) => t.state === "RETIRED")).toBe(true);
 	});
+	it("admits one selected action while paused, commits its claim before launch and never relaunches a replay", async () => {
+		const { store } = fixture();
+		const adapter = new FakeAdapter();
+		adapter.launchResult = () => ({ kind: "running", processIdentity: "pid:1" });
+		const engine = new FactoryEngine(store, adapter, { enabled: true });
+		engine.applyPlan(plan([action("a"), action("b")]));
+		engine.pause("sequential shipping");
+		const empty: FactoryPlan = { version: 1, tickets: [], slots: [], actions: [] };
+		const options = { select: "b", expectedRevision: 1, mutationId: "admit-b", evidence };
+		const admitted = await engine.recoverAdmit(empty, options);
+		expect(admitted).toMatchObject({ actionId: "b", replayed: false, attemptState: "RUNNING", paused: true });
+		expect(await engine.recoverAdmit(empty, options)).toMatchObject({
+			attemptId: admitted.attemptId,
+			replayed: true,
+		});
+		expect(adapter.launches.map((c) => c.action.id)).toEqual(["b"]);
+		await expect(engine.recoverAdmit(empty, { ...options, select: "a" })).rejects.toThrow("Mutation identity reused");
+		await expect(engine.recoverAdmit(empty, { ...options, select: "a", mutationId: "admit-a" })).rejects.toThrow(
+			"a live, uncertain, or unreleased claim remains",
+		);
+		expect(store.isPaused()).toBe(true);
+	});
 	it("records failed processes without accepting them", async () => {
 		const { store } = fixture();
 		const adapter = new FakeAdapter();

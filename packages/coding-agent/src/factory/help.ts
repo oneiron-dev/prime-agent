@@ -2,6 +2,7 @@ export const FACTORY_HELP = `Usage:
   prime factory init <directory> <plan.json> --hosts <hosts.json> [--pause-file <absolute-path>]
   prime factory launch <directory> <w7-manifest.json> <mint-plan.json> --launcher <launcher.json>
   prime factory import <directory> <plan.json> --expected-revision <revision> [--mutation-id <id>]
+  prime factory recover-admit <directory> <selected-plan.json> --select <action-id> [--supersede <rejected-action-id>] --expected-revision <revision> --mutation-id <id> --actor <actor> --reason <reason> --ref <evidence>
   prime factory status <directory>
   prime factory events <directory> [--after <sequence>]
   prime factory fingerprint <host> <absolute-cwd> --hosts <hosts.json> [--timeout-ms <milliseconds>]
@@ -29,6 +30,12 @@ run/serve stay in the foreground; SIGINT/SIGTERM persist a scheduling pause whil
 Each configured host needs Python 3 on a POSIX system. Factory storage needs Node 22.13+ with node:sqlite.
 Hosts JSON: {"local":{"type":"local","runnerRoot":"/absolute/attempts"}}
 SSH host: {"type":"ssh","sshHost":"arch","runnerRoot":"/absolute/attempts","python":"python3"}
+recover-admit admits exactly one owner-selected action while the durable factory stays paused, refusing any live, uncertain or unreleased claim.
+Its plan may hold only the selected replacement action and its exact slot; existing ticket ownership, roles, actions and slots cannot change.
+Without --supersede the action must already be READY and unchanged; an empty version-1 plan is enough.
+With --supersede the old action must be REJECTED; the replacement keeps its ticket and dependencies, and only unstarted dependents are rewired.
+A durable SUBMITTED claim and the mutation receipt commit before the launch; a replay never launches the same attempt again, and an ambiguous launch stays UNCERTAIN for reconciliation.
+External owner pause files are never overridden. tick, serve and resume are unchanged.
 Only foreground commands are supported; daemonized/detached descendants require another adapter.
 Plans use argv arrays and absolute cwd paths. Use fingerprint for verified Git source identity.
 fingerprint --timeout-ms accepts integers 1..120000 (default 20000 ms); launch and inspect deadlines are unchanged.

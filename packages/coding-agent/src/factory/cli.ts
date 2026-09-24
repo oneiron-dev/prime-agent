@@ -25,6 +25,8 @@ function parseArguments(args: readonly string[]): { positionals: string[]; optio
 		"--ref",
 		"--expected-revision",
 		"--mutation-id",
+		"--select",
+		"--supersede",
 	]);
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index]!;
@@ -72,6 +74,8 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 	}
 	const { positionals, options } = parseArguments(args);
 	const [command, rawDirectory, argument, choice] = positionals;
+	if ((options.has("--select") || options.has("--supersede")) && command !== "recover-admit")
+		throw new Error("--select and --supersede are only supported for recover-admit");
 	if (options.has("--timeout-ms") && command !== "fingerprint") {
 		throw new Error("--timeout-ms is only supported for fingerprint");
 	}
@@ -145,6 +149,39 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 					{ mode: 0o600 },
 				);
 				emit({ ...result, skipped, tickets: tickets.length });
+				break;
+			}
+			case "recover-admit": {
+				const allowed = new Set([
+					"--select",
+					"--supersede",
+					"--expected-revision",
+					"--mutation-id",
+					"--actor",
+					"--reason",
+					"--ref",
+				]);
+				const select = options.get("--select");
+				const mutationId = options.get("--mutation-id");
+				if (
+					positionals.length !== 3 ||
+					!argument ||
+					!select ||
+					!mutationId ||
+					[...options.keys()].some((key) => !allowed.has(key))
+				)
+					throw new Error(
+						"recover-admit requires plan.json --select ACTION --expected-revision N --mutation-id ID --actor ACTOR --reason REASON --ref EVIDENCE; optional --supersede REJECTED",
+					);
+				emit(
+					await engine.recoverAdmit(readFactoryJson(argument) as FactoryPlan, {
+						select,
+						supersede: options.get("--supersede"),
+						expectedRevision: expectedRevision(options),
+						mutationId,
+						evidence: evidence(options),
+					}),
+				);
 				break;
 			}
 			case "import":

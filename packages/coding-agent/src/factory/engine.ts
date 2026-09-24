@@ -61,6 +61,50 @@ export class FactoryEngine {
 		this.requireUnpaused();
 		this.store.resolveForRetry(attemptId, evidence, expectedRevision);
 	}
+	/**
+	 * Admit one owner-selected action while the factory stays paused. The durable SUBMITTED claim and the mutation
+	 * receipt commit before the launch; a replayed mutation never launches again, and an ambiguous launch is left
+	 * UNCERTAIN for ordinary reconciliation. An external owner pause file is never overridden.
+	 */
+	async recoverAdmit(
+		plan: FactoryPlan,
+		options: {
+			select: string;
+			supersede?: string;
+			expectedRevision: number;
+			mutationId: string;
+			evidence: DecisionEvidence;
+		},
+	): Promise<{
+		revision: number;
+		replayed: boolean;
+		actionId: string;
+		attemptId: string;
+		attemptState: string;
+		paused: boolean;
+	}> {
+		this.requireOwnerUnpaused();
+		const selected = this.store.recoverAndClaim(plan, options);
+		if (!selected.replayed) {
+			try {
+				this.record(selected.context, await this.adapter.launch(selected.context));
+			} catch (error) {
+				this.store.markUncertain(
+					selected.context.attempt.id,
+					`Launch outcome unknown: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+		const current = this.store.context(selected.context.attempt.id);
+		return {
+			revision: selected.revision,
+			replayed: selected.replayed,
+			actionId: current.action.id,
+			attemptId: current.attempt.id,
+			attemptState: current.attempt.state,
+			paused: this.paused(),
+		};
+	}
 	status(): FactoryStatus {
 		const status = this.store.status();
 		if (this.externalPause()) {
