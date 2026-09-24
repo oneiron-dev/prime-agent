@@ -29,6 +29,10 @@ A call whose git toplevel is `<work>/wt/<key>` is offloaded. Under a per-ticket 
 
 When every slot of every reachable host is busy the call waits (`WAIT_CAPACITY` on stderr once a minute) instead of overrunning a host. A host that cannot be reached is skipped for the rest of the call. A call from anywhere else, an empty `buildHosts`, no host reachable at all, or `W7_CARGO_LOCAL=1` runs the real cargo on the ticket host unchanged. The wrapper runs on bash 3.2 and uses `flock(1)`, or perl's `flock(2)` where that is missing.
 
+### Seats
+
+The defaults stay in source (`DEFAULT_SEATS`, all on `cpa-r`: writer `gpt-6-astra` xhigh, pack `muse-spark-1.3-contributor` max, grok `grok-4.6` xhigh, opus `claude-opus-5` xhigh). A launch picks its models in `launcher.json` `seats`, for example `{"writer":{"provider":"cpa-r","model":"gpt-6-sol","thinking":"xhigh"},"grok":{"provider":"cpa-r","model":"gpt-6-astra","thinking":"xhigh"}}`, with `tier: "two"` on every manifest row for one reviewer on the `grok` slot. The seats are copied into every `ticket.json`; a ticket cannot override one. A seat always passes `--provider`, and the runner host must define that provider and model in its own `~/.prime/agent/models.json`: add a new model id there before a launch names it.
+
 ### Opening a seat
 
 Seats spawn with `--daemon-hosted`, so the daemon owns the session instead of the launcher. The seat is listed as running in `prime-agent` and in the agents view, and can be opened from another terminal while the launcher keeps consuming its JSON event stream. Check it with `prime-agent` and the agents view, or `prime-agent session list`.
