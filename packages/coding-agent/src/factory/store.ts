@@ -530,7 +530,7 @@ export class FactoryStore {
 			)
 			.digest("hex");
 		return this.transaction(() => {
-			if (!this.isPaused()) throw new Error("recover-admit requires the durable factory pause to remain set");
+			// A replay answers with its first receipt even after a resume; only a new admission needs the pause.
 			const receiptKey = `recover_admit:${mutationId}`;
 			const priorMutation = this.planMutation(mutationId);
 			const priorText = this.meta(receiptKey);
@@ -542,6 +542,7 @@ export class FactoryStore {
 					throw new Error("Corrupt selected-admission receipt");
 				return { revision: prior.revision, replayed: true, context: this.context(prior.attemptId) };
 			}
+			if (!this.isPaused()) throw new Error("recover-admit requires the durable factory pause to remain set");
 			if (Number(this.meta("plan_revision")) !== expectedRevision) throw new Error("Factory plan revision changed");
 			if (
 				this.db

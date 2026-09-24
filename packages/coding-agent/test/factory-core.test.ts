@@ -125,6 +125,16 @@ describe("portable factory journal", () => {
 			"a live, uncertain, or unreleased claim remains",
 		);
 		expect(store.isPaused()).toBe(true);
+		// After a resume the replay still answers with its first receipt and launches nothing.
+		engine.resume();
+		expect(await engine.recoverAdmit(empty, options)).toMatchObject({
+			attemptId: admitted.attemptId,
+			replayed: true,
+		});
+		expect(adapter.launches).toHaveLength(1);
+		await expect(engine.recoverAdmit(empty, { ...options, mutationId: "admit-b-2" })).rejects.toThrow(
+			"requires the durable factory pause",
+		);
 	});
 	it("records failed processes without accepting them", async () => {
 		const { store } = fixture();
