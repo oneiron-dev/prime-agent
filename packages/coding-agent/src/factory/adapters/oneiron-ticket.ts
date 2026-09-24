@@ -63,7 +63,8 @@ export interface OneironLauncherSettings {
 	idleMs?: number;
 	/** Ordered build hosts for cargo. The first reachable one runs it; an empty list keeps cargo on this host. */
 	buildHosts?: OneironBuildHost[];
-	timeouts?: Partial<{ ghMs: number; botsMs: number }>;
+	/** gh and git calls; the bot poll; the required-check wait before a merge. */
+	timeouts?: Partial<{ ghMs: number; botsMs: number; ciMs: number }>;
 }
 /** A host that runs cargo for this factory: the worktree is synced to `<root>/wt/<key>` and cargo runs there. */
 export interface OneironBuildHost {
@@ -119,7 +120,7 @@ export const DEFAULT_SEATS: Record<SeatName, OneironSeat> = {
 	opus: { provider: "cpa-r", model: "claude-opus-5", thinking: "xhigh" },
 };
 /** gh and git are network calls, not models; they keep a wall clock. Nothing that runs a model does. */
-const DEFAULT_TIMEOUTS = { ghMs: 300_000, botsMs: 2_700_000 };
+const DEFAULT_TIMEOUTS = { ghMs: 300_000, botsMs: 2_700_000, ciMs: 2_700_000 };
 /** No event on a seat's stream for this long means the seat is gone, not thinking. */
 export const DEFAULT_IDLE_MS = 30 * 60_000;
 /** A round that writes nothing at all and exits non-zero is a seat that cannot start; enough of them is a failure. */
@@ -148,6 +149,7 @@ const ATTRIBUTION =
 	/co-authored-by|generated with \[?claude|generated-by|🤖|signed-off-by: .*(?:claude|codex|astra|gpt)/i;
 
 export class TicketFailure extends Error {}
+export type MergeReadiness = "merged" | "conflicting" | "behind" | "ready" | "pending";
 
 type Logger = (step: string, message?: string) => void;
 interface Exec {
@@ -1510,20 +1512,308 @@ ${rendered || "(no bot comments)"}`;
 		const parsed = JSON.parse(view.output) as { state?: string; mergedAt?: string | null };
 		return parsed.state === "MERGED" || !!parsed.mergedAt;
 	}
-	/** Native stacks: sync then merge; a lone PR is an ordinary squash. One merge at a time on this host. */
+	private async dirty(): Promise<boolean> {
+		return (await this.git(["status", "--porcelain"])) !== "";
+	}
+	private async prView<T>(repo: string, fields: string): Promise<T> {
+		return (await this.ghJson(["pr", "view", String(this.state.pr), "--repo", repo, "--json", fields])) as T;
+	}
+	private async remoteHead(branch: string): Promise<string | undefined> {
+		const [sha, ref, ...rest] = (
+			await this.git(["ls-remote", "--heads", this.settings.remote, `refs/heads/${branch}`])
+		)
+			.trim()
+			.split(/\s+/);
+		return ref === `refs/heads/${branch}` && !rest.length ? sha : undefined;
+	}
+	/**
+	 * After an ordinary push of an exact tested head succeeded, the pull request API can lag the branch. Confirm the
+	 * remote branch itself, then wait (bounded by the gh clock, no model call) for the API to show the same head.
+	 * The lag is never read as a conflict; a remote branch that is not the tested head fails at once.
+	 */
+	async waitForPushedHead(repo: string, testedHead: string): Promise<void> {
+		const deadline = Date.now() + this.t.ghMs;
+		let reported = false;
+		for (;;) {
+			if ((await this.head()) !== testedHead || (await this.dirty()))
+				throw new TicketFailure("post-push propagation: the local tested head or source changed; no merge");
+			if ((await this.remoteHead(this.branch)) !== testedHead)
+				throw new TicketFailure(
+					`post-push propagation: the remote branch is not the tested ${testedHead}; this is not API lag`,
+				);
+			const view = await this.prView<{ state?: string; headRefOid?: string }>(repo, "state,headRefOid");
+			if (view.state !== "OPEN" && view.state !== "MERGED")
+				throw new TicketFailure(`post-push propagation: the pull request is ${view.state}`);
+			if (view.headRefOid === testedHead) {
+				if ((await this.head()) !== testedHead || (await this.dirty()))
+					throw new TicketFailure("post-push propagation: the source changed while reading the pull request");
+				this.log("merge:propagation", `the pull request shows the pushed tested head ${testedHead}`);
+				return;
+			}
+			if (!reported) {
+				this.log(
+					"merge:propagation",
+					`push succeeded and the remote branch is ${testedHead}; waiting for the pull request head ${view.headRefOid} to follow`,
+				);
+				reported = true;
+			}
+			if (Date.now() >= deadline)
+				throw new TicketFailure(
+					`the pull request did not show the pushed head ${testedHead} within the gh budget; keep the tested commit and retry the merge only`,
+				);
+			await sleep(Math.min(1_000, Math.max(0, deadline - Date.now())));
+		}
+	}
+	/**
+	 * GitHub recomputes mergeability and required checks after every push. Wait for the exact local head's required
+	 * checks (bounded by `ciMs`), never mislabel pending checks as a conflict, and fail on a failed required check.
+	 * This is the CI gate that `skipFactoryTests` relies on.
+	 */
+	async waitForMergeReadiness(repo: string, once = false): Promise<MergeReadiness> {
+		const head = await this.head();
+		const deadline = Date.now() + this.t.ciMs;
+		let last = "";
+		for (;;) {
+			if ((await this.head()) !== head)
+				throw new TicketFailure("merge wait: the local head changed; retry against the new exact head");
+			const view = await this.prView<{
+				state?: string;
+				headRefOid?: string;
+				mergeable?: string;
+				mergeStateStatus?: string;
+			}>(repo, "state,headRefOid,mergeable,mergeStateStatus");
+			if (view.state === "MERGED") return "merged";
+			if (view.state !== "OPEN") throw new TicketFailure(`merge wait: the pull request is ${view.state}`);
+			if (view.headRefOid !== head)
+				throw new TicketFailure(
+					`merge wait: the pull request head ${view.headRefOid} differs from the local ${head}; never merge another revision`,
+				);
+			if (view.mergeable === "CONFLICTING") return "conflicting";
+			const checks = await this.gh([
+				"pr",
+				"checks",
+				String(this.state.pr),
+				"--repo",
+				repo,
+				"--required",
+				"--json",
+				"name,bucket,state,link",
+			]);
+			let rows: Array<{ name?: string; bucket?: string; state?: string; link?: string }>;
+			try {
+				rows = JSON.parse(checks.output);
+			} catch {
+				if (!/no required checks reported/i.test(checks.output))
+					throw new TicketFailure(`cannot read the required checks: ${tail(checks.output, 10)}`);
+				rows = [];
+			}
+			if (!Array.isArray(rows) || ![0, 1, 8].includes(checks.code))
+				throw new TicketFailure(`cannot read the required checks rc=${checks.code}: ${tail(checks.output, 10)}`);
+			const failed = rows.filter((row) => row.bucket === "fail" || row.bucket === "cancel");
+			if (failed.length)
+				throw new TicketFailure(
+					`required checks failed at ${head}: ${failed.map((row) => `${row.name} (${row.state}) ${row.link ?? ""}`).join("; ")}`,
+				);
+			// A head that moved between the two reads cannot borrow these check results.
+			if ((await this.prView<{ headRefOid?: string }>(repo, "headRefOid")).headRefOid !== head)
+				throw new TicketFailure(
+					"the pull request head changed while its required checks were read; retry the merge",
+				);
+			const pending = rows.filter((row) => !["pass", "skipping"].includes(row.bucket ?? ""));
+			if (view.mergeable === "MERGEABLE" && !pending.length && checks.code !== 8) {
+				if (view.mergeStateStatus === "BEHIND") return "behind";
+				if (["CLEAN", "HAS_HOOKS", "UNSTABLE"].includes(view.mergeStateStatus ?? "")) return "ready";
+			}
+			const status = `head=${head} mergeable=${view.mergeable} state=${view.mergeStateStatus} requiredPending=${pending.map((row) => row.name).join(",") || "-"}`;
+			if (status !== last) {
+				this.log("merge:wait", status);
+				last = status;
+			}
+			if (once) return "pending";
+			if (Date.now() >= deadline)
+				throw new TicketFailure(
+					`merge readiness still pending after the bounded wait: ${status}; retry the merge only, never a conflict repair`,
+				);
+			await sleep(Math.min(10_000, Math.max(0, deadline - Date.now())));
+		}
+	}
+	private acquireMergeMutex(): Promise<() => void> {
+		return acquireSlot(join(this.settings.work, "merge-lock"), 1, this.log);
+	}
+	/**
+	 * A candidate that is behind or conflicts is updated outside the global mutex: `gh pr update-branch` when the
+	 * branch is merely behind, else one writer round that merges the fetched trunk. The new bytes get the full gate
+	 * and an ordinary push of the exact tested head; nothing borrows the old head's evidence.
+	 */
+	private async repairNonstackedCandidate(repo: string): Promise<void> {
+		const oldHead = await this.head();
+		const update = await this.gh(["pr", "update-branch", String(this.state.pr), "--repo", repo]);
+		await this.git(["fetch", "-q", this.settings.remote]);
+		if (update.code === 0) {
+			this.log("merge", "the branch was behind; updated natively");
+			await this.git(["merge", "--ff-only", `${this.settings.remote}/${this.branch}`]);
+		} else {
+			const actual = await this.prView<{ headRefOid?: string; mergeable?: string }>(repo, "headRefOid,mergeable");
+			if (actual.headRefOid !== oldHead || actual.mergeable !== "CONFLICTING")
+				throw new TicketFailure(
+					`the branch update failed without a confirmed conflict at the current head: ${tail(update.output, 10)}`,
+				);
+			await this.fixRound(
+				"fix-merge",
+				`The pull request does not merge because this branch conflicts with ${this.settings.remote}/${this.settings.trunk}. Run \`git merge ${this.settings.remote}/${this.settings.trunk}\` in this worktree, resolve every conflict, keep every commit's intent, commit the merge, and do not push.`,
+				update.output,
+			);
+		}
+		if ((await this.head()) === oldHead)
+			throw new TicketFailure(
+				"the branch preparation produced no new candidate; no validation rerun, no guessed base",
+			);
+		await this.tests("tests-after-merge-fix");
+		const testedHead = await this.head();
+		if (await this.dirty()) throw new TicketFailure("the merge preparation gate left dirty source; no push");
+		const push = await this.run(["git", "push", this.settings.remote, `${testedHead}:refs/heads/${this.branch}`], {
+			timeoutMs: this.t.ghMs,
+			logName: "git-push.log",
+		});
+		if (push.code !== 0)
+			throw new TicketFailure(`the push after candidate preparation failed: ${tail(push.output, 10)}`);
+		await this.waitForPushedHead(repo, testedHead);
+	}
+	/** Outside the global mutex: a clean head that contains the fetched trunk and whose required checks are green. */
+	private async prepareNonstackedCandidate(repo: string): Promise<{ head: string; base: string } | undefined> {
+		for (;;) {
+			if (await this.mergedOnGitHub(repo)) return undefined;
+			if (await this.dirty()) throw new TicketFailure("candidate preparation needs clean committed source");
+			await this.git(["fetch", "-q", this.settings.remote]);
+			const head = await this.head();
+			const base = await this.git(["rev-parse", `${this.settings.remote}/${this.settings.trunk}`]);
+			const ancestry = await this.run(["git", "merge-base", "--is-ancestor", base, head], {
+				timeoutMs: this.t.ghMs,
+			});
+			if (![0, 1].includes(ancestry.code))
+				throw new TicketFailure(`cannot verify the candidate's base ancestry: ${tail(ancestry.output, 10)}`);
+			const view = await this.prView<{
+				state?: string;
+				headRefOid?: string;
+				baseRefName?: string;
+				mergeable?: string;
+				mergeStateStatus?: string;
+			}>(repo, "state,headRefOid,baseRefName,mergeable,mergeStateStatus");
+			if (view.state === "MERGED") return undefined;
+			if (view.state !== "OPEN" || view.headRefOid !== head || view.baseRefName !== this.settings.trunk)
+				throw new TicketFailure(
+					"the candidate pull request head or base branch does not match; no inferred recovery",
+				);
+			if (ancestry.code === 1 || view.mergeable === "CONFLICTING" || view.mergeStateStatus === "BEHIND") {
+				this.log(
+					"merge:prepare",
+					`preparing a changed candidate outside the global mutex; head=${head} base=${base}`,
+				);
+				await this.repairNonstackedCandidate(repo);
+				continue;
+			}
+			const readiness = await this.waitForMergeReadiness(repo);
+			if (readiness === "merged") return undefined;
+			if (readiness !== "ready") {
+				await this.repairNonstackedCandidate(repo);
+				continue;
+			}
+			if ((await this.head()) !== head)
+				throw new TicketFailure("the candidate changed during the required-check wait");
+			return { head, base };
+		}
+	}
+	/**
+	 * The only critical section: under the global merge mutex, recheck the exact head, the base and the required
+	 * checks once, then merge with `--match-head-commit`. No sleep and no model call happen inside it. The mutex
+	 * serializes this factory only; GitHub's own conflict and protection checks still govern other writers.
+	 */
+	private async finalizePreparedMerge(
+		repo: string,
+		args: string[],
+		candidate: { head: string; base: string },
+	): Promise<"merged" | "stale-base" | "reprepare"> {
+		const release = await this.acquireMergeMutex();
+		try {
+			if (await this.mergedOnGitHub(repo)) return "merged";
+			if ((await this.head()) !== candidate.head || (await this.dirty()))
+				throw new TicketFailure("the prepared candidate's head or source changed before the final merge");
+			const trunkHead = async () => {
+				const sha = await this.remoteHead(this.settings.trunk);
+				if (!sha) throw new TicketFailure("cannot read the remote trunk head for the final merge");
+				return sha;
+			};
+			if ((await trunkHead()) !== candidate.base) return "stale-base";
+			const readiness = await this.waitForMergeReadiness(repo, true);
+			if (readiness === "merged") return "merged";
+			if (readiness !== "ready") return "reprepare";
+			const view = await this.prView<{ headRefOid?: string; baseRefOid?: string; baseRefName?: string }>(
+				repo,
+				"headRefOid,baseRefOid,baseRefName",
+			);
+			if (view.headRefOid !== candidate.head || view.baseRefName !== this.settings.trunk)
+				throw new TicketFailure("the final pull request head or base branch changed");
+			if (view.baseRefOid !== candidate.base || (await trunkHead()) !== candidate.base) return "stale-base";
+			if ((await this.head()) !== candidate.head || (await this.dirty()))
+				throw new TicketFailure("the local evidence changed during the final checks");
+			const merge = await this.gh([...args, "--match-head-commit", candidate.head]);
+			if (merge.code === 0 || (await this.mergedOnGitHub(repo))) return "merged";
+			if ((await trunkHead()) !== candidate.base) return "stale-base";
+			throw new TicketFailure(
+				`the native merge failed at an unchanged candidate and base: ${tail(merge.output, 15)}`,
+			);
+		} finally {
+			release();
+		}
+	}
+	/** A lone pull request: prepare under a per-ticket lock, merge under the short global mutex, repeat on a stale base. */
+	private async mergeNonstacked(repo: string): Promise<void> {
+		const releaseTicket = await acquireSlot(join(this.directory, "merge-preparation-lock"), 1, this.log);
+		try {
+			const args = [
+				"pr",
+				"merge",
+				String(this.state.pr),
+				"--repo",
+				repo,
+				"--squash",
+				"--subject",
+				`${this.ticket.key}: ${this.ticket.title}`.slice(0, 250),
+				"--body-file",
+				join(this.directory, "PR-BODY.md"),
+			];
+			for (;;) {
+				const candidate = await this.prepareNonstackedCandidate(repo);
+				if (!candidate) return;
+				const outcome = await this.finalizePreparedMerge(repo, args, candidate);
+				if (outcome === "merged") return;
+				this.log(
+					"merge:prepare",
+					`${outcome}; the global mutex is released; recheck the candidate and base outside it`,
+				);
+				await sleep(1_000);
+			}
+		} finally {
+			releaseTicket();
+		}
+	}
+	/**
+	 * Native stacks keep their conservative boundary: sync then merge under the global mutex. A lone pull request is
+	 * prepared outside the mutex and merged at its exact tested head once its required checks are green.
+	 */
 	async merge(): Promise<void> {
 		if (this.state.merged) return;
 		if (!this.state.pr) throw new TicketFailure("merge requires a submitted pull request; run submit first");
 		await this.waitForParents();
 		const repo = await this.githubRepo();
-		const release = await acquireSlot(join(this.settings.work, "merge-lock"), 1, this.log);
-		try {
-			if (await this.mergedOnGitHub(repo)) {
-				this.save({ merged: true });
-				this.log("merge", "already merged");
-				return;
-			}
-			if (this.state.stacked) {
+		if (await this.mergedOnGitHub(repo)) {
+			this.save({ merged: true });
+			this.log("merge", "already merged");
+			return;
+		}
+		if (this.state.stacked) {
+			const release = await this.acquireMergeMutex();
+			try {
 				const sync = await this.gh(["stack", "sync"]);
 				if (sync.code !== 0) {
 					this.log("merge", `gh stack sync failed; one fix round: ${tail(sync.output, 5)}`);
@@ -1539,55 +1829,12 @@ ${rendered || "(no bot comments)"}`;
 				const merge = await this.gh(["stack", "merge", "--squash", "--yes"]);
 				if (merge.code !== 0 && !(await this.mergedOnGitHub(repo)))
 					throw new TicketFailure(`gh stack merge failed: ${tail(merge.output, 15)}`);
-			} else {
-				const title = `${this.ticket.key}: ${this.ticket.title}`.slice(0, 250);
-				const args = [
-					"pr",
-					"merge",
-					String(this.state.pr),
-					"--repo",
-					repo,
-					"--squash",
-					"--subject",
-					title,
-					"--body-file",
-					join(this.directory, "PR-BODY.md"),
-				];
-				let merge = await this.gh(args);
-				if (merge.code !== 0 && !(await this.mergedOnGitHub(repo))) {
-					// Never a raw force push. A branch that is merely behind is updated natively; a conflict gets one
-					// writer round that merges the trunk into the branch, then a plain push.
-					const update = await this.gh(["pr", "update-branch", String(this.state.pr), "--repo", repo]);
-					if (update.code === 0) {
-						this.log("merge", "branch was behind; updated natively");
-						await this.git(["fetch", "-q", this.settings.remote]);
-						await this.git(["merge", "--ff-only", `${this.settings.remote}/${this.branch}`]);
-					} else {
-						this.log("merge", `squash failed; one merge fix round: ${tail(merge.output, 5)}`);
-						await this.git(["fetch", "-q", this.settings.remote]);
-						await this.fixRound(
-							"fix-merge",
-							`The pull request does not merge because this branch conflicts with ${this.settings.remote}/${this.settings.trunk}. Run \`git merge ${this.settings.remote}/${this.settings.trunk}\` in this worktree, resolve every conflict, keep every commit's intent, commit the merge, and do not push.`,
-							`${merge.output}\n${update.output}`,
-						);
-						await this.tests("tests-after-merge-fix");
-						const push = await this.run(["git", "push", this.settings.remote, this.branch], {
-							timeoutMs: this.t.ghMs,
-							logName: "git-push.log",
-						});
-						if (push.code !== 0)
-							throw new TicketFailure(`push after the merge fix failed: ${tail(push.output, 10)}`);
-					}
-					merge = await this.gh(args);
-					if (merge.code !== 0 && !(await this.mergedOnGitHub(repo)))
-						throw new TicketFailure(`gh pr merge failed: ${tail(merge.output, 15)}`);
-				}
+			} finally {
+				release();
 			}
-			this.save({ merged: true });
-			this.log("merge", `MERGED ${this.state.prUrl}`);
-		} finally {
-			release();
-		}
+		} else await this.mergeNonstacked(repo);
+		this.save({ merged: true });
+		this.log("merge", `MERGED ${this.state.prUrl}`);
 		await this.run(["git", "worktree", "remove", "--force", this.worktree], { cwd: this.settings.repo });
 		await this.run(["git", "worktree", "prune"], { cwd: this.settings.repo });
 	}

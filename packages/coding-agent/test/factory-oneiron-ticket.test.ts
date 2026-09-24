@@ -33,7 +33,11 @@ const long = "This handler ignores the usage limit returned by the provider and 
 if (group === "pr" && verb === "view") {
   const pr = state.prs[target];
   if (!pr) { process.stderr.write("no pull requests found"); process.exit(1); }
-  out({ number: pr.number, url: "https://github.com/org/repo/pull/" + pr.number, state: pr.merged ? "MERGED" : "OPEN", mergedAt: pr.merged ? "2026-09-19T00:00:00Z" : null });
+  const remote = (ref) => require("node:child_process").execFileSync("git", ["ls-remote", "origin", "refs/heads/" + ref], { encoding: "utf8" }).split(/\\s+/)[0];
+  out({ number: pr.number, url: "https://github.com/org/repo/pull/" + pr.number, state: pr.merged ? "MERGED" : "OPEN", mergedAt: pr.merged ? "2026-09-19T00:00:00Z" : null,
+    headRefOid: remote(pr.branch), baseRefName: "main", baseRefOid: remote("main"), mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+} else if (group === "pr" && verb === "checks") {
+  out(JSON.stringify(state.checks ?? []));
 } else if (group === "pr" && verb === "create") {
   const head = args[args.indexOf("--head") + 1];
   const pr = { number: state.next++, merged: false, branch: head };
@@ -245,8 +249,10 @@ describe("Oneiron ticket runner", () => {
 		expect([usage.status, rerun.status]).toEqual([2, 0]);
 		expect(rerun.stdout).toContain("MERGED https://github.com/org/repo/pull/7");
 		const mergeLog = readFileSync(join(f.root, "gh.log"), "utf8");
-		expect(mergeLog).toContain(
-			"pr merge 7 --repo org/repo --squash --subject alpha-one: Ticket alpha-one --body-file",
+		// A lone pull request merges at its exact tested head, after its required checks were read.
+		expect(mergeLog).toContain("pr checks 7 --repo org/repo --required --json name,bucket,state,link");
+		expect(mergeLog).toMatch(
+			/pr merge 7 --repo org\/repo --squash --subject alpha-one: Ticket alpha-one --body-file \S+ --match-head-commit [0-9a-f]{40}\n/,
 		);
 		expect(existsSync(alpha.worktree)).toBe(false);
 		await beta.merge();
