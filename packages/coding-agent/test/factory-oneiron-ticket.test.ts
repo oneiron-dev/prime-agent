@@ -87,8 +87,9 @@ const fs = require("node:fs"), path = require("node:path");
 const input = fs.readFileSync(0, "utf8"), argv = process.argv.slice(2);
 const dir = argv.includes("--session-dir") ? argv[argv.indexOf("--session-dir") + 1] : undefined;
 if (dir) { fs.mkdirSync(dir, { recursive: true }); fs.appendFileSync(path.join(dir, "session.jsonl"), "{}\\n"); }
-fs.appendFileSync(path.join(process.env.FAKE_ROOT, "prime.log"), (argv.includes("-c") ? "continue " : "open ") + input.slice(0, 20) + "\\n");
+fs.appendFileSync(path.join(process.env.FAKE_ROOT, "prime.log"), (argv.includes("-c") ? "continue " : "open ") + input.slice(0, 20) + (input.includes("owner note") ? " +note" : "") + "\\n");
 const text = input.startsWith("Continue this SAME review") ? "Checked every hunk.\\nVERDICT: LANDABLE"
+  : input.startsWith("finish") ? "Finished.\\nDONE note-one"
   : input.startsWith("Review this diff") ? "Reviewers are still running; VERDICT: LANDABLE is likely."
   : "argv " + argv.includes(input) + " stdin " + input.length;
 const say = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
@@ -374,6 +375,25 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		const prompt = "x".repeat(300_000);
 		const result = await runner.seat("writer", prompt, { logName: "stdin.jsonl" });
 		expect([result.code, result.final]).toEqual([0, `argv false stdin ${prompt.length}`]);
+	});
+
+	it("continues a writer's existing session on round 1 and delivers the owner's note once", async () => {
+		const f = setup();
+		const ticket = f.ticket("note-one");
+		ticket.launcher = { ...f.launcher, seats: { writer: { provider: "p", model: "m", thinking: "low" } } };
+		const runner = new OneironTicketRunner(ticket, {
+			env: f.env,
+			routing: {},
+			cli: [process.execPath, join(f.root, "prime.js")],
+		});
+		mkdirSync(runner.worktree, { recursive: true });
+		writeFileSync(join(runner.directory, "resume-note.md"), "owner note: the fixture host moved\n");
+		await runner.writerRounds("fix-tests", "finish the first fix", "continue");
+		await runner.writerRounds("fix-tests", "finish the second fix", "continue");
+		expect(readFileSync(join(f.root, "prime.log"), "utf8")).toBe(
+			"open finish the first fix +note\ncontinue finish the second fi\n",
+		);
+		expect(existsSync(join(runner.directory, "resume-note.md"))).toBe(false);
 	});
 
 	it("sends cargo to the ruled build hosts and leaves it alone with none configured", () => {

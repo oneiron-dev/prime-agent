@@ -7,6 +7,7 @@ import {
 	openSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statfsSync,
 	unlinkSync,
@@ -782,13 +783,22 @@ ${rendered || "(no bot comments)"}`;
 		let final = "";
 		let split: string | undefined;
 		let silent = 0;
+		// A runner restarted after a crash or a relaunch continues the writer it had, never a blank one.
+		const prior = hasSessionFile(join(this.directory, "sessions", session));
+		if (prior) this.log(`writer:${session}`, "continuing the existing session");
 		for (let round = 1; ; round++) {
-			const result = await this.seat("writer", round === 1 ? prompt : continueLine, {
-				system: this.writerSystem(),
-				session,
-				continueSession: round > 1,
-				logName: `${session}.r${round}.jsonl`,
-			});
+			const note = this.resumeNote();
+			const result = await this.seat(
+				"writer",
+				[round === 1 ? prompt : continueLine, note].filter((part) => part !== undefined).join("\n\n"),
+				{
+					system: this.writerSystem(),
+					session,
+					continueSession: round > 1 || prior,
+					logName: `${session}.r${round}.jsonl`,
+				},
+			);
+			if (note !== undefined && result.bytes > 0) this.noteDelivered(note);
 			final = result.final;
 			this.log(
 				`writer:${session}`,
@@ -823,6 +833,21 @@ ${rendered || "(no bot comments)"}`;
 				throw new TicketFailure(`the writer seat produced no output in ${silent} consecutive rounds`);
 			if (result.code !== 0) await sleep(this.options.retryDelayMs ?? 30_000);
 		}
+	}
+	/** The owner's note for the next writer round of this ticket, `resume-note.md` in the ticket directory. */
+	private resumeNote(): string | undefined {
+		const path = join(this.directory, "resume-note.md");
+		return (existsSync(path) && readFileSync(path, "utf8").trim()) || undefined;
+	}
+	/** A delivered note is kept, renamed, so it reaches the writer once; a note rewritten meanwhile stays pending. */
+	private noteDelivered(note: string): void {
+		const path = join(this.directory, "resume-note.md");
+		if (this.resumeNote() !== note) return;
+		renameSync(
+			path,
+			join(this.directory, `resume-note.${new Date().toISOString().replace(/[:.]/g, "-")}.delivered.md`),
+		);
+		this.log("resume-note", "delivered to the writer");
 	}
 	private journalIntent(session: string, round: number, answer: RoutingAnswer<string>): void {
 		appendFileSync(
