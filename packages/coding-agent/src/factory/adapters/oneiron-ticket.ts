@@ -35,6 +35,7 @@ import {
 	locateFactoryCli,
 } from "../runtime.js";
 import { fetchOneironBotReviews, type OneironBotComment, REQUIRED_REVIEWERS } from "./oneiron-review.js";
+import { acknowledgePendingWriter, pendingWriterPath, waitForPendingWriter } from "./pending-writer.js";
 
 /** One model seat: a prime-agent print session, or any command that takes the prompt as its last argument. */
 export type OneironSeat = { provider: string; model: string; thinking: string } | { command: string[] };
@@ -786,15 +787,39 @@ ${rendered || "(no bot comments)"}`;
 		// A runner restarted after a crash or a relaunch continues the writer it had, never a blank one.
 		const prior = hasSessionFile(join(this.directory, "sessions", session));
 		if (prior) this.log(`writer:${session}`, "continuing the existing session");
+		const pendingPath = pendingWriterPath(this.directory, session);
+		if (existsSync(pendingPath) && !prior)
+			throw new TicketFailure(
+				`pending validation has no retained writer session ${session}; reconcile custody instead of starting a replacement`,
+			);
+		const wait = async () => {
+			try {
+				return await waitForPendingWriter({
+					directory: this.directory,
+					worktree: this.worktree,
+					ticket: key,
+					session,
+					log: this.log,
+				});
+			} catch (error) {
+				throw new TicketFailure(error instanceof Error ? error.message : String(error));
+			}
+		};
+		let completed = await wait();
 		for (let round = 1; ; round++) {
 			const note = this.resumeNote();
+			const consumed = completed
+				? `Registered validation ${completed.job.jobId} reached its actual terminal condition: exitCode=${completed.terminal.exitCode}, artifact=${completed.job.terminalPath}. Read and assess the retained result. This is NOT a DONE or passing-gate determination. Continue this SAME session; do not relaunch the completed job.`
+				: undefined;
 			const result = await this.seat(
 				"writer",
-				[round === 1 ? prompt : continueLine, note].filter((part) => part !== undefined).join("\n\n"),
+				[round === 1 ? prompt : continueLine, note, this.waitInstruction(session, pendingPath), consumed]
+					.filter((part) => part !== undefined)
+					.join("\n\n"),
 				{
 					system: this.writerSystem(),
 					session,
-					continueSession: round > 1 || prior,
+					continueSession: round > 1 || prior || completed !== undefined,
 					logName: `${session}.r${round}.jsonl`,
 				},
 			);
@@ -804,6 +829,17 @@ ${rendered || "(no bot comments)"}`;
 				`writer:${session}`,
 				`round ${round} rc=${result.code}${result.idle ? " (seat idle)" : ""} bytes=${result.bytes} final=${JSON.stringify(final.slice(-160))}`,
 			);
+			if (completed) {
+				if (result.code !== 0 || result.idle)
+					throw new TicketFailure(
+						`same-session result consumption failed for ${completed.job.jobId}; preserve the pending receipt and terminal evidence before a retry`,
+					);
+				acknowledgePendingWriter(completed);
+				completed = undefined;
+			}
+			// A job the writer registered this round is awaited first: pending work is never DONE, whatever the prose.
+			completed = await wait();
+			if (completed) continue;
 			const terminal = writerTerminal(final, key);
 			if (terminal) {
 				this.journalIntent(session, round, {
@@ -833,6 +869,11 @@ ${rendered || "(no bot comments)"}`;
 				throw new TicketFailure(`the writer seat produced no output in ${silent} consecutive rounds`);
 			if (result.code !== 0) await sleep(this.options.retryDelayMs ?? 30_000);
 		}
+	}
+	/** How a writer hands a durable validation to the factory instead of polling it in model rounds. */
+	private waitInstruction(session: string, pendingPath: string): string {
+		const { key } = this.ticket;
+		return `Productive waiting: when durable validation is actually running and there is no other useful work, register it BEFORE yielding by atomically writing ${pendingPath}. JSON schema: {"version":1,"ticket":"${key}","session":"${session}","jobId":"<unique job id, 8-128 letters/digits/_/->","pid":<actual durable controller PID>,"startId":"proc:<actual /proc/PID/stat starttime field 22>","terminalPath":"<absolute unique terminal artifact under this ticket or worktree>"}. Create parent directories first. Use the real controller identity, never an inferred worker PID or a service MainPID that will change. Its producer must atomically publish terminal JSON (temporary file then rename) with the SAME version/ticket/session/jobId/pid/startId and an integer exitCode, for success OR failure. A terminal schema without that identity is insufficient: bind it in the actual producer, never invent a successful result. Register only a durable controller whose completion does not start another model turn by itself. If that contract is unavailable, report the exact custody gap; do not fake a receipt. The factory waits without model rounds, then resumes this same session to consume the actual result. Do not poll in repeated model rounds, launch duplicate validation, or call pending work DONE. Do not replace an existing unregistered live job merely to use this protocol.`;
 	}
 	/** The owner's note for the next writer round of this ticket, `resume-note.md` in the ticket directory. */
 	private resumeNote(): string | undefined {

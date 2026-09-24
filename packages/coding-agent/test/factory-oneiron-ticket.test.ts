@@ -1,8 +1,9 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { getProcessStartId } from "../src/core/session-lease.js";
 import {
 	acquireSlot,
 	finalAssistantText,
@@ -90,6 +91,8 @@ if (dir) { fs.mkdirSync(dir, { recursive: true }); fs.appendFileSync(path.join(d
 fs.appendFileSync(path.join(process.env.FAKE_ROOT, "prime.log"), (argv.includes("-c") ? "continue " : "open ") + input.slice(0, 20) + (input.includes("owner note") ? " +note" : "") + "\\n");
 const text = input.startsWith("Continue this SAME review") ? "Checked every hunk.\\nVERDICT: LANDABLE"
   : input.startsWith("finish") ? "Finished.\\nDONE note-one"
+  : input.startsWith("register") ? (fs.mkdirSync(path.dirname(process.env.PENDING_PATH), { recursive: true }), fs.writeFileSync(process.env.PENDING_PATH, process.env.PENDING_JSON), "Validation started.\\nDONE wait-one")
+  : input.includes("Registered validation job-00001") ? "Validation passed.\\nDONE wait-one"
   : input.startsWith("Review this diff") ? "Reviewers are still running; VERDICT: LANDABLE is likely."
   : "argv " + argv.includes(input) + " stdin " + input.length;
 const say = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
@@ -394,6 +397,51 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 			"open finish the first fix +note\ncontinue finish the second fi\n",
 		);
 		expect(existsSync(join(runner.directory, "resume-note.md"))).toBe(false);
+	});
+
+	it("holds a writer's registered validation without model rounds, then resumes the same session with its result", async () => {
+		const f = setup();
+		const controller = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600_000)"], { stdio: "ignore" });
+		try {
+			const pid = controller.pid!;
+			const identity = { version: 1, ticket: "wait-one", session: "write", jobId: "job-00001", pid };
+			const startId = getProcessStartId(pid)!;
+			const ticket = f.ticket("wait-one");
+			ticket.launcher = { ...f.launcher, seats: { writer: { provider: "p", model: "m", thinking: "low" } } };
+			const directory = join(f.work, "tickets", "wait-one");
+			const terminalPath = join(directory, "validation.json");
+			const runner = new OneironTicketRunner(ticket, {
+				env: {
+					...f.env,
+					PENDING_PATH: join(directory, "pending-jobs", "write.json"),
+					PENDING_JSON: JSON.stringify({ ...identity, startId, terminalPath }),
+				},
+				routing: {},
+				cli: [process.execPath, join(f.root, "prime.js")],
+			});
+			mkdirSync(runner.worktree, { recursive: true });
+			const log = runner.log;
+			const waiting = new Promise<void>((resolveWait) => {
+				runner.log = (step, message) => {
+					log(step, message);
+					if (step === "writer:wait" && message?.includes(`pid=${pid}`)) resolveWait();
+				};
+			});
+			// Round 1 registers the job and prints DONE; the pending job wins, so the session is not over.
+			const rounds = runner.writerRounds("write", "register the gate", "continue");
+			rounds.catch(() => undefined);
+			await waiting;
+			expect(readFileSync(join(f.root, "prime.log"), "utf8")).toBe("open register the gate\n\nP\n");
+			writeFileSync(terminalPath, JSON.stringify({ ...identity, startId, exitCode: 0 }));
+			const { final } = await rounds;
+			expect([final, readFileSync(join(f.root, "prime.log"), "utf8")]).toEqual([
+				"Validation passed.\nDONE wait-one",
+				"open register the gate\n\nP\ncontinue continue\n\nProductive\n",
+			]);
+			expect(existsSync(join(directory, "pending-jobs", "write.job-00001.consumed.json"))).toBe(true);
+		} finally {
+			controller.kill();
+		}
 	});
 
 	it("sends cargo to the ruled build hosts and leaves it alone with none configured", () => {
