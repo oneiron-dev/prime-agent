@@ -3,5 +3,7 @@
 - Added factory launch settings `noStacks`, `skipFactoryTests`, `skipBots` and `preMergeReview`, and a launch that fails on a blocker it cannot resolve.
 - Added a short factory merge mutex with post-push propagation and required-check waits, and owner recovery of an interrupted merge repair.
 - Added per-host `slots` and `jobs` and a `local` host to factory build hosts.
-- Added `factory recover-admit`, factory productive-wait custody for writers, and a parameterized factory exception watchdog with a user unit template.
+- Added `factory recover-admit`, which admits one selected action while the factory stays paused.
+- Added factory productive-wait custody: a writer registers a durable validation and the factory waits for its terminal record.
+- Added a parameterized factory exception watchdog with a user unit template.
 - Fixed factory seats failing to spawn on large prompts by sending the prompt on stdin.
