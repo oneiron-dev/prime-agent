@@ -44,17 +44,23 @@ it("turns the ticket DAG into submit and merge actions, then stacks a writer's S
 			],
 		}),
 	);
-	const { tickets, skipped } = readLauncherTickets(manifest, plan);
+	const { tickets: read, skipped } = readLauncherTickets(manifest, plan);
 	expect(skipped).toEqual(["OF-2-c"]);
-	expect(tickets.map((t) => [t.key, t.tier, t.blockedBy])).toEqual([
+	expect(read.map((t) => [t.key, t.tier, t.blockedBy])).toEqual([
 		["OF-1-a", "two", []],
-		["OF-1-b", "three", ["OF-1-a"]],
+		["OF-1-b", "three", ["OF-1-a", "OF-9-missing"]],
 	]);
 	const settings: OneironLauncherSettings = { host: "arch", repo: join(root, "repo"), work: join(root, "work") };
 	const store = new FactoryStore(join(root, "factory.db"));
 	stores.push(store);
 	store.pause("initialized");
 	const entry = [process.execPath, "/entry.js"];
+	// A blocker the launch cannot resolve fails it, naming the ticket and the missing id; nothing is written.
+	expect(() => launchTickets(store, settings, read, entry)).toThrow(
+		"ticket OF-1-b is blocked by OF-9-missing, which this launch does not carry",
+	);
+	expect([store.actions(), existsSync(join(root, "work", "tickets"))]).toEqual([[], false]);
+	const tickets = read.map((t) => ({ ...t, blockedBy: t.blockedBy.filter((b) => b !== "OF-9-missing") }));
 	const launched = launchTickets(store, settings, tickets, entry);
 	expect(launched).toEqual({
 		imported: ["OF-1-a", "OF-1-b"],

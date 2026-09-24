@@ -23,7 +23,10 @@ function record(value: unknown): Record<string, unknown> {
 	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
-/** Read `w7-manifest.json` (tickets with blocked_by) and `mint-plan.json` (contracts). Tickets without a contract are skipped. */
+/**
+ * Read `w7-manifest.json` (tickets with blocked_by) and `mint-plan.json` (contracts). Tickets without a contract are
+ * skipped. Every blocker is kept as written; `launchTickets` refuses one it cannot resolve.
+ */
 export function readLauncherTickets(
 	manifestPath: string,
 	planPath: string,
@@ -36,7 +39,6 @@ export function readLauncherTickets(
 	const tickets: LauncherTicket[] = [];
 	const skipped: string[] = [];
 	const rows = Array.isArray(manifest.tickets) ? manifest.tickets.map(record) : [];
-	const keys = new Set(rows.map((row) => bare(String(row.key ?? row.identifier ?? ""))));
 	for (const row of rows) {
 		const key = bare(String(row.key ?? row.identifier ?? ""));
 		const contract = contracts.get(key);
@@ -56,9 +58,7 @@ export function readLauncherTickets(
 					: typeof contract.review_tier === "string"
 						? contract.review_tier
 						: undefined,
-			blockedBy: (Array.isArray(row.blocked_by) ? row.blocked_by : [])
-				.map((b: unknown) => bare(String(b)))
-				.filter((b: string) => keys.has(b)),
+			blockedBy: (Array.isArray(row.blocked_by) ? row.blocked_by : []).map((b: unknown) => bare(String(b))),
 		});
 	}
 	return { tickets, skipped };
@@ -160,6 +160,19 @@ export function launcherPlan(
 	return { version: 1, tickets: tickets.map((t) => ({ id: t.key, owner: "launcher" })), slots, actions };
 }
 
+/** Blockers that are neither a ticket of this launch nor one the factory already knows. Dropping them would start the dependent at once. */
+export function missingBlockers(
+	tickets: LauncherTicket[],
+	known: Set<string>,
+): Array<{ key: string; blocker: string }> {
+	const launched = new Set(tickets.map((ticket) => ticket.key));
+	return tickets.flatMap((ticket) =>
+		ticket.blockedBy
+			.filter((blocker) => !launched.has(blocker) && !known.has(blocker))
+			.map((blocker) => ({ key: ticket.key, blocker })),
+	);
+}
+
 /**
  * Import the DAG, and re-import it on every later launch. Every ticket's `ticket.json` is rewritten with today's
  * blockers and launcher settings, and every action that has not started is re-imported so a corrected dependency
@@ -173,6 +186,11 @@ export function launchTickets(
 	entryArgv = ticketEntryArgv(),
 ): { imported: string[]; existing: string[]; rewritten: string[]; frozen: string[]; revision: number } {
 	const known = new Set(store.tickets().map((t) => t.id));
+	const missing = missingBlockers(tickets, known);
+	if (missing.length)
+		throw new Error(
+			`launch refused, nothing was imported: ${missing.map(({ key, blocker }) => `ticket ${key} is blocked by ${blocker}, which this launch does not carry (absent from the manifest or without a contract) and the factory does not know`).join("; ")}`,
+		);
 	const plan = launcherPlan(tickets, settings, entryArgv, known);
 	const frozen = plan.actions.filter((action) => store.actionStarted(action.id)).map((action) => action.id);
 	const kept = new Set(frozen);
