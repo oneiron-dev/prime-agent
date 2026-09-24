@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import type { OneironLauncherSettings } from "../src/factory/adapters/oneiron-ticket.js";
-import { importSplits, launchTickets, readLauncherTickets } from "../src/factory/launcher.js";
+import { importSplits, launcherPlan, launchTickets, readLauncherTickets } from "../src/factory/launcher.js";
 import { FactoryStore } from "../src/factory/store.js";
 
 const roots: string[] = [];
@@ -138,4 +138,8 @@ it("turns the ticket DAG into submit and merge actions, then stacks a writer's S
 	expect(follow.blockedBy).toEqual(["OF-1-a"]);
 	expect(existsSync(join(root, "work", "tickets", "OF-1-a-split"))).toBe(true);
 	expect(store.allEvents().some((e) => e.kind === "split_imported")).toBe(true);
+
+	// No stacks: a child's submit waits for its parent's merge, so it never starts on an unmerged parent.
+	const flat = launcherPlan(tickets, { ...settings, noStacks: true }, entry);
+	expect(flat.actions.find((a) => a.id === "OF-1-b:submit")?.dependencies).toEqual(["OF-1-a:merge"]);
 });

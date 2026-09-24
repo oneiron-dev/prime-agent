@@ -75,6 +75,10 @@ export function readLauncherSettings(path: string): OneironLauncherSettings {
 		throw new Error("launcher.host must name a configured host");
 	if (value.idleMs !== undefined && (!Number.isSafeInteger(value.idleMs) || value.idleMs < 60_000))
 		throw new Error("launcher.idleMs must be at least 60000; it is silence detection, never a work limit");
+	const flags = value as unknown as Record<string, unknown>;
+	for (const field of ["noStacks", "skipFactoryTests", "skipBots", "preMergeReview"])
+		if (flags[field] !== undefined && typeof flags[field] !== "boolean")
+			throw new Error(`launcher.${field} must be true or false`);
 	if (value.buildHosts !== undefined) {
 		if (!Array.isArray(value.buildHosts)) throw new Error("launcher.buildHosts must be an array");
 		for (const host of value.buildHosts) {
@@ -110,7 +114,10 @@ export function ticketEntryArgv(): string[] {
 export const SUBMIT_TIMEOUT_MS = 72 * 3_600_000;
 export const MERGE_TIMEOUT_MS = 72 * 3_600_000;
 
-/** Two actions per ticket: submit (writer through bots) and merge. blocked_by edges become dependencies on both. */
+/**
+ * Two actions per ticket: submit (writer through bots) and merge. A blocker's merge gates the merge; its submit gates
+ * the submit, or its merge under `noStacks`, so no child starts on an unmerged parent.
+ */
 export function launcherPlan(
 	tickets: LauncherTicket[],
 	settings: OneironLauncherSettings,
@@ -145,7 +152,7 @@ export function launcherPlan(
 				description: `${stage} ${ticket.key}: ${ticket.title}`,
 				dependencies:
 					stage === "submit"
-						? parents.map((p) => `${p}:submit`)
+						? parents.map((p) => `${p}:${settings.noStacks ? "merge" : "submit"}`)
 						: [`${ticket.key}:submit`, ...parents.map((p) => `${p}:merge`)],
 				sourceFingerprint: `ticket:${ticket.key}:${stage}`,
 				command: {

@@ -68,6 +68,11 @@ export interface OneironLauncherSettings {
 	buildHosts?: OneironBuildHost[];
 	/** gh and git calls; the bot poll; the required-check wait before a merge. */
 	timeouts?: Partial<{ ghMs: number; botsMs: number; ciMs: number }>;
+	/**
+	 * No stacks: every ticket branches from the trunk, its submit waits until every blocker merged, it opens with
+	 * `gh pr create --base <trunk>` and merges with `gh pr merge --squash`. No `gh stack` call runs. Default off.
+	 */
+	noStacks?: boolean;
 }
 /** A host that runs cargo for this factory: the worktree is synced to `<root>/wt/<key>` and cargo runs there. */
 export interface OneironBuildHost {
@@ -379,6 +384,8 @@ export class OneironTicketRunner {
 			now?: () => number;
 			/** Pause after a round whose seat process failed to start or died. Never a limit on the work itself. */
 			retryDelayMs?: number;
+			/** How often a runner waiting on its blockers re-reads their state (default one minute). */
+			waitMs?: number;
 		} = {},
 	) {
 		const l = ticket.launcher;
@@ -395,6 +402,7 @@ export class OneironTicketRunner {
 			diskFloorGiB: l.diskFloorGiB ?? 100,
 			seats: { ...DEFAULT_SEATS, ...l.seats },
 			idleMs: l.idleMs ?? DEFAULT_IDLE_MS,
+			noStacks: l.noStacks ?? false,
 			buildHosts: l.buildHosts ?? [],
 			timeouts: { ...DEFAULT_TIMEOUTS, ...l.timeouts },
 		};
@@ -720,22 +728,26 @@ ${rendered || "(no bot comments)"}`;
 	}
 
 	// ---- git -----------------------------------------------------------------------------------------------------
+	/**
+	 * The trunk once every blocker merged. With stacks, the branch of the one unmerged submitted blocker; with
+	 * `noStacks`, never: the runner waits until every blocker merged, whatever the factory's own dependencies say.
+	 */
 	private async chooseBase(): Promise<{ base: string; stacked: boolean; chain: string[] }> {
 		const remoteTrunk = `${this.settings.remote}/${this.settings.trunk}`;
 		for (let waited = 0; ; waited++) {
 			const parents = this.blockers().map((key) => ({ key, state: this.stateOf(key) }));
 			const unmerged = parents.filter((p) => !p.state?.merged);
 			if (unmerged.length === 0) return { base: remoteTrunk, stacked: false, chain: [] };
-			if (unmerged.length === 1 && unmerged[0]!.state?.pr) {
+			if (!this.settings.noStacks && unmerged.length === 1 && unmerged[0]!.state?.pr) {
 				const parent = unmerged[0]!.state!;
 				return { base: parent.branch, stacked: true, chain: [...(parent.chain ?? []), parent.branch] };
 			}
 			if (waited % 10 === 0)
 				this.log(
 					"base",
-					`waiting: ${unmerged.length} blockers unmerged (${unmerged.map((p) => `${p.key}:${p.state?.pr ? "submitted" : "not submitted"}`).join(", ")})`,
+					`waiting${this.settings.noStacks ? " for every blocker to merge (noStacks)" : ""}: ${unmerged.length} blockers unmerged (${unmerged.map((p) => `${p.key}:${p.state?.pr ? "submitted" : "not submitted"}`).join(", ")})`,
 				);
-			await sleep(60_000);
+			await sleep(this.options.waitMs ?? 60_000);
 		}
 	}
 	private async cutWorktree(): Promise<void> {
@@ -1527,7 +1539,7 @@ ${rendered || "(no bot comments)"}`;
 			const pending = this.blockers().filter((key) => !this.stateOf(key)?.merged);
 			if (!pending.length) return;
 			if (waited % 10 === 0) this.log("merge", `waiting for blockers to merge: ${pending.join(", ")}`);
-			await sleep(60_000);
+			await sleep(this.options.waitMs ?? 60_000);
 		}
 	}
 	private async mergedOnGitHub(repo: string): Promise<boolean> {

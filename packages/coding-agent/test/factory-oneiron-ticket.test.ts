@@ -263,6 +263,38 @@ describe("Oneiron ticket runner", () => {
 		expect(beta.state.merged).toBe(true);
 	});
 
+	it("under noStacks waits for every blocker to merge, branches from the trunk and never calls gh stack", async () => {
+		const f = setup();
+		const parentState = join(f.work, "tickets", "parent", "state.json");
+		mkdirSync(join(f.work, "tickets", "parent"), { recursive: true });
+		const parent = { key: "parent", branch: "w7/parent", worktree: join(f.work, "wt", "parent"), pr: 3 };
+		writeFileSync(parentState, JSON.stringify(parent));
+		const ticket = f.ticket("child", ["parent"]);
+		ticket.launcher = { ...f.launcher, noStacks: true };
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {}, waitMs: 5 });
+		const log = runner.log;
+		const waiting = new Promise<void>((resolveWait) => {
+			runner.log = (step, message) => {
+				log(step, message);
+				if (step === "base" && message?.includes("noStacks")) resolveWait();
+			};
+		});
+		// The parent is submitted but not merged: with stacks the child would branch from it now.
+		const submitted = runner.submit();
+		submitted.catch(() => undefined);
+		await waiting;
+		expect(runner.state.base).toBeUndefined();
+		writeFileSync(parentState, JSON.stringify({ ...parent, merged: true }));
+		await submitted;
+		expect(runner.state).toMatchObject({ base: "origin/main", stacked: false, pr: 7 });
+		await runner.merge();
+		const gh = readFileSync(join(f.root, "gh.log"), "utf8");
+		expect(gh).not.toMatch(/^stack /m);
+		expect(gh).toContain("--base main --head w7/child");
+		expect(gh).toMatch(/^pr merge 7 --repo org\/repo --squash .* --match-head-commit [0-9a-f]{40}$/m);
+		expect(runner.state.merged).toBe(true);
+	});
+
 	it("kills a silent seat, keeps a talking one, and lets the writer run past any round count", async () => {
 		const f = setup();
 		// A seat that prints nothing and outlives the idle window, and one that keeps talking through it.
