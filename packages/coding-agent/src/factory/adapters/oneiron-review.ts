@@ -23,7 +23,7 @@ export interface OneironBotReport {
 	comments: OneironBotComment[];
 	/** Required reviewers that posted a substantive review or comment on the head. */
 	completed: OneironReviewer[];
-	/** Required reviewers whose latest word on this head is a not-completed notice. */
+	/** Required reviewers whose latest word on this head is a terminal not-completed notice; pending is not one. */
 	unavailable: OneironReviewer[];
 }
 export type GhJson = (args: string[]) => Promise<unknown>;
@@ -40,12 +40,15 @@ export function reviewerFromLogin(login: unknown): OneironReviewer | undefined {
 }
 const NOT_COMPLETED =
 	/^(?:(?:this |the )?review (?:was |is |has been )?)?(?:skipped|disabled|pending|queued|timed out|in progress|failed|currently processing new changes|bugbot (?:couldn['’]t|could not) run|quota(?:[- ]limited| exceeded| exhausted)|(?:usage|rate)[- ]limit(?:ed| (?:reached|exhausted|exceeded))?|out of (?:usage|credits)|unable to review|not (?:run|performed)|maximum number of reviews)(?=[ \t]*(?:$|[\r\n.!:])|[ \t]+(?:-[ \t]+)?(?:usage limit reached|in this PR|on this repository|please wait|try again)\b)/i;
+/** A notice the bot rewrites in place when it finishes: pending, never a terminal unavailable. */
+const IN_PROGRESS =
+	/^(?:(?:this |the )?review (?:was |is |has been )?)?(?:pending|queued|in progress|currently processing new changes)\b/i;
 const REVIEW_STATUS_NOTICE_MAX_LENGTH = 600;
 const METADATA_TITLE =
 	/^(?:(?:pr )?summary(?: by qodo)?|run configuration|walkthrough|review info|commits|files (?:selected for processing|ignored due to path filters)(?: \(\d+\))?)$/i;
 
 /** Strip metadata blocks, not findings beside them. Returns the substantive text and whether the body is only a status notice. */
-export function reviewContent(body: string): { text: string; incomplete: boolean } {
+export function reviewContent(body: string): { text: string; incomplete: boolean; unavailable: boolean } {
 	let text = body
 		.replace(
 			/<!-- (walkthrough|final_review_risk|pre_merge_checks_walkthrough|finishing_touch_checkbox|tips)_start -->[\s\S]*?<!-- \1_end -->/g,
@@ -102,7 +105,7 @@ export function reviewContent(body: string): { text: string; incomplete: boolean
 		.trim();
 	const notice = text.replace(/^(?:\[![A-Z]+\]\s*)?[\s#*_>\-`]+/, "");
 	const incomplete = notice.length < REVIEW_STATUS_NOTICE_MAX_LENGTH && NOT_COMPLETED.test(notice);
-	return { text: incomplete ? "" : text, incomplete };
+	return { text: incomplete ? "" : text, incomplete, unavailable: incomplete && !IN_PROGRESS.test(notice) };
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -168,7 +171,7 @@ export async function fetchOneironBotReviews(
 	for (const reviewer of REQUIRED_REVIEWERS) {
 		const own = comments.filter((c) => c.reviewer === reviewer && onHead(c));
 		if (own.some((c) => !c.incomplete && reviewContent(c.body).text.length >= 40)) completed.push(reviewer);
-		else if (own.length && own.at(-1)!.incomplete) unavailable.push(reviewer);
+		else if (own.length && reviewContent(own.at(-1)!.body).unavailable) unavailable.push(reviewer);
 	}
 	return { head, comments, completed, unavailable };
 }
