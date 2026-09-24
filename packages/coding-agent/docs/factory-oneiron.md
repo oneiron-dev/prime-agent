@@ -55,7 +55,7 @@ Productive waiting belongs to the factory. A writer that starts a durable valida
 
 `cargo test --no-fail-fast -p <crate>...` for every crate under `crates/` touched since the base, with `CARGO_TARGET_DIR=<work>/target/<key>` and `CARGO_BUILD_JOBS`. The run takes one of `buildSlots` pid-lock files under `<work>/build-slots/` and waits while free space is under `diskFloorGiB`. It is guarded by `idleMs`, not by a wall clock, so a long link or a slow test suite is never cut. A run that reports zero tests is not a pass. A failure gets one fix round in the `fix-<label>` session, then the tests again; a second failure rejects the stage. A run killed for silence is an infrastructure failure: it fails the stage without a fix round and is never a test verdict.
 
-With `skipFactoryTests` (which needs `noStacks`) the factory runs no cargo tests of its own, so a ticket that touches no crate no longer fails "zero tests ran"; the merge waits for the pull request's required checks instead.
+With `skipFactoryTests` (which needs `noStacks`) the factory runs no cargo tests of its own, so a ticket that touches no crate no longer fails "zero tests ran"; the merge waits for the pull request's required checks instead, and a pull request with no required check reported never passes that gate.
 
 ### Review by tier
 
