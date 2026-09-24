@@ -61,18 +61,26 @@ export interface OneironLauncherSettings {
 	 * round continues in the same session. A model that is still working is never interrupted.
 	 */
 	idleMs?: number;
-	/** Ordered build hosts for cargo. The first reachable one runs it; an empty list keeps cargo on this host. */
+	/**
+	 * Ordered build hosts for cargo. The first one with a free slot runs a call; a call waits while every reachable
+	 * host is full. An empty list keeps cargo on this host.
+	 */
 	buildHosts?: OneironBuildHost[];
 	/** gh and git calls; the bot poll; the required-check wait before a merge. */
 	timeouts?: Partial<{ ghMs: number; botsMs: number; ciMs: number }>;
 }
 /** A host that runs cargo for this factory: the worktree is synced to `<root>/wt/<key>` and cargo runs there. */
 export interface OneironBuildHost {
-	/** ssh destination, e.g. `olety@100.124.216.116`. */
+	/** ssh destination, e.g. `olety@100.124.216.116`, or `local` for this host. */
 	sshHost: string;
-	/** Absolute directory on that host; build trees live under `<root>/wt/<key>`. */
+	/** Absolute directory on that host: build trees under `<root>/wt/<key>`, or `<root>/target/<key>` for `local`. */
 	root: string;
+	/** Cargo calls this host runs at once (default 2). */
+	slots?: number;
+	/** Cargo jobs per call on this host (default `cargoJobs`). */
+	jobs?: number;
 }
+export const DEFAULT_BUILD_HOST_SLOTS = 2;
 export interface OneironTicketRun {
 	version: 1;
 	key: string;
@@ -511,8 +519,8 @@ export class OneironTicketRunner {
 	}
 	/**
 	 * The ruled build order, as environment. The wrapper shipped beside this module goes first on PATH, so both
-	 * this runner's own cargo and every cargo the writers call from their worktree land on a build host.
-	 * With no build hosts configured nothing is prepended and cargo stays on this host.
+	 * this runner's own cargo and every cargo the writers call from their worktree land on a build host, within that
+	 * host's slots and job budget. With no build hosts configured nothing is prepended and cargo stays on this host.
 	 */
 	cargoEnvironment(): Record<string, string> {
 		const hosts = this.settings.buildHosts;
@@ -521,7 +529,12 @@ export class OneironTicketRunner {
 		return {
 			PATH: `${factoryCargoBinDirectory()}:${path}`,
 			W7_CARGO_WORK: this.settings.work,
-			W7_CARGO_HOSTS: hosts.map((h) => `${h.sshHost}:${h.root}`).join(";"),
+			W7_CARGO_HOSTS: hosts
+				.map(
+					(h) =>
+						`${h.sshHost}:${h.slots ?? DEFAULT_BUILD_HOST_SLOTS}:${h.jobs ?? this.settings.cargoJobs}:${h.root}`,
+				)
+				.join(";"),
 		};
 	}
 	private async git(args: string[], cwd = this.worktree): Promise<string> {

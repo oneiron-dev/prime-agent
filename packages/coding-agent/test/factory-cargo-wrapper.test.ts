@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -40,7 +40,8 @@ if ((process.env.STUB_UNREACHABLE || "").split(",").includes(host)) { process.st
 );
 const REAL_CARGO = stub(
 	"real-cargo",
-	`process.stdout.write("local cargo " + process.argv.slice(2).join(" ") + "\\n");`,
+	`const target = process.env.CARGO_TARGET_DIR ? " target=" + process.env.CARGO_TARGET_DIR : "";
+process.stdout.write("local cargo " + process.argv.slice(2).join(" ") + target + "\\n");`,
 );
 
 function setup() {
@@ -66,7 +67,7 @@ function setup() {
 		PATH: `${bin}:${process.env.PATH}`,
 		STUB_ROOT: root,
 		W7_CARGO_WORK: work,
-		W7_CARGO_HOSTS: "olety@mac-one:/Volumes/Cinema/w7-build;olety@mac-two:/Users/olety/w7-build",
+		W7_CARGO_HOSTS: "olety@mac-one:1:3:/Volumes/Cinema/w7-build;olety@mac-two:1:2:/Users/olety/w7-build",
 	};
 	const cargo = (cwd: string, args: string[], overrides: Record<string, string> = {}) =>
 		spawnSync("bash", [WRAPPER, ...args], { cwd, env: { ...env, ...overrides }, encoding: "utf8" });
@@ -80,6 +81,23 @@ function setup() {
 	return { root, work, worktree, outside, cargo, read };
 }
 
+/** Hold one host slot the way another wrapper does, until the returned release is called. */
+async function holdSlot(work: string, host: string): Promise<() => void> {
+	mkdirSync(join(work, "locks"), { recursive: true });
+	const holder = spawn(
+		"perl",
+		[
+			"-MFcntl=:flock",
+			"-e",
+			'open(my $h, ">", $ARGV[0]) or die; flock($h, LOCK_EX) or die; $| = 1; print "held\\n"; <STDIN>;',
+			join(work, "locks", `cargo-host-${host}-1.lock`),
+		],
+		{ stdio: ["pipe", "pipe", "inherit"] },
+	);
+	await new Promise<void>((resolveHeld) => holder.stdout.once("data", () => resolveHeld()));
+	return () => holder.stdin.end();
+}
+
 describe("factory cargo wrapper", () => {
 	it("runs a worktree's cargo on the first reachable build host, in the same relative directory", () => {
 		const f = setup();
@@ -91,7 +109,8 @@ describe("factory cargo wrapper", () => {
 		);
 		const script = f.read("ssh-stdin.log");
 		expect(script).toContain("cd /Volumes/Cinema/w7-build/wt/W7-C01/crates/alpha");
-		expect(script).toContain("exec cargo test --no-fail-fast -p alpha");
+		expect(script).toContain("exec cargo test --no-fail-fast -p alpha --jobs=3");
+		expect(script).toContain("export CARGO_BUILD_JOBS=3;");
 		expect(script).toContain("unset CARGO_TARGET_DIR");
 		expect(f.read("real-cargo.log")).toBe("");
 	});
@@ -118,6 +137,26 @@ describe("factory cargo wrapper", () => {
 			expect([run.status, run.stdout.trim()]).toEqual([0, "local cargo fmt"]);
 		}
 		expect(f.read("ssh-stdin.log")).not.toContain("exec cargo fmt");
+	});
+
+	it("skips a host whose slots are all taken, caps explicit jobs, and runs the local host into its own target", async () => {
+		const f = setup();
+		const release = await holdSlot(f.work, "olety@mac-one");
+		try {
+			const result = f.cargo(f.worktree, ["build", "-j", "8", "--", "-j", "9"]);
+			expect(result.status).toBe(0);
+			const script = f.read("ssh-stdin.log");
+			expect(script).toContain("cd /Users/olety/w7-build/wt/W7-C01");
+			expect(script).toContain("exec cargo build --jobs=2 -- -j 9");
+			expect(script).not.toContain("/Volumes/Cinema/w7-build/wt/W7-C01\n");
+		} finally {
+			release();
+		}
+		const local = f.cargo(f.worktree, ["check", "--jobs=1"], { W7_CARGO_HOSTS: "local:1:2:/mnt/build" });
+		expect([local.status, local.stdout.trim()]).toEqual([
+			0,
+			"local cargo check --jobs=1 target=/mnt/build/target/W7-C01",
+		]);
 	});
 
 	it("returns the remote exit code and syncs a source-changing subcommand back", () => {

@@ -458,13 +458,13 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		offloaded.launcher = {
 			...f.launcher,
 			buildHosts: [
-				{ sshHost: "olety@100.124.216.116", root: "/Volumes/Cinema/w7-build" },
+				{ sshHost: "olety@100.124.216.116", root: "/Volumes/Cinema/w7-build", slots: 3, jobs: 3 },
 				{ sshHost: "olety@100.81.227.117", root: "/Users/olety/w7-build" },
 			],
 		};
 		const environment = new OneironTicketRunner(offloaded, { env: f.env, routing: {} }).cargoEnvironment();
 		expect(environment.W7_CARGO_HOSTS).toBe(
-			"olety@100.124.216.116:/Volumes/Cinema/w7-build;olety@100.81.227.117:/Users/olety/w7-build",
+			"olety@100.124.216.116:3:3:/Volumes/Cinema/w7-build;olety@100.81.227.117:2:4:/Users/olety/w7-build",
 		);
 		expect(environment.W7_CARGO_WORK).toBe(f.work);
 		expect(environment.PATH?.startsWith(`${factoryCargoBinDirectory()}:`)).toBe(true);

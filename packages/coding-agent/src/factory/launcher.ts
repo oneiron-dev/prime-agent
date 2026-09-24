@@ -78,10 +78,16 @@ export function readLauncherSettings(path: string): OneironLauncherSettings {
 	if (value.buildHosts !== undefined) {
 		if (!Array.isArray(value.buildHosts)) throw new Error("launcher.buildHosts must be an array");
 		for (const host of value.buildHosts) {
-			if (!host || typeof host.sshHost !== "string" || !host.sshHost.trim() || host.sshHost.includes(":"))
-				throw new Error("launcher.buildHosts[].sshHost must be an ssh destination without a colon");
-			if (typeof host.root !== "string" || !isAbsolute(host.root))
+			if (!host || typeof host.sshHost !== "string" || !host.sshHost.trim() || /[:;\s]/.test(host.sshHost))
+				throw new Error("launcher.buildHosts[].sshHost must be `local` or an ssh destination without a colon");
+			if (typeof host.root !== "string" || !isAbsolute(host.root) || host.root.includes(";"))
 				throw new Error("launcher.buildHosts[].root must be an absolute path");
+			for (const field of ["slots", "jobs"] as const)
+				if (
+					host[field] !== undefined &&
+					(!Number.isSafeInteger(host[field]) || host[field]! < 1 || host[field]! > 64)
+				)
+					throw new Error(`launcher.buildHosts[].${field} must be an integer from 1 to 64`);
 		}
 	}
 	return value;
