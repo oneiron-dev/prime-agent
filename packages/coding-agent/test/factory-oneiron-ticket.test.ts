@@ -10,6 +10,7 @@ import {
 	type OneironLauncherSettings,
 	type OneironTicketRun,
 	OneironTicketRunner,
+	reviewVerdict,
 	SEAT_IDLE_EXIT_CODE,
 	SEAT_POLICY_LINE,
 	WRITER_LINES,
@@ -80,6 +81,21 @@ else {
   process.stdout.write("Implemented.\\nPR BODY:\\nAdded the function.\\nSPLIT: the follow-up half\\nDONE " + key + "\\n");
 }
 `;
+/** Print mode with a session directory: a review answers with progress first and its verdict only when continued. */
+const FAKE_PRIME = `#!/usr/bin/env node
+const fs = require("node:fs"), path = require("node:path");
+const input = fs.readFileSync(0, "utf8"), argv = process.argv.slice(2);
+const dir = argv.includes("--session-dir") ? argv[argv.indexOf("--session-dir") + 1] : undefined;
+if (dir) { fs.mkdirSync(dir, { recursive: true }); fs.appendFileSync(path.join(dir, "session.jsonl"), "{}\\n"); }
+fs.appendFileSync(path.join(process.env.FAKE_ROOT, "prime.log"), (argv.includes("-c") ? "continue " : "open ") + input.slice(0, 20) + "\\n");
+const text = input.startsWith("Continue this SAME review") ? "Checked every hunk.\\nVERDICT: LANDABLE"
+  : input.startsWith("Review this diff") ? "Reviewers are still running; VERDICT: LANDABLE is likely."
+  : "argv " + argv.includes(input) + " stdin " + input.length;
+const say = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+say({ type: "agent_start" });
+say({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } });
+say({ type: "agent_end" });
+`;
 
 function setup() {
 	const root = mkdtempSync(join(tmpdir(), "factory-ticket-"));
@@ -92,6 +108,7 @@ function setup() {
 	] as const)
 		writeFileSync(join(bin, name), source, { mode: 0o755 });
 	writeFileSync(join(root, "seat.js"), FAKE_SEAT);
+	writeFileSync(join(root, "prime.js"), FAKE_PRIME);
 	const env = {
 		...process.env,
 		PATH: `${bin}:${process.env.PATH}`,
@@ -143,7 +160,17 @@ afterEach(() => {
 describe("Oneiron ticket runner", () => {
 	it("runs one ticket from worktree to merge and stacks a child on its submitted parent", async () => {
 		const f = setup();
-		const alpha = new OneironTicketRunner(f.ticket("alpha-one"), { env: f.env, routing: {} });
+		// The grok reviewer is a print-mode seat whose first reply is progress, not a verdict.
+		const first = f.ticket("alpha-one");
+		first.launcher = {
+			...f.launcher,
+			seats: { ...f.launcher.seats, grok: { provider: "p", model: "m", thinking: "low" } },
+		};
+		const alpha = new OneironTicketRunner(first, {
+			env: f.env,
+			routing: {},
+			cli: [process.execPath, join(f.root, "prime.js")],
+		});
 		await alpha.submit();
 		expect(f.git(["rev-parse", "--abbrev-ref", "HEAD"], alpha.worktree)).toBe("w7/alpha-one");
 		expect(alpha.state.base).toBe("origin/main");
@@ -157,6 +184,10 @@ describe("Oneiron ticket runner", () => {
 		// lib.rs is a public seam, so the tier is forced by code and both reviewers read the head once.
 		expect(alpha.state.review?.tier).toMatchObject({ choice: "grok_plus_opus", decided_by: "code" });
 		expect(alpha.state.review?.verdicts).toEqual({ grok: "LANDABLE", opus: "LANDABLE" });
+		// A reply that only mentions a verdict is continued in the same session until the standalone line arrives.
+		expect(readFileSync(join(f.root, "prime.log"), "utf8")).toBe(
+			"open Review this diff for\ncontinue Continue this SAME r\n",
+		);
 		const gh = readFileSync(join(f.root, "gh.log"), "utf8");
 		expect(gh).toContain("pr create --repo org/repo --title alpha-one: Ticket alpha-one");
 		expect(gh).toContain("pr comment 7 --repo org/repo --body @coderabbitai review");
@@ -167,7 +198,7 @@ describe("Oneiron ticket runner", () => {
 		const seatLog = readFileSync(join(f.root, "seat.log"), "utf8");
 		expect(seatLog).toContain("Consider bounding this retry loop.");
 		expect(seatLog).toContain("Bugbot couldn't run");
-		expect(seatLog.split(INITIATIVE_LINES).length).toBeGreaterThan(5);
+		expect(seatLog.split(INITIATIVE_LINES).length).toBeGreaterThan(4);
 		expect(seatLog).toContain(WRITER_LINES);
 		expect(alpha.writerSystem()).toContain(SEAT_POLICY_LINE);
 		const body = readFileSync(join(alpha.directory, "PR-BODY.md"), "utf8");
@@ -277,6 +308,17 @@ process.stdout.write("DONE late-one\\n");
 	});
 
 	it.each([
+		["VERDICT: LANDABLE\nNo defects.", "LANDABLE"],
+		["Summary first.\nVERDICT: DEFECTS\nsrc/a.rs:1 wrong", "DEFECTS"],
+		["I would say VERDICT: LANDABLE.", undefined],
+		["> VERDICT: LANDABLE", undefined],
+		["```\nVERDICT: LANDABLE\n```", undefined],
+		["VERDICT: LANDABLE\nVERDICT: DEFECTS", undefined],
+	])("a review verdict is one standalone line outside a fence: %j", (final, expected) => {
+		expect(reviewVerdict(final)).toBe(expected);
+	});
+
+	it.each([
 		["DONE T1", { kind: "done", line: "DONE T1" }],
 		["Work finished.\nPR BODY:\nx\n\nDONE T1  \n\n", { kind: "done", line: "DONE T1" }],
 		["No token.\nBLOCKED T1: the fixture host is gone", { kind: "blocked", why: "the fixture host is gone" }],
@@ -321,22 +363,12 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 
 	it("sends a prime seat its prompt on stdin, never in argv", async () => {
 		const f = setup();
-		writeFileSync(
-			join(f.root, "cli.js"),
-			`const input = require("node:fs").readFileSync(0, "utf8");
-const say = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
-const text = "argv " + process.argv.includes(input) + " stdin " + input.length;
-say({ type: "agent_start" });
-say({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } });
-say({ type: "agent_end" });
-`,
-		);
 		const ticket = f.ticket("stdin-one");
 		ticket.launcher = { ...f.launcher, seats: { writer: { provider: "p", model: "m", thinking: "low" } } };
 		const runner = new OneironTicketRunner(ticket, {
 			env: f.env,
 			routing: {},
-			cli: [process.execPath, join(f.root, "cli.js")],
+			cli: [process.execPath, join(f.root, "prime.js")],
 		});
 		mkdirSync(runner.worktree, { recursive: true });
 		const prompt = "x".repeat(300_000);

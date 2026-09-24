@@ -13,7 +13,7 @@ import {
 	writeFileSync,
 	writeSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
 	type FixCategory,
@@ -53,7 +53,7 @@ export interface OneironLauncherSettings {
 	buildSlots?: number;
 	cargoJobs?: number;
 	diskFloorGiB?: number;
-	seats?: Partial<Record<"writer" | "pack" | "grok" | "opus", OneironSeat>>;
+	seats?: Partial<Record<SeatName, OneironSeat>>;
 	/**
 	 * Silence, never a clock. A seat or cargo run whose stream produces nothing for this long is killed and the
 	 * round continues in the same session. A model that is still working is never interrupted.
@@ -107,7 +107,10 @@ export interface OneironTicketState {
 	failure?: string;
 }
 
-export const DEFAULT_SEATS: Record<"writer" | "pack" | "grok" | "opus", OneironSeat> = {
+export type SeatName = "writer" | "pack" | "grok" | "opus";
+/** The seats a review tier can name. `grok` is only the slot name; the launcher decides its model. */
+export type ReviewSeat = "grok" | "opus";
+export const DEFAULT_SEATS: Record<SeatName, OneironSeat> = {
 	writer: { provider: "cpa-r", model: "gpt-6-astra", thinking: "xhigh" },
 	pack: { provider: "cpa-r", model: "muse-spark-1.3-contributor", thinking: "max" },
 	grok: { provider: "cpa-r", model: "grok-4.6", thinking: "xhigh" },
@@ -238,6 +241,48 @@ export function writerTerminal(final: string, key: string): WriterTerminal | und
 		return undefined;
 	}
 	return undefined;
+}
+
+/**
+ * The one standalone `VERDICT: LANDABLE|DEFECTS` line of a reviewer's final reply, outside code fences. None, or
+ * two that disagree, is no verdict. Only terminal assistant text is inspected, never a raw event stream.
+ */
+export function reviewVerdict(final: string): "LANDABLE" | "DEFECTS" | undefined {
+	const verdicts = new Set<"LANDABLE" | "DEFECTS">();
+	for (const line of unfencedLines(final).lines) {
+		const match = line.match(/^VERDICT:[ \t]*(LANDABLE|DEFECTS)[ \t]*$/)?.[1];
+		if (match) verdicts.add(match as "LANDABLE" | "DEFECTS");
+	}
+	return verdicts.size === 1 ? [...verdicts][0] : undefined;
+}
+
+interface SessionEntry {
+	type?: string;
+	id?: string;
+	cwd?: string;
+	timestamp?: string;
+	rlmDepth?: number;
+	git?: { commit?: string };
+	message?: {
+		role?: string;
+		stopReason?: string;
+		content?: ContentBlock[];
+		responseId?: string;
+		provider?: string;
+		model?: string;
+		usage?: unknown;
+		errorMessage?: string;
+	};
+}
+function sessionEntries(path: string): SessionEntry[] {
+	return readFileSync(path, "utf8")
+		.split("\n")
+		.filter((line) => line.trim())
+		.map((line) => JSON.parse(line) as SessionEntry);
+}
+/** Whether a session directory already holds a session file, i.e. a later seat call continues it. */
+function hasSessionFile(directory: string): boolean {
+	return existsSync(directory) && readdirSync(directory).some((file) => file.endsWith(".jsonl"));
 }
 
 function readState(path: string): OneironTicketState | undefined {
@@ -490,10 +535,17 @@ export class OneironTicketRunner {
 	 * from another terminal while this stream is consumed, or an explicit command. The only guard is silence.
 	 */
 	async seat(
-		name: "writer" | "pack" | "grok" | "opus",
+		name: SeatName,
 		prompt: string,
-		options: { system?: string; session?: string; continueSession?: boolean; logName: string },
-	): Promise<{ code: number; final: string; bytes: number; idle: boolean }> {
+		options: {
+			system?: string;
+			session?: string;
+			continueSession?: boolean;
+			/** An absolute session file to continue instead of the newest one in `session`. */
+			resumeSession?: string;
+			logName: string;
+		},
+	): Promise<{ code: number; final: string; bytes: number; idle: boolean; activity: boolean }> {
 		const spec = this.settings.seats[name] ?? DEFAULT_SEATS[name];
 		const logPath = join(this.directory, "logs", options.logName);
 		let argv: string[];
@@ -520,7 +572,7 @@ export class OneironTicketRunner {
 				"--no-extensions",
 				"--no-skills",
 				...(options.session ? ["--session-dir", join(this.directory, "sessions", options.session)] : []),
-				...(options.continueSession ? ["-c"] : []),
+				...(options.resumeSession ? ["--resume", options.resumeSession] : options.continueSession ? ["-c"] : []),
 				...(options.system ? ["--append-system-prompt", options.system] : []),
 			];
 		}
@@ -540,6 +592,8 @@ export class OneironTicketRunner {
 			final,
 			bytes: Buffer.byteLength(result.output),
 			idle: result.code === SEAT_IDLE_EXIT_CODE,
+			// Tools or delegated children ran: a review that did this and then failed is incomplete, not absent.
+			activity: /"type"\s*:\s*"(?:tool_execution_start|rlm_child_update)"/.test(result.output),
 		};
 	}
 	/** A seat that went silent is killed and journaled; the round continues in the same session. */
@@ -905,24 +959,205 @@ ${rendered || "(no bot comments)"}`;
 		}
 		return { lines, hunks: stat.split("\n").filter(Boolean).length };
 	}
-	private async reviewers(tier: ReviewTier, diff: string, logSuffix: string): Promise<Record<string, string>> {
-		const names: Array<"grok" | "opus"> =
-			tier === "grok" ? ["grok"] : tier === "grok_plus_opus" ? ["grok", "opus"] : [];
+	/** The reviewers a tier names; tier one names none. */
+	private tierSeats(tier: ReviewTier): ReviewSeat[] {
+		return tier === "grok" ? ["grok"] : tier === "grok_plus_opus" ? ["grok", "opus"] : [];
+	}
+	private async reviewers(names: ReviewSeat[], diff: string, logSuffix: string): Promise<Record<string, string>> {
 		const prompt = this.reviewPrompt(diff);
 		const verdicts: Record<string, string> = {};
 		await Promise.all(
 			names.map(async (name) => {
-				const result = await this.seat(name, prompt, { logName: `review-${name}${logSuffix}.jsonl` });
-				verdicts[name] =
-					result.code !== 0 || !/VERDICT:/.test(result.final)
-						? `unavailable rc=${result.code}`
-						: /VERDICT:\s*LANDABLE/.test(result.final)
-							? "LANDABLE"
-							: `DEFECTS\n${tail(result.final, 60)}`;
+				verdicts[name] = await this.reviewer(name, prompt, `review-${name}${logSuffix}`);
 				this.log(`review:${name}`, verdicts[name]!.split("\n")[0]!);
 			}),
 		);
 		return verdicts;
+	}
+	/**
+	 * One reviewer in its own session, continued until it returns one standalone verdict line; a reply without one
+	 * is never read as a pass. A seat that could not start is recorded unavailable. A seat that started, ran tools
+	 * or answered and then failed leaves the review incomplete and its session preserved for a same-session resume.
+	 * `sessions/<session>.resume` may point at the review's original session file to continue it in place.
+	 */
+	private async reviewer(name: ReviewSeat, prompt: string, session: string): Promise<string> {
+		const sessionDir = join(this.directory, "sessions", session);
+		const logName = `${session}.jsonl`;
+		const spec = this.settings.seats[name] ?? DEFAULT_SEATS[name];
+		const resumeFile = join(this.directory, "sessions", `${session}.resume`);
+		const resumeSession = existsSync(resumeFile) ? readFileSync(resumeFile, "utf8").trim() : undefined;
+		if (resumeSession !== undefined) {
+			if (!isAbsolute(resumeSession) || !existsSync(resumeSession) || "command" in spec)
+				throw new TicketFailure(`review ${name} invalid native resume pointer: ${resumeFile}`);
+			const header = JSON.parse(readFileSync(resumeSession, "utf8").split("\n")[0] ?? "{}") as SessionEntry;
+			if (header.type !== "session" || !header.id || header.cwd !== this.worktree)
+				throw new TicketFailure(`review ${name} resume pointer is not the original worktree session`);
+		}
+		const completed = await this.completedReview(
+			name,
+			session,
+			sessionDir,
+			join(this.directory, "logs", logName),
+			resumeSession,
+		);
+		if (completed !== undefined) return completed;
+		let continuing = resumeSession !== undefined || hasSessionFile(sessionDir);
+		let pending = continuing;
+		const continuePrompt = `Continue this SAME review for ${this.ticket.key}. Do not start a new review or duplicate delegated reviewers. Recover existing child handles, collect their results and inspect completed child sessions if a reply is missing. Wait for outstanding delegated work before deciding. Never edit files. Return exactly one line \`VERDICT: LANDABLE\` or \`VERDICT: DEFECTS\`, followed by concrete defects with file:line. A progress report is not a verdict.`;
+		const kept = resumeSession ?? sessionDir;
+		for (;;) {
+			const result = await this.seat(name, continuing ? continuePrompt : prompt, {
+				session: resumeSession ? undefined : session,
+				resumeSession,
+				continueSession: continuing,
+				logName,
+			});
+			// The provider returns this refusal as ordinary terminal text, not refusal metadata.
+			if (/^(?:\*\*)?I must decline this request\.(?:\*\*)?(?:\r?\n|$)/.test(result.final.trim()))
+				throw new TicketFailure(
+					`review ${name} explicitly refused the request; review incomplete. Preserve session ${kept} and its findings; no unavailable or passing verdict and no automatic continuation.`,
+				);
+			if (/^\[error:[ \t]*user_prompt_too_long\][ \t]*$/m.test(result.final))
+				throw new TicketFailure(
+					`review ${name} context overflow: provider user_prompt_too_long; preserve session ${kept} and its findings; compact or recover that session before a retry; no verdict accepted`,
+				);
+			if (result.code !== 0) {
+				if (pending || result.final.trim() || result.activity)
+					throw new TicketFailure(
+						`review ${name} incomplete rc=${result.code}; preserve and resume session ${kept}; no verdict accepted`,
+					);
+				return `unavailable rc=${result.code}`;
+			}
+			const verdict = reviewVerdict(result.final);
+			if (verdict) return verdict === "LANDABLE" ? "LANDABLE" : `DEFECTS\n${result.final}`;
+			pending = true;
+			this.log(`review:${name}`, `incomplete rc=0; continuing same session ${session}`);
+			if ("command" in spec || (resumeSession === undefined && !hasSessionFile(sessionDir)))
+				throw new TicketFailure(
+					`review ${name} incomplete; no resumable native session; preserve logs and recover before retrying`,
+				);
+			continuing = true;
+		}
+	}
+	/**
+	 * Owner recovery: `sessions/<session>.completed.json` (`head`, `sessionPath`, `messageId`, optional
+	 * `missingSeatReceiptReason`) names a terminal review message already saved in the review's own session. It is
+	 * reconsumed only when it binds this worktree, the current clean head, one successful terminal assistant message
+	 * with one standalone verdict, no newer terminal message, and the seat stream and run.log line that produced it.
+	 */
+	private async completedReview(
+		name: ReviewSeat,
+		session: string,
+		sessionDir: string,
+		logPath: string,
+		resumeSession: string | undefined,
+	): Promise<string | undefined> {
+		const receiptPath = join(this.directory, "sessions", `${session}.completed.json`);
+		if (!existsSync(receiptPath)) return undefined;
+		const invalid = (reason: string) => new TicketFailure(`review ${name} invalid completed receipt: ${reason}`);
+		const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as {
+			head?: string;
+			sessionPath?: string;
+			messageId?: string;
+			missingSeatReceiptReason?: string;
+		};
+		const { head, sessionPath, messageId } = receipt;
+		if (!head || !sessionPath || !messageId || !isAbsolute(sessionPath) || !existsSync(sessionPath))
+			throw invalid("missing canonical session, head or message ID");
+		if (resumeSession ? sessionPath !== resumeSession : !sessionPath.startsWith(`${sessionDir}/`))
+			throw invalid("session is not this review's original root");
+		if (head !== (await this.head()) || (await this.git(["status", "--porcelain"])).trim())
+			throw invalid("reviewed HEAD changed or worktree is dirty");
+		const entries = sessionEntries(sessionPath);
+		const header = entries[0];
+		if (
+			header?.type !== "session" ||
+			header.cwd !== this.worktree ||
+			header.git?.commit !== head ||
+			header.rlmDepth !== 0
+		)
+			throw invalid("canonical root header does not bind this worktree and HEAD");
+		const matches = entries.filter((entry) => entry.id === messageId);
+		if (matches.length !== 1) throw invalid("message ID missing or ambiguous");
+		const entry = matches[0]!;
+		const message = entry.message;
+		if (
+			entry.type !== "message" ||
+			message?.role !== "assistant" ||
+			message.stopReason !== "stop" ||
+			!Array.isArray(message.content) ||
+			message.content.some((block) => block?.type === "toolCall")
+		)
+			throw invalid("not a successful terminal assistant message");
+		const index = entries.indexOf(entry);
+		if (
+			entries
+				.slice(index + 1)
+				.some((later) => later.message?.role === "assistant" && later.message.stopReason === "stop")
+		)
+			throw invalid("a newer terminal assistant message supersedes the receipt");
+		const final = contentText(message.content);
+		const verdict = reviewVerdict(final);
+		if (!verdict) throw invalid("missing or conflicting standalone verdict");
+		if (
+			/\b(?:reviewers?|delegated (?:work|reviews?)) (?:are |is )?(?:still )?(?:running|pending|outstanding)\b|\bI (?:will|must|need to) collect (?:their|the|child|reviewer)\b/i.test(
+				final,
+			)
+		)
+			throw invalid("terminal text contradicts completion of delegated review work");
+		// The seat stream that carried this message must have reached agent_end.
+		let matched = false;
+		let seen = false;
+		let ended = false;
+		for (const line of existsSync(logPath) ? readFileSync(logPath, "utf8").split("\n") : []) {
+			let event: { type?: unknown; message?: unknown };
+			try {
+				event = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (event.type === "agent_start" || event.type === "message_start") matched = false;
+			if (event.type === "message_end") {
+				matched = isDeepStrictEqual(event.message, message);
+				seen ||= matched;
+			}
+			if (event.type === "agent_end" && matched) ended = true;
+		}
+		if (seen && !ended) throw invalid("matching native message lacks terminal stream completion");
+		if (
+			!seen &&
+			!(
+				receipt.missingSeatReceiptReason &&
+				message.responseId &&
+				message.provider &&
+				message.model &&
+				message.usage &&
+				!message.errorMessage
+			)
+		)
+			throw invalid(
+				"no matching seat stream; an explicit missing-receipt reason and native response provenance are required",
+			);
+		const nextUser = entries.slice(index + 1).find((later) => later.message?.role === "user");
+		const after = Date.parse(entry.timestamp ?? "");
+		const before = nextUser ? Date.parse(nextUser.timestamp ?? "") : Number.POSITIVE_INFINITY;
+		const successful = readFileSync(this.logPath, "utf8")
+			.split("\n")
+			.some((line) => {
+				const at = Date.parse(line.match(/^\[([^\]]+)\]/)?.[1] ?? "");
+				return (
+					at >= after &&
+					at <= before &&
+					(line.includes(`review:${name} incomplete rc=0;`) || line.endsWith(`review:${name} ${verdict}`))
+				);
+			});
+		if (seen && !successful) throw invalid("no successful seat receipt for this terminal message");
+		appendFileSync(
+			join(this.directory, "review-reconsumption.jsonl"),
+			`${JSON.stringify({ at: new Date().toISOString(), name, ...receipt, verdict, source: "canonical-native-terminal-message", responseId: message.responseId, seatReceipt: seen ? "native-agent-end-and-rc0" : "missing-after-controller-stop" })}\n`,
+		);
+		this.log(`review:${name}`, `${verdict} (reconsumed original terminal message ${messageId} at ${head})`);
+		return verdict === "LANDABLE" ? "LANDABLE" : `DEFECTS\n${final}`;
 	}
 	private async review(): Promise<void> {
 		if (this.state.review) return;
@@ -947,7 +1182,7 @@ ${rendered || "(no bot comments)"}`;
 			`${JSON.stringify({ question: "review_tier", ...tier })}\n`,
 		);
 		this.log("review:tier", `${tier.choice} by ${tier.decided_by}`);
-		const verdicts = await this.reviewers(tier.choice, before.diff, "");
+		const verdicts = await this.reviewers(this.tierSeats(tier.choice), before.diff, "");
 		const defects = Object.entries(verdicts).filter(([, v]) => v.startsWith("DEFECTS"));
 		const review: NonNullable<OneironTicketState["review"]> = { tier, verdicts };
 		if (defects.length) {
@@ -977,7 +1212,7 @@ ${rendered || "(no bot comments)"}`;
 			);
 			this.log("review:trivial", `${trivial.choice} by ${trivial.decided_by}`);
 			if (trivial.choice === "review_again") {
-				const again = await this.reviewers(tier.choice, (await this.diffAgainstBase()).diff, "-2");
+				const again = await this.reviewers(this.tierSeats(tier.choice), (await this.diffAgainstBase()).diff, "-2");
 				review.recheck = Object.entries(again)
 					.map(([n, v]) => `${n}: ${v.split("\n")[0]}`)
 					.join("; ");
