@@ -17,12 +17,16 @@ export const FACTORY_HELP = `Usage:
 Factory mode is optional and runs separately from Prime sessions. State and results are JSON.
 The factory is a DAG launcher: an action is one foreground command; exit 0 accepts it and readies its dependents, any other exit rejects it.
 launch reads the ticket DAG (tickets with blocked_by) and the contracts, and imports two actions per ticket: submit and merge.
-submit cuts a worktree, has Muse write the context pack, runs the Astra writer until DONE, tests the touched crates, reviews by tier, publishes and closes the bot round.
-merge waits for the blockers, syncs the native stack or squash-merges the lone PR. A writer's SPLIT: leftover becomes one follow-up ticket while serve runs.
-launcher.json: {"host":"arch","repo":"/abs/oneiron","docs":"/abs/oneiron-docs","work":"/abs/w7-build","buildSlots":4,"diskFloorGiB":100,"idleMs":1800000,"buildHosts":[{"sshHost":"user@host","root":"/abs/build"}],"seats":{...}}
+A blocker that is neither in the launch nor already known to the factory fails the whole launch, naming the ticket and the id.
+submit cuts a worktree, has Muse write the context pack, runs the writer until the last line of its reply is exactly DONE <key> (or BLOCKED <key>: <why>), tests the touched crates, reviews by tier, publishes and closes the bot round.
+merge waits for the blockers, syncs the native stack, or prepares the lone PR outside the merge mutex and squash-merges its exact head once its required checks pass. A writer's SPLIT: leftover becomes one follow-up ticket while serve runs.
+launcher.json: {"host":"arch","repo":"/abs/oneiron","docs":"/abs/oneiron-docs","work":"/abs/w7-build","buildSlots":4,"diskFloorGiB":100,"idleMs":1800000,"buildHosts":[{"sshHost":"user@host","root":"/abs/build","slots":2,"jobs":4}],"seats":{...},"noStacks":false,"skipFactoryTests":false,"skipBots":false,"preMergeReview":false}
+noStacks: every ticket branches from the trunk and its submit waits for every blocker's merge; no gh stack call runs.
+skipFactoryTests (needs noStacks): no factory cargo tests; the merge waits for the PR's required checks. skipBots: no CodeRabbit, bot wait or bot round.
+preMergeReview: one more review of the exact head on the review seat (grok) right before the merge; only VERDICT: LANDABLE merges.
 launch on known tickets rewrites every ticket.json and re-imports the actions that have not started; started ones keep their spec.
 No clock ever ends a working seat: idleMs kills a seat or cargo run only after its stream has been silent that long, and writer rounds are unbounded.
-buildHosts, in order, run every cargo call made inside <work>/wt/<key>, the runner's own and the writers'; the first reachable one wins, else cargo runs here.
+buildHosts, in order, run every cargo call made inside <work>/wt/<key>, the runner's own and the writers': the first host with a free slot wins, each call is capped at the host's jobs, a call waits while every reachable host is full, and with none reachable cargo runs here. sshHost "local" runs cargo here into <root>/target/<key>.
 New factories start paused. Resume prints the ledger catch-up, recomputes the frontier, unpauses and runs one scheduling tick.
 Resume exits 1 for an owner pause or idle_with_backlog (READY work with nothing RUNNING after the tick); the latter opens a wake.
 A changed installed runtime is journaled at resume and never refused. Resume never removes an external owner pause file.
