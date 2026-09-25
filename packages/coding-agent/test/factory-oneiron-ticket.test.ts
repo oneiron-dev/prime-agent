@@ -34,8 +34,11 @@ if (group === "pr" && verb === "view") {
   const pr = state.prs[target];
   if (!pr) { process.stderr.write("no pull requests found"); process.exit(1); }
   const remote = (ref) => require("node:child_process").execFileSync("git", ["ls-remote", "origin", "refs/heads/" + ref], { encoding: "utf8" }).split(/\\s+/)[0];
+  // state.lag: that many head reads still show a stale head, as the API does right after a push.
+  const stale = state.lag > 0 && (args[args.indexOf("--json") + 1] || "").includes("headRefOid");
+  if (stale) { state.lag--; save(); }
   out({ number: pr.number, url: "https://github.com/org/repo/pull/" + pr.number, state: pr.merged ? "MERGED" : "OPEN", mergedAt: pr.merged ? "2026-09-19T00:00:00Z" : null,
-    headRefOid: remote(pr.branch), baseRefName: "main", baseRefOid: remote("main"), mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+    headRefOid: stale ? "0".repeat(40) : remote(pr.branch), baseRefName: "main", baseRefOid: remote("main"), mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
 } else if (group === "pr" && verb === "checks") {
   out(JSON.stringify(state.checks ?? []));
 } else if (group === "pr" && verb === "create") {
@@ -291,7 +294,11 @@ describe("Oneiron ticket runner", () => {
 		writeFileSync(parentState, JSON.stringify({ ...parent, merged: true }));
 		await submitted;
 		expect(runner.state).toMatchObject({ base: "origin/main", stacked: false, pr: 7 });
+		// The pull request API still shows the head from before the last push: the merge waits for it to follow.
+		const ghState = join(f.root, "gh-state.json");
+		writeFileSync(ghState, JSON.stringify({ ...JSON.parse(readFileSync(ghState, "utf8")), lag: 2 }));
 		await runner.merge();
+		expect(readFileSync(runner.logPath, "utf8")).toContain("waiting for the pull request head");
 		const gh = readFileSync(join(f.root, "gh.log"), "utf8");
 		expect(gh).not.toMatch(/^stack /m);
 		expect(gh).toContain("--base main --head w7/child");

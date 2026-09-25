@@ -1962,6 +1962,11 @@ ${rendered || "(no bot comments)"}`;
 				mergeStateStatus?: string;
 			}>(repo, "state,headRefOid,baseRefName,mergeable,mergeStateStatus");
 			if (view.state === "MERGED") return undefined;
+			// A push that just landed (publish, the bot round) can leave the API on the old head: wait, never a conflict.
+			if (view.state === "OPEN" && view.headRefOid !== head && (await this.remoteHead(this.branch)) === head) {
+				await this.waitForPushedHead(repo, head);
+				continue;
+			}
 			if (view.state !== "OPEN" || view.headRefOid !== head || view.baseRefName !== this.settings.trunk)
 				throw new TicketFailure(
 					"the candidate pull request head or base branch does not match; no inferred recovery",
