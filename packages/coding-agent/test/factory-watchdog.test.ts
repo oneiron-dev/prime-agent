@@ -1,5 +1,11 @@
 import { expect, it } from "vitest";
-import { reduceSignals, type WatchdogSnapshot, type WatchdogState } from "../src/factory/watchdog.js";
+import {
+	reduceSignals,
+	runFactoryWatchdogCli,
+	servesFactory,
+	type WatchdogSnapshot,
+	type WatchdogState,
+} from "../src/factory/watchdog.js";
 
 type Actions = WatchdogSnapshot["status"]["actions"];
 type Attempts = WatchdogSnapshot["status"]["attempts"];
@@ -66,4 +72,25 @@ it("alerts once per new exception, baselines known ones, confirms a lost runner 
 		"action:a:attempt-2",
 		"serve-lost:0",
 	]);
+});
+
+it("finds a serve started with a relative directory and refuses a blank disk threshold", async () => {
+	const cwd = () => "/work";
+	expect(servesFactory(["node", "cli.js", "factory", "serve", "factory"], cwd, "/work/factory")).toBe(true);
+	expect(servesFactory(["node", "cli.js", "factory", "serve", "."], () => "/work/factory", "/work/factory")).toBe(
+		true,
+	);
+	expect(servesFactory(["node", "cli.js", "factory", "serve", "/work/factory"], cwd, "/work/factory")).toBe(true);
+	expect(servesFactory(["node", "cli.js", "factory", "serve", "other"], cwd, "/work/factory")).toBe(false);
+	expect(servesFactory(["node", "cli.js", "factory", "serve"], () => "/work/factory", "/work/factory")).toBe(false);
+	const usage = console.error;
+	console.error = () => undefined;
+	try {
+		for (const threshold of [" ", "", "Infinity", "-1"])
+			expect(
+				await runFactoryWatchdogCli(["--factory", "/work/factory", "--session", "s", "--disk-low-gib", threshold]),
+			).toBe(2);
+	} finally {
+		console.error = usage;
+	}
 });

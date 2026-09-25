@@ -5,6 +5,8 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	readlinkSync,
+	realpathSync,
 	renameSync,
 	statfsSync,
 	watch,
@@ -153,6 +155,13 @@ function identityCurrent(identity: string): boolean | undefined {
 		return false;
 	}
 }
+/** Whether a command line is `factory serve` of this factory; a relative directory is read from the serve's cwd. */
+export function servesFactory(argv: string[], cwd: () => string, factory: string): boolean {
+	const index = argv.indexOf("factory");
+	const target = argv[index + 2];
+	if (index < 0 || argv[index + 1] !== "serve" || !target) return false;
+	return resolve(isAbsolute(target) ? "/" : cwd(), target) === factory;
+}
 function servePresent(factory: string): boolean | undefined {
 	let pids: string[];
 	try {
@@ -163,8 +172,7 @@ function servePresent(factory: string): boolean | undefined {
 	for (const pid of pids) {
 		try {
 			const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
-			const index = argv.indexOf("factory");
-			if (index >= 0 && argv[index + 1] === "serve" && resolve(argv[index + 2] ?? "") === factory) return true;
+			if (servesFactory(argv, () => readlinkSync(`/proc/${pid}/cwd`), factory)) return true;
 		} catch {}
 	}
 	return false;
@@ -183,7 +191,8 @@ export async function runFactoryWatchdog(options: {
 	const work = launcher?.work;
 	const host = launcher ? config.hosts[launcher.host] : undefined;
 	const runnerRoot = host && host.type !== "ssh" ? host.runnerRoot : undefined;
-	const diskLowGiB = options.diskLowGiB ?? launcher?.diskFloorGiB ?? 30;
+	// The runner's own default floor: below it cargoTest waits, so that is when the owner hears of it.
+	const diskLowGiB = options.diskLowGiB ?? launcher?.diskFloorGiB ?? 100;
 	const cli = options.cli ?? [process.execPath, locateFactoryCli()];
 	const directory = options.stateDirectory ?? join(factory, "watchdog");
 	const statePath = join(directory, "state.json");
@@ -274,9 +283,13 @@ export async function runFactoryWatchdog(options: {
 		} catch (error) {
 			item.attempts = (item.attempts ?? 0) + 1;
 			item.nextAttemptAt = Date.now() + Math.min(900_000, 30_000 * 2 ** (item.attempts - 1));
+			// Sends carry no idempotency key: after eight failures the owner reconciles before anything is re-sent.
 			if (item.attempts >= 8) item.deliveryPaused = true;
 			save();
-			throw error;
+			if (!item.deliveryPaused) throw error;
+			throw new Error(
+				`${error instanceof Error ? error.message : String(error)}; delivery of ${item.key} is paused after ${item.attempts} failures and ${state.outbox!.length - 1} later alerts wait behind it: check the daemon and deliveries.jsonl, then clear the item's deliveryPaused, attempts and nextAttemptAt in state.json`,
+			);
 		}
 	};
 	let running = false;
@@ -344,7 +357,9 @@ export async function runFactoryWatchdogCli(args: string[]): Promise<number> {
 	const factory = values.get("--factory");
 	const session = values.get("--session");
 	const stateDirectory = values.get("--state-dir");
-	const diskLowGiB = values.has("--disk-low-gib") ? Number(values.get("--disk-low-gib")) : undefined;
+	const diskText = values.get("--disk-low-gib");
+	// Number(" ") is 0, which would silence every disk alert.
+	const diskLowGiB = diskText === undefined ? undefined : diskText.trim() ? Number(diskText) : Number.NaN;
 	if (
 		!factory ||
 		!isAbsolute(factory) ||
@@ -360,6 +375,15 @@ export async function runFactoryWatchdogCli(args: string[]): Promise<number> {
 	return 0;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+/** Node resolves a symlinked entry script for import.meta.url but not for argv[1]; a mismatch would exit 0 unseen. */
+function invokedDirectly(): boolean {
+	try {
+		return realpathSync(process.argv[1] ?? "") === fileURLToPath(import.meta.url);
+	} catch {
+		return false;
+	}
+}
+
+if (invokedDirectly()) {
 	process.exitCode = await runFactoryWatchdogCli(process.argv.slice(2));
 }
