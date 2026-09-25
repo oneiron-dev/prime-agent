@@ -75,6 +75,25 @@ export function readLauncherSettings(path: string): OneironLauncherSettings {
 		throw new Error("launcher.host must name a configured host");
 	if (value.idleMs !== undefined && (!Number.isSafeInteger(value.idleMs) || value.idleMs < 60_000))
 		throw new Error("launcher.idleMs must be at least 60000; it is silence detection, never a work limit");
+	const mergePolicy: unknown = value.mergePolicy;
+	switch (mergePolicy) {
+		case undefined:
+		case "github":
+		case "current-base":
+			break;
+		default:
+			throw new Error("launcher.mergePolicy must be github or current-base");
+	}
+	const timeouts: unknown = value.timeouts;
+	if (timeouts !== undefined) {
+		if (!timeouts || typeof timeouts !== "object" || Array.isArray(timeouts))
+			throw new Error("launcher.timeouts must be an object");
+		for (const field of ["mergePollMs", "propagationPollMs"] as const) {
+			const timeout = (timeouts as Record<string, unknown>)[field];
+			if (timeout !== undefined && (typeof timeout !== "number" || !Number.isSafeInteger(timeout) || timeout <= 0))
+				throw new Error(`launcher.timeouts.${field} must be a positive integer`);
+		}
+	}
 	const flags = value as unknown as Record<string, unknown>;
 	for (const field of ["noStacks", "skipFactoryTests", "skipBots", "preMergeReview"])
 		if (flags[field] !== undefined && typeof flags[field] !== "boolean")

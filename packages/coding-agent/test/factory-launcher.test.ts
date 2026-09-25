@@ -150,15 +150,31 @@ it("turns the ticket DAG into submit and merge actions, then stacks a writer's S
 	expect(flat.actions.find((a) => a.id === "OF-1-b:submit")?.dependencies).toEqual(["OF-1-a:merge"]);
 });
 
-it("bounds cargoJobs like each build host's jobs, since a host without jobs takes it", () => {
+it("validates launcher cargo jobs, merge policy and polling settings before import", () => {
 	const root = mkdtempSync(join(tmpdir(), "factory-launcher-"));
 	roots.push(root);
 	const path = join(root, "launcher.json");
-	const settings = (cargoJobs: unknown) => {
-		writeFileSync(path, JSON.stringify({ host: "arch", repo: "/repo", work: "/work", cargoJobs }));
+	const settings = (cargoJobs: unknown, extra = "") => {
+		writeFileSync(
+			path,
+			`{"host":"arch","repo":"/repo","work":"/work","cargoJobs":${JSON.stringify(cargoJobs)}${extra}}`,
+		);
 		return () => readLauncherSettings(path);
 	};
 	for (const bad of [0, 2.5, 65, "4"])
 		expect(settings(bad)).toThrow("launcher.cargoJobs must be an integer from 1 to 64");
 	expect(settings(4)().cargoJobs).toBe(4);
+	for (const bad of ['"current_base"', '"auto"', "null", "1"])
+		expect(settings(4, `,"mergePolicy":${bad}`)).toThrow("launcher.mergePolicy must be github or current-base");
+	for (const bad of ["null", "[]", "false"])
+		expect(settings(4, `,"timeouts":${bad}`)).toThrow("launcher.timeouts must be an object");
+	for (const field of ["mergePollMs", "propagationPollMs"])
+		for (const bad of ["null", "0", "-1", "1.5", '"5"', "1e999"])
+			expect(settings(4, `,"timeouts":{"${field}":${bad}}`)).toThrow(
+				`launcher.timeouts.${field} must be a positive integer`,
+			);
+	expect(
+		settings(4, ',"mergePolicy":"current-base","timeouts":{"mergePollMs":1,"propagationPollMs":2}')().timeouts,
+	).toEqual({ mergePollMs: 1, propagationPollMs: 2 });
+	expect(settings(4)().timeouts).toBeUndefined();
 });
