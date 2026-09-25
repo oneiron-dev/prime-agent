@@ -47,15 +47,54 @@ export function kernelMemoryPromptLine(limitGb: number): string | undefined {
 
 export function formatGb(bytes: number): string {
 	const gb = bytes / GB;
-	const digits = gb >= 10 ? 0 : gb >= 1 ? 1 : 2;
+	const digits = gb >= 100 ? 0 : gb >= 10 ? 1 : 2;
 	return String(Number(gb.toFixed(digits)));
+}
+
+/** A usage above the limit never reads as the limit itself ("16 GB, above its 16 GB limit"). */
+function formatOver(bytes: number, limitBytes: number): string {
+	let text = formatGb(bytes);
+	for (let digits = 2; bytes > limitBytes && Number(text) * GB <= limitBytes && digits <= 3; digits += 1) {
+		text = String(Number((bytes / GB).toFixed(digits)));
+	}
+	return text;
+}
+
+/** Variable sizes: GB like every other number in the messages, MB or KB below 10 MB. */
+function formatSize(bytes: number): string {
+	if (bytes >= 10 * 1024 ** 2) return `${formatGb(bytes)} GB`;
+	if (bytes >= 1024 ** 2) return `${Math.round(bytes / 1024 ** 2)} MB`;
+	return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 export interface SizedVariable {
 	name: string;
 	bytes: number;
 	type: string;
+	/** numpy, pandas, polars and torch values. */
+	shape?: number[];
+	dtype?: string;
+	/** Lists, tuples, sets, dicts and deques. */
+	length?: number;
 }
+
+/** The line a stopped or ended cell was running. */
+export interface CellLine {
+	lineno: number;
+	source: string;
+}
+
+function describeType(v: SizedVariable): string {
+	if (v.length !== undefined) return `${v.type} of ${v.length}`;
+	const text = v.dtype ? `${v.type} ${v.dtype}` : v.type;
+	return v.shape ? `${text}, shape (${v.shape.join(", ")}${v.shape.length === 1 ? "," : ""})` : text;
+}
+
+function describeVariable(v: SizedVariable): string {
+	return `${v.name} (${formatSize(v.bytes)}, ${describeType(v)})`;
+}
+
+const cellAt = (line: CellLine) => `line ${line.lineno} (\`${line.source}\`)`;
 
 export function memoryWarningMessage(
 	totalBytes: number,
@@ -63,7 +102,7 @@ export function memoryWarningMessage(
 	largest: readonly SizedVariable[],
 ): string {
 	const variables = largest.length
-		? largest.map((v) => `${v.name} ${formatGb(v.bytes)} GB (${v.type})`).join(", ")
+		? largest.map((v) => `${v.name} ${formatSize(v.bytes)} (${describeType(v)})`).join(", ")
 		: "none";
 	const limit = formatGb(limitBytes);
 	return (
@@ -73,63 +112,104 @@ export function memoryWarningMessage(
 	);
 }
 
-export function memoryChildMessage(
-	child: { name: string; pid: number; bytes: number },
-	totalBytes: number,
-	limitBytes: number,
-	machine: boolean,
-): string {
-	const limit = formatGb(limitBytes);
-	let used = `used ${formatGb(child.bytes)} GB`;
-	if (child.bytes > limitBytes) used += `, above the ${limit} GB limit`;
-	else if (totalBytes > limitBytes) {
-		used += ` and took this kernel and its processes to ${formatGb(totalBytes)} GB, above the ${limit} GB limit`;
+export interface ChildStepContext {
+	child: { name: string; pid: number; bytes: number };
+	totalBytes: number;
+	/** The tree without the stopped child. */
+	afterBytes: number;
+	limitBytes: number;
+	machine: boolean;
+}
+
+export function memoryChildMessage(c: ChildStepContext): string {
+	const limit = formatGb(c.limitBytes);
+	let used = `used ${formatOver(c.child.bytes, c.limitBytes)} GB`;
+	if (c.child.bytes > c.limitBytes) used += `, above the ${limit} GB limit`;
+	else if (c.totalBytes > c.limitBytes) {
+		used += ` and took this kernel and its processes to ${formatOver(c.totalBytes, c.limitBytes)} GB, above the ${limit} GB limit`;
 	}
 	return (
-		`${machine ? MACHINE_PREFIX : ""}Memory limit: ${child.name} (pid ${child.pid}), started from this kernel, ${used}, ` +
-		`so the runtime stopped it. The kernel and all its variables are intact. ${MEMORY_LIMIT_REASON} ` +
+		`${c.machine ? MACHINE_PREFIX : ""}Memory limit: ${c.child.name} (pid ${c.child.pid}), started from this kernel, ${used}, ` +
+		`so the runtime stopped it. Memory now: ${formatGb(c.afterBytes)} GB. ` +
+		`The kernel and all its variables are intact, and files on disk are untouched. ${MEMORY_LIMIT_REASON} ` +
 		`Next: process the data ${PIECES_ADVICE}`
 	);
 }
 
-export function memoryTrimMessage(
-	totalBytes: number,
-	limitBytes: number,
-	dropped: readonly SizedVariable[],
-	cellStopped: boolean,
-): string {
-	const head = `Memory limit: this kernel used ${formatGb(totalBytes)} GB, above its ${formatGb(limitBytes)} GB limit, so the runtime `;
+export interface TrimStepContext {
+	totalBytes: number;
+	/** Measured after the trim; undefined when the table could not be read. */
+	afterBytes?: number;
+	limitBytes: number;
+	dropped: readonly SizedVariable[];
+	/** The running cell was stopped for this step. */
+	cellStopped: boolean;
+	line?: CellLine;
+}
+
+export function memoryTrimMessage(c: TrimStepContext): string {
+	const head = `Memory limit: this kernel used ${formatOver(c.totalBytes, c.limitBytes)} GB, above its ${formatGb(c.limitBytes)} GB limit, so the runtime `;
+	const stopped = c.cellStopped ? `stopped the cell${c.line ? ` at ${cellAt(c.line)}` : ""}` : "";
+	const now = c.afterBytes === undefined ? "" : ` Memory now: ${formatGb(c.afterBytes)} GB.`;
 	const next = `${MEMORY_LIMIT_REASON} Next: recompute only what you need, ${PIECES_ADVICE}`;
-	if (dropped.length === 0) {
+	if (c.dropped.length === 0) {
 		return (
-			`${head}${cellStopped ? "stopped the cell" : "looked for large variables"}. ` +
-			`No variable held ${formatGb(MEMORY_TRIM_MIN_BYTES)} GB or more, so none was deleted; if memory stays above the limit, the runtime ends the kernel. ${next}`
+			`${head}${stopped || "looked for large variables"}. No variable held ${formatGb(MEMORY_TRIM_MIN_BYTES)} GB or more, ` +
+			`so none was deleted: every variable is intact, and files on disk are untouched.${now} ` +
+			`If memory stays above the limit, the runtime ends the kernel. ${next}`
 		);
 	}
-	const names = dropped.map((v) => `${v.name} (${formatGb(v.bytes)} GB, ${v.type})`).join(", ");
 	return (
-		`${head}${cellStopped ? "stopped the cell and deleted" : "deleted"} the largest variables: ${names}. ` +
-		`Every other variable is intact. ${next}`
+		`${head}${stopped ? `${stopped} and deleted` : "deleted"} the largest variables: ${c.dropped.map(describeVariable).join(", ")}.${now} ` +
+		`Every other variable is intact, and files on disk are untouched. ${next}`
 	);
 }
 
 export type KernelEndCause = "grace" | "hard" | "machine";
 
-export function memoryKillMessage(totalBytes: number, limitBytes: number, cause: KernelEndCause): string {
-	const limit = formatGb(limitBytes);
+export interface KillStepContext {
+	totalBytes: number;
+	limitBytes: number;
+	cause: KernelEndCause;
+	/** A user cell was running when the kernel ended. */
+	cellRunning: boolean;
+	line?: CellLine;
+	/** Names the kernel held, largest first; `staleSeconds` when they come from an earlier reading. */
+	held?: { names: readonly SizedVariable[]; more: number; staleSeconds?: number };
+}
+
+export function memoryKillMessage(c: KillStepContext): string {
+	const above = `, above its ${formatGb(c.limitBytes)} GB limit`;
 	const why =
-		cause === "grace"
-			? `, above its ${limit} GB limit, and stopping the cell did not bring it down`
-			: cause === "hard"
-				? `, above its ${limit} GB limit and past the ${formatGb(limitBytes * MEMORY_HARD_LIMIT_FACTOR)} GB hard limit`
-				: totalBytes > limitBytes
-					? `, above its ${limit} GB limit`
+		c.cause === "grace"
+			? `${above}, and ${c.cellRunning ? "stopping the cell" : "deleting the largest variables"} did not bring it down`
+			: c.cause === "hard"
+				? `${above} and past the ${formatGb(c.limitBytes * MEMORY_HARD_LIMIT_FACTOR)} GB hard limit`
+				: c.totalBytes > c.limitBytes
+					? above
 					: "";
+	const where = !c.cellRunning ? "" : c.line ? ` while the cell ran ${cellAt(c.line)}` : " while a cell was running";
+	let held = " The kernel did not answer in time, so the names it held are not known.";
+	if (c.held && c.held.names.length === 0) held = " The kernel held no variables.";
+	else if (c.held) {
+		const when = c.held.staleSeconds === undefined ? "" : ` (at a reading ${c.held.staleSeconds} s earlier)`;
+		const more = c.held.more > 0 ? `, and ${c.held.more} more` : "";
+		held = ` The kernel held${when}: ${c.held.names.map(describeVariable).join(", ")}${more}.`;
+	}
 	return (
-		`${cause === "machine" ? MACHINE_PREFIX : ""}Memory limit: this kernel used ${formatGb(totalBytes)} GB${why}, ` +
-		`so the runtime ended the kernel. All Python variables are gone; the next cell starts a fresh kernel. ` +
+		`${c.cause === "machine" ? MACHINE_PREFIX : ""}Memory limit: this kernel used ${formatOver(c.totalBytes, c.limitBytes)} GB${why}, ` +
+		`so the runtime ended the kernel and every process it started${where}. ` +
+		`All Python variables are gone; the next cell starts a fresh kernel.${held} Files on disk are untouched. ` +
 		`${MEMORY_LIMIT_REASON} Next: rebuild state in pieces, and run a heavy one-off job as a script through bash.`
 	);
+}
+
+/** A tool result's text: notices from actions taken while no cell ran come first, this cell's own last. */
+export function placeMemoryNotices(
+	text: string,
+	result: { queuedMemoryNotices?: readonly string[]; memoryNotices?: readonly string[] },
+): string {
+	return [...(result.queuedMemoryNotices ?? []), text, ...(result.memoryNotices ?? [])].filter(Boolean).join("\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +555,7 @@ export interface MemoryGuardedKernel {
 	warnMemory(usage: KernelTreeUsage): void;
 	stopMemoryChild(unit: ChildUnit, usage: KernelTreeUsage, machine: boolean): Promise<void>;
 	trimMemory(targetBytes: number, usage: KernelTreeUsage): void;
-	endMemoryKernel(usage: KernelTreeUsage, cause: KernelEndCause): void;
+	endMemoryKernel(usage: KernelTreeUsage, cause: KernelEndCause): Promise<void>;
 }
 
 export class KernelMemoryGuard {
@@ -513,6 +593,28 @@ export class KernelMemoryGuard {
 		if (state?.trimAt !== undefined) state.trimAt = this.now();
 	}
 
+	/** One kernel's tree now, outside the poll: the "memory now" figure after a step. */
+	async measure(kernel: MemoryGuardedKernel): Promise<KernelTreeUsage | undefined> {
+		const watch = kernel.memoryWatch;
+		if (!this.reader || !watch) return undefined;
+		try {
+			const table = await this.reader(watch.python);
+			return this.measureOne(table, indexChildren(table.rows), watch, this.journalPgids());
+		} catch {
+			return undefined;
+		}
+	}
+
+	private measureOne(
+		table: ProcessTable,
+		children: ReadonlyMap<number, readonly number[]>,
+		watch: NonNullable<MemoryGuardedKernel["memoryWatch"]>,
+		journal: ReadonlyMap<number, readonly number[]>,
+	): KernelTreeUsage | undefined {
+		const bash = new Set([...watch.bashPgids, ...(journal.get(watch.pid) ?? [])]);
+		return measureKernelTree(table, children, watch.pid, bash, table.rows.get(process.pid)?.pgid);
+	}
+
 	/** One measurement pass for every watched kernel; overlapping calls join the pass in flight. */
 	tick(): Promise<void> {
 		this.ticking ??= this.runTick().finally(() => {
@@ -532,15 +634,13 @@ export class KernelMemoryGuard {
 			return; // An unreadable table skips this pass; the next one retries.
 		}
 		const children = indexChildren(table.rows);
-		const ownPgid = table.rows.get(process.pid)?.pgid;
 		const journal = this.journalPgids();
 		const measured: { kernel: MemoryGuardedKernel; usage: KernelTreeUsage; limitBytes: number; backstop: boolean }[] =
 			[];
 		for (const kernel of watched) {
 			const watch = kernel.memoryWatch;
 			if (!watch || !this.kernels.has(kernel)) continue;
-			const bash = new Set([...watch.bashPgids, ...(journal.get(watch.pid) ?? [])]);
-			const usage = measureKernelTree(table, children, watch.pid, bash, ownPgid);
+			const usage = this.measureOne(table, children, watch, journal);
 			if (usage) measured.push({ kernel, usage, limitBytes: watch.limitBytes, backstop: watch.backstop });
 		}
 		const backstop = table.critical
@@ -557,7 +657,7 @@ export class KernelMemoryGuard {
 					if (step.kind === "warn") m.kernel.warnMemory(m.usage);
 					else if (step.kind === "child") await m.kernel.stopMemoryChild(step.unit, m.usage, m === backstop);
 					else if (step.kind === "trim") m.kernel.trimMemory(step.targetBytes, m.usage);
-					else m.kernel.endMemoryKernel(m.usage, step.cause);
+					else await m.kernel.endMemoryKernel(m.usage, step.cause);
 				} catch {
 					// One kernel's failed step must not stop the pass for the others.
 				}

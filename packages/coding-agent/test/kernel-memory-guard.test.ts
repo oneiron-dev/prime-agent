@@ -3,11 +3,12 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getKernelVenvDir, kernelVenvPython } from "../src/core/kernel/bootstrap.js";
 import { type ExecuteResult, ReplKernelManager } from "../src/core/kernel/index.js";
 import {
 	decideMemorySteps,
+	GB,
 	indexChildren,
 	type KernelTreeUsage,
 	kernelMemoryGuard,
@@ -23,6 +24,7 @@ import {
 	parseLinuxMeminfoCritical,
 	parseLinuxStat,
 	parseLinuxStatusBytes,
+	placeMemoryNotices,
 	platformMemoryReader,
 	resolveKernelMemoryLimitGb,
 } from "../src/core/kernel/memory-guard.js";
@@ -108,22 +110,108 @@ describe("kernel memory guard", () => {
 		expect(kinds(tree(100, 200), 12_000, true)).toEqual(["child"]);
 	});
 
+	const line = { lineno: 4, source: "frames = np.stack([load(v) for v in videos])" };
+	const frames = { name: "frames", bytes: 9.95 * GB, type: "ndarray", dtype: "float64", shape: [200, 1080, 1920, 3] };
+	const framesText = "frames (9.95 GB, ndarray float64, shape (200, 1080, 1920, 3))";
+	const clips = { name: "clips", bytes: 3.1 * GB, type: "list", length: 200 };
+	const trim = { totalBytes: 17.2 * GB, afterBytes: 1.2 * GB, limitBytes: 16 * GB, dropped: [frames, clips] };
+	const kill = { totalBytes: 17.2 * GB, limitBytes: 16 * GB, cellRunning: true, line };
 	it.each([
-		[
-			"warning",
-			memoryWarningMessage(0.35 * 2 ** 30, 2 ** 29, [{ name: "data", bytes: 0.34 * 2 ** 30, type: "bytes" }]),
-		],
-		["child", memoryChildMessage({ name: "python3", pid: 7, bytes: 2 ** 30 }, 2 ** 30, 2 ** 29, false)],
-		["variable", memoryTrimMessage(2 ** 30, 2 ** 29, [{ name: "big", bytes: 2 ** 30, type: "list" }], true)],
-		["variable, nothing large", memoryTrimMessage(2 ** 30, 2 ** 29, [], true)],
-		["last", memoryKillMessage(2 ** 30, 2 ** 29, "grace")],
-		["hard", memoryKillMessage(2 ** 30, 2 ** 29, "hard")],
-		["machine child", memoryChildMessage({ name: "python3", pid: 7, bytes: 2 ** 28 }, 2 ** 28, 2 ** 29, true)],
-		["machine kernel", memoryKillMessage(2 ** 28, 2 ** 29, "machine")],
-	])("the %s message says why and what next", (kind, message) => {
-		expect(message).toContain(MEMORY_LIMIT_REASON);
-		expect(message).toMatch(kind.startsWith("machine") ? /^The machine is nearly out of memory/ : /^Memory/);
-		expect(message).toMatch(kind === "warning" ? /Free what you no longer need/ : /Next: /);
+		{
+			kind: "child",
+			message: memoryChildMessage({
+				child: { name: "python3", pid: 7, bytes: 16.02 * GB },
+				...{ totalBytes: 16.1 * GB, afterBytes: 0.08 * GB, limitBytes: 16 * GB, machine: false },
+			}),
+			stopped: "python3 (pid 7), started from this kernel",
+			where: null,
+			numbers: ["used 16.02 GB, above the 16 GB limit", "Memory now: 0.08 GB."],
+			lostKept: ["The kernel and all its variables are intact"],
+			next: "Next: process the data in pieces",
+		},
+		{
+			kind: "variable",
+			message: memoryTrimMessage({ ...trim, cellStopped: true, line }),
+			stopped: "stopped the cell",
+			where: "at line 4 (`frames = np.stack([load(v) for v in videos])`)",
+			numbers: ["used 17.2 GB, above its 16 GB limit", "Memory now: 1.2 GB."],
+			lostKept: [
+				`deleted the largest variables: ${framesText}, clips (3.1 GB, list of 200).`,
+				"Every other variable is intact",
+			],
+			next: "Next: recompute only what you need, in pieces",
+		},
+		{
+			kind: "idle variable",
+			message: memoryTrimMessage({ ...trim, dropped: [], cellStopped: false }),
+			stopped: "looked for large variables",
+			where: null,
+			numbers: ["used 17.2 GB, above its 16 GB limit", "Memory now: 1.2 GB."],
+			lostKept: ["none was deleted: every variable is intact"],
+			next: "Next: recompute only what you need, in pieces",
+		},
+		{
+			kind: "last",
+			message: memoryKillMessage({
+				...kill,
+				cause: "grace",
+				held: { names: [frames, { name: "n", bytes: 28, type: "int" }], more: 2 },
+			}),
+			stopped: "ended the kernel and every process it started",
+			where: "while the cell ran line 4 (`frames = np.stack([load(v) for v in videos])`)",
+			numbers: ["used 17.2 GB, above its 16 GB limit, and stopping the cell did not bring it down", "fresh kernel"],
+			lostKept: [`The kernel held: ${framesText}, n (1 KB, int), and 2 more.`, "All Python variables are gone"],
+			next: "Next: rebuild state in pieces",
+		},
+		{
+			kind: "hard, unanswered",
+			message: memoryKillMessage({ ...kill, cause: "hard", line: undefined }),
+			stopped: "ended the kernel and every process it started",
+			where: "while a cell was running",
+			numbers: ["used 17.2 GB, above its 16 GB limit and past the 24 GB hard limit", "fresh kernel"],
+			lostKept: ["All Python variables are gone", "The kernel did not answer in time"],
+			next: "Next: rebuild state in pieces",
+		},
+		{
+			kind: "machine, idle",
+			message: memoryKillMessage({
+				...kill,
+				totalBytes: 3 * GB,
+				cause: "machine",
+				cellRunning: false,
+				held: { names: [clips], more: 0, staleSeconds: 12 },
+			}),
+			stopped:
+				"The machine is nearly out of memory, and this kernel was the largest this session owns. Memory limit: this kernel used 3 GB, so the runtime ended the kernel",
+			where: null,
+			numbers: ["used 3 GB, so", "fresh kernel"],
+			lostKept: ["The kernel held (at a reading 12 s earlier): clips (3.1 GB, list of 200)."],
+			next: "Next: rebuild state in pieces",
+		},
+	])("the $kind message says what stopped, where, the numbers, what was lost and kept, why, and what next", (c) => {
+		expect(c.message).toContain(c.stopped);
+		if (c.where === null) expect(c.message).not.toMatch(/\bline \d|cell was running/);
+		else expect(c.message).toContain(c.where);
+		for (const number of c.numbers) expect(c.message).toContain(number);
+		for (const part of c.lostKept) expect(c.message).toContain(part);
+		expect(c.message).toMatch(/files on disk are untouched/i);
+		expect(c.message).toContain(MEMORY_LIMIT_REASON);
+		expect(c.message).toContain(c.next);
+	});
+
+	it("the warning names the largest variables with their shapes and says why", () => {
+		const warning = memoryWarningMessage(10 * GB, 16 * GB, [frames, clips]);
+		expect(warning).toContain(
+			"Largest variables: frames 9.95 GB (ndarray float64, shape (200, 1080, 1920, 3)), clips 3.1 GB (list of 200).",
+		);
+		expect(warning).toContain(MEMORY_LIMIT_REASON);
+	});
+
+	it("puts notices from actions taken while no cell ran above the output, the cell's own below", () => {
+		expect(placeMemoryNotices("out", { queuedMemoryNotices: ["idle"], memoryNotices: ["own"] })).toBe(
+			"idle\n\nout\n\nown",
+		);
+		expect(placeMemoryNotices("", { queuedMemoryNotices: ["idle"] })).toBe("idle");
 	});
 
 	it("resolves the limit from settings, then the environment, then 16 GB", () => {
@@ -152,13 +240,19 @@ describe("kernel memory ladder (real runtime, 0.5 GB limit)", { tags: ["kernel-h
 	let fifoCount = 0;
 
 	beforeEach(() => {
+		// Only the explicit ticks below walk the ladder; the 2 s poll never fires mid-test.
+		vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
 		dir = mkdtempSync(join(tmpdir(), "prime-agent-memcap-"));
 	});
 
 	afterEach(async () => {
-		await manager?.shutdown();
-		manager = undefined;
-		rmSync(dir, { recursive: true, force: true });
+		try {
+			await manager?.shutdown();
+		} finally {
+			manager = undefined;
+			vi.useRealTimers();
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	function start(memoryLimitGb = 0.5): ReplKernelManager {
@@ -206,6 +300,7 @@ describe("kernel memory ladder (real runtime, 0.5 GB limit)", { tags: ["kernel-h
 		expect(warned.memoryNotices?.[0]).toMatch(
 			/^Memory: this kernel and its processes use 0\.\d+ GB of their 0\.5 GB limit\. Largest variables: data 0\.34 GB \(bytes\)/,
 		);
+		expect(warned.memoryNotices?.[0]).toContain(MEMORY_LIMIT_REASON);
 		const again = await runMeasured(`more = 1\n${HOLD}`, true);
 		expect(again.memoryNotices).toBeUndefined();
 	});
@@ -221,39 +316,71 @@ describe("kernel memory ladder (real runtime, 0.5 GB limit)", { tags: ["kernel-h
 		expect(manager!.memoryWatch === undefined).toBe(limit === 0);
 	});
 
-	it("stops only the child that bash started, and the bash call returns why", async () => {
-		start();
-		await manager!.execute("before = 41");
+	function hogScript(): string {
 		const script = join(dir, "hog.py");
 		writeFileSync(
 			script,
 			'import sys, time\ndata = b"\\x01" * (700 << 20)\nopen(sys.argv[1], "w").close()\ntime.sleep(600)\n',
 		);
+		return script;
+	}
+
+	const CHILD_STOPPED =
+		/^Memory limit: python\S* \(pid \d+\), started from this kernel, used 0\.\d+ GB, above the 0\.5 GB limit, so the runtime stopped it\. Memory now: 0\.\d+ GB\. The kernel and all its variables are intact, and files on disk are untouched\./m;
+
+	it("stops only the child that bash started, and the bash call returns why", async () => {
+		start();
+		await manager!.execute("before = 41");
 		const result = await runMeasured(
-			`import shlex, sys\nfrom rlm import bash\nr = await bash(shlex.join([sys.executable, ${JSON.stringify(script)}, READY]))\nprint(r.exit_code)\nprint(r.output)`,
+			`import shlex, sys\nfrom rlm import bash\nr = await bash(shlex.join([sys.executable, ${JSON.stringify(hogScript())}, READY]))\nprint(r.exit_code)\nprint(r.output)`,
 			false,
 		);
 		expect(result.stdout).toMatch(/^-9\n/);
-		expect(result.stdout).toMatch(
-			/Memory limit: python\S* \(pid \d+\), started from this kernel, used 0\.\d+ GB, above the 0\.5 GB limit/,
-		);
+		expect(result.stdout).toMatch(CHILD_STOPPED);
 		expect(result.stdout).toContain(MEMORY_LIMIT_REASON);
+		// The bash call returned it; the host does not say it twice.
+		expect(result.memoryNotices).toBeUndefined();
 		expect((await manager!.execute("before + 1")).result).toBe("42");
 	});
 
-	it("stops the cell and drops the big variable, keeping the small one", async () => {
+	it("reports a background child stopped after its bash call returned at the top of the next cell result", async () => {
+		start();
+		const ready = fifo();
+		await manager!.execute(
+			`import shlex, sys\nfrom rlm import bash\nh = bash(shlex.join([sys.executable, ${JSON.stringify(hogScript())}, ${JSON.stringify(ready)}]))\nbefore = h.pid`,
+		);
+		await readFile(ready);
+		await kernelMemoryGuard.tick();
+		const next = await manager!.execute('print("after")\nbefore > 0');
+		expect(next.queuedMemoryNotices?.[0]).toMatch(CHILD_STOPPED);
+		expect(placeMemoryNotices(next.stdout, next)).toMatch(/^Memory limit: python[^\n]*\n\nafter\n$/);
+		expect(next.result).toBe("True");
+	});
+
+	it("stops the cell at its line and drops the big array, keeping the small variable", async () => {
 		start();
 		await manager!.execute('small = b"\\x02" * (64 << 20)');
-		const loop = `big = []\nfor _ in range(64):\n    big.append(b"\\x01" * (16 << 20))\n    if len(big) == 30:\n        ${HOLD.replace("\n", "\n        ")}`;
+		const loop = `import numpy as np\nbig = np.empty((64, 16 << 20), dtype=np.uint8)\nfor i in range(64):\n    big[i] = 1\n    if i == 29:\n        ${HOLD.replace("\n", "\n        ")}`;
 		const result = await runMeasured(loop, false);
 		expect(result.error?.ename).toBe("KeyboardInterrupt");
 		expect(result.memoryNotices?.[0]).toMatch(
-			/so the runtime stopped the cell and deleted the largest variables: big \(0\.47 GB, list\)\. Every other variable is intact\./,
+			/^Memory limit: this kernel used 0\.\d+ GB, above its 0\.5 GB limit, so the runtime stopped the cell at line 7 \(`open\(".+"\)\.read\(\)`\) and deleted the largest variables: big \(1 GB, ndarray uint8, shape \(64, 16777216\)\)\. Memory now: 0\.\d+ GB\. Every other variable is intact, and files on disk are untouched\./,
 		);
 		expect((await manager!.execute('(len(small), "big" in globals())')).result).toBe("(67108864, False)");
 	});
 
-	it("ends the kernel when the memory ignores the interrupt, and the next cell runs fresh", async () => {
+	it("reports an idle trim at the top of the next cell result", async () => {
+		start();
+		await manager!.execute('big = b"\\x01" * (600 << 20)');
+		await kernelMemoryGuard.tick();
+		const next = await manager!.execute('print("after")');
+		expect(next.queuedMemoryNotices?.[0]).toMatch(
+			/^Memory limit: this kernel used 0\.\d+ GB, above its 0\.5 GB limit, so the runtime deleted the largest variables: big \(0\.59 GB, bytes\)\. Memory now: 0\.\d+ GB\./,
+		);
+		expect(placeMemoryNotices(next.stdout, next)).toMatch(/^Memory limit: [^\n]*\n\nafter\n$/);
+	});
+
+	it("ends the kernel when the memory ignores the interrupt, names its line and variables, and the next cell runs fresh", async () => {
 		start();
 		await manager!.execute("x = 1");
 		const firstPid = manager!.memoryWatch?.pid;
@@ -261,7 +388,7 @@ describe("kernel memory ladder (real runtime, 0.5 GB limit)", { tags: ["kernel-h
 		const result = await runMeasured(masked, false);
 		expect(result.status).toBe("error");
 		expect(result.memoryNotices?.[0]).toMatch(
-			/past the 0\.75 GB hard limit, so the runtime ended the kernel\. All Python variables are gone/,
+			/past the 0\.75 GB hard limit, so the runtime ended the kernel and every process it started while the cell ran line 5 \(`open\(".+"\)\.read\(\)`\)\. All Python variables are gone; the next cell starts a fresh kernel\. The kernel held: big \(0\.8 GB, bytes\), x \(1 KB, int\)\. Files on disk are untouched\./,
 		);
 		expect((await manager!.execute('"x" in globals()')).result).toBe("False");
 		expect(manager!.memoryWatch?.pid).not.toBe(firstPid);

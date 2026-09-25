@@ -19,7 +19,7 @@ import {
 	type KernelSentAgentMessage,
 	ReplKernelManager,
 } from "../kernel/index.js";
-import { kernelMemoryPromptLine, resolveKernelMemoryLimitGb } from "../kernel/memory-guard.js";
+import { kernelMemoryPromptLine, placeMemoryNotices, resolveKernelMemoryLimitGb } from "../kernel/memory-guard.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
@@ -310,7 +310,9 @@ export interface IpythonToolDetails {
 	sentAgentMessages?: KernelSentAgentMessage[];
 	/** True when this result came after killing and restarting a busy kernel. */
 	kernelRestarted?: boolean;
-	/** What the kernel memory ceiling did since the previous cell. */
+	/** What the kernel memory ceiling did while no cell ran; shown above the output. */
+	queuedMemoryNotices?: string[];
+	/** What the kernel memory ceiling did during this cell; shown after the output. */
 	memoryNotices?: string[];
 	error?: {
 		ename: string;
@@ -760,12 +762,10 @@ export function createIpythonToolDefinition(
 				if (r.backgroundOutput) {
 					text += `${text ? "\n" : ""}[background output (unattributed)]\n${r.backgroundOutput}`;
 				}
-				for (const notice of r.memoryNotices ?? []) {
-					text += `${text ? "\n\n" : ""}${notice}`;
-				}
 				if (kernelRestarted) {
 					text = text ? `${KERNEL_RESTART_NOTICE}\n\n${text}` : KERNEL_RESTART_NOTICE;
 				}
+				text = placeMemoryNotices(text, r);
 
 				const imageBlocks = imageBlocksFromAttachments(r.attachments);
 				const content: (TextContent | ImageContent)[] = [{ type: "text", text: text || "" }, ...imageBlocks];
@@ -785,6 +785,7 @@ export function createIpythonToolDefinition(
 						sentAgentMessages: r.sentAgentMessages,
 						kernelRestarted,
 						error: r.error,
+						queuedMemoryNotices: r.queuedMemoryNotices,
 						memoryNotices: r.memoryNotices,
 					},
 					isError: r.status === "error" || r.status === "aborted",

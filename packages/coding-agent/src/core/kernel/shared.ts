@@ -153,9 +153,12 @@ export interface ExecuteResult {
 	/** Output that arrived without this cell's id (user threads, other cells' leftovers, raw fd writes). */
 	backgroundOutput?: string;
 	status: "ok" | "error" | "aborted";
-	error?: { ename: string; evalue: string; traceback: string[] };
+	/** `line`: the cell's own innermost traceback line (for an interrupt, where the cell was stopped). */
+	error?: { ename: string; evalue: string; traceback: string[]; line?: { lineno: number; source: string } };
 	durationMs: number;
-	/** What the memory ceiling did since the last user cell, for the model. */
+	/** What the memory ceiling did while no cell ran, for the top of this result. */
+	queuedMemoryNotices?: string[];
+	/** What the memory ceiling did during this cell, for the model, after its output. */
 	memoryNotices?: string[];
 }
 
