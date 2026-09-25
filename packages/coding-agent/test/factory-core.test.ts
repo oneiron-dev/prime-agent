@@ -136,6 +136,47 @@ describe("portable factory journal", () => {
 			"requires the durable factory pause",
 		);
 	});
+	it("replaces a rejected action while paused, rewires its dependents, and writes nothing for a refused admission", async () => {
+		const { store } = fixture();
+		const adapter = new FakeAdapter();
+		adapter.launchResult = (c) =>
+			c.action.id === "a"
+				? { kind: "terminal", receipt: receipt(c, 1) }
+				: { kind: "running", processIdentity: "pid:2" };
+		const engine = new FactoryEngine(store, adapter, { enabled: true });
+		engine.applyPlan(plan([action("a"), action("b", ["a"])]));
+		await engine.tick();
+		engine.pause("sequential shipping");
+		const revision = store.status().planRevision;
+		const replacement = { ...action("repair"), ticketId: "a" };
+		const admit = (actions: ActionSpec[], extra: Partial<FactoryPlan> = {}, select = "repair") =>
+			engine.recoverAdmit(
+				{ version: 1, tickets: [], slots: [], actions, ...extra },
+				{
+					select,
+					supersede: select === "repair" ? "a" : undefined,
+					expectedRevision: revision,
+					mutationId: `m-${select}`,
+					evidence,
+				},
+			);
+		await expect(admit([{ ...replacement, ticketId: "b" }])).rejects.toThrow("retain the rejected action's ticket");
+		await expect(admit([{ ...action("b", ["a"]), sourceFingerprint: "changed" }], {}, "b")).rejects.toThrow(
+			"Pure admission requires the unchanged existing READY action",
+		);
+		await expect(
+			admit([replacement], { slots: [{ id: "foreign", host: "host", capabilities: [] }] }),
+		).rejects.toThrow("may add only the selected action's exact slot");
+		// Each refusal rolled back whole: no revision, no action, no receipt.
+		expect([store.status().planRevision, store.actions().some((a) => a.id === "repair")]).toEqual([revision, false]);
+		const admitted = await admit([replacement]);
+		expect(admitted).toMatchObject({ actionId: "repair", replayed: false, paused: true });
+		expect(store.status().planRevision).toBe(revision + 2);
+		expect(store.actions().find((a) => a.id === "a")?.state).toBe("SUPERSEDED");
+		expect(store.actions().find((a) => a.id === "b")?.dependencies).toEqual(["repair"]);
+		expect(adapter.launches.map((c) => c.action.id)).toEqual(["a", "repair"]);
+		expect(store.isPaused()).toBe(true);
+	});
 	it("records failed processes without accepting them", async () => {
 		const { store } = fixture();
 		const adapter = new FakeAdapter();
