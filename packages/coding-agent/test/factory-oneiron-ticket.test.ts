@@ -436,6 +436,7 @@ const n = (fs.existsSync(p) ? Number(fs.readFileSync(p, "utf8")) : 0) + 1;
 fs.writeFileSync(p, String(n));
 if (n === 1) process.stdout.write("The build is running; I will end with DONE quote-one once it passes.\\n");
 else if (n === 2) process.stdout.write("Template:\\n\`\`\`\\nDONE quote-one\\n\`\`\`\\n");
+else if (n === 3) { process.stdout.write("Tests pass.\\nDONE quote-one\\n"); process.exitCode = 1; }
 else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 `,
 		);
@@ -447,9 +448,10 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		const writer = new OneironTicketRunner(quoting, { env: f.env, routing: {}, retryDelayMs: 0 });
 		mkdirSync(writer.worktree, { recursive: true });
 		const { final } = await writer.writerRounds("write", "start", "continue");
-		expect([final, readFileSync(join(f.root, "quoting"), "utf8")]).toEqual(["Tests pass.\nDONE quote-one", "3"]);
+		// Round 3 prints the exact line and then exits 1: a failed seat has not ended its round.
+		expect([final, readFileSync(join(f.root, "quoting"), "utf8")]).toEqual(["Tests pass.\nDONE quote-one", "4"]);
 		const intents = readFileSync(join(writer.directory, "routing.jsonl"), "utf8").trim().split("\n");
-		expect(intents.map((line) => JSON.parse(line).choice)).toEqual(["continue", "continue", "done"]);
+		expect(intents.map((line) => JSON.parse(line).choice)).toEqual(["continue", "continue", "continue", "done"]);
 	});
 
 	it("sends a prime seat its prompt on stdin, never in argv", async () => {

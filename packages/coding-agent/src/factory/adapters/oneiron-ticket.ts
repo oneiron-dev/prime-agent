@@ -894,7 +894,9 @@ ${rendered || "(no bot comments)"}`;
 			// A job the writer registered this round is awaited first: pending work is never DONE, whatever the prose.
 			completed = await wait();
 			if (completed) continue;
-			const terminal = writerTerminal(final, key);
+			// A seat that failed or went silent after its last line has not ended its round; the session continues.
+			const clean = result.code === 0 && !result.idle;
+			const terminal = clean ? writerTerminal(final, key) : undefined;
 			if (terminal) {
 				this.journalIntent(session, round, {
 					choice: terminal.kind,
@@ -906,16 +908,15 @@ ${rendered || "(no bot comments)"}`;
 				if (terminal.kind === "done") return { final, ...(split ? { split } : {}) };
 				throw new TicketFailure(`writer BLOCKED: ${terminal.line}\n${final.slice(-600)}`);
 			}
-			const intent =
-				result.code === 0 && !result.idle
-					? await routeWriterContinuation({ key, session, final }, this.routing())
-					: {
-							choice: "continue" as const,
-							decided_by: "code" as const,
-							confidence: null,
-							reason: "the seat did not end its turn cleanly",
-							wall_clock_ms: 0,
-						};
+			const intent = clean
+				? await routeWriterContinuation({ key, session, final }, this.routing())
+				: {
+						choice: "continue" as const,
+						decided_by: "code" as const,
+						confidence: null,
+						reason: "the seat did not end its turn cleanly",
+						wall_clock_ms: 0,
+					};
 			this.journalIntent(session, round, intent);
 			if (intent.choice === "split") split = final.match(/^SPLIT:\s*(.+)$/m)?.[1]?.trim() || tail(final, 20);
 			silent = result.bytes === 0 && result.code !== 0 ? silent + 1 : 0;
