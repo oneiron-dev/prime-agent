@@ -1801,7 +1801,14 @@ ${rendered || "(no bot comments)"}`;
 		const oldHead = await this.head();
 		const update = await this.gh(["pr", "update-branch", String(this.state.pr), "--repo", repo]);
 		await this.git(["fetch", "-q", this.settings.remote]);
-		if (update.code === 0) {
+		const throttled = update.code !== 0 && githubRateLimited(update.output);
+		if (throttled) {
+			const remote = await this.remoteHead(this.branch);
+			if (!remote) throw new TicketFailure("the pull request branch disappeared during the update");
+			if (remote === oldHead) throw new GitHubRateLimit(`gh pr update-branch failed: ${tail(update.output, 10)}`);
+			await this.git(["merge", "--ff-only", `${this.settings.remote}/${this.branch}`]);
+			await this.waitForPushedHead(repo, remote);
+		} else if (update.code === 0) {
 			this.log("merge", "the branch was behind; updated natively");
 			await this.git(["merge", "--ff-only", `${this.settings.remote}/${this.branch}`]);
 		} else {
@@ -2133,6 +2140,7 @@ ${rendered || "(no bot comments)"}`;
 			const merge = await this.gh([...args, "--match-head-commit", candidate.head]);
 			if (merge.code === 0 || (await this.mergedOnGitHub(repo))) return "merged";
 			if ((await trunkHead()) !== candidate.base) return "stale-base";
+			if (githubRateLimited(merge.output)) return "rate-limited";
 			throw new TicketFailure(
 				`the native merge failed at an unchanged candidate and base: ${tail(merge.output, 15)}`,
 			);
@@ -2173,7 +2181,16 @@ ${rendered || "(no bot comments)"}`;
 			];
 			const deadline = Date.now() + this.t.ciMs;
 			for (;;) {
-				const candidate = await this.prepareNonstackedCandidate(repo, deadline);
+				let candidate: { head: string; base: string } | undefined;
+				try {
+					candidate = await this.prepareNonstackedCandidate(repo, deadline);
+				} catch (error) {
+					if (!(error instanceof GitHubRateLimit)) throw error;
+					if (Date.now() >= deadline)
+						throw new TicketFailure("merge preparation timed out while GitHub was rate limited");
+					await sleep(Math.min(this.t.mergePollMs, deadline - Date.now()));
+					continue;
+				}
 				if (!candidate) return;
 				// The review runs outside the global mutex, on the candidate whose required checks are green.
 				if (this.settings.preMergeReview) await this.preMergeReview(candidate.head);

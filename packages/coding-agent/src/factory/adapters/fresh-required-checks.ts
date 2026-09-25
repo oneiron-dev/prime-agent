@@ -31,6 +31,8 @@ type WorkflowJob = {
 	status: string;
 	conclusion: string | null;
 	html_url?: string;
+	check_run_url?: string;
+	run_attempt?: number;
 };
 type CheckRun = {
 	id: number;
@@ -146,9 +148,10 @@ export async function freshRequiredChecks(
 
 	const initial = await generation();
 	const previousRuns = new Map<number, WorkflowRun>();
-	const suiteChecks = new Map<number, CheckRun[]>();
+	const suiteChecks = new Map<string, CheckRun[]>();
 	const attemptJobs = new Map<string, WorkflowJob[]>();
 	const selected = new Map<number, { old: WorkflowRun; run: WorkflowRun }>();
+	const retained = new Map<number, number>();
 	let pendingMissing = false;
 	const pending = (name: string): RequiredCheckRow => {
 		pendingMissing = true;
@@ -188,11 +191,32 @@ export async function freshRequiredChecks(
 				`repos/${repo}/actions/runs/${run.id}/attempts/${attempt}/jobs?per_page=${PAGE_SIZE}`,
 			);
 			jobs = onePage(listed, listed.jobs, "rerun attempt jobs");
-			if (jobs.some((job) => job.run_id !== run.id || job.head_sha !== head))
-				throw new Error("rerun attempt contains another workflow or head");
+			if (
+				jobs.some(
+					(job) =>
+						job.run_id !== run.id ||
+						job.head_sha !== head ||
+						(job.run_attempt !== undefined && job.run_attempt !== attempt),
+				)
+			)
+				throw new Error("rerun attempt contains another workflow, head or attempt");
 			attemptJobs.set(key, jobs);
 		}
 		return jobs;
+	}
+	async function checksFor(suiteId: number, filter: "all" | "latest"): Promise<CheckRun[]> {
+		const key = `${suiteId}/${filter}`;
+		let checks = suiteChecks.get(key);
+		if (!checks) {
+			const listed = await getJson<{ total_count: number; check_runs: CheckRun[] }>(
+				gh,
+				`repos/${repo}/check-suites/${suiteId}/check-runs?per_page=${PAGE_SIZE}&filter=${filter}`,
+			);
+			checks = onePage(listed, listed.check_runs, "check runs");
+			if (checks.some((check) => check.head_sha !== head)) throw new Error("check suite contains another head");
+			suiteChecks.set(key, checks);
+		}
+		return checks;
 	}
 	const current = await Promise.all(
 		rows.map(async (row, index): Promise<RequiredCheckRow> => {
@@ -235,8 +259,13 @@ export async function freshRequiredChecks(
 				const jobs = await jobsFor(detail, attempt);
 				const job = [...jobs].filter((candidate) => candidate.name === row.name).sort((a, b) => b.id - a.id)[0];
 				if (job) return checkBucket({ ...job, details_url: job.html_url });
-				// A failed-jobs-only rerun omits successful jobs. Carry one forward only after this attempt ends.
-				if (detail.status === "completed") {
+				// A partial rerun can retain a previous job. Terminal status alone cannot prove retention.
+				if (
+					detail.status === "completed" &&
+					detail.conclusion === "success" &&
+					jobs.length > 0 &&
+					jobs.every((candidate) => candidate.status === "completed")
+				) {
 					for (let prior = attempt - 1; prior >= 1; prior--) {
 						const priorJobs = await jobsFor(detail, prior);
 						const priorJob = [...priorJobs]
@@ -244,23 +273,27 @@ export async function freshRequiredChecks(
 							.sort((a, b) => b.id - a.id)[0];
 						if (priorJob) {
 							const result = checkBucket({ ...priorJob, details_url: priorJob.html_url });
-							if (result.bucket === "pass") return result;
+							if (result.bucket === "pass" || result.bucket === "skipping") {
+								const checks = await checksFor(detail.check_suite_id, "latest");
+								const effective = checks.filter((check) => check.name === row.name);
+								if (
+									effective.length === 1 &&
+									priorJob.check_run_url ===
+										`https://api.github.com/repos/${repo}/check-runs/${effective[0]!.id}` &&
+									effective[0]!.id === priorJob.id &&
+									checkBucket(effective[0]!).bucket === result.bucket
+								) {
+									retained.set(index, effective[0]!.id);
+									return result;
+								}
+							}
 							break;
 						}
 					}
 				}
 				return pending(row.name);
 			}
-			let checks = suiteChecks.get(detail.check_suite_id);
-			if (!checks) {
-				const listedChecks = await getJson<{ total_count: number; check_runs: CheckRun[] }>(
-					gh,
-					`repos/${repo}/check-suites/${detail.check_suite_id}/check-runs?per_page=${PAGE_SIZE}&filter=all`,
-				);
-				checks = onePage(listedChecks, listedChecks.check_runs, "check runs");
-				if (checks.some((check) => check.head_sha !== head)) throw new Error("check suite contains another head");
-				suiteChecks.set(detail.check_suite_id, checks);
-			}
+			const checks = await checksFor(detail.check_suite_id, "all");
 			const matching = checks.filter((check) => check.name === row.name);
 			const newest = latest(
 				matching.map((check) => ({ ...check, created_at: check.started_at ?? check.completed_at ?? "" })),
@@ -281,9 +314,28 @@ export async function freshRequiredChecks(
 			!matches(detail, old) ||
 			detail.check_suite_id !== run.check_suite_id ||
 			(detail.run_attempt ?? 1) !== (run.run_attempt ?? 1) ||
+			(retained.has(index) && (detail.status !== "completed" || detail.conclusion !== "success")) ||
 			unreconciled(after, run)
-		)
+		) {
 			current[index] = pending(rows[index]!.name!);
+			continue;
+		}
+		const retainedId = retained.get(index);
+		if (retainedId !== undefined) {
+			const listed = await getJson<{ total_count: number; check_runs: CheckRun[] }>(
+				gh,
+				`repos/${repo}/check-suites/${run.check_suite_id}/check-runs?per_page=${PAGE_SIZE}&filter=latest`,
+			);
+			const checks = onePage(listed, listed.check_runs, "latest check runs");
+			const effective = checks.filter((check) => check.name === rows[index]!.name);
+			if (
+				checks.some((check) => check.head_sha !== head) ||
+				effective.length !== 1 ||
+				effective[0]!.id !== retainedId ||
+				checkBucket(effective[0]!).bucket !== current[index]!.bucket
+			)
+				current[index] = pending(rows[index]!.name!);
+		}
 	}
 	return { rows: current, pendingMissing };
 }

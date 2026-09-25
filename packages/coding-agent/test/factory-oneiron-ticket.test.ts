@@ -881,7 +881,10 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		};
 		let preparation = 0;
 		let finalView = 0;
+		let mergeCalls = 0;
 		runner.run = (args, options) => {
+			if (args[0] === "gh" && args[1] === "pr" && args[2] === "merge" && mergeCalls++ === 0)
+				return Promise.resolve({ code: 1, output: "GraphQL: API rate limit exceeded" });
 			if (args[0] === "gh" && args[1] === "pr" && args[2] === "view") {
 				const fields = args[args.indexOf("--json") + 1];
 				if (fields === "state,headRefOid,baseRefName,mergeable,mergeStateStatus" && preparation++ === 0)
@@ -894,7 +897,87 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		await runner.merge();
 		expect(preparation).toBeGreaterThan(1);
 		expect(finalView).toBeGreaterThan(1);
+		expect(mergeCalls).toBe(2);
 		expect(runner.state.merged).toBe(true);
 		expect(releasedBeforeBackoff).toBe(true);
+	});
+
+	it("retries a throttled update-branch without treating it as a conflict", async () => {
+		const f = setup();
+		const ticket = f.ticket("update-throttle");
+		ticket.launcher = {
+			...f.launcher,
+			noStacks: true,
+			skipBots: true,
+			skipFactoryTests: true,
+			timeouts: { ...f.launcher.timeouts, mergePollMs: 1 },
+		};
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		await runner.submit();
+		const statePath = join(f.root, "gh-state.json");
+		const state = JSON.parse(readFileSync(statePath, "utf8"));
+		writeFileSync(
+			statePath,
+			JSON.stringify({
+				...state,
+				mergeStateStatus: "BEHIND",
+				checks: [{ name: "Test", bucket: "pass", state: "SUCCESS" }],
+			}),
+		);
+		const execute = runner.run.bind(runner);
+		let updates = 0;
+		runner.run = (args, options) => {
+			if (args[0] === "gh" && args[1] === "pr" && args[2] === "update-branch" && updates++ === 0) {
+				writeFileSync(
+					statePath,
+					JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), mergeStateStatus: "CLEAN" }),
+				);
+				return Promise.resolve({ code: 1, output: "GraphQL: API rate limit exceeded" });
+			}
+			return execute(args, options);
+		};
+		await runner.merge();
+		expect(updates).toBe(1);
+		expect(runner.state.merged).toBe(true);
+	});
+
+	it("confirms a remote branch advanced by a throttled update before reusing it", async () => {
+		const f = setup();
+		const ticket = f.ticket("update-ambiguous");
+		ticket.launcher = { ...f.launcher, noStacks: true, skipBots: true, skipFactoryTests: true };
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		await runner.submit();
+		const statePath = join(f.root, "gh-state.json");
+		writeFileSync(
+			statePath,
+			JSON.stringify({
+				...JSON.parse(readFileSync(statePath, "utf8")),
+				mergeStateStatus: "BEHIND",
+				checks: [{ name: "Test", bucket: "pass", state: "SUCCESS" }],
+			}),
+		);
+		const execute = runner.run.bind(runner);
+		let updates = 0;
+		runner.run = (args, options) => {
+			if (args[0] === "gh" && args[1] === "pr" && args[2] === "update-branch" && updates++ === 0) {
+				f.git(["fetch", "-q", "origin"], f.repo);
+				const external = join(f.root, "external-update");
+				f.git(["worktree", "add", "-q", "-b", "fake-update", external, `origin/${runner.branch}`], f.repo);
+				writeFileSync(join(external, "remote.txt"), "updated branch\n");
+				f.git(["add", "remote.txt"], external);
+				f.git(["commit", "-qm", "remote update"], external);
+				f.git(["push", "-q", "origin", `HEAD:refs/heads/${runner.branch}`], external);
+				writeFileSync(
+					statePath,
+					JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), mergeStateStatus: "CLEAN" }),
+				);
+				return Promise.resolve({ code: 1, output: "GraphQL: API rate limit exceeded" });
+			}
+			return execute(args, options);
+		};
+		await runner.merge();
+		expect(updates).toBe(1);
+		expect(runner.state.merged).toBe(true);
+		expect(readFileSync(runner.logPath, "utf8")).toContain("tests-after-merge-fix");
 	});
 });

@@ -26,6 +26,18 @@ const fresh = {
 };
 const other = { ...fresh, id: 3, workflow_id: 51, check_suite_id: 103, created_at: "2026-09-25T01:00:00Z" };
 
+function job(id: number, name: string, conclusion: string) {
+	return {
+		id,
+		run_id: 2,
+		head_sha: head,
+		name,
+		status: "completed",
+		conclusion,
+		check_run_url: `https://api.github.com/repos/org/repo/check-runs/${id}`,
+	};
+}
+
 function fixture() {
 	const calls: string[] = [];
 	const state = {
@@ -40,9 +52,10 @@ function fixture() {
 			app?: { id?: number; slug?: string };
 		}>,
 		checks: [] as object[],
+		latestChecks: [] as object[],
 		attemptJobs: [] as object[],
 		previousJobs: [] as object[],
-		detail: undefined as (typeof fresh & { run_attempt?: number; status?: string }) | undefined,
+		detail: undefined as (typeof fresh & { run_attempt?: number; status?: string; conclusion?: string }) | undefined,
 		status: 0,
 		onRead: (_path: string) => {},
 	};
@@ -70,9 +83,10 @@ function fixture() {
 					...state.externalSuites,
 				],
 			};
-		else if (path.includes("/check-suites/102/check-runs?"))
-			response = { total_count: state.checks.length, check_runs: state.checks };
-		else if (path.includes("/actions/runs/2/attempts/2/jobs?"))
+		else if (path.includes("/check-suites/102/check-runs?")) {
+			const checks = path.includes("filter=latest") ? state.latestChecks : state.checks;
+			response = { total_count: checks.length, check_runs: checks };
+		} else if (path.includes("/actions/runs/2/attempts/2/jobs?"))
 			response = { total_count: state.attemptJobs.length, jobs: state.attemptJobs };
 		else if (path.includes("/actions/runs/2/attempts/1/jobs?"))
 			response = { total_count: state.previousJobs.length, jobs: state.previousJobs };
@@ -196,19 +210,60 @@ describe("fresh required checks", () => {
 		});
 	});
 
-	it("carries a successful Test from a failed-jobs-only rerun only when the new attempt is terminal", async () => {
+	it.each([
+		["success", "success", true, 1001, "pass"],
+		["success", "skipped", true, 1001, "skipping"],
+		["in_progress", "success", true, 1001, "pending"],
+		["failure", "success", true, 1001, "pending"],
+		["cancelled", "skipped", true, 1001, "pending"],
+		["success", "success", false, 1001, "pending"],
+		["success", "success", true, undefined, "pending"],
+		["success", "success", true, 9999, "pending"],
+		["success", "failure", true, 1001, "pending"],
+	] as const)(
+		"retains an earlier %s rerun job only with complete current jobs and exact effective %s check (%s, %s)",
+		async (conclusion, previousConclusion, currentJobs, effectiveId, bucket) => {
+			const f = fixture();
+			f.state.runs = [old, { ...fresh, run_attempt: 2 }, other];
+			f.state.detail = {
+				...fresh,
+				run_attempt: 2,
+				status: conclusion === "in_progress" ? conclusion : "completed",
+				conclusion,
+			};
+			if (currentJobs)
+				f.state.attemptJobs = [
+					{ id: 1002, run_id: 2, head_sha: head, name: "Other", status: "completed", conclusion },
+				];
+			f.state.previousJobs = [job(1001, "Test", previousConclusion)];
+			if (effectiveId)
+				f.state.latestChecks = [
+					{ id: effectiveId, name: "Test", head_sha: head, status: "completed", conclusion: previousConclusion },
+				];
+			expect(await freshRequiredChecks(f.gh, "org/repo", head, 7, [stale])).toMatchObject({
+				pendingMissing: bucket === "pending",
+				rows: [{ bucket }],
+			});
+		},
+	);
+
+	it("holds a retained success when the effective check changes during the final generation read", async () => {
 		const f = fixture();
 		f.state.runs = [old, { ...fresh, run_attempt: 2 }, other];
-		f.state.detail = { ...fresh, run_attempt: 2, status: "in_progress" };
-		f.state.previousJobs = [
-			{ id: 1001, run_id: 2, head_sha: head, name: "Test", status: "completed", conclusion: "success" },
+		f.state.detail = { ...fresh, run_attempt: 2, status: "completed", conclusion: "success" };
+		f.state.attemptJobs = [
+			{ id: 1002, run_id: 2, head_sha: head, name: "Other", status: "completed", conclusion: "success" },
 		];
-		const read = () => freshRequiredChecks(f.gh, "org/repo", head, 7, [stale]);
-		expect(await read()).toMatchObject({ pendingMissing: true, rows: [{ bucket: "pending" }] });
-		f.state.detail.status = "completed";
-		expect(await read()).toMatchObject({ pendingMissing: false, rows: [{ bucket: "pass" }] });
-		f.state.previousJobs = [{ ...f.state.previousJobs[0], conclusion: "failure" }];
-		expect(await read()).toMatchObject({ pendingMissing: true, rows: [{ bucket: "pending" }] });
+		f.state.previousJobs = [job(1001, "Test", "success")];
+		f.state.latestChecks = [{ id: 1001, name: "Test", head_sha: head, status: "completed", conclusion: "success" }];
+		let reads = 0;
+		f.state.onRead = (path) => {
+			if (path.includes("/check-suites?") && ++reads === 2) f.state.latestChecks = [];
+		};
+		expect(await freshRequiredChecks(f.gh, "org/repo", head, 7, [stale])).toMatchObject({
+			pendingMissing: true,
+			rows: [{ bucket: "pending" }],
+		});
 	});
 
 	it("fails closed on incomplete or failing API reads, not stale success", async () => {
