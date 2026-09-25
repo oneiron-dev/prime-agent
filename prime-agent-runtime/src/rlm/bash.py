@@ -246,6 +246,8 @@ class BashHandle:
         self._creating_cell_finished = completion_context[0] if completion_context else None
         self._creating_cell_task = completion_context[1] if completion_context else None
         self._awaited_by_creating_cell = False
+        # Tasks awaiting this handle right now; the memory guard asks whether the live cell is one.
+        self._awaiters: list[asyncio.Task[Any] | None] = []
         self._buffer = _BoundedBuffer()
         self._done = threading.Event()
         self._eof = threading.Event()
@@ -941,11 +943,13 @@ class BashHandle:
         wait = self._wait_owned() if owned else self._wait()
         self._released = True
         completed = False
+        self._awaiters.append(current_task)
         try:
             result = yield from wait.__await__()
             completed = True
             return result
         finally:
+            self._awaiters.remove(current_task)
             if (completed or owned) and (
                 creating_cell_waited
                 or _creating_cell_waits_for(self._creating_cell_task, current_task)
@@ -1199,15 +1203,24 @@ def _record_journal(pid: int, active: bool) -> bool:
     return True
 
 
-def record_memory_notice(pids: list[int], text: str) -> bool:
-    """Keep the host's reason for killing one of these pids; True when a live handle owns one."""
+def record_memory_notice(pids: list[int], text: str) -> tuple[bool, bool]:
+    """Keep the host's reason for killing one of these pids.
+
+    Returns whether a live handle owns one, and whether the running cell awaits
+    such a handle (its bash() call then returns the reason to the model).
+    """
     with _live_lock:
-        owners = [handle._pid for handle in _live_handles if handle._pid in pids and not handle._reaped]
-        for pid in owners:
-            _memory_notices[pid] = text
+        owners = [handle for handle in _live_handles if handle._pid in pids and not handle._reaped]
+        for handle in owners:
+            _memory_notices[handle._pid] = text
         while len(_memory_notices) > _MAX_MEMORY_NOTICES:
             _memory_notices.pop(next(iter(_memory_notices)))
-    return bool(owners)
+    cell = _live_cell_owner()
+    try:
+        awaited = any(_creating_cell_waits_for(cell, task) for handle in owners for task in list(handle._awaiters))
+    except Exception:  # noqa: BLE001 - read off the loop thread; unsure means the host queues the message too
+        awaited = False
+    return bool(owners), awaited
 
 
 def _kill_live_handles() -> None:

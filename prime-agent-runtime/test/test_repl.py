@@ -838,12 +838,13 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(one(self.repl.execute("hr-big", code), "error")["ename"], "ValueError")
 
     def test_trim_memory_drops_largest_groups_above_the_floor(self):
-        self.assertEqual(self.ready_event["features"], ["trim_memory", "memory_notice"])
+        self.assertEqual(self.ready_event["features"], ["trim_memory", "memory_notice", "memory_report"])
         self.repl.execute("t1", "a = b'x' * 3000\nalias = a\nb = [bytes([i]) * 1000 for i in range(4)]\nc = b'z' * 500\nimport os")
-        self.repl.send({"type": "trim_memory", "id": "t2", "target_bytes": 0, "min_bytes": 1000})
+        self.repl.send({"type": "trim_memory", "id": "t2", "target_bytes": 0, "min_bytes": 1000, "count": 2})
         report = one(self.repl.until_done("t2"), "done")
         self.assertEqual(report["dropped"], [])
-        self.assertEqual([v["name"] for v in report["largest"]], ["b", "a, alias", "c"])
+        self.assertEqual([v["name"] for v in report["largest"]], ["b", "a, alias"])
+        self.assertEqual((report["largest"][0]["length"], report["more"]), (4, 1))
         self.repl.send({"type": "trim_memory", "id": "t3", "target_bytes": 10**9, "min_bytes": 1000})
         done = one(self.repl.until_done("t3"), "done")
         self.assertEqual([(v["name"], v["type"]) for v in done["dropped"]], [("b", "list"), ("a, alias", "bytes")])
@@ -855,12 +856,13 @@ class ReplTest(unittest.TestCase):
 
     def test_interrupted_cell_releases_its_frame_locals(self):
         self.repl.execute("f1", "import gc, time, weakref\ngc.disable()\nclass Big: pass\nrefs = []")
-        hold = "def hold():\n    big = Big()\n    refs.append(weakref.ref(big))\n    print('holding')\n    while True:\n        time.sleep(0.05)\nhold()"
+        hold = "def hold():\n    big = Big()\n    refs.append(weakref.ref(big))\n    print('holding')\n    time.sleep(600)\nhold()"
         self.repl.send({"type": "execute", "id": "f2", "code": hold})
         while "holding" not in stream_text([self.repl.read_event()], "stdout"):
             pass
         self.repl.send({"type": "interrupt"})
-        self.assertEqual(one(self.repl.until_done("f2"), "error")["ename"], "KeyboardInterrupt")
+        error = one(self.repl.until_done("f2"), "error")
+        self.assertEqual((error["ename"], error["line"]), ("KeyboardInterrupt", {"lineno": 5, "source": "time.sleep(600)"}))
         events = self.repl.execute("f3", "refs[0]() is None")
         self.assertEqual(one(events, "result")["text"], "True")
 
@@ -869,11 +871,33 @@ class ReplTest(unittest.TestCase):
         pid = int(one(events, "result")["text"])
         self.repl.send({"type": "memory_notice", "id": "n2", "pids": [pid + 100000], "text": "other"})
         self.assertFalse(one(self.repl.until_done("n2"), "done")["matched"])
-        self.repl.send({"type": "memory_notice", "id": "n3", "pids": [pid], "text": "Memory limit: stopped"})
-        self.assertTrue(one(self.repl.until_done("n3"), "done")["matched"])
+        self.repl.send({"type": "memory_notice", "id": "n3", "pids": [pid], "text": "idle"})
+        idle = one(self.repl.until_done("n3"), "done")
+        self.assertEqual((idle["matched"], idle["awaited"]), (True, False))
+        # The print is scheduled to run once the cell is suspended inside `await h`.
+        code = "import asyncio\nasyncio.get_running_loop().call_soon(print, 'awaiting')\nr = await h\n(r.exit_code, r.output.strip())"
+        self.repl.send({"type": "execute", "id": "n4", "code": code})
+        while "awaiting" not in stream_text([self.repl.read_event()], "stdout"):
+            pass
+        self.repl.send({"type": "memory_notice", "id": "n5", "pids": [pid], "text": "Memory limit: stopped"})
+        self.assertTrue(one(self.repl.until_done("n5"), "done")["awaited"])
         os.killpg(pid, signal.SIGKILL)
-        events = self.repl.execute("n4", "r = await h\n(r.exit_code, r.output.strip())")
-        self.assertEqual(one(events, "result")["text"], "(-9, 'Memory limit: stopped')")
+        self.assertEqual(one(self.repl.until_done("n4"), "result")["text"], "(-9, 'Memory limit: stopped')")
+
+    def test_memory_report_answers_while_a_cell_runs(self):
+        self.repl.execute("m1", "import asyncio, time\nblob = b'x' * 5000\nitems = list(range(10))")
+        self.repl.send({"type": "memory_report", "id": "m2", "count": 1})
+        idle = one(self.repl.until_done("m2"), "done")
+        self.assertEqual((idle["line"], [v["name"] for v in idle["names"]], idle["more"]), (None, ["blob"], 1))
+        for rid, park in (("m3", "time.sleep(600)"), ("m5", "await asyncio.sleep(600)")):
+            source = f"print('parked', flush=True); {park}"
+            self.repl.send({"type": "execute", "id": rid, "code": f"x = 1\n{source}"})
+            while "parked" not in stream_text([self.repl.read_event()], "stdout"):
+                pass
+            self.repl.send({"type": "memory_report", "id": f"{rid}-report"})
+            self.assertEqual(one(self.repl.until_done(f"{rid}-report"), "done")["line"], {"lineno": 2, "source": source})
+            self.repl.send({"type": "interrupt"})
+            self.assertEqual(one(self.repl.until_done(rid), "error")["line"], {"lineno": 2, "source": source})
 
     def test_bash_integration(self):
         events = self.repl.execute(
