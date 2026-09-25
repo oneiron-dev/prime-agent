@@ -3,6 +3,7 @@
 // a diagnostics tail. The protocol is documented in prime-agent-runtime/src/rlm/repl.md.
 import type { ChildProcess } from "node:child_process";
 import {
+	appendFileSync,
 	chmodSync,
 	closeSync,
 	existsSync,
@@ -20,6 +21,24 @@ import { v4 as uuid } from "uuid";
 import { spawnHidden } from "../../utils/child-process.js";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
 import { ensureKernelPython } from "./bootstrap.js";
+import {
+	type ChildUnit,
+	formatGb,
+	GB,
+	type KernelEndCause,
+	type KernelTreeUsage,
+	kernelMemoryGuard,
+	killChildUnit,
+	MEMORY_TRIM_MIN_BYTES,
+	type MemoryGuardedKernel,
+	memoryChildMessage,
+	memoryKillMessage,
+	memoryTrimMessage,
+	memoryWarningMessage,
+	resolveKernelMemoryBackstop,
+	resolveKernelMemoryLimitGb,
+	type SizedVariable,
+} from "./memory-guard.js";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
 	ATTACHMENT_DISPLAY_MIME,
@@ -79,6 +98,10 @@ const MAX_PROTOCOL_LINE_CHARS = 32 * 1024 * 1024;
 // as runtimeMetadata.spawnCode, so cap it once at this boundary.
 // Keep below SPAWN_CODE_MAX_CHARS in daemon-session-list.ts so its 4000-char display slice stays a no-op.
 const MAX_CELL_SOURCE_CHARS = 2 * 1024;
+// A trim sizes every top-level value (pandas deep usage can be slow); past this the last step decides.
+const MEMORY_TRIM_TIMEOUT_MS = 30_000;
+// The runtime acknowledges a memory notice from its reader thread; a wedged kernel must not delay the kill.
+const MEMORY_NOTICE_ACK_TIMEOUT_MS = 200;
 const CELL_SOURCE_TRUNCATION_MARKER = ` [... cell source truncated at ${MAX_CELL_SOURCE_CHARS} chars ...]`;
 
 const MAX_KERNEL_STDERR_CHARS = 8 * 1024;
@@ -178,6 +201,15 @@ function asStringArray(value: unknown): string[] {
 	return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
 }
 
+function asSizedArray(value: unknown): SizedVariable[] {
+	if (!Array.isArray(value)) return [];
+	return value.flatMap((entry) =>
+		isRecord(entry) && typeof entry.name === "string" && typeof entry.bytes === "number"
+			? [{ name: entry.name, bytes: entry.bytes, type: typeof entry.type === "string" ? entry.type : "object" }]
+			: [],
+	);
+}
+
 function asReasonArray(value: unknown): { name: string; reason: string }[] {
 	if (!Array.isArray(value)) return [];
 	return value.flatMap((entry) => {
@@ -188,7 +220,7 @@ function asReasonArray(value: unknown): { name: string; reason: string }[] {
 	});
 }
 
-export class ReplKernelManager {
+export class ReplKernelManager implements MemoryGuardedKernel {
 	private readonly options: Pick<
 		KernelManagerOptions,
 		| "python"
@@ -211,8 +243,8 @@ export class ReplKernelManager {
 	private activeExecution?: ActiveExecution;
 	private readonly activeExecutionIdleWaiters = new Set<() => void>();
 	private readonly lateSentAgentMessageHandlers = new Map<string, (message: KernelSentAgentMessage) => void>();
-	/** Resolvers for done events outside the active execution (the shutdown reply). */
-	private readonly pendingDoneWaiters = new Map<string, () => void>();
+	/** Resolvers for done events outside the active execution (shutdown reply, memory notice acknowledgement). */
+	private readonly pendingDoneWaiters = new Map<string, (event: Record<string, unknown>) => void>();
 	// Source of the most recently started cell, retained after it finishes so
 	// rlm.run spawns from detached asyncio tasks (cell already idle) can still
 	// attribute their spawning program.
@@ -255,6 +287,15 @@ export class ReplKernelManager {
 	};
 	private rebootstrapPromise?: Promise<boolean>;
 	private teardownInFlight = 0;
+	private readonly memoryLimitBytes: number;
+	private readonly memoryBackstop: boolean;
+	/** Optional requests the running runtime announced in its ready event. */
+	private runtimeFeatures = new Set<string>();
+	/** Variable step awaiting its trim, run once the stopped (or next) request settles. */
+	private pendingMemoryTrim?: { targetBytes: number; usage: KernelTreeUsage; cellStopped: boolean };
+	private pendingMemoryWarning?: KernelTreeUsage;
+	/** Memory messages owed to the model, delivered with the next user cell's result. */
+	private memoryNotices: string[] = [];
 
 	constructor(options: KernelManagerOptions) {
 		this.options = {
@@ -269,6 +310,8 @@ export class ReplKernelManager {
 			bootstrapCode: options.bootstrapCode,
 			stderrLogPath: options.stderrLogPath,
 		};
+		this.memoryLimitBytes = resolveKernelMemoryLimitGb(options.memoryLimitGb) * GB;
+		this.memoryBackstop = resolveKernelMemoryBackstop(options.memoryBackstop);
 	}
 
 	get ownerSessionId(): string | undefined {
@@ -418,6 +461,7 @@ export class ReplKernelManager {
 		}
 
 		this.state = "running";
+		if (this.memoryLimitBytes > 0) kernelMemoryGuard.watch(this);
 	}
 
 	/** True when a teardown (or newer start) superseded the start that captured `generation`. */
@@ -869,6 +913,7 @@ export class ReplKernelManager {
 			return;
 		}
 		if (type === "ready") {
+			this.runtimeFeatures = new Set(asStringArray(event.features));
 			this.readyDeferred?.resolve(typeof event.protocol === "number" ? event.protocol : -1);
 			return;
 		}
@@ -889,7 +934,7 @@ export class ReplKernelManager {
 			} else if (type === "done" && id) {
 				const waiter = this.pendingDoneWaiters.get(id);
 				this.pendingDoneWaiters.delete(id);
-				waiter?.();
+				waiter?.(event);
 			} else if (type === "error" && id === undefined) {
 				this.appendKernelDiagnostic(`protocol error: ${String(event.evalue ?? "")}`);
 			}
@@ -967,6 +1012,9 @@ export class ReplKernelManager {
 		// crash before graceful shutdown) revives the most recent namespace.
 		if (result.status === "ok") {
 			this.scheduleSnapshot();
+		}
+		if (!opts.internal && this.memoryNotices.length > 0) {
+			result.memoryNotices = this.memoryNotices.splice(0);
 		}
 		return result;
 	}
@@ -1062,7 +1110,10 @@ export class ReplKernelManager {
 				await this.waitForProtocolRepair(opts.signal);
 				return this.enqueueRequest(requestFields, code, opts, executionTimeoutMs);
 			}
-			return await this.executeInner(requestFields, code, opts, started);
+			const result = await this.executeInner(requestFields, code, opts, started);
+			// Still holding the slot: a memory trim runs before anything else can allocate.
+			await this.runMemoryFollowUp(opts.internal === true);
+			return result;
 		} finally {
 			resolveNext();
 		}
@@ -1406,8 +1457,181 @@ export class ReplKernelManager {
 		await this.writeLine({ type: "interrupt", id: requestId });
 	}
 
+	get memoryWatch(): MemoryGuardedKernel["memoryWatch"] {
+		const pid = this.child?.pid;
+		if (this.state !== "running" || pid === undefined || this.memoryLimitBytes <= 0) return undefined;
+		return {
+			pid,
+			limitBytes: this.memoryLimitBytes,
+			backstop: this.memoryBackstop,
+			python: this.options.python,
+			bashPgids: this.backgroundBashHandles.values(),
+		};
+	}
+
+	/** Memory actions go to the diagnostics tail and the stderr log: never cell source or process arguments. */
+	private logMemory(line: string): void {
+		this.appendKernelDiagnostic(`memory ${line}`);
+		const path = this.options.stderrLogPath;
+		if (!path) return;
+		try {
+			appendFileSync(path, `[kernel] memory ${line}\n`, { mode: KERNEL_STDERR_LOG_MODE });
+		} catch {
+			// The in-memory tail still has it.
+		}
+	}
+
+	private describeTree(usage: KernelTreeUsage): string {
+		return `pid=${usage.kernelPid} tree=${formatGb(usage.totalBytes)}GB kernel=${formatGb(usage.kernelBytes)}GB limit=${formatGb(this.memoryLimitBytes)}GB`;
+	}
+
+	warnMemory(usage: KernelTreeUsage): void {
+		this.logMemory(`warn ${this.describeTree(usage)}`);
+		if (!this.pendingMemoryWarning || usage.totalBytes > this.pendingMemoryWarning.totalBytes) {
+			this.pendingMemoryWarning = usage;
+		}
+	}
+
+	async stopMemoryChild(unit: ChildUnit, usage: KernelTreeUsage, machine: boolean): Promise<void> {
+		const text = memoryChildMessage(unit, usage.totalBytes, this.memoryLimitBytes, machine);
+		const pids = unit.pgid === undefined ? unit.pids : [unit.pgid, ...unit.pids];
+		// The runtime records the reason before the kill, so the bash() call that owned the group returns it.
+		const deliveredToBash = await this.sendMemoryNotice(pids, text);
+		killChildUnit(unit);
+		this.logMemory(
+			`child-step ${machine ? "machine " : ""}${this.describeTree(usage)} child=${unit.pid} process=${unit.name} child_gb=${formatGb(unit.bytes)}`,
+		);
+		if (!deliveredToBash) this.memoryNotices.push(text);
+	}
+
+	/** Resolves whether a live bash() handle owns one of the pids; false when the runtime cannot say in time. */
+	private async sendMemoryNotice(pids: number[], text: string): Promise<boolean> {
+		if (!this.runtimeFeatures.has("memory_notice")) return false;
+		const id = uuid();
+		let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
+		try {
+			const ack = new Promise<boolean>((resolve) => {
+				this.pendingDoneWaiters.set(id, (event) => resolve(event.matched === true));
+				timer = globalThis.setTimeout(() => resolve(false), MEMORY_NOTICE_ACK_TIMEOUT_MS);
+				timer.unref?.();
+			});
+			// Not awaited: a kernel that stopped draining stdin must not hold up the kill; the timer bounds it.
+			this.writeLine({ type: "memory_notice", id, pids, text }).catch(() => undefined);
+			return await ack;
+		} finally {
+			if (timer) globalThis.clearTimeout(timer);
+			this.pendingDoneWaiters.delete(id);
+		}
+	}
+
+	trimMemory(targetBytes: number, usage: KernelTreeUsage): void {
+		const cellStopped = this.activeExecution !== undefined && !this.activeExecution.opts.internal;
+		this.logMemory(`variable-step ${this.describeTree(usage)} target=${formatGb(targetBytes)}GB cell=${cellStopped}`);
+		if (!this.runtimeFeatures.has("trim_memory")) {
+			this.logMemory("variable-step unavailable: the kernel runtime has no trim_memory; the last step decides");
+			return;
+		}
+		this.pendingMemoryTrim = { targetBytes, usage, cellStopped };
+		if (this.activeExecution) void this.interrupt().catch(() => undefined);
+		else void this.runIdleMemoryFollowUp();
+	}
+
+	endMemoryKernel(usage: KernelTreeUsage, cause: KernelEndCause): void {
+		if (this.state !== "running") return;
+		const text = memoryKillMessage(usage.totalBytes, this.memoryLimitBytes, cause);
+		this.logMemory(`last-step cause=${cause} ${this.describeTree(usage)}`);
+		for (const unit of usage.units) killChildUnit(unit);
+		const execution = this.activeExecution;
+		if (execution && !execution.settled) {
+			execution.status = "error";
+			execution.error = { ename: "KernelMemoryLimit", evalue: text, traceback: [] };
+			this.resolveExecution(execution, { clearActive: true });
+		}
+		this.memoryNotices.push(text);
+		if (this.teardownInFlight > 0 || this.flushingSnapshotForDispose) {
+			void this.kill();
+			return;
+		}
+		this.killChildToIdle();
+		// The message promises a fresh kernel: never revive the namespace that outgrew the limit.
+		this.pendingRestore = false;
+	}
+
+	/** The variable step's trim and the owed warning, run in the request slot right after a request settles. */
+	private async runMemoryFollowUp(internal: boolean): Promise<void> {
+		if (!this.pendingMemoryTrim && (internal || !this.pendingMemoryWarning)) return;
+		const ready = () =>
+			this.state === "running" &&
+			this.teardownInFlight === 0 &&
+			!this.protocolRepairPromise &&
+			!this.activeExecution;
+		if (!ready()) return;
+		const trim = this.pendingMemoryTrim;
+		if (trim) {
+			this.pendingMemoryTrim = undefined;
+			const report = await this.requestTrim(trim.targetBytes);
+			if (report) {
+				const dropped = report.dropped.map((v) => `${v.name} ${formatGb(v.bytes)}GB ${v.type}`).join(", ");
+				this.logMemory(`variable-step dropped=[${dropped}] pid=${trim.usage.kernelPid}`);
+				this.memoryNotices.push(
+					memoryTrimMessage(trim.usage.totalBytes, this.memoryLimitBytes, report.dropped, trim.cellStopped),
+				);
+				// The step's own message supersedes a warning owed from the same climb.
+				this.pendingMemoryWarning = undefined;
+				kernelMemoryGuard.noteTrimmed(this);
+			}
+		}
+		const warning = this.pendingMemoryWarning;
+		if (internal || !warning || !ready()) return;
+		this.pendingMemoryWarning = undefined;
+		const report = await this.requestTrim(0);
+		this.memoryNotices.push(memoryWarningMessage(warning.totalBytes, this.memoryLimitBytes, report?.largest ?? []));
+	}
+
+	private async runIdleMemoryFollowUp(): Promise<void> {
+		if (this.flushingSnapshotForDispose) return;
+		const prev = this.executionQueue;
+		let resolveNext: () => void = () => {};
+		this.executionQueue = new Promise<void>((r) => {
+			resolveNext = r;
+		});
+		try {
+			await prev;
+			await this.runMemoryFollowUp(true);
+		} catch (error) {
+			this.logMemory(`idle trim failed: ${errorMessage(error)}`);
+		} finally {
+			resolveNext();
+		}
+	}
+
+	private async requestTrim(
+		targetBytes: number,
+	): Promise<{ dropped: SizedVariable[]; largest: SizedVariable[] } | undefined> {
+		if (!this.runtimeFeatures.has("trim_memory")) return undefined;
+		try {
+			const r = await this.executeInner(
+				{ type: "trim_memory", target_bytes: targetBytes, min_bytes: MEMORY_TRIM_MIN_BYTES },
+				"",
+				{ internal: true, signal: AbortSignal.timeout(MEMORY_TRIM_TIMEOUT_MS) },
+				Date.now(),
+			);
+			if (r.status !== "ok" || !r.doneFields) {
+				this.logMemory(`trim ${r.status}: ${r.error?.evalue ?? ""}`);
+				return undefined;
+			}
+			return { dropped: asSizedArray(r.doneFields.dropped), largest: asSizedArray(r.doneFields.largest) };
+		} catch (error) {
+			this.logMemory(`trim error: ${errorMessage(error)}`);
+			return undefined;
+		}
+	}
+
 	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
 		this.startGeneration++; // any teardown invalidates in-flight starts
+		kernelMemoryGuard.unwatch(this);
+		this.pendingMemoryTrim = undefined;
+		this.pendingMemoryWarning = undefined;
 		this.startupController?.abort();
 		this.startupController = undefined;
 		this.clearSnapshotTimer();
@@ -1543,7 +1767,7 @@ export class ReplKernelManager {
 				const requestId = uuid();
 				doneWaiterId = requestId;
 				const doneReply = new Promise<void>((resolve) => {
-					this.pendingDoneWaiters.set(requestId, resolve);
+					this.pendingDoneWaiters.set(requestId, () => resolve());
 				});
 				const shutdownDeadline = new Promise<never>((_resolve, reject) => {
 					shutdownTimer = globalThis.setTimeout(

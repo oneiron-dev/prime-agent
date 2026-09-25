@@ -1,4 +1,5 @@
 import { DEFAULT_RLM_EXTRA_IMPORT_LABELS } from "../kernel/bootstrap.js";
+import { kernelMemoryPromptLine } from "../kernel/memory-guard.js";
 
 export interface RlmPromptOptions {
 	cwd: string;
@@ -9,6 +10,8 @@ export interface RlmPromptOptions {
 	depth?: number;
 	parentAgent?: string;
 	activeTools?: string[];
+	/** Memory ceiling per kernel tree in GB; 0 or unset leaves the line out. */
+	kernelMemoryLimitGb?: number;
 }
 
 const LONG_RUNNING_WORK_PROMPT = [
@@ -190,6 +193,8 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 
 	if (hasIpython) {
 		parts.push("", REPL_CONTROL_PROMPT);
+		const memoryLine = kernelMemoryPromptLine(options.kernelMemoryLimitGb ?? 0);
+		if (memoryLine) parts.push("", memoryLine);
 		if (installedSkills.includes("refine")) {
 			parts.push(
 				"",

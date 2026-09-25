@@ -63,6 +63,10 @@ export interface KernelManagerOptions {
 	bootstrapCode?: string;
 	/** File receiving the kernel process's stderr, rotated once at each spawn. */
 	stderrLogPath?: string;
+	/** Memory ceiling for the kernel and every process it starts, in GB; 0 turns the ladder off. Default: settings/env, else 16. */
+	memoryLimitGb?: number;
+	/** Let the machine-wide backstop end this kernel's tree when the machine runs out of memory. Default: on. */
+	memoryBackstop?: boolean;
 }
 
 export interface KernelStartOptions {
@@ -151,6 +155,8 @@ export interface ExecuteResult {
 	status: "ok" | "error" | "aborted";
 	error?: { ename: string; evalue: string; traceback: string[] };
 	durationMs: number;
+	/** What the memory ceiling did since the last user cell, for the model. */
+	memoryNotices?: string[];
 }
 
 /** Parse a {@link DIFF_DISPLAY_MIME} payload, tolerating malformed input. */

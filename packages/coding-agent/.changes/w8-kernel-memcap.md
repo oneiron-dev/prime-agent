@@ -1,0 +1,1 @@
+- Added a memory ceiling per Python kernel and the processes it starts (`kernelMemoryLimitGb`, default 16 GB): a warning at 60%, then the runaway child process, the largest variables, or as a last resort the kernel is stopped, with a message to the model; plus a machine-wide backstop (`kernelMemoryBackstop`) on macOS and Linux.

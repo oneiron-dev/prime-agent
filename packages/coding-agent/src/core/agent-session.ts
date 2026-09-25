@@ -5504,6 +5504,7 @@ export class AgentSession {
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
 			genericMcpServers: this._mcpManager?.getEnabledPersistentGenericServers(),
+			kernelMemoryLimitGb: this.settingsManager.getKernelMemoryLimitGb(),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
@@ -11047,6 +11048,8 @@ export class AgentSession {
 			const notifyRestore = !this._ipythonRuntimeBuilt || this._ipythonInitialRestorePending;
 			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
 				env: this._rlmKernelEnv(),
+				kernelMemoryLimitGb: this.settingsManager.getKernelMemoryLimitGb(),
+				kernelMemoryBackstop: this.settingsManager.getKernelMemoryBackstop(),
 				commandPrefix: this.settingsManager.getShellCommandPrefix(),
 				shellPath: this.settingsManager.getShellPath(),
 				sessionId: this.sessionId,
@@ -11067,6 +11070,7 @@ export class AgentSession {
 					commandPrefix: this.settingsManager.getShellCommandPrefix(),
 					shellPath: this.settingsManager.getShellPath(),
 					commandTimeoutSeconds: this.settingsManager.getCommandTimeoutSeconds(),
+					kernelMemoryLimitGb: this.settingsManager.getKernelMemoryLimitGb(),
 					onLateSentAgentMessage: (toolCallId, message) =>
 						this._recordLateIpythonSentAgentMessage(toolCallId, message),
 				},

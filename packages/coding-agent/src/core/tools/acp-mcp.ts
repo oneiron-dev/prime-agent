@@ -27,6 +27,7 @@ function executionResult(result: ExecuteResult) {
 	if (result.stderr) text += `${text ? "\n" : ""}${result.stderr}`;
 	if (result.result) text += `${text ? "\n" : ""}${result.result}`;
 	if (result.error) text += `${text ? "\n" : ""}${result.error.traceback.join("\n")}`;
+	for (const notice of result.memoryNotices ?? []) text += `${text ? "\n\n" : ""}${notice}`;
 	if (result.status !== "ok") {
 		throw new Error(text || `MCP kernel execution ${result.status}`);
 	}

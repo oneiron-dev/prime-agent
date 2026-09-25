@@ -19,6 +19,7 @@ import {
 	type KernelSentAgentMessage,
 	ReplKernelManager,
 } from "../kernel/index.js";
+import { kernelMemoryPromptLine, resolveKernelMemoryLimitGb } from "../kernel/memory-guard.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
@@ -309,6 +310,8 @@ export interface IpythonToolDetails {
 	sentAgentMessages?: KernelSentAgentMessage[];
 	/** True when this result came after killing and restarting a busy kernel. */
 	kernelRestarted?: boolean;
+	/** What the kernel memory ceiling did since the previous cell. */
+	memoryNotices?: string[];
 	error?: {
 		ename: string;
 		evalue: string;
@@ -326,6 +329,10 @@ export interface IpythonToolOptions {
 	shellPath?: string;
 	/** Owner-configured hard ceiling for agent user cells. Defaults to 30 minutes. */
 	commandTimeoutSeconds?: number;
+	/** Memory ceiling per kernel tree in GB (0 = off). Default: PRIME_AGENT_KERNEL_MEMORY_LIMIT_GB, else 16. */
+	kernelMemoryLimitGb?: number;
+	/** Machine-wide memory backstop for this session's kernels. Default: on. */
+	kernelMemoryBackstop?: boolean;
 	sessionId?: string;
 	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
 	hostHandlers?: HostRequestHandlers;
@@ -556,6 +563,8 @@ export class IpythonKernelProvisioner {
 					: undefined,
 				stderrLogPath: snapshotDir ? join(snapshotDir, "kernel-stderr.log") : undefined,
 				bootstrapCode,
+				memoryLimitGb: this.options?.kernelMemoryLimitGb,
+				memoryBackstop: this.options?.kernelMemoryBackstop,
 			});
 			let pendingRestore: RestoreResult | undefined;
 			let snapshotExisted = false;
@@ -700,12 +709,12 @@ export function createIpythonToolDefinition(
 	options?: IpythonToolOptions,
 ): ToolDefinition<typeof ipythonSchema, IpythonToolDetails> {
 	const provisioner = options?.provisioner ?? new IpythonKernelProvisioner(cwd, options);
+	const memoryLine = kernelMemoryPromptLine(resolveKernelMemoryLimitGb(options?.kernelMemoryLimitGb));
 
 	return {
 		name: "ipython",
 		label: "ipython",
-		description:
-			"Execute Python code in a persistent Python REPL. Top-level `await` is supported. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). Run shell commands with `bash('cmd')` / `await bash('cmd')`. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
+		description: `Execute Python code in a persistent Python REPL. Top-level \`await\` is supported. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). Run shell commands with \`bash('cmd')\` / \`await bash('cmd')\`. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.${memoryLine ? ` ${memoryLine}` : ""}`,
 		promptSnippet: "ipython - persistent Python REPL for code, state, and bash() orchestration",
 		// The kernel is single-threaded — pi must not run two ipython calls in parallel within a batch.
 		executionMode: "sequential",
@@ -751,6 +760,9 @@ export function createIpythonToolDefinition(
 				if (r.backgroundOutput) {
 					text += `${text ? "\n" : ""}[background output (unattributed)]\n${r.backgroundOutput}`;
 				}
+				for (const notice of r.memoryNotices ?? []) {
+					text += `${text ? "\n\n" : ""}${notice}`;
+				}
 				if (kernelRestarted) {
 					text = text ? `${KERNEL_RESTART_NOTICE}\n\n${text}` : KERNEL_RESTART_NOTICE;
 				}
@@ -773,6 +785,7 @@ export function createIpythonToolDefinition(
 						sentAgentMessages: r.sentAgentMessages,
 						kernelRestarted,
 						error: r.error,
+						memoryNotices: r.memoryNotices,
 					},
 					isError: r.status === "error" || r.status === "aborted",
 				};
