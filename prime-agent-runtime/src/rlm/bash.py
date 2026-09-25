@@ -53,6 +53,9 @@ _live_handles: set["BashHandle"] = set()
 _live_lock = threading.Lock()
 _hook_installed = False
 _hook_lock = threading.Lock()
+# The host's memory guard explains a group kill here before it sends the SIGKILL.
+_memory_notices: dict[int, str] = {}
+_MAX_MEMORY_NOTICES = 64
 
 
 def _current_cell_completion_context() -> tuple[asyncio.Event, asyncio.Task[Any] | None] | None:
@@ -539,6 +542,11 @@ class BashHandle:
         if delivered is None and not self._done.is_set():
             self._abandon_completion()
             self._drain_grace()
+            if _IS_POSIX and exit_code == -signal.SIGKILL:
+                with _live_lock:
+                    notice = _memory_notices.pop(self._pid, None)
+                if notice:
+                    self._buffer.write(f"\n{notice}\n".encode())
             self._finalize(exit_code)
         with self._kill_lock:
             delivered = self._reap_group()
@@ -1189,6 +1197,17 @@ def _record_journal(pid: int, active: bool) -> bool:
     except OSError:
         return False
     return True
+
+
+def record_memory_notice(pids: list[int], text: str) -> bool:
+    """Keep the host's reason for killing one of these pids; True when a live handle owns one."""
+    with _live_lock:
+        owners = [handle._pid for handle in _live_handles if handle._pid in pids and not handle._reaped]
+        for pid in owners:
+            _memory_notices[pid] = text
+        while len(_memory_notices) > _MAX_MEMORY_NOTICES:
+            _memory_notices.pop(next(iter(_memory_notices)))
+    return bool(owners)
 
 
 def _kill_live_handles() -> None:

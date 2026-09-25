@@ -27,9 +27,11 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .bash import _kill_live_handles
+from .bash import _kill_live_handles, record_memory_notice
 
 PROTOCOL_VERSION = 3
+# Request types beyond the version-3 base; the ready event lists them so a host can gate on them.
+FEATURES = ("trim_memory", "memory_notice")
 
 DEFAULT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 8 * 1024 * 1024
@@ -538,6 +540,15 @@ def _error_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
     }
 
 
+def _clear_frames(exc: BaseException | None) -> None:
+    """Release the locals an interrupted cell's frames still hold (its data would outlive it)."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        traceback.clear_frames(exc.__traceback__)
+        exc = exc.__cause__ or exc.__context__
+
+
 def _interrupt_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
     """Report a cancelled await-suspended cell as a KeyboardInterrupt."""
     stack = _cell_stack(traceback.extract_tb(exc.__traceback__))
@@ -591,10 +602,15 @@ async def _run_guarded(task: asyncio.Task[Any], rid: str) -> tuple[str, Any, dic
         return "ok", value, None
     except asyncio.CancelledError as exc:
         if _active["interrupted"]:
-            return "error", None, _interrupt_event(rid, exc)
+            event = _interrupt_event(rid, exc)
+            _clear_frames(exc)
+            return "error", None, event
         return "error", None, _error_event(rid, exc)
     except BaseException as exc:  # noqa: BLE001 - every cell failure becomes an error event
-        return "error", None, _error_event(rid, exc)
+        event = _error_event(rid, exc)
+        if _active["interrupted"] and isinstance(exc, KeyboardInterrupt):
+            _clear_frames(exc)
+        return "error", None, event
     finally:
         with _interrupt_lock:
             global _finishing_rid
@@ -1185,6 +1201,163 @@ async def _handle_list_names(req: dict[str, Any], ns: dict[str, Any]) -> None:
     _send({"event": "done", "id": req["id"], "status": "ok", "names": _list_names(ns)})
 
 
+# Sizing walks at most this many objects per top-level value, then extrapolates.
+_SIZE_WALK_NODES = 100_000
+_SIZE_WALK_DEPTH = 32
+_UNSIZED_TYPES = (types.ModuleType, type, types.FunctionType, types.BuiltinFunctionType, types.MethodType)
+
+
+_ATOMS = (int, float, complex, bool, type(None), bytes, bytearray, str)
+
+
+def _direct_size(value: Any) -> int | None:
+    """In-memory bytes of atoms and of array-likes that report their own size, else None."""
+    if type(value) in _ATOMS:
+        return sys.getsizeof(value)
+    if isinstance(value, memoryview):
+        return value.nbytes
+    module = type(value).__module__ or ""
+    try:
+        if module.startswith("pandas"):
+            usage = value.memory_usage(deep=True)
+            return int(usage.sum()) if hasattr(usage, "sum") else int(usage)
+        if module.startswith("polars"):
+            return int(value.estimated_size())
+        nbytes = getattr(value, "nbytes", None)
+        if callable(nbytes):
+            nbytes = nbytes()
+    except Exception:  # noqa: BLE001 - a broken size hook falls back to the walk
+        return None
+    return nbytes if isinstance(nbytes, int) and not isinstance(nbytes, bool) else None
+
+
+def _deep_size(value: Any, seen: set[int], budget: list[int], depth: int = 0) -> int:
+    """Bounded walk: containers and instance dicts; a list longer than the budget is extrapolated."""
+    if id(value) in seen or isinstance(value, _UNSIZED_TYPES):
+        return 0
+    seen.add(id(value))
+    budget[0] -= 1
+    direct = _direct_size(value)
+    if direct is not None:
+        return direct
+    try:
+        size = sys.getsizeof(value)
+    except Exception:  # noqa: BLE001
+        size = 0
+    if depth >= _SIZE_WALK_DEPTH:
+        return size
+    try:
+        if isinstance(value, dict):
+            children: Any = [item for pair in value.items() for item in pair]
+            count = 2 * len(value)
+        elif isinstance(value, (list, tuple, set, frozenset)) or type(value).__name__ == "deque":
+            children, count = value, len(value)
+        else:
+            attrs = getattr(value, "__dict__", None)
+            if not isinstance(attrs, dict):
+                return size
+            children, count = list(attrs.values()), len(attrs)
+        walked = total = 0
+        for child in children:
+            if budget[0] <= 0:
+                break
+            total += _deep_size(child, seen, budget, depth + 1)
+            walked += 1
+    except Exception:  # noqa: BLE001 - a mutating or broken container keeps what was measured
+        return size
+    if 0 < walked < count:
+        total = total * count // walked
+    return size + total
+
+
+def _array_owner(value: Any) -> Any:
+    """The array that owns a view's memory (numpy .base chain), so views and bases drop together."""
+    for _ in range(8):
+        base = getattr(value, "base", None) if (type(value).__module__ or "").startswith("numpy") else None
+        if base is None or not (type(base).__module__ or "").startswith("numpy"):
+            return value
+        value = base
+    return value
+
+
+def _sized_groups(ns: dict[str, Any]) -> list[dict[str, Any]]:
+    """Top-level names grouped by the object that holds their memory, largest first."""
+    groups: dict[int, dict[str, Any]] = {}
+    for name, value in list(ns.items()):
+        if not isinstance(name, str) or (name.startswith("__") and name.endswith("__")) or name in _ALWAYS_SKIP:
+            continue
+        if isinstance(value, _UNSIZED_TYPES):
+            continue
+        owner = _array_owner(value)
+        group = groups.get(id(owner))
+        if group is None:
+            group = groups[id(owner)] = {
+                "names": [],
+                "ids": set(),
+                "bytes": _deep_size(owner, set(), [_SIZE_WALK_NODES]),
+                "type": type(value).__name__,
+            }
+        group["names"].append(name)
+        group["ids"].add(id(value))
+    return sorted(groups.values(), key=lambda group: group["bytes"], reverse=True)
+
+
+def _release_heap() -> None:
+    """Hand freed heap pages back to the OS so the host's measurement sees the drop."""
+    try:
+        if sys.platform.startswith("linux"):
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        elif sys.platform == "darwin":
+            ctypes.CDLL("/usr/lib/libSystem.B.dylib").malloc_zone_pressure_relief(None, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _trim_memory(ns: dict[str, Any], target_bytes: int, min_bytes: int) -> dict[str, Any]:
+    """Drop the largest top-level values (never one under min_bytes) until target_bytes are freed."""
+    import gc
+
+    groups = _sized_groups(ns)
+    dropped: list[dict[str, Any]] = []
+    freed = 0
+    purge_ids: set[int] = set()
+    for group in groups:
+        if freed >= target_bytes or group["bytes"] < min_bytes:
+            break
+        for name in group["names"]:
+            ns.pop(name, None)
+        purge_ids |= group["ids"]
+        freed += group["bytes"]
+        dropped.append({"name": ", ".join(group["names"]), "bytes": group["bytes"], "type": group["type"]})
+    output_cache = ns.get("Out")
+    if isinstance(output_cache, dict):
+        for key in [key for key, value in output_cache.items() if id(value) in purge_ids]:
+            del output_cache[key]
+    for attr in ("last_type", "last_value", "last_traceback", "last_exc"):
+        if hasattr(sys, attr):
+            setattr(sys, attr, None)
+    kept = groups[len(dropped) :]
+    del groups
+    gc.collect()
+    _release_heap()
+    largest = [
+        {"name": ", ".join(group["names"]), "bytes": group["bytes"], "type": group["type"]} for group in kept[:3]
+    ]
+    return {"dropped": dropped, "largest": largest, "freed_bytes": freed}
+
+
+async def _handle_trim_memory(req: dict[str, Any], ns: dict[str, Any]) -> None:
+    fields = {}
+    for field in ("target_bytes", "min_bytes"):
+        value = req.get(field, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            _send({"event": "done", "id": req["id"], "status": "error", "reason": f"{field} must be a non-negative integer"})
+            return
+        fields[field] = value
+    result = _trim_memory(ns, fields["target_bytes"], fields["min_bytes"])
+    _send({"event": "done", "id": req["id"], "status": "ok", **result})
+
+
 async def _handle_request(
     handler: Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]],
     req: dict[str, Any],
@@ -1234,6 +1407,8 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
             await _handle_request(_handle_state, req, ns)
         elif rtype == "list_names":
             await _handle_request(_handle_list_names, req, ns)
+        elif rtype == "trim_memory":
+            await _handle_request(_handle_trim_memory, req, ns)
 
 
 _REQUIRED_FIELDS = {
@@ -1241,8 +1416,27 @@ _REQUIRED_FIELDS = {
     "snapshot": ("id", "path", "manifest_path"),
     "restore": ("id", "path"),
     "list_names": ("id",),
+    "trim_memory": ("id",),
     "shutdown": (),
 }
+
+
+def _handle_memory_notice(req: dict[str, Any]) -> None:
+    """Reader-thread half of the child step: record why these pids die, then acknowledge.
+
+    Out-of-band like interrupt: the host kills the group right after this
+    acknowledgement, so the bash() call that owned it can return the reason.
+    """
+    rid, pids, text = req.get("id"), req.get("pids"), req.get("text")
+    if (
+        not isinstance(rid, str)
+        or not isinstance(text, str)
+        or not isinstance(pids, list)
+        or not all(isinstance(pid, int) and not isinstance(pid, bool) for pid in pids)
+    ):
+        _protocol_error("memory_notice request needs string id and text and an int pids list")
+        return
+    _send({"event": "done", "id": rid, "status": "ok", "matched": record_memory_notice(pids, text)})
 
 
 def _protocol_error(message: str) -> None:
@@ -1260,6 +1454,9 @@ def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> No
             _protocol_error("interrupt request id must be a string")
             return
         _request_interrupt(req.get("id"))
+        return
+    if rtype == "memory_notice":
+        _handle_memory_notice(req)
         return
     if rtype == "host_reply":
         # Bypass the FIFO queue: the awaiting cell IS the in-flight
@@ -1421,7 +1618,14 @@ def main() -> None:
     user_module.__dict__["__builtins__"] = __builtins__
     sys.modules["__main__"] = user_module
 
-    _send({"event": "ready", "protocol": PROTOCOL_VERSION, "python": platform.python_version()})
+    _send(
+        {
+            "event": "ready",
+            "protocol": PROTOCOL_VERSION,
+            "python": platform.python_version(),
+            "features": list(FEATURES),
+        }
+    )
 
     # The event-loop stack (asyncio plus its ssl, concurrent.futures, and
     # logging imports) is the heaviest part of this module's boot chain; load
