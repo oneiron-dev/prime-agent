@@ -165,7 +165,7 @@ export const SEAT_POLICY_LINE =
 export const WRITER_LINES = [
 	"Use one coherent implementation, the smallest test that can falsify changed behavior plus required compile/typecheck. Reuse green evidence. Skip broad, redundant, ceremonial, and unchanged-byte tests.",
 	"A plan is not work. A status report is not work.",
-	"Do the whole contract. Only if a genuinely separate piece remains after the work, end with `SPLIT: <what remains>`.",
+	"Do the whole contract. Only if a genuinely separate piece remains after the work, write `SPLIT: <what remains>` on its own line before your completion line.",
 	"Never edit the docs repo. Leave implementation notes in `impl-notes/<ticket>.md` in the engine repo (decisions, where the canon page was stale or wrong, what it should say); they ride the PR.",
 	"No attribution lines in commits or PR text.",
 ].join(" ");
@@ -732,10 +732,10 @@ ${diff}`;
 			.join("\n\n");
 		return `Same ticket ${this.ticket.key}, same worktree, pull request ${repo}#${pr} (branch ${this.branch}).
 Below is EVERY bot comment on the pull request, unfiltered. It is a snapshot, not proof that all current feedback is gathered.
-Before any fix, fetch and read the latest complete Qodo, Codex and CodeRabbit reviews, pull request comments, inline comments and review threads (with pagination), and this ticket's internal reviewer findings. Read every finding in full, deduplicate overlapping defects across sources, and decide each distinct finding on its merits before editing. Keep the source comment ids when deduplicating so no feedback disappears. A pending or queued bot review is not an unavailable one.
+Before any fix, fetch and read the latest complete Qodo, Codex and CodeRabbit reviews, pull request comments, inline comments and review threads (with pagination), and this ticket's internal reviewer findings. Read every finding in full, deduplicate overlapping defects across sources, and decide each distinct finding on its merits before editing. Keep the source comment ids when deduplicating so no feedback disappears. A pending or queued bot review is not an unavailable one; a bot is unavailable only on its own explicit quota or provider failure, which you cite, and you never invent its success or predict its exhaustion.
 For every real defect: fix it in this worktree, commit with a plain message, and run the tests of the crates you touched. Skip an invalid or inapplicable finding only with an explicit reason.
 Reply on each inline thread with what you did or why not: \`gh api repos/${repo}/pulls/${pr}/comments/<id>/replies -f body=<text>\` for review_comment entries.
-After the fixes, post exactly one summary comment on the pull request: \`gh pr comment ${pr} --repo ${repo} --body <text>\`. Map each source comment id and each internal finding to its disposition, say what changed, what was skipped and why, and the validation you ran with its actual result. Never claim validation that did not run.
+After the fixes, post exactly one summary comment on the pull request: \`gh pr comment ${pr} --repo ${repo} --body <text>\`. Map each source comment id and each internal finding to its disposition, say what changed, what was skipped and why, and the validation you ran with its actual result. Never claim validation that did not run. Before you stop, fetch the bot comments again: a comment a bot edited in place, or a review of a newer head, counts in its latest form.
 Never push, never merge, never close the pull request; the launcher pushes after you stop.
 ${WRITER_LINES}
 ${INITIATIVE_LINES}
@@ -920,7 +920,8 @@ ${rendered || "(no bot comments)"}`;
 						wall_clock_ms: 0,
 					};
 			this.journalIntent(session, round, intent);
-			if (intent.choice === "split") split = final.match(/^SPLIT:\s*(.+)$/m)?.[1]?.trim() || tail(final, 20);
+			// A split names its remainder on a `SPLIT:` line; the classification alone never makes prose a contract.
+			if (intent.choice === "split") split = final.match(/^SPLIT:\s*(.+)$/m)?.[1]?.trim() || split;
 			silent = result.bytes === 0 && result.code !== 0 ? silent + 1 : 0;
 			if (silent >= MAX_SILENT_ROUNDS)
 				throw new TicketFailure(`the writer seat produced no output in ${silent} consecutive rounds`);
