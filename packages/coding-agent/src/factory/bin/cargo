@@ -190,6 +190,9 @@ while :; do
 		if [ "$host" = local ]; then
 			export CARGO_TARGET_DIR="$root/target/$key"
 			[ "$jobs" = 0 ] || export CARGO_BUILD_JOBS=$jobs
+			# A cargo started by this one (a build script, a trybuild test) finds this wrapper first on PATH; it runs
+			# under the ticket lock and slot this cargo holds, so it must not wait for them.
+			export W7_CARGO_LOCAL=1
 			local_cargo ${capped[@]+"${capped[@]}"}
 		fi
 		args=""
@@ -240,6 +243,7 @@ while :; do
 	done
 	if [ "$busy" = 0 ]; then
 		echo "[factory-cargo] no build host could be reached; running cargo on this host" >&2
+		export W7_CARGO_LOCAL=1
 		local_cargo "$@"
 	fi
 	if [ "$SECONDS" -ge "$notice" ]; then

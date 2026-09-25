@@ -41,7 +41,12 @@ if ((process.env.STUB_UNREACHABLE || "").split(",").includes(host)) { process.st
 const REAL_CARGO = stub(
 	"real-cargo",
 	`const target = process.env.CARGO_TARGET_DIR ? " target=" + process.env.CARGO_TARGET_DIR : "";
-process.stdout.write("local cargo " + process.argv.slice(2).join(" ") + target + "\\n");`,
+process.stdout.write("local cargo " + process.argv.slice(2).join(" ") + target + "\\n");
+// STUB_NESTED: a build script that runs a bare cargo, which finds the wrapper first on PATH.
+if (process.env.STUB_NESTED && process.argv[2] === "check") {
+  const nested = require("node:child_process").spawnSync("bash", [process.env.STUB_NESTED, "metadata"], { encoding: "utf8", timeout: 10000 });
+  process.stdout.write("nested rc=" + nested.status + " " + nested.stdout.trim() + "\\n");
+}`,
 );
 
 function setup() {
@@ -157,6 +162,19 @@ describe("factory cargo wrapper", () => {
 			0,
 			"local cargo check --jobs=1 target=/mnt/build/target/W7-C01",
 		]);
+	});
+
+	it("lets a cargo started by a local cargo run under its ticket lock instead of waiting for it", () => {
+		const f = setup();
+		const cases: Array<Record<string, string>> = [
+			{ W7_CARGO_HOSTS: "local:1:2:/mnt/build" },
+			{ STUB_UNREACHABLE: "olety@mac-one,olety@mac-two" },
+		];
+		for (const overrides of cases) {
+			const run = f.cargo(f.worktree, ["check"], { ...overrides, STUB_NESTED: WRAPPER });
+			expect(run.status).toBe(0);
+			expect(run.stdout).toMatch(/^nested rc=0 local cargo metadata/m);
+		}
 	});
 
 	it("returns the remote exit code and syncs a source-changing subcommand back", () => {

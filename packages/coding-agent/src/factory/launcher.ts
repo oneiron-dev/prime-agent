@@ -84,6 +84,12 @@ export function readLauncherSettings(path: string): OneironLauncherSettings {
 		throw new Error(
 			"launcher.skipFactoryTests needs launcher.noStacks: the required-check gate covers lone pull requests",
 		);
+	// Every build host without its own `jobs` takes cargoJobs, so it carries the same bounds.
+	if (
+		value.cargoJobs !== undefined &&
+		(!Number.isSafeInteger(value.cargoJobs) || value.cargoJobs < 1 || value.cargoJobs > 64)
+	)
+		throw new Error("launcher.cargoJobs must be an integer from 1 to 64");
 	if (value.buildHosts !== undefined) {
 		if (!Array.isArray(value.buildHosts)) throw new Error("launcher.buildHosts must be an array");
 		for (const host of value.buildHosts) {

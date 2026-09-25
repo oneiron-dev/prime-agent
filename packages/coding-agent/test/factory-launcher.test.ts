@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import type { OneironLauncherSettings } from "../src/factory/adapters/oneiron-ticket.js";
-import { importSplits, launcherPlan, launchTickets, readLauncherTickets } from "../src/factory/launcher.js";
+import {
+	importSplits,
+	launcherPlan,
+	launchTickets,
+	readLauncherSettings,
+	readLauncherTickets,
+} from "../src/factory/launcher.js";
 import { FactoryStore } from "../src/factory/store.js";
 
 const roots: string[] = [];
@@ -142,4 +148,17 @@ it("turns the ticket DAG into submit and merge actions, then stacks a writer's S
 	// No stacks: a child's submit waits for its parent's merge, so it never starts on an unmerged parent.
 	const flat = launcherPlan(tickets, { ...settings, noStacks: true }, entry);
 	expect(flat.actions.find((a) => a.id === "OF-1-b:submit")?.dependencies).toEqual(["OF-1-a:merge"]);
+});
+
+it("bounds cargoJobs like each build host's jobs, since a host without jobs takes it", () => {
+	const root = mkdtempSync(join(tmpdir(), "factory-launcher-"));
+	roots.push(root);
+	const path = join(root, "launcher.json");
+	const settings = (cargoJobs: unknown) => {
+		writeFileSync(path, JSON.stringify({ host: "arch", repo: "/repo", work: "/work", cargoJobs }));
+		return () => readLauncherSettings(path);
+	};
+	for (const bad of [0, 2.5, 65, "4"])
+		expect(settings(bad)).toThrow("launcher.cargoJobs must be an integer from 1 to 64");
+	expect(settings(4)().cargoJobs).toBe(4);
 });
