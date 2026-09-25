@@ -476,6 +476,23 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		expect([result.code, result.final]).toEqual([0, `argv false stdin ${prompt.length}`]);
 	});
 
+	it("counts a seat whose session began as started, and a spawn failure as never started", async () => {
+		const f = setup();
+		// A review killed mid-think streams only agent_start under the factory profile; it is not "unavailable".
+		writeFileSync(join(f.root, "dies.js"), 'process.stdout.write(\'{"type":"agent_start"}\\n\'); process.exit(3);\n');
+		const ticket = f.ticket("start-one");
+		ticket.launcher = { ...f.launcher, seats: { grok: { provider: "p", model: "m", thinking: "low" } } };
+		const cli = (...argv: string[]) => new OneironTicketRunner(ticket, { env: f.env, routing: {}, cli: argv });
+		const started = cli(process.execPath, join(f.root, "dies.js"));
+		mkdirSync(started.worktree, { recursive: true });
+		const died = await started.seat("grok", "Review this diff", { logName: "died.jsonl" });
+		expect([died.code, died.final, died.activity]).toEqual([3, "", true]);
+		const absent = await cli(join(f.root, "no-such-cli")).seat("grok", "Review this diff", {
+			logName: "absent.jsonl",
+		});
+		expect([absent.code, absent.activity, absent.bytes > 0]).toEqual([127, false, true]);
+	});
+
 	it("continues a writer's existing session on round 1 and delivers the owner's note once", async () => {
 		const f = setup();
 		const ticket = f.ticket("note-one");

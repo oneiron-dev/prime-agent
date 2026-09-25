@@ -644,8 +644,9 @@ export class OneironTicketRunner {
 			final,
 			bytes: Buffer.byteLength(result.output),
 			idle: result.code === SEAT_IDLE_EXIT_CODE,
-			// Tools or delegated children ran: a review that did this and then failed is incomplete, not absent.
-			activity: /"type"\s*:\s*"(?:tool_execution_start|rlm_child_update)"/.test(result.output),
+			// The session started, ran tools or delegated: a review that did this and then failed is incomplete, not
+			// absent. A long think streams nothing under the factory profile, so agent_start is the proof it began.
+			activity: /"type"\s*:\s*"(?:agent_start|tool_execution_start|rlm_child_update)"/.test(result.output),
 		};
 	}
 	/** A seat that went silent is killed and journaled; the round continues in the same session. */
@@ -877,7 +878,8 @@ ${rendered || "(no bot comments)"}`;
 					logName: `${session}.r${round}.jsonl`,
 				},
 			);
-			if (note !== undefined && result.bytes > 0) this.noteDelivered(note);
+			// A spawn failure prints bytes too; only a round whose session started has read the note.
+			if (note !== undefined && (result.code === 0 || result.activity)) this.noteDelivered(note);
 			final = result.final;
 			this.log(
 				`writer:${session}`,
@@ -922,7 +924,8 @@ ${rendered || "(no bot comments)"}`;
 			silent = result.bytes === 0 && result.code !== 0 ? silent + 1 : 0;
 			if (silent >= MAX_SILENT_ROUNDS)
 				throw new TicketFailure(`the writer seat produced no output in ${silent} consecutive rounds`);
-			if (result.code !== 0) await sleep(this.options.retryDelayMs ?? 30_000);
+			// A provider error in JSON mode exits 0 with no reply; without a pause the rounds would spin.
+			if (!clean || !final.trim()) await sleep(this.options.retryDelayMs ?? 30_000);
 		}
 	}
 	/** How a writer hands a durable validation to the factory instead of polling it in model rounds. */
@@ -1171,6 +1174,7 @@ ${rendered || "(no bot comments)"}`;
 			if (verdict) return verdict === "LANDABLE" ? "LANDABLE" : `DEFECTS\n${result.final}`;
 			pending = true;
 			this.log(`review:${name}`, `incomplete rc=0; continuing same session ${session}`);
+			if (!result.final.trim()) await sleep(this.options.retryDelayMs ?? 30_000);
 			if ("command" in spec || (resumeSession === undefined && !hasSessionFile(sessionDir)))
 				throw new TicketFailure(
 					`review ${name} incomplete; no resumable native session; preserve logs and recover before retrying`,
