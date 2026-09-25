@@ -34,6 +34,7 @@ import {
 	factoryOwnedEnvironment,
 	locateFactoryCli,
 } from "../runtime.js";
+import { freshRequiredChecks } from "./fresh-required-checks.js";
 import { fetchOneironBotReviews, type OneironBotComment, REQUIRED_REVIEWERS } from "./oneiron-review.js";
 import { acknowledgePendingWriter, pendingWriterPath, waitForPendingWriter } from "./pending-writer.js";
 
@@ -50,6 +51,9 @@ export interface OneironLauncherSettings {
 	work: string;
 	remote?: string;
 	trunk?: string;
+	branchPrefix?: string;
+	/** Repair only when GitHub reports a conflict or BEHIND, unless current-base is explicitly requested. */
+	mergePolicy?: "github" | "current-base";
 	/** owner/name for gh api; derived from the remote URL when absent. */
 	githubRepo?: string;
 	buildSlots?: number;
@@ -67,7 +71,7 @@ export interface OneironLauncherSettings {
 	 */
 	buildHosts?: OneironBuildHost[];
 	/** gh and git calls; the bot poll; the required-check wait before a merge. */
-	timeouts?: Partial<{ ghMs: number; botsMs: number; ciMs: number }>;
+	timeouts?: Partial<{ ghMs: number; botsMs: number; ciMs: number; mergePollMs: number; propagationPollMs: number }>;
 	/**
 	 * No stacks: every ticket branches from the trunk, its submit waits until every blocker merged, it opens with
 	 * `gh pr create --base <trunk>` and merges with `gh pr merge --squash`. No `gh stack` call runs. Default off.
@@ -146,7 +150,13 @@ export const DEFAULT_SEATS: Record<SeatName, OneironSeat> = {
 	opus: { provider: "cpa-r", model: "claude-opus-5", thinking: "xhigh" },
 };
 /** gh and git are network calls, not models; they keep a wall clock. Nothing that runs a model does. */
-const DEFAULT_TIMEOUTS = { ghMs: 300_000, botsMs: 2_700_000, ciMs: 2_700_000 };
+const DEFAULT_TIMEOUTS = {
+	ghMs: 300_000,
+	botsMs: 2_700_000,
+	ciMs: 24 * 60 * 60_000,
+	mergePollMs: 120_000,
+	propagationPollMs: 10_000,
+};
 /** No event on a seat's stream for this long means the seat is gone, not thinking. */
 export const DEFAULT_IDLE_MS = 30 * 60_000;
 /** A round that writes nothing at all and exits non-zero is a seat that cannot start; enough of them is a failure. */
@@ -168,6 +178,7 @@ export const WRITER_LINES = [
 	"Do the whole contract. Only if a genuinely separate piece remains after the work, write `SPLIT: <what remains>` on its own line before your completion line.",
 	"Never edit the docs repo. Leave implementation notes in `impl-notes/<ticket>.md` in the engine repo (decisions, where the canon page was stale or wrong, what it should say); they ride the PR.",
 	"No attribution lines in commits or PR text.",
+	"Launch durable local validation controllers with setsid, not nohup ... & or bare shell backgrounding: the writer shell can reap its background children.",
 ].join(" ");
 export const PACK_LINE =
 	"Docs might be stale. Implementation notes live in impl-notes/. Read them too when gathering context.";
@@ -409,6 +420,8 @@ export class OneironTicketRunner {
 			work: l.work,
 			remote: l.remote ?? "origin",
 			trunk: l.trunk ?? "main",
+			branchPrefix: l.branchPrefix ?? "w7",
+			mergePolicy: l.mergePolicy ?? "github",
 			githubRepo: l.githubRepo,
 			buildSlots: l.buildSlots ?? 4,
 			cargoJobs: l.cargoJobs ?? 4,
@@ -424,7 +437,7 @@ export class OneironTicketRunner {
 		};
 		this.directory = join(this.settings.work, "tickets", ticket.key);
 		this.worktree = join(this.settings.work, "wt", ticket.key);
-		this.branch = `w7/${ticket.key}`;
+		this.branch = `${this.settings.branchPrefix}/${ticket.key}`;
 		this.statePath = join(this.directory, "state.json");
 		this.logPath = join(this.directory, "run.log");
 		mkdirSync(join(this.directory, "logs"), { recursive: true });
@@ -562,7 +575,17 @@ export class OneironTicketRunner {
 		};
 	}
 	private async git(args: string[], cwd = this.worktree): Promise<string> {
-		const result = await this.run(["git", ...args], { cwd, timeoutMs: this.t.ghMs });
+		let result = await this.run(["git", ...args], { cwd, timeoutMs: this.t.ghMs });
+		for (
+			let attempt = 1;
+			result.code !== 0 &&
+			attempt <= 6 &&
+			/cannot lock ref|could not lock config file|Unable to create '[^']*\.lock'/i.test(result.output);
+			attempt++
+		) {
+			await sleep(1_000 + Math.floor(Math.random() * 4_000) * attempt);
+			result = await this.run(["git", ...args], { cwd, timeoutMs: this.t.ghMs });
+		}
 		if (result.code !== 0) throw new TicketFailure(`git ${args[0]} failed: ${tail(result.output, 20)}`);
 		return result.output.trim();
 	}
@@ -777,7 +800,10 @@ ${rendered || "(no bot comments)"}`;
 		mkdirSync(join(this.settings.work, "wt"), { recursive: true });
 		if (existsSync(this.worktree)) rmSync(this.worktree, { recursive: true, force: true });
 		await this.run(["git", "worktree", "prune"], { cwd: this.settings.repo });
-		await this.git(["worktree", "add", "-B", this.branch, this.worktree, chosen.base], this.settings.repo);
+		await this.git(
+			["worktree", "add", "--no-track", "-B", this.branch, this.worktree, chosen.base],
+			this.settings.repo,
+		);
 		const exclude = (await this.git(["rev-parse", "--git-path", "info/exclude"])).trim();
 		appendFileSync(exclude.startsWith("/") ? exclude : join(this.worktree, exclude), ".w7/\n");
 		mkdirSync(join(this.worktree, ".w7"), { recursive: true });
@@ -932,7 +958,7 @@ ${rendered || "(no bot comments)"}`;
 	/** How a writer hands a durable validation to the factory instead of polling it in model rounds. */
 	private waitInstruction(session: string, pendingPath: string): string {
 		const { key } = this.ticket;
-		return `Productive waiting: when durable validation is actually running and there is no other useful work, register it BEFORE yielding by atomically writing ${pendingPath}. JSON schema: {"version":1,"ticket":"${key}","session":"${session}","jobId":"<unique job id, 8-128 letters/digits/_/->","pid":<actual durable controller PID>,"startId":"proc:<actual /proc/PID/stat starttime field 22>","terminalPath":"<absolute unique terminal artifact under this ticket or worktree>"}. Create parent directories first. Use the real controller identity, never an inferred worker PID or a service MainPID that will change. Its producer must atomically publish terminal JSON (temporary file then rename) with the SAME version/ticket/session/jobId/pid/startId and an integer exitCode, for success OR failure. A terminal schema without that identity is insufficient: bind it in the actual producer, never invent a successful result. Register only a durable controller whose completion does not start another model turn by itself. If that contract is unavailable, report the exact custody gap; do not fake a receipt. The factory waits without model rounds, then resumes this same session to consume the actual result. Do not poll in repeated model rounds, launch duplicate validation, or call pending work DONE. Do not replace an existing unregistered live job merely to use this protocol.`;
+		return `Productive waiting: when durable validation is actually running and there is no other useful work, register it BEFORE yielding by atomically writing ${pendingPath}. JSON schema: {"version":1,"ticket":"${key}","session":"${session}","jobId":"<unique job id, 8-128 letters/digits/_/->","pid":<actual durable controller PID>,"startId":"proc:<actual /proc/PID/stat starttime field 22>","terminalPath":"<absolute unique terminal artifact under this ticket or worktree>"}. Create parent directories first. Use the real controller identity, never an inferred worker PID or a service MainPID that will change. Its producer must atomically publish terminal JSON (temporary file then rename) with the SAME version/ticket/session/jobId/pid/startId and an integer exitCode, for success OR failure. A terminal schema without that identity is insufficient: bind it in the actual producer, never invent a successful result. For a locally detached validation controller, use \`setsid\`, not \`nohup ... &\` or bare shell backgrounding; capture the actual long-lived controller PID and /proc start ID and bind terminal publication to that same process before registration. Register only a durable controller whose completion does not start another model turn by itself. If that contract is unavailable, report the exact custody gap; do not fake a receipt. The factory waits without model rounds, then resumes this same session to consume the actual result. Do not poll in repeated model rounds, launch duplicate validation, or call pending work DONE. Do not replace an existing unregistered live job merely to use this protocol.`;
 	}
 	/** The owner's note for the next writer round of this ticket, `resume-note.md` in the ticket directory. */
 	private resumeNote(): string | undefined {
@@ -1616,7 +1642,16 @@ ${rendered || "(no bot comments)"}`;
 				throw new TicketFailure(
 					`post-push propagation: the remote branch is not the tested ${testedHead}; this is not API lag`,
 				);
-			const view = await this.prView<{ state?: string; headRefOid?: string }>(repo, "state,headRefOid");
+			let view: { state?: string; headRefOid?: string };
+			try {
+				view = await this.prView(repo, "state,headRefOid");
+			} catch (error) {
+				if (!/rate[ _-]?limit/i.test(String(error))) throw error;
+				if (Date.now() >= deadline)
+					throw new TicketFailure("post-push propagation timed out while GitHub was rate limited");
+				await sleep(Math.min(this.t.mergePollMs, Math.max(0, deadline - Date.now())));
+				continue;
+			}
 			if (view.state !== "OPEN" && view.state !== "MERGED")
 				throw new TicketFailure(`post-push propagation: the pull request is ${view.state}`);
 			if (view.headRefOid === testedHead) {
@@ -1636,7 +1671,7 @@ ${rendered || "(no bot comments)"}`;
 				throw new TicketFailure(
 					`the pull request did not show the pushed head ${testedHead} within the gh budget; keep the tested commit and retry the merge only`,
 				);
-			await sleep(Math.min(1_000, Math.max(0, deadline - Date.now())));
+			await sleep(Math.min(this.t.propagationPollMs, Math.max(0, deadline - Date.now())));
 		}
 	}
 	/**
@@ -1649,70 +1684,80 @@ ${rendered || "(no bot comments)"}`;
 		const deadline = Date.now() + this.t.ciMs;
 		let last = "";
 		for (;;) {
-			if ((await this.head()) !== head)
-				throw new TicketFailure("merge wait: the local head changed; retry against the new exact head");
-			const view = await this.prView<{
-				state?: string;
-				headRefOid?: string;
-				mergeable?: string;
-				mergeStateStatus?: string;
-			}>(repo, "state,headRefOid,mergeable,mergeStateStatus");
-			if (view.state === "MERGED") return "merged";
-			if (view.state !== "OPEN") throw new TicketFailure(`merge wait: the pull request is ${view.state}`);
-			if (view.headRefOid !== head)
-				throw new TicketFailure(
-					`merge wait: the pull request head ${view.headRefOid} differs from the local ${head}; never merge another revision`,
-				);
-			if (view.mergeable === "CONFLICTING") return "conflicting";
-			const checks = await this.gh([
-				"pr",
-				"checks",
-				String(this.state.pr),
-				"--repo",
-				repo,
-				"--required",
-				"--json",
-				"name,bucket,state,link",
-			]);
-			let rows: Array<{ name?: string; bucket?: string; state?: string; link?: string }>;
 			try {
-				rows = JSON.parse(checks.output);
-			} catch {
-				// "no required checks reported": none required; "no checks reported": none registered yet, so wait.
-				if (!/no (?:required )?checks reported/i.test(checks.output))
-					throw new TicketFailure(`cannot read the required checks: ${tail(checks.output, 10)}`);
-				rows = [];
+				if ((await this.head()) !== head)
+					throw new TicketFailure("merge wait: the local head changed; retry against the new exact head");
+				const view = await this.prView<{
+					state?: string;
+					headRefOid?: string;
+					mergeable?: string;
+					mergeStateStatus?: string;
+				}>(repo, "state,headRefOid,mergeable,mergeStateStatus");
+				if (view.state === "MERGED") return "merged";
+				if (view.state !== "OPEN") throw new TicketFailure(`merge wait: the pull request is ${view.state}`);
+				if (view.headRefOid !== head)
+					throw new TicketFailure(
+						`merge wait: the pull request head ${view.headRefOid} differs from the local ${head}; never merge another revision`,
+					);
+				if (view.mergeable === "CONFLICTING") return "conflicting";
+				const checks = await this.gh([
+					"pr",
+					"checks",
+					String(this.state.pr),
+					"--repo",
+					repo,
+					"--required",
+					"--json",
+					"name,bucket,state,link",
+				]);
+				let rows: Array<{ name?: string; bucket?: string; state?: string; link?: string }>;
+				try {
+					rows = JSON.parse(checks.output);
+				} catch {
+					// "no required checks reported": none required; "no checks reported": none registered yet, so wait.
+					if (!/no (?:required )?checks reported/i.test(checks.output))
+						throw new TicketFailure(`cannot read the required checks: ${tail(checks.output, 10)}`);
+					rows = [];
+				}
+				if (!Array.isArray(rows) || ![0, 1, 8].includes(checks.code))
+					throw new TicketFailure(`cannot read the required checks rc=${checks.code}: ${tail(checks.output, 10)}`);
+				const fresh = await freshRequiredChecks((args) => this.gh(args), repo, head, this.state.pr!, rows);
+				rows = fresh.rows;
+				const failed = rows.filter((row) => row.bucket === "fail" || row.bucket === "cancel");
+				if (failed.length)
+					throw new TicketFailure(
+						`required checks failed at ${head}: ${failed.map((row) => `${row.name} (${row.state}) ${row.link ?? ""}`).join("; ")}`,
+					);
+				// A head that moved between the two reads cannot borrow these check results.
+				if ((await this.prView<{ headRefOid?: string }>(repo, "headRefOid")).headRefOid !== head)
+					throw new TicketFailure(
+						"the pull request head changed while its required checks were read; retry the merge",
+					);
+				const pending = rows.filter((row) => !["pass", "skipping"].includes(row.bucket ?? ""));
+				// Under skipFactoryTests the required checks are the only tests: none reported is not a pass.
+				const ungated = fresh.pendingMissing || (this.settings.skipFactoryTests && rows.length === 0);
+				if (view.mergeable === "MERGEABLE" && !pending.length && !ungated && checks.code !== 8) {
+					if (view.mergeStateStatus === "BEHIND") return "behind";
+					if (["CLEAN", "HAS_HOOKS", "UNSTABLE"].includes(view.mergeStateStatus ?? "")) return "ready";
+				}
+				const status = `head=${head} mergeable=${view.mergeable} state=${view.mergeStateStatus} requiredPending=${pending.map((row) => row.name).join(",") || (ungated ? "none reported, and skipFactoryTests needs one" : "-")}`;
+				if (status !== last) {
+					this.log("merge:wait", status);
+					last = status;
+				}
+				if (once) return "pending";
+				if (Date.now() >= deadline)
+					throw new TicketFailure(
+						`merge readiness still pending after the bounded wait: ${status}; retry the merge only, never a conflict repair`,
+					);
+			} catch (error) {
+				if (!/rate[ _-]?limit/i.test(String(error))) throw error;
+				this.log("merge:wait", `GitHub rate limited the readiness poll: ${String(error).slice(0, 500)}`);
+				if (once) return "pending";
+				if (Date.now() >= deadline)
+					throw new TicketFailure("merge readiness timed out while GitHub was rate limited");
 			}
-			if (!Array.isArray(rows) || ![0, 1, 8].includes(checks.code))
-				throw new TicketFailure(`cannot read the required checks rc=${checks.code}: ${tail(checks.output, 10)}`);
-			const failed = rows.filter((row) => row.bucket === "fail" || row.bucket === "cancel");
-			if (failed.length)
-				throw new TicketFailure(
-					`required checks failed at ${head}: ${failed.map((row) => `${row.name} (${row.state}) ${row.link ?? ""}`).join("; ")}`,
-				);
-			// A head that moved between the two reads cannot borrow these check results.
-			if ((await this.prView<{ headRefOid?: string }>(repo, "headRefOid")).headRefOid !== head)
-				throw new TicketFailure(
-					"the pull request head changed while its required checks were read; retry the merge",
-				);
-			const pending = rows.filter((row) => !["pass", "skipping"].includes(row.bucket ?? ""));
-			// Under skipFactoryTests the required checks are the only tests: none reported is not a pass.
-			const ungated = this.settings.skipFactoryTests && rows.length === 0;
-			if (view.mergeable === "MERGEABLE" && !pending.length && !ungated && checks.code !== 8) {
-				if (view.mergeStateStatus === "BEHIND") return "behind";
-				if (["CLEAN", "HAS_HOOKS", "UNSTABLE"].includes(view.mergeStateStatus ?? "")) return "ready";
-			}
-			const status = `head=${head} mergeable=${view.mergeable} state=${view.mergeStateStatus} requiredPending=${pending.map((row) => row.name).join(",") || (ungated ? "none reported, and skipFactoryTests needs one" : "-")}`;
-			if (status !== last) {
-				this.log("merge:wait", status);
-				last = status;
-			}
-			if (once) return "pending";
-			if (Date.now() >= deadline)
-				throw new TicketFailure(
-					`merge readiness still pending after the bounded wait: ${status}; retry the merge only, never a conflict repair`,
-				);
-			await sleep(Math.min(10_000, Math.max(0, deadline - Date.now())));
+			await sleep(Math.min(this.t.mergePollMs, Math.max(0, deadline - Date.now())));
 		}
 	}
 	private acquireMergeMutex(): Promise<() => void> {
@@ -1955,7 +2000,7 @@ ${rendered || "(no bot comments)"}`;
 		if (!Number.isFinite(jobCompletedAt) || jobCompletedAt > failedAt || jobCompletedAt >= completedAt)
 			throw fail("the job's completion does not precede the recorded failure and the repair");
 	}
-	/** Outside the global mutex: a clean head that contains the fetched trunk and whose required checks are green. */
+	/** Outside the global mutex: a clean head with green required checks and a captured local trunk view. */
 	private async prepareNonstackedCandidate(repo: string): Promise<{ head: string; base: string } | undefined> {
 		for (;;) {
 			if (await this.mergedOnGitHub(repo)) return undefined;
@@ -1963,11 +2008,15 @@ ${rendered || "(no bot comments)"}`;
 			await this.git(["fetch", "-q", this.settings.remote]);
 			const head = await this.head();
 			const base = await this.git(["rev-parse", `${this.settings.remote}/${this.settings.trunk}`]);
-			const ancestry = await this.run(["git", "merge-base", "--is-ancestor", base, head], {
-				timeoutMs: this.t.ghMs,
-			});
-			if (![0, 1].includes(ancestry.code))
-				throw new TicketFailure(`cannot verify the candidate's base ancestry: ${tail(ancestry.output, 10)}`);
+			let staleBase = false;
+			if (this.settings.mergePolicy === "current-base") {
+				const ancestry = await this.run(["git", "merge-base", "--is-ancestor", base, head], {
+					timeoutMs: this.t.ghMs,
+				});
+				if (![0, 1].includes(ancestry.code))
+					throw new TicketFailure(`cannot verify the candidate's base ancestry: ${tail(ancestry.output, 10)}`);
+				staleBase = ancestry.code === 1;
+			}
 			const view = await this.prView<{
 				state?: string;
 				headRefOid?: string;
@@ -1985,7 +2034,7 @@ ${rendered || "(no bot comments)"}`;
 				throw new TicketFailure(
 					"the candidate pull request head or base branch does not match; no inferred recovery",
 				);
-			if (ancestry.code === 1 || view.mergeable === "CONFLICTING" || view.mergeStateStatus === "BEHIND") {
+			if (staleBase || view.mergeable === "CONFLICTING" || view.mergeStateStatus === "BEHIND") {
 				this.log(
 					"merge:prepare",
 					`preparing a changed candidate outside the global mutex; head=${head} base=${base}`,
@@ -2028,13 +2077,10 @@ ${rendered || "(no bot comments)"}`;
 			const readiness = await this.waitForMergeReadiness(repo, true);
 			if (readiness === "merged") return "merged";
 			if (readiness !== "ready") return "reprepare";
-			const view = await this.prView<{ headRefOid?: string; baseRefOid?: string; baseRefName?: string }>(
-				repo,
-				"headRefOid,baseRefOid,baseRefName",
-			);
+			const view = await this.prView<{ headRefOid?: string; baseRefName?: string }>(repo, "headRefOid,baseRefName");
 			if (view.headRefOid !== candidate.head || view.baseRefName !== this.settings.trunk)
 				throw new TicketFailure("the final pull request head or base branch changed");
-			if (view.baseRefOid !== candidate.base || (await trunkHead()) !== candidate.base) return "stale-base";
+			if ((await trunkHead()) !== candidate.base) return "stale-base";
 			if ((await this.head()) !== candidate.head || (await this.dirty()))
 				throw new TicketFailure("the local evidence changed during the final checks");
 			const merge = await this.gh([...args, "--match-head-commit", candidate.head]);

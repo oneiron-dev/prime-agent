@@ -1,8 +1,10 @@
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
+import { existsSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { factoryArguments, supportsFactoryRuntime } from "../src/cli/factory-launch.js";
@@ -141,6 +143,88 @@ describe("optional factory CLI", () => {
 			server.kill("SIGKILL");
 		}
 	}, 15_000);
+
+	it("keeps serve alive through a SQLite write lock and reconciles after the lock clears", async () => {
+		const { root, directory, runnerRoot, marker, planPath, hostsPath } = setup();
+		const plan = JSON.parse(readFileSync(planPath, "utf8")) as FactoryPlan;
+		plan.actions[0]!.command.argv = [
+			process.execPath,
+			"-e",
+			`const fs=require('node:fs'); process.on('SIGUSR1',()=>process.exit(0)); fs.watch(${JSON.stringify(root)},()=>{}); fs.writeFileSync(${JSON.stringify(marker)}, String(process.pid));`,
+		];
+		writeFileSync(planPath, JSON.stringify(plan));
+		invoke(["init", directory, planPath, "--hosts", hostsPath]);
+		unpauseFixture(directory);
+		const server = spawn(process.execPath, [...nodeArgs, factoryEntry, "serve", directory, "--interval-ms", "50"], {
+			cwd: packageRoot,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let holder: ReturnType<typeof spawn> | undefined;
+		const watchers: ReturnType<typeof watch>[] = [];
+		const fileReady = (path: string) =>
+			new Promise<void>((resolveReady) => {
+				if (existsSync(path)) return resolveReady();
+				const watcher = watch(dirname(path), () => {
+					if (existsSync(path)) {
+						watcher.close();
+						resolveReady();
+					}
+				});
+				watchers.push(watcher);
+			});
+		let launched!: (attemptId: string) => void;
+		let busy!: () => void;
+		let recovered!: () => void;
+		const launchedEvent = new Promise<string>((resolveEvent) => {
+			launched = resolveEvent;
+		});
+		const busyEvent = new Promise<void>((resolveEvent) => {
+			busy = resolveEvent;
+		});
+		const recoveredEvent = new Promise<void>((resolveEvent) => {
+			recovered = resolveEvent;
+		});
+		let sawBusy = false;
+		const lines = createInterface({ input: server.stdout! });
+		lines.on("line", (line) => {
+			const event = JSON.parse(line) as { error?: string; launched?: string[]; reconciled?: string[] };
+			if (event.launched?.length) launched(event.launched[0]!);
+			if (event.error === "SQLITE_BUSY") {
+				sawBusy = true;
+				busy();
+			}
+			if (sawBusy && event.reconciled?.length) recovered();
+		});
+		try {
+			const markerReady = fileReady(marker);
+			const attemptId = await launchedEvent;
+			await markerReady;
+			const terminalReady = fileReady(join(runnerRoot, attemptId, "terminal.json"));
+			const script = `const {DatabaseSync}=require('node:sqlite'); const db=new DatabaseSync(${JSON.stringify(join(directory, "factory.db"))}); db.exec('BEGIN IMMEDIATE'); console.log('LOCKED'); process.stdin.once('data',()=>{ db.exec('ROLLBACK'); db.close(); });`;
+			holder = spawn(process.execPath, ["-e", script], { stdio: ["pipe", "pipe", "pipe"] });
+			expect(String((await once(holder.stdout!, "data"))[0])).toContain("LOCKED");
+			process.kill(Number(readFileSync(marker, "utf8")), "SIGUSR1");
+			await terminalReady;
+			await Promise.race([
+				busyEvent,
+				once(server, "exit").then(() => {
+					throw new Error("serve exited during SQLite lock");
+				}),
+			]);
+			expect(server.exitCode).toBeNull();
+			holder.kill("SIGTERM");
+			await once(holder, "exit");
+			await recoveredEvent;
+			expect((JSON.parse(invoke(["status", directory])) as FactoryStatus).actions[0]?.state).toBe("ACCEPTED");
+			expect(readFileSync(marker, "utf8")).toMatch(/^\d+$/);
+		} finally {
+			for (const watcher of watchers) watcher.close();
+			lines.close();
+			if (holder?.exitCode === null) holder.kill("SIGKILL");
+			if (server.exitCode === null) server.kill("SIGKILL");
+		}
+		// test-policy: allow explicit-test-timeout -- A real SQLite five-second busy timeout needs a failure bound; process events signal readiness.
+	}, 20_000);
 
 	it("pauses scheduling when its launcher disappears", async () => {
 		const { directory, marker, planPath, hostsPath } = setup();

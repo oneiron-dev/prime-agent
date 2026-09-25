@@ -249,6 +249,31 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 	}
 }
 
+function sqliteBusy(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		"code" in error &&
+		error.code === "ERR_SQLITE_ERROR" &&
+		"errcode" in error &&
+		error.errcode === 5
+	);
+}
+
+async function tickWithBusyRetry(
+	engine: FactoryEngine,
+): Promise<Awaited<ReturnType<FactoryEngine["tick"]>> | undefined> {
+	for (let retry = 0; retry <= 3; retry++) {
+		try {
+			return await engine.tick();
+		} catch (error) {
+			if (!sqliteBusy(error)) throw error;
+			emit({ error: "SQLITE_BUSY", retriesRemaining: 3 - retry });
+			if (retry === 3) return undefined;
+			await new Promise<void>((resolveWait) => setTimeout(resolveWait, 100 * 2 ** retry));
+		}
+	}
+}
+
 async function serve(engine: FactoryEngine, intervalMs: number, afterTick: () => void): Promise<void> {
 	let stopped = false;
 	let wake: (() => void) | undefined;
@@ -262,12 +287,15 @@ async function serve(engine: FactoryEngine, intervalMs: number, afterTick: () =>
 	process.on("SIGTERM", stop);
 	try {
 		while (!stopped) {
-			emit(await engine.tick());
+			const result = await tickWithBusyRetry(engine);
 			if (stopped) break;
-			try {
-				afterTick();
-			} catch (error) {
-				emit({ error: error instanceof Error ? error.message : String(error) });
+			if (result) {
+				emit(result);
+				try {
+					afterTick();
+				} catch (error) {
+					emit({ error: error instanceof Error ? error.message : String(error) });
+				}
 			}
 			await new Promise<void>((resolveWait) => {
 				const timer = setTimeout(() => {

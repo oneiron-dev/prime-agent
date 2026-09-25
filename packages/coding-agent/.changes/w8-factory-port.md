@@ -1,0 +1,4 @@
+- Fixed factory ticket worktree creation and git lock contention under concurrent launches.
+- Changed merge readiness to wait for fresh required checks and repair only conflicting or behind pull requests.
+- Added configurable branch prefixes, merge polling intervals, and a 24-hour default CI wait.
+- Fixed durable validation guidance and kept factory serve running through transient database locks.
