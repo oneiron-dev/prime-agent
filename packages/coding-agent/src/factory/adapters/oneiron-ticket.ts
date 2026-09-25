@@ -1548,8 +1548,16 @@ ${rendered || "(no bot comments)"}`;
 		this.log("bots:round", `done at ${this.state.submittedHead}`);
 	}
 
+	/** A ticket cut on a stack keeps it: `noStacks` set later must not run `gh stack` or merge past the CI gate. */
+	private refuseStackUnderNoStacks(): void {
+		if (this.settings.noStacks && this.state.stacked)
+			throw new TicketFailure(
+				`${this.ticket.key} was cut on the stack ${this.state.base} before noStacks was set; reset its state and worktree to relaunch it from ${this.settings.trunk}`,
+			);
+	}
 	/** Worktree → pack → writer → tests → review → publish → CodeRabbit → bots → bot round. Exit 0 = submitted. */
 	async submit(): Promise<void> {
+		this.refuseStackUnderNoStacks();
 		await this.cutWorktree();
 		await this.pack();
 		await this.write();
@@ -1670,7 +1678,8 @@ ${rendered || "(no bot comments)"}`;
 			try {
 				rows = JSON.parse(checks.output);
 			} catch {
-				if (!/no required checks reported/i.test(checks.output))
+				// "no required checks reported": none required; "no checks reported": none registered yet, so wait.
+				if (!/no (?:required )?checks reported/i.test(checks.output))
 					throw new TicketFailure(`cannot read the required checks: ${tail(checks.output, 10)}`);
 				rows = [];
 			}
@@ -2093,6 +2102,7 @@ ${rendered || "(no bot comments)"}`;
 	async merge(): Promise<void> {
 		if (this.state.merged) return;
 		if (!this.state.pr) throw new TicketFailure("merge requires a submitted pull request; run submit first");
+		this.refuseStackUnderNoStacks();
 		await this.waitForParents();
 		const repo = await this.githubRepo();
 		if (await this.mergedOnGitHub(repo)) {

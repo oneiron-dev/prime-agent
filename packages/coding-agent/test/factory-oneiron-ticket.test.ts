@@ -40,6 +40,7 @@ if (group === "pr" && verb === "view") {
   out({ number: pr.number, url: "https://github.com/org/repo/pull/" + pr.number, state: pr.merged ? "MERGED" : "OPEN", mergedAt: pr.merged ? "2026-09-19T00:00:00Z" : null,
     headRefOid: stale ? "0".repeat(40) : remote(pr.branch), baseRefName: "main", baseRefOid: remote("main"), mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
 } else if (group === "pr" && verb === "checks") {
+  if (state.checksText) { process.stderr.write(state.checksText); process.exit(1); }
   out(JSON.stringify(state.checks ?? []));
 } else if (group === "pr" && verb === "create") {
   const head = args[args.indexOf("--head") + 1];
@@ -304,6 +305,18 @@ describe("Oneiron ticket runner", () => {
 		expect(gh).toContain("--base main --head w7/child");
 		expect(gh).toMatch(/^pr merge 7 --repo org\/repo --squash .* --match-head-commit [0-9a-f]{40}$/m);
 		expect(runner.state.merged).toBe(true);
+
+		// A ticket cut on a stack before noStacks was set is refused, never merged through gh stack.
+		const stacked = f.ticket("stacked", ["parent"]);
+		stacked.launcher = { ...f.launcher, noStacks: true };
+		mkdirSync(join(f.work, "tickets", "stacked"), { recursive: true });
+		writeFileSync(
+			join(f.work, "tickets", "stacked", "state.json"),
+			JSON.stringify({ key: "stacked", branch: "w7/stacked", base: "w7/parent", stacked: true, pr: 9 }),
+		);
+		const leftover = new OneironTicketRunner(stacked, { env: f.env, routing: {} });
+		await expect(leftover.merge()).rejects.toThrow("was cut on the stack w7/parent before noStacks was set");
+		await expect(leftover.submit()).rejects.toThrow("before noStacks was set");
 	});
 
 	it("with CI-only tests, no bots and a pre-merge review, merges only a head whose checks and review pass", async () => {
@@ -332,7 +345,15 @@ describe("Oneiron ticket runner", () => {
 			const state = JSON.parse(readFileSync(join(f.root, "gh-state.json"), "utf8"));
 			writeFileSync(join(f.root, "gh-state.json"), JSON.stringify({ ...state, checks: rows }));
 		};
-		// With no factory tests, a pull request with no required check reported has nothing gating it.
+		// With no factory tests, a pull request with no required check reported has nothing gating it, and a head
+		// whose checks have not registered yet ("no checks reported") waits for them rather than failing the read.
+		const ghState = () => JSON.parse(readFileSync(join(f.root, "gh-state.json"), "utf8"));
+		writeFileSync(
+			join(f.root, "gh-state.json"),
+			JSON.stringify({ ...ghState(), checksText: "no checks reported on the 'w7/docs-one' branch" }),
+		);
+		await expect(runner.merge()).rejects.toThrow("requiredPending=none reported, and skipFactoryTests needs one");
+		writeFileSync(join(f.root, "gh-state.json"), JSON.stringify({ ...ghState(), checksText: undefined }));
 		await expect(runner.merge()).rejects.toThrow("requiredPending=none reported, and skipFactoryTests needs one");
 		const check = {
 			name: "Test",
