@@ -186,6 +186,10 @@ const ATTRIBUTION =
 	/co-authored-by|generated with \[?claude|generated-by|🤖|signed-off-by: .*(?:claude|codex|astra|gpt)/i;
 
 export class TicketFailure extends Error {}
+class GitHubRateLimit extends TicketFailure {}
+function githubRateLimited(output: string): boolean {
+	return /(?:API|secondary|primary) rate limit|rate limit exceeded/i.test(output);
+}
 export type MergeReadiness = "merged" | "conflicting" | "behind" | "ready" | "pending";
 const SHA = /^[0-9a-f]{40}$/;
 interface MergeRepairReceipt {
@@ -437,11 +441,14 @@ export class OneironTicketRunner {
 		};
 		this.directory = join(this.settings.work, "tickets", ticket.key);
 		this.worktree = join(this.settings.work, "wt", ticket.key);
-		this.branch = `${this.settings.branchPrefix}/${ticket.key}`;
 		this.statePath = join(this.directory, "state.json");
 		this.logPath = join(this.directory, "run.log");
 		mkdirSync(join(this.directory, "logs"), { recursive: true });
-		this.state = readState(this.statePath) ?? { key: ticket.key, branch: this.branch, worktree: this.worktree };
+		const retained = readState(this.statePath);
+		if (retained && (retained.key !== ticket.key || retained.worktree !== this.worktree || !retained.branch))
+			throw new TicketFailure(`the retained ticket identity does not match ${ticket.key}`);
+		this.branch = retained?.branch ?? `${this.settings.branchPrefix}/${ticket.key}`;
+		this.state = retained ?? { key: ticket.key, branch: this.branch, worktree: this.worktree };
 	}
 	private get t() {
 		return this.settings.timeouts as Required<NonNullable<OneironLauncherSettings["timeouts"]>>;
@@ -594,7 +601,11 @@ export class OneironTicketRunner {
 	}
 	private ghJson = async (args: string[]): Promise<unknown> => {
 		const result = await this.gh(args);
-		if (result.code !== 0) throw new TicketFailure(`gh ${args.join(" ")} failed: ${tail(result.output, 10)}`);
+		if (result.code !== 0) {
+			const message = `gh ${args.join(" ")} failed: ${tail(result.output, 10)}`;
+			if (githubRateLimited(result.output)) throw new GitHubRateLimit(message);
+			throw new TicketFailure(message);
+		}
 		return JSON.parse(result.output || "null");
 	};
 	private async githubRepo(): Promise<string> {
@@ -790,8 +801,13 @@ ${rendered || "(no bot comments)"}`;
 			await sleep(this.options.waitMs ?? 60_000);
 		}
 	}
+	private async verifyWorktreeBranch(): Promise<void> {
+		const branch = await this.git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+		if (branch !== this.branch) throw new TicketFailure(`worktree branch ${branch} does not match ${this.branch}`);
+	}
 	private async cutWorktree(): Promise<void> {
 		if (this.state.base && existsSync(join(this.worktree, ".git"))) {
+			await this.verifyWorktreeBranch();
 			this.log("worktree", `reusing ${this.worktree}`);
 			return;
 		}
@@ -1646,7 +1662,7 @@ ${rendered || "(no bot comments)"}`;
 			try {
 				view = await this.prView(repo, "state,headRefOid");
 			} catch (error) {
-				if (!/rate[ _-]?limit/i.test(String(error))) throw error;
+				if (!(error instanceof GitHubRateLimit)) throw error;
 				if (Date.now() >= deadline)
 					throw new TicketFailure("post-push propagation timed out while GitHub was rate limited");
 				await sleep(Math.min(this.t.mergePollMs, Math.max(0, deadline - Date.now())));
@@ -1714,6 +1730,8 @@ ${rendered || "(no bot comments)"}`;
 				try {
 					rows = JSON.parse(checks.output);
 				} catch {
+					if (checks.code !== 0 && githubRateLimited(checks.output))
+						throw new GitHubRateLimit(`gh pr checks failed: ${tail(checks.output, 10)}`);
 					// "no required checks reported": none required; "no checks reported": none registered yet, so wait.
 					if (!/no (?:required )?checks reported/i.test(checks.output))
 						throw new TicketFailure(`cannot read the required checks: ${tail(checks.output, 10)}`);
@@ -1721,7 +1739,18 @@ ${rendered || "(no bot comments)"}`;
 				}
 				if (!Array.isArray(rows) || ![0, 1, 8].includes(checks.code))
 					throw new TicketFailure(`cannot read the required checks rc=${checks.code}: ${tail(checks.output, 10)}`);
-				const fresh = await freshRequiredChecks((args) => this.gh(args), repo, head, this.state.pr!, rows);
+				const fresh = await freshRequiredChecks(
+					async (args) => {
+						const result = await this.gh(args);
+						if (result.code !== 0 && githubRateLimited(result.output))
+							throw new GitHubRateLimit(`gh ${args.join(" ")} failed: ${tail(result.output, 10)}`);
+						return result;
+					},
+					repo,
+					head,
+					this.state.pr!,
+					rows,
+				);
 				rows = fresh.rows;
 				const failed = rows.filter((row) => row.bucket === "fail" || row.bucket === "cancel");
 				if (failed.length)
@@ -1751,7 +1780,7 @@ ${rendered || "(no bot comments)"}`;
 						`merge readiness still pending after the bounded wait: ${status}; retry the merge only, never a conflict repair`,
 					);
 			} catch (error) {
-				if (!/rate[ _-]?limit/i.test(String(error))) throw error;
+				if (!(error instanceof GitHubRateLimit)) throw error;
 				this.log("merge:wait", `GitHub rate limited the readiness poll: ${String(error).slice(0, 500)}`);
 				if (once) return "pending";
 				if (Date.now() >= deadline)
@@ -2001,7 +2030,10 @@ ${rendered || "(no bot comments)"}`;
 			throw fail("the job's completion does not precede the recorded failure and the repair");
 	}
 	/** Outside the global mutex: a clean head with green required checks and a captured local trunk view. */
-	private async prepareNonstackedCandidate(repo: string): Promise<{ head: string; base: string } | undefined> {
+	private async prepareNonstackedCandidate(
+		repo: string,
+		deadline: number,
+	): Promise<{ head: string; base: string } | undefined> {
 		for (;;) {
 			if (await this.mergedOnGitHub(repo)) return undefined;
 			if (await this.dirty()) throw new TicketFailure("candidate preparation needs clean committed source");
@@ -2017,13 +2049,22 @@ ${rendered || "(no bot comments)"}`;
 					throw new TicketFailure(`cannot verify the candidate's base ancestry: ${tail(ancestry.output, 10)}`);
 				staleBase = ancestry.code === 1;
 			}
-			const view = await this.prView<{
+			let view: {
 				state?: string;
 				headRefOid?: string;
 				baseRefName?: string;
 				mergeable?: string;
 				mergeStateStatus?: string;
-			}>(repo, "state,headRefOid,baseRefName,mergeable,mergeStateStatus");
+			};
+			try {
+				view = await this.prView(repo, "state,headRefOid,baseRefName,mergeable,mergeStateStatus");
+			} catch (error) {
+				if (!(error instanceof GitHubRateLimit)) throw error;
+				if (Date.now() >= deadline)
+					throw new TicketFailure("merge preparation timed out while GitHub was rate limited");
+				await sleep(Math.min(this.t.mergePollMs, Math.max(0, deadline - Date.now())));
+				continue;
+			}
 			if (view.state === "MERGED") return undefined;
 			// A push that just landed (publish, the bot round) can leave the API on the old head: wait, never a conflict.
 			if (view.state === "OPEN" && view.headRefOid !== head && (await this.remoteHead(this.branch)) === head) {
@@ -2062,7 +2103,7 @@ ${rendered || "(no bot comments)"}`;
 		repo: string,
 		args: string[],
 		candidate: { head: string; base: string },
-	): Promise<"merged" | "stale-base" | "reprepare"> {
+	): Promise<"merged" | "stale-base" | "reprepare" | "rate-limited"> {
 		const release = await this.acquireMergeMutex();
 		try {
 			if (await this.mergedOnGitHub(repo)) return "merged";
@@ -2077,7 +2118,13 @@ ${rendered || "(no bot comments)"}`;
 			const readiness = await this.waitForMergeReadiness(repo, true);
 			if (readiness === "merged") return "merged";
 			if (readiness !== "ready") return "reprepare";
-			const view = await this.prView<{ headRefOid?: string; baseRefName?: string }>(repo, "headRefOid,baseRefName");
+			let view: { headRefOid?: string; baseRefName?: string };
+			try {
+				view = await this.prView(repo, "headRefOid,baseRefName");
+			} catch (error) {
+				if (!(error instanceof GitHubRateLimit)) throw error;
+				return "rate-limited";
+			}
 			if (view.headRefOid !== candidate.head || view.baseRefName !== this.settings.trunk)
 				throw new TicketFailure("the final pull request head or base branch changed");
 			if ((await trunkHead()) !== candidate.base) return "stale-base";
@@ -2124,8 +2171,9 @@ ${rendered || "(no bot comments)"}`;
 				"--body-file",
 				join(this.directory, "PR-BODY.md"),
 			];
+			const deadline = Date.now() + this.t.ciMs;
 			for (;;) {
-				const candidate = await this.prepareNonstackedCandidate(repo);
+				const candidate = await this.prepareNonstackedCandidate(repo, deadline);
 				if (!candidate) return;
 				// The review runs outside the global mutex, on the candidate whose required checks are green.
 				if (this.settings.preMergeReview) await this.preMergeReview(candidate.head);
@@ -2135,7 +2183,9 @@ ${rendered || "(no bot comments)"}`;
 					"merge:prepare",
 					`${outcome}; the global mutex is released; recheck the candidate and base outside it`,
 				);
-				await sleep(1_000);
+				if (outcome === "rate-limited" && Date.now() >= deadline)
+					throw new TicketFailure("merge finalization timed out while GitHub was rate limited");
+				await sleep(outcome === "rate-limited" ? Math.min(this.t.mergePollMs, deadline - Date.now()) : 1_000);
 			}
 		} finally {
 			releaseTicket();
@@ -2148,6 +2198,7 @@ ${rendered || "(no bot comments)"}`;
 	async merge(): Promise<void> {
 		if (this.state.merged) return;
 		if (!this.state.pr) throw new TicketFailure("merge requires a submitted pull request; run submit first");
+		if (existsSync(join(this.worktree, ".git"))) await this.verifyWorktreeBranch();
 		this.refuseStackUnderNoStacks();
 		await this.waitForParents();
 		const repo = await this.githubRepo();

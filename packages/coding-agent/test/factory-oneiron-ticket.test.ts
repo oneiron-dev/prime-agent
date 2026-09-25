@@ -313,7 +313,14 @@ describe("Oneiron ticket runner", () => {
 		mkdirSync(join(f.work, "tickets", "stacked"), { recursive: true });
 		writeFileSync(
 			join(f.work, "tickets", "stacked", "state.json"),
-			JSON.stringify({ key: "stacked", branch: "w7/stacked", base: "w7/parent", stacked: true, pr: 9 }),
+			JSON.stringify({
+				key: "stacked",
+				branch: "w7/stacked",
+				worktree: join(f.work, "wt", "stacked"),
+				base: "w7/parent",
+				stacked: true,
+				pr: 9,
+			}),
 		);
 		const leftover = new OneironTicketRunner(stacked, { env: f.env, routing: {} });
 		await expect(leftover.merge()).rejects.toThrow("was cut on the stack w7/parent before noStacks was set");
@@ -767,12 +774,19 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 				? { total_count: 2, workflow_runs: [old, newest] }
 				: path.endsWith("/actions/runs/1")
 					? old
-					: path.includes("/check-suites?")
-						? {
-								total_count: 2,
-								check_suites: [101, 102].map((id) => ({ id, head_sha: head, created_at: newest.created_at })),
-							}
-						: { total_count: currentChecks.length, check_runs: currentChecks };
+					: path.endsWith("/actions/runs/2")
+						? newest
+						: path.includes("/check-suites?")
+							? {
+									total_count: 2,
+									check_suites: [101, 102].map((id) => ({
+										id,
+										head_sha: head,
+										created_at: newest.created_at,
+										app: { id: 15368, slug: "github-actions" },
+									})),
+								}
+							: { total_count: currentChecks.length, check_runs: currentChecks };
 			return { code: 0, output: JSON.stringify(data) };
 		};
 		expect(await runner.waitForMergeReadiness("org/repo", true)).toBe("pending");
@@ -804,5 +818,83 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("retains a submitted ticket's branch across a prefix change and rejects a mismatched worktree", async () => {
+		const f = setup();
+		const ticket = f.ticket("prefix-one");
+		ticket.launcher = { ...f.launcher, noStacks: true, skipBots: true };
+		const submitted = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		await submitted.submit();
+		const resumed = new OneironTicketRunner(
+			{ ...ticket, launcher: { ...ticket.launcher, branchPrefix: "w8" } },
+			{ env: f.env, routing: {} },
+		);
+		expect(resumed.branch).toBe("w7/prefix-one");
+		f.git(["branch", "-m", "w7/prefix-one", "w7/other"], resumed.worktree);
+		await expect(resumed.merge()).rejects.toThrow("worktree branch w7/other does not match w7/prefix-one");
+		f.git(["branch", "-m", "w7/other", "w7/prefix-one"], resumed.worktree);
+		await resumed.merge();
+		expect(resumed.state.merged).toBe(true);
+		expect(readFileSync(join(f.root, "gh.log"), "utf8")).toMatch(/^pr merge 7 .*--match-head-commit/m);
+	});
+
+	it("reports a failed required check whose name contains rate-limit", async () => {
+		const f = setup();
+		const runner = new OneironTicketRunner(f.ticket("failed-name"));
+		runner.save({ pr: 7 });
+		const head = "a".repeat(40);
+		runner.run = async (args) =>
+			args[0] === "git"
+				? { code: 0, output: head }
+				: {
+						code: 0,
+						output: JSON.stringify(
+							args.includes("checks")
+								? [{ name: "Rate-limit tests", state: "FAILURE", bucket: "fail" }]
+								: { state: "OPEN", headRefOid: head, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
+						),
+					};
+		await expect(runner.waitForMergeReadiness("org/repo", true)).rejects.toThrow(
+			`required checks failed at ${head}: Rate-limit tests (FAILURE)`,
+		);
+	});
+
+	it("backs off rate limits in merge preparation and outside the final merge mutex", async () => {
+		const f = setup();
+		const ticket = f.ticket("throttle-merge");
+		ticket.launcher = {
+			...f.launcher,
+			noStacks: true,
+			skipBots: true,
+			timeouts: { ...f.launcher.timeouts, mergePollMs: 1 },
+		};
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		await runner.submit();
+		const execute = runner.run.bind(runner);
+		const log = runner.log;
+		let releasedBeforeBackoff = false;
+		runner.log = (step, message) => {
+			if (step === "merge:prepare" && message?.startsWith("rate-limited"))
+				releasedBeforeBackoff = !existsSync(join(f.work, "merge-lock", "slot-1.lock"));
+			log(step, message);
+		};
+		let preparation = 0;
+		let finalView = 0;
+		runner.run = (args, options) => {
+			if (args[0] === "gh" && args[1] === "pr" && args[2] === "view") {
+				const fields = args[args.indexOf("--json") + 1];
+				if (fields === "state,headRefOid,baseRefName,mergeable,mergeStateStatus" && preparation++ === 0)
+					return Promise.resolve({ code: 1, output: "GraphQL: API rate limit exceeded" });
+				if (fields === "headRefOid,baseRefName" && finalView++ === 0)
+					return Promise.resolve({ code: 1, output: "GraphQL: API rate limit exceeded" });
+			}
+			return execute(args, options);
+		};
+		await runner.merge();
+		expect(preparation).toBeGreaterThan(1);
+		expect(finalView).toBeGreaterThan(1);
+		expect(runner.state.merged).toBe(true);
+		expect(releasedBeforeBackoff).toBe(true);
 	});
 });

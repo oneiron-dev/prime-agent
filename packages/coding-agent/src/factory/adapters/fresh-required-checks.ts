@@ -16,11 +16,13 @@ type WorkflowRun = {
 	head_sha: string;
 	created_at: string;
 	run_attempt?: number;
+	status?: string;
+	conclusion?: string | null;
 	event?: string;
 	head_branch?: string;
 	pull_requests?: Array<{ number: number }>;
 };
-type CheckSuite = { id: number; head_sha: string; created_at: string };
+type CheckSuite = { id: number; head_sha: string; created_at: string; app?: { id?: number; slug?: string } };
 type WorkflowJob = {
 	id: number;
 	run_id: number;
@@ -126,23 +128,72 @@ export async function freshRequiredChecks(
 	});
 	if (!actions.some((id) => id !== undefined)) return { rows, pendingMissing: false };
 
-	const listedRuns = await getJson<{ total_count: number; workflow_runs: WorkflowRun[] }>(
-		gh,
-		`repos/${repo}/actions/runs?head_sha=${head}&per_page=${PAGE_SIZE}`,
-	);
-	const runs = onePage(listedRuns, listedRuns.workflow_runs, "workflow runs");
-	const listedSuites = await getJson<{ total_count: number; check_suites: CheckSuite[] }>(
-		gh,
-		`repos/${repo}/commits/${head}/check-suites?per_page=${PAGE_SIZE}`,
-	);
-	const suites = onePage(listedSuites, listedSuites.check_suites, "check suites");
-	if (runs.some((run) => run.head_sha !== head) || suites.some((suite) => suite.head_sha !== head))
-		throw new Error("GitHub returned checks for another head");
+	async function generation() {
+		const listedRuns = await getJson<{ total_count: number; workflow_runs: WorkflowRun[] }>(
+			gh,
+			`repos/${repo}/actions/runs?head_sha=${head}&per_page=${PAGE_SIZE}`,
+		);
+		const runs = onePage(listedRuns, listedRuns.workflow_runs, "workflow runs");
+		const listedSuites = await getJson<{ total_count: number; check_suites: CheckSuite[] }>(
+			gh,
+			`repos/${repo}/commits/${head}/check-suites?per_page=${PAGE_SIZE}`,
+		);
+		const suites = onePage(listedSuites, listedSuites.check_suites, "check suites");
+		if (runs.some((run) => run.head_sha !== head) || suites.some((suite) => suite.head_sha !== head))
+			throw new Error("GitHub returned checks for another head");
+		return { runs, suites };
+	}
 
+	const initial = await generation();
 	const previousRuns = new Map<number, WorkflowRun>();
 	const suiteChecks = new Map<number, CheckRun[]>();
 	const attemptJobs = new Map<string, WorkflowJob[]>();
+	const selected = new Map<number, { old: WorkflowRun; run: WorkflowRun }>();
 	let pendingMissing = false;
+	const pending = (name: string): RequiredCheckRow => {
+		pendingMissing = true;
+		return { name, bucket: "pending", state: "PENDING" };
+	};
+	const matches = (run: WorkflowRun, old: WorkflowRun) =>
+		run.workflow_id === old.workflow_id &&
+		run.event === old.event &&
+		run.head_branch === old.head_branch &&
+		(run.pull_requests?.length ? run.pull_requests.some((pull) => pull.number === pr) : true);
+	// Only an unbound Actions suite can signal a newer Actions generation.
+	// Missing or conflicting app identity cannot disprove that race.
+	const unreconciled = (snapshot: Awaited<ReturnType<typeof generation>>, run: WorkflowRun) => {
+		const chosenSuites = snapshot.suites.filter((suite) => suite.id === run.check_suite_id);
+		if (chosenSuites.length !== 1) return true;
+		const app = chosenSuites[0]?.app;
+		if (!app || !Number.isSafeInteger(app.id) || !app.slug) return true;
+		const boundSuites = new Set(snapshot.runs.map((listed) => listed.check_suite_id));
+		return snapshot.suites.some(
+			(suite) =>
+				suite.id > run.check_suite_id &&
+				Date.parse(suite.created_at) >= Date.parse(run.created_at) &&
+				!boundSuites.has(suite.id) &&
+				(!suite.app ||
+					!Number.isSafeInteger(suite.app.id) ||
+					!suite.app.slug ||
+					suite.app.id === app.id ||
+					suite.app.slug === app.slug),
+		);
+	};
+	async function jobsFor(run: WorkflowRun, attempt: number): Promise<WorkflowJob[]> {
+		const key = `${run.id}/${attempt}`;
+		let jobs = attemptJobs.get(key);
+		if (!jobs) {
+			const listed = await getJson<{ total_count: number; jobs: WorkflowJob[] }>(
+				gh,
+				`repos/${repo}/actions/runs/${run.id}/attempts/${attempt}/jobs?per_page=${PAGE_SIZE}`,
+			);
+			jobs = onePage(listed, listed.jobs, "rerun attempt jobs");
+			if (jobs.some((job) => job.run_id !== run.id || job.head_sha !== head))
+				throw new Error("rerun attempt contains another workflow or head");
+			attemptJobs.set(key, jobs);
+		}
+		return jobs;
+	}
 	const current = await Promise.all(
 		rows.map(async (row, index): Promise<RequiredCheckRow> => {
 			const oldId = actions[index];
@@ -160,67 +211,79 @@ export async function freshRequiredChecks(
 					throw new Error(`cannot bind required check to exact workflow run ${oldId}`);
 				previousRuns.set(oldId, old);
 			}
-			const matched = runs.filter(
-				(run) =>
-					run.workflow_id === old.workflow_id &&
-					run.event === old.event &&
-					run.head_branch === old.head_branch &&
-					(run.pull_requests?.length ? run.pull_requests.some((pull) => pull.number === pr) : true),
-			);
-			// The old row may be visible before the workflow-run listing catches up. Never borrow its result.
-			const chosen = latestWorkflow(matched);
-			if (
-				!chosen ||
-				chosen.id < old.id ||
-				(chosen.id === old.id && (chosen.run_attempt ?? 1) < (old.run_attempt ?? 1))
-			)
-				throw new Error(`cannot locate latest required workflow run ${old.workflow_id}`);
+			const listed = latestWorkflow(initial.runs.filter((run) => matches(run, old)));
+			const chosen = latestWorkflow([old, ...(listed ? [listed] : [])])!;
 			if (!Number.isSafeInteger(chosen.check_suite_id)) throw new Error("latest workflow has no valid check suite");
-			if (!suites.some((suite) => suite.id === chosen.check_suite_id)) {
-				pendingMissing = true;
-				return { name: row.name, bucket: "pending", state: "PENDING" };
-			}
-			// A rerun may reuse its suite. The attempt's job list excludes checks from earlier attempts.
-			if ((chosen.run_attempt ?? 1) > 1) {
-				const key = `${chosen.id}/${chosen.run_attempt}`;
-				let jobs = attemptJobs.get(key);
-				if (!jobs) {
-					const listed = await getJson<{ total_count: number; jobs: WorkflowJob[] }>(
-						gh,
-						`repos/${repo}/actions/runs/${chosen.id}/attempts/${chosen.run_attempt}/jobs?per_page=${PAGE_SIZE}`,
-					);
-					jobs = onePage(listed, listed.jobs, "rerun attempt jobs");
-					if (jobs.some((job) => job.run_id !== chosen.id || job.head_sha !== head))
-						throw new Error("rerun attempt contains another workflow or head");
-					attemptJobs.set(key, jobs);
-				}
+			// Both the listing and detail must agree before a completed job can be trusted.
+			const detail =
+				chosen.id === oldId ? old : await getJson<WorkflowRun>(gh, `repos/${repo}/actions/runs/${chosen.id}`);
+			if (
+				!listed ||
+				listed.id !== chosen.id ||
+				(listed.run_attempt ?? 1) !== (chosen.run_attempt ?? 1) ||
+				detail.id !== chosen.id ||
+				detail.head_sha !== head ||
+				!matches(detail, old) ||
+				detail.check_suite_id !== chosen.check_suite_id ||
+				(detail.run_attempt ?? 1) !== (chosen.run_attempt ?? 1)
+			)
+				return pending(row.name);
+			selected.set(index, { old, run: detail });
+			if (unreconciled(initial, detail)) return pending(row.name);
+			if ((detail.run_attempt ?? 1) > 1) {
+				const attempt = detail.run_attempt!;
+				const jobs = await jobsFor(detail, attempt);
 				const job = [...jobs].filter((candidate) => candidate.name === row.name).sort((a, b) => b.id - a.id)[0];
-				if (!job) {
-					pendingMissing = true;
-					return { name: row.name, bucket: "pending", state: "PENDING" };
+				if (job) return checkBucket({ ...job, details_url: job.html_url });
+				// A failed-jobs-only rerun omits successful jobs. Carry one forward only after this attempt ends.
+				if (detail.status === "completed") {
+					for (let prior = attempt - 1; prior >= 1; prior--) {
+						const priorJobs = await jobsFor(detail, prior);
+						const priorJob = [...priorJobs]
+							.filter((candidate) => candidate.name === row.name)
+							.sort((a, b) => b.id - a.id)[0];
+						if (priorJob) {
+							const result = checkBucket({ ...priorJob, details_url: priorJob.html_url });
+							if (result.bucket === "pass") return result;
+							break;
+						}
+					}
 				}
-				return checkBucket({ ...job, details_url: job.html_url });
+				return pending(row.name);
 			}
-			let checks = suiteChecks.get(chosen.check_suite_id);
+			let checks = suiteChecks.get(detail.check_suite_id);
 			if (!checks) {
-				const listed = await getJson<{ total_count: number; check_runs: CheckRun[] }>(
+				const listedChecks = await getJson<{ total_count: number; check_runs: CheckRun[] }>(
 					gh,
-					`repos/${repo}/check-suites/${chosen.check_suite_id}/check-runs?per_page=${PAGE_SIZE}&filter=all`,
+					`repos/${repo}/check-suites/${detail.check_suite_id}/check-runs?per_page=${PAGE_SIZE}&filter=all`,
 				);
-				checks = onePage(listed, listed.check_runs, "check runs");
+				checks = onePage(listedChecks, listedChecks.check_runs, "check runs");
 				if (checks.some((check) => check.head_sha !== head)) throw new Error("check suite contains another head");
-				suiteChecks.set(chosen.check_suite_id, checks);
+				suiteChecks.set(detail.check_suite_id, checks);
 			}
 			const matching = checks.filter((check) => check.name === row.name);
 			const newest = latest(
 				matching.map((check) => ({ ...check, created_at: check.started_at ?? check.completed_at ?? "" })),
 			);
-			if (!newest) {
-				pendingMissing = true;
-				return { name: row.name, bucket: "pending", state: "PENDING" };
-			}
-			return checkBucket(newest);
+			return newest ? checkBucket(newest) : pending(row.name);
 		}),
 	);
+	// The next generation may appear while reading jobs. Never publish the older result in that case.
+	const after = await generation();
+	for (const [index, { old, run }] of selected) {
+		const newest = latestWorkflow([old, ...after.runs.filter((candidate) => matches(candidate, old))])!;
+		const detail = await getJson<WorkflowRun>(gh, `repos/${repo}/actions/runs/${run.id}`);
+		if (
+			newest.id > run.id ||
+			(newest.id === run.id && (newest.run_attempt ?? 1) > (run.run_attempt ?? 1)) ||
+			detail.id !== run.id ||
+			detail.head_sha !== head ||
+			!matches(detail, old) ||
+			detail.check_suite_id !== run.check_suite_id ||
+			(detail.run_attempt ?? 1) !== (run.run_attempt ?? 1) ||
+			unreconciled(after, run)
+		)
+			current[index] = pending(rows[index]!.name!);
+	}
 	return { rows: current, pendingMissing };
 }

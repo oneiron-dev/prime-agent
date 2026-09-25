@@ -259,8 +259,8 @@ function sqliteBusy(error: unknown): boolean {
 	);
 }
 
-async function tickWithBusyRetry(
-	engine: FactoryEngine,
+export async function tickWithBusyRetry(
+	engine: Pick<FactoryEngine, "tick">,
 ): Promise<Awaited<ReturnType<FactoryEngine["tick"]>> | undefined> {
 	for (let retry = 0; retry <= 3; retry++) {
 		try {

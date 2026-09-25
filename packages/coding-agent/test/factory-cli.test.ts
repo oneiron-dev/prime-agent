@@ -5,9 +5,11 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { factoryArguments, supportsFactoryRuntime } from "../src/cli/factory-launch.js";
+import { tickWithBusyRetry } from "../src/factory/cli.js";
 import { FactoryStore } from "../src/factory/store.js";
 import type { FactoryPlan, FactoryStatus } from "../src/factory/types.js";
 
@@ -225,6 +227,75 @@ describe("optional factory CLI", () => {
 		}
 		// test-policy: allow explicit-test-timeout -- A real SQLite five-second busy timeout needs a failure bound; process events signal readiness.
 	}, 20_000);
+
+	it.each([11, 1])("does not retry native SQLite errcode %i", async (errcode) => {
+		const root = mkdtempSync(join(tmpdir(), "prime-factory-corrupt-"));
+		roots.push(root);
+		const path = join(root, "query.db");
+		let db = new DatabaseSync(path);
+		try {
+			if (errcode === 11) {
+				db.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)");
+				const pageSize = Number(db.prepare("PRAGMA page_size").get()?.page_size);
+				const rootPage = Number(db.prepare("SELECT rootpage FROM sqlite_schema WHERE name='t'").get()?.rootpage);
+				db.close();
+				const bytes = readFileSync(path);
+				bytes[pageSize * (rootPage - 1)] = 0xff;
+				writeFileSync(path, bytes);
+				db = new DatabaseSync(path);
+			}
+			let calls = 0;
+			await expect(
+				tickWithBusyRetry({
+					tick: async (): Promise<never> => {
+						calls++;
+						db.exec(errcode === 11 ? "SELECT * FROM t" : "SELECT * FROM absent");
+						throw new Error("SQLite query unexpectedly succeeded");
+					},
+				}),
+			).rejects.toMatchObject({ code: "ERR_SQLITE_ERROR", errcode });
+			expect(calls).toBe(1);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("retries a native SQLITE_BUSY only within the bounded budget", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-factory-busy-"));
+		roots.push(root);
+		const path = join(root, "lock.db");
+		const holder = new DatabaseSync(path);
+		holder.exec("CREATE TABLE t (x); BEGIN IMMEDIATE");
+		const contender = new DatabaseSync(path);
+		contender.exec("PRAGMA busy_timeout=0");
+		const output = vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.useFakeTimers();
+		try {
+			let calls = 0;
+			const pending = tickWithBusyRetry({
+				tick: async (): Promise<never> => {
+					calls++;
+					contender.exec("INSERT INTO t VALUES (1)");
+					throw new Error("SQLite insert unexpectedly succeeded");
+				},
+			});
+			await vi.runAllTimersAsync();
+			expect(await pending).toBeUndefined();
+			expect(calls).toBe(4);
+			expect(output.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+				{ error: "SQLITE_BUSY", retriesRemaining: 3 },
+				{ error: "SQLITE_BUSY", retriesRemaining: 2 },
+				{ error: "SQLITE_BUSY", retriesRemaining: 1 },
+				{ error: "SQLITE_BUSY", retriesRemaining: 0 },
+			]);
+		} finally {
+			vi.useRealTimers();
+			output.mockRestore();
+			holder.exec("ROLLBACK");
+			contender.close();
+			holder.close();
+		}
+	});
 
 	it("pauses scheduling when its launcher disappears", async () => {
 		const { directory, marker, planPath, hostsPath } = setup();
