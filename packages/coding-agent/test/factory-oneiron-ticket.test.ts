@@ -2,7 +2,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import {
 	acquireSlot,
@@ -38,7 +38,7 @@ if (group === "pr" && verb === "view") {
   const stale = state.lag > 0 && (args[args.indexOf("--json") + 1] || "").includes("headRefOid");
   if (stale) { state.lag--; save(); }
   out({ number: pr.number, url: "https://github.com/org/repo/pull/" + pr.number, state: pr.merged ? "MERGED" : "OPEN", mergedAt: pr.merged ? "2026-09-19T00:00:00Z" : null,
-    headRefOid: stale ? "0".repeat(40) : remote(pr.branch), baseRefName: "main", baseRefOid: remote("main"), mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+    headRefOid: stale ? "0".repeat(40) : remote(pr.branch), baseRefName: "main", baseRefOid: state.baseOid ?? remote("main"), mergeable: state.mergeable ?? "MERGEABLE", mergeStateStatus: state.mergeStateStatus ?? "CLEAN" });
 } else if (group === "pr" && verb === "checks") {
   if (state.checksText) { process.stderr.write(state.checksText); process.exit(1); }
   out(JSON.stringify(state.checks ?? []));
@@ -101,6 +101,7 @@ const input = fs.readFileSync(0, "utf8"), argv = process.argv.slice(2);
 const dir = argv.includes("--session-dir") ? argv[argv.indexOf("--session-dir") + 1] : undefined;
 if (dir) { fs.mkdirSync(dir, { recursive: true }); fs.appendFileSync(path.join(dir, "session.jsonl"), "{}\\n"); }
 fs.appendFileSync(path.join(process.env.FAKE_ROOT, "prime.log"), (argv.includes("-c") ? "continue " : "open ") + input.slice(0, 20) + (input.includes("owner note") ? " +note" : "") + "\\n");
+if (input.startsWith("register")) fs.writeFileSync(path.join(process.env.FAKE_ROOT, "writer-prompt"), input);
 const text = input.startsWith("Continue this SAME review") ? "Checked every hunk.\\nVERDICT: LANDABLE"
   : input.startsWith("finish") ? "Finished.\\nDONE note-one"
   : input.startsWith("register") ? (fs.mkdirSync(path.dirname(process.env.PENDING_PATH), { recursive: true }), fs.writeFileSync(process.env.PENDING_PATH, process.env.PENDING_JSON), "Validation started.\\nDONE wait-one")
@@ -312,7 +313,14 @@ describe("Oneiron ticket runner", () => {
 		mkdirSync(join(f.work, "tickets", "stacked"), { recursive: true });
 		writeFileSync(
 			join(f.work, "tickets", "stacked", "state.json"),
-			JSON.stringify({ key: "stacked", branch: "w7/stacked", base: "w7/parent", stacked: true, pr: 9 }),
+			JSON.stringify({
+				key: "stacked",
+				branch: "w7/stacked",
+				worktree: join(f.work, "wt", "stacked"),
+				base: "w7/parent",
+				stacked: true,
+				pr: 9,
+			}),
 		);
 		const leftover = new OneironTicketRunner(stacked, { env: f.env, routing: {} });
 		await expect(leftover.merge()).rejects.toThrow("was cut on the stack w7/parent before noStacks was set");
@@ -359,7 +367,7 @@ describe("Oneiron ticket runner", () => {
 			name: "Test",
 			state: "FAILURE",
 			bucket: "fail",
-			link: "https://github.com/org/repo/actions/runs/1/job/2",
+			link: "https://ci.example.invalid/check/2",
 		};
 		checks([check]);
 		await expect(runner.merge()).rejects.toThrow(/required checks failed at [0-9a-f]{40}: Test \(FAILURE\)/);
@@ -566,6 +574,8 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 			rounds.catch(() => undefined);
 			await waiting;
 			expect(readFileSync(join(f.root, "prime.log"), "utf8")).toBe("open register the gate\n\nP\n");
+			expect(readFileSync(join(f.root, "writer-prompt"), "utf8")).toContain("use `setsid`, not `nohup ... &`");
+			expect(runner.writerSystem()).toContain("setsid, not nohup ... &");
 			writeFileSync(terminalPath, JSON.stringify({ ...identity, startId, exitCode: 0 }));
 			const { final } = await rounds;
 			expect([final, readFileSync(join(f.root, "prime.log"), "utf8")]).toEqual([
@@ -631,5 +641,343 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		expect(readFileSync(join(directory, "slot-1.lock"), "utf8")).toBe(String(process.pid));
 		release();
 		expect(existsSync(join(directory, "slot-1.lock"))).toBe(false);
+	});
+
+	it("retries git ref locks and cuts configurable branches without writing shared tracking config", async () => {
+		const f = setup();
+		f.git(["config", "branch.autoSetupMerge", "true"], f.repo);
+		const ticket = f.ticket("lock-one");
+		ticket.launcher = { ...f.launcher, branchPrefix: "w8", skipBots: true };
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		const execute = runner.run.bind(runner);
+		let locks = 0;
+		let trackingOnCut: number | null = null;
+		runner.run = async (args, options) => {
+			if (args[0] === "git" && args[1] === "fetch" && locks++ === 0)
+				return { code: 1, output: "cannot lock ref 'refs/remotes/origin/main'" };
+			const result = await execute(args, options);
+			if (args[0] === "git" && args[1] === "worktree" && args[2] === "add")
+				trackingOnCut = spawnSync("git", ["config", "--get", "branch.w8/lock-one.remote"], { cwd: f.repo }).status;
+			return result;
+		};
+		const random = vi.spyOn(Math, "random").mockReturnValue(0);
+		try {
+			await runner.submit();
+		} finally {
+			random.mockRestore();
+		}
+		expect(locks).toBeGreaterThan(1);
+		expect(f.git(["rev-parse", "--abbrev-ref", "HEAD"], runner.worktree)).toBe("w8/lock-one");
+		expect(trackingOnCut).toBe(1);
+	});
+
+	it("merges a green candidate with old ancestry and a stale GitHub baseRefOid", async () => {
+		const f = setup();
+		const ticket = f.ticket("base-one");
+		ticket.launcher = { ...f.launcher, noStacks: true, skipBots: true, skipFactoryTests: true };
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		await runner.submit();
+		const baseOid = f.git(["rev-parse", "HEAD"], f.repo);
+		writeFileSync(join(f.repo, "trunk.txt"), "new trunk\n");
+		f.git(["add", "trunk.txt"], f.repo);
+		f.git(["commit", "-qm", "advance main"], f.repo);
+		f.git(["push", "-q", "origin", "main"], f.repo);
+		const statePath = join(f.root, "gh-state.json");
+		const state = JSON.parse(readFileSync(statePath, "utf8"));
+		writeFileSync(
+			statePath,
+			JSON.stringify({ ...state, baseOid, checks: [{ name: "Test", bucket: "pass", state: "SUCCESS" }] }),
+		);
+		await runner.merge();
+		expect(readFileSync(join(f.root, "gh.log"), "utf8")).not.toContain("pr update-branch");
+		expect(runner.state.merged).toBe(true);
+	});
+
+	it("backs off a GitHub rate limit without failing the ticket, with a 24-hour default CI budget", async () => {
+		const f = setup();
+		const runner = new OneironTicketRunner(f.ticket("rate-one"));
+		expect(runner.settings.timeouts).toMatchObject({
+			ciMs: 86_400_000,
+			mergePollMs: 120_000,
+			propagationPollMs: 10_000,
+		});
+		runner.save({ pr: 7 });
+		let calls = 0;
+		runner.run = async (args) => {
+			if (args[0] === "git") return { code: 0, output: "a".repeat(40) };
+			if (args.includes("checks") && calls++ === 0) return { code: 1, output: "GraphQL: API rate limit exceeded" };
+			return args.includes("checks")
+				? { code: 0, output: JSON.stringify([{ name: "Test", bucket: "pass", state: "SUCCESS" }]) }
+				: {
+						code: 0,
+						output: JSON.stringify({
+							state: "OPEN",
+							headRefOid: "a".repeat(40),
+							mergeable: "MERGEABLE",
+							mergeStateStatus: "CLEAN",
+						}),
+					};
+		};
+		vi.useFakeTimers();
+		try {
+			const ready = runner.waitForMergeReadiness("org/repo");
+			await vi.advanceTimersByTimeAsync(120_000);
+			expect(await ready).toBe("ready");
+			expect(calls).toBe(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("waits for the newest workflow's required Test instead of rejecting its old failure", async () => {
+		const f = setup();
+		const runner = new OneironTicketRunner(f.ticket("fresh-one"));
+		runner.save({ pr: 7 });
+		const head = "a".repeat(40);
+		let currentChecks: object[] = [];
+		runner.run = async (args) => {
+			if (args[0] === "git") return { code: 0, output: head };
+			if (args[1] === "pr" && args[2] === "checks")
+				return {
+					code: 0,
+					output: JSON.stringify([
+						{
+							name: "Test",
+							bucket: "fail",
+							state: "FAILURE",
+							link: "https://github.com/org/repo/actions/runs/1/job/11",
+						},
+					]),
+				};
+			if (args[1] === "pr")
+				return {
+					code: 0,
+					output: JSON.stringify({
+						state: "OPEN",
+						headRefOid: head,
+						mergeable: "MERGEABLE",
+						mergeStateStatus: "CLEAN",
+					}),
+				};
+			const path = args[4]!;
+			const old = {
+				id: 1,
+				workflow_id: 50,
+				check_suite_id: 101,
+				head_sha: head,
+				created_at: "2026-09-24T00:00:00Z",
+				event: "pull_request",
+				head_branch: "w7/fresh-one",
+			};
+			const newest = { ...old, id: 2, check_suite_id: 102, created_at: "2026-09-25T00:00:00Z" };
+			const data = path.includes("/actions/runs?")
+				? { total_count: 2, workflow_runs: [old, newest] }
+				: path.endsWith("/actions/runs/1")
+					? old
+					: path.endsWith("/actions/runs/2")
+						? newest
+						: path.includes("/check-suites?")
+							? {
+									total_count: 2,
+									check_suites: [101, 102].map((id) => ({
+										id,
+										head_sha: head,
+										created_at: newest.created_at,
+										app: { id: 15368, slug: "github-actions" },
+									})),
+								}
+							: { total_count: currentChecks.length, check_runs: currentChecks };
+			return { code: 0, output: JSON.stringify(data) };
+		};
+		expect(await runner.waitForMergeReadiness("org/repo", true)).toBe("pending");
+		currentChecks = [{ id: 3, name: "Test", head_sha: head, status: "completed", conclusion: "success" }];
+		expect(await runner.waitForMergeReadiness("org/repo", true)).toBe("ready");
+	});
+
+	it("spaces stale PR-head polling by ten seconds", async () => {
+		const f = setup();
+		const runner = new OneironTicketRunner(f.ticket("lag-one"));
+		const head = "a".repeat(40);
+		let views = 0;
+		runner.run = async (args) => {
+			if (args[0] === "git")
+				return {
+					code: 0,
+					output: args[1] === "ls-remote" ? `${head}\trefs/heads/w7/lag-one` : args[1] === "status" ? "" : head,
+				};
+			return { code: 0, output: JSON.stringify({ state: "OPEN", headRefOid: views++ ? head : "0".repeat(40) }) };
+		};
+		vi.useFakeTimers();
+		try {
+			const ready = runner.waitForPushedHead("org/repo", head);
+			await vi.advanceTimersByTimeAsync(9_999);
+			expect(views).toBe(1);
+			await vi.advanceTimersByTimeAsync(1);
+			await ready;
+			expect(views).toBe(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("retains a submitted ticket's branch across a prefix change and rejects a mismatched worktree", async () => {
+		const f = setup();
+		const ticket = f.ticket("prefix-one");
+		ticket.launcher = { ...f.launcher, noStacks: true, skipBots: true };
+		const submitted = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		await submitted.submit();
+		const resumed = new OneironTicketRunner(
+			{ ...ticket, launcher: { ...ticket.launcher, branchPrefix: "w8" } },
+			{ env: f.env, routing: {} },
+		);
+		expect(resumed.branch).toBe("w7/prefix-one");
+		f.git(["branch", "-m", "w7/prefix-one", "w7/other"], resumed.worktree);
+		await expect(resumed.merge()).rejects.toThrow("worktree branch w7/other does not match w7/prefix-one");
+		f.git(["branch", "-m", "w7/other", "w7/prefix-one"], resumed.worktree);
+		await resumed.merge();
+		expect(resumed.state.merged).toBe(true);
+		expect(readFileSync(join(f.root, "gh.log"), "utf8")).toMatch(/^pr merge 7 .*--match-head-commit/m);
+	});
+
+	it("reports a failed required check whose name contains rate-limit", async () => {
+		const f = setup();
+		const runner = new OneironTicketRunner(f.ticket("failed-name"));
+		runner.save({ pr: 7 });
+		const head = "a".repeat(40);
+		runner.run = async (args) =>
+			args[0] === "git"
+				? { code: 0, output: head }
+				: {
+						code: 0,
+						output: JSON.stringify(
+							args.includes("checks")
+								? [{ name: "Rate-limit tests", state: "FAILURE", bucket: "fail" }]
+								: { state: "OPEN", headRefOid: head, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
+						),
+					};
+		await expect(runner.waitForMergeReadiness("org/repo", true)).rejects.toThrow(
+			`required checks failed at ${head}: Rate-limit tests (FAILURE)`,
+		);
+	});
+
+	it("backs off rate limits in merge preparation and outside the final merge mutex", async () => {
+		const f = setup();
+		const ticket = f.ticket("throttle-merge");
+		ticket.launcher = {
+			...f.launcher,
+			noStacks: true,
+			skipBots: true,
+			timeouts: { ...f.launcher.timeouts, mergePollMs: 1 },
+		};
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		await runner.submit();
+		const execute = runner.run.bind(runner);
+		const log = runner.log;
+		let releasedBeforeBackoff = false;
+		runner.log = (step, message) => {
+			if (step === "merge:prepare" && message?.startsWith("rate-limited"))
+				releasedBeforeBackoff = !existsSync(join(f.work, "merge-lock", "slot-1.lock"));
+			log(step, message);
+		};
+		let preparation = 0;
+		let finalView = 0;
+		let mergeCalls = 0;
+		runner.run = (args, options) => {
+			if (args[0] === "gh" && args[1] === "pr" && args[2] === "merge" && mergeCalls++ === 0)
+				return Promise.resolve({ code: 1, output: "GraphQL: API rate limit exceeded" });
+			if (args[0] === "gh" && args[1] === "pr" && args[2] === "view") {
+				const fields = args[args.indexOf("--json") + 1];
+				if (fields === "state,headRefOid,baseRefName,mergeable,mergeStateStatus" && preparation++ === 0)
+					return Promise.resolve({ code: 1, output: "GraphQL: API rate limit exceeded" });
+				if (fields === "headRefOid,baseRefName" && finalView++ === 0)
+					return Promise.resolve({ code: 1, output: "GraphQL: API rate limit exceeded" });
+			}
+			return execute(args, options);
+		};
+		await runner.merge();
+		expect(preparation).toBeGreaterThan(1);
+		expect(finalView).toBeGreaterThan(1);
+		expect(mergeCalls).toBe(2);
+		expect(runner.state.merged).toBe(true);
+		expect(releasedBeforeBackoff).toBe(true);
+	});
+
+	it("retries a throttled update-branch without treating it as a conflict", async () => {
+		const f = setup();
+		const ticket = f.ticket("update-throttle");
+		ticket.launcher = {
+			...f.launcher,
+			noStacks: true,
+			skipBots: true,
+			skipFactoryTests: true,
+			timeouts: { ...f.launcher.timeouts, mergePollMs: 1 },
+		};
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		await runner.submit();
+		const statePath = join(f.root, "gh-state.json");
+		const state = JSON.parse(readFileSync(statePath, "utf8"));
+		writeFileSync(
+			statePath,
+			JSON.stringify({
+				...state,
+				mergeStateStatus: "BEHIND",
+				checks: [{ name: "Test", bucket: "pass", state: "SUCCESS" }],
+			}),
+		);
+		const execute = runner.run.bind(runner);
+		let updates = 0;
+		runner.run = (args, options) => {
+			if (args[0] === "gh" && args[1] === "pr" && args[2] === "update-branch" && updates++ === 0) {
+				writeFileSync(
+					statePath,
+					JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), mergeStateStatus: "CLEAN" }),
+				);
+				return Promise.resolve({ code: 1, output: "GraphQL: API rate limit exceeded" });
+			}
+			return execute(args, options);
+		};
+		await runner.merge();
+		expect(updates).toBe(1);
+		expect(runner.state.merged).toBe(true);
+	});
+
+	it("confirms a remote branch advanced by a throttled update before reusing it", async () => {
+		const f = setup();
+		const ticket = f.ticket("update-ambiguous");
+		ticket.launcher = { ...f.launcher, noStacks: true, skipBots: true, skipFactoryTests: true };
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		await runner.submit();
+		const statePath = join(f.root, "gh-state.json");
+		writeFileSync(
+			statePath,
+			JSON.stringify({
+				...JSON.parse(readFileSync(statePath, "utf8")),
+				mergeStateStatus: "BEHIND",
+				checks: [{ name: "Test", bucket: "pass", state: "SUCCESS" }],
+			}),
+		);
+		const execute = runner.run.bind(runner);
+		let updates = 0;
+		runner.run = (args, options) => {
+			if (args[0] === "gh" && args[1] === "pr" && args[2] === "update-branch" && updates++ === 0) {
+				f.git(["fetch", "-q", "origin"], f.repo);
+				const external = join(f.root, "external-update");
+				f.git(["worktree", "add", "-q", "-b", "fake-update", external, `origin/${runner.branch}`], f.repo);
+				writeFileSync(join(external, "remote.txt"), "updated branch\n");
+				f.git(["add", "remote.txt"], external);
+				f.git(["commit", "-qm", "remote update"], external);
+				f.git(["push", "-q", "origin", `HEAD:refs/heads/${runner.branch}`], external);
+				writeFileSync(
+					statePath,
+					JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), mergeStateStatus: "CLEAN" }),
+				);
+				return Promise.resolve({ code: 1, output: "GraphQL: API rate limit exceeded" });
+			}
+			return execute(args, options);
+		};
+		await runner.merge();
+		expect(updates).toBe(1);
+		expect(runner.state.merged).toBe(true);
+		expect(readFileSync(runner.logPath, "utf8")).toContain("tests-after-merge-fix");
 	});
 });
