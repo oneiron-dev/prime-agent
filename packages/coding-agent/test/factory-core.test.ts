@@ -164,11 +164,26 @@ describe("portable factory journal", () => {
 		await expect(admit([{ ...action("b", ["a"]), sourceFingerprint: "changed" }], {}, "b")).rejects.toThrow(
 			"Pure admission requires the unchanged existing READY action",
 		);
+		await expect(admit([{ ...replacement, dependencies: ["b"] }])).rejects.toThrow(
+			"retain the rejected action's ticket and dependency set",
+		);
 		await expect(
 			admit([replacement], { slots: [{ id: "foreign", host: "host", capabilities: [] }] }),
 		).rejects.toThrow("may add only the selected action's exact slot");
-		// Each refusal rolled back whole: no revision, no action, no receipt.
-		expect([store.status().planRevision, store.actions().some((a) => a.id === "repair")]).toEqual([revision, false]);
+		// The existing slot may be named, never changed.
+		await expect(
+			admit([{ ...replacement, requirements: { slotId: "slot" } }], {
+				slots: [{ id: "slot", host: "host", capabilities: ["gpu"] }],
+			}),
+		).rejects.toThrow("existing slots cannot change");
+		// Each refusal rolled back whole: no revision, no action, no mutation row, no receipt.
+		expect([
+			store.status().planRevision,
+			store.actions().some((a) => a.id === "repair"),
+			store.planMutation("m-repair"),
+			store.planMutation("m-b"),
+			store.slots().map((slot) => slot.capabilities),
+		]).toEqual([revision, false, undefined, undefined, [["linux"]]]);
 		const admitted = await admit([replacement]);
 		expect(admitted).toMatchObject({ actionId: "repair", replayed: false, paused: true });
 		expect(store.status().planRevision).toBe(revision + 2);
