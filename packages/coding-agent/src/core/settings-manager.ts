@@ -5,6 +5,7 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
+import { resolveKernelMemoryBackstop, resolveKernelMemoryLimitGb } from "./kernel/memory-guard.js";
 import { MAX_PROVIDER_PAUSE_MS, type ProviderWaitPolicy } from "./provider-retry.js";
 
 const RECENT_MODELS_LIMIT = 20;
@@ -240,6 +241,8 @@ export interface Settings {
 	autonomous?: AutonomousSettings;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	commandTimeoutSeconds?: number; // Hard ceiling for agent bash commands and IPython user cells
+	kernelMemoryLimitGb?: number; // Memory ceiling per Python kernel and the processes it starts (default: 16; 0 turns the ladder off)
+	kernelMemoryBackstop?: boolean; // End the heaviest kernel tree when the machine runs out of memory (default: true)
 	quietStartup?: boolean;
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
 	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
@@ -1156,6 +1159,14 @@ export class SettingsManager {
 		}
 		const fromEnv = Number(process.env.PRIME_AGENT_COMMAND_TIMEOUT_SECONDS);
 		return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : undefined;
+	}
+
+	getKernelMemoryLimitGb(): number {
+		return resolveKernelMemoryLimitGb(this.settings.kernelMemoryLimitGb);
+	}
+
+	getKernelMemoryBackstop(): boolean {
+		return resolveKernelMemoryBackstop(this.settings.kernelMemoryBackstop);
 	}
 
 	setShellPath(path: string | undefined): void {

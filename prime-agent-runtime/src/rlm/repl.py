@@ -27,9 +27,11 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .bash import _kill_live_handles
+from .bash import _kill_live_handles, record_memory_notice
 
 PROTOCOL_VERSION = 3
+# Request types beyond the version-3 base; the ready event lists them so a host can gate on them.
+FEATURES = ("trim_memory", "memory_notice", "memory_report")
 
 DEFAULT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 8 * 1024 * 1024
@@ -76,6 +78,10 @@ _current_cell_execution: contextvars.ContextVar[_CellExecution | None] = context
 )
 _active: dict[str, Any] = {"task": None, "rid": None, "interrupted": False}
 _cell_counter = 0
+# Code filename of the cell being executed, so its line can be named in errors and memory reports.
+_cell_file: str | None = None
+# The user namespace, for the memory report the reader thread answers.
+_user_ns: dict[str, Any] | None = None
 _pending_host: dict[str, "asyncio.Future[dict[str, Any]]"] = {}
 # Set on the loop thread once stdin hits EOF or a shutdown request arrives; no
 # host reply can arrive after that, so waiting (and future) host_request calls fail.
@@ -520,6 +526,30 @@ def _cap_text(text: str) -> str:
     return text
 
 
+_LINE_SOURCE_CAP = 200
+
+
+def _line_of(filename: str, lineno: int | None) -> dict[str, Any] | None:
+    if not lineno:
+        return None
+    source = linecache.getline(filename, lineno).strip()
+    if len(source) > _LINE_SOURCE_CAP:
+        source = source[:_LINE_SOURCE_CAP] + "..."
+    return {"lineno": lineno, "source": source}
+
+
+def _with_cell_line(event: dict[str, Any], stack: traceback.StackSummary | None) -> dict[str, Any]:
+    """Add the running cell's innermost traceback line (a call into an earlier cell names this cell's call)."""
+    filename = _cell_file
+    for frame in reversed(stack or []):
+        if filename is not None and frame.filename == filename:
+            line = _line_of(filename, frame.lineno)
+            if line:
+                event["line"] = line
+            break
+    return event
+
+
 def _error_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
     # No cell frame (e.g. SyntaxError): exception-only keeps filename, source, and caret.
     te = traceback.TracebackException.from_exception(exc)
@@ -529,13 +559,23 @@ def _error_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
     else:
         te.stack = stack
         lines = list(te.format())
-    return {
+    event = {
         "event": "error",
         "id": cell_id,
         "ename": type(exc).__name__,
         "evalue": _cap_text(_safe_str(exc)),
         "traceback": [_cap_text(line) for line in lines],
     }
+    return _with_cell_line(event, stack)
+
+
+def _clear_frames(exc: BaseException | None) -> None:
+    """Release the locals an interrupted cell's frames still hold (its data would outlive it)."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        traceback.clear_frames(exc.__traceback__)
+        exc = exc.__cause__ or exc.__context__
 
 
 def _interrupt_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
@@ -546,7 +586,8 @@ def _interrupt_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
         lines = ["Traceback (most recent call last):\n"]
         lines.extend(stack.format())
     lines.append("KeyboardInterrupt\n")
-    return {"event": "error", "id": cell_id, "ename": "KeyboardInterrupt", "evalue": "", "traceback": lines}
+    event = {"event": "error", "id": cell_id, "ename": "KeyboardInterrupt", "evalue": "", "traceback": lines}
+    return _with_cell_line(event, stack)
 
 
 def _compile_cell(code: str, filename: str) -> tuple[list[types.CodeType], bool]:
@@ -591,10 +632,15 @@ async def _run_guarded(task: asyncio.Task[Any], rid: str) -> tuple[str, Any, dic
         return "ok", value, None
     except asyncio.CancelledError as exc:
         if _active["interrupted"]:
-            return "error", None, _interrupt_event(rid, exc)
+            event = _interrupt_event(rid, exc)
+            _clear_frames(exc)
+            return "error", None, event
         return "error", None, _error_event(rid, exc)
     except BaseException as exc:  # noqa: BLE001 - every cell failure becomes an error event
-        return "error", None, _error_event(rid, exc)
+        event = _error_event(rid, exc)
+        if _active["interrupted"] and isinstance(exc, KeyboardInterrupt):
+            _clear_frames(exc)
+        return "error", None, event
     finally:
         with _interrupt_lock:
             global _finishing_rid
@@ -608,10 +654,11 @@ async def _run_guarded(task: asyncio.Task[Any], rid: str) -> tuple[str, Any, dic
 
 
 async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
-    global _cell_counter
+    global _cell_counter, _cell_file
     cell_id = req["id"]
     _cell_counter += 1
     filename = f"<cell-{_cell_counter}>"
+    _cell_file = filename
     execution = _CellExecution()
     cell_token = _current_cell.set(cell_id)
     execution_token = _current_cell_execution.set(execution)
@@ -646,6 +693,7 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
             _send(error)
         _send({"event": "done", "id": cell_id, "status": status})
     finally:
+        _cell_file = None
         execution.owner = None
         execution.finished.set()
         _current_cell_execution.reset(execution_token)
@@ -1185,6 +1233,194 @@ async def _handle_list_names(req: dict[str, Any], ns: dict[str, Any]) -> None:
     _send({"event": "done", "id": req["id"], "status": "ok", "names": _list_names(ns)})
 
 
+# Sizing walks at most this many objects per top-level value, then extrapolates.
+_SIZE_WALK_NODES = 100_000
+# A memory report races a kill: it walks less and extrapolates more.
+_REPORT_WALK_NODES = 10_000
+_SIZE_WALK_DEPTH = 32
+_UNSIZED_TYPES = (types.ModuleType, type, types.FunctionType, types.BuiltinFunctionType, types.MethodType)
+
+
+_ATOMS = (int, float, complex, bool, type(None), bytes, bytearray, str)
+
+
+def _direct_size(value: Any) -> int | None:
+    """In-memory bytes of atoms and of array-likes that report their own size, else None."""
+    if type(value) in _ATOMS:
+        return sys.getsizeof(value)
+    if isinstance(value, memoryview):
+        return value.nbytes
+    module = type(value).__module__ or ""
+    try:
+        if module.startswith("pandas"):
+            usage = value.memory_usage(deep=True)
+            return int(usage.sum()) if hasattr(usage, "sum") else int(usage)
+        if module.startswith("polars"):
+            return int(value.estimated_size())
+        nbytes = getattr(value, "nbytes", None)
+        if callable(nbytes):
+            nbytes = nbytes()
+    except Exception:  # noqa: BLE001 - a broken size hook falls back to the walk
+        return None
+    return nbytes if isinstance(nbytes, int) and not isinstance(nbytes, bool) else None
+
+
+def _deep_size(value: Any, seen: set[int], budget: list[int], depth: int = 0) -> int:
+    """Bounded walk: containers and instance dicts; a list longer than the budget is extrapolated."""
+    if id(value) in seen or isinstance(value, _UNSIZED_TYPES):
+        return 0
+    seen.add(id(value))
+    budget[0] -= 1
+    direct = _direct_size(value)
+    if direct is not None:
+        return direct
+    try:
+        size = sys.getsizeof(value)
+    except Exception:  # noqa: BLE001
+        size = 0
+    if depth >= _SIZE_WALK_DEPTH:
+        return size
+    try:
+        if isinstance(value, dict):
+            children: Any = [item for pair in value.items() for item in pair]
+            count = 2 * len(value)
+        elif isinstance(value, (list, tuple, set, frozenset)) or type(value).__name__ == "deque":
+            children, count = value, len(value)
+        else:
+            attrs = getattr(value, "__dict__", None)
+            if not isinstance(attrs, dict):
+                return size
+            children, count = list(attrs.values()), len(attrs)
+        walked = total = 0
+        for child in children:
+            if budget[0] <= 0:
+                break
+            total += _deep_size(child, seen, budget, depth + 1)
+            walked += 1
+    except Exception:  # noqa: BLE001 - a mutating or broken container keeps what was measured
+        return size
+    if 0 < walked < count:
+        total = total * count // walked
+    return size + total
+
+
+def _array_owner(value: Any) -> Any:
+    """The array that owns a view's memory (numpy .base chain), so views and bases drop together."""
+    for _ in range(8):
+        base = getattr(value, "base", None) if (type(value).__module__ or "").startswith("numpy") else None
+        if base is None or not (type(base).__module__ or "").startswith("numpy"):
+            return value
+        value = base
+    return value
+
+
+_ARRAY_MODULES = ("numpy", "pandas", "polars", "torch")
+_SIZED_CONTAINERS = (list, tuple, set, frozenset, dict)
+
+
+def _shape_fields(value: Any) -> dict[str, Any]:
+    """Shape and dtype of an array or frame (numpy, pandas, polars, torch), or a container's length."""
+    try:
+        if (type(value).__module__ or "").split(".")[0] in _ARRAY_MODULES:
+            fields: dict[str, Any] = {}
+            shape = getattr(value, "shape", None)
+            if isinstance(shape, tuple):
+                fields["shape"] = [int(n) for n in shape]
+            dtype = getattr(value, "dtype", None)
+            if dtype is not None:
+                fields["dtype"] = str(dtype).removeprefix("torch.")
+            elif getattr(value, "dtypes", None) is not None:
+                kinds = list(dict.fromkeys(str(kind) for kind in list(value.dtypes)))
+                fields["dtype"] = "/".join(kinds[:3]) + ("/..." if len(kinds) > 3 else "")
+            return fields
+        if isinstance(value, _SIZED_CONTAINERS) or type(value).__name__ == "deque":
+            return {"length": len(value)}
+    except Exception:  # noqa: BLE001 - a broken attribute leaves the size and type
+        pass
+    return {}
+
+
+def _sized_groups(ns: dict[str, Any], walk_nodes: int = _SIZE_WALK_NODES) -> list[dict[str, Any]]:
+    """Top-level names grouped by the object that holds their memory, largest first."""
+    groups: dict[int, dict[str, Any]] = {}
+    for name, value in list(ns.items()):
+        if not isinstance(name, str) or (name.startswith("__") and name.endswith("__")) or name in _ALWAYS_SKIP:
+            continue
+        if isinstance(value, _UNSIZED_TYPES):
+            continue
+        owner = _array_owner(value)
+        group = groups.get(id(owner))
+        if group is None:
+            group = groups[id(owner)] = {
+                "names": [],
+                "ids": set(),
+                "bytes": _deep_size(owner, set(), [walk_nodes]),
+                "type": type(value).__name__,
+                "details": _shape_fields(value),
+            }
+        group["names"].append(name)
+        group["ids"].add(id(value))
+    return sorted(groups.values(), key=lambda group: group["bytes"], reverse=True)
+
+
+def _sized_entry(group: dict[str, Any]) -> dict[str, Any]:
+    return {"name": ", ".join(group["names"]), "bytes": group["bytes"], "type": group["type"], **group["details"]}
+
+
+def _release_heap() -> None:
+    """Hand freed heap pages back to the OS so the host's measurement sees the drop."""
+    try:
+        if sys.platform.startswith("linux"):
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        elif sys.platform == "darwin":
+            ctypes.CDLL("/usr/lib/libSystem.B.dylib").malloc_zone_pressure_relief(None, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _trim_memory(ns: dict[str, Any], target_bytes: int, min_bytes: int, count: int = 3) -> dict[str, Any]:
+    """Drop the largest top-level values (never one under min_bytes) until target_bytes are freed."""
+    import gc
+
+    groups = _sized_groups(ns)
+    dropped: list[dict[str, Any]] = []
+    freed = 0
+    purge_ids: set[int] = set()
+    for group in groups:
+        if freed >= target_bytes or group["bytes"] < min_bytes:
+            break
+        for name in group["names"]:
+            ns.pop(name, None)
+        purge_ids |= group["ids"]
+        freed += group["bytes"]
+        dropped.append(_sized_entry(group))
+    output_cache = ns.get("Out")
+    if isinstance(output_cache, dict):
+        for key in [key for key, value in output_cache.items() if id(value) in purge_ids]:
+            del output_cache[key]
+    for attr in ("last_type", "last_value", "last_traceback", "last_exc"):
+        if hasattr(sys, attr):
+            setattr(sys, attr, None)
+    kept = groups[len(dropped) :]
+    del groups
+    gc.collect()
+    _release_heap()
+    largest = [_sized_entry(group) for group in kept[:count]]
+    return {"dropped": dropped, "largest": largest, "more": max(0, len(kept) - count), "freed_bytes": freed}
+
+
+async def _handle_trim_memory(req: dict[str, Any], ns: dict[str, Any]) -> None:
+    fields = {}
+    for field, default in (("target_bytes", 0), ("min_bytes", 0), ("count", 3)):
+        value = req.get(field, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            _send({"event": "done", "id": req["id"], "status": "error", "reason": f"{field} must be a non-negative integer"})
+            return
+        fields[field] = value
+    result = _trim_memory(ns, fields["target_bytes"], fields["min_bytes"], fields["count"])
+    _send({"event": "done", "id": req["id"], "status": "ok", **result})
+
+
 async def _handle_request(
     handler: Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]],
     req: dict[str, Any],
@@ -1234,6 +1470,8 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
             await _handle_request(_handle_state, req, ns)
         elif rtype == "list_names":
             await _handle_request(_handle_list_names, req, ns)
+        elif rtype == "trim_memory":
+            await _handle_request(_handle_trim_memory, req, ns)
 
 
 _REQUIRED_FIELDS = {
@@ -1241,8 +1479,72 @@ _REQUIRED_FIELDS = {
     "snapshot": ("id", "path", "manifest_path"),
     "restore": ("id", "path"),
     "list_names": ("id",),
+    "trim_memory": ("id",),
     "shutdown": (),
 }
+
+
+def _handle_memory_notice(req: dict[str, Any]) -> None:
+    """Reader-thread half of the child step: record why these pids die, then acknowledge.
+
+    Out-of-band like interrupt: the host kills the group right after this
+    acknowledgement, so the bash() call that owned it can return the reason.
+    """
+    rid, pids, text = req.get("id"), req.get("pids"), req.get("text")
+    if (
+        not isinstance(rid, str)
+        or not isinstance(text, str)
+        or not isinstance(pids, list)
+        or not all(isinstance(pid, int) and not isinstance(pid, bool) for pid in pids)
+    ):
+        _protocol_error("memory_notice request needs string id and text and an int pids list")
+        return
+    matched, awaited = record_memory_notice(pids, text)
+    _send({"event": "done", "id": rid, "status": "ok", "matched": matched, "awaited": awaited})
+
+
+def _running_line() -> dict[str, Any] | None:
+    """The line the running cell executes now: its innermost frame in its own code, read from another thread."""
+    filename = _cell_file
+    if filename is None:
+        return None
+    frame = sys._current_frames().get(threading.main_thread().ident)
+    while frame is not None and frame.f_code.co_filename != filename:
+        frame = frame.f_back
+    if frame is None:
+        # Suspended at an await: the cell's frames hang off its task's await chain.
+        task = _active["task"]
+        awaitable: Any = task.get_coro() if task is not None else None
+        for _ in range(64):
+            inner = getattr(awaitable, "cr_frame", None)
+            if inner is not None and inner.f_code.co_filename == filename:
+                frame = inner
+            awaitable = getattr(awaitable, "cr_await", None)
+            if awaitable is None:
+                break
+    return _line_of(filename, frame.f_lineno) if frame is not None else None
+
+
+def _handle_memory_report(req: dict[str, Any]) -> None:
+    """Answer off the request queue, like interrupt: the host asks right before it ends the kernel,
+    usually while a cell is still running, for the running line and the names it holds."""
+    rid, count = req.get("id"), req.get("count", 30)
+    if not isinstance(rid, str) or isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        _protocol_error("memory_report request needs a string id and a non-negative int count")
+        return
+
+    def report() -> None:
+        try:
+            line = _running_line()
+            groups = _sized_groups(_user_ns if _user_ns is not None else {}, _REPORT_WALK_NODES)
+            names = [_sized_entry(group) for group in groups[:count]]
+            more = max(0, len(groups) - count)
+            _send({"event": "done", "id": rid, "status": "ok", "line": line, "names": names, "more": more})
+        except Exception as exc:  # noqa: BLE001 - the host falls back to what it already knows
+            _send({"event": "done", "id": rid, "status": "error", "reason": _safe_str(exc)})
+
+    # Its own thread: sizing a large namespace must not hold up interrupts on the reader thread.
+    threading.Thread(target=report, name="rlm-memory-report", daemon=True).start()
 
 
 def _protocol_error(message: str) -> None:
@@ -1260,6 +1562,12 @@ def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> No
             _protocol_error("interrupt request id must be a string")
             return
         _request_interrupt(req.get("id"))
+        return
+    if rtype == "memory_notice":
+        _handle_memory_notice(req)
+        return
+    if rtype == "memory_report":
+        _handle_memory_report(req)
         return
     if rtype == "host_reply":
         # Bypass the FIFO queue: the awaiting cell IS the in-flight
@@ -1409,7 +1717,7 @@ def _setup_fds() -> int:
 
 
 def main() -> None:
-    global _loop, _serve_task
+    global _loop, _serve_task, _user_ns
     stdin_fd = _setup_fds()
     _start_owner_watchdog()
 
@@ -1420,8 +1728,16 @@ def main() -> None:
     user_module = types.ModuleType("__main__")
     user_module.__dict__["__builtins__"] = __builtins__
     sys.modules["__main__"] = user_module
+    _user_ns = user_module.__dict__
 
-    _send({"event": "ready", "protocol": PROTOCOL_VERSION, "python": platform.python_version()})
+    _send(
+        {
+            "event": "ready",
+            "protocol": PROTOCOL_VERSION,
+            "python": platform.python_version(),
+            "features": list(FEATURES),
+        }
+    )
 
     # The event-loop stack (asyncio plus its ssl, concurrent.futures, and
     # logging imports) is the heaviest part of this module's boot chain; load

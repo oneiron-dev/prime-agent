@@ -33,6 +33,8 @@ export interface BuildSystemPromptOptions {
 	rlmParentAgent?: string;
 	/** Enabled user-configured servers available through the generic kernel MCP API. */
 	genericMcpServers?: string[];
+	/** Memory ceiling per kernel tree in GB, stated to the model; 0 or unset leaves it out. */
+	kernelMemoryLimitGb?: number;
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -120,6 +122,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		allowRecursion,
 		depth: options.rlmDepth,
 		parentAgent: options.rlmParentAgent,
+		kernelMemoryLimitGb: options.kernelMemoryLimitGb,
 	});
 
 	// Appended AFTER the trained buildRlmPrompt prefix: delegation doctrine precedes the subagent specs delivered via the harness digest.

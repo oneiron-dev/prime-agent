@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "../extensions/types.js";
 import type { ExecuteResult } from "../kernel/index.js";
+import { placeMemoryNotices } from "../kernel/memory-guard.js";
 import type { AcpMcpServerConfig } from "../mcp/acp-mcp-types.js";
 import type { IpythonKernelProvisioner } from "./ipython.js";
 
@@ -27,6 +28,7 @@ function executionResult(result: ExecuteResult) {
 	if (result.stderr) text += `${text ? "\n" : ""}${result.stderr}`;
 	if (result.result) text += `${text ? "\n" : ""}${result.result}`;
 	if (result.error) text += `${text ? "\n" : ""}${result.error.traceback.join("\n")}`;
+	text = placeMemoryNotices(text, result);
 	if (result.status !== "ok") {
 		throw new Error(text || `MCP kernel execution ${result.status}`);
 	}

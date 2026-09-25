@@ -4,7 +4,9 @@
 one persistent `__main__` namespace on a single asyncio event loop. The wire
 format is newline-delimited JSON: one object per line, UTF-8, no other framing.
 The current protocol version is `3`; the runtime announces it in the `ready`
-event.
+event, together with `features`: the optional requests beyond the version-3
+base that this runtime serves (`trim_memory`, `memory_notice`,
+`memory_report`). A host checks `features` before sending one of them.
 
 ## Channels
 
@@ -33,17 +35,20 @@ event.
 | `snapshot` | `{"type":"snapshot","id":str,"path":str,"manifest_path":str,"max_bytes"?:int,"max_variable_bytes"?:int,"prune_oversized"?:bool}` |
 | `restore` | `{"type":"restore","id":str,"path":str}` |
 | `list_names` | `{"type":"list_names","id":str}` |
+| `trim_memory` | `{"type":"trim_memory","id":str,"target_bytes"?:int,"min_bytes"?:int,"count"?:int}` |
+| `memory_notice` | `{"type":"memory_notice","id":str,"pids":[int,...],"text":str}` — replies `done` from the reader thread |
+| `memory_report` | `{"type":"memory_report","id":str,"count"?:int}` — replies `done` off the request queue |
 | `shutdown` | `{"type":"shutdown","id"?:str}` |
 
-Requests other than `interrupt` and `host_reply` run strictly in order, one at
-a time. A malformed line
+Requests other than `interrupt`, `host_reply`, `memory_notice` and
+`memory_report` run strictly in order, one at a time. A malformed line
 produces `{"event":"error","id":null,"ename":"ProtocolError",...}` and the
 runtime keeps serving. Closing stdin is equivalent to `shutdown`.
 
 ## Events
 
-- `{"event":"ready","protocol":3,"python":"3.13.11"}` — sent once at startup;
-  the handshake. No banner precedes it.
+- `{"event":"ready","protocol":3,"python":"3.13.11","features":[str,...]}` —
+  sent once at startup; the handshake. No banner precedes it.
 - `{"event":"stdout"|"stderr","id":str|null,"text":str}` — captured output.
   `id` is the cell whose Python execution context performed the write; asyncio
   tasks inherit the spawning cell's id (even after that cell finished). `null`
@@ -68,14 +73,19 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
   carrying the same id. `data` is subject to the same encoding cap as a
   `display` payload: `host_request()` raises `ValueError` in the calling cell
   instead of sending an oversized request.
-- `{"event":"error","id":str|null,"ename":str,"evalue":str,"traceback":[str,...]}`
+- `{"event":"error","id":str|null,"ename":str,"evalue":str,"traceback":[str,...],"line"?:{"lineno":int,"source":str}}`
   — `evalue` and each `traceback` entry are capped like `result` text (same
-  cap, same trailing marker).
+  cap, same trailing marker). `line` is the failing cell's own innermost
+  traceback line (for an interrupt, the line the cell was stopped at); a call
+  into a function from an earlier cell names this cell's calling line. The
+  source text is stripped and capped at 200 characters.
 - `{"event":"done","id":str,"status":"ok"|"error"}` — exactly one per id'd
   request, always after all of that request's other events. A snapshot `done`
   adds `saved`, `skipped`, `pruned`, `bytes`; a restore `done` adds `restored`,
-  `failed`; a `list_names` `done` adds `names`; a failed snapshot/restore adds
-  `reason`. Restoring a missing file reports `status:"ok"` with empty
+  `failed`; a `list_names` `done` adds `names`; a `trim_memory` `done` adds
+  `dropped`, `largest`, `more`, `freed_bytes`; a `memory_notice` `done` adds
+  `matched` and `awaited`; a `memory_report` `done` adds `line`, `names`, `more`;
+  a failed snapshot/restore/trim adds `reason`. Restoring a missing file reports `status:"ok"` with empty
   `restored`/`failed` lists and `reason:"snapshot not found"`.
 
 Before a cell's `done`, the runtime drains both channels: tagged Python-level
@@ -171,6 +181,50 @@ fail with `status:"error"` and a `reason`.
 
 `list_names` replies with `done` carrying `names`: the sorted user-defined
 top-level names under the same filter the snapshot applies.
+
+## Memory ceiling
+
+The host measures the kernel and every process it starts and enforces a memory
+limit per kernel tree (see `packages/coding-agent/src/core/kernel/memory-guard.ts`).
+Two requests serve it.
+
+`trim_memory` frees memory held by top-level variables. Every top-level name
+except dunders, the always-skipped names above, modules, classes and functions
+is sized by in-memory bytes: numpy-style `nbytes`, pandas
+`memory_usage(deep=True)`, polars `estimated_size()`, `sys.getsizeof` for
+`bytes`/`bytearray`/`str`, and a bounded walk (100,000 objects, then
+extrapolated) through containers and instance `__dict__`s. Names bound to the
+same object, or to numpy views of the same base array, form one group. Groups
+are deleted largest first until their sizes add up to `target_bytes`; a group
+under `min_bytes` is never deleted. Matching `Out` entries and `sys.last_*`
+are cleared, `gc.collect()` runs, and the C heap is handed back to the OS
+(`malloc_trim` on glibc, `malloc_zone_pressure_relief` on macOS). The `done`
+carries `dropped` and `largest` (the `count` largest remaining groups, default
+3), plus `more` (how many remaining groups `largest` leaves out) and
+`freed_bytes`. Each entry is `{"name","bytes","type"}`, where `name` joins a
+group's names with `", "`; a numpy, pandas, polars or torch value adds `shape`
+(a list of ints) and `dtype` (a frame's distinct column dtypes joined with
+`/`, at most three), and a list, tuple, set, dict or deque adds `length`.
+`target_bytes` 0 only reports. The request is not interruptible. A cell
+stopped by an interrupt also releases the locals its frames held, so a trim
+right after it frees what the cell built.
+
+`memory_notice` is handled on the reader thread, like `interrupt`: the host
+sends it right before it SIGKILLs a process group the kernel started. When a
+live `bash()` handle owns one of `pids`, the handle keeps `text` and appends it
+to its output once the kill ends it, so the awaited `bash()` call returns the
+reason. The `done` reply carries `matched`: whether such a handle existed, and
+`awaited`: whether the running cell awaits it (directly or through asyncio
+wrappers). When `awaited` is false the host delivers the text itself.
+
+`memory_report` is answered on a thread of its own, so it works while a cell
+runs: the host sends it right before it ends the kernel. The `done` carries
+`line`, the running cell's current line as `{"lineno","source"}` (its innermost
+frame in its own code, following the await chain of a suspended cell; `null`
+when no cell runs), and `names`: the `count` largest groups (default 30) in
+the `trim_memory` entry format, measured with a smaller walk (10,000 objects
+per value), plus `more`. A main thread that holds the GIL in one long C call
+delays the reply; the host does not wait for it long.
 
 ## Shutdown
 

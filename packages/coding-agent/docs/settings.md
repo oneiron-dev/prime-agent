@@ -333,6 +333,15 @@ available, authenticated model, the bounded wait runs instead.
 
 Normally the package manager's global modules location is queried using `root -g`. As a special case, if the first element of `npmCommand` is `"bun"`, the modules location will instead be queried with `pm bin -g`.
 
+### Python Kernel
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `kernelMemoryLimitGb` | number | `16` | Memory ceiling for each Python kernel together with every process it starts. `0` turns the ceiling and the backstop off. Env: `PRIME_AGENT_KERNEL_MEMORY_LIMIT_GB` |
+| `kernelMemoryBackstop` | boolean | `true` | When the machine is nearly out of memory, stop the heaviest kernel tree this process owns at once. Env: `PRIME_AGENT_KERNEL_MEMORY_BACKSTOP` |
+
+Every 2 seconds prime-agent measures each kernel and its descendants: resident plus swapped memory on Linux, the physical footprint (compressed memory included) on macOS. At 60% of the limit the model gets a warning with the largest variables. Above the limit, a child process that holds more than the kernel is killed alone; otherwise the running cell is interrupted and top-level variables of 256 MB or more are deleted, largest first, until the kernel is back under 60%. If the tree is still over the limit 10 seconds later, or passes 1.5x the limit, the kernel and all its processes are killed and the next cell starts a fresh kernel. Each message tells the model what was stopped, the cell line that was running, memory before and after, which variables were deleted (with shape and dtype for arrays and frames) or, after a kill, which the kernel held, why, and what to do next. An action taken while no cell runs is reported at the top of the next cell result. Each action is logged to `kernel-stderr.log` in the session directory.
+
 ### Daemon
 
 | Setting | Type | Default | Description |
