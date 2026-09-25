@@ -23,7 +23,10 @@ function record(value: unknown): Record<string, unknown> {
 	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
-/** Read `w7-manifest.json` (tickets with blocked_by) and `mint-plan.json` (contracts). Tickets without a contract are skipped. */
+/**
+ * Read `w7-manifest.json` (tickets with blocked_by) and `mint-plan.json` (contracts). Tickets without a contract are
+ * skipped. Every blocker is kept as written; `launchTickets` refuses one it cannot resolve.
+ */
 export function readLauncherTickets(
 	manifestPath: string,
 	planPath: string,
@@ -36,7 +39,6 @@ export function readLauncherTickets(
 	const tickets: LauncherTicket[] = [];
 	const skipped: string[] = [];
 	const rows = Array.isArray(manifest.tickets) ? manifest.tickets.map(record) : [];
-	const keys = new Set(rows.map((row) => bare(String(row.key ?? row.identifier ?? ""))));
 	for (const row of rows) {
 		const key = bare(String(row.key ?? row.identifier ?? ""));
 		const contract = contracts.get(key);
@@ -56,9 +58,7 @@ export function readLauncherTickets(
 					: typeof contract.review_tier === "string"
 						? contract.review_tier
 						: undefined,
-			blockedBy: (Array.isArray(row.blocked_by) ? row.blocked_by : [])
-				.map((b: unknown) => bare(String(b)))
-				.filter((b: string) => keys.has(b)),
+			blockedBy: (Array.isArray(row.blocked_by) ? row.blocked_by : []).map((b: unknown) => bare(String(b))),
 		});
 	}
 	return { tickets, skipped };
@@ -75,13 +75,34 @@ export function readLauncherSettings(path: string): OneironLauncherSettings {
 		throw new Error("launcher.host must name a configured host");
 	if (value.idleMs !== undefined && (!Number.isSafeInteger(value.idleMs) || value.idleMs < 60_000))
 		throw new Error("launcher.idleMs must be at least 60000; it is silence detection, never a work limit");
+	const flags = value as unknown as Record<string, unknown>;
+	for (const field of ["noStacks", "skipFactoryTests", "skipBots", "preMergeReview"])
+		if (flags[field] !== undefined && typeof flags[field] !== "boolean")
+			throw new Error(`launcher.${field} must be true or false`);
+	// Only a lone pull request's merge waits for its required checks; a stack merge would go untested.
+	if (value.skipFactoryTests && !value.noStacks)
+		throw new Error(
+			"launcher.skipFactoryTests needs launcher.noStacks: the required-check gate covers lone pull requests",
+		);
+	// Every build host without its own `jobs` takes cargoJobs, so it carries the same bounds.
+	if (
+		value.cargoJobs !== undefined &&
+		(!Number.isSafeInteger(value.cargoJobs) || value.cargoJobs < 1 || value.cargoJobs > 64)
+	)
+		throw new Error("launcher.cargoJobs must be an integer from 1 to 64");
 	if (value.buildHosts !== undefined) {
 		if (!Array.isArray(value.buildHosts)) throw new Error("launcher.buildHosts must be an array");
 		for (const host of value.buildHosts) {
-			if (!host || typeof host.sshHost !== "string" || !host.sshHost.trim() || host.sshHost.includes(":"))
-				throw new Error("launcher.buildHosts[].sshHost must be an ssh destination without a colon");
-			if (typeof host.root !== "string" || !isAbsolute(host.root))
+			if (!host || typeof host.sshHost !== "string" || !host.sshHost.trim() || /[:;\s]/.test(host.sshHost))
+				throw new Error("launcher.buildHosts[].sshHost must be `local` or an ssh destination without a colon");
+			if (typeof host.root !== "string" || !isAbsolute(host.root) || host.root.includes(";"))
 				throw new Error("launcher.buildHosts[].root must be an absolute path");
+			for (const field of ["slots", "jobs"] as const)
+				if (
+					host[field] !== undefined &&
+					(!Number.isSafeInteger(host[field]) || host[field]! < 1 || host[field]! > 64)
+				)
+					throw new Error(`launcher.buildHosts[].${field} must be an integer from 1 to 64`);
 		}
 	}
 	return value;
@@ -104,7 +125,10 @@ export function ticketEntryArgv(): string[] {
 export const SUBMIT_TIMEOUT_MS = 72 * 3_600_000;
 export const MERGE_TIMEOUT_MS = 72 * 3_600_000;
 
-/** Two actions per ticket: submit (writer through bots) and merge. blocked_by edges become dependencies on both. */
+/**
+ * Two actions per ticket: submit (writer through bots) and merge. A blocker's merge gates the merge; its submit gates
+ * the submit, or its merge under `noStacks`, so no child starts on an unmerged parent.
+ */
 export function launcherPlan(
 	tickets: LauncherTicket[],
 	settings: OneironLauncherSettings,
@@ -139,7 +163,7 @@ export function launcherPlan(
 				description: `${stage} ${ticket.key}: ${ticket.title}`,
 				dependencies:
 					stage === "submit"
-						? parents.map((p) => `${p}:submit`)
+						? parents.map((p) => `${p}:${settings.noStacks ? "merge" : "submit"}`)
 						: [`${ticket.key}:submit`, ...parents.map((p) => `${p}:merge`)],
 				sourceFingerprint: `ticket:${ticket.key}:${stage}`,
 				command: {
@@ -152,6 +176,19 @@ export function launcherPlan(
 		}
 	}
 	return { version: 1, tickets: tickets.map((t) => ({ id: t.key, owner: "launcher" })), slots, actions };
+}
+
+/** Blockers that are neither a ticket of this launch nor one the factory already knows. Dropping them would start the dependent at once. */
+export function missingBlockers(
+	tickets: LauncherTicket[],
+	known: Set<string>,
+): Array<{ key: string; blocker: string }> {
+	const launched = new Set(tickets.map((ticket) => ticket.key));
+	return tickets.flatMap((ticket) =>
+		ticket.blockedBy
+			.filter((blocker) => !launched.has(blocker) && !known.has(blocker))
+			.map((blocker) => ({ key: ticket.key, blocker })),
+	);
 }
 
 /**
@@ -167,6 +204,11 @@ export function launchTickets(
 	entryArgv = ticketEntryArgv(),
 ): { imported: string[]; existing: string[]; rewritten: string[]; frozen: string[]; revision: number } {
 	const known = new Set(store.tickets().map((t) => t.id));
+	const missing = missingBlockers(tickets, known);
+	if (missing.length)
+		throw new Error(
+			`launch refused, nothing was imported: ${missing.map(({ key, blocker }) => `ticket ${key} is blocked by ${blocker}, which this launch does not carry (absent from the manifest or without a contract) and the factory does not know`).join("; ")}`,
+		);
 	const plan = launcherPlan(tickets, settings, entryArgv, known);
 	const frozen = plan.actions.filter((action) => store.actionStarted(action.id)).map((action) => action.id);
 	const kept = new Set(frozen);

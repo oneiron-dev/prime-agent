@@ -7,13 +7,14 @@ import {
 	openSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statfsSync,
 	unlinkSync,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
 	type FixCategory,
@@ -24,6 +25,7 @@ import {
 	type RoutingSeats,
 	routeReviewTier,
 	routeTrivialFix,
+	routeWriterContinuation,
 	routingSeatsFromEnvironment,
 } from "../routing.js";
 import {
@@ -33,6 +35,7 @@ import {
 	locateFactoryCli,
 } from "../runtime.js";
 import { fetchOneironBotReviews, type OneironBotComment, REQUIRED_REVIEWERS } from "./oneiron-review.js";
+import { acknowledgePendingWriter, pendingWriterPath, waitForPendingWriter } from "./pending-writer.js";
 
 /** One model seat: a prime-agent print session, or any command that takes the prompt as its last argument. */
 export type OneironSeat = { provider: string; model: string; thinking: string } | { command: string[] };
@@ -52,23 +55,46 @@ export interface OneironLauncherSettings {
 	buildSlots?: number;
 	cargoJobs?: number;
 	diskFloorGiB?: number;
-	seats?: Partial<Record<"writer" | "pack" | "grok" | "opus", OneironSeat>>;
+	seats?: Partial<Record<SeatName, OneironSeat>>;
 	/**
 	 * Silence, never a clock. A seat or cargo run whose stream produces nothing for this long is killed and the
 	 * round continues in the same session. A model that is still working is never interrupted.
 	 */
 	idleMs?: number;
-	/** Ordered build hosts for cargo. The first reachable one runs it; an empty list keeps cargo on this host. */
+	/**
+	 * Ordered build hosts for cargo. The first one with a free slot runs a call; a call waits while every reachable
+	 * host is full. An empty list keeps cargo on this host.
+	 */
 	buildHosts?: OneironBuildHost[];
-	timeouts?: Partial<{ ghMs: number; botsMs: number }>;
+	/** gh and git calls; the bot poll; the required-check wait before a merge. */
+	timeouts?: Partial<{ ghMs: number; botsMs: number; ciMs: number }>;
+	/**
+	 * No stacks: every ticket branches from the trunk, its submit waits until every blocker merged, it opens with
+	 * `gh pr create --base <trunk>` and merges with `gh pr merge --squash`. No `gh stack` call runs. Default off.
+	 */
+	noStacks?: boolean;
+	/**
+	 * The factory runs no cargo tests of its own: the pull request's required checks gate the merge, which waits for
+	 * them at the exact head. A ticket that touches no crate no longer fails "zero tests ran". Needs `noStacks`.
+	 */
+	skipFactoryTests?: boolean;
+	/** No CodeRabbit request, no bot wait and no bot round. */
+	skipBots?: boolean;
+	/** One more review on the review seat (`grok`) of the exact head right before the merge; only LANDABLE merges. */
+	preMergeReview?: boolean;
 }
 /** A host that runs cargo for this factory: the worktree is synced to `<root>/wt/<key>` and cargo runs there. */
 export interface OneironBuildHost {
-	/** ssh destination, e.g. `olety@100.124.216.116`. */
+	/** ssh destination, e.g. `olety@100.124.216.116`, or `local` for this host. */
 	sshHost: string;
-	/** Absolute directory on that host; build trees live under `<root>/wt/<key>`. */
+	/** Absolute directory on that host: build trees under `<root>/wt/<key>`, or `<root>/target/<key>` for `local`. */
 	root: string;
+	/** Cargo calls this host runs at once (default 2). */
+	slots?: number;
+	/** Cargo jobs per call on this host (default `cargoJobs`). */
+	jobs?: number;
 }
+export const DEFAULT_BUILD_HOST_SLOTS = 2;
 export interface OneironTicketRun {
 	version: 1;
 	key: string;
@@ -90,7 +116,7 @@ export interface OneironTicketState {
 	pack?: boolean;
 	writer?: { rounds: number; final: string };
 	split?: string;
-	tests?: { crates: string[]; ran: number; rounds: number };
+	tests?: { crates: string[]; ran: number; rounds: number; skipped?: true };
 	/** Seats killed for silence, newest last. A working model never lands here. */
 	idleKills?: Array<{ at: string; step: string; idleMs: number }>;
 	review?: { tier: RoutingAnswer<ReviewTier>; verdicts: Record<string, string>; fixRound?: boolean; recheck?: string };
@@ -102,18 +128,25 @@ export interface OneironTicketState {
 	coderabbit?: "requested" | "failed";
 	bots?: { completed: string[]; unavailable: string[]; comments: number; waitedMs: number };
 	botRound?: { final: string; head: string };
+	/** The last pre-merge review: the head it read and its verdict line. */
+	preMerge?: { head: string; verdict: string };
 	merged?: boolean;
 	failure?: string;
 }
 
-export const DEFAULT_SEATS: Record<"writer" | "pack" | "grok" | "opus", OneironSeat> = {
+export type SeatName = "writer" | "pack" | "grok" | "opus";
+/** Tier two's single reviewer slot, so the pre-merge review runs on the model that reviewed at PR open. */
+const PRE_MERGE_SEAT = "grok";
+/** The seats a review tier can name. `grok` is only the slot name; the launcher decides its model. */
+export type ReviewSeat = "grok" | "opus";
+export const DEFAULT_SEATS: Record<SeatName, OneironSeat> = {
 	writer: { provider: "cpa-r", model: "gpt-6-astra", thinking: "xhigh" },
 	pack: { provider: "cpa-r", model: "muse-spark-1.3-contributor", thinking: "max" },
 	grok: { provider: "cpa-r", model: "grok-4.6", thinking: "xhigh" },
 	opus: { provider: "cpa-r", model: "claude-opus-5", thinking: "xhigh" },
 };
 /** gh and git are network calls, not models; they keep a wall clock. Nothing that runs a model does. */
-const DEFAULT_TIMEOUTS = { ghMs: 300_000, botsMs: 2_700_000 };
+const DEFAULT_TIMEOUTS = { ghMs: 300_000, botsMs: 2_700_000, ciMs: 2_700_000 };
 /** No event on a seat's stream for this long means the seat is gone, not thinking. */
 export const DEFAULT_IDLE_MS = 30 * 60_000;
 /** A round that writes nothing at all and exits non-zero is a seat that cannot start; enough of them is a failure. */
@@ -132,7 +165,7 @@ export const SEAT_POLICY_LINE =
 export const WRITER_LINES = [
 	"Use one coherent implementation, the smallest test that can falsify changed behavior plus required compile/typecheck. Reuse green evidence. Skip broad, redundant, ceremonial, and unchanged-byte tests.",
 	"A plan is not work. A status report is not work.",
-	"Do the whole contract. Only if a genuinely separate piece remains after the work, end with `SPLIT: <what remains>`.",
+	"Do the whole contract. Only if a genuinely separate piece remains after the work, write `SPLIT: <what remains>` on its own line before your completion line.",
 	"Never edit the docs repo. Leave implementation notes in `impl-notes/<ticket>.md` in the engine repo (decisions, where the canon page was stale or wrong, what it should say); they ride the PR.",
 	"No attribution lines in commits or PR text.",
 ].join(" ");
@@ -142,6 +175,18 @@ const ATTRIBUTION =
 	/co-authored-by|generated with \[?claude|generated-by|🤖|signed-off-by: .*(?:claude|codex|astra|gpt)/i;
 
 export class TicketFailure extends Error {}
+export type MergeReadiness = "merged" | "conflicting" | "behind" | "ready" | "pending";
+const SHA = /^[0-9a-f]{40}$/;
+interface MergeRepairReceipt {
+	head?: string;
+	remoteHead?: string;
+	fixSessionPath?: string;
+	messageId?: string;
+	mode?: "initial-fix-merge" | "post-ci-repair";
+	failedCiHead?: string;
+	runId?: number;
+	jobId?: number;
+}
 
 type Logger = (step: string, message?: string) => void;
 interface Exec {
@@ -149,8 +194,21 @@ interface Exec {
 	output: string;
 }
 
+type ContentBlock = { type?: unknown; text?: unknown };
+function contentText(content: ContentBlock[]): string {
+	return content
+		.filter((block) => block?.type === "text" && typeof block.text === "string")
+		.map((block) => block.text as string)
+		.join("");
+}
+
+/**
+ * The text of the last assistant reply of a turn that ended. A reply that called a tool, was cut off or errored
+ * leaves nothing, and so does a stream without `agent_end`: earlier commentary is never reused as the final.
+ */
 export function finalAssistantText(jsonl: string): string {
 	let final = "";
+	let ended = false;
 	for (const line of jsonl.split("\n")) {
 		if (!line.trim()) continue;
 		let event: unknown;
@@ -160,19 +218,112 @@ export function finalAssistantText(jsonl: string): string {
 			continue;
 		}
 		if (!event || typeof event !== "object") continue;
-		const record = event as Record<string, unknown>;
+		const record = event as { type?: unknown; message?: Record<string, unknown> };
+		// Compaction and harness metadata can arrive after agent_end; it is not a new turn.
+		if ((record.type === "message_start" || record.type === "message_end") && record.message?.role === "custom")
+			continue;
+		if (record.type === "agent_start" || record.type === "message_start") {
+			ended = false;
+			final = "";
+		}
+		if (record.type === "agent_end") {
+			ended = true;
+			continue;
+		}
 		if (record.type !== "message_end") continue;
-		const message = record.message as Record<string, unknown> | undefined;
-		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
-		const text = message.content
-			.filter(
-				(block: unknown) => !!block && typeof block === "object" && (block as { type?: string }).type === "text",
-			)
-			.map((block: unknown) => String((block as { text?: unknown }).text ?? ""))
-			.join("");
-		if (text.trim()) final = text;
+		ended = false;
+		final = "";
+		const message = record.message;
+		if (
+			message?.role !== "assistant" ||
+			message.stopReason !== "stop" ||
+			!Array.isArray(message.content) ||
+			(message.content as ContentBlock[]).some((block) => block?.type === "toolCall")
+		)
+			continue;
+		final = contentText(message.content as ContentBlock[]);
 	}
-	return final;
+	return ended ? final : "";
+}
+
+/** Lines of `text` that sit outside fenced code blocks; fence markers themselves are dropped. */
+function unfencedLines(text: string): { lines: string[]; open: boolean } {
+	const lines: string[] = [];
+	let fence: string | undefined;
+	for (const line of text.split(/\r?\n/)) {
+		const marker = line.match(/^ {0,3}(`{3,}|~{3,})/)?.[1];
+		if (marker) {
+			if (!fence) fence = marker;
+			else if (marker[0] === fence[0] && marker.length >= fence.length) fence = undefined;
+			lines.push("");
+			continue;
+		}
+		lines.push(fence ? "" : line);
+	}
+	return { lines, open: fence !== undefined };
+}
+
+export type WriterTerminal = { kind: "done"; line: string } | { kind: "blocked"; line: string; why: string };
+/**
+ * A writer reply is terminal only when its last non-empty line, outside any code fence, is exactly `DONE <key>` or
+ * `BLOCKED <key>: <why>`. The same words anywhere else, inside a fence or with other text on the line are not.
+ */
+export function writerTerminal(final: string, key: string): WriterTerminal | undefined {
+	const { lines, open } = unfencedLines(final);
+	if (open) return undefined;
+	const raw = final.split(/\r?\n/);
+	for (let index = lines.length - 1; index >= 0; index--) {
+		if (!raw[index]!.trim()) continue;
+		const line = lines[index]!.trimEnd();
+		if (line === `DONE ${key}`) return { kind: "done", line };
+		const blocked = `BLOCKED ${key}: `;
+		if (line.startsWith(blocked) && line.slice(blocked.length).trim())
+			return { kind: "blocked", line, why: line.slice(blocked.length).trim() };
+		return undefined;
+	}
+	return undefined;
+}
+
+/**
+ * The one standalone `VERDICT: LANDABLE|DEFECTS` line of a reviewer's final reply, outside code fences. None, or
+ * two that disagree, is no verdict. Only terminal assistant text is inspected, never a raw event stream.
+ */
+export function reviewVerdict(final: string): "LANDABLE" | "DEFECTS" | undefined {
+	const verdicts = new Set<"LANDABLE" | "DEFECTS">();
+	for (const line of unfencedLines(final).lines) {
+		const match = line.match(/^VERDICT:[ \t]*(LANDABLE|DEFECTS)[ \t]*$/)?.[1];
+		if (match) verdicts.add(match as "LANDABLE" | "DEFECTS");
+	}
+	return verdicts.size === 1 ? [...verdicts][0] : undefined;
+}
+
+interface SessionEntry {
+	type?: string;
+	id?: string;
+	cwd?: string;
+	timestamp?: string;
+	rlmDepth?: number;
+	git?: { commit?: string };
+	message?: {
+		role?: string;
+		stopReason?: string;
+		content?: ContentBlock[];
+		responseId?: string;
+		provider?: string;
+		model?: string;
+		usage?: unknown;
+		errorMessage?: string;
+	};
+}
+function sessionEntries(path: string): SessionEntry[] {
+	return readFileSync(path, "utf8")
+		.split("\n")
+		.filter((line) => line.trim())
+		.map((line) => JSON.parse(line) as SessionEntry);
+}
+/** Whether a session directory already holds a session file, i.e. a later seat call continues it. */
+function hasSessionFile(directory: string): boolean {
+	return existsSync(directory) && readdirSync(directory).some((file) => file.endsWith(".jsonl"));
 }
 
 function readState(path: string): OneironTicketState | undefined {
@@ -246,6 +397,8 @@ export class OneironTicketRunner {
 			now?: () => number;
 			/** Pause after a round whose seat process failed to start or died. Never a limit on the work itself. */
 			retryDelayMs?: number;
+			/** How often a runner waiting on its blockers re-reads their state (default one minute). */
+			waitMs?: number;
 		} = {},
 	) {
 		const l = ticket.launcher;
@@ -262,6 +415,10 @@ export class OneironTicketRunner {
 			diskFloorGiB: l.diskFloorGiB ?? 100,
 			seats: { ...DEFAULT_SEATS, ...l.seats },
 			idleMs: l.idleMs ?? DEFAULT_IDLE_MS,
+			noStacks: l.noStacks ?? false,
+			skipFactoryTests: l.skipFactoryTests ?? false,
+			skipBots: l.skipBots ?? false,
+			preMergeReview: l.preMergeReview ?? false,
 			buildHosts: l.buildHosts ?? [],
 			timeouts: { ...DEFAULT_TIMEOUTS, ...l.timeouts },
 		};
@@ -320,6 +477,8 @@ export class OneironTicketRunner {
 			env?: Record<string, string>;
 			logName?: string;
 			onIdle?: (idleMs: number) => void;
+			/** Written to the child's stdin, then closed; without it stdin is /dev/null. */
+			input?: string;
 		} = {},
 	): Promise<Exec> {
 		const cwd = options.cwd ?? this.worktree;
@@ -329,9 +488,16 @@ export class OneironTicketRunner {
 			const child = spawn(argv[0]!, argv.slice(1), {
 				cwd,
 				env: { ...(this.options.env ?? process.env), ...options.env, GIT_OPTIONAL_LOCKS: "0" },
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 			});
 			let output = "";
+			let inputError: Error | undefined;
+			if (options.input !== undefined) {
+				child.stdin?.on("error", (error) => {
+					inputError = error;
+				});
+				child.stdin?.end(options.input);
+			}
 			let expired = false;
 			let timer: NodeJS.Timeout;
 			const arm = () => {
@@ -351,8 +517,8 @@ export class OneironTicketRunner {
 				output += chunk.toString();
 				if (output.length > 64 * 1024 * 1024) output = output.slice(-32 * 1024 * 1024);
 			};
-			child.stdout.on("data", collect);
-			child.stderr.on("data", collect);
+			child.stdout!.on("data", collect);
+			child.stderr!.on("data", collect);
 			child.on("error", (error) => {
 				clearTimeout(timer);
 				resolve({ code: 127, output: `${output}\n${error.message}` });
@@ -363,16 +529,22 @@ export class OneironTicketRunner {
 					appendFileSync(join(this.directory, "logs", options.logName), `\n=== ${argv.join(" ")}\n${output}`);
 				const note = idleMs === undefined ? "TIMEOUT" : `IDLE ${Math.round(idleMs / 1000)}s`;
 				resolve({
-					code: expired ? (idleMs === undefined ? 124 : SEAT_IDLE_EXIT_CODE) : (code ?? (signal ? 128 : 1)),
-					output: expired ? `${output}\n${note}` : output,
+					code: expired
+						? idleMs === undefined
+							? 124
+							: SEAT_IDLE_EXIT_CODE
+						: inputError
+							? 127
+							: (code ?? (signal ? 128 : 1)),
+					output: expired ? `${output}\n${note}` : inputError ? `${output}\nstdin: ${inputError.message}` : output,
 				});
 			});
 		});
 	}
 	/**
 	 * The ruled build order, as environment. The wrapper shipped beside this module goes first on PATH, so both
-	 * this runner's own cargo and every cargo the writers call from their worktree land on a build host.
-	 * With no build hosts configured nothing is prepended and cargo stays on this host.
+	 * this runner's own cargo and every cargo the writers call from their worktree land on a build host, within that
+	 * host's slots and job budget. With no build hosts configured nothing is prepended and cargo stays on this host.
 	 */
 	cargoEnvironment(): Record<string, string> {
 		const hosts = this.settings.buildHosts;
@@ -381,7 +553,12 @@ export class OneironTicketRunner {
 		return {
 			PATH: `${factoryCargoBinDirectory()}:${path}`,
 			W7_CARGO_WORK: this.settings.work,
-			W7_CARGO_HOSTS: hosts.map((h) => `${h.sshHost}:${h.root}`).join(";"),
+			W7_CARGO_HOSTS: hosts
+				.map(
+					(h) =>
+						`${h.sshHost}:${h.slots ?? DEFAULT_BUILD_HOST_SLOTS}:${h.jobs ?? this.settings.cargoJobs}:${h.root}`,
+				)
+				.join(";"),
 		};
 	}
 	private async git(args: string[], cwd = this.worktree): Promise<string> {
@@ -410,10 +587,17 @@ export class OneironTicketRunner {
 	 * from another terminal while this stream is consumed, or an explicit command. The only guard is silence.
 	 */
 	async seat(
-		name: "writer" | "pack" | "grok" | "opus",
+		name: SeatName,
 		prompt: string,
-		options: { system?: string; session?: string; continueSession?: boolean; logName: string },
-	): Promise<{ code: number; final: string; bytes: number; idle: boolean }> {
+		options: {
+			system?: string;
+			session?: string;
+			continueSession?: boolean;
+			/** An absolute session file to continue instead of the newest one in `session`. */
+			resumeSession?: string;
+			logName: string;
+		},
+	): Promise<{ code: number; final: string; bytes: number; idle: boolean; activity: boolean }> {
 		const spec = this.settings.seats[name] ?? DEFAULT_SEATS[name];
 		const logPath = join(this.directory, "logs", options.logName);
 		let argv: string[];
@@ -440,26 +624,29 @@ export class OneironTicketRunner {
 				"--no-extensions",
 				"--no-skills",
 				...(options.session ? ["--session-dir", join(this.directory, "sessions", options.session)] : []),
-				...(options.continueSession ? ["-c"] : []),
+				...(options.resumeSession ? ["--resume", options.resumeSession] : options.continueSession ? ["-c"] : []),
 				...(options.system ? ["--append-system-prompt", options.system] : []),
-				"--",
-				prompt,
 			];
 		}
 		const step = options.logName.replace(/\.jsonl$/, "");
 		const result = await this.run(argv, {
+			// Print mode reads a piped prompt; a review diff in argv can exceed the per-argument limit (E2BIG).
+			input: "command" in spec ? undefined : prompt,
 			idleMs: this.settings.idleMs,
 			env: { ...factoryOwnedEnvironment(), ...this.cargoEnvironment() },
 			onIdle: (idleMs) => this.noteIdle(step, idleMs),
 		});
 		writeFileSync(logPath, result.output, { flag: "a" });
-		const final =
-			"command" in spec ? result.output.trim() : finalAssistantText(result.output) || tail(result.output, 40);
+		// Never the raw stream: it carries the prompts, which quote the completion line.
+		const final = "command" in spec ? result.output.trim() : finalAssistantText(result.output);
 		return {
 			code: result.code,
 			final,
 			bytes: Buffer.byteLength(result.output),
 			idle: result.code === SEAT_IDLE_EXIT_CODE,
+			// The session started, ran tools or delegated: a review that did this and then failed is incomplete, not
+			// absent. A long think streams nothing under the factory profile, so agent_start is the proof it began.
+			activity: /"type"\s*:\s*"(?:agent_start|tool_execution_start|rlm_child_update)"/.test(result.output),
 		};
 	}
 	/** A seat that went silent is killed and journaled; the round continues in the same session. */
@@ -498,7 +685,6 @@ Return the pack as markdown under 5000 words. Your final message is the pack.`;
 		return `You are the Astra coding seat for one ticket. ${SEAT_POLICY_LINE} ${INITIATIVE_LINES} ${WRITER_LINES}`;
 	}
 	writerPrompt(): string {
-		const { key } = this.ticket;
 		return `${this.ticketHeader()}
 Context pack: .w7/CONTEXT.md (Muse wrote it; read it first). The docs are the intent; the code is what is.
 
@@ -512,10 +698,16 @@ Rules:
 7. If something cannot be done, one line \`COULD NOT: <what and why>\`, and still commit what works.
 ${WRITER_LINES}
 ${INITIATIVE_LINES}
-End your final reply with the exact line \`DONE ${key}\` (or \`BLOCKED ${key}\` with one reason).`;
+${this.completionRule()}`;
+	}
+	/** The only words that end a writer's rounds; see `writerTerminal`. */
+	completionRule(): string {
+		const { key } = this.ticket;
+		return `The last line of your final reply, outside any code fence, is exactly \`DONE ${key}\`, or \`BLOCKED ${key}: <why>\` when no useful authorized path remains. Nothing after it. Any other reply continues this session.`;
 	}
 	fixPrompt(what: string, output: string): string {
-		return `Same ticket ${this.ticket.key}, same worktree. ${what} Fix it, keep commits small, commit, run the tests of the crates you touched, and stop with the exact line \`DONE ${this.ticket.key}\`.
+		return `Same ticket ${this.ticket.key}, same worktree. ${what} Fix it, keep commits small, commit and run the tests of the crates you touched.
+${this.completionRule()}
 ${INITIATIVE_LINES}
 Output tail:
 ${tail(output, 160)}`;
@@ -539,35 +731,40 @@ ${diff}`;
 			)
 			.join("\n\n");
 		return `Same ticket ${this.ticket.key}, same worktree, pull request ${repo}#${pr} (branch ${this.branch}).
-Below is EVERY bot comment on the pull request, unfiltered. Read each one and decide it on the merits.
-For every real defect: fix it in this worktree, commit with a plain message, and run the tests of the crates you touched.
+Below is EVERY bot comment on the pull request, unfiltered. It is a snapshot, not proof that all current feedback is gathered.
+Before any fix, fetch and read the latest complete Qodo, Codex and CodeRabbit reviews, pull request comments, inline comments and review threads (with pagination), and this ticket's internal reviewer findings. Read every finding in full, deduplicate overlapping defects across sources, and decide each distinct finding on its merits before editing. Keep the source comment ids when deduplicating so no feedback disappears. A pending or queued bot review is not an unavailable one; a bot is unavailable only on its own explicit quota or provider failure, which you cite, and you never invent its success or predict its exhaustion.
+For every real defect: fix it in this worktree, commit with a plain message, and run the tests of the crates you touched. Skip an invalid or inapplicable finding only with an explicit reason.
 Reply on each inline thread with what you did or why not: \`gh api repos/${repo}/pulls/${pr}/comments/<id>/replies -f body=<text>\` for review_comment entries.
-Then post exactly one summary comment on the pull request: \`gh pr comment ${pr} --repo ${repo} --body <text>\` listing each comment id and its disposition.
+After the fixes, post exactly one summary comment on the pull request: \`gh pr comment ${pr} --repo ${repo} --body <text>\`. Map each source comment id and each internal finding to its disposition, say what changed, what was skipped and why, and the validation you ran with its actual result. Never claim validation that did not run. Before you stop, fetch the bot comments again: a comment a bot edited in place, or a review of a newer head, counts in its latest form.
 Never push, never merge, never close the pull request; the launcher pushes after you stop.
 ${WRITER_LINES}
 ${INITIATIVE_LINES}
-End with the exact line \`DONE ${this.ticket.key}\`.
+${this.completionRule()}
 
 ${rendered || "(no bot comments)"}`;
 	}
 
 	// ---- git -----------------------------------------------------------------------------------------------------
+	/**
+	 * The trunk once every blocker merged. With stacks, the branch of the one unmerged submitted blocker; with
+	 * `noStacks`, never: the runner waits until every blocker merged, whatever the factory's own dependencies say.
+	 */
 	private async chooseBase(): Promise<{ base: string; stacked: boolean; chain: string[] }> {
 		const remoteTrunk = `${this.settings.remote}/${this.settings.trunk}`;
 		for (let waited = 0; ; waited++) {
 			const parents = this.blockers().map((key) => ({ key, state: this.stateOf(key) }));
 			const unmerged = parents.filter((p) => !p.state?.merged);
 			if (unmerged.length === 0) return { base: remoteTrunk, stacked: false, chain: [] };
-			if (unmerged.length === 1 && unmerged[0]!.state?.pr) {
+			if (!this.settings.noStacks && unmerged.length === 1 && unmerged[0]!.state?.pr) {
 				const parent = unmerged[0]!.state!;
 				return { base: parent.branch, stacked: true, chain: [...(parent.chain ?? []), parent.branch] };
 			}
 			if (waited % 10 === 0)
 				this.log(
 					"base",
-					`waiting: ${unmerged.length} blockers unmerged (${unmerged.map((p) => `${p.key}:${p.state?.pr ? "submitted" : "not submitted"}`).join(", ")})`,
+					`waiting${this.settings.noStacks ? " for every blocker to merge (noStacks)" : ""}: ${unmerged.length} blockers unmerged (${unmerged.map((p) => `${p.key}:${p.state?.pr ? "submitted" : "not submitted"}`).join(", ")})`,
 				);
-			await sleep(60_000);
+			await sleep(this.options.waitMs ?? 60_000);
 		}
 	}
 	private async cutWorktree(): Promise<void> {
@@ -622,44 +819,151 @@ ${rendered || "(no bot comments)"}`;
 		this.save({ pack: true });
 		this.log("pack", `rc=${result.code} bytes=${Buffer.byteLength(result.final)}`);
 	}
+	private routing(): RoutingSeats {
+		return this.options.routing ?? routingSeatsFromEnvironment(this.options.env ?? process.env);
+	}
 	/**
-	 * Rounds of one session until the writer says DONE; a fresh session name starts a fresh writer. Rounds are
-	 * unbounded: a writer holding an ultralarge packet may work for many hours and no count may end it. The only
-	 * exit that is not the writer's own is a run of rounds that produced no stream at all, which is a seat that
-	 * cannot start rather than a model that is still working.
+	 * Rounds of one session until the writer's last line is `DONE <key>` or `BLOCKED <key>: <why>`; a fresh session
+	 * name starts a fresh writer. Any other reply continues the session: Jev and the Grok advisor only tell a plain
+	 * continuation from a named split remainder, never a terminal verdict. Rounds are unbounded: a writer holding an
+	 * ultralarge packet may work for many hours and no count may end it. The only exit that is not the writer's own
+	 * is a run of rounds that produced no stream at all, which is a seat that cannot start rather than a model that
+	 * is still working.
 	 */
-	async writerRounds(session: string, prompt: string, continueLine: string): Promise<string> {
+	async writerRounds(
+		session: string,
+		prompt: string,
+		continueLine: string,
+	): Promise<{ final: string; split?: string }> {
 		const { key } = this.ticket;
 		let final = "";
+		let split: string | undefined;
 		let silent = 0;
+		// A runner restarted after a crash or a relaunch continues the writer it had, never a blank one.
+		const prior = hasSessionFile(join(this.directory, "sessions", session));
+		if (prior) this.log(`writer:${session}`, "continuing the existing session");
+		const pendingPath = pendingWriterPath(this.directory, session);
+		if (existsSync(pendingPath) && !prior)
+			throw new TicketFailure(
+				`pending validation has no retained writer session ${session}; reconcile custody instead of starting a replacement`,
+			);
+		const wait = async () => {
+			try {
+				return await waitForPendingWriter({
+					directory: this.directory,
+					worktree: this.worktree,
+					ticket: key,
+					session,
+					log: this.log,
+				});
+			} catch (error) {
+				throw new TicketFailure(error instanceof Error ? error.message : String(error));
+			}
+		};
+		let completed = await wait();
 		for (let round = 1; ; round++) {
-			const result = await this.seat("writer", round === 1 ? prompt : continueLine, {
-				system: this.writerSystem(),
-				session,
-				continueSession: round > 1,
-				logName: `${session}.r${round}.jsonl`,
-			});
+			const note = this.resumeNote();
+			const consumed = completed
+				? `Registered validation ${completed.job.jobId} reached its actual terminal condition: exitCode=${completed.terminal.exitCode}, artifact=${completed.job.terminalPath}. Read and assess the retained result. This is NOT a DONE or passing-gate determination. Continue this SAME session; do not relaunch the completed job.`
+				: undefined;
+			const result = await this.seat(
+				"writer",
+				[round === 1 ? prompt : continueLine, note, this.waitInstruction(session, pendingPath), consumed]
+					.filter((part) => part !== undefined)
+					.join("\n\n"),
+				{
+					system: this.writerSystem(),
+					session,
+					continueSession: round > 1 || prior || completed !== undefined,
+					logName: `${session}.r${round}.jsonl`,
+				},
+			);
+			// A spawn failure prints bytes too; only a round whose session started has read the note.
+			if (note !== undefined && (result.code === 0 || result.activity)) this.noteDelivered(note);
 			final = result.final;
 			this.log(
 				`writer:${session}`,
 				`round ${round} rc=${result.code}${result.idle ? " (seat idle)" : ""} bytes=${result.bytes} final=${JSON.stringify(final.slice(-160))}`,
 			);
-			if (final.includes(`DONE ${key}`)) return final;
-			if (final.includes(`BLOCKED ${key}`)) throw new TicketFailure(`writer BLOCKED: ${final.slice(-600)}`);
+			if (completed) {
+				if (result.code !== 0 || result.idle)
+					throw new TicketFailure(
+						`same-session result consumption failed for ${completed.job.jobId}; preserve the pending receipt and terminal evidence before a retry`,
+					);
+				acknowledgePendingWriter(completed);
+				completed = undefined;
+			}
+			// A job the writer registered this round is awaited first: pending work is never DONE, whatever the prose.
+			completed = await wait();
+			if (completed) continue;
+			// A seat that failed or went silent after its last line has not ended its round; the session continues.
+			const clean = result.code === 0 && !result.idle;
+			const terminal = clean ? writerTerminal(final, key) : undefined;
+			if (terminal) {
+				this.journalIntent(session, round, {
+					choice: terminal.kind,
+					decided_by: "code",
+					confidence: null,
+					reason: `exact last line: ${terminal.line}`,
+					wall_clock_ms: 0,
+				});
+				if (terminal.kind === "done") return { final, ...(split ? { split } : {}) };
+				throw new TicketFailure(`writer BLOCKED: ${terminal.line}\n${final.slice(-600)}`);
+			}
+			const intent = clean
+				? await routeWriterContinuation({ key, session, final }, this.routing())
+				: {
+						choice: "continue" as const,
+						decided_by: "code" as const,
+						confidence: null,
+						reason: "the seat did not end its turn cleanly",
+						wall_clock_ms: 0,
+					};
+			this.journalIntent(session, round, intent);
+			// A split names its remainder on a `SPLIT:` line; the classification alone never makes prose a contract.
+			if (intent.choice === "split") split = final.match(/^SPLIT:\s*(.+)$/m)?.[1]?.trim() || split;
 			silent = result.bytes === 0 && result.code !== 0 ? silent + 1 : 0;
 			if (silent >= MAX_SILENT_ROUNDS)
 				throw new TicketFailure(`the writer seat produced no output in ${silent} consecutive rounds`);
-			if (result.code !== 0) await sleep(this.options.retryDelayMs ?? 30_000);
+			// A provider error in JSON mode exits 0 with no reply; without a pause the rounds would spin.
+			if (!clean || !final.trim()) await sleep(this.options.retryDelayMs ?? 30_000);
 		}
 	}
+	/** How a writer hands a durable validation to the factory instead of polling it in model rounds. */
+	private waitInstruction(session: string, pendingPath: string): string {
+		const { key } = this.ticket;
+		return `Productive waiting: when durable validation is actually running and there is no other useful work, register it BEFORE yielding by atomically writing ${pendingPath}. JSON schema: {"version":1,"ticket":"${key}","session":"${session}","jobId":"<unique job id, 8-128 letters/digits/_/->","pid":<actual durable controller PID>,"startId":"proc:<actual /proc/PID/stat starttime field 22>","terminalPath":"<absolute unique terminal artifact under this ticket or worktree>"}. Create parent directories first. Use the real controller identity, never an inferred worker PID or a service MainPID that will change. Its producer must atomically publish terminal JSON (temporary file then rename) with the SAME version/ticket/session/jobId/pid/startId and an integer exitCode, for success OR failure. A terminal schema without that identity is insufficient: bind it in the actual producer, never invent a successful result. Register only a durable controller whose completion does not start another model turn by itself. If that contract is unavailable, report the exact custody gap; do not fake a receipt. The factory waits without model rounds, then resumes this same session to consume the actual result. Do not poll in repeated model rounds, launch duplicate validation, or call pending work DONE. Do not replace an existing unregistered live job merely to use this protocol.`;
+	}
+	/** The owner's note for the next writer round of this ticket, `resume-note.md` in the ticket directory. */
+	private resumeNote(): string | undefined {
+		const path = join(this.directory, "resume-note.md");
+		return (existsSync(path) && readFileSync(path, "utf8").trim()) || undefined;
+	}
+	/** A delivered note is kept, renamed, so it reaches the writer once; a note rewritten meanwhile stays pending. */
+	private noteDelivered(note: string): void {
+		const path = join(this.directory, "resume-note.md");
+		if (this.resumeNote() !== note) return;
+		renameSync(
+			path,
+			join(this.directory, `resume-note.${new Date().toISOString().replace(/[:.]/g, "-")}.delivered.md`),
+		);
+		this.log("resume-note", "delivered to the writer");
+	}
+	private journalIntent(session: string, round: number, answer: RoutingAnswer<string>): void {
+		appendFileSync(
+			join(this.directory, "routing.jsonl"),
+			`${JSON.stringify({ stage: "writer_completion", session, round, ...answer })}\n`,
+		);
+		this.log(`writer:${session}:intent`, `${answer.choice} by ${answer.decided_by}: ${answer.reason}`);
+	}
 	private continueLine(): string {
-		return `Continue the same ticket. Finish and end with the exact line \`DONE ${this.ticket.key}\` or \`BLOCKED ${this.ticket.key}\`. ${INITIATIVE_LINES}`;
+		return `Continue the same ticket. ${this.completionRule()} ${INITIATIVE_LINES}`;
 	}
 	private async write(): Promise<void> {
 		if (this.state.writer) return;
-		const final = await this.writerRounds("write", this.writerPrompt(), this.continueLine());
+		const { final, split: routed } = await this.writerRounds("write", this.writerPrompt(), this.continueLine());
 		await this.commitLeftovers(`${this.ticket.key}: writer leftovers`);
-		const split = final.match(/^SPLIT:\s*(.+)$/m)?.[1]?.trim();
+		const split = final.match(/^SPLIT:\s*(.+)$/m)?.[1]?.trim() || routed;
 		if (split) {
 			writeFileSync(
 				join(this.directory, "split.json"),
@@ -719,9 +1023,25 @@ ${rendered || "(no bot comments)"}`;
 			release();
 		}
 	}
+	/**
+	 * A cargo run that went silent proves nothing about the source: it is an infrastructure failure, never a test
+	 * verdict and never a reason for a fix round. The retained log stays the evidence.
+	 */
+	private idleCargo(result: { code: number; ran: number; output: string }, when: string): void {
+		if (result.code === SEAT_IDLE_EXIT_CODE)
+			throw new TicketFailure(
+				`infrastructure: the cargo run ${when} went idle (rc=${result.code}, ran=${result.ran}); no source verdict and no passing gate. Check the build host and slot custody before a retry; logs/cargo-test.log is the evidence. ${tail(result.output, 12)}`,
+			);
+	}
 	private async tests(label: string): Promise<void> {
+		if (this.settings.skipFactoryTests) {
+			this.log(label, "skipped (skipFactoryTests): the pull request's required checks gate the merge");
+			this.save({ tests: { crates: [], ran: 0, rounds: 0, skipped: true } });
+			return;
+		}
 		let result = await this.cargoTest();
 		this.log(label, `rc=${result.code} ran=${result.ran} crates=${result.crates.join(",")}`);
+		this.idleCargo(result, `for ${label}`);
 		let rounds = 0;
 		if (result.code !== 0) {
 			rounds = 1;
@@ -734,6 +1054,7 @@ ${rendered || "(no bot comments)"}`;
 			);
 			result = await this.cargoTest();
 			this.log(`${label}:2`, `rc=${result.code} ran=${result.ran}`);
+			this.idleCargo(result, `after the ${label} fix round, whose source failure stays unresolved`);
 			if (result.code !== 0)
 				throw new TicketFailure(
 					result.ran === 0
@@ -781,28 +1102,210 @@ ${rendered || "(no bot comments)"}`;
 		}
 		return { lines, hunks: stat.split("\n").filter(Boolean).length };
 	}
-	private async reviewers(tier: ReviewTier, diff: string, logSuffix: string): Promise<Record<string, string>> {
-		const names: Array<"grok" | "opus"> =
-			tier === "grok" ? ["grok"] : tier === "grok_plus_opus" ? ["grok", "opus"] : [];
+	/** The reviewers a tier names; tier one names none. */
+	private tierSeats(tier: ReviewTier): ReviewSeat[] {
+		return tier === "grok" ? ["grok"] : tier === "grok_plus_opus" ? ["grok", "opus"] : [];
+	}
+	private async reviewers(names: ReviewSeat[], diff: string, logSuffix: string): Promise<Record<string, string>> {
 		const prompt = this.reviewPrompt(diff);
 		const verdicts: Record<string, string> = {};
 		await Promise.all(
 			names.map(async (name) => {
-				const result = await this.seat(name, prompt, { logName: `review-${name}${logSuffix}.jsonl` });
-				verdicts[name] =
-					result.code !== 0 || !/VERDICT:/.test(result.final)
-						? `unavailable rc=${result.code}`
-						: /VERDICT:\s*LANDABLE/.test(result.final)
-							? "LANDABLE"
-							: `DEFECTS\n${tail(result.final, 60)}`;
+				verdicts[name] = await this.reviewer(name, prompt, `review-${name}${logSuffix}`);
 				this.log(`review:${name}`, verdicts[name]!.split("\n")[0]!);
 			}),
 		);
 		return verdicts;
 	}
+	/**
+	 * One reviewer in its own session, continued until it returns one standalone verdict line; a reply without one
+	 * is never read as a pass. A seat that could not start is recorded unavailable. A seat that started, ran tools
+	 * or answered and then failed leaves the review incomplete and its session preserved for a same-session resume.
+	 * `sessions/<session>.resume` may point at the review's original session file to continue it in place.
+	 */
+	private async reviewer(name: ReviewSeat, prompt: string, session: string): Promise<string> {
+		const sessionDir = join(this.directory, "sessions", session);
+		const logName = `${session}.jsonl`;
+		const spec = this.settings.seats[name] ?? DEFAULT_SEATS[name];
+		const resumeFile = join(this.directory, "sessions", `${session}.resume`);
+		const resumeSession = existsSync(resumeFile) ? readFileSync(resumeFile, "utf8").trim() : undefined;
+		if (resumeSession !== undefined) {
+			if (!isAbsolute(resumeSession) || !existsSync(resumeSession) || "command" in spec)
+				throw new TicketFailure(`review ${name} invalid native resume pointer: ${resumeFile}`);
+			const header = JSON.parse(readFileSync(resumeSession, "utf8").split("\n")[0] ?? "{}") as SessionEntry;
+			if (header.type !== "session" || !header.id || header.cwd !== this.worktree)
+				throw new TicketFailure(`review ${name} resume pointer is not the original worktree session`);
+		}
+		const completed = await this.completedReview(
+			name,
+			session,
+			sessionDir,
+			join(this.directory, "logs", logName),
+			resumeSession,
+		);
+		if (completed !== undefined) return completed;
+		let continuing = resumeSession !== undefined || hasSessionFile(sessionDir);
+		let pending = continuing;
+		const continuePrompt = `Continue this SAME review for ${this.ticket.key}. Do not start a new review or duplicate delegated reviewers. Recover existing child handles, collect their results and inspect completed child sessions if a reply is missing. Wait for outstanding delegated work before deciding. Never edit files. Return exactly one line \`VERDICT: LANDABLE\` or \`VERDICT: DEFECTS\`, followed by concrete defects with file:line. A progress report is not a verdict.`;
+		const kept = resumeSession ?? sessionDir;
+		for (;;) {
+			const result = await this.seat(name, continuing ? continuePrompt : prompt, {
+				session: resumeSession ? undefined : session,
+				resumeSession,
+				continueSession: continuing,
+				logName,
+			});
+			// The provider returns this refusal as ordinary terminal text, not refusal metadata.
+			if (/^(?:\*\*)?I must decline this request\.(?:\*\*)?(?:\r?\n|$)/.test(result.final.trim()))
+				throw new TicketFailure(
+					`review ${name} explicitly refused the request; review incomplete. Preserve session ${kept} and its findings; no unavailable or passing verdict and no automatic continuation.`,
+				);
+			if (/^\[error:[ \t]*user_prompt_too_long\][ \t]*$/m.test(result.final))
+				throw new TicketFailure(
+					`review ${name} context overflow: provider user_prompt_too_long; preserve session ${kept} and its findings; compact or recover that session before a retry; no verdict accepted`,
+				);
+			if (result.code !== 0) {
+				if (pending || result.final.trim() || result.activity)
+					throw new TicketFailure(
+						`review ${name} incomplete rc=${result.code}; preserve and resume session ${kept}; no verdict accepted`,
+					);
+				return `unavailable rc=${result.code}`;
+			}
+			const verdict = reviewVerdict(result.final);
+			if (verdict) return verdict === "LANDABLE" ? "LANDABLE" : `DEFECTS\n${result.final}`;
+			pending = true;
+			this.log(`review:${name}`, `incomplete rc=0; continuing same session ${session}`);
+			if (!result.final.trim()) await sleep(this.options.retryDelayMs ?? 30_000);
+			if ("command" in spec || (resumeSession === undefined && !hasSessionFile(sessionDir)))
+				throw new TicketFailure(
+					`review ${name} incomplete; no resumable native session; preserve logs and recover before retrying`,
+				);
+			continuing = true;
+		}
+	}
+	/**
+	 * Owner recovery: `sessions/<session>.completed.json` (`head`, `sessionPath`, `messageId`, optional
+	 * `missingSeatReceiptReason`) names a terminal review message already saved in the review's own session. It is
+	 * reconsumed only when it binds this worktree, the current clean head, one successful terminal assistant message
+	 * with one standalone verdict, no newer terminal message, and the seat stream and run.log line that produced it.
+	 */
+	private async completedReview(
+		name: ReviewSeat,
+		session: string,
+		sessionDir: string,
+		logPath: string,
+		resumeSession: string | undefined,
+	): Promise<string | undefined> {
+		const receiptPath = join(this.directory, "sessions", `${session}.completed.json`);
+		if (!existsSync(receiptPath)) return undefined;
+		const invalid = (reason: string) => new TicketFailure(`review ${name} invalid completed receipt: ${reason}`);
+		const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as {
+			head?: string;
+			sessionPath?: string;
+			messageId?: string;
+			missingSeatReceiptReason?: string;
+		};
+		const { head, sessionPath, messageId } = receipt;
+		if (!head || !sessionPath || !messageId || !isAbsolute(sessionPath) || !existsSync(sessionPath))
+			throw invalid("missing canonical session, head or message ID");
+		if (resumeSession ? sessionPath !== resumeSession : !sessionPath.startsWith(`${sessionDir}/`))
+			throw invalid("session is not this review's original root");
+		if (head !== (await this.head()) || (await this.git(["status", "--porcelain"])).trim())
+			throw invalid("reviewed HEAD changed or worktree is dirty");
+		const entries = sessionEntries(sessionPath);
+		const header = entries[0];
+		if (
+			header?.type !== "session" ||
+			header.cwd !== this.worktree ||
+			header.git?.commit !== head ||
+			header.rlmDepth !== 0
+		)
+			throw invalid("canonical root header does not bind this worktree and HEAD");
+		const matches = entries.filter((entry) => entry.id === messageId);
+		if (matches.length !== 1) throw invalid("message ID missing or ambiguous");
+		const entry = matches[0]!;
+		const message = entry.message;
+		if (
+			entry.type !== "message" ||
+			message?.role !== "assistant" ||
+			message.stopReason !== "stop" ||
+			!Array.isArray(message.content) ||
+			message.content.some((block) => block?.type === "toolCall")
+		)
+			throw invalid("not a successful terminal assistant message");
+		const index = entries.indexOf(entry);
+		if (
+			entries
+				.slice(index + 1)
+				.some((later) => later.message?.role === "assistant" && later.message.stopReason === "stop")
+		)
+			throw invalid("a newer terminal assistant message supersedes the receipt");
+		const final = contentText(message.content);
+		const verdict = reviewVerdict(final);
+		if (!verdict) throw invalid("missing or conflicting standalone verdict");
+		if (
+			/\b(?:reviewers?|delegated (?:work|reviews?)) (?:are |is )?(?:still )?(?:running|pending|outstanding)\b|\bI (?:will|must|need to) collect (?:their|the|child|reviewer)\b/i.test(
+				final,
+			)
+		)
+			throw invalid("terminal text contradicts completion of delegated review work");
+		// The seat stream that carried this message must have reached agent_end.
+		let matched = false;
+		let seen = false;
+		let ended = false;
+		for (const line of existsSync(logPath) ? readFileSync(logPath, "utf8").split("\n") : []) {
+			let event: { type?: unknown; message?: unknown };
+			try {
+				event = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (event.type === "agent_start" || event.type === "message_start") matched = false;
+			if (event.type === "message_end") {
+				matched = isDeepStrictEqual(event.message, message);
+				seen ||= matched;
+			}
+			if (event.type === "agent_end" && matched) ended = true;
+		}
+		if (seen && !ended) throw invalid("matching native message lacks terminal stream completion");
+		if (
+			!seen &&
+			!(
+				receipt.missingSeatReceiptReason &&
+				message.responseId &&
+				message.provider &&
+				message.model &&
+				message.usage &&
+				!message.errorMessage
+			)
+		)
+			throw invalid(
+				"no matching seat stream; an explicit missing-receipt reason and native response provenance are required",
+			);
+		const nextUser = entries.slice(index + 1).find((later) => later.message?.role === "user");
+		const after = Date.parse(entry.timestamp ?? "");
+		const before = nextUser ? Date.parse(nextUser.timestamp ?? "") : Number.POSITIVE_INFINITY;
+		const successful = readFileSync(this.logPath, "utf8")
+			.split("\n")
+			.some((line) => {
+				const at = Date.parse(line.match(/^\[([^\]]+)\]/)?.[1] ?? "");
+				return (
+					at >= after &&
+					at <= before &&
+					(line.includes(`review:${name} incomplete rc=0;`) || line.endsWith(`review:${name} ${verdict}`))
+				);
+			});
+		if (seen && !successful) throw invalid("no successful seat receipt for this terminal message");
+		appendFileSync(
+			join(this.directory, "review-reconsumption.jsonl"),
+			`${JSON.stringify({ at: new Date().toISOString(), name, ...receipt, verdict, source: "canonical-native-terminal-message", responseId: message.responseId, seatReceipt: seen ? "native-agent-end-and-rc0" : "missing-after-controller-stop" })}\n`,
+		);
+		this.log(`review:${name}`, `${verdict} (reconsumed original terminal message ${messageId} at ${head})`);
+		return verdict === "LANDABLE" ? "LANDABLE" : `DEFECTS\n${final}`;
+	}
 	private async review(): Promise<void> {
 		if (this.state.review) return;
-		const routing = this.options.routing ?? routingSeatsFromEnvironment(this.options.env ?? process.env);
+		const routing = this.routing();
 		const before = await this.diffAgainstBase();
 		const stat = this.numstat(before.stat);
 		const tier = await routeReviewTier(
@@ -823,7 +1326,7 @@ ${rendered || "(no bot comments)"}`;
 			`${JSON.stringify({ question: "review_tier", ...tier })}\n`,
 		);
 		this.log("review:tier", `${tier.choice} by ${tier.decided_by}`);
-		const verdicts = await this.reviewers(tier.choice, before.diff, "");
+		const verdicts = await this.reviewers(this.tierSeats(tier.choice), before.diff, "");
 		const defects = Object.entries(verdicts).filter(([, v]) => v.startsWith("DEFECTS"));
 		const review: NonNullable<OneironTicketState["review"]> = { tier, verdicts };
 		if (defects.length) {
@@ -853,7 +1356,7 @@ ${rendered || "(no bot comments)"}`;
 			);
 			this.log("review:trivial", `${trivial.choice} by ${trivial.decided_by}`);
 			if (trivial.choice === "review_again") {
-				const again = await this.reviewers(tier.choice, (await this.diffAgainstBase()).diff, "-2");
+				const again = await this.reviewers(this.tierSeats(tier.choice), (await this.diffAgainstBase()).diff, "-2");
 				review.recheck = Object.entries(again)
 					.map(([n, v]) => `${n}: ${v.split("\n")[0]}`)
 					.join("; ");
@@ -1023,7 +1526,7 @@ ${rendered || "(no bot comments)"}`;
 	private async botRound(comments: OneironBotComment[]): Promise<void> {
 		if (this.state.botRound) return;
 		const repo = await this.githubRepo();
-		const final = await this.writerRounds(
+		const { final } = await this.writerRounds(
 			"bots",
 			this.botRoundPrompt(repo, this.state.pr!, comments),
 			this.continueLine(),
@@ -1045,14 +1548,26 @@ ${rendered || "(no bot comments)"}`;
 		this.log("bots:round", `done at ${this.state.submittedHead}`);
 	}
 
+	/** A ticket cut on a stack keeps it: `noStacks` set later must not run `gh stack` or merge past the CI gate. */
+	private refuseStackUnderNoStacks(): void {
+		if (this.settings.noStacks && this.state.stacked)
+			throw new TicketFailure(
+				`${this.ticket.key} was cut on the stack ${this.state.base} before noStacks was set; reset its state and worktree to relaunch it from ${this.settings.trunk}`,
+			);
+	}
 	/** Worktree → pack → writer → tests → review → publish → CodeRabbit → bots → bot round. Exit 0 = submitted. */
 	async submit(): Promise<void> {
+		this.refuseStackUnderNoStacks();
 		await this.cutWorktree();
 		await this.pack();
 		await this.write();
 		await this.tests("tests");
 		await this.review();
 		await this.publish();
+		if (this.settings.skipBots) {
+			this.log("bots", "skipped (skipBots): no CodeRabbit request, no bot wait, no bot round");
+			return;
+		}
 		await this.requestCodeRabbit();
 		const comments = await this.waitForBots();
 		await this.botRound(comments);
@@ -1063,7 +1578,7 @@ ${rendered || "(no bot comments)"}`;
 			const pending = this.blockers().filter((key) => !this.stateOf(key)?.merged);
 			if (!pending.length) return;
 			if (waited % 10 === 0) this.log("merge", `waiting for blockers to merge: ${pending.join(", ")}`);
-			await sleep(60_000);
+			await sleep(this.options.waitMs ?? 60_000);
 		}
 	}
 	private async mergedOnGitHub(repo: string): Promise<boolean> {
@@ -1072,20 +1587,532 @@ ${rendered || "(no bot comments)"}`;
 		const parsed = JSON.parse(view.output) as { state?: string; mergedAt?: string | null };
 		return parsed.state === "MERGED" || !!parsed.mergedAt;
 	}
-	/** Native stacks: sync then merge; a lone PR is an ordinary squash. One merge at a time on this host. */
+	private async dirty(): Promise<boolean> {
+		return (await this.git(["status", "--porcelain"])) !== "";
+	}
+	private async prView<T>(repo: string, fields: string): Promise<T> {
+		return (await this.ghJson(["pr", "view", String(this.state.pr), "--repo", repo, "--json", fields])) as T;
+	}
+	private async remoteHead(branch: string): Promise<string | undefined> {
+		const [sha, ref, ...rest] = (
+			await this.git(["ls-remote", "--heads", this.settings.remote, `refs/heads/${branch}`])
+		)
+			.trim()
+			.split(/\s+/);
+		return ref === `refs/heads/${branch}` && !rest.length ? sha : undefined;
+	}
+	/**
+	 * After an ordinary push of an exact tested head succeeded, the pull request API can lag the branch. Confirm the
+	 * remote branch itself, then wait (bounded by the gh clock, no model call) for the API to show the same head.
+	 * The lag is never read as a conflict; a remote branch that is not the tested head fails at once.
+	 */
+	async waitForPushedHead(repo: string, testedHead: string): Promise<void> {
+		const deadline = Date.now() + this.t.ghMs;
+		let reported = false;
+		for (;;) {
+			if ((await this.head()) !== testedHead || (await this.dirty()))
+				throw new TicketFailure("post-push propagation: the local tested head or source changed; no merge");
+			if ((await this.remoteHead(this.branch)) !== testedHead)
+				throw new TicketFailure(
+					`post-push propagation: the remote branch is not the tested ${testedHead}; this is not API lag`,
+				);
+			const view = await this.prView<{ state?: string; headRefOid?: string }>(repo, "state,headRefOid");
+			if (view.state !== "OPEN" && view.state !== "MERGED")
+				throw new TicketFailure(`post-push propagation: the pull request is ${view.state}`);
+			if (view.headRefOid === testedHead) {
+				if ((await this.head()) !== testedHead || (await this.dirty()))
+					throw new TicketFailure("post-push propagation: the source changed while reading the pull request");
+				this.log("merge:propagation", `the pull request shows the pushed tested head ${testedHead}`);
+				return;
+			}
+			if (!reported) {
+				this.log(
+					"merge:propagation",
+					`push succeeded and the remote branch is ${testedHead}; waiting for the pull request head ${view.headRefOid} to follow`,
+				);
+				reported = true;
+			}
+			if (Date.now() >= deadline)
+				throw new TicketFailure(
+					`the pull request did not show the pushed head ${testedHead} within the gh budget; keep the tested commit and retry the merge only`,
+				);
+			await sleep(Math.min(1_000, Math.max(0, deadline - Date.now())));
+		}
+	}
+	/**
+	 * GitHub recomputes mergeability and required checks after every push. Wait for the exact local head's required
+	 * checks (bounded by `ciMs`), never mislabel pending checks as a conflict, and fail on a failed required check.
+	 * This is the CI gate that `skipFactoryTests` relies on.
+	 */
+	async waitForMergeReadiness(repo: string, once = false): Promise<MergeReadiness> {
+		const head = await this.head();
+		const deadline = Date.now() + this.t.ciMs;
+		let last = "";
+		for (;;) {
+			if ((await this.head()) !== head)
+				throw new TicketFailure("merge wait: the local head changed; retry against the new exact head");
+			const view = await this.prView<{
+				state?: string;
+				headRefOid?: string;
+				mergeable?: string;
+				mergeStateStatus?: string;
+			}>(repo, "state,headRefOid,mergeable,mergeStateStatus");
+			if (view.state === "MERGED") return "merged";
+			if (view.state !== "OPEN") throw new TicketFailure(`merge wait: the pull request is ${view.state}`);
+			if (view.headRefOid !== head)
+				throw new TicketFailure(
+					`merge wait: the pull request head ${view.headRefOid} differs from the local ${head}; never merge another revision`,
+				);
+			if (view.mergeable === "CONFLICTING") return "conflicting";
+			const checks = await this.gh([
+				"pr",
+				"checks",
+				String(this.state.pr),
+				"--repo",
+				repo,
+				"--required",
+				"--json",
+				"name,bucket,state,link",
+			]);
+			let rows: Array<{ name?: string; bucket?: string; state?: string; link?: string }>;
+			try {
+				rows = JSON.parse(checks.output);
+			} catch {
+				// "no required checks reported": none required; "no checks reported": none registered yet, so wait.
+				if (!/no (?:required )?checks reported/i.test(checks.output))
+					throw new TicketFailure(`cannot read the required checks: ${tail(checks.output, 10)}`);
+				rows = [];
+			}
+			if (!Array.isArray(rows) || ![0, 1, 8].includes(checks.code))
+				throw new TicketFailure(`cannot read the required checks rc=${checks.code}: ${tail(checks.output, 10)}`);
+			const failed = rows.filter((row) => row.bucket === "fail" || row.bucket === "cancel");
+			if (failed.length)
+				throw new TicketFailure(
+					`required checks failed at ${head}: ${failed.map((row) => `${row.name} (${row.state}) ${row.link ?? ""}`).join("; ")}`,
+				);
+			// A head that moved between the two reads cannot borrow these check results.
+			if ((await this.prView<{ headRefOid?: string }>(repo, "headRefOid")).headRefOid !== head)
+				throw new TicketFailure(
+					"the pull request head changed while its required checks were read; retry the merge",
+				);
+			const pending = rows.filter((row) => !["pass", "skipping"].includes(row.bucket ?? ""));
+			// Under skipFactoryTests the required checks are the only tests: none reported is not a pass.
+			const ungated = this.settings.skipFactoryTests && rows.length === 0;
+			if (view.mergeable === "MERGEABLE" && !pending.length && !ungated && checks.code !== 8) {
+				if (view.mergeStateStatus === "BEHIND") return "behind";
+				if (["CLEAN", "HAS_HOOKS", "UNSTABLE"].includes(view.mergeStateStatus ?? "")) return "ready";
+			}
+			const status = `head=${head} mergeable=${view.mergeable} state=${view.mergeStateStatus} requiredPending=${pending.map((row) => row.name).join(",") || (ungated ? "none reported, and skipFactoryTests needs one" : "-")}`;
+			if (status !== last) {
+				this.log("merge:wait", status);
+				last = status;
+			}
+			if (once) return "pending";
+			if (Date.now() >= deadline)
+				throw new TicketFailure(
+					`merge readiness still pending after the bounded wait: ${status}; retry the merge only, never a conflict repair`,
+				);
+			await sleep(Math.min(10_000, Math.max(0, deadline - Date.now())));
+		}
+	}
+	private acquireMergeMutex(): Promise<() => void> {
+		return acquireSlot(join(this.settings.work, "merge-lock"), 1, this.log);
+	}
+	/**
+	 * A candidate that is behind or conflicts is updated outside the global mutex: `gh pr update-branch` when the
+	 * branch is merely behind, else one writer round that merges the fetched trunk. The new bytes get the full gate
+	 * and an ordinary push of the exact tested head; nothing borrows the old head's evidence.
+	 */
+	private async repairNonstackedCandidate(repo: string): Promise<void> {
+		const oldHead = await this.head();
+		const update = await this.gh(["pr", "update-branch", String(this.state.pr), "--repo", repo]);
+		await this.git(["fetch", "-q", this.settings.remote]);
+		if (update.code === 0) {
+			this.log("merge", "the branch was behind; updated natively");
+			await this.git(["merge", "--ff-only", `${this.settings.remote}/${this.branch}`]);
+		} else {
+			const actual = await this.prView<{ headRefOid?: string; mergeable?: string }>(repo, "headRefOid,mergeable");
+			if (actual.headRefOid !== oldHead || actual.mergeable !== "CONFLICTING")
+				throw new TicketFailure(
+					`the branch update failed without a confirmed conflict at the current head: ${tail(update.output, 10)}`,
+				);
+			await this.fixRound(
+				"fix-merge",
+				`The pull request does not merge because this branch conflicts with ${this.settings.remote}/${this.settings.trunk}. Run \`git merge ${this.settings.remote}/${this.settings.trunk}\` in this worktree, resolve every conflict, keep every commit's intent, commit the merge, and do not push.`,
+				update.output,
+			);
+		}
+		if ((await this.head()) === oldHead)
+			throw new TicketFailure(
+				"the branch preparation produced no new candidate; no validation rerun, no guessed base",
+			);
+		await this.tests("tests-after-merge-fix");
+		const testedHead = await this.head();
+		if (await this.dirty()) throw new TicketFailure("the merge preparation gate left dirty source; no push");
+		const push = await this.run(["git", "push", this.settings.remote, `${testedHead}:refs/heads/${this.branch}`], {
+			timeoutMs: this.t.ghMs,
+			logName: "git-push.log",
+		});
+		if (push.code !== 0)
+			throw new TicketFailure(`the push after candidate preparation failed: ${tail(push.output, 10)}`);
+		await this.waitForPushedHead(repo, testedHead);
+	}
+	/**
+	 * Owner recovery for a committed merge repair interrupted before its push: `sessions/merge-repair.resume.json`
+	 * with `head` (the unpushed repair), `remoteHead` (the pull request head it builds on), `fixSessionPath` and, per
+	 * mode, `messageId`. Mode `post-ci-repair` answers a failed required check on the pushed head and also carries
+	 * `failedCiHead`, `runId` and `jobId`, verified against GitHub. Mode `initial-fix-merge` recovers a fix-merge
+	 * writer that ended BLOCKED and later completed with its exact DONE line. No mode recovers a failed merge-test
+	 * gate after the fix session finished. The repair head then takes the full gate, an ordinary push of the exact
+	 * tested head and the propagation wait; nothing is pushed on older evidence.
+	 */
+	private async resumeLocalMergeRepair(repo: string): Promise<void> {
+		const receiptPath = join(this.directory, "sessions", "merge-repair.resume.json");
+		if (!existsSync(receiptPath)) return;
+		const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as MergeRepairReceipt;
+		const fail = (reason: string) => new TicketFailure(`local merge repair recovery: ${reason}`);
+		const { head, remoteHead, fixSessionPath, mode } = receipt;
+		if (!head || !SHA.test(head) || !remoteHead || !SHA.test(remoteHead) || typeof fixSessionPath !== "string")
+			throw fail("invalid owner recovery receipt");
+		if (mode !== undefined && mode !== "initial-fix-merge" && mode !== "post-ci-repair")
+			throw fail("unknown merge repair recovery mode");
+		const sessionDir = join(this.directory, "sessions", mode ? "fix-merge" : "fix-tests-after-merge-fix");
+		if (!fixSessionPath.startsWith(`${sessionDir}/`) || !existsSync(fixSessionPath))
+			throw fail("the original merge fix session is missing");
+		const entries = sessionEntries(fixSessionPath);
+		if (
+			entries[0]?.type !== "session" ||
+			entries[0].cwd !== this.worktree ||
+			entries[0].rlmDepth !== 0 ||
+			!readFileSync(fixSessionPath, "utf8").includes(head.slice(0, 8))
+		)
+			throw fail("the retained fix session does not bind this worktree and repair commit");
+		const runLog = readFileSync(this.logPath, "utf8");
+		const loggedAt = (line: string | undefined) => Date.parse(line?.match(/^\[([^\]]+)\]/)?.[1] ?? "");
+		if (mode) {
+			const terminal = entries
+				.filter((entry) => entry.type === "message" && entry.message?.role === "assistant")
+				.at(-1);
+			const message = terminal?.message;
+			if (
+				!receipt.messageId ||
+				!terminal ||
+				terminal.id !== receipt.messageId ||
+				message?.stopReason !== "stop" ||
+				!Array.isArray(message.content) ||
+				message.content.some((block) => block?.type === "toolCall")
+			)
+				throw fail("the recovery needs the latest native terminal completion of the fix session");
+			const final = contentText(message.content);
+			if (writerTerminal(final, this.ticket.key)?.kind !== "done" || !final.includes(head.slice(0, 8)))
+				throw fail("the completion does not end with its exact DONE line and name the retained repair head");
+			if (mode === "post-ci-repair") await this.verifyPostCiRepair(receipt, repo, terminal, runLog, loggedAt);
+			else {
+				const interrupted = loggedAt(
+					runLog
+						.split("\n")
+						.filter((line) => line.includes(`FAILED writer BLOCKED: BLOCKED ${this.ticket.key}`))
+						.at(-1),
+				);
+				if (
+					!runLog.includes("writer:fix-merge:intent blocked") ||
+					!Number.isFinite(interrupted) ||
+					!(Date.parse(terminal.timestamp ?? "") > interrupted)
+				)
+					throw fail("no blocked merge interruption precedes the recovered completion");
+			}
+		} else {
+			if (
+				!runLog.includes("tests-after-merge-fix:2 rc=") ||
+				!runLog.includes("writer:fix-tests-after-merge-fix:intent done")
+			)
+				throw fail("missing interrupted merge-test fix evidence");
+			const priorTest = runLog
+				.split("\n")
+				.filter((line) => /tests-after-merge-fix(?::2)? rc=/.test(line))
+				.at(-1);
+			if (!priorTest || / rc=0(?: |$)/.test(priorTest))
+				throw fail("the receipt is not for a failed full merge-test gate");
+		}
+		if ((await this.head()) !== head || (await this.dirty()))
+			throw fail("the repair head changed or the worktree is dirty");
+		const boundary = async () =>
+			this.prView<{ headRefOid?: string; headRefName?: string; state?: string }>(
+				repo,
+				"headRefOid,headRefName,state",
+			);
+		const remote = await boundary();
+		if (
+			remote.state !== "OPEN" ||
+			remote.headRefName !== this.branch ||
+			remote.headRefOid !== remoteHead ||
+			head === remoteHead
+		)
+			throw fail("the pull request branch or the unpushed repair boundary changed");
+		await this.git(["fetch", "-q", this.settings.remote]);
+		if ((await this.git(["rev-parse", `${this.settings.remote}/${this.branch}`])) !== remoteHead)
+			throw fail("the pull request and the remote branch disagree");
+		await this.git(["merge-base", "--is-ancestor", remoteHead, head]);
+		this.log("merge:resume", `full gate for the retained repair ${head}; no scoped result stands in for it`);
+		await this.tests("tests-after-merge-fix");
+		const testedHead = await this.head();
+		if (await this.dirty()) throw fail("the full gate left uncommitted changes");
+		await this.git(["merge-base", "--is-ancestor", head, testedHead]);
+		const current = await boundary();
+		if (current.state !== "OPEN" || current.headRefName !== this.branch || current.headRefOid !== remoteHead)
+			throw fail("the remote branch changed during validation; no push");
+		if ((await this.head()) !== testedHead) throw fail("the local head changed after the full gate");
+		const push = await this.run(["git", "push", this.settings.remote, `${testedHead}:refs/heads/${this.branch}`], {
+			timeoutMs: this.t.ghMs,
+			logName: "git-push.log",
+		});
+		if (push.code !== 0) throw fail(`the ordinary push failed: ${tail(push.output, 10)}`);
+		appendFileSync(
+			join(this.directory, "merge-repair-recovery.jsonl"),
+			`${JSON.stringify({ at: new Date().toISOString(), ...receipt, testedHead, pushed: true })}\n`,
+		);
+		// The journal keeps the receipt; its executable marker is consumed once the push succeeded.
+		unlinkSync(receiptPath);
+		this.log(
+			"merge:resume",
+			`full gate passed; pushed the exact repair ${testedHead}; waiting for the required checks`,
+		);
+		await this.waitForPushedHead(repo, testedHead);
+	}
+	/** The repair answers the failed required check the state recorded: the run, the job and their order must agree. */
+	private async verifyPostCiRepair(
+		receipt: MergeRepairReceipt,
+		repo: string,
+		terminal: SessionEntry,
+		runLog: string,
+		loggedAt: (line: string | undefined) => number,
+	): Promise<void> {
+		const fail = (reason: string) => new TicketFailure(`post-CI repair evidence rejected: ${reason}`);
+		const { failedCiHead, runId, jobId } = receipt;
+		if (
+			!failedCiHead ||
+			failedCiHead !== receipt.remoteHead ||
+			!SHA.test(failedCiHead) ||
+			!Number.isSafeInteger(runId) ||
+			!Number.isSafeInteger(jobId) ||
+			runId! <= 0 ||
+			jobId! <= 0
+		)
+			throw fail("the failed head, run or job identity is missing or differs from the retained remote head");
+		const jobUrl = `https://github.com/${repo}/actions/runs/${runId}/job/${jobId}`;
+		const prefix = `required checks failed at ${failedCiHead}:`;
+		if (
+			typeof this.state.failure !== "string" ||
+			!this.state.failure.startsWith(prefix) ||
+			!this.state.failure.includes(jobUrl)
+		)
+			throw fail("the retained state does not bind the failed CI head and job");
+		const failedAt = loggedAt(
+			runLog
+				.split("\n")
+				.filter((line) => line.includes(`FAILED ${prefix}`) && line.includes(jobUrl))
+				.at(-1),
+		);
+		const completedAt = Date.parse(terminal.timestamp ?? "");
+		if (!Number.isFinite(failedAt) || !Number.isFinite(completedAt) || completedAt <= failedAt)
+			throw fail("the repair completion must follow the recorded CI failure");
+		// Job and workflow-run REST schemas differ; the run carries the authoritative head_sha.
+		const job = (await this.ghJson(["api", `repos/${repo}/actions/jobs/${jobId}`])) as {
+			id?: number;
+			run_id?: number;
+			html_url?: string;
+			status?: string;
+			conclusion?: string;
+			head_sha?: string;
+			completed_at?: string;
+		};
+		const run = (await this.ghJson(["api", `repos/${repo}/actions/runs/${runId}`])) as {
+			id?: number;
+			repository?: { full_name?: string };
+			head_sha?: string;
+			status?: string;
+			conclusion?: string;
+		};
+		if (
+			job.id !== jobId ||
+			job.run_id !== runId ||
+			job.html_url !== jobUrl ||
+			job.status !== "completed" ||
+			job.conclusion !== "failure"
+		)
+			throw fail("the GitHub job is not the exact completed failed job");
+		if (
+			run.id !== runId ||
+			run.repository?.full_name !== repo ||
+			run.head_sha !== failedCiHead ||
+			run.status !== "completed" ||
+			run.conclusion !== "failure"
+		)
+			throw fail("the GitHub run's repository, head or conclusion does not match the failed candidate");
+		if (job.head_sha !== undefined && job.head_sha !== failedCiHead)
+			throw fail("the job head conflicts with its workflow run head");
+		const jobCompletedAt = Date.parse(job.completed_at ?? "");
+		if (!Number.isFinite(jobCompletedAt) || jobCompletedAt > failedAt || jobCompletedAt >= completedAt)
+			throw fail("the job's completion does not precede the recorded failure and the repair");
+	}
+	/** Outside the global mutex: a clean head that contains the fetched trunk and whose required checks are green. */
+	private async prepareNonstackedCandidate(repo: string): Promise<{ head: string; base: string } | undefined> {
+		for (;;) {
+			if (await this.mergedOnGitHub(repo)) return undefined;
+			if (await this.dirty()) throw new TicketFailure("candidate preparation needs clean committed source");
+			await this.git(["fetch", "-q", this.settings.remote]);
+			const head = await this.head();
+			const base = await this.git(["rev-parse", `${this.settings.remote}/${this.settings.trunk}`]);
+			const ancestry = await this.run(["git", "merge-base", "--is-ancestor", base, head], {
+				timeoutMs: this.t.ghMs,
+			});
+			if (![0, 1].includes(ancestry.code))
+				throw new TicketFailure(`cannot verify the candidate's base ancestry: ${tail(ancestry.output, 10)}`);
+			const view = await this.prView<{
+				state?: string;
+				headRefOid?: string;
+				baseRefName?: string;
+				mergeable?: string;
+				mergeStateStatus?: string;
+			}>(repo, "state,headRefOid,baseRefName,mergeable,mergeStateStatus");
+			if (view.state === "MERGED") return undefined;
+			// A push that just landed (publish, the bot round) can leave the API on the old head: wait, never a conflict.
+			if (view.state === "OPEN" && view.headRefOid !== head && (await this.remoteHead(this.branch)) === head) {
+				await this.waitForPushedHead(repo, head);
+				continue;
+			}
+			if (view.state !== "OPEN" || view.headRefOid !== head || view.baseRefName !== this.settings.trunk)
+				throw new TicketFailure(
+					"the candidate pull request head or base branch does not match; no inferred recovery",
+				);
+			if (ancestry.code === 1 || view.mergeable === "CONFLICTING" || view.mergeStateStatus === "BEHIND") {
+				this.log(
+					"merge:prepare",
+					`preparing a changed candidate outside the global mutex; head=${head} base=${base}`,
+				);
+				await this.repairNonstackedCandidate(repo);
+				continue;
+			}
+			const readiness = await this.waitForMergeReadiness(repo);
+			if (readiness === "merged") return undefined;
+			if (readiness !== "ready") {
+				await this.repairNonstackedCandidate(repo);
+				continue;
+			}
+			if ((await this.head()) !== head)
+				throw new TicketFailure("the candidate changed during the required-check wait");
+			return { head, base };
+		}
+	}
+	/**
+	 * The only critical section: under the global merge mutex, recheck the exact head, the base and the required
+	 * checks once, then merge with `--match-head-commit`. No sleep and no model call happen inside it. The mutex
+	 * serializes this factory only; GitHub's own conflict and protection checks still govern other writers.
+	 */
+	private async finalizePreparedMerge(
+		repo: string,
+		args: string[],
+		candidate: { head: string; base: string },
+	): Promise<"merged" | "stale-base" | "reprepare"> {
+		const release = await this.acquireMergeMutex();
+		try {
+			if (await this.mergedOnGitHub(repo)) return "merged";
+			if ((await this.head()) !== candidate.head || (await this.dirty()))
+				throw new TicketFailure("the prepared candidate's head or source changed before the final merge");
+			const trunkHead = async () => {
+				const sha = await this.remoteHead(this.settings.trunk);
+				if (!sha) throw new TicketFailure("cannot read the remote trunk head for the final merge");
+				return sha;
+			};
+			if ((await trunkHead()) !== candidate.base) return "stale-base";
+			const readiness = await this.waitForMergeReadiness(repo, true);
+			if (readiness === "merged") return "merged";
+			if (readiness !== "ready") return "reprepare";
+			const view = await this.prView<{ headRefOid?: string; baseRefOid?: string; baseRefName?: string }>(
+				repo,
+				"headRefOid,baseRefOid,baseRefName",
+			);
+			if (view.headRefOid !== candidate.head || view.baseRefName !== this.settings.trunk)
+				throw new TicketFailure("the final pull request head or base branch changed");
+			if (view.baseRefOid !== candidate.base || (await trunkHead()) !== candidate.base) return "stale-base";
+			if ((await this.head()) !== candidate.head || (await this.dirty()))
+				throw new TicketFailure("the local evidence changed during the final checks");
+			const merge = await this.gh([...args, "--match-head-commit", candidate.head]);
+			if (merge.code === 0 || (await this.mergedOnGitHub(repo))) return "merged";
+			if ((await trunkHead()) !== candidate.base) return "stale-base";
+			throw new TicketFailure(
+				`the native merge failed at an unchanged candidate and base: ${tail(merge.output, 15)}`,
+			);
+		} finally {
+			release();
+		}
+	}
+	/**
+	 * `preMergeReview`: one more review of the exact head about to merge, on the review seat, with the same verdict
+	 * line. Only LANDABLE merges; a head already found LANDABLE is not reviewed again.
+	 */
+	private async preMergeReview(head: string): Promise<void> {
+		if (this.state.preMerge?.head === head && this.state.preMerge.verdict === "LANDABLE") return;
+		const { diff } = await this.diffAgainstBase();
+		const verdict = (await this.reviewers([PRE_MERGE_SEAT], diff, `-premerge-${head.slice(0, 12)}`))[PRE_MERGE_SEAT]!;
+		this.save({ preMerge: { head, verdict: verdict.split("\n")[0]! } });
+		if ((await this.head()) !== head)
+			throw new TicketFailure(`the head moved during the pre-merge review of ${head}; merge again`);
+		if (verdict !== "LANDABLE")
+			throw new TicketFailure(`the pre-merge review of ${head} is not LANDABLE: ${verdict.slice(0, 4000)}`);
+	}
+	/** A lone pull request: prepare under a per-ticket lock, merge under the short global mutex, repeat on a stale base. */
+	private async mergeNonstacked(repo: string): Promise<void> {
+		const releaseTicket = await acquireSlot(join(this.directory, "merge-preparation-lock"), 1, this.log);
+		try {
+			await this.resumeLocalMergeRepair(repo);
+			const args = [
+				"pr",
+				"merge",
+				String(this.state.pr),
+				"--repo",
+				repo,
+				"--squash",
+				"--subject",
+				`${this.ticket.key}: ${this.ticket.title}`.slice(0, 250),
+				"--body-file",
+				join(this.directory, "PR-BODY.md"),
+			];
+			for (;;) {
+				const candidate = await this.prepareNonstackedCandidate(repo);
+				if (!candidate) return;
+				// The review runs outside the global mutex, on the candidate whose required checks are green.
+				if (this.settings.preMergeReview) await this.preMergeReview(candidate.head);
+				const outcome = await this.finalizePreparedMerge(repo, args, candidate);
+				if (outcome === "merged") return;
+				this.log(
+					"merge:prepare",
+					`${outcome}; the global mutex is released; recheck the candidate and base outside it`,
+				);
+				await sleep(1_000);
+			}
+		} finally {
+			releaseTicket();
+		}
+	}
+	/**
+	 * Native stacks keep their conservative boundary: sync then merge under the global mutex. A lone pull request is
+	 * prepared outside the mutex and merged at its exact tested head once its required checks are green.
+	 */
 	async merge(): Promise<void> {
 		if (this.state.merged) return;
 		if (!this.state.pr) throw new TicketFailure("merge requires a submitted pull request; run submit first");
+		this.refuseStackUnderNoStacks();
 		await this.waitForParents();
 		const repo = await this.githubRepo();
-		const release = await acquireSlot(join(this.settings.work, "merge-lock"), 1, this.log);
-		try {
-			if (await this.mergedOnGitHub(repo)) {
-				this.save({ merged: true });
-				this.log("merge", "already merged");
-				return;
-			}
-			if (this.state.stacked) {
+		if (await this.mergedOnGitHub(repo)) {
+			this.save({ merged: true });
+			this.log("merge", "already merged");
+			return;
+		}
+		if (this.state.stacked) {
+			const release = await this.acquireMergeMutex();
+			try {
 				const sync = await this.gh(["stack", "sync"]);
 				if (sync.code !== 0) {
 					this.log("merge", `gh stack sync failed; one fix round: ${tail(sync.output, 5)}`);
@@ -1098,58 +2125,16 @@ ${rendered || "(no bot comments)"}`;
 					const again = await this.gh(["stack", "sync"]);
 					if (again.code !== 0) throw new TicketFailure(`gh stack sync still failing: ${tail(again.output, 10)}`);
 				}
+				if (this.settings.preMergeReview) await this.preMergeReview(await this.head());
 				const merge = await this.gh(["stack", "merge", "--squash", "--yes"]);
 				if (merge.code !== 0 && !(await this.mergedOnGitHub(repo)))
 					throw new TicketFailure(`gh stack merge failed: ${tail(merge.output, 15)}`);
-			} else {
-				const title = `${this.ticket.key}: ${this.ticket.title}`.slice(0, 250);
-				const args = [
-					"pr",
-					"merge",
-					String(this.state.pr),
-					"--repo",
-					repo,
-					"--squash",
-					"--subject",
-					title,
-					"--body-file",
-					join(this.directory, "PR-BODY.md"),
-				];
-				let merge = await this.gh(args);
-				if (merge.code !== 0 && !(await this.mergedOnGitHub(repo))) {
-					// Never a raw force push. A branch that is merely behind is updated natively; a conflict gets one
-					// writer round that merges the trunk into the branch, then a plain push.
-					const update = await this.gh(["pr", "update-branch", String(this.state.pr), "--repo", repo]);
-					if (update.code === 0) {
-						this.log("merge", "branch was behind; updated natively");
-						await this.git(["fetch", "-q", this.settings.remote]);
-						await this.git(["merge", "--ff-only", `${this.settings.remote}/${this.branch}`]);
-					} else {
-						this.log("merge", `squash failed; one merge fix round: ${tail(merge.output, 5)}`);
-						await this.git(["fetch", "-q", this.settings.remote]);
-						await this.fixRound(
-							"fix-merge",
-							`The pull request does not merge because this branch conflicts with ${this.settings.remote}/${this.settings.trunk}. Run \`git merge ${this.settings.remote}/${this.settings.trunk}\` in this worktree, resolve every conflict, keep every commit's intent, commit the merge, and do not push.`,
-							`${merge.output}\n${update.output}`,
-						);
-						await this.tests("tests-after-merge-fix");
-						const push = await this.run(["git", "push", this.settings.remote, this.branch], {
-							timeoutMs: this.t.ghMs,
-							logName: "git-push.log",
-						});
-						if (push.code !== 0)
-							throw new TicketFailure(`push after the merge fix failed: ${tail(push.output, 10)}`);
-					}
-					merge = await this.gh(args);
-					if (merge.code !== 0 && !(await this.mergedOnGitHub(repo)))
-						throw new TicketFailure(`gh pr merge failed: ${tail(merge.output, 15)}`);
-				}
+			} finally {
+				release();
 			}
-			this.save({ merged: true });
-			this.log("merge", `MERGED ${this.state.prUrl}`);
-		} finally {
-			release();
-		}
+		} else await this.mergeNonstacked(repo);
+		this.save({ merged: true });
+		this.log("merge", `MERGED ${this.state.prUrl}`);
 		await this.run(["git", "worktree", "remove", "--force", this.worktree], { cwd: this.settings.repo });
 		await this.run(["git", "worktree", "prune"], { cwd: this.settings.repo });
 	}

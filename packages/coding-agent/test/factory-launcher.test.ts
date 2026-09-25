@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import type { OneironLauncherSettings } from "../src/factory/adapters/oneiron-ticket.js";
-import { importSplits, launchTickets, readLauncherTickets } from "../src/factory/launcher.js";
+import {
+	importSplits,
+	launcherPlan,
+	launchTickets,
+	readLauncherSettings,
+	readLauncherTickets,
+} from "../src/factory/launcher.js";
 import { FactoryStore } from "../src/factory/store.js";
 
 const roots: string[] = [];
@@ -44,17 +50,23 @@ it("turns the ticket DAG into submit and merge actions, then stacks a writer's S
 			],
 		}),
 	);
-	const { tickets, skipped } = readLauncherTickets(manifest, plan);
+	const { tickets: read, skipped } = readLauncherTickets(manifest, plan);
 	expect(skipped).toEqual(["OF-2-c"]);
-	expect(tickets.map((t) => [t.key, t.tier, t.blockedBy])).toEqual([
+	expect(read.map((t) => [t.key, t.tier, t.blockedBy])).toEqual([
 		["OF-1-a", "two", []],
-		["OF-1-b", "three", ["OF-1-a"]],
+		["OF-1-b", "three", ["OF-1-a", "OF-9-missing"]],
 	]);
 	const settings: OneironLauncherSettings = { host: "arch", repo: join(root, "repo"), work: join(root, "work") };
 	const store = new FactoryStore(join(root, "factory.db"));
 	stores.push(store);
 	store.pause("initialized");
 	const entry = [process.execPath, "/entry.js"];
+	// A blocker the launch cannot resolve fails it, naming the ticket and the missing id; nothing is written.
+	expect(() => launchTickets(store, settings, read, entry)).toThrow(
+		"ticket OF-1-b is blocked by OF-9-missing, which this launch does not carry",
+	);
+	expect([store.actions(), existsSync(join(root, "work", "tickets"))]).toEqual([[], false]);
+	const tickets = read.map((t) => ({ ...t, blockedBy: t.blockedBy.filter((b) => b !== "OF-9-missing") }));
 	const launched = launchTickets(store, settings, tickets, entry);
 	expect(launched).toEqual({
 		imported: ["OF-1-a", "OF-1-b"],
@@ -132,4 +144,21 @@ it("turns the ticket DAG into submit and merge actions, then stacks a writer's S
 	expect(follow.blockedBy).toEqual(["OF-1-a"]);
 	expect(existsSync(join(root, "work", "tickets", "OF-1-a-split"))).toBe(true);
 	expect(store.allEvents().some((e) => e.kind === "split_imported")).toBe(true);
+
+	// No stacks: a child's submit waits for its parent's merge, so it never starts on an unmerged parent.
+	const flat = launcherPlan(tickets, { ...settings, noStacks: true }, entry);
+	expect(flat.actions.find((a) => a.id === "OF-1-b:submit")?.dependencies).toEqual(["OF-1-a:merge"]);
+});
+
+it("bounds cargoJobs like each build host's jobs, since a host without jobs takes it", () => {
+	const root = mkdtempSync(join(tmpdir(), "factory-launcher-"));
+	roots.push(root);
+	const path = join(root, "launcher.json");
+	const settings = (cargoJobs: unknown) => {
+		writeFileSync(path, JSON.stringify({ host: "arch", repo: "/repo", work: "/work", cargoJobs }));
+		return () => readLauncherSettings(path);
+	};
+	for (const bad of [0, 2.5, 65, "4"])
+		expect(settings(bad)).toThrow("launcher.cargoJobs must be an integer from 1 to 64");
+	expect(settings(4)().cargoJobs).toBe(4);
 });

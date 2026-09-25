@@ -2,19 +2,20 @@
 # Factory cargo wrapper. The ticket runner puts this directory first on PATH for itself and for every seat, so
 # both its own test step and the writers' own `cargo ...` calls land here.
 #
-# Rule (owner, 2026-09-17): portable work runs on a Mac first, then the next Mac, then the ticket host. Builds never
-# run on the writers' host while a build host is reachable.
+# A call is offloaded only when the git toplevel of the current directory is $W7_CARGO_WORK/wt/<KEY>. Build hosts are
+# tried in their configured order. A host admits `slots` cargo calls at once (one lock per slot, held through the sync,
+# the run and the sync-back) and caps each call at `jobs` Cargo jobs. A remote host gets the worktree synced to
+# <root>/wt/<KEY> (target and .git excluded, so the remote target/ is a persistent per-ticket cache), runs the same
+# arguments in the same relative directory, streams output back and returns the remote exit code; fmt, fix and clippy
+# sync the tree back. The host `local` runs cargo here with CARGO_TARGET_DIR=<root>/target/<KEY>.
+# When every slot of every reachable host is busy, the call waits and retries; a host is never overrun. With no host
+# reachable at all, outside a worktree, with no build host configured, or with W7_CARGO_LOCAL=1, the real cargo runs
+# here unchanged.
 #
-# A call is offloaded only when the git toplevel of the current directory is $W7_CARGO_WORK/wt/<KEY>. The worktree is
-# synced to <root>/wt/<KEY> on the first reachable build host (target and .git excluded, so the remote target/ is a
-# persistent per-ticket cache), the same arguments run in the same relative directory, output streams back, and the
-# exit code is the remote one. Source-changing subcommands (fmt, fix, clippy) sync the tree back first.
-# Outside a worktree, with no build host configured, when none can be reached, or with W7_CARGO_LOCAL=1, the real
-# cargo runs here.
-#
-# Environment, set by the factory: W7_CARGO_WORK (absolute work root), W7_CARGO_HOSTS (`sshHost:root` entries joined
-# by ';', in order), W7_CARGO_REAL (optional explicit path to the real cargo), W7_CARGO_LOCAL=1 (force local).
-# Login shells on the build hosts are fish, so every remote command is `/bin/bash -s` with the script on stdin.
+# Environment, set by the factory: W7_CARGO_WORK (absolute work root), W7_CARGO_HOSTS (`sshHost:slots:jobs:root`
+# entries joined by ';', in order; jobs 0 means no cap), W7_CARGO_REAL (optional explicit path to the real cargo),
+# W7_CARGO_LOCAL=1 (force local). Login shells on the build hosts are fish, so every remote command is `/bin/bash -s`
+# with the script on stdin. Portable to bash 3.2: flock(1) when present, else perl's flock(2) on the same descriptor.
 set -u
 
 self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
@@ -61,61 +62,193 @@ rel=${rel#/}
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30)
 
-# One cargo call per ticket at a time, so two seats on the same worktree never race the same remote tree.
+# A non-blocking exclusive lock on an open descriptor: 0 held, 1 busy, anything else an error. The lock belongs to
+# the open file, so it lasts while this shell, or the cargo it execs, keeps the descriptor.
+try_lock() {
+	if command -v flock >/dev/null 2>&1; then
+		flock -n "$1"
+		return
+	fi
+	perl -MFcntl=:flock -e 'open(my $h, ">&=", $ARGV[0]) or exit 2; flock($h, LOCK_EX | LOCK_NB) or exit 1; exit 0' "$1"
+}
+
+# One cargo call per ticket at a time, so two seats on the same worktree never race the same build tree.
 lock_dir=$W7_CARGO_WORK/locks
-mkdir -p "$lock_dir" 2>/dev/null
-if command -v flock >/dev/null 2>&1; then
-	exec 9>"$lock_dir/cargo-$key.lock" && flock 9
-fi
+mkdir -p "$lock_dir" || exit 1
+exec 9>"$lock_dir/cargo-$key.lock" || exit 1
+notice=$SECONDS
+while :; do
+	try_lock 9
+	rc=$?
+	[ "$rc" = 0 ] && break
+	[ "$rc" = 1 ] || {
+		echo "[factory-cargo] cannot lock $lock_dir/cargo-$key.lock" >&2
+		exit 1
+	}
+	if [ "$SECONDS" -ge "$notice" ]; then
+		echo "[factory-cargo] WAIT_TICKET_LOCK $key; another cargo call of this ticket is running; waiting" >&2
+		notice=$((SECONDS + 60))
+	fi
+	sleep 2
+done
+
+# Descriptor 8 holds the host slot through the sync, the run and the sync-back, or through the local exec.
+claim_slot() {
+	slot=1
+	while [ "$slot" -le "$slots" ]; do
+		exec 8>"$lock_dir/cargo-host-$host_id-$slot.lock" || return 2
+		try_lock 8 && return 0
+		exec 8>&-
+		slot=$((slot + 1))
+	done
+	return 1
+}
+
+# The host's job budget: a larger explicit -j/--jobs is lowered, a smaller positive one is kept, and build commands
+# get an explicit --jobs so `--config build.jobs` cannot raise it. Arguments after `--` are left alone.
+cap_jobs() {
+	capped=()
+	local arg value command=${1:-} tool=0 explicit=0
+	if [ "$jobs" = 0 ]; then
+		capped=("$@")
+		return
+	fi
+	case "$command" in +*) command=${2:-} ;; esac
+	while [ "$#" -gt 0 ]; do
+		arg=$1
+		shift
+		if [ "$arg" = -- ]; then
+			tool=1
+			break
+		fi
+		case "$arg" in
+		-j | --jobs)
+			value=${1:-}
+			[ "$#" -gt 0 ] && shift
+			;;
+		--jobs=*) value=${arg#--jobs=} ;;
+		-j*)
+			value=${arg#-j}
+			value=${value#=}
+			;;
+		*)
+			capped+=("$arg")
+			continue
+			;;
+		esac
+		explicit=1
+		if [[ "$value" =~ ^[0-9]{1,5}$ ]] && ((10#$value > 0 && 10#$value < jobs)); then
+			capped+=("--jobs=$((10#$value))")
+		else
+			capped+=("--jobs=$jobs")
+		fi
+	done
+	case "$command" in
+	build | b | check | c | test | t | bench | run | r | rustc | rustdoc | doc | d | clippy | fix)
+		[ "$explicit" = 1 ] || capped+=("--jobs=$jobs")
+		;;
+	esac
+	[ "$tool" = 0 ] || capped+=(-- "$@")
+}
 
 # The remote run inherits nothing from here, so the knobs that matter travel explicitly.
 forward=""
-for name in CARGO_BUILD_JOBS RUST_TEST_THREADS RUSTFLAGS RUSTDOCFLAGS CARGO_INCREMENTAL CARGO_PROFILE; do
+for name in RUST_TEST_THREADS RUSTFLAGS RUSTDOCFLAGS CARGO_INCREMENTAL CARGO_PROFILE; do
 	value=${!name:-}
 	[ -n "$value" ] && forward="$forward export $name=$(printf '%q' "$value");"
 done
-args=$(printf '%q ' "$@")
 
 IFS=';' read -ra entries <<<"$W7_CARGO_HOSTS"
-for entry in "${entries[@]}"; do
-	[ -n "$entry" ] || continue
-	host=${entry%%:*}
-	root=${entry#*:}
-	[ -n "$host" ] && [ -n "$root" ] && [ "$host" != "$entry" ] || continue
-	dst=$root/wt/$key
-	err=$(mktemp 2>/dev/null) || err=$lock_dir/cargo-$key.err
-	if ! ssh "${SSH_OPTS[@]}" "$host" /bin/bash -s <<-REMOTE 2>"$err"
-		set -eu
-		mkdir -p $(printf '%q' "$dst")
-	REMOTE
-	then
-		echo "[factory-cargo] $host unreachable ($(tail -n 1 "$err" 2>/dev/null)); trying the next build host" >&2
+down=" "
+notice=$SECONDS
+while :; do
+	busy=0
+	for entry in ${entries[@]+"${entries[@]}"}; do
+		host=${entry%%:*}
+		rest=${entry#*:}
+		slots=${rest%%:*}
+		rest=${rest#*:}
+		jobs=${rest%%:*}
+		root=${rest#*:}
+		[ -n "$host" ] && [ "$host" != "$entry" ] && [ -n "$root" ] || continue
+		[[ "$slots" =~ ^[0-9]+$ ]] && [[ "$jobs" =~ ^[0-9]+$ ]] && [ "$slots" -gt 0 ] || continue
+		case "$down" in *" $host "*) continue ;; esac
+		host_id=$(printf '%s' "$host" | tr -c 'A-Za-z0-9@._-' '_')
+		claim_slot
+		case $? in
+		0) ;;
+		1)
+			busy=1
+			continue
+			;;
+		*) exit 1 ;;
+		esac
+		cap_jobs "$@"
+		limit=$jobs
+		[ "$jobs" != 0 ] || limit=unlimited
+		echo "[factory-cargo] $host slot $slot/$slots; at most $limit Cargo jobs" >&2
+		if [ "$host" = local ]; then
+			export CARGO_TARGET_DIR="$root/target/$key"
+			[ "$jobs" = 0 ] || export CARGO_BUILD_JOBS=$jobs
+			# A cargo started by this one (a build script, a trybuild test) finds this wrapper first on PATH; it runs
+			# under the ticket lock and slot this cargo holds, so it must not wait for them.
+			export W7_CARGO_LOCAL=1
+			local_cargo ${capped[@]+"${capped[@]}"}
+		fi
+		args=""
+		[ "${#capped[@]}" = 0 ] || args=$(printf '%q ' "${capped[@]}")
+		budget=""
+		if [ "$jobs" != 0 ]; then
+			budget="export CARGO_BUILD_JOBS=$jobs;"
+		elif [ -n "${CARGO_BUILD_JOBS:-}" ]; then
+			budget="export CARGO_BUILD_JOBS=$(printf '%q' "$CARGO_BUILD_JOBS");"
+		fi
+		dst=$root/wt/$key
+		err=$(mktemp 2>/dev/null) || err=$lock_dir/cargo-$key.err
+		if ! ssh "${SSH_OPTS[@]}" "$host" /bin/bash -s <<-REMOTE 2>"$err"; then
+			set -eu
+			mkdir -p $(printf '%q' "$dst")
+		REMOTE
+			echo "[factory-cargo] $host unreachable ($(tail -n 1 "$err" 2>/dev/null)); trying the next build host" >&2
+			rm -f "$err" 2>/dev/null
+			down="$down$host "
+			exec 8>&-
+			continue
+		fi
+		if ! rsync -a --delete --exclude target --exclude .git -e "ssh ${SSH_OPTS[*]}" "$top/" "$host:$dst/" 2>>"$err"; then
+			echo "[factory-cargo] sync to $host failed ($(tail -n 1 "$err" 2>/dev/null)); trying the next build host" >&2
+			rm -f "$err" 2>/dev/null
+			down="$down$host "
+			exec 8>&-
+			continue
+		fi
 		rm -f "$err" 2>/dev/null
-		continue
+		ssh "${SSH_OPTS[@]}" "$host" /bin/bash -s <<-REMOTE
+			set -u
+			export PATH="\$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+			export CARGO_TERM_COLOR=never
+			unset CARGO_TARGET_DIR
+			$forward
+			$budget
+			cd $(printf '%q' "$dst/$rel") || exit 1
+			exec cargo $args
+		REMOTE
+		rc=$?
+		case "${1:-}" in
+		fmt | fix | clippy)
+			rsync -a --exclude target --exclude .git -e "ssh ${SSH_OPTS[*]}" "$host:$dst/" "$top/" 2>/dev/null
+			;;
+		esac
+		exit $rc
+	done
+	if [ "$busy" = 0 ]; then
+		echo "[factory-cargo] no build host could be reached; running cargo on this host" >&2
+		export W7_CARGO_LOCAL=1
+		local_cargo "$@"
 	fi
-	if ! rsync -a --delete --exclude target --exclude .git -e "ssh ${SSH_OPTS[*]}" "$top/" "$host:$dst/" 2>>"$err"; then
-		echo "[factory-cargo] sync to $host failed ($(tail -n 1 "$err" 2>/dev/null)); trying the next build host" >&2
-		rm -f "$err" 2>/dev/null
-		continue
+	if [ "$SECONDS" -ge "$notice" ]; then
+		echo "[factory-cargo] WAIT_CAPACITY $key; every slot of every reachable build host is busy; waiting" >&2
+		notice=$((SECONDS + 60))
 	fi
-	rm -f "$err" 2>/dev/null
-	ssh "${SSH_OPTS[@]}" "$host" /bin/bash -s <<-REMOTE
-		set -u
-		export PATH="\$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-		export CARGO_TERM_COLOR=never
-		unset CARGO_TARGET_DIR
-		$forward
-		cd $(printf '%q' "$dst/$rel") || exit 1
-		exec cargo $args
-	REMOTE
-	rc=$?
-	case "${1:-}" in
-	fmt | fix | clippy)
-		rsync -a --exclude target --exclude .git -e "ssh ${SSH_OPTS[*]}" "$host:$dst/" "$top/" 2>/dev/null
-		;;
-	esac
-	exit $rc
+	sleep 2
 done
-
-echo "[factory-cargo] no build host could be reached; running cargo on this host" >&2
-local_cargo "$@"

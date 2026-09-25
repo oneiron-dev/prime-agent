@@ -1,0 +1,29 @@
+# Exception-only factory watchdog, one instance per factory. The instance name picks an environment file with
+# WATCHDOG_SCRIPT (<install>/lib/node_modules/prime-agent/dist/factory/watchdog.js), FACTORY_DIR (absolute),
+# OWNER_SESSION (the session that receives the messages) and PATH. The user manager's own PATH is minimal, so the
+# file's PATH must name the directory of the node that runs prime-agent (systemd refuses a variable as the program).
+# Install as a user unit:
+#   mkdir -p ~/.config/systemd/user ~/.config/prime-agent/factory-watchdog
+#   cp <install>/lib/node_modules/prime-agent/dist/factory/factory-exception-watchdog@.service ~/.config/systemd/user/
+#   printf 'WATCHDOG_SCRIPT=%s\nFACTORY_DIR=%s\nOWNER_SESSION=%s\nPATH=%s:/usr/local/bin:/usr/bin:/bin\n' \
+#     <script> <factory> <session> "$(dirname "$(command -v node)")" > ~/.config/prime-agent/factory-watchdog/<name>.env
+#   systemctl --user daemon-reload && systemctl --user enable --now factory-exception-watchdog@<name>.service
+# State, receipts and errors live in $FACTORY_DIR/watchdog/.
+[Unit]
+Description=Factory exception-only watchdog (%i)
+After=default.target
+StartLimitIntervalSec=300
+StartLimitBurst=8
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/prime-agent/factory-watchdog/%i.env
+ExecStart=/usr/bin/env node ${WATCHDOG_SCRIPT} --factory ${FACTORY_DIR} --session ${OWNER_SESSION}
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target

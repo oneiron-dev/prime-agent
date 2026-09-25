@@ -21,6 +21,8 @@ import type {
 
 type Row = Record<string, unknown>;
 const SCHEMA_VERSION = 3;
+/** Private authority of the one selected-admission transaction; never exported, so no other caller holds it. */
+const SELECTED_PAUSED_ADMISSION = Symbol("selected-paused-admission");
 const now = (): string => new Date().toISOString();
 function decode<T>(value: unknown): T {
 	return JSON.parse(String(value)) as T;
@@ -491,10 +493,145 @@ export class FactoryStore {
 		if (!action || !slot) throw new Error("Corrupt factory attempt references");
 		return { attempt, action, slot };
 	}
-	/** Atomically claims action, slot and declared host/cwd. Paths are lexical identities, not symlink resolution. */
-	claim(actionId: string, slotId: string): AttemptContext | undefined {
+	/**
+	 * Admit ONE owner-selected action while the factory stays paused: validate, apply the selected plan, optionally
+	 * supersede a REJECTED action, claim a slot and mark the attempt SUBMITTED, all in one transaction and before
+	 * any launch. A replayed mutation id returns its first receipt and never launches again. Nothing asynchronous
+	 * happens here, and the pause is never cleared.
+	 */
+	recoverAndClaim(
+		plan: FactoryPlan,
+		options: {
+			select: string;
+			supersede?: string;
+			expectedRevision: number;
+			mutationId: string;
+			evidence: DecisionEvidence;
+		},
+	): { revision: number; replayed: boolean; context: AttemptContext } {
+		const { select, supersede, expectedRevision, mutationId, evidence } = options;
+		validatePlan(plan);
+		required(select, "select");
+		required(mutationId, "mutationId");
+		evidenceValid(evidence);
+		if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
+			throw new Error("recover-admit requires an explicit expected revision");
+		if (supersede !== undefined) required(supersede, "supersede");
+		const payloadSha256 = createHash("sha256")
+			.update(
+				JSON.stringify({
+					operation: "recover-admit",
+					plan,
+					select,
+					supersede: supersede ?? null,
+					expectedRevision,
+					evidence,
+				}),
+			)
+			.digest("hex");
 		return this.transaction(() => {
-			if (this.isPaused()) return undefined;
+			// A replay answers with its first receipt even after a resume; only a new admission needs the pause.
+			const receiptKey = `recover_admit:${mutationId}`;
+			const priorMutation = this.planMutation(mutationId);
+			const priorText = this.meta(receiptKey);
+			if (priorMutation || priorText) {
+				if (!priorMutation || !priorText || priorMutation.payloadSha256 !== payloadSha256)
+					throw new Error("Mutation identity reused for a different operation or payload");
+				const prior = decode<{ payloadSha256: string; revision: number; attemptId: string }>(priorText);
+				if (prior.payloadSha256 !== payloadSha256 || prior.revision !== priorMutation.revision)
+					throw new Error("Corrupt selected-admission receipt");
+				return { revision: prior.revision, replayed: true, context: this.context(prior.attemptId) };
+			}
+			if (!this.isPaused()) throw new Error("recover-admit requires the durable factory pause to remain set");
+			if (Number(this.meta("plan_revision")) !== expectedRevision) throw new Error("Factory plan revision changed");
+			if (
+				this.db
+					.prepare(
+						"SELECT id FROM attempts WHERE claim_released=0 OR state IN ('PREPARED','SUBMITTED','RUNNING','UNCERTAIN') LIMIT 1",
+					)
+					.get() ||
+				this.actions().some((action) => action.state === "RUNNING" || action.state === "UNCERTAIN")
+			)
+				throw new Error("Strict sequential admission refused: a live, uncertain, or unreleased claim remains");
+			const old = supersede === undefined ? undefined : this.action(supersede);
+			const existing = this.action(select);
+			if (supersede !== undefined && (!old || old.state !== "REJECTED" || old.id === select))
+				throw new Error("recover-admit supersede must name a distinct REJECTED action");
+			if (plan.actions.length > 1 || plan.actions.some((action) => action.id !== select))
+				throw new Error("recover-admit plan may contain only the selected action");
+			const proposed: ActionSpec | undefined = plan.actions[0] ?? existing;
+			if (!proposed) throw new Error("Selected action is missing");
+			if (
+				!old &&
+				(!existing || existing.state !== "READY" || !isDeepStrictEqual(actionSpec(proposed), actionSpec(existing)))
+			)
+				throw new Error("Pure admission requires the unchanged existing READY action");
+			if (
+				old &&
+				(proposed.ticketId !== old.ticketId ||
+					!isDeepStrictEqual([...proposed.dependencies].sort(), [...old.dependencies].sort()))
+			)
+				throw new Error("Replacement must retain the rejected action's ticket and dependency set");
+			if (existing && !isDeepStrictEqual(actionSpec(proposed), actionSpec(existing)))
+				throw new Error("recover-admit cannot rewrite an existing action spec");
+			const ticket = this.tickets().find((item) => item.id === proposed.ticketId);
+			if (!ticket || plan.tickets.some((item) => item.id !== ticket.id || item.owner !== ticket.owner))
+				throw new Error("recover-admit cannot create or change ticket ownership");
+			if (plan.roles !== undefined && !isDeepStrictEqual(plan.roles, decode(this.meta("roles") ?? "{}")))
+				throw new Error("recover-admit cannot change role configuration");
+			if (plan.slots.length > 1) throw new Error("recover-admit plan may contain only the selected slot");
+			for (const slot of plan.slots) {
+				const current = this.slot(slot.id);
+				if (
+					slot.id !== proposed.requirements.slotId ||
+					(!current && !old) ||
+					(current && !isDeepStrictEqual(current, slot))
+				)
+					throw new Error(
+						"recover-admit may add only the selected action's exact slot; existing slots cannot change",
+					);
+			}
+			let revision = this.applyPlan(plan, expectedRevision);
+			if (old) revision = this.supersede(old.id, select, evidence, revision, SELECTED_PAUSED_ADMISSION);
+			this.refreshReadiness();
+			if (this.action(select)?.state !== "READY")
+				throw new Error("Selected action is not READY after recovery; dependency checks remain mandatory");
+			let claimed: AttemptContext | undefined;
+			for (const slot of this.slots()) {
+				claimed = this.claim(select, slot.id, SELECTED_PAUSED_ADMISSION);
+				if (claimed) break;
+			}
+			if (!claimed || !this.markSubmitted(claimed.attempt.id, SELECTED_PAUSED_ADMISSION))
+				throw new Error("Selected action cannot claim a compatible slot/cwd");
+			if (!this.isPaused()) throw new Error("Selected admission must never unset pause");
+			const receipt = {
+				payloadSha256,
+				previousRevision: expectedRevision,
+				revision,
+				select,
+				supersede: supersede ?? null,
+				attemptId: claimed.attempt.id,
+				...evidence,
+			};
+			this.setMeta(receiptKey, JSON.stringify(receipt));
+			this.db
+				.prepare("INSERT INTO plan_mutations(id,payload_sha256,previous_revision,revision) VALUES(?,?,?,?)")
+				.run(mutationId, payloadSha256, expectedRevision, revision);
+			this.event("selected_admitted", select, claimed.attempt.id, {
+				previousRevision: expectedRevision,
+				revision,
+				mutationId,
+				supersede: supersede ?? null,
+				paused: true,
+				...evidence,
+			});
+			return { revision, replayed: false, context: this.context(claimed.attempt.id) };
+		});
+	}
+	/** Atomically claims action, slot and declared host/cwd. Paths are lexical identities, not symlink resolution. */
+	claim(actionId: string, slotId: string, authority?: symbol): AttemptContext | undefined {
+		return this.transaction(() => {
+			if (this.isPaused() && authority !== SELECTED_PAUSED_ADMISSION) return undefined;
 			const action = this.action(actionId);
 			const slot = this.slot(slotId);
 			if (!action || !slot || action.state !== "READY") return undefined;
@@ -528,9 +665,9 @@ export class FactoryStore {
 			return this.context(id);
 		});
 	}
-	markSubmitted(attemptId: string): boolean {
+	markSubmitted(attemptId: string, authority?: symbol): boolean {
 		return this.transaction(() => {
-			if (this.isPaused()) return false;
+			if (this.isPaused() && authority !== SELECTED_PAUSED_ADMISSION) return false;
 			const result = this.db
 				.prepare(
 					"UPDATE attempts SET state='SUBMITTED',submitted_at=? WHERE id=? AND state='PREPARED' AND claim_released=0",
@@ -650,10 +787,17 @@ export class FactoryStore {
 		return changed;
 	}
 	/** Replace rejected work explicitly, retaining history and updating only future dependencies. */
-	supersede(actionId: string, replacementId: string, evidence: DecisionEvidence, expectedRevision?: number): number {
+	supersede(
+		actionId: string,
+		replacementId: string,
+		evidence: DecisionEvidence,
+		expectedRevision?: number,
+		authority?: symbol,
+	): number {
 		evidenceValid(evidence);
 		return this.transaction(() => {
-			if (this.isPaused()) throw new Error("Factory is paused; supersession is blocked");
+			if (this.isPaused() && authority !== SELECTED_PAUSED_ADMISSION)
+				throw new Error("Factory is paused; supersession is blocked");
 			const revision = Number(this.meta("plan_revision"));
 			if (expectedRevision !== undefined && revision !== expectedRevision)
 				throw new Error("Factory plan revision changed");

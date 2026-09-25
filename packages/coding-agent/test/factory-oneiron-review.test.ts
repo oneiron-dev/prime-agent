@@ -94,4 +94,9 @@ it("reads every bot comment unfiltered and settles only on Qodo and Codex", asyn
 	]);
 	expect(report.completed).toEqual(["qodo"]);
 	expect(report.unavailable).toEqual(["codex"]);
+	// Qodo rewrites its in-progress post in place: pending is waited for, never counted unavailable.
+	expect(["Review in progress", "Review skipped"].map((body) => reviewContent(body).unavailable)).toEqual([
+		false,
+		true,
+	]);
 });

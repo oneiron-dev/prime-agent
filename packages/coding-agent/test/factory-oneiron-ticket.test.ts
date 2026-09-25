@@ -1,8 +1,9 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { getProcessStartId } from "../src/core/session-lease.js";
 import {
 	acquireSlot,
 	finalAssistantText,
@@ -10,9 +11,11 @@ import {
 	type OneironLauncherSettings,
 	type OneironTicketRun,
 	OneironTicketRunner,
+	reviewVerdict,
 	SEAT_IDLE_EXIT_CODE,
 	SEAT_POLICY_LINE,
 	WRITER_LINES,
+	writerTerminal,
 } from "../src/factory/adapters/oneiron-ticket.js";
 import { factoryCargoBinDirectory } from "../src/factory/runtime.js";
 
@@ -30,7 +33,15 @@ const long = "This handler ignores the usage limit returned by the provider and 
 if (group === "pr" && verb === "view") {
   const pr = state.prs[target];
   if (!pr) { process.stderr.write("no pull requests found"); process.exit(1); }
-  out({ number: pr.number, url: "https://github.com/org/repo/pull/" + pr.number, state: pr.merged ? "MERGED" : "OPEN", mergedAt: pr.merged ? "2026-09-19T00:00:00Z" : null });
+  const remote = (ref) => require("node:child_process").execFileSync("git", ["ls-remote", "origin", "refs/heads/" + ref], { encoding: "utf8" }).split(/\\s+/)[0];
+  // state.lag: that many head reads still show a stale head, as the API does right after a push.
+  const stale = state.lag > 0 && (args[args.indexOf("--json") + 1] || "").includes("headRefOid");
+  if (stale) { state.lag--; save(); }
+  out({ number: pr.number, url: "https://github.com/org/repo/pull/" + pr.number, state: pr.merged ? "MERGED" : "OPEN", mergedAt: pr.merged ? "2026-09-19T00:00:00Z" : null,
+    headRefOid: stale ? "0".repeat(40) : remote(pr.branch), baseRefName: "main", baseRefOid: remote("main"), mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+} else if (group === "pr" && verb === "checks") {
+  if (state.checksText) { process.stderr.write(state.checksText); process.exit(1); }
+  out(JSON.stringify(state.checks ?? []));
 } else if (group === "pr" && verb === "create") {
   const head = args[args.indexOf("--head") + 1];
   const pr = { number: state.next++, merged: false, branch: head };
@@ -71,13 +82,35 @@ const prompt = process.argv[process.argv.length - 1];
 fs.appendFileSync(path.join(process.env.FAKE_ROOT, "seat.log"), "---\\n" + prompt + "\\n");
 const key = (prompt.match(/Ticket ([-\\w.]+):/) || prompt.match(/ticket ([-\\w.]+)/))[1];
 if (prompt.includes("build the context pack")) process.stdout.write("PACK: crates/alpha/src/lib.rs:1 add_one\\n");
-else if (prompt.includes("Review this diff")) process.stdout.write("VERDICT: LANDABLE\\n");
+else if (prompt.includes("Review this diff")) process.stdout.write(fs.existsSync(path.join(process.env.FAKE_ROOT, "defects")) ? "VERDICT: DEFECTS\\ndocs/x.md:1 wrong\\n" : "VERDICT: LANDABLE\\n");
 else if (prompt.includes("EVERY bot comment")) process.stdout.write("replied to 11 and posted the summary\\nDONE " + key + "\\n");
-else {
+else if (prompt.includes("docs only")) {
+  fs.mkdirSync("docs", { recursive: true }); fs.writeFileSync("docs/" + key + ".md", "note\\n");
+  execFileSync("git", ["add", "-A"]); execFileSync("git", ["commit", "-qm", key + ": note"]);
+  process.stdout.write("Documented.\\nDONE " + key + "\\n");
+} else {
   fs.appendFileSync("crates/alpha/src/lib.rs", "pub fn " + key.replace(/[^a-z0-9]/g, "_") + "() -> u8 { 1 }\\n");
   execFileSync("git", ["add", "-A"]); execFileSync("git", ["commit", "-qm", key + ": implement"]);
   process.stdout.write("Implemented.\\nPR BODY:\\nAdded the function.\\nSPLIT: the follow-up half\\nDONE " + key + "\\n");
 }
+`;
+/** Print mode with a session directory: a review answers with progress first and its verdict only when continued. */
+const FAKE_PRIME = `#!/usr/bin/env node
+const fs = require("node:fs"), path = require("node:path");
+const input = fs.readFileSync(0, "utf8"), argv = process.argv.slice(2);
+const dir = argv.includes("--session-dir") ? argv[argv.indexOf("--session-dir") + 1] : undefined;
+if (dir) { fs.mkdirSync(dir, { recursive: true }); fs.appendFileSync(path.join(dir, "session.jsonl"), "{}\\n"); }
+fs.appendFileSync(path.join(process.env.FAKE_ROOT, "prime.log"), (argv.includes("-c") ? "continue " : "open ") + input.slice(0, 20) + (input.includes("owner note") ? " +note" : "") + "\\n");
+const text = input.startsWith("Continue this SAME review") ? "Checked every hunk.\\nVERDICT: LANDABLE"
+  : input.startsWith("finish") ? "Finished.\\nDONE note-one"
+  : input.startsWith("register") ? (fs.mkdirSync(path.dirname(process.env.PENDING_PATH), { recursive: true }), fs.writeFileSync(process.env.PENDING_PATH, process.env.PENDING_JSON), "Validation started.\\nDONE wait-one")
+  : input.includes("Registered validation job-00001") ? "Validation passed.\\nDONE wait-one"
+  : input.startsWith("Review this diff") ? "Reviewers are still running; VERDICT: LANDABLE is likely."
+  : "argv " + argv.includes(input) + " stdin " + input.length;
+const say = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+say({ type: "agent_start" });
+say({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } });
+say({ type: "agent_end" });
 `;
 
 function setup() {
@@ -91,6 +124,7 @@ function setup() {
 	] as const)
 		writeFileSync(join(bin, name), source, { mode: 0o755 });
 	writeFileSync(join(root, "seat.js"), FAKE_SEAT);
+	writeFileSync(join(root, "prime.js"), FAKE_PRIME);
 	const env = {
 		...process.env,
 		PATH: `${bin}:${process.env.PATH}`,
@@ -142,7 +176,17 @@ afterEach(() => {
 describe("Oneiron ticket runner", () => {
 	it("runs one ticket from worktree to merge and stacks a child on its submitted parent", async () => {
 		const f = setup();
-		const alpha = new OneironTicketRunner(f.ticket("alpha-one"), { env: f.env, routing: {} });
+		// The grok reviewer is a print-mode seat whose first reply is progress, not a verdict.
+		const first = f.ticket("alpha-one");
+		first.launcher = {
+			...f.launcher,
+			seats: { ...f.launcher.seats, grok: { provider: "p", model: "m", thinking: "low" } },
+		};
+		const alpha = new OneironTicketRunner(first, {
+			env: f.env,
+			routing: {},
+			cli: [process.execPath, join(f.root, "prime.js")],
+		});
 		await alpha.submit();
 		expect(f.git(["rev-parse", "--abbrev-ref", "HEAD"], alpha.worktree)).toBe("w7/alpha-one");
 		expect(alpha.state.base).toBe("origin/main");
@@ -156,6 +200,10 @@ describe("Oneiron ticket runner", () => {
 		// lib.rs is a public seam, so the tier is forced by code and both reviewers read the head once.
 		expect(alpha.state.review?.tier).toMatchObject({ choice: "grok_plus_opus", decided_by: "code" });
 		expect(alpha.state.review?.verdicts).toEqual({ grok: "LANDABLE", opus: "LANDABLE" });
+		// A reply that only mentions a verdict is continued in the same session until the standalone line arrives.
+		expect(readFileSync(join(f.root, "prime.log"), "utf8")).toBe(
+			"open Review this diff for\ncontinue Continue this SAME r\n",
+		);
 		const gh = readFileSync(join(f.root, "gh.log"), "utf8");
 		expect(gh).toContain("pr create --repo org/repo --title alpha-one: Ticket alpha-one");
 		expect(gh).toContain("pr comment 7 --repo org/repo --body @coderabbitai review");
@@ -166,7 +214,7 @@ describe("Oneiron ticket runner", () => {
 		const seatLog = readFileSync(join(f.root, "seat.log"), "utf8");
 		expect(seatLog).toContain("Consider bounding this retry loop.");
 		expect(seatLog).toContain("Bugbot couldn't run");
-		expect(seatLog.split(INITIATIVE_LINES).length).toBeGreaterThan(5);
+		expect(seatLog.split(INITIATIVE_LINES).length).toBeGreaterThan(4);
 		expect(seatLog).toContain(WRITER_LINES);
 		expect(alpha.writerSystem()).toContain(SEAT_POLICY_LINE);
 		const body = readFileSync(join(alpha.directory, "PR-BODY.md"), "utf8");
@@ -209,8 +257,10 @@ describe("Oneiron ticket runner", () => {
 		expect([usage.status, rerun.status]).toEqual([2, 0]);
 		expect(rerun.stdout).toContain("MERGED https://github.com/org/repo/pull/7");
 		const mergeLog = readFileSync(join(f.root, "gh.log"), "utf8");
-		expect(mergeLog).toContain(
-			"pr merge 7 --repo org/repo --squash --subject alpha-one: Ticket alpha-one --body-file",
+		// A lone pull request merges at its exact tested head, after its required checks were read.
+		expect(mergeLog).toContain("pr checks 7 --repo org/repo --required --json name,bucket,state,link");
+		expect(mergeLog).toMatch(
+			/pr merge 7 --repo org\/repo --squash --subject alpha-one: Ticket alpha-one --body-file \S+ --match-head-commit [0-9a-f]{40}\n/,
 		);
 		expect(existsSync(alpha.worktree)).toBe(false);
 		await beta.merge();
@@ -219,6 +269,107 @@ describe("Oneiron ticket runner", () => {
 		expect(after).toContain("stack sync");
 		expect(after).toContain("stack merge --squash --yes");
 		expect(beta.state.merged).toBe(true);
+	});
+
+	it("under noStacks waits for every blocker to merge, branches from the trunk and never calls gh stack", async () => {
+		const f = setup();
+		const parentState = join(f.work, "tickets", "parent", "state.json");
+		mkdirSync(join(f.work, "tickets", "parent"), { recursive: true });
+		const parent = { key: "parent", branch: "w7/parent", worktree: join(f.work, "wt", "parent"), pr: 3 };
+		writeFileSync(parentState, JSON.stringify(parent));
+		const ticket = f.ticket("child", ["parent"]);
+		ticket.launcher = { ...f.launcher, noStacks: true };
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {}, waitMs: 5 });
+		const log = runner.log;
+		const waiting = new Promise<void>((resolveWait) => {
+			runner.log = (step, message) => {
+				log(step, message);
+				if (step === "base" && message?.includes("noStacks")) resolveWait();
+			};
+		});
+		// The parent is submitted but not merged: with stacks the child would branch from it now.
+		const submitted = runner.submit();
+		submitted.catch(() => undefined);
+		await waiting;
+		expect(runner.state.base).toBeUndefined();
+		writeFileSync(parentState, JSON.stringify({ ...parent, merged: true }));
+		await submitted;
+		expect(runner.state).toMatchObject({ base: "origin/main", stacked: false, pr: 7 });
+		// The pull request API still shows the head from before the last push: the merge waits for it to follow.
+		const ghState = join(f.root, "gh-state.json");
+		writeFileSync(ghState, JSON.stringify({ ...JSON.parse(readFileSync(ghState, "utf8")), lag: 2 }));
+		await runner.merge();
+		expect(readFileSync(runner.logPath, "utf8")).toContain("waiting for the pull request head");
+		const gh = readFileSync(join(f.root, "gh.log"), "utf8");
+		expect(gh).not.toMatch(/^stack /m);
+		expect(gh).toContain("--base main --head w7/child");
+		expect(gh).toMatch(/^pr merge 7 --repo org\/repo --squash .* --match-head-commit [0-9a-f]{40}$/m);
+		expect(runner.state.merged).toBe(true);
+
+		// A ticket cut on a stack before noStacks was set is refused, never merged through gh stack.
+		const stacked = f.ticket("stacked", ["parent"]);
+		stacked.launcher = { ...f.launcher, noStacks: true };
+		mkdirSync(join(f.work, "tickets", "stacked"), { recursive: true });
+		writeFileSync(
+			join(f.work, "tickets", "stacked", "state.json"),
+			JSON.stringify({ key: "stacked", branch: "w7/stacked", base: "w7/parent", stacked: true, pr: 9 }),
+		);
+		const leftover = new OneironTicketRunner(stacked, { env: f.env, routing: {} });
+		await expect(leftover.merge()).rejects.toThrow("was cut on the stack w7/parent before noStacks was set");
+		await expect(leftover.submit()).rejects.toThrow("before noStacks was set");
+	});
+
+	it("with CI-only tests, no bots and a pre-merge review, merges only a head whose checks and review pass", async () => {
+		const f = setup();
+		const ticket = f.ticket("docs-one");
+		ticket.contract = "docs only: describe the flag.";
+		ticket.launcher = {
+			...f.launcher,
+			noStacks: true,
+			skipFactoryTests: true,
+			skipBots: true,
+			preMergeReview: true,
+			timeouts: { ...f.launcher.timeouts, ciMs: 0 },
+		};
+		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		// A ticket that touches no crate is not "zero tests ran": the factory runs no cargo at all.
+		await runner.submit();
+		expect([existsSync(join(f.root, "cargo.log")), runner.state.tests?.skipped, runner.state.bots]).toEqual([
+			false,
+			true,
+			undefined,
+		]);
+		const gh = () => readFileSync(join(f.root, "gh.log"), "utf8");
+		expect(gh()).not.toMatch(/@coderabbitai|api --paginate/);
+		const checks = (rows: unknown[]) => {
+			const state = JSON.parse(readFileSync(join(f.root, "gh-state.json"), "utf8"));
+			writeFileSync(join(f.root, "gh-state.json"), JSON.stringify({ ...state, checks: rows }));
+		};
+		// With no factory tests, a pull request with no required check reported has nothing gating it, and a head
+		// whose checks have not registered yet ("no checks reported") waits for them rather than failing the read.
+		const ghState = () => JSON.parse(readFileSync(join(f.root, "gh-state.json"), "utf8"));
+		writeFileSync(
+			join(f.root, "gh-state.json"),
+			JSON.stringify({ ...ghState(), checksText: "no checks reported on the 'w7/docs-one' branch" }),
+		);
+		await expect(runner.merge()).rejects.toThrow("requiredPending=none reported, and skipFactoryTests needs one");
+		writeFileSync(join(f.root, "gh-state.json"), JSON.stringify({ ...ghState(), checksText: undefined }));
+		await expect(runner.merge()).rejects.toThrow("requiredPending=none reported, and skipFactoryTests needs one");
+		const check = {
+			name: "Test",
+			state: "FAILURE",
+			bucket: "fail",
+			link: "https://github.com/org/repo/actions/runs/1/job/2",
+		};
+		checks([check]);
+		await expect(runner.merge()).rejects.toThrow(/required checks failed at [0-9a-f]{40}: Test \(FAILURE\)/);
+		checks([{ ...check, state: "SUCCESS", bucket: "pass" }]);
+		writeFileSync(join(f.root, "defects"), "");
+		await expect(runner.merge()).rejects.toThrow("is not LANDABLE");
+		rmSync(join(f.root, "defects"));
+		await runner.merge();
+		expect(runner.state).toMatchObject({ merged: true, preMerge: { verdict: "LANDABLE" } });
+		expect(gh()).toMatch(/^pr merge 7 .* --match-head-commit [0-9a-f]{40}$/m);
 	});
 
 	it("kills a silent seat, keeps a talking one, and lets the writer run past any round count", async () => {
@@ -271,8 +422,160 @@ process.stdout.write("DONE late-one\\n");
 		};
 		const writer = new OneironTicketRunner(late, { env: f.env, routing: {}, retryDelayMs: 0 });
 		mkdirSync(writer.worktree, { recursive: true });
-		const final = await writer.writerRounds("write", "start", "continue");
+		const { final } = await writer.writerRounds("write", "start", "continue");
 		expect([final.includes("DONE late-one"), readFileSync(join(f.root, "rounds"), "utf8")]).toEqual([true, "15"]);
+	});
+
+	it.each([
+		["VERDICT: LANDABLE\nNo defects.", "LANDABLE"],
+		["Summary first.\nVERDICT: DEFECTS\nsrc/a.rs:1 wrong", "DEFECTS"],
+		["I would say VERDICT: LANDABLE.", undefined],
+		["> VERDICT: LANDABLE", undefined],
+		["```\nVERDICT: LANDABLE\n```", undefined],
+		["VERDICT: LANDABLE\nVERDICT: DEFECTS", undefined],
+	])("a review verdict is one standalone line outside a fence: %j", (final, expected) => {
+		expect(reviewVerdict(final)).toBe(expected);
+	});
+
+	it.each([
+		["DONE T1", { kind: "done", line: "DONE T1" }],
+		["Work finished.\nPR BODY:\nx\n\nDONE T1  \n\n", { kind: "done", line: "DONE T1" }],
+		["No token.\nBLOCKED T1: the fixture host is gone", { kind: "blocked", why: "the fixture host is gone" }],
+		["I will print DONE T1 when the build ends.", undefined],
+		["DONE T1\nStill running the tests.", undefined],
+		["DONE T1.", undefined],
+		["  DONE T1", undefined],
+		["BLOCKED T1", undefined],
+		["DONE T10", undefined],
+		["Example:\n```\nDONE T1\n```", undefined],
+		["Unclosed fence:\n~~~\nDONE T1", undefined],
+	])("a writer reply is terminal only on its exact last line outside a fence: %j", (final, expected) => {
+		const terminal = writerTerminal(final, "T1");
+		if (expected) expect(terminal).toMatchObject(expected);
+		else expect(terminal).toBeUndefined();
+	});
+
+	it("keeps a writer session going when DONE is only quoted, and ends it on the exact line", async () => {
+		const f = setup();
+		writeFileSync(
+			join(f.root, "quoting.js"),
+			`const fs = require("node:fs"), p = process.env.FAKE_ROOT + "/quoting";
+const n = (fs.existsSync(p) ? Number(fs.readFileSync(p, "utf8")) : 0) + 1;
+fs.writeFileSync(p, String(n));
+if (n === 1) process.stdout.write("The build is running; I will end with DONE quote-one once it passes.\\n");
+else if (n === 2) process.stdout.write("Template:\\n\`\`\`\\nDONE quote-one\\n\`\`\`\\n");
+else if (n === 3) { process.stdout.write("Tests pass.\\nDONE quote-one\\n"); process.exitCode = 1; }
+else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
+`,
+		);
+		const quoting = f.ticket("quote-one");
+		quoting.launcher = {
+			...f.launcher,
+			seats: { ...f.launcher.seats, writer: { command: [process.execPath, join(f.root, "quoting.js")] } },
+		};
+		const writer = new OneironTicketRunner(quoting, { env: f.env, routing: {}, retryDelayMs: 0 });
+		mkdirSync(writer.worktree, { recursive: true });
+		const { final } = await writer.writerRounds("write", "start", "continue");
+		// Round 3 prints the exact line and then exits 1: a failed seat has not ended its round.
+		expect([final, readFileSync(join(f.root, "quoting"), "utf8")]).toEqual(["Tests pass.\nDONE quote-one", "4"]);
+		const intents = readFileSync(join(writer.directory, "routing.jsonl"), "utf8").trim().split("\n");
+		expect(intents.map((line) => JSON.parse(line).choice)).toEqual(["continue", "continue", "continue", "done"]);
+	});
+
+	it("sends a prime seat its prompt on stdin, never in argv", async () => {
+		const f = setup();
+		const ticket = f.ticket("stdin-one");
+		ticket.launcher = { ...f.launcher, seats: { writer: { provider: "p", model: "m", thinking: "low" } } };
+		const runner = new OneironTicketRunner(ticket, {
+			env: f.env,
+			routing: {},
+			cli: [process.execPath, join(f.root, "prime.js")],
+		});
+		mkdirSync(runner.worktree, { recursive: true });
+		const prompt = "x".repeat(300_000);
+		const result = await runner.seat("writer", prompt, { logName: "stdin.jsonl" });
+		expect([result.code, result.final]).toEqual([0, `argv false stdin ${prompt.length}`]);
+	});
+
+	it("counts a seat whose session began as started, and a spawn failure as never started", async () => {
+		const f = setup();
+		// A review killed mid-think streams only agent_start under the factory profile; it is not "unavailable".
+		writeFileSync(join(f.root, "dies.js"), 'process.stdout.write(\'{"type":"agent_start"}\\n\'); process.exit(3);\n');
+		const ticket = f.ticket("start-one");
+		ticket.launcher = { ...f.launcher, seats: { grok: { provider: "p", model: "m", thinking: "low" } } };
+		const cli = (...argv: string[]) => new OneironTicketRunner(ticket, { env: f.env, routing: {}, cli: argv });
+		const started = cli(process.execPath, join(f.root, "dies.js"));
+		mkdirSync(started.worktree, { recursive: true });
+		const died = await started.seat("grok", "Review this diff", { logName: "died.jsonl" });
+		expect([died.code, died.final, died.activity]).toEqual([3, "", true]);
+		const absent = await cli(join(f.root, "no-such-cli")).seat("grok", "Review this diff", {
+			logName: "absent.jsonl",
+		});
+		expect([absent.code, absent.activity, absent.bytes > 0]).toEqual([127, false, true]);
+	});
+
+	it("continues a writer's existing session on round 1 and delivers the owner's note once", async () => {
+		const f = setup();
+		const ticket = f.ticket("note-one");
+		ticket.launcher = { ...f.launcher, seats: { writer: { provider: "p", model: "m", thinking: "low" } } };
+		const runner = new OneironTicketRunner(ticket, {
+			env: f.env,
+			routing: {},
+			cli: [process.execPath, join(f.root, "prime.js")],
+		});
+		mkdirSync(runner.worktree, { recursive: true });
+		writeFileSync(join(runner.directory, "resume-note.md"), "owner note: the fixture host moved\n");
+		await runner.writerRounds("fix-tests", "finish the first fix", "continue");
+		await runner.writerRounds("fix-tests", "finish the second fix", "continue");
+		expect(readFileSync(join(f.root, "prime.log"), "utf8")).toBe(
+			"open finish the first fix +note\ncontinue finish the second fi\n",
+		);
+		expect(existsSync(join(runner.directory, "resume-note.md"))).toBe(false);
+	});
+
+	it("holds a writer's registered validation without model rounds, then resumes the same session with its result", async () => {
+		const f = setup();
+		const controller = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600_000)"], { stdio: "ignore" });
+		try {
+			const pid = controller.pid!;
+			const identity = { version: 1, ticket: "wait-one", session: "write", jobId: "job-00001", pid };
+			const startId = getProcessStartId(pid)!;
+			const ticket = f.ticket("wait-one");
+			ticket.launcher = { ...f.launcher, seats: { writer: { provider: "p", model: "m", thinking: "low" } } };
+			const directory = join(f.work, "tickets", "wait-one");
+			const terminalPath = join(directory, "validation.json");
+			const runner = new OneironTicketRunner(ticket, {
+				env: {
+					...f.env,
+					PENDING_PATH: join(directory, "pending-jobs", "write.json"),
+					PENDING_JSON: JSON.stringify({ ...identity, startId, terminalPath }),
+				},
+				routing: {},
+				cli: [process.execPath, join(f.root, "prime.js")],
+			});
+			mkdirSync(runner.worktree, { recursive: true });
+			const log = runner.log;
+			const waiting = new Promise<void>((resolveWait) => {
+				runner.log = (step, message) => {
+					log(step, message);
+					if (step === "writer:wait" && message?.includes(`pid=${pid}`)) resolveWait();
+				};
+			});
+			// Round 1 registers the job and prints DONE; the pending job wins, so the session is not over.
+			const rounds = runner.writerRounds("write", "register the gate", "continue");
+			rounds.catch(() => undefined);
+			await waiting;
+			expect(readFileSync(join(f.root, "prime.log"), "utf8")).toBe("open register the gate\n\nP\n");
+			writeFileSync(terminalPath, JSON.stringify({ ...identity, startId, exitCode: 0 }));
+			const { final } = await rounds;
+			expect([final, readFileSync(join(f.root, "prime.log"), "utf8")]).toEqual([
+				"Validation passed.\nDONE wait-one",
+				"open register the gate\n\nP\ncontinue continue\n\nProductive\n",
+			]);
+			expect(existsSync(join(directory, "pending-jobs", "write.job-00001.consumed.json"))).toBe(true);
+		} finally {
+			controller.kill();
+		}
 	});
 
 	it("sends cargo to the ruled build hosts and leaves it alone with none configured", () => {
@@ -283,32 +586,44 @@ process.stdout.write("DONE late-one\\n");
 		offloaded.launcher = {
 			...f.launcher,
 			buildHosts: [
-				{ sshHost: "olety@100.124.216.116", root: "/Volumes/Cinema/w7-build" },
+				{ sshHost: "olety@100.124.216.116", root: "/Volumes/Cinema/w7-build", slots: 3, jobs: 3 },
 				{ sshHost: "olety@100.81.227.117", root: "/Users/olety/w7-build" },
 			],
 		};
 		const environment = new OneironTicketRunner(offloaded, { env: f.env, routing: {} }).cargoEnvironment();
 		expect(environment.W7_CARGO_HOSTS).toBe(
-			"olety@100.124.216.116:/Volumes/Cinema/w7-build;olety@100.81.227.117:/Users/olety/w7-build",
+			"olety@100.124.216.116:3:3:/Volumes/Cinema/w7-build;olety@100.81.227.117:2:4:/Users/olety/w7-build",
 		);
 		expect(environment.W7_CARGO_WORK).toBe(f.work);
 		expect(environment.PATH?.startsWith(`${factoryCargoBinDirectory()}:`)).toBe(true);
 	});
 
-	it("reads the final assistant text from a factory-completed stream and reclaims dead slot locks", async () => {
+	it("reads the final assistant text only from an ended turn and reclaims dead slot locks", async () => {
+		const reply = (text: string, extra: Record<string, unknown> = {}) =>
+			JSON.stringify({
+				type: "message_end",
+				message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }], ...extra },
+			});
 		const stream = [
+			JSON.stringify({ type: "agent_start" }),
 			JSON.stringify({ type: "message_end", message: { role: "user", content: [{ type: "text", text: "no" }] } }),
-			JSON.stringify({
-				type: "message_end",
-				message: { role: "assistant", content: [{ type: "text", text: "first" }] },
-			}),
+			reply("first"),
 			"not json",
-			JSON.stringify({
-				type: "message_end",
-				message: { role: "assistant", content: [{ type: "text", text: "DONE x" }] },
-			}),
+			reply("DONE x"),
+			JSON.stringify({ type: "agent_end" }),
+			JSON.stringify({ type: "message_end", message: { role: "custom", content: [] } }),
 		].join("\n");
 		expect(finalAssistantText(stream)).toBe("DONE x");
+		// No agent_end, a tool call or a cut-off reply leaves no final text: earlier commentary is never reused.
+		expect(finalAssistantText(stream.split("\n").slice(0, 5).join("\n"))).toBe("");
+		expect(
+			finalAssistantText(
+				[reply("DONE x"), reply("", { content: [{ type: "toolCall" }] }), '{"type":"agent_end"}'].join("\n"),
+			),
+		).toBe("");
+		expect(finalAssistantText([reply("DONE x", { stopReason: "length" }), '{"type":"agent_end"}'].join("\n"))).toBe(
+			"",
+		);
 		const directory = mkdtempSync(join(tmpdir(), "factory-slots-"));
 		roots.push(directory);
 		writeFileSync(join(directory, "slot-1.lock"), "999999999");
