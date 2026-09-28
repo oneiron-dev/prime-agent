@@ -204,11 +204,6 @@ export async function generateAgentStatus(params: GenerateAgentStatusParams): Pr
 	}
 }
 
-function isSessionWorking(state: ActiveSessionState): boolean {
-	const session = state.runtime.session;
-	return session.isSessionActive;
-}
-
 // Recap prefix for a turn that errored; the transcript's own error text follows
 // it so the persisted verdict reports the real last event, never invented work.
 const ERROR_RECAP_PREFIX = "Model request failed";
@@ -352,7 +347,7 @@ export class DaemonSessionSummarizer {
 			return;
 		}
 		const messageCount = messages.length;
-		const isWorking = isSessionWorking(state);
+		const isWorking = session.isSessionActive;
 		// Work resumed after an error verdict (a new turn, or an auto-retry of the
 		// failed one): that verdict is history now. Replace it at once instead of
 		// leaving "Model request failed" on screen until the classifier lands,
@@ -459,7 +454,7 @@ export class DaemonSessionSummarizer {
 			if (
 				controller.signal.aborted ||
 				state.runtime.session !== session ||
-				isSessionWorking(state) !== isWorking ||
+				session.isSessionActive !== isWorking ||
 				session.messages.length !== messageCount
 			) {
 				return;
@@ -523,8 +518,8 @@ export class DaemonSessionSummarizer {
 		status: AgentStatus,
 		{ isWorking, previous, persist }: { isWorking: boolean; previous: AgentStatus | undefined; persist: boolean },
 	): void {
-		// An idle settle refreshes the verdict's currency, which drives the roster's
-		// activity axis: it must publish even when the verdict text is unchanged.
+		// An idle settle refreshes the verdict's currency, which gates the published
+		// taskState: it must publish even when the verdict text is unchanged.
 		const changed =
 			previous?.summary !== status.summary ||
 			previous?.taskState !== status.taskState ||
