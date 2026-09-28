@@ -85,6 +85,7 @@ import {
 	type StartupNotices,
 } from "../shared/startup-notices.js";
 import {
+	AGENTS_VIEW_SECTIONS,
 	type AgentsViewManualOrder,
 	type AgentsViewRecursiveRollup,
 	type AgentsViewRow,
@@ -112,6 +113,7 @@ import {
 	hasUnifiedSessionChildren,
 	isAgentsViewSectionHeadingRow,
 	isAgentsViewSessionRow,
+	isSubagentSummary,
 	migrateAgentsViewIdentitySet,
 	reconcileUnifiedSessions,
 	resolveAgentsViewLeftResult,
@@ -980,6 +982,9 @@ export class AgentsViewMode implements Component, Focusable {
 	private rosterStore: AgentsViewRosterStore | undefined;
 	private unsubscribeRosterUpdate: (() => void) | undefined;
 	private savedSearchFetchStarted = false;
+	private savedCatalogFresh = false;
+	private savedCatalogRefreshRequested = false;
+	private liveRosterObserved = false;
 	private statusMessage: string | undefined;
 	private statusMessageTone: "muted" | "error" | "warning" = "muted";
 	private statusMessageSticky = false;
@@ -1180,6 +1185,8 @@ export class AgentsViewMode implements Component, Focusable {
 		this.savedCatalogReady = this.persistentState.savedCatalogLoaded === true;
 		this.applySessionList(this.rosterStore.summaries(), true);
 		this.armSavedSearchFetch();
+		// Show cached rows first, then revalidate to discover chats closed while away.
+		if (this.savedCatalogReady) this.requestSavedCatalogRefresh();
 		this.resolveMissingSelectionAnchor();
 		void this.refreshHeartbeats();
 		this.loadStartupNotices();
@@ -1291,6 +1298,14 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.reorderDown")) {
 			this.reorderSelection(1);
+			return;
+		}
+		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.jumpSectionStart")) {
+			this.jumpSectionSelection(-1);
+			return;
+		}
+		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.jumpSectionEnd")) {
+			this.jumpSectionSelection(1);
 			return;
 		}
 		if (!this.replyTarget && this.handleListNavigation(data)) {
@@ -1436,14 +1451,24 @@ export class AgentsViewMode implements Component, Focusable {
 		if (!row?.selectable || (row.kind !== "agent" && row.kind !== "subagent" && row.kind !== "subagent-summary"))
 			return;
 		const pinned = new Set(this.persistentState.pinnedRootSessionIds ?? []);
-		if (pinned.has(row.rootSessionId)) pinned.delete(row.rootSessionId);
-		else pinned.add(row.rootSessionId);
+		const wasPinned = pinned.delete(row.rootSessionId);
+		if (!wasPinned) pinned.add(row.rootSessionId);
 		this.persistentState.pinnedRootSessionIds = [...pinned];
-		this.applyAgentsViewStateOperation?.({
-			type: "setPin",
-			sessionId: row.rootSessionId,
-			pinned: pinned.has(row.rootSessionId),
-		});
+		const roots = wasPinned ? this.getVisibleGlobalRootRows() : [];
+		const inactiveUnpin = roots.some(
+			(candidate) => candidate.sessionId === row.rootSessionId && candidate.activitySection === "inactive",
+		);
+		const operation: AgentsViewStateOperation = inactiveUnpin
+			? {
+					type: "unpinInactiveRoot",
+					sessionId: row.rootSessionId,
+					inactiveBaseOrder: roots
+						.filter((candidate) => candidate.displaySection === "inactive")
+						.map((candidate) => candidate.sessionId),
+				}
+			: { type: "setPin", sessionId: row.rootSessionId, pinned: !wasPinned };
+		this.applyAgentsViewStateOperation?.(operation);
+		if (this.savedCatalogFresh) this.observeRootActivity();
 		this.rebuildRows();
 		this.ui.requestRender();
 	}
@@ -1537,6 +1562,34 @@ export class AgentsViewMode implements Component, Focusable {
 		// of truncating, so the pointer to the incident CLI stays readable.
 		const wrapWidth = Math.max(1, width - 1);
 		return wrapTextWithAnsi(formatIncidentNoticeLine(notice), wrapWidth).map((wrapped) => ` ${wrapped}`);
+	}
+
+	private jumpSectionSelection(direction: -1 | 1): void {
+		const current = this.rows[this.selectedIndex];
+		if (!current) return;
+		const sections = AGENTS_VIEW_SECTIONS.map((section) =>
+			this.rows.flatMap((row, index) =>
+				row.selectable && (row.kind === "agent" || row.kind === "subagent") && row.displaySection === section
+					? [index]
+					: [],
+			),
+		);
+		const currentSection = AGENTS_VIEW_SECTIONS.indexOf(current.displaySection);
+		const indexes = sections[currentSection] ?? [];
+		const boundary = direction === -1 ? indexes[0] : indexes.at(-1);
+		let target = boundary;
+		if (boundary === undefined || this.selectedIndex === boundary) {
+			for (let offset = 1; offset <= sections.length; offset++) {
+				const nextIndexes = sections[(currentSection + direction * offset + sections.length) % sections.length]!;
+				if (nextIndexes.length === 0) continue;
+				target = direction === -1 ? nextIndexes.at(-1) : nextIndexes[0];
+				break;
+			}
+		}
+		if (target === undefined || target === this.selectedIndex) return;
+		const selectable = this.getSelectableRowIndexes();
+		const currentPosition = selectable.includes(this.selectedIndex) ? selectable.indexOf(this.selectedIndex) : 0;
+		this.moveSelection(selectable.indexOf(target) - currentPosition);
 	}
 
 	private handleListNavigation(data: string): boolean {
@@ -1796,6 +1849,7 @@ export class AgentsViewMode implements Component, Focusable {
 		// The inactive section is catalog-fed, so no query gate: load on view open.
 		if (
 			this.savedSearchFetchStarted ||
+			this.savedCatalogRefreshPending ||
 			this.savedCatalogRetryTimer ||
 			this.persistentState.savedCatalogLoaded === true
 		) {
@@ -1821,11 +1875,7 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
 		const query = this.getActiveSearchQuery();
-		const preservedSessionIds = new Set([
-			...(this.anchorSessionId ? [this.anchorSessionId] : []),
-			...(this.scopeKey ? [this.scopeKey.sessionId] : []),
-			...this.heartbeats.map((heartbeat) => heartbeat.job.sessionId),
-		]);
+		const preservedSessionIds = this.getPreservedSessionIds();
 		const records = filterEmptyAgentsViewSessions(this.scopedRecords, preservedSessionIds, this.unifiedIndex);
 		const queryKey = JSON.stringify([query, [...preservedSessionIds]]);
 		const cached = this.filteredRecordsCache;
@@ -1840,6 +1890,14 @@ export class AgentsViewMode implements Component, Focusable {
 			: records;
 		this.filteredRecordsCache = { query: queryKey, records: this.scopedRecords, filtered };
 		return filtered;
+	}
+
+	private getPreservedSessionIds(): Set<string> {
+		return new Set([
+			...(this.anchorSessionId ? [this.anchorSessionId] : []),
+			...(this.scopeKey ? [this.scopeKey.sessionId] : []),
+			...this.heartbeats.map((heartbeat) => heartbeat.job.sessionId),
+		]);
 	}
 
 	/** Rebuild rows from the last fetched summaries, keeping selection on the same row. */
@@ -2801,8 +2859,24 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private applySessionList(sessions: SessionSummary[], successful = false): void {
+		const nextRootIds = new Set(
+			sessions
+				.filter((summary) => summary.lifecycle === "live" && !isSubagentSummary(summary))
+				.map((summary) => summary.sessionId),
+		);
+		const rootRemoved =
+			successful &&
+			this.liveRosterObserved &&
+			this.lastListedSummaries.some(
+				(summary) =>
+					summary.lifecycle === "live" && !isSubagentSummary(summary) && !nextRootIds.has(summary.sessionId),
+			);
 		this.lastListedSummaries = sessions;
-		if (successful) this.persistentState.lastSuccessfulLiveSummaries = sessions;
+		if (successful) {
+			this.persistentState.lastSuccessfulLiveSummaries = sessions;
+			this.liveRosterObserved = true;
+		}
+		if (rootRemoved) this.requestSavedCatalogRefresh();
 		this.reconcileCatalogs();
 	}
 
@@ -2821,6 +2895,7 @@ export class AgentsViewMode implements Component, Focusable {
 		);
 		this.unifiedIndex = buildUnifiedSessionIndex(this.unifiedRecords);
 		this.recursiveRollups = computeRecursiveRollups(this.unifiedRecords, this.unifiedIndex);
+		if (this.savedCatalogFresh) this.observeRootActivity();
 		migrateAgentsViewIdentitySet(this.expandedSubagentParents, this.unifiedIndex.byKey);
 		migrateAgentsViewIdentitySet(this.programShownParents, this.unifiedIndex.byKey);
 
@@ -2853,6 +2928,63 @@ export class AgentsViewMode implements Component, Focusable {
 		this.applyPendingAncestorExpansion();
 		this.restoreSelection();
 		this.ui.requestRender();
+	}
+
+	/** Global root projection, without search or scope, using the same empty-row filter as the displayed roster. */
+	private getVisibleGlobalRootRows(): AgentsViewSessionRow[] {
+		const visible = filterEmptyAgentsViewSessions(
+			this.unifiedRecords,
+			this.getPreservedSessionIds(),
+			this.unifiedIndex,
+		);
+		return buildAgentsViewRows(
+			visible,
+			new Set(),
+			new Set(),
+			undefined,
+			{
+				pinnedRootSessionIds: new Set(this.persistentState.pinnedRootSessionIds ?? []),
+				manualOrder: this.persistentState.manualOrder ?? {},
+			},
+			this.recursiveRollups,
+			this.anchorSessionId,
+		).filter((row) => row.kind === "agent" && row.depth === 0);
+	}
+
+	private observeRootActivity(): void {
+		if (
+			this.persistentState.pendingAgentsViewStateOperations?.some(
+				(operation) => operation.type === "observeInactiveRoots",
+			)
+		)
+			return;
+		const roots = this.getVisibleGlobalRootRows();
+		const inactive = roots.filter((row) => row.displaySection === "inactive");
+		const legacyOrder = this.persistentState.manualOrder?.roots ?? [];
+		const timestamp = (row: AgentsViewSessionRow): number => {
+			const value = Date.parse(row.summary.lastActivityAt ?? row.summary.modified ?? "");
+			return Number.isFinite(value) ? value : 0;
+		};
+		const newestFirst = (a: AgentsViewSessionRow, b: AgentsViewSessionRow): number => timestamp(b) - timestamp(a);
+		const inactiveOrder = this.persistentState.manualOrder?.["roots:inactive"]
+			? [...inactive].sort(newestFirst)
+			: [
+					...inactive.filter((row) => !legacyOrder.includes(row.sessionId)).sort(newestFirst),
+					...inactive.filter((row) => legacyOrder.includes(row.sessionId)),
+				];
+		this.applyAgentsViewStateOperation({
+			type: "observeInactiveRoots",
+			inactiveSessionIds: inactiveOrder.map((row) => row.sessionId),
+		});
+	}
+
+	private requestSavedCatalogRefresh(): void {
+		if (this.stopped || this.reconnectPromise || this.daemonShutdownReceived) return;
+		if (this.savedCatalogRefreshPending) {
+			this.savedCatalogRefreshRequested = true;
+			return;
+		}
+		void this.refreshSavedSessions({ preserveStatusOnError: true });
 	}
 
 	private rearmSavedSearchFetch(): void {
@@ -2940,10 +3072,12 @@ export class AgentsViewMode implements Component, Focusable {
 		this.unsubscribeSavedCatalog?.();
 		this.unsubscribeSavedCatalog = undefined;
 		const generation = ++this.savedCatalogGeneration;
+		let succeeded = false;
 		this.persistentState.savedCatalogGeneration = generation;
 		this.savedCatalogRefreshPending = true;
 		this.savedCatalogReady = false;
 		this.persistentState.savedCatalogLoaded = undefined;
+		this.savedCatalogFresh = false;
 		this.savedCatalogStatus = "loading saved sessions";
 		const progressiveSessions = new Map(
 			[
@@ -3001,10 +3135,12 @@ export class AgentsViewMode implements Component, Focusable {
 			this.lastSuccessfulSavedSessions = sessions;
 			this.savedCatalogReady = true;
 			this.savedCatalogStatus = undefined;
+			this.savedCatalogFresh = true;
 			this.persistentState.lastSuccessfulSavedSessions = sessions;
 			this.persistentState.savedSessions = sessions;
 			this.persistentState.savedCatalogLoaded = true;
 			this.reconcileCatalogs();
+			succeeded = true;
 			return true;
 		} catch (error) {
 			if (!this.stopped && generation === this.savedCatalogGeneration) {
@@ -3043,6 +3179,9 @@ export class AgentsViewMode implements Component, Focusable {
 				this.unsubscribeSavedCatalog = undefined;
 				this.savedCatalogRefreshPending = false;
 				this.resolveMissingSelectionAnchor();
+				const followUp = this.savedCatalogRefreshRequested;
+				this.savedCatalogRefreshRequested = false;
+				if (succeeded && followUp) this.requestSavedCatalogRefresh();
 			}
 		}
 	}
@@ -3605,8 +3744,15 @@ export class AgentsViewMode implements Component, Focusable {
 		const selectedAgent = selectedRow?.kind === "agent";
 		const selectedSubagent = selectedRow?.kind === "subagent";
 		const selectedSummary = selectedRow?.kind === "subagent-summary";
+		const sectionJumpHints = [
+			[keyText("app.agents.jumpSectionStart"), "first"],
+			[keyText("app.agents.jumpSectionEnd"), "last"],
+		]
+			.filter(([key]) => key)
+			.map(([key, label]) => `${key} ${label}`);
 		const hints = [
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
+			sectionJumpHints.length > 0 ? sectionJumpHints.join("/") : undefined,
 			selectedHeading
 				? undefined
 				: `${keyText("app.agents.reorderUp")}/${keyText("app.agents.reorderDown")} reorder`,

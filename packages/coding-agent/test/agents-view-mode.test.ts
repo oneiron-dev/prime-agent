@@ -179,6 +179,7 @@ function catalogHarness(saved: AgentConnectionSavedSessionInfo[] = [], live: Ses
 		reconcileCatalogs: vi.fn((): void => {
 			invoke("reconcileCatalogs", self);
 		}),
+		observeRootActivity: vi.fn(),
 		rebuildRows: vi.fn((): void => {
 			invoke("rebuildRows", self);
 		}),
@@ -390,6 +391,58 @@ describe("AgentsViewMode", () => {
 		});
 		expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ type: "delete_rlm_subagent" }));
 	});
+
+	it.each([
+		["pinned-a", "\u001b[1;5A", "inactive"],
+		["pinned-b", "\u001b[1;5A", "pinned-a"],
+		["pinned-a", "\u001b[1;5B", "pinned-b"],
+		["pinned-b", "\u001b[1;5B", "running"],
+		["pinned-b", "\u001b[1;5B", "inactive", true],
+		["running", "\u001b[1;5B", "inactive"],
+		["inactive", "\u001b[1;5B", "pinned-a"],
+	] as [string, string, string, boolean?][])(
+		"jumps from %s to %s with configured section keys",
+		(from, input, target, collapsed) => {
+			const roots = ["pinned-a", "pinned-b", "running", "inactive"].map((id) =>
+				summary({
+					id,
+					activeSessionId: id,
+					sessionId: id,
+					rosterStatus: id === "running" ? "running" : id === "inactive" ? "inactive" : "idle",
+				}),
+			);
+			const rows = buildAgentsViewSectionRows(
+				buildAgentsViewRows(roots, new Set(), new Set(), undefined, {
+					pinnedRootSessionIds: new Set(["pinned-a", "pinned-b"]),
+				}),
+				{ collapsedSections: new Set(collapsed ? ["running"] : []) },
+			);
+			const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
+			try {
+				Reflect.set(
+					view,
+					"keybindings",
+					new KeybindingsManager({
+						"app.agents.jumpSectionStart": "ctrl+up",
+						"app.agents.jumpSectionEnd": "ctrl+down",
+					}),
+				);
+				Reflect.set(view, "rows", rows);
+				Reflect.set(
+					view,
+					"selectedIndex",
+					rows.findIndex((row) => row.kind === "agent" && row.sessionId === from),
+				);
+				view.handleInput(input);
+				expect(rows[Reflect.get(view, "selectedIndex") as number]).toMatchObject({
+					kind: "agent",
+					sessionId: target,
+				});
+			} finally {
+				stopThemeWatcher();
+			}
+		},
+	);
 
 	it("re-resolves subagent state before choosing stop or delete intent", async () => {
 		const child = summary({
@@ -832,6 +885,7 @@ describe("AgentsViewMode", () => {
 			requireClient: () => ({ request }),
 			getSavedSessionCatalogContext: () => ({ cwd: "/tmp" }),
 			reconcileCatalogs: vi.fn(),
+			observeRootActivity: vi.fn(),
 			resolveMissingSelectionAnchor: vi.fn(),
 		};
 
@@ -1863,6 +1917,75 @@ describe("AgentsViewMode persistent catalog state", () => {
 		}
 	});
 
+	it("discovers saved-only roots after a cached-catalog remount", async () => {
+		const store = new AgentsViewStateStore(join(mkdtempSync(join(tmpdir(), "agents-view-mode-")), "state.json"));
+		store.apply({ type: "observeInactiveRoots", inactiveSessionIds: ["old"] });
+		const old = savedSession("old");
+		const empty = { ...savedSession("new"), messageCount: 0, firstMessage: "", allMessagesText: "" };
+		const view = new AgentsViewMode(
+			{ config: { cwd: "/tmp" } as never, uiServices: createUiServices(), agentsViewStateStore: store },
+			{ savedCatalogLoaded: true, savedSessions: [old, empty], lastSuccessfulSavedSessions: [old, empty] },
+		);
+		const catalog = deferredSavedCatalog();
+		const refresh = vi.spyOn(
+			view as unknown as { refreshSavedSessions: () => Promise<boolean> },
+			"refreshSavedSessions",
+		);
+		Reflect.set(view, "client", { request: vi.fn(), isConnected: true });
+		try {
+			invoke("loadAgentsViewState", view);
+			invoke("reconcileCatalogs", view);
+			invoke("requestSavedCatalogRefresh", view);
+			catalog.emit(savedSession("new"));
+			expect(store.load().state.manualOrder["roots:inactive"]).toEqual(["old"]);
+			catalog.resolve([old, savedSession("new")]);
+			await expect(refresh.mock.results[0]?.value).resolves.toBe(true);
+			expect(store.load().state.manualOrder["roots:inactive"]).toEqual(["new", "old"]);
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
+	it("scans once for a removed live root, then coalesces a second removal", async () => {
+		const store = new AgentsViewStateStore(join(mkdtempSync(join(tmpdir(), "agents-view-mode-")), "state.json"));
+		const view = new AgentsViewMode(
+			{ config: { cwd: "/tmp" } as never, uiServices: createUiServices(), agentsViewStateStore: store },
+			{},
+		);
+		const first = deferredSavedCatalog(),
+			second = deferredSavedCatalog();
+		const refresh = vi.spyOn(
+			view as unknown as { refreshSavedSessions: () => Promise<boolean> },
+			"refreshSavedSessions",
+		);
+		Reflect.set(view, "client", { request: vi.fn(), isConnected: true });
+		const a = summary({ id: "a", activeSessionId: "a", sessionId: "a" });
+		const b = summary({ id: "b", activeSessionId: "b", sessionId: "b" });
+		let listed: SessionSummary[] = [a, b];
+		Reflect.set(view, "rosterStore", { summaries: () => listed });
+		const update = (next: SessionSummary[]) => {
+			listed = next;
+			invoke("onRosterUpdate", view);
+		};
+		try {
+			invoke("loadAgentsViewState", view);
+			update([a, b]);
+			update([b]);
+			update([]);
+			expect(refresh).toHaveBeenCalledTimes(1);
+			first.resolve([savedSession("a")]);
+			await expect(refresh.mock.results[0]?.value).resolves.toBe(true);
+			expect(refresh).toHaveBeenCalledTimes(2);
+			second.resolve([savedSession("a"), savedSession("b")]);
+			await expect(refresh.mock.results[1]?.value).resolves.toBe(true);
+			expect(store.load().state.manualOrder["roots:inactive"]).toEqual(["b", "a"]);
+			update([]);
+			expect(refresh).toHaveBeenCalledTimes(2);
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
 	it("applies an initial handoff scope from the first pushed roster refresh", async () => {
 		const root = summary();
 		const scope = { sessionId: root.sessionId, activeSessionId: root.activeSessionId };
@@ -2532,6 +2655,7 @@ describe("agents view startup notices", () => {
 			rows: [summaryRow],
 			selectedIndex: 0,
 			persistentState: { pinnedRootSessionIds: [] as string[] },
+			getVisibleGlobalRootRows: () => [],
 			rebuildRows: vi.fn(),
 			ui: { requestRender: vi.fn() },
 		};

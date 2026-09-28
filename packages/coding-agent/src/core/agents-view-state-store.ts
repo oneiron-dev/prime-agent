@@ -20,6 +20,8 @@ export type AgentsViewManualOrder = Record<string, string[]>;
 export type AgentsViewStateOperation =
 	| { type: "setPin"; sessionId: string; pinned: boolean }
 	| { type: "setSectionCollapsed"; section: AgentsViewSection; collapsed: boolean }
+	| { type: "observeInactiveRoots"; inactiveSessionIds: readonly string[] }
+	| { type: "unpinInactiveRoot"; sessionId: string; inactiveBaseOrder: readonly string[] }
 	| {
 			group: string;
 			type: "placePeer";
@@ -35,6 +37,8 @@ export interface AgentsViewState {
 	manualOrder: AgentsViewManualOrder;
 	/** Sections the user collapsed. Absent in files written before the feature. */
 	collapsedSections: AgentsViewSection[];
+	/** Roots previously seen in Inactive; retained across temporary catalog omissions. */
+	observedInactiveRootSessionIds?: string[];
 }
 export interface AgentsViewStateResult {
 	state: AgentsViewState;
@@ -49,6 +53,7 @@ const empty = (): AgentsViewState => ({
 	pinnedRootSessionIds: [],
 	manualOrder: Object.create(null) as AgentsViewManualOrder,
 	collapsedSections: [],
+	observedInactiveRootSessionIds: [],
 });
 
 function report(message: string, cause?: unknown): Error {
@@ -84,6 +89,7 @@ function normalize(value: unknown): AgentsViewState {
 		pinnedRootSessionIds: strings(input.pinnedRootSessionIds),
 		manualOrder,
 		collapsedSections: sections(input.collapsedSections),
+		observedInactiveRootSessionIds: strings(input.observedInactiveRootSessionIds),
 	};
 }
 
@@ -194,6 +200,10 @@ export class AgentsViewStateStore {
 			return {
 				state: withLock(this.path, this.coordination, () => {
 					const state = readState(this.path);
+					const previous =
+						operation.type === "observeInactiveRoots" || operation.type === "unpinInactiveRoot"
+							? JSON.stringify(state)
+							: undefined;
 					switch (operation.type) {
 						case "setPin": {
 							const pins = new Set(state.pinnedRootSessionIds);
@@ -207,6 +217,37 @@ export class AgentsViewStateStore {
 							if (operation.collapsed) collapsed.add(operation.section);
 							else collapsed.delete(operation.section);
 							state.collapsedSections = [...collapsed];
+							break;
+						}
+						case "observeInactiveRoots": {
+							const known = new Set(state.observedInactiveRootSessionIds ?? []);
+							const inactive = strings(operation.inactiveSessionIds);
+							const newcomers = inactive.filter((id) => !known.has(id));
+							for (const id of inactive) known.add(id);
+							state.observedInactiveRootSessionIds = [...known];
+							if (newcomers.length > 0) {
+								const previousOrder =
+									state.manualOrder["roots:inactive"] ??
+									(state.manualOrder.roots ?? []).filter((id) => inactive.includes(id));
+								state.manualOrder["roots:inactive"] = [
+									...new Set([...newcomers, ...previousOrder, ...inactive]),
+								];
+							}
+							break;
+						}
+						case "unpinInactiveRoot": {
+							if (!state.pinnedRootSessionIds.includes(operation.sessionId)) break;
+							state.pinnedRootSessionIds = state.pinnedRootSessionIds.filter((id) => id !== operation.sessionId);
+							const base = strings(operation.inactiveBaseOrder);
+							const previousOrder =
+								state.manualOrder["roots:inactive"] ??
+								(state.manualOrder.roots ?? []).filter((id) => base.includes(id));
+							state.manualOrder["roots:inactive"] = [
+								...new Set([operation.sessionId, ...previousOrder, ...base]),
+							];
+							state.observedInactiveRootSessionIds = [
+								...new Set([...(state.observedInactiveRootSessionIds ?? []), operation.sessionId]),
+							];
 							break;
 						}
 						case "placePeer": {
@@ -227,6 +268,9 @@ export class AgentsViewStateStore {
 						}
 						case "removeSession":
 							state.pinnedRootSessionIds = state.pinnedRootSessionIds.filter((id) => id !== operation.sessionId);
+							state.observedInactiveRootSessionIds = (state.observedInactiveRootSessionIds ?? []).filter(
+								(id) => id !== operation.sessionId,
+							);
 							for (const key of Object.keys(state.manualOrder)) {
 								if (key.startsWith(`children:${operation.sessionId}:`)) delete state.manualOrder[key];
 								else
@@ -235,7 +279,7 @@ export class AgentsViewStateStore {
 							break;
 					}
 					const normalized = normalize(state);
-					writeState(this.path, normalized);
+					if (previous !== JSON.stringify(normalized)) writeState(this.path, normalized);
 					return normalized;
 				}),
 			};

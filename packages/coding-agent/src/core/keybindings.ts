@@ -50,6 +50,8 @@ export interface AppKeybindings {
 	"app.agents.reorderUp": true;
 	"app.agents.reorderDown": true;
 	"app.agents.expand": true;
+	"app.agents.jumpSectionStart": true;
+	"app.agents.jumpSectionEnd": true;
 	"app.tree.foldOrUp": true;
 	"app.tree.unfoldOrDown": true;
 	"app.tree.editLabel": true;
@@ -155,6 +157,14 @@ export const KEYBINDINGS = {
 	"app.agents.reorderUp": { defaultKeys: "shift+up", description: "Move selected agent up" },
 	"app.agents.reorderDown": { defaultKeys: "shift+down", description: "Move selected agent down" },
 	"app.agents.expand": { defaultKeys: "alt+right", description: "Expand or collapse selected agent subagents" },
+	"app.agents.jumpSectionStart": {
+		defaultKeys: process.platform === "darwin" ? "super+up" : [],
+		description: "Jump to the first session in this section, or the previous section",
+	},
+	"app.agents.jumpSectionEnd": {
+		defaultKeys: process.platform === "darwin" ? "super+down" : [],
+		description: "Jump to the last session in this section, or the next section",
+	},
 	"app.tree.foldOrUp": {
 		defaultKeys: ["ctrl+left", "alt+left"],
 		description: "Fold tree branch or move up",

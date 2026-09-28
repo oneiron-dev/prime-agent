@@ -10,7 +10,7 @@ After editing `keybindings.json`, run `/reload` in Prime Agent to apply the chan
 
 ## Key Format
 
-`modifier+key` where modifiers are `ctrl`, `shift`, `alt` (combinable) and keys are:
+Use `modifier+key`, with combinable `ctrl`, `shift`, `alt`, and `super` modifiers. In config, `super` is the macOS Command key. Supported keys include:
 
 - **Letters:** `a-z`
 - **Digits:** `0-9`
@@ -216,3 +216,7 @@ Binding `ctrl+p` below moves the editor cursor up; shortcuts in other views keep
 | `app.agents.reorderUp` | `shift+up` | Move selected agent within its section and sibling group; order is durable per local profile and machine |
 | `app.agents.reorderDown` | `shift+down` | Move selected agent within its section and sibling group; order is durable per local profile and machine |
 | `app.agents.togglePin` | `ctrl+t` | Pin or unpin the selected agent tree in Agents View; pins are durable per local profile and machine |
+| `app.agents.jumpSectionStart` | `super+up` (Cmd+↑ on macOS; none elsewhere) | Jump to the first visible session in the current section; from its first session, jump to the last session in the previous nonempty section |
+| `app.agents.jumpSectionEnd` | `super+down` (Cmd+↓ on macOS; none elsewhere) | Jump to the last visible session in the current section; from its last session, jump to the first session in the next nonempty section |
+
+Cmd+Arrow requires a terminal that sends Super-modified arrow events (for example, through the Kitty keyboard protocol). macOS or the terminal may intercept these keys first. If they do not reach Prime Agent, change the terminal shortcut or remap `app.agents.jumpSectionStart` and `app.agents.jumpSectionEnd` in `~/.prime/agent/keybindings.json` to keys your terminal sends, such as `alt+home` and `alt+end`.

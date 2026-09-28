@@ -1293,7 +1293,7 @@ function buildSpawnCodeRows(
 export function getAgentsViewReorderGroup(row: AgentsViewRow): string | undefined {
 	// Section headings are not reorderable peers of any session group.
 	if (!isAgentsViewSessionRow(row)) return undefined;
-	if (row.kind === "agent" && row.depth === 0) return "roots";
+	if (row.kind === "agent" && row.depth === 0) return row.displaySection === "inactive" ? "roots:inactive" : "roots";
 	if (row.kind === "subagent" && row.parentSessionId)
 		return `children:${row.parentSessionId}:${row.summary.spawnCode ?? ""}`;
 	return undefined;
@@ -1308,7 +1308,10 @@ function compareAgentsViewRows(
 	const sectionDiff = sectionRank(a.displaySection) - sectionRank(b.displaySection);
 	if (sectionDiff !== 0) return sectionDiff;
 	const group = getAgentsViewReorderGroup(a);
-	const manual = group !== undefined && group === getAgentsViewReorderGroup(b) ? manualOrder[group] : undefined;
+	const manual =
+		group !== undefined && group === getAgentsViewReorderGroup(b)
+			? (manualOrder[group] ?? (group === "roots:inactive" ? manualOrder.roots : undefined))
+			: undefined;
 	if (manual) {
 		const ai = manual.indexOf(a.sessionId);
 		const bi = manual.indexOf(b.sessionId);

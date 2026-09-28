@@ -2378,6 +2378,33 @@ describe("agents view pin and ordering regressions", () => {
 		).toEqual(["a", "c"]);
 		expect(rows.find((row) => row.sessionId === "b")?.displaySection).toBe("idle");
 	});
+
+	test("isolates inactive manual order from pinned peers and running/idle comparators", () => {
+		const summaries = (["p", "r", "i", "x"] as const).flatMap((group) =>
+			(["old", "new"] as const).map((age) =>
+				makeSummary({
+					id: `${group}-${age}`,
+					sessionId: `${group}-${age}`,
+					rosterStatus: group === "x" ? "inactive" : group === "r" ? "running" : undefined,
+					created: `2026-01-0${age === "old" ? 1 : 2}T00:00:00Z`,
+					lastActivityAt: `2026-01-0${age === "old" ? 2 : 1}T00:00:00Z`,
+				}),
+			),
+		);
+		const rows = buildAgentsViewRows(summaries, new Set(), new Set(), undefined, {
+			pinnedRootSessionIds: new Set(["p-old", "p-new"]),
+			manualOrder: { roots: ["p-old", "p-new", "x-new", "x-old"], "roots:inactive": ["x-old", "x-new"] },
+		});
+		const ids = (section: string) =>
+			rows.filter((row) => row.depth === 0 && row.displaySection === section).map((row) => row.sessionId);
+		expect(["pinned", "running", "idle", "inactive"].map(ids)).toEqual([
+			["p-old", "p-new"],
+			["r-new", "r-old"],
+			["i-old", "i-new"],
+			["x-old", "x-new"],
+		]);
+		expect(getAgentsViewReorderGroup(rows.find((row) => row.sessionId === "x-old")!)).toBe("roots:inactive");
+	});
 });
 
 describe("#502 agents view catalog refresh races", () => {

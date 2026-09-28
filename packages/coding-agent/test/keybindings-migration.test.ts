@@ -80,6 +80,17 @@ describe("keybindings migration", () => {
 		expect(new KeybindingsManager(config).getKeys(id)).toEqual(keys);
 	});
 
+	it.each([
+		["app.agents.jumpSectionStart", "super+up", "alt+home", "\x1b[1;9A"],
+		["app.agents.jumpSectionEnd", "super+down", "alt+end", "\x1b[1;9B"],
+	] as const)("supports configurable %s with a macOS-only default", (action, macKey, customKey, sequence) => {
+		const defaults = new KeybindingsManager();
+		expect(defaults.getKeys(action)).toEqual(process.platform === "darwin" ? [macKey] : []);
+		if (process.platform === "darwin") expect(defaults.matches(sequence, action)).toBe(true);
+		const customized = new KeybindingsManager({ [action]: customKey });
+		expect(customized.getKeys(action)).toEqual([customKey]);
+	});
+
 	it("reports an application default explicitly retained against an editor binding", () => {
 		const keybindings = new KeybindingsManager({ ...editorOverride, "app.tools.expand": "ctrl+o" });
 

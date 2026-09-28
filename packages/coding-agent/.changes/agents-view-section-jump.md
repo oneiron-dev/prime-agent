@@ -1,0 +1,2 @@
+- Added configurable Cmd+Up and Cmd+Down navigation between visible Agents View sections on macOS.
+- Changed newly observed Inactive roots and explicitly unpinned Inactive roots to appear first, while preserving later manual moves; resumed same-ID roots are not auto-promoted.

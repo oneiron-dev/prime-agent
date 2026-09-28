@@ -120,6 +120,31 @@ describe("AgentsViewStateStore", () => {
 		expect(store.load().state.collapsedSections).toEqual(["idle"]);
 	});
 
+	test("promotes first-seen roots once; preserves moves after restart and stale unpin replay", () => {
+		const path = statePath(),
+			first = new AgentsViewStateStore(path);
+		const observe = (store: AgentsViewStateStore, inactiveSessionIds: string[]) =>
+			store.apply({ type: "observeInactiveRoots", inactiveSessionIds }).state.manualOrder["roots:inactive"];
+		first.apply(place("roots", "old", "new", false, ["old", "new", "pinned"]));
+		expect(observe(first, ["new", "old"])).toEqual(["new", "old"]);
+		expect(observe(first, ["new", "old", "saved"])).toEqual(["saved", "new", "old"]);
+		first.apply(place("roots:inactive", "saved", "new", false, ["saved", "new", "old"]));
+		const restarted = new AgentsViewStateStore(path);
+		observe(restarted, ["new", "old"]);
+		expect(observe(restarted, ["saved", "new", "old"])).toEqual(["new", "saved", "old"]);
+		expect(restarted.load().state.manualOrder.roots).toEqual(["new", "old", "pinned"]);
+		restarted.apply({ type: "setPin", sessionId: "old", pinned: true });
+		const unpin = {
+			type: "unpinInactiveRoot" as const,
+			sessionId: "old",
+			inactiveBaseOrder: ["new", "saved", "old"],
+		};
+		expect(restarted.apply(unpin).state.manualOrder["roots:inactive"]).toEqual(["old", "new", "saved"]);
+		restarted.apply(place("roots:inactive", "old", "new", false, ["old", "new", "saved"]));
+		expect(first.apply(unpin).state.manualOrder["roots:inactive"]).toEqual(["new", "old", "saved"]);
+		expect(restarted.load().state.pinnedRootSessionIds).toEqual([]);
+	});
+
 	test("writes parsable private state, creates a private parent, and leaves no lock or temp", () => {
 		const path = join(mkdtempSync(join(tmpdir(), "agents-view-state-")), "nested", "state.json"),
 			store = new AgentsViewStateStore(path);
