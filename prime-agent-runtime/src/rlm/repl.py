@@ -35,6 +35,11 @@ FEATURES = ("trim_memory", "memory_notice", "memory_report")
 
 DEFAULT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 8 * 1024 * 1024
+# Restore bounds when the host sends none: upstream's writer caps, above ours, so a
+# snapshot written before our caps were lowered still restores, while a corrupt or
+# sparse file cannot force a multi-gigabyte read.
+DEFAULT_RESTORE_MAX_BYTES = 256 * 1024 * 1024
+DEFAULT_RESTORE_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
 
 # Plain ASCII, never a pickle start: _restore_state sniffs it to tell v2 framed
 # payloads from legacy (single dill-pickled dict) ones.
@@ -755,13 +760,16 @@ def _has_filehandle_reducer(blob: bytes | bytearray) -> bool:
     return False
 
 
-def _read_snapshot_records(fh: Any) -> dict[str, bytes]:
+def _read_snapshot_records(fh: Any, max_bytes: int, max_variable_bytes: int) -> dict[str, bytes]:
     """Framing damage is a corrupt snapshot: a restore error, never a partial namespace.
-    Length fields are bounds-checked before their reads, so a corrupt header cannot force a huge allocation."""
+    Length fields are bounds-checked before their reads, so a corrupt header cannot force a huge
+    allocation; the per-record and aggregate caps bound every name and blob read, so a sparse
+    multi-gigabyte file cannot OOM the process either."""
     fh.seek(0, os.SEEK_END)
     size = fh.tell()
     fh.seek(len(_SNAPSHOT_MAGIC))
     records: dict[str, bytes] = {}
+    total = 0
     while fh.tell() < size:
         header = fh.read(4)
         if len(header) < 4:
@@ -769,11 +777,18 @@ def _read_snapshot_records(fh: Any) -> dict[str, bytes]:
         name_len = int.from_bytes(header, "little")
         if fh.tell() + name_len + 8 > size:
             raise ValueError("truncated snapshot record")
+        if name_len > max_bytes:
+            raise ValueError("snapshot record name exceeds the aggregate byte cap")
         name = fh.read(name_len)
         raw_len = fh.read(8)
         blob_len = int.from_bytes(raw_len, "little")
         if len(raw_len) < 8 or fh.tell() + blob_len > size:
             raise ValueError("truncated snapshot record")
+        if blob_len > max_variable_bytes:
+            raise ValueError("snapshot record exceeds the per-variable byte cap")
+        total += blob_len
+        if total > max_bytes:
+            raise ValueError("snapshot payload exceeds the aggregate byte cap")
         blob = fh.read(blob_len)
         if len(blob) < blob_len:
             raise ValueError("truncated snapshot record")
@@ -1077,7 +1092,11 @@ def _revive_with_live_globals(
 
 
 def _restore_state(
-    ns: dict[str, Any], path: str, committed: list[dict[str, Any]] | None = None
+    ns: dict[str, Any],
+    path: str,
+    committed: list[dict[str, Any]] | None = None,
+    max_bytes: int | None = None,
+    max_variable_bytes: int | None = None,
 ) -> dict[str, Any]:
     if not os.path.exists(path):
         return {"restored": [], "failed": [], "reason": "snapshot not found"}
@@ -1088,7 +1107,15 @@ def _restore_state(
     try:
         with open(path, "rb") as fh:
             if fh.read(len(_SNAPSHOT_MAGIC)) == _SNAPSHOT_MAGIC:
-                payload = _read_snapshot_records(fh)
+                payload = _read_snapshot_records(
+                    fh,
+                    max_bytes if max_bytes is not None else DEFAULT_RESTORE_MAX_BYTES,
+                    (
+                        max_variable_bytes
+                        if max_variable_bytes is not None
+                        else DEFAULT_RESTORE_MAX_VARIABLE_BYTES
+                    ),
+                )
             else:
                 # Legacy: one dill-pickled dict; old snapshot files must keep restoring.
                 fh.seek(0)
@@ -1174,7 +1201,9 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
                 prune,
                 committed,
             )
-        return _restore_state(ns, req["path"], committed)
+        return _restore_state(
+            ns, req["path"], committed, req.get("max_bytes"), req.get("max_variable_bytes")
+        )
 
     assert _loop is not None
     task = _loop.create_task(run())
