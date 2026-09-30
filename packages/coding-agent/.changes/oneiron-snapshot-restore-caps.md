@@ -1,0 +1,1 @@
+- Fixed kernel state restore reading snapshot records with no size limit: a corrupt or sparse snapshot declaring a huge record now fails the restore against a per-variable and an aggregate byte cap (the host's caps when it sends them, else 16 MiB and 256 MiB) instead of allocating it.

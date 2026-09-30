@@ -2781,6 +2781,33 @@ class SnapshotMemoryAndFileHandleSafetyTest(unittest.TestCase):
         self.assertEqual(set(ns), {"math", "new"})
         self.assertLessEqual(result["bytes"], 7_000)
 
+    def test_restore_caps_every_record_read_before_it_allocates(self):
+        import dill
+
+        def frame(name: bytes, blob: bytes) -> bytes:
+            return len(name).to_bytes(4, "little") + name + len(blob).to_bytes(8, "little") + blob
+
+        mib, huge = 1 << 20, 64 << 20
+        caps = {"max_bytes": mib, "max_variable_bytes": mib}
+        part = dill.dumps(b"x" * (mib * 3 // 5))
+        cases = [
+            ("within the caps", frame(b"a", dill.dumps(1)), 0, caps, ["a"]),
+            ("default caps admit a pre-8-MiB-cap record", frame(b"a", dill.dumps(b"x" * 9 * mib)), 0, {}, ["a"]),
+            ("record over the per-variable cap", frame(b"a", dill.dumps(b"x" * mib)), 0, caps, None),
+            ("payload over the aggregate cap", frame(b"a", part) + frame(b"b", part), 0, caps, None),
+            ("sparse huge blob", (4).to_bytes(4, "little") + b"huge" + huge.to_bytes(8, "little"), huge, caps, None),
+            ("sparse huge name", huge.to_bytes(4, "little"), huge + 8, caps, None),
+        ]
+        for label, body, sparse, request_caps, restored in cases:
+            with self.subTest(label):
+                with open(self.path, "wb") as fh:
+                    fh.write(self.repl._SNAPSHOT_MAGIC + body)
+                    fh.truncate(fh.tell() + sparse)
+                ns = {"keep": 1}
+                result = self.repl._restore_state(ns, self.path, None, **request_caps)
+                self.assertEqual(("error" in result, result.get("restored")), (restored is None, restored))
+                self.assertEqual(sorted(ns), sorted(["keep", *(restored or [])]))
+
 
 if __name__ == "__main__":
     unittest.main()
