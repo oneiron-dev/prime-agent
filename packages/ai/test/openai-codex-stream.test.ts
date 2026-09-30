@@ -1544,6 +1544,7 @@ describe("openai-responses shared conversions", () => {
 				type: "response.output_item.done",
 				item: { ...item, arguments: argumentsJson },
 			} as ResponseStreamEvent;
+			yield { type: "response.completed", response: { status: "completed" } } as ResponseStreamEvent;
 		}
 
 		const output: AssistantMessage = {

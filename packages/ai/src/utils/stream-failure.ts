@@ -29,7 +29,7 @@ export type StreamTransportFailureCause = "connect" | "error" | "closed" | "eof"
  * before the provider delivered a verdict, so no provider error type exists.
  */
 export interface StreamTransportFailureDetail {
-	protocol: "websocket";
+	protocol: "websocket" | "sse";
 	cause: StreamTransportFailureCause;
 	/** Server close code, when the socket closed with one. */
 	closeCode?: number;
@@ -158,6 +158,24 @@ export function streamFailureFromStopReason(
 		? streamFailureMessage(info)
 		: streamFailureMessage(info, "stream ended with an error and no stop reason");
 	return new StreamFailureError(message, info);
+}
+
+/**
+ * An SSE response that ended without its terminal marker (no stop signal, no
+ * error frame): the provider dropped the stream mid-response. Classified as
+ * `transport` so the turn is retried instead of settling as a partial stop.
+ */
+export function sseStreamDropError(output: AssistantMessage): StreamFailureError {
+	const open = output.content.at(-1)?.type;
+	const info: StreamFailureInfo = {
+		kind: "transport",
+		providerErrorType: "stream_drop",
+		transport: { protocol: "sse", cause: "eof" },
+	};
+	const detail = open
+		? `the stream ended inside a ${open === "toolCall" ? "tool call" : open} block before the stop signal`
+		: "the stream ended before any response content or stop signal";
+	return new StreamFailureError(streamFailureMessage(info, detail), info);
 }
 
 const MAX_RAW_LENGTH = 2000;

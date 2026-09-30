@@ -32,7 +32,12 @@ import type { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { classifyStreamFailure, StreamFailureError, streamFailureMessage } from "../utils/stream-failure.js";
+import {
+	classifyStreamFailure,
+	StreamFailureError,
+	sseStreamDropError,
+	streamFailureMessage,
+} from "../utils/stream-failure.js";
 import { transformMessages } from "./transform-messages.js";
 
 function encodeTextSignatureV1(id: string, phase?: TextSignatureV1["phase"]): string {
@@ -631,9 +636,7 @@ export async function processResponsesStream<TApi extends Api>(
 			});
 		}
 	}
-	if (model.provider === "xai" && !sawTerminalResponse) {
-		throw new StreamFailureError("xAI Responses stream ended before a terminal response event", { kind: "unknown" });
-	}
+	if (!sawTerminalResponse) throw sseStreamDropError(output);
 }
 
 function mapStopReason(status: OpenAI.Responses.ResponseStatus | undefined): StopReason {
