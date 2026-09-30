@@ -1,0 +1,1 @@
+- Fixed SSE streams that end without a terminal marker (no `finish_reason` and no `[DONE]` on Chat Completions; no terminal response event on every Responses provider, not only xAI) settling as a normal stop; they now fail as a retryable `transport` stream failure (`stream_drop`), so the turn is retried instead of ending silently with partial output.

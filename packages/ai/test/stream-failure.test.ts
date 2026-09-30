@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { setLogSink } from "../src/log.js";
 import { streamOpenAICompletions } from "../src/providers/openai-completions.js";
-import type { AssistantMessage, Context, Model } from "../src/types.js";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model } from "../src/types.js";
 import {
 	classifyStreamFailure,
 	extractStreamFailureInfo,
@@ -306,5 +306,29 @@ describe("provider retry ownership", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(failed?.stopReason).toBe("error");
 		expect(failed?.diagnostics?.[0]).toMatchObject({ type: "provider_stream_failure", details: expectedDetails });
+	});
+
+	const sse = (delta: object, finish_reason: string | null = null) =>
+		`data: ${JSON.stringify({ id: "c1", choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
+	const dropped = {
+		kind: "transport",
+		providerErrorType: "stream_drop",
+		transport: { protocol: "sse", cause: "eof" },
+	};
+
+	test.each([
+		["neither finish_reason nor [DONE]", sse({ reasoning_content: "thinking" }), ["error", dropped]],
+		["an empty body", "", ["error", dropped]],
+		["finish_reason without [DONE]", sse({ content: "hi" }) + sse({}, "stop"), ["done", undefined]],
+		["[DONE] without finish_reason", `${sse({ content: "hi" })}data: [DONE]\n\n`, ["done", undefined]],
+	] as const)("settles an openai-completions body with %s", async (_name, body, expected) => {
+		global.fetch = vi.fn(async () => new Response(body, { headers: { "content-type": "text/event-stream" } }));
+		let terminal: AssistantMessageEvent | undefined;
+		for await (const event of streamOpenAICompletions(completionsModel(), retryContext, { apiKey: "test-key" })) {
+			terminal = event;
+		}
+		const message =
+			terminal?.type === "error" ? terminal.error : terminal?.type === "done" ? terminal.message : undefined;
+		expect([terminal?.type, message?.diagnostics?.[0]?.details]).toEqual(expected);
 	});
 });

@@ -35,7 +35,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { recordStreamFailure } from "../utils/stream-failure.js";
+import { recordStreamFailure, sseStreamDropError } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { withOpenCodeHeaders } from "./opencode-headers.js";
@@ -175,6 +175,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 					? getAnthropicCacheWriteCost(model.cost.input, cacheControl.ttl === "1h" ? "1h" : "5m")
 					: undefined;
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
+			let sawDoneMarker = false;
+			let sawFinishReason = false;
 			const client = createClient(
 				model,
 				context,
@@ -183,6 +185,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				cacheSessionId,
 				compat,
 				options?.sessionId,
+				() => {
+					sawDoneMarker = true;
+				},
 			);
 			let params = buildParams(model, context, options, compat, cacheRetention, cacheControl);
 			const nextParams = await options?.onPayload?.(params, model);
@@ -333,6 +338,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				}
 
 				if (choice.finish_reason) {
+					sawFinishReason = true;
 					const finishReasonResult = mapStopReason(choice.finish_reason);
 					output.stopReason = finishReasonResult.stopReason;
 					if (finishReasonResult.errorMessage) {
@@ -481,6 +487,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			if (output.stopReason === "error") {
 				throw new Error(output.errorMessage || "Provider returned an error stop reason");
 			}
+			// Gateways vary in which marker they send; a body with neither was cut off mid-response.
+			if (!sawFinishReason && !sawDoneMarker) {
+				throw sseStreamDropError(output);
+			}
 
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
@@ -538,6 +548,7 @@ function createClient(
 	cacheSessionId?: string,
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
 	conversationId?: string,
+	onDoneMarker?: () => void,
 ) {
 	if (!apiKey) {
 		if (!process.env.OPENAI_API_KEY) {
@@ -583,7 +594,41 @@ function createClient(
 		dangerouslyAllowBrowser: true,
 		defaultHeaders: withOpenCodeHeaders(model.provider, conversationId, defaultHeaders),
 		maxRetries: 0,
+		...(onDoneMarker ? { fetch: fetchObservingDoneMarker(onDoneMarker) } : {}),
 	});
+}
+
+/** The SDK consumes the SSE `data: [DONE]` line without surfacing it, so watch the raw body for it. */
+function fetchObservingDoneMarker(
+	onDone: () => void,
+): (input: string | URL | Request, init?: RequestInit) => Promise<Response> {
+	return async (input, init) => {
+		const response = await fetch(input, init);
+		if (!response.ok || !response.body) return response;
+		const decoder = new TextDecoder();
+		let partialLine = "";
+		const scan = (text: string) => {
+			const lines = (partialLine + text).split(/\r\n|\r|\n/);
+			partialLine = lines.pop() ?? "";
+			if (lines.some((line) => /^data: ?\[DONE\]/.test(line))) onDone();
+		};
+		const body = response.body.pipeThrough(
+			new TransformStream<Uint8Array, Uint8Array>({
+				transform(chunk, controller) {
+					scan(decoder.decode(chunk, { stream: true }));
+					controller.enqueue(chunk);
+				},
+				flush() {
+					scan(`${decoder.decode()}\n`);
+				},
+			}),
+		);
+		return new Response(body, {
+			status: response.status,
+			statusText: response.statusText,
+			headers: response.headers,
+		});
+	};
 }
 
 function buildParams(

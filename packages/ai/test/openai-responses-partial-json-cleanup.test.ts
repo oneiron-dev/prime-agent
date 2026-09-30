@@ -4,6 +4,21 @@ import { processResponsesStream } from "../src/providers/openai-responses-shared
 import type { AssistantMessage, AssistantMessageEvent, Model } from "../src/types.js";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.js";
 
+function createModel(provider: string): Model<"openai-responses"> {
+	return {
+		id: "gpt-5-mini",
+		name: "GPT-5 Mini",
+		api: "openai-responses",
+		provider,
+		baseUrl: "https://api.openai.com/v1",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 400000,
+		maxTokens: 128000,
+	};
+}
+
 function createOutput(model: Model<"openai-responses">): AssistantMessage {
 	return {
 		role: "assistant",
@@ -24,7 +39,7 @@ function createOutput(model: Model<"openai-responses">): AssistantMessage {
 	};
 }
 
-async function* createFunctionCallEvents(argumentsJson: string): AsyncIterable<ResponseStreamEvent> {
+async function* createFunctionCallEvents(argumentsJson: string, terminal = true): AsyncIterable<ResponseStreamEvent> {
 	yield {
 		type: "response.output_item.added",
 		item: {
@@ -57,6 +72,7 @@ async function* createFunctionCallEvents(argumentsJson: string): AsyncIterable<R
 			arguments: argumentsJson,
 		},
 	} as ResponseStreamEvent;
+	if (terminal) yield { type: "response.completed", response: { status: "completed" } } as ResponseStreamEvent;
 }
 
 async function* createNestedCpaErrorEvent(): AsyncIterable<ResponseStreamEvent> {
@@ -73,18 +89,7 @@ async function* createNestedCpaErrorEvent(): AsyncIterable<ResponseStreamEvent> 
 
 describe("openai responses partialJson cleanup", () => {
 	it("classifies nested CPA error frames without retaining bearer credentials", async () => {
-		const model: Model<"openai-responses"> = {
-			id: "gpt-5-mini",
-			name: "GPT-5 Mini",
-			api: "openai-responses",
-			provider: "cpa-r",
-			baseUrl: "https://cpa.test/v1",
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 400000,
-			maxTokens: 128000,
-		};
+		const model = createModel("cpa-r");
 		const result = processResponsesStream(
 			createNestedCpaErrorEvent(),
 			createOutput(model),
@@ -108,18 +113,7 @@ describe("openai responses partialJson cleanup", () => {
 	});
 
 	it("removes partialJson from persisted tool-call blocks at output_item.done", async () => {
-		const model: Model<"openai-responses"> = {
-			id: "gpt-5-mini",
-			name: "GPT-5 Mini",
-			api: "openai-responses",
-			provider: "openai",
-			baseUrl: "https://api.openai.com/v1",
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 400000,
-			maxTokens: 128000,
-		};
+		const model = createModel("openai");
 		const output = createOutput(model);
 		const stream = new AssistantMessageEventStream();
 		const pushSpy = vi.spyOn(stream, "push");
@@ -144,5 +138,18 @@ describe("openai responses partialJson cleanup", () => {
 		}
 		expect(toolCallEnd.toolCall).toBe(persistedToolCall);
 		expect("partialJson" in toolCallEnd.toolCall).toBe(false);
+	});
+
+	it("rejects a stream that ends before its terminal response event as a retryable stream drop", async () => {
+		const model = createModel("cpa-r");
+		const result = processResponsesStream(
+			createFunctionCallEvents("{}", false),
+			createOutput(model),
+			new AssistantMessageEventStream(),
+			model,
+		);
+		await expect(result).rejects.toMatchObject({
+			info: { kind: "transport", providerErrorType: "stream_drop", transport: { protocol: "sse", cause: "eof" } },
+		});
 	});
 });
