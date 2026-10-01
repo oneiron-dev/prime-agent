@@ -848,7 +848,8 @@ async fn a_later_claim_owns_the_slot_when_an_earlier_socket_opens_late() {
 
 /// Session disposal cancels a request stalled on the socket and one still
 /// connecting: both settle as aborted with the disposal text, never as a
-/// transport failure, and neither replays over SSE.
+/// transport failure, and neither replays over SSE. The stalled request's
+/// socket closes with `session_cleanup`.
 #[tokio::test]
 async fn session_disposal_cancels_stalled_and_connecting_requests() {
     let mut server = mock_server::spawn(
@@ -903,12 +904,246 @@ async fn session_disposal_cancels_stalled_and_connecting_requests() {
         assert_eq!(transport["details"].get("fallbackTransport"), None);
         assert_eq!(diagnostic(message, "provider_stream_failure"), None);
     }
+    assert_eq!(server.closed(1).await.as_deref(), Some("session_cleanup"));
     assert!(!server
         .drain()
         .iter()
         .any(|record| matches!(record, Record::SseRequest { .. })));
     assert_eq!(super::session::owned_request_count("dispose-stalled"), 0);
     assert_eq!(super::session::owned_request_count("dispose-connecting"), 0);
+}
+
+/// Disposal reaches a busy request whose connection a concurrent request
+/// of the same session displaced from the cache (TS `owner.socket`): both
+/// requests settle as disposed, and both sockets close with
+/// `session_cleanup`, the uncached one included (it used to close with
+/// `done`, and the cached one's reason raced its request's cancellation).
+#[tokio::test]
+async fn disposal_reaches_a_displaced_busy_connection() {
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![Turn::Stall]),
+            Upgrade::Accept(vec![Turn::Stall]),
+        ],
+        vec![SseReply::Events(response("resp_sse", "never"))],
+    )
+    .await;
+    let ws = ws_model(&server);
+    let displaced = stream_openai_responses(
+        &ws,
+        &context(vec![user("a")]),
+        Some(&options(Some("dispose-displaced"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 1, .. }
+    ));
+    let cached_before = super::session::cached_connection_id("dispose-displaced");
+    let newer = stream_openai_responses(
+        &ws,
+        &context(vec![user("b")]),
+        Some(&options(Some("dispose-displaced"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 2, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 2, .. }
+    ));
+    // The newer connection owns the slot; the displaced one serves its
+    // request outside the cache.
+    let cached_after = super::session::cached_connection_id("dispose-displaced");
+    assert!(cached_before.is_some() && cached_after.is_some());
+    assert_ne!(cached_before, cached_after);
+    crate::cleanup_session_resources(Some("dispose-displaced"));
+    for message in [displaced.result().await, newer.result().await] {
+        assert_eq!(message.stop_reason, StopReason::Aborted);
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some(super::SESSION_DISPOSED_MESSAGE)
+        );
+    }
+    assert_eq!(server.closed(1).await.as_deref(), Some("session_cleanup"));
+    assert_eq!(server.closed(2).await.as_deref(), Some("session_cleanup"));
+    assert!(!server
+        .drain()
+        .iter()
+        .any(|record| matches!(record, Record::SseRequest { .. })));
+    assert_eq!(
+        super::session::cached_connection_id("dispose-displaced"),
+        None
+    );
+    assert_eq!(super::session::owned_request_count("dispose-displaced"), 0);
+}
+
+/// A later claim under a new identity (rotated credentials) owns the slot
+/// even when the earlier, old-identity socket opens after it: the late
+/// socket serves its one request and closes with `done`, and the next
+/// new-identity request reuses the later connection.
+#[tokio::test]
+async fn a_new_identity_claim_owns_the_slot_when_the_old_identity_opens_late() {
+    let (open_first, gate) = tokio::sync::oneshot::channel();
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::AcceptWhen(gate, vec![Turn::Events(response("resp_a", "late"))]),
+            Upgrade::Accept(vec![
+                Turn::Events(response("resp_b", "early")),
+                Turn::Events(response("resp_c", "reuse")),
+            ]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let late = stream_openai_responses(
+        &ws,
+        &context(vec![user("a")]),
+        Some(&options(Some("claims-identity"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+    let mut rotated = options(Some("claims-identity"), None);
+    rotated.base.api_key = Some("rotated-key".to_string());
+    let early = run(&ws, &context(vec![user("b")]), &rotated).await;
+    assert_eq!(text_of(&early), "early");
+    open_first.send(()).expect("gate");
+    assert_eq!(text_of(&late.result().await), "late");
+    // The superseded old-identity socket retires after its one request.
+    assert_eq!(server.closed(1).await.as_deref(), Some("done"));
+    let reuse = run(
+        &ws,
+        &context(vec![user("b"), Message::Assistant(early), user("c")]),
+        &rotated,
+    )
+    .await;
+    assert_eq!(text_of(&reuse), "reuse");
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(2),
+            Seen::Ws {
+                connection: 2,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 2,
+                previous: Some("resp_b".to_string()),
+                inputs: 1
+            },
+        ]
+    );
+}
+
+/// The `ws://` URL of the scripted server's Responses endpoint.
+fn ws_url(server: &MockServer) -> String {
+    resolve_responses_websocket_url(&server.base_url).expect("ws url")
+}
+
+/// A busy connection that a newer same-identity claim displaced from the
+/// cache releases without touching the newer entry (TS entry-reference
+/// guards): its anchor write skips the slot, it closes with
+/// `connection_identity_changed`, and the next acquire reuses the newer
+/// connection with the newer connection's (empty) anchor.
+#[tokio::test]
+async fn a_displaced_connection_release_leaves_the_newer_entry() {
+    use super::continuation::ContinuationAnchor;
+    use super::session::{acquire, release, set_continuation, ReleaseDisposition};
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(Vec::new()), Upgrade::Accept(Vec::new())],
+        Vec::new(),
+    )
+    .await;
+    let url = ws_url(&server);
+    let token = CancellationToken::new();
+    let displaced = acquire(&url, &[], Some("release-guard"), &token)
+        .await
+        .expect("first connection");
+    let newer = acquire(&url, &[], Some("release-guard"), &token)
+        .await
+        .expect("second connection");
+    assert_ne!(
+        displaced.worker.connection_id(),
+        newer.worker.connection_id()
+    );
+    release(&newer, ReleaseDisposition::Keep);
+    set_continuation(
+        &displaced,
+        Some(ContinuationAnchor {
+            body: json!({ "input": [] }),
+            response_id: "resp_stale".to_string(),
+            response_items: Vec::new(),
+        }),
+    );
+    release(&displaced, ReleaseDisposition::Keep);
+    assert_eq!(
+        server.closed(1).await.as_deref(),
+        Some("connection_identity_changed")
+    );
+    let reused = acquire(&url, &[], Some("release-guard"), &token)
+        .await
+        .expect("reuse");
+    assert_eq!(reused.worker.connection_id(), newer.worker.connection_id());
+    assert_eq!(reused.continuation, None);
+    release(&reused, ReleaseDisposition::Discard);
+    assert_eq!(server.closed(2).await.as_deref(), Some("done"));
+    assert_eq!(super::session::cached_connection_id("release-guard"), None);
+}
+
+/// An idle timer scheduled before a reuse never evicts the reused
+/// connection (the generation guard): only the timer of the last release
+/// expires it, with an `idle_timeout` close (paused clock; no real wait).
+#[tokio::test]
+async fn a_stale_idle_timer_never_evicts_a_reused_connection() {
+    use super::session::{acquire, release, ReleaseDisposition, CONNECTION_IDLE_TTL};
+    let mut server = mock_server::spawn(vec![Upgrade::Accept(Vec::new())], Vec::new()).await;
+    let url = ws_url(&server);
+    let token = CancellationToken::new();
+    let first = acquire(&url, &[], Some("timer-guard"), &token)
+        .await
+        .expect("open");
+    let connection = first.worker.connection_id();
+    release(&first, ReleaseDisposition::Keep);
+    tokio::time::pause();
+    let reused = acquire(&url, &[], Some("timer-guard"), &token)
+        .await
+        .expect("reuse");
+    assert_eq!(reused.worker.connection_id(), connection);
+    // The first release's timer comes due while the connection is busy
+    // again: it is stale and leaves the entry alone.
+    tokio::time::sleep(CONNECTION_IDLE_TTL + std::time::Duration::from_secs(1)).await;
+    assert_eq!(
+        super::session::cached_connection_id("timer-guard"),
+        Some(connection)
+    );
+    release(&reused, ReleaseDisposition::Keep);
+    tokio::time::sleep(
+        CONNECTION_IDLE_TTL
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the TTL exceeds a second"),
+    )
+    .await;
+    assert_eq!(
+        super::session::cached_connection_id("timer-guard"),
+        Some(connection)
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(super::session::cached_connection_id("timer-guard"), None);
+    tokio::time::resume();
+    assert_eq!(server.closed(1).await.as_deref(), Some("idle_timeout"));
 }
 
 /// An abort from the response hook (fired at the upgrade) stops the

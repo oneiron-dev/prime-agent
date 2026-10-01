@@ -337,6 +337,10 @@ async fn connection_worker(
             cancel,
         }) = request
         else {
+            // Every handle is gone (an ephemeral connection released and
+            // dropped right after its close): the socket still closes with
+            // the close frame, never a bare drop.
+            close_politely(&mut sink, closing.reason()).await;
             return;
         };
         // A request whose token fired while it queued never reaches the
@@ -361,9 +365,11 @@ async fn connection_worker(
         let completed = matches!(end, SocketEnd::Completed);
         // A request that did not complete retires the connection (TS
         // `release(false)` closes with `done`); a local close keeps its
-        // own reason.
+        // own reason, and so does a cancellation that came with one (a
+        // disposal closes the socket before it fires the token).
         let close_reason = match &end {
             SocketEnd::LocalClose(reason) => *reason,
+            SocketEnd::Cancelled => closing.reason(),
             _ => CloseReason::Done,
         };
         let _ = events.send(WorkerEvent::End(end)).await;

@@ -10,7 +10,8 @@
 //! connection-id guards keep stale releases and idle timers from touching
 //! a newer entry. Every request registers as owned by its session, so
 //! session disposal cancels in-flight and still-connecting requests too
-//! (closing a socket alone cannot stop an upstream that stalls).
+//! (closing a socket alone cannot stop an upstream that stalls), and closes
+//! each request's socket with `session_cleanup`, cached or not.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +60,9 @@ struct Owned {
     session_id: Option<String>,
     cancel: CancellationToken,
     disposed: Arc<AtomicBool>,
+    /// The request's connection once acquired (TS `owner.socket`), so
+    /// disposal reaches a socket that never entered the session cache.
+    worker: Option<WorkerHandle>,
 }
 
 #[derive(Default)]
@@ -110,6 +114,7 @@ impl OwnedRequest {
                 session_id: session_id.map(str::to_string),
                 cancel: cancel.clone(),
                 disposed: Arc::clone(&disposed),
+                worker: None,
             },
         );
         Self {
@@ -124,16 +129,28 @@ impl OwnedRequest {
         &self.cancel
     }
 
-    /// Why the request stopped, if it did.
-    pub(crate) fn cancellation(&self) -> Option<Cancellation> {
-        if !self.cancel.is_cancelled() {
-            return None;
+    /// Record the request's acquired connection (TS `owner.socket =
+    /// acquired.socket`): disposal closes it with `session_cleanup`. A
+    /// disposal that landed while the connection was being acquired closes
+    /// it now.
+    pub(crate) fn attach(&self, worker: &WorkerHandle) {
+        let mut state = lock_state();
+        if self.disposed.load(Ordering::SeqCst) {
+            worker.close(CloseReason::SessionCleanup);
         }
-        Some(if self.disposed.load(Ordering::SeqCst) {
-            Cancellation::SessionDisposed
-        } else {
-            Cancellation::Aborted
-        })
+        if let Some(owned) = state.owned.get_mut(&self.id) {
+            owned.worker = Some(worker.clone());
+        }
+    }
+
+    /// Why the request stopped, if it did. A disposal counts from the
+    /// moment it marks the request, before its token fires: the socket's
+    /// `session_cleanup` close can reach the request first.
+    pub(crate) fn cancellation(&self) -> Option<Cancellation> {
+        if self.disposed.load(Ordering::SeqCst) {
+            return Some(Cancellation::SessionDisposed);
+        }
+        self.cancel.is_cancelled().then_some(Cancellation::Aborted)
     }
 }
 
@@ -348,14 +365,21 @@ pub(crate) fn release(acquired: &Acquired, disposition: ReleaseDisposition) {
 /// Dispose one session's (or every session's) Responses WebSocket
 /// resources (TS `closeOpenAIResponsesWebSocketSessions`): ownership
 /// first — every owned request, cached or not, connecting or streaming, is
-/// cancelled as disposed — then the claims and cached connections.
+/// cancelled as disposed and its socket closed with `session_cleanup` —
+/// then the claims and cached connections.
 pub(crate) fn close_sessions(session_id: Option<&str>) {
     let mut state = lock_state();
     for owned in state.owned.values() {
         let owns =
             session_id.is_none_or(|session_id| owned.session_id.as_deref() == Some(session_id));
         if owns && !owned.cancel.is_cancelled() {
+            // Marked first: whichever signal the socket's worker sees, the
+            // request reads as disposed, and the close reason is set before
+            // the token fires.
             owned.disposed.store(true, Ordering::SeqCst);
+            if let Some(worker) = &owned.worker {
+                worker.close(CloseReason::SessionCleanup);
+            }
             owned.cancel.cancel();
         }
     }

@@ -337,6 +337,9 @@ pub(crate) async fn process_generation(
     let acquired = session::acquire(url, headers, session_id, owner.token())
         .await
         .map_err(|failure| connect_error(failure, &owner))?;
+    // Disposal can now reach this socket even when it never entered the
+    // session cache.
+    owner.attach(&acquired.worker);
     let delta = match (continuation, &acquired.continuation) {
         (ContinuationMode::Cached, Some(anchor)) => {
             let delta = delta_request_body(body, anchor);
