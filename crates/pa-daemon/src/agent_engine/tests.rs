@@ -23,6 +23,7 @@ mod saved_context;
 mod session;
 mod streaming;
 mod transport;
+mod websocket_retry;
 
 fn bare_engine(dir: &std::path::Path) -> AgentSessionEngine {
     let agent_dir = dir.join("agent");
