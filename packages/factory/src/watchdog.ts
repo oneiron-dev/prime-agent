@@ -3,20 +3,19 @@ import {
 	appendFileSync,
 	existsSync,
 	mkdirSync,
-	readdirSync,
 	readFileSync,
-	readlinkSync,
 	realpathSync,
 	renameSync,
 	statfsSync,
 	watch,
 	writeFileSync,
 } from "node:fs";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { AGENT_BINARY_ENV, agentSelection } from "./agent-command.js";
 import { type FactoryConfig, readFactoryConfig } from "./config.js";
 import { invokedDirectly, locateFactoryEntrypoint } from "./runtime.js";
+import { serveRunning } from "./serve-record.js";
 import type { FactoryStatus } from "./types.js";
 
 /**
@@ -36,7 +35,7 @@ export interface WatchdogSnapshot {
 	lost: string[];
 	/** Ticket id to a structured provider failure class. */
 	failures: Record<string, string>;
-	/** Whether `factory serve <dir>` runs; undefined when it cannot be observed on this host. */
+	/** Whether the factory's recorded `serve` runs (see `serve-record`); undefined when it cannot be observed. */
 	serve: boolean | undefined;
 	freeGiB: number;
 	at: string;
@@ -162,91 +161,6 @@ function canonical(path: string): string {
 	} catch {
 		return path;
 	}
-}
-/** Node options whose value is the next argument; the `--name=value` form needs no entry here. */
-const NODE_VALUE_OPTIONS = new Set([
-	"-r",
-	"--require",
-	"--import",
-	"--loader",
-	"--experimental-loader",
-	"-C",
-	"--conditions",
-	"--env-file",
-	"--env-file-if-exists",
-	"--input-type",
-	"--title",
-	"--inspect-port",
-	"--debug-port",
-	"--disable-warning",
-	"--redirect-warnings",
-	"--watch-path",
-	"--diagnostic-dir",
-	"--report-dir",
-	"--report-directory",
-	"--report-filename",
-	"--report-signal",
-	"--cpu-prof-dir",
-	"--cpu-prof-name",
-	"--heap-prof-dir",
-	"--heap-prof-name",
-	"--icu-data-dir",
-	"--openssl-config",
-	"--tls-keylog",
-	"--tls-cipher-list",
-	"--trace-event-categories",
-	"--trace-event-file-pattern",
-	"--unhandled-rejections",
-	"--dns-result-order",
-	"--snapshot-blob",
-	"--localstorage-file",
-	"--experimental-config-file",
-]);
-/** Node options that run code from the command line instead of a script. */
-const NODE_PROGRAM_OPTIONS = new Set(["-e", "--eval", "-p", "--print", "-i", "--interactive", "--test", "--run"]);
-/**
- * Whether a command line is this package's `serve` of this factory: Node running exactly the factory entry as its
- * script (`entry`, canonical; a bin symlink or a relative path resolves to it), with `serve` and then the directory
- * as the first command arguments. The entry appearing anywhere else, as some other program's data, is not a serve.
- * Relative paths are read from the serve's cwd.
- */
-export function servesFactory(argv: string[], cwd: () => string, factory: string, entry: string): boolean {
-	if (!/^node(?:js)?[\d.-]*$/.test(basename(argv[0] ?? ""))) return false;
-	let index = 1;
-	for (; index < argv.length; index++) {
-		const option = argv[index]!;
-		if (option === "--") {
-			index++;
-			break;
-		}
-		if (!option.startsWith("-") || option === "-") break;
-		if (NODE_PROGRAM_OPTIONS.has(option.split("=")[0]!)) return false;
-		if (!option.includes("=") && NODE_VALUE_OPTIONS.has(option)) index++;
-	}
-	const at = (path: string) => resolve(isAbsolute(path) ? "/" : cwd(), path);
-	const script = argv[index];
-	if (!script || canonical(at(script)) !== entry || argv[index + 1] !== "serve") return false;
-	// Every factory option takes a value, so the directory is the first argument after serve that is neither.
-	for (let next = index + 2; next < argv.length; next += 2) {
-		const argument = argv[next]!;
-		if (!argument.startsWith("--")) return at(argument) === factory;
-	}
-	return false;
-}
-function servePresent(factory: string, entry: string): boolean | undefined {
-	let pids: string[];
-	try {
-		pids = readdirSync("/proc").filter((entry) => /^\d+$/.test(entry));
-	} catch {
-		return undefined;
-	}
-	for (const pid of pids) {
-		try {
-			const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
-			if (servesFactory(argv, () => readlinkSync(`/proc/${pid}/cwd`), factory, entry)) return true;
-		} catch {}
-	}
-	return false;
 }
 
 /**
@@ -378,7 +292,7 @@ export function factoryWatchdog(options: WatchdogOptions): FactoryWatchdog {
 			sequence,
 			lost,
 			failures,
-			serve: servePresent(factory, entry),
+			serve: serveRunning(factory, entry),
 			freeGiB: (Number(disk.bavail) * Number(disk.bsize)) / 1024 ** 3,
 			at: new Date().toISOString(),
 		};

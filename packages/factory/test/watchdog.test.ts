@@ -1,28 +1,19 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import {
-	existsSync,
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	realpathSync,
-	renameSync,
-	rmSync,
-	symlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, inject, it } from "vitest";
 import { AGENT_BINARY_ENV } from "../src/agent-command.js";
 import { FactoryEngine } from "../src/engine.js";
+import { getProcessStartId } from "../src/process-identity.js";
+import { recordServe, serveRunning } from "../src/serve-record.js";
 import { FactoryStore } from "../src/store.js";
 import type { AttemptContext, Inspection } from "../src/types.js";
 import {
 	factoryWatchdog,
 	reduceSignals,
 	runFactoryWatchdogCli,
-	servesFactory,
 	type WatchdogSnapshot,
 	type WatchdogState,
 } from "../src/watchdog.js";
@@ -100,39 +91,31 @@ it("alerts once per new exception, baselines known ones, confirms a lost runner 
 	]);
 });
 
-it("finds this package's serve by its exact entry and directory, and refuses a blank disk threshold", async () => {
-	const root = mkdtempSync(join(tmpdir(), "factory-serve-"));
-	roots.push(root);
-	const entry = join(root, "dist", "cli-entry.js");
-	mkdirSync(join(root, "dist"));
-	mkdirSync(join(root, "bin"));
-	writeFileSync(entry, "");
-	writeFileSync(join(root, "other.js"), "");
-	symlinkSync(entry, join(root, "bin", "prime-agent-factory"));
-	const factory = join(root, "factory");
-	const at = (cwd: string) => () => cwd;
-	const serves = (argv: string[], cwd = root) => servesFactory(argv, at(cwd), factory, realpathSync(entry));
-	expect([
-		serves(["node", entry, "serve", "factory"]),
-		serves(["node", join(root, "bin", "prime-agent-factory"), "serve", "."], factory),
-		serves(["/usr/bin/node", "dist/cli-entry.js", "serve", factory]),
-		serves(["node", "--import", "loader.mjs", entry, "serve", factory, "--interval-ms", "50"]),
-		serves(["node", "--enable-source-maps", "--title=factory", "-r", "x.cjs", entry, "serve", factory]),
-		serves(["node", entry, "serve", "--interval-ms", "50", factory]),
-	]).toEqual([true, true, true, true, true, true]);
-	expect([
-		serves(["node", entry, "serve", "other"]),
-		serves(["node", entry, "serve"], factory),
-		serves(["node", entry, "status", factory]),
-		serves(["node", join(root, "other.js"), "serve", factory]),
-		// The old in-binary form names no entry of this package.
-		serves(["node", "cli.js", "factory", "serve", factory]),
-		// The entry as some other program's data: another interpreter, another script, inline code.
-		serves(["python3", "-c", "pass", entry, "serve", factory]),
-		serves(["node", join(root, "other.js"), entry, "serve", factory]),
-		serves(["node", "-e", "setInterval(() => {}, 1000)", entry, "serve", factory]),
-		serves(["node", "--require", entry, join(root, "other.js"), "serve", factory]),
-	]).toEqual([false, false, false, false, false, false, false, false, false]);
+
+it("sees a serve only while its recorded process lives and runs this entry, and refuses a blank disk threshold", async () => {
+	const factory = mkdtempSync(join(tmpdir(), "factory-serve-"));
+	roots.push(factory);
+	const entry = "/opt/prime-agent-factory/dist/cli-entry.js";
+	const record = join(factory, "serve.json");
+	const startId = getProcessStartId(process.pid)!;
+	// Nothing recorded, then this live process recorded as the serve of this entry, then forgotten again.
+	const before = serveRunning(factory, entry);
+	const forget = recordServe(factory, entry);
+	const recorded = [serveRunning(factory, entry), serveRunning(factory, "/elsewhere/dist/cli-entry.js")];
+	forget();
+	expect([before, ...recorded, serveRunning(factory, entry), existsSync(record)]).toEqual([
+		false,
+		true,
+		false,
+		false,
+		false,
+	]);
+	// A record outliving its process: the pid now names another process start, or no process at all.
+	writeFileSync(record, JSON.stringify({ version: 1, pid: process.pid, startId: `${startId}0`, entry }));
+	const reused = serveRunning(factory, entry);
+	const exited = spawnSync(process.execPath, ["-e", ""]);
+	writeFileSync(record, JSON.stringify({ version: 1, pid: exited.pid, startId, entry }));
+	expect([reused, serveRunning(factory, entry)]).toEqual([false, false]);
 	const usage = console.error;
 	console.error = () => undefined;
 	try {

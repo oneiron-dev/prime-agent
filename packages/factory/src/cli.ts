@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { CommandAdapter, fingerprintCommand } from "./adapters/command.js";
 import { DEFAULT_SEATS } from "./adapters/oneiron-settings.js";
@@ -9,7 +9,8 @@ import { FactoryEngine } from "./engine.js";
 import { FACTORY_HELP } from "./help.js";
 import { importSplits, launchTickets, readLauncherSettings, readLauncherTickets } from "./launcher.js";
 import { resumeFactory } from "./resume.js";
-import { recordFactoryRuntime } from "./runtime.js";
+import { locateFactoryEntrypoint, recordFactoryRuntime } from "./runtime.js";
+import { recordServe } from "./serve-record.js";
 import { FactoryStore } from "./store.js";
 import type { DecisionEvidence, FactoryPlan } from "./types.js";
 
@@ -258,17 +259,24 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 				break;
 			}
 			case "serve":
-			case "run":
-				await serve(engine, integer(options.get("--interval-ms"), 1000, 50), () => {
-					if (engine.status().paused) return;
-					// The launcher as the last launch wrote it: a relaunch that changed the settings or the agent
-					// binary reaches the follow-ups this running server imports.
-					const { launcher } = readFactoryConfig(directory);
-					if (!launcher) return;
-					const imported = importSplits(store, launcher);
-					if (imported.length) emit({ splitsImported: imported });
-				});
+			case "run": {
+				// The watchdog's proof that scheduling runs: this process's identity and entry, gone when it stops.
+				const forget = recordServe(directory, realpathSync(locateFactoryEntrypoint().entry));
+				try {
+					await serve(engine, integer(options.get("--interval-ms"), 1000, 50), () => {
+						if (engine.status().paused) return;
+						// The launcher as the last launch wrote it: a relaunch that changed the settings or the agent
+						// binary reaches the follow-ups this running server imports.
+						const { launcher } = readFactoryConfig(directory);
+						if (!launcher) return;
+						const imported = importSplits(store, launcher);
+						if (imported.length) emit({ splitsImported: imported });
+					});
+				} finally {
+					forget();
+				}
 				break;
+			}
 			default:
 				throw new Error(`Unknown factory command ${command}`);
 		}

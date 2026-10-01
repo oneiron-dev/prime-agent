@@ -1,6 +1,15 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -8,6 +17,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, inject, it, vi } from "vitest";
 import { tickWithBusyRetry } from "../src/cli.js";
 import { supportsFactoryRuntime } from "../src/runtime.js";
+import { serveRunning } from "../src/serve-record.js";
 import { FactoryStore } from "../src/store.js";
 import type { FactoryPlan, FactoryStatus } from "../src/types.js";
 import { fileReady, gatedJob } from "./helpers.js";
@@ -207,6 +217,8 @@ describe("prime-agent-factory CLI", () => {
 			expect(await imported).toEqual(["parent-split"]);
 			const followUp = JSON.parse(readFileSync(join(relaunched.work, "tickets", "parent-split", "ticket.json"), "utf8"));
 			expect(followUp.launcher).toEqual(relaunched);
+			// The running serve recorded itself for the watchdog; killed, its stale record no longer counts.
+			expect(serveRunning(f.directory, realpathSync(entry()))).toBe(true);
 		} finally {
 			lines.close();
 			server.kill("SIGKILL");
@@ -215,6 +227,7 @@ describe("prime-agent-factory CLI", () => {
 			f.release();
 			await fileReady(join(f.runnerRoot, attemptId!, "terminal.json"));
 		}
+		expect(serveRunning(f.directory, realpathSync(entry()))).toBe(false);
 	});
 
 	it("keeps serve alive through a SQLite write lock and reconciles after the lock clears", async () => {
