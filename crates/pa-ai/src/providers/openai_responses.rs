@@ -200,7 +200,18 @@ fn build_headers(
 ) -> Vec<(String, String)> {
     let compat = get_responses_compat(model);
     let mut headers: Vec<(String, String)> = Vec::new();
+    // TS `withOpenCodeHeaders`: OpenCode routes identify the client and
+    // the conversation ahead of the model headers, which still win
+    // (case-insensitively). The SSE request and the WebSocket handshake
+    // share this set.
+    if model.provider == "opencode" || model.provider == "opencode-go" {
+        headers.push(("User-Agent".into(), "prime-agent".into()));
+        if let Some(session_id) = &options.base.session_id {
+            headers.push(("x-opencode-session".into(), session_id.clone()));
+        }
+    }
     for (name, value) in model.headers.iter().flatten() {
+        headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         headers.push((name.clone(), value.clone()));
     }
     if let Some(cache_session_id) = cache_session_id {
@@ -703,6 +714,53 @@ mod tests {
             "compat": raw,
         }))
         .unwrap()
+    }
+
+    /// `OpenCode` routes carry the TS `withOpenCodeHeaders` identity (the
+    /// client and the conversation) ahead of the model headers, which
+    /// override it case-insensitively; `cacheRetention: none` drops only
+    /// the cache-affinity pair. Other providers carry no identity.
+    #[test]
+    fn opencode_routes_identify_the_client_and_conversation() {
+        let opencode = |provider: &str| -> Model {
+            serde_json::from_value(serde_json::json!({
+                "id": "m", "name": "m", "api": "openai-responses", "provider": provider,
+                "baseUrl": "https://opencode.ai/zen/v1", "reasoning": false, "input": ["text"],
+                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                "contextWindow": 1000, "maxTokens": 100,
+                "headers": { "user-agent": "custom-agent" },
+            }))
+            .unwrap()
+        };
+        let mut options = OpenAIResponsesOptions::from_base(StreamOptions {
+            session_id: Some("conv-1".to_string()),
+            cache_retention: Some(CacheRetention::None),
+            ..StreamOptions::default()
+        });
+        let pairs = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect()
+        };
+        assert_eq!(
+            build_headers(&opencode("opencode-go"), "key", &options, None),
+            pairs(&[
+                ("x-opencode-session", "conv-1"),
+                ("user-agent", "custom-agent"),
+                ("Authorization", "Bearer key"),
+            ])
+        );
+        options.base.cache_retention = None;
+        assert_eq!(
+            build_headers(&opencode("cpa-r"), "key", &options, Some("conv-1")),
+            pairs(&[
+                ("user-agent", "custom-agent"),
+                ("session_id", "conv-1"),
+                ("x-client-request-id", "conv-1"),
+                ("Authorization", "Bearer key"),
+            ])
+        );
     }
 
     #[test]
