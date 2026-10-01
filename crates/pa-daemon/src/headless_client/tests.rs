@@ -35,19 +35,27 @@ struct FakeSupervisor {
 }
 
 impl FakeSupervisor {
-    fn start(mut script: Script) -> Self {
+    /// A supervisor advertising admission cancellation, as this build's
+    /// does.
+    fn start(script: Script) -> Self {
+        Self::advertising(&["prompt_admission_cancellation"], script)
+    }
+
+    /// A supervisor whose hello advertises exactly `capabilities`.
+    fn advertising(capabilities: &[&str], mut script: Script) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("d.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&commands);
+        let hello = json!({
+            "type": "daemon_hello",
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "serverCapabilities": capabilities,
+        });
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, mut writer) = stream.into_split();
-            let hello = json!({
-                "type": "daemon_hello",
-                "protocol": { "name": "prime-agent.daemon", "version": 7 },
-            });
             writer
                 .write_all(format!("{hello}\n").as_bytes())
                 .await
@@ -472,6 +480,44 @@ async fn a_prompt_still_queued_past_the_route_budget_is_withdrawn() {
             "cancel_prompt_admission"
         ]
     );
+}
+
+/// A daemon that does not advertise `prompt_admission_cancellation` gets
+/// no `admissionId` (TS requires the capability for it) and no admission
+/// read: a timed-out prompt has no evidence and fails closed.
+#[tokio::test]
+async fn a_daemon_without_admission_cancellation_fails_a_timed_out_prompt() {
+    let fake = FakeSupervisor::advertising(
+        &[],
+        Box::new(|kind, _| {
+            if let Some(replies) = opening(kind) {
+                return replies;
+            }
+            match kind {
+                "prompt_and_wait" => vec![Reply::Fail("Session worker timed out")],
+                other => panic!("unexpected command {other}"),
+            }
+        }),
+    );
+    let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
+        .await
+        .unwrap();
+    let error = bounded(session.prompt(prompt("older daemon")))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Session worker timed out before the prompt was seen to start; it may not have run"
+    );
+    assert_eq!(
+        fake.sent("prompt_and_wait"),
+        json!({
+            "type": "prompt_and_wait",
+            "activeSessionId": "s1",
+            "message": "older daemon",
+        })
+    );
+    assert_eq!(fake.commands(), ["create", "attach", "prompt_and_wait"]);
 }
 
 /// A prompt the worker rejects fails with the worker's message.

@@ -48,6 +48,9 @@ pub(crate) struct DaemonLink {
     /// The classified inbound frames; exactly one consumer drains them.
     pub(crate) frames: Mutex<mpsc::UnboundedReceiver<LinkFrame>>,
     protocol_version: u64,
+    /// The optional features the daemon's hello advertised
+    /// (`serverCapabilities`); empty when it named none.
+    pub(crate) server_capabilities: Vec<String>,
     next_request_id: AtomicU64,
     /// Prefix of request ids and of the envelope client id (`acp`,
     /// `headless`), so the daemon log names the transport.
@@ -132,11 +135,20 @@ impl DaemonLink {
                 version: DAEMON_PROTOCOL_VERSION,
             });
         let version = protocol.version.min(DAEMON_PROTOCOL_VERSION);
+        let server_capabilities = hello
+            .get("serverCapabilities")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
         Ok(DaemonLink {
             writer: std::sync::Mutex::new(Some(line_tx)),
             pending: std::sync::Mutex::new(Some(HashMap::new())),
             frames: Mutex::new(frame_rx),
             protocol_version: version,
+            server_capabilities,
             next_request_id: AtomicU64::new(0),
             label,
         })

@@ -17,9 +17,12 @@
 //! Route budget: the supervisor answers `prompt_and_wait` with its route
 //! timeout after ten minutes even while the worker still runs the turn
 //! (TS forwards it for 24 hours). Each prompt therefore carries its own
-//! schema-30 `admissionId`, and a timed-out prompt reads its admission
-//! back with `cancel_prompt_admission` (never `cancelOwned`): only that
-//! answer says whether THIS prompt's turn started.
+//! schema-30 `admissionId` when the daemon advertises
+//! `prompt_admission_cancellation` (TS print sends none: its route never
+//! times out), and a timed-out prompt reads its admission back with
+//! `cancel_prompt_admission` (never `cancelOwned`): only that answer says
+//! whether THIS prompt's turn started. Without the capability a timed-out
+//! prompt has no evidence and fails.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +43,10 @@ const REQUEST_BOUND: ResponseWait = ResponseWait::Within(Duration::from_secs(120
 /// Bound for the detach on the way out: an exit must not hang on a daemon
 /// that stopped answering (closing the socket detaches anyway).
 const DETACH_BOUND: ResponseWait = ResponseWait::Within(Duration::from_secs(5));
+/// The server capability an admitted prompt and its
+/// `cancel_prompt_admission` read require (TS
+/// `PROMPT_ADMISSION_CANCELLATION_COMMAND`).
+const PROMPT_ADMISSION_CANCELLATION: &str = "prompt_admission_cancellation";
 
 /// Everything [`HostedHeadlessSession::open`] needs.
 #[derive(Debug, Clone)]
@@ -318,16 +325,23 @@ impl HostedHeadlessSession {
     ///
     /// Returns the prompt's rejection (the worker's admission or settle
     /// error), the route budget's timeout for a prompt that was withdrawn
-    /// while queued or that nothing holds any more (it may never have
-    /// reached the worker, so the run fails rather than report it), or a
-    /// transport failure. A turn confirmed past the budget reports the
-    /// session's idle state, not its own settle error.
+    /// while queued, that nothing holds any more, or whose daemon cannot
+    /// read admissions back (it may never have reached the worker, so the
+    /// run fails rather than report it), or a transport failure. A turn
+    /// confirmed past the budget reports the session's idle state, not its
+    /// own settle error.
     pub async fn prompt(&self, prompt: HostedPrompt) -> anyhow::Result<()> {
         let images = (!prompt.images.is_empty())
             .then(|| serde_json::to_value(&prompt.images))
             .transpose()?;
-        // TS `DaemonAgentConnection`'s admission id shape.
-        let admission_id = format!("prompt-admission:{}", uuid::Uuid::new_v4());
+        // TS `DaemonAgentConnection`'s admission id shape, behind the same
+        // capability TS requires for an admitted prompt.
+        let admission_id = self
+            .link
+            .server_capabilities
+            .iter()
+            .any(|capability| capability == PROMPT_ADMISSION_CANCELLATION)
+            .then(|| format!("prompt-admission:{}", uuid::Uuid::new_v4()));
         let command = DaemonCommand::PromptAndWait {
             id: None,
             active_session_id: self.active_session_id.clone(),
@@ -343,7 +357,7 @@ impl HostedHeadlessSession {
                 custom_message: None,
                 queue_key: None,
                 prefix_messages: None,
-                admission_id: Some(admission_id.clone()),
+                admission_id: admission_id.clone(),
                 rlm_notice_nonce: None,
             },
             rest: Map::default(),
@@ -355,18 +369,24 @@ impl HostedHeadlessSession {
         if !is_route_timeout(&response) {
             return success_data(response).map(|_| ());
         }
-        let read = DaemonCommand::CancelPromptAdmission {
-            id: None,
-            active_session_id: self.active_session_id.clone(),
-            admission_id,
-            // A running turn must keep running.
-            cancel_owned: None,
-            rest: Map::default(),
+        let answer = match admission_id {
+            Some(admission_id) => {
+                let read = DaemonCommand::CancelPromptAdmission {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    admission_id,
+                    // A running turn must keep running.
+                    cancel_owned: None,
+                    rest: Map::default(),
+                };
+                let data = success_data(self.link.request(read, REQUEST_BOUND).await?)?;
+                serde_json::from_value(data.get("status").cloned().unwrap_or_default()).map_err(
+                    |error| anyhow::anyhow!("unreadable prompt admission status: {error}"),
+                )?
+            }
+            // A daemon without admission cancellation holds no evidence.
+            None => AdmissionAnswer::Unknown,
         };
-        let data = success_data(self.link.request(read, REQUEST_BOUND).await?)?;
-        let answer: AdmissionAnswer =
-            serde_json::from_value(data.get("status").cloned().unwrap_or_default())
-                .map_err(|error| anyhow::anyhow!("unreadable prompt admission status: {error}"))?;
         match answer {
             AdmissionAnswer::Owned => {
                 self.idle_status().await?;
