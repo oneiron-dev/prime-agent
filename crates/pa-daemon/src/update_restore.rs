@@ -392,8 +392,27 @@ pub(crate) fn boot_sweep(agent_dir: &Path, socket_path: &Path) {
 /// boot. A malformed roster never fails the boot (spec §9): it restores
 /// nothing and the sessions stay on disk for manual resume.
 pub(crate) fn consume_roster_env() -> Option<UpdateRoster> {
-    let path = std::env::var(UPDATE_ROSTER_ENV).ok()?;
-    let path = Path::new(&path);
+    read_roster(
+        std::env::var(UPDATE_ROSTER_ENV)
+            .ok()
+            .as_deref()
+            .map(Path::new),
+        pa_core::update::installer::self_update_refusal().is_some(),
+    )
+}
+
+/// The roster at `path`, unless self-update is disabled: an install that
+/// never performs an update restart (Oneiron's side-by-side build) must not
+/// replay an inherited roster, which names another install's live sessions.
+fn read_roster(path: Option<&Path>, self_update_disabled: bool) -> Option<UpdateRoster> {
+    let path = path?;
+    if self_update_disabled {
+        eprintln!(
+            "pa-daemon: ignoring the update roster at {}: self-update is disabled for this install",
+            path.display()
+        );
+        return None;
+    }
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) => {
@@ -1052,6 +1071,19 @@ mod tests {
         assert!(!scratch.exists());
         assert!(!legacy_update_restarts_dir(&agent_dir).exists());
         assert!(!legacy_update_restart_status(&agent_dir).exists());
+    }
+
+    #[test]
+    fn an_inherited_roster_is_ignored_when_self_update_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roster.json");
+        std::fs::write(&path, serde_json::to_string(&two_row_roster()).unwrap()).unwrap();
+        assert!(read_roster(Some(&path), /*self_update_disabled*/ true).is_none());
+        assert_eq!(
+            read_roster(Some(&path), /*self_update_disabled*/ false)
+                .map(|roster| serde_json::to_value(roster).unwrap()),
+            Some(serde_json::to_value(two_row_roster()).unwrap())
+        );
     }
 
     #[test]

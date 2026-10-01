@@ -374,6 +374,13 @@ mod tests {
     /// state and restored after (an assertion panic must never leave the
     /// process env mutated, and a host-exported opt-out must not bleed in).
     fn with_clean_telemetry_env(body: impl FnOnce() + std::panic::UnwindSafe) {
+        // The telemetry tests mutate the same process env and cargo runs
+        // tests on parallel threads: one test's cleanup could clear
+        // another's DO_NOT_TRACK mid-assertion, so they serialize here.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let vars = ["PRIME_AGENT_TELEMETRY", "DO_NOT_TRACK", "PI_OFFLINE"];
         let saved: Vec<(String, Option<String>)> = vars
             .iter()
