@@ -29,6 +29,11 @@ export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 if command -v sccache >/dev/null 2>&1; then
   export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
   export SCCACHE_DIR="${SCCACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sccache}"
+  # The sccache server is a long-lived daemon that keeps the environment it
+  # was spawned with: started inside a test sandbox, it would keep the
+  # sandbox TMPDIR and fail every compile once the sandbox is removed. Start
+  # it (if none is running) from the real environment, and never idle out.
+  SCCACHE_IDLE_TIMEOUT=0 sccache --start-server >/dev/null 2>&1 || true
 fi
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
 # mold cuts link time and memory when several lanes build at once (Linux x64 only).
@@ -48,13 +53,29 @@ run_clippy() { cargo clippy --workspace --all-targets --locked -- -D warnings; }
 run_test() {
   local scope=(--workspace) sandbox
   if [ ${#crates[@]} -gt 0 ]; then scope=("${crates[@]}"); fi
-  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/pa-gate.XXXXXX")"
-  mkdir -p "$sandbox/home" "$sandbox/tmp"
+  # Short paths: tests bind unix sockets under TMPDIR and sun_path holds
+  # ~104-108 bytes, so the sandbox sits directly in /tmp as on a CI runner.
+  sandbox="$(mktemp -d /tmp/pg.XXXXXX)"
+  mkdir -p "$sandbox/h" "$sandbox/t" "$sandbox/bin"
   echo "gate: sandbox $sandbox"
-  local ts_reference="${PA_TS_BINARY:-}"
+  local ts_reference="${PA_TS_BINARY:-}" shadowed_path="" dir entry status
+  # PATH minus any `prime-agent`: a dir holding one is replaced by a shadow
+  # with links to everything else in it (uv, python, git stay reachable).
+  local IFS=:
+  for dir in $PATH; do
+    if [ -n "$dir" ] && [ -e "$dir/prime-agent" ]; then
+      for entry in "$dir"/*; do
+        case "${entry##*/}" in prime-agent|prime-agent-*|sol) ;; *) [ -e "$sandbox/bin/${entry##*/}" ] || ln -s "$entry" "$sandbox/bin/" ;; esac
+      done
+      dir="$sandbox/bin"
+    fi
+    case ":$shadowed_path:" in *":$dir:"*) ;; *) shadowed_path="${shadowed_path:+$shadowed_path:}$dir" ;; esac
+  done
+  unset IFS
   (
-    export HOME="$sandbox/home" TMPDIR="$sandbox/tmp" XDG_CONFIG_HOME="$sandbox/home/.config" \
-      XDG_DATA_HOME="$sandbox/home/.local/share" XDG_STATE_HOME="$sandbox/home/.local/state"
+    export HOME="$sandbox/h" TMPDIR="$sandbox/t" XDG_CONFIG_HOME="$sandbox/h/.config" \
+      XDG_DATA_HOME="$sandbox/h/.local/share" XDG_STATE_HOME="$sandbox/h/.local/state" \
+      PATH="$shadowed_path" TZ=UTC
     # CI runs with a clean env. Every product switch goes: state roots
     # (session dirs, agent dir), update roles (the restart roster), sockets,
     # venvs, telemetry (a developer's DO_NOT_TRACK=1 flips the env-precedence
@@ -62,17 +83,25 @@ run_test() {
     for name in $(env | sed -n 's/^\(PRIME_AGENT_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(PI_[A-Za-z0-9_]*\)=.*/\1/p'); do
       unset "$name"
     done
-    unset DO_NOT_TRACK PA_TS_REFERENCE
+    unset DO_NOT_TRACK PA_TS_REFERENCE PA_TS_BINARY
     # The TS-differential suites run `PA_TS_BINARY`, else `prime-agent` on
-    # PATH: by default that is the Oneiron TS fork (not upstream's parity
-    # ground truth), so they skip as on a CI runner; an explicit
-    # PA_TS_BINARY is kept as the reference.
-    export PA_TS_BINARY="${ts_reference:-/nonexistent/pa-gate-no-ts-binary}"
+    # PATH. Here that would be the Oneiron TS fork, not upstream's parity
+    # ground truth, so by default neither exists (they skip as on a CI
+    # runner); an explicit PA_TS_BINARY is kept as the reference.
+    if [ -n "$ts_reference" ]; then export PA_TS_BINARY="$ts_reference"; fi
+    # TZ=UTC as on CI: fixtures pin zone-less git dates (golden bash replay).
     cargo build --locked --workspace --bins
     "$CARGO_TARGET_DIR/debug/prime-agent" --prime-agent-bootstrap
     cargo test --locked "${scope[@]}" --no-fail-fast "$@"
-  )
-  rm -rf "$sandbox"
+  ) && status=0 || status=$?
+  # /tmp is RAM-backed here: a failed run's sandbox (kernel venv included)
+  # is kept only on request.
+  if [ "$status" -ne 0 ] && [ -n "${GATE_KEEP_SANDBOX:-}" ]; then
+    echo "gate: kept sandbox $sandbox"
+  else
+    rm -rf "$sandbox"
+  fi
+  return "$status"
 }
 
 run_policy() {
