@@ -629,9 +629,16 @@ async fn track_update_completed(status: &UpdateStatus) {
 /// # Errors
 /// Returns an error when the coordinator cannot adopt the staged status
 /// record or a status write fails. An invalid invocation (a status path
-/// outside the agent dir's `update-restarts/`) is reported on stderr and
-/// returns `Ok(1)` instead.
+/// outside the agent dir's `update-restarts/`) and a disabled self-update
+/// (`PRIME_AGENT_DISABLE_SELF_UPDATE`) are reported on stderr and return
+/// `Ok(1)` instead.
 pub async fn run_coordinator_mode(socket_path: PathBuf, status_path: PathBuf) -> Result<i32> {
+    // Oneiron fork: the side-by-side guard refuses before the coordinator
+    // adopts the status record or talks to the daemon.
+    if let Some(refusal) = pa_core::update::installer::self_update_refusal() {
+        eprintln!("Error: {refusal}");
+        return Ok(1);
+    }
     let agent_dir = crate::config::get_agent_dir();
     // TS parity: the status file belongs under the agent dir's
     // `update-restarts/` - the coordinator never writes status elsewhere.

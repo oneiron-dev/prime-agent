@@ -82,11 +82,8 @@ pub fn confirm_nightly_switch(
 pub fn run(options: &SelfUpdateOptions, persisted_wire: Option<&str>) -> i32 {
     // Oneiron fork: the side-by-side launcher's guard covers the staged
     // native updater too, not only the installer funnel.
-    if pa_core::update::installer::self_update_disabled() {
-        eprintln!(
-            "Error: self-update is disabled for this install ({}); install new builds with its own release tooling",
-            pa_core::update::installer::ENV_DISABLE_SELF_UPDATE
-        );
+    if let Some(refusal) = pa_core::update::installer::self_update_refusal() {
+        eprintln!("Error: {refusal}");
         return 1;
     }
     // The effective channel: an explicit flag wins, else the persisted

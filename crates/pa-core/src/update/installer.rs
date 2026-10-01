@@ -41,15 +41,25 @@ pub const OFFICIAL_INSTALLER_URL: &str = "https://app.primeintellect.ai/prime-ag
 /// Oneiron fork: `PRIME_AGENT_DISABLE_SELF_UPDATE` (`1`/`true`/`yes`), set by
 /// the side-by-side `prime-agent-rs` launcher. The takeover installer stops
 /// every daemon of the TypeScript product and replaces
-/// `~/.local/bin/prime-agent`, so a side-by-side install must never reach it;
-/// the CLI `update` and the TUI `/update` both enter through [`run_installer`].
+/// `~/.local/bin/prime-agent`, so a side-by-side install must never reach it.
+/// Every self-update entry refuses through [`self_update_refusal`]: the
+/// installer funnel ([`run_installer`], the CLI `update` and the TUI
+/// `/update`), the staged native updater (`update --rollback|--archive`,
+/// `package update --rollback`), the restart coordinator, and the daemon's
+/// `prepare_update_restart`.
 pub const ENV_DISABLE_SELF_UPDATE: &str = "PRIME_AGENT_DISABLE_SELF_UPDATE";
 
-/// Whether this process's environment disables self-update (both the
-/// installer funnel and the staged native updater check it).
+/// The refusal every self-update entry reports when this process's
+/// environment disables self-update ([`ENV_DISABLE_SELF_UPDATE`]); `None`
+/// when self-update may run.
 #[must_use]
-pub fn self_update_disabled() -> bool {
-    disables_self_update(std::env::var(ENV_DISABLE_SELF_UPDATE).ok().as_deref())
+pub fn self_update_refusal() -> Option<String> {
+    disables_self_update(std::env::var(ENV_DISABLE_SELF_UPDATE).ok().as_deref()).then(|| {
+        format!(
+            "self-update is disabled for this install ({ENV_DISABLE_SELF_UPDATE}); \
+             install new builds with its own release tooling"
+        )
+    })
 }
 
 /// Whether an `ENV_DISABLE_SELF_UPDATE` value disables self-update (the
@@ -186,13 +196,8 @@ pub async fn run_installer(
     channel: Option<&'static str>,
     output: InstallerOutput,
 ) -> std::result::Result<Installed, UpdateFailure> {
-    if self_update_disabled() {
-        return Err(UpdateFailure {
-            message: format!(
-                "self-update is disabled for this install ({ENV_DISABLE_SELF_UPDATE}); \
-                 install new builds with its own release tooling"
-            ),
-        });
+    if let Some(message) = self_update_refusal() {
+        return Err(UpdateFailure { message });
     }
     run_installer_from(&installer_script_url(), &install_prefix(), channel, output).await
 }
