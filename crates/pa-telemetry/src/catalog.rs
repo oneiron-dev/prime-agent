@@ -32,8 +32,10 @@ pub const SCHEMA_VERSION: u64 = 2;
 pub const ERROR_MESSAGE_POLICY_REVISION: u64 = 1;
 
 /// The error-classifier revision (`classifier_revision` on `agent error`).
-/// Bumped to 2 when the `stream_drop` subtype/code joined the vocabulary.
-pub const ERROR_CLASSIFIER_REVISION: u64 = 2;
+/// Bumped to 2 when the `stream_drop` subtype/code joined the vocabulary,
+/// to 3 when the structured WebSocket transport codes (`websocket_<cause>`)
+/// did.
+pub const ERROR_CLASSIFIER_REVISION: u64 = 3;
 
 // ---------------------------------------------------------------------------
 // Rule kinds
@@ -254,6 +256,10 @@ pub const ERROR_CODES: &[&str] = &[
     "safety",
     "malformed_response",
     "stream_drop",
+    "websocket_connect",
+    "websocket_error",
+    "websocket_closed",
+    "websocket_eof",
     "context_length_exceeded",
     "context_window_exceeded",
     "ENOENT",

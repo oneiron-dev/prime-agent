@@ -1045,3 +1045,50 @@ async fn provider_transport_used_reports_the_first_upgrade_once() {
         vec![200, 101, 101, 200, 101, 101]
     );
 }
+
+/// `agent error` for a structured WebSocket transport failure: the
+/// occurrence classifies by the recorded cause (a retryable network error
+/// coded `websocket_closed`), not by the bare socket text, which matches
+/// no status, code, or reviewed message and used to read as `unknown`.
+#[tokio::test]
+async fn transport_failures_report_their_recorded_cause() {
+    let fixture = fixture();
+    let mut failed = assistant_with_error("WebSocket closed before response.completed");
+    failed.diagnostics = Some(vec![pa_agent::types::AssistantMessageDiagnostic {
+        kind: "provider_stream_failure".to_string(),
+        timestamp: 0,
+        error: None,
+        details: Some(serde_json::json!({
+            "kind": "transport",
+            "providerErrorType": "websocket_closed",
+            "transport": { "protocol": "websocket", "cause": "closed", "closeCode": 1006 },
+        })),
+    }]);
+    emit(&fixture, AgentEvent::AgentStart);
+    emit(&fixture, AgentEvent::TurnStart);
+    emit(&fixture, message_end_event(failed));
+    emit(
+        &fixture,
+        AgentEvent::AgentEnd {
+            messages: Vec::new(),
+        },
+    );
+    let errors = event_properties(&fixture.mock, "agent error").await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        [
+            &errors[0]["error_subtype"],
+            &errors[0]["error_category"],
+            &errors[0]["error_code"],
+            &errors[0]["classification_source"],
+            &errors[0]["retryable"],
+        ],
+        [
+            &serde_json::json!("network_error"),
+            &serde_json::json!("network"),
+            &serde_json::json!("websocket_closed"),
+            &serde_json::json!("typed_error"),
+            &serde_json::json!(true),
+        ]
+    );
+}
