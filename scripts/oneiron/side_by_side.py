@@ -10,11 +10,14 @@
            that bootstraps the separate kernel venv; writes PROBE-RECEIPT.json
 
 The TS product is never touched: the `prime-agent` launcher, its install tree
-(~/.local/share/prime-agent-oneiron/), its daemon socket dir and its kernel
-venv. The launcher gives every Rust process its own socket dir
-(PRIME_AGENT_SOCKET_DIR, a fork-only knob read by pa-daemon's socket_dir()),
-its own supervisor socket (PRIME_AGENT_DAEMON_SOCKET) and its own kernel venv
-(PRIME_AGENT_KERNEL_VENV). Self-update is shut three ways: the fork-only
+(~/.local/share/prime-agent-oneiron/), its daemon socket dirs, its agent dir
+and its kernel venv (PROTECTED_STATE, one policy for the installer and the
+launcher). The launcher gives every Rust process its own agent dir
+(PRIME_AGENT_CODING_AGENT_DIR), socket dir (PRIME_AGENT_SOCKET_DIR, a
+fork-only knob read by pa-daemon's socket_dir()), supervisor socket
+(PRIME_AGENT_DAEMON_SOCKET) and kernel venv (PRIME_AGENT_KERNEL_VENV); the
+installer seeds the agent dir with a Rust-owned snapshot of the TS skills.
+Self-update is shut three ways: the fork-only
 PRIME_AGENT_DISABLE_SELF_UPDATE guard refuses `update` and the TUI `/update`
 (both would otherwise fetch and run upstream's takeover installer), the
 installer and download URLs point at a dead loopback endpoint, and
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
 import hashlib
 import json
 import os
@@ -34,6 +38,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -43,13 +48,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 HOME = Path.home()
-DEFAULT_PREFIX = HOME / ".local" / "share" / "prime-agent-oneiron-rs"
-DEFAULT_BIN_DIR = HOME / ".local" / "bin"
-TS_PREFIX = HOME / ".local" / "share" / "prime-agent-oneiron"
+SYSTEM_TMP = Path("/tmp")
 TS_AGENT_DIR = HOME / ".prime" / "agent"
-DEFAULT_AGENT_DIR = HOME / ".prime" / "agent-rs"
-# Read-only inputs the Rust build shares with TS by link (no Rust writer).
-SHARED_READ_ONLY = ("models.json", "skills")
+# The TS product's state. No side-by-side destination (prefix, receipts, bin
+# dir, agent dir, socket dir, kernel venv) may equal, sit inside or contain
+# one, in the installer and the launcher alike: the launcher's list is
+# rendered from this one. Bases: tmp = TMPDIR and /tmp (the TS daemon's
+# os.tmpdir()), home = HOME, data = XDG_DATA_HOME and ~/.local/share.
+PROTECTED_STATE = (
+    ("tmp", "prime-agent-{uid}"),                  # TS daemon sockets
+    ("tmp", "prime-agent-user"),                   # TS shared sockets
+    ("home", ".prime/agent"),                      # TS agent dir
+    ("data", "prime/agent"),                       # TS agent dir, XDG layout
+    ("home", ".local/share/prime-agent-oneiron"),  # TS install tree
+)
+# Read-only inputs the Rust agent dir links to (no Rust writer: audit item 24).
+SHARED_LINKS = ("models.json",)
+# Build output and caches a skills snapshot leaves behind.
+SKILLS_SNAPSHOT_SKIP = ("__pycache__", "*.egg-info", ".venv", "node_modules", ".pytest_cache")
 LAUNCHER_NAME = "prime-agent-rs"
 TS_LAUNCHER_NAME = "prime-agent"
 RECEIPT_SCHEMA = "prime-agent-oneiron-rs.install/1"
@@ -60,69 +76,110 @@ REQUIRED_STAGE_PATHS = ("prime-agent", "package.json", "prime-agent-runtime/src/
 # The socket dir name stays short: macOS sun_path holds 104 bytes and $TMPDIR
 # there is ~49, so `prime-agent-rs-<uid>/worker-<12>-<12>.sock` would overflow
 # where `pa-rs-<uid>/…` fits. RS-specific overrides only; the generic names
-# are always rewritten so an inherited TS value can never leak in. Every
-# override is validated (absolute, canonical through symlinked ancestors, no
-# overlap with a TS root) BEFORE anything is created.
+# are always rewritten so an inherited TS value can never leak in. The
+# checks mirror the installer's (checked_path, canonical, refuse_ts_state,
+# check_agent_tree) and all run BEFORE anything is created.
 LAUNCHER_TEMPLATE = """#!/bin/sh
 # prime-agent-rs: the side-by-side Rust prime-agent (Oneiron fork).
 # Written by scripts/oneiron/side_by_side.py install; reinstall instead of editing.
-# Own socket dir + socket, own kernel venv, self-update shut. The TS
-# `prime-agent` launcher, its daemons and its kernel venv are never touched.
+# Own agent dir, socket dir + socket and kernel venv; self-update shut. The
+# TS `prime-agent` launcher, its daemons and its state are never touched.
 set -e
 prefix={prefix}
+system_tmp={system_tmp}
 uid=$(id -u)
-tmp=${{TMPDIR:-/tmp}}
-tmp=${{tmp%/}}
 die() {{ echo "prime-agent-rs: $*" >&2; exit 1; }}
-# canon P: the physical absolute spelling of P (its deepest existing ancestor
+# checked NAME P: P without trailing slashes. It must be absolute with no
+# empty, . or .. component: a `..` past a missing dir would slip by canon
+# and the overlap checks, then mkdir -p would resolve it into TS state.
+checked() {{
+  p=$2
+  while [ "$p" != / ] && [ "${{p%/}}" != "$p" ]; do p=${{p%/}}; done
+  case "$p" in /*) ;; *) die "$1 must be an absolute path: $2" ;; esac
+  case "$p/" in //) ;; *//*|*/./*|*/../*) die "$1 must not hold empty, . or .. components: $2" ;; esac
+  printf '%s\\n' "$p"
+}}
+# canon P: the physical spelling of absolute P (its deepest existing ancestor
 # resolved with cd -P, the missing tail appended), so symlinked ancestors and
-# aliases compare equal.
+# aliases compare equal. A link to a missing dir is refused, not guessed at.
 canon() {{
   p=$1 rest=
-  while [ ! -d "$p" ]; do rest="/${{p##*/}}$rest"; p=${{p%/*}}; [ -n "$p" ] || p=/; done
-  printf '%s%s\\n' "$(cd -P "$p" && pwd)" "$rest"
+  while [ ! -d "$p" ]; do
+    if [ -L "$p" ]; then die "$p is a link but not to a dir"; fi
+    rest="/${{p##*/}}$rest"; p=${{p%/*}}; [ -n "$p" ] || p=/
+  done
+  p=$(cd -P "$p" && pwd)
+  case "$p$rest" in /) echo / ;; *) printf '%s%s\\n' "${{p%/}}" "$rest" ;; esac
 }}
 # overlaps A B: A equals B, sits inside B, or contains B.
 overlaps() {{
-  case "$1/" in "$2"/*) return 0 ;; esac
-  case "$2/" in "$1"/*) return 0 ;; esac
+  case "$1/" in "${{2%/}}"/*) return 0 ;; esac
+  case "$2/" in "${{1%/}}"/*) return 0 ;; esac
   return 1
 }}
-absolute() {{ case "$2" in /*) ;; *) die "$1 must be an absolute path: $2" ;; esac; }}
+# refuse_ts_state ROLE P: the one protected set (side_by_side.PROTECTED_STATE)
+# for every path the launcher creates or hands the binary.
+refuse_ts_state() {{
+  for root in {protected_roots}; do
+    root=$(canon "$root")
+    if overlaps "$2" "$root"; then die "refusing $1 $2: it overlaps TS state at $root"; fi
+  done
+}}
 
-sock_dir=${{PRIME_AGENT_RS_SOCKET_DIR:-$tmp/pa-rs-$uid}}
-absolute PRIME_AGENT_RS_SOCKET_DIR "$sock_dir"
+home=$(checked HOME "$HOME")
+tmp=$(checked TMPDIR "${{TMPDIR:-$system_tmp}}")
+case "${{XDG_DATA_HOME:-}}" in
+  /*) data=$(checked XDG_DATA_HOME "$XDG_DATA_HOME") ;;
+  *) data=$home/.local/share ;;
+esac
+sock_dir=$(checked PRIME_AGENT_RS_SOCKET_DIR "${{PRIME_AGENT_RS_SOCKET_DIR:-$tmp/pa-rs-$uid}}")
 sock_dir=$(canon "$sock_dir")
-for protected in "$tmp/prime-agent-$uid" "$tmp/prime-agent-user" "$HOME/.prime"; do
-  protected=$(canon "$protected")
-  if overlaps "$sock_dir" "$protected"; then die "refusing socket dir $sock_dir: it overlaps TS state at $protected"; fi
-done
+refuse_ts_state "socket dir" "$sock_dir"
+# Own agent dir: the TS fleet's ~/.prime/agent is shared mutable state the
+# Rust daemon would sweep, migrate and rewrite (session archiving, update
+# manifests, schedules, settings, OAuth refresh). The installer seeds it with
+# a models.json link, a skills snapshot and a one-time settings copy.
+agent_dir=$(checked PRIME_AGENT_RS_AGENT_DIR "${{PRIME_AGENT_RS_AGENT_DIR:-$home/.prime/agent-rs}}")
+agent_dir=$(canon "$agent_dir")
+refuse_ts_state "agent dir" "$agent_dir"
+kernel_venv=$(checked PRIME_AGENT_RS_KERNEL_VENV "${{PRIME_AGENT_RS_KERNEL_VENV:-$agent_dir/kernel-venv}}")
+kernel_venv=$(canon "$kernel_venv")
+refuse_ts_state "kernel venv" "$kernel_venv"
+case "$agent_dir/" in "$kernel_venv"/*) die "refusing kernel venv $kernel_venv: it holds the agent dir" ;; esac
+
+# Nothing in the agent dir may alias out of it (`sessions -> <TS sessions>`
+# would hand TS state to the Rust daemon): only models.json may be a link
+# (read-only, no Rust writer), to a regular file. The kernel venv holds uv's
+# links (its interpreter, lib64 -> lib): a linked dir there must stay inside
+# the venv, or package installs would land elsewhere. A tree that cannot be
+# fully scanned is refused too.
+if [ -d "$agent_dir" ]; then
+  found=$(find "$agent_dir" -type l) || die "cannot scan the agent dir $agent_dir for links"
+  links=$(printf '%s\\n' "$found" | while IFS= read -r link; do
+    case "$link" in
+      ''|"$kernel_venv"/*) ;;
+      "$agent_dir/models.json") [ -f "$link" ] || printf '%s\\n' "$link" ;;
+      *) printf '%s\\n' "$link" ;;
+    esac
+  done)
+  if [ -n "$links" ]; then die "refusing agent dir $agent_dir: only models.json may be a link in it, found: $links"; fi
+fi
+if [ -d "$kernel_venv" ]; then
+  found=$(find "$kernel_venv" -type l) || die "cannot scan the kernel venv $kernel_venv for links"
+  links=$(printf '%s\\n' "$found" | while IFS= read -r link; do
+    if [ -n "$link" ] && [ -d "$link" ]; then
+      case "$(cd -P "$link" && pwd)/" in "$kernel_venv"/*) ;; *) printf '%s\\n' "$link" ;; esac
+    fi
+  done)
+  if [ -n "$links" ]; then die "refusing kernel venv $kernel_venv: a linked dir in it leads out of it: $links"; fi
+fi
+
 if [ ! -e "$sock_dir" ]; then (umask 077 && mkdir -p "$sock_dir"); fi
 if [ -L "$sock_dir" ] || [ ! -d "$sock_dir" ] || [ ! -O "$sock_dir" ]; then
   die "refusing socket dir $sock_dir (not a directory owned by uid $uid)"
 fi
 chmod 700 "$sock_dir"
-
-# Own agent dir: the TS fleet's ~/.prime/agent is shared mutable state the
-# Rust daemon would sweep, migrate and rewrite (session archiving, update
-# manifests, schedules, settings, OAuth refresh). The installer seeds it with
-# read-only links to models.json and skills/ and a one-time settings copy.
-agent_dir=${{PRIME_AGENT_RS_AGENT_DIR:-$HOME/.prime/agent-rs}}
-absolute PRIME_AGENT_RS_AGENT_DIR "$agent_dir"
-agent_dir=$(canon "$agent_dir")
-for protected in "$HOME/.prime/agent" "${{XDG_DATA_HOME:-$HOME/.local/share}}/prime/agent"; do
-  protected=$(canon "$protected")
-  if overlaps "$agent_dir" "$protected"; then die "refusing agent dir $agent_dir: it overlaps the TS agent dir $protected"; fi
-done
 if [ ! -e "$agent_dir" ]; then (umask 077 && mkdir -p "$agent_dir"); fi
-
-kernel_venv=${{PRIME_AGENT_RS_KERNEL_VENV:-$agent_dir/kernel-venv}}
-absolute PRIME_AGENT_RS_KERNEL_VENV "$kernel_venv"
-kernel_venv=$(canon "$kernel_venv")
-for protected in "$HOME/.prime/agent/kernel-venv" "${{XDG_DATA_HOME:-$HOME/.local/share}}/prime/agent/kernel-venv"; do
-  protected=$(canon "$protected")
-  if overlaps "$kernel_venv" "$protected"; then die "refusing kernel venv $kernel_venv: it overlaps the TS kernel venv $protected"; fi
-done
 
 PRIME_AGENT_CODING_AGENT_DIR=$agent_dir
 PRIME_AGENT_SOCKET_DIR=$sock_dir
@@ -134,8 +191,11 @@ PRIME_AGENT_DOWNLOAD_BASE_URL=http://127.0.0.1:1/oneiron-feed-disabled
 PI_SKIP_VERSION_CHECK=1
 export PRIME_AGENT_CODING_AGENT_DIR PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV \\
   PRIME_AGENT_DISABLE_SELF_UPDATE PRIME_AGENT_RUST_INSTALLER_URL PRIME_AGENT_DOWNLOAD_BASE_URL PI_SKIP_VERSION_CHECK
-# Inherited session-dir overrides would point the Rust daemon at TS sessions.
-unset PI_PACKAGE_DIR PRIME_AGENT_KERNEL_PYTHON PRIME_AGENT_SESSION_DIR PRIME_AGENT_CODING_AGENT_SESSION_DIR
+# Inherited state paths and debug sinks would point the Rust process at TS
+# sessions, a TS session's harness state, or a parent's trace and log files.
+unset PI_PACKAGE_DIR PRIME_AGENT_KERNEL_PYTHON PRIME_AGENT_SESSION_DIR PRIME_AGENT_CODING_AGENT_SESSION_DIR \\
+  RLM_SESSION_DIR RLM_HARNESS_STATE_DIR RLM_GLOBAL_HARNESS_STATE_DIR \\
+  PA_COMPACTION_TRACE PA_MCP_LOGIN_URL_FILE PA_DAEMON_EVENT_LOG
 dir=$(cd "$prefix/current" && pwd -P)
 if [ "${{PRIME_AGENT_RS_PRINT_ENV:-}}" = 1 ]; then
   # The probe's view of what a real run gets (no binary is started).
@@ -200,30 +260,137 @@ def git_facts(root: Path) -> dict:
             "dirty": bool(run("status", "--porcelain")), "rustBase": base}
 
 
+def checked_path(name: str, raw: str) -> Path:
+    """`raw` as a path, trailing slashes dropped. It must be absolute with no
+    empty, `.` or `..` component: a `..` past a missing dir would slip by the
+    canonical overlap checks (the launcher's `checked` is the same rule)."""
+    text = raw.rstrip("/") or raw[:1]
+    if not text.startswith("/"):
+        raise SystemExit(f"error: {name} must be an absolute path: {raw}")
+    if text != "/" and any(part in ("", ".", "..") for part in text.split("/")[1:]):
+        raise SystemExit(f"error: {name} must not hold empty, . or .. components: {raw}")
+    return Path(text)
+
+
+def canonical(name: str, path: Path) -> Path:
+    """The physical spelling of `path` (symlinked ancestors resolved). A link
+    to a missing dir is refused, not guessed at, as the launcher's canon does."""
+    probe = path
+    while not probe.is_dir() and probe != probe.parent:
+        if probe.is_symlink():
+            raise SystemExit(f"error: {name} {path}: {probe} is a link but not to a dir")
+        probe = probe.parent
+    return path.resolve()
+
+
+def tmp_dir() -> Path:
+    return checked_path("TMPDIR", os.environ.get("TMPDIR") or str(SYSTEM_TMP))
+
+
+def data_home() -> Path:
+    raw = os.environ.get("XDG_DATA_HOME") or ""
+    return checked_path("XDG_DATA_HOME", raw) if raw.startswith("/") else HOME / ".local" / "share"
+
+
 def protected_roots() -> list[Path]:
-    """TS product state an install may never write into (or contain)."""
-    tmp = Path(os.environ.get("TMPDIR") or "/tmp")
-    return [TS_PREFIX, HOME / ".prime", tmp / f"prime-agent-{os.getuid()}", tmp / "prime-agent-user"]
+    """PROTECTED_STATE under this process's TMPDIR, HOME and XDG_DATA_HOME."""
+    bases = {"tmp": [tmp_dir(), SYSTEM_TMP], "home": [HOME], "data": [data_home(), HOME / ".local" / "share"]}
+    return list(dict.fromkeys(base / rel.format(uid=os.getuid())
+                              for kind, rel in PROTECTED_STATE for base in bases[kind]))
 
 
-def overlaps(path: Path, root: Path) -> bool:
-    path, root = path.resolve(), root.resolve()
-    return path == root or is_within(path, root) or is_within(root, path)
+def shell_protected_roots() -> str:
+    """PROTECTED_STATE as the launcher's word list (its own $tmp, $home, $data)."""
+    bases = {"tmp": ("$tmp", "$system_tmp"), "home": ("$home",), "data": ("$data", "$home/.local/share")}
+    return " ".join(f'"{base}/{rel.format(uid="$uid")}"' for kind, rel in PROTECTED_STATE for base in bases[kind])
 
 
-def check_prefix(prefix: Path, bin_dir: Path) -> None:
+def ts_state_overlap(path: Path) -> Path | None:
+    """The protected root canonical `path` equals, sits inside or contains."""
     for root in protected_roots():
-        if overlaps(prefix, root):
-            raise SystemExit(f"error: prefix {prefix} overlaps protected TS state at {root}")
-        if bin_dir.resolve() == root.resolve() or is_within(bin_dir.resolve(), root.resolve()):
-            raise SystemExit(f"error: bin dir {bin_dir} sits inside protected TS state at {root}")
-    if (bin_dir / LAUNCHER_NAME).resolve() == (bin_dir / TS_LAUNCHER_NAME).resolve():
-        raise SystemExit("error: the prime-agent-rs launcher would alias the TS prime-agent launcher")
+        root = canonical("protected root", root)
+        if path == root or is_within(path, root) or is_within(root, path):
+            return root
+    return None
+
+
+def outside_ts_state(role: str, raw: str) -> bool:
+    return ts_state_overlap(canonical(role, Path(raw))) is None
+
+
+def refuse_ts_state(role: str, path: Path) -> Path:
+    """`path`, canonical, unless it overlaps TS state (the launcher's
+    refuse_ts_state is the same rule over the same set)."""
+    path = canonical(role, path)
+    root = ts_state_overlap(path)
+    if root is not None:
+        raise SystemExit(f"error: refusing {role} {path}: it overlaps TS state at {root}")
+    return path
+
+
+def cli_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
+    """The canonical --prefix and --bin-dir, checked against TS state."""
+    prefix = checked_path("--prefix", os.path.expanduser(args.prefix or f"{HOME}/.local/share/prime-agent-oneiron-rs"))
+    bin_dir = checked_path("--bin-dir", os.path.expanduser(args.bin_dir or f"{HOME}/.local/bin"))
+    return refuse_ts_state("prefix", prefix), refuse_ts_state("bin dir", bin_dir)
+
+
+def runtime_dirs() -> dict[str, Path]:
+    """The agent dir, socket dir and kernel venv the launcher will hand the
+    binary (same overrides, same defaults), canonical and checked."""
+    env = os.environ.get
+    agent_dir = refuse_ts_state("agent dir", checked_path(
+        "PRIME_AGENT_RS_AGENT_DIR", env("PRIME_AGENT_RS_AGENT_DIR") or f"{HOME}/.prime/agent-rs"))
+    socket_dir = refuse_ts_state("socket dir", checked_path(
+        "PRIME_AGENT_RS_SOCKET_DIR", env("PRIME_AGENT_RS_SOCKET_DIR") or f"{tmp_dir()}/pa-rs-{os.getuid()}"))
+    kernel_venv = refuse_ts_state("kernel venv", checked_path(
+        "PRIME_AGENT_RS_KERNEL_VENV", env("PRIME_AGENT_RS_KERNEL_VENV") or f"{agent_dir}/kernel-venv"))
+    if agent_dir == kernel_venv or is_within(agent_dir, kernel_venv):
+        raise SystemExit(f"error: refusing kernel venv {kernel_venv}: it holds the agent dir")
+    return {"agent dir": agent_dir, "socket dir": socket_dir, "kernel venv": kernel_venv}
+
+
+def tree_links(root: Path, skip: Path | None = None) -> list[Path]:
+    """Every symlink under `root` (none followed), the `skip` subtree aside.
+    A subtree that cannot be read is an error, not an empty answer."""
+    if not root.exists():
+        return []
+
+    def unreadable(error: OSError) -> None:
+        raise SystemExit(f"error: cannot scan {root} for links: {error}")
+
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root, onerror=unreadable):
+        here = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if here / name != skip]
+        found.extend(here / name for name in dirnames + filenames if (here / name).is_symlink())
+    return found
+
+
+def check_agent_tree(agent_dir: Path, kernel_venv: Path, *, old_skills_link: bool) -> None:
+    """Nothing in the agent dir may alias out of it (`sessions -> <TS
+    sessions>` would hand TS state to the Rust daemon): only models.json may
+    be a link, to a regular file. The kernel venv holds uv's links (its
+    interpreter, lib64 -> lib): a linked dir there must stay inside it.
+    `old_skills_link` admits the pre-snapshot skills link the seeder is about
+    to replace. The launcher applies the same rules."""
+    allowed = {agent_dir / "skills"} if old_skills_link else set()
+    bad = [link for link in tree_links(agent_dir, skip=kernel_venv) if link not in allowed
+           and not (link == agent_dir / "models.json" and link.is_file())]
+    if bad:
+        raise SystemExit(f"error: refusing agent dir {agent_dir}: only models.json may be a link in it, "
+                         f"found: {' '.join(map(str, bad))}")
+    escapes = [link for link in tree_links(kernel_venv) if link.is_dir()
+               and not (link.resolve() == kernel_venv or is_within(link.resolve(), kernel_venv))]
+    if escapes:
+        raise SystemExit(f"error: refusing kernel venv {kernel_venv}: a linked dir in it leads out of it: "
+                         f"{' '.join(map(str, escapes))}")
 
 
 # One path component: the version names the install dir, the `current`
 # target and the receipt dir, so `/` and `..` must never reach a path.
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.+-]*)?$")
+CURRENT_LINK = re.compile(r"^(?:current|\.current\.tmp-[0-9]+)$")
 
 
 def check_version(version: str) -> None:
@@ -231,15 +398,30 @@ def check_version(version: str) -> None:
         raise SystemExit(f"error: version {version!r} is not a plain release version (e.g. 0.9.8-oneiron.20261001.1)")
 
 
+def check_prefix_tree(prefix: Path) -> None:
+    """Every install and receipt write must land inside the prefix: its only
+    links are `current` (and an interrupted flip's temp) naming a version."""
+    bad = [link for link in tree_links(prefix)
+           if not (link.parent == prefix and CURRENT_LINK.match(link.name) and VERSION_PATTERN.match(os.readlink(link)))]
+    if bad:
+        raise SystemExit(f"error: refusing prefix {prefix}: only `current` may be a link in it, "
+                         f"found: {' '.join(map(str, bad))}")
+
+
+def inside_prefix(prefix: Path, path: Path) -> Path:
+    if not is_within(path.resolve(), prefix) or path.resolve() == prefix:
+        raise SystemExit(f"error: {path} would land outside {prefix}")
+    return path
+
+
 def check_no_symlinks(stage_dir: Path) -> None:
     """The staged tree must hold only regular files and dirs: a preserved
     symlink would let the install (or the version stamp) write outside it."""
     if stage_dir.is_symlink():
         raise SystemExit(f"error: staged layout {stage_dir} is a symlink")
-    for dirpath, dirnames, filenames in os.walk(stage_dir):
-        for name in dirnames + filenames:
-            if (Path(dirpath) / name).is_symlink():
-                raise SystemExit(f"error: staged layout holds a symlink: {Path(dirpath) / name}")
+    links = tree_links(stage_dir)
+    if links:
+        raise SystemExit(f"error: staged layout holds a symlink: {links[0]}")
 
 
 def read_stage(stage_dir: Path) -> tuple[str, str]:
@@ -280,14 +462,71 @@ def extract_tarball(tarball: Path, into: Path) -> Path:
     return stage
 
 
-def seed_agent_dir(agent_dir: Path, ts_agent_dir: Path) -> dict:
-    """Create the Rust agent dir: links to the read-only shared inputs, a
-    one-time copy of settings.json, nothing else (no auth, no sessions)."""
-    if overlaps(agent_dir, ts_agent_dir):
-        raise SystemExit(f"error: agent dir {agent_dir} overlaps the TS agent dir {ts_agent_dir}")
+def remove_entry(path: Path) -> None:
+    """Remove `path` itself: a link is unlinked, never followed."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def copy_snapshot(source: Path, target: Path, skipped: list[str]) -> None:
+    """Copy the `source` tree to a new `target` with files and dirs only:
+    every link becomes a copy of what it names, SKILLS_SNAPSHOT_SKIP names
+    are left behind, and dangling links, link cycles and special files are
+    recorded in `skipped`. (shutil.copytree checks relative link targets
+    against the cwd, so it would drop or misjudge them.)"""
+    active: set[Path] = set()
+
+    def copy_dir(src: Path, dst: Path) -> None:
+        real = src.resolve()
+        if real in active:
+            skipped.append(f"{src} (link cycle)")
+            return
+        active.add(real)
+        dst.mkdir()
+        for entry in sorted(os.scandir(src), key=lambda entry: entry.name):
+            if any(fnmatch.fnmatch(entry.name, pattern) for pattern in SKILLS_SNAPSHOT_SKIP):
+                continue
+            if entry.is_dir():
+                copy_dir(Path(entry.path), dst / entry.name)
+            elif entry.is_file():
+                shutil.copy2(entry.path, dst / entry.name)
+            else:
+                skipped.append(entry.path)
+        active.discard(real)
+
+    copy_dir(source, target)
+
+
+def snapshot_skills(source: Path, target: Path) -> dict:
+    """Replace `target` with a Rust-owned snapshot of the TS skills dir. The
+    kernel installs Python skills editable and imports them, so bytecode and
+    build metadata land beside the skill source: a link would put those
+    writes in the TS tree."""
+    temp = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+    old = target.with_name(f".{target.name}.old-{os.getpid()}")
+    skipped: list[str] = []
+    remove_entry(temp)
+    try:
+        copy_snapshot(source, temp, skipped)
+        if target.is_symlink() or target.exists():
+            os.rename(target, old)
+        os.rename(temp, target)
+    finally:
+        remove_entry(temp)
+    remove_entry(old)
+    return {"snapshotOf": str(source), "skipped": skipped}
+
+
+def seed_agent_dir(agent_dir: Path, ts_agent_dir: Path, *, refresh_skills: bool) -> dict:
+    """Create the Rust agent dir: a link to models.json (no Rust writer), a
+    snapshot of the skills, a one-time copy of settings.json, nothing else
+    (no auth, no sessions). An existing snapshot is kept unless
+    `refresh_skills`; an old-layout skills link is always replaced."""
     agent_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    actions = {}
-    for name in SHARED_READ_ONLY:
+    actions: dict[str, object] = {}
+    for name in SHARED_LINKS:
         source, target = ts_agent_dir / name, agent_dir / name
         if target.exists() or target.is_symlink():
             actions[name] = "kept"
@@ -296,6 +535,17 @@ def seed_agent_dir(agent_dir: Path, ts_agent_dir: Path) -> dict:
             actions[name] = f"linked -> {source}"
         else:
             actions[name] = "absent in TS agent dir"
+    source, target = ts_agent_dir / "skills", agent_dir / "skills"
+    old_link = os.readlink(target) if target.is_symlink() else None
+    if target.exists() and old_link is None and not refresh_skills:
+        actions["skills"] = "kept (install --refresh-skills replaces it)"
+    elif source.is_dir():
+        replaced = f"link -> {old_link}" if old_link is not None else "snapshot" if target.exists() else None
+        actions["skills"] = {**snapshot_skills(source, target), "replaced": replaced}
+    else:
+        if old_link is not None:
+            target.unlink()
+        actions["skills"] = "absent in TS agent dir"
     settings, settings_copy = ts_agent_dir / "settings.json", agent_dir / "settings.json"
     if settings_copy.exists() or settings_copy.is_symlink():
         actions["settings.json"] = "kept"
@@ -312,7 +562,9 @@ def write_launcher(bin_dir: Path, prefix: Path) -> Path:
     bin_dir.mkdir(parents=True, exist_ok=True)
     launcher = bin_dir / LAUNCHER_NAME
     temp = bin_dir / f".{LAUNCHER_NAME}.tmp-{os.getpid()}"
-    temp.write_text(LAUNCHER_TEMPLATE.format(prefix=shlex.quote(str(prefix))))
+    temp.write_text(LAUNCHER_TEMPLATE.format(prefix=shlex.quote(str(prefix)),
+                                             system_tmp=shlex.quote(str(SYSTEM_TMP)),
+                                             protected_roots=shell_protected_roots()))
     temp.chmod(0o755)
     os.replace(temp, launcher)
     return launcher
@@ -338,9 +590,17 @@ def stamp_manifest(package_json: Path, version: str) -> None:
 
 
 def install(args: argparse.Namespace) -> int:
-    prefix = args.prefix.expanduser()
-    bin_dir = args.bin_dir.expanduser()
-    check_prefix(prefix, bin_dir)
+    # Every destination is validated before anything is written: the prefix
+    # (receipts included), the bin dir, and the agent dir, socket dir and
+    # kernel venv the seeder and the launcher's --version run will create.
+    prefix, bin_dir = cli_dirs(args)
+    runtime = runtime_dirs()
+    agent_dir = runtime["agent dir"]
+    check_prefix_tree(prefix)
+    refuse_ts_state("receipts", inside_prefix(prefix, prefix / "receipts"))
+    check_agent_tree(agent_dir, runtime["kernel venv"], old_skills_link=True)
+    if (bin_dir / LAUNCHER_NAME).resolve() == (bin_dir / TS_LAUNCHER_NAME).resolve():
+        raise SystemExit("error: the prime-agent-rs launcher would alias the TS prime-agent launcher")
     ts_launcher = bin_dir / TS_LAUNCHER_NAME
     ts_before = link_state(ts_launcher)
 
@@ -355,13 +615,13 @@ def install(args: argparse.Namespace) -> int:
                              f"(e.g. {staged_version}-oneiron.YYYYMMDD.N)")
         if not re.match(r"^[a-z0-9]+-[a-z0-9]+$", platform):
             raise SystemExit(f"error: platform {platform!r} is not a plain <os>-<arch> tag")
-        target = prefix / version
-        if target.resolve().parent != prefix.resolve():
+        target = inside_prefix(prefix, prefix / version)
+        if target.resolve().parent != prefix:
             raise SystemExit(f"error: {target} would land outside {prefix}")
         if target.exists():
             raise SystemExit(f"error: {target} already exists; installs are immutable, bump the build number")
         prefix.mkdir(parents=True, exist_ok=True)
-        temp_target = prefix / f".{version}.tmp-{os.getpid()}"
+        temp_target = inside_prefix(prefix, prefix / f".{version}.tmp-{os.getpid()}")
         if temp_target.exists():
             shutil.rmtree(temp_target)
         shutil.copytree(stage, temp_target, symlinks=True)
@@ -373,8 +633,7 @@ def install(args: argparse.Namespace) -> int:
     launcher = bin_dir / LAUNCHER_NAME
     agent = None
     if args.activate:
-        agent_dir = Path(os.environ.get("PRIME_AGENT_RS_AGENT_DIR") or DEFAULT_AGENT_DIR)
-        agent = seed_agent_dir(agent_dir, TS_AGENT_DIR)
+        agent = seed_agent_dir(agent_dir, TS_AGENT_DIR, refresh_skills=args.refresh_skills)
         current_before = flip_current(prefix, version)
         launcher = write_launcher(bin_dir, prefix)
 
@@ -388,7 +647,7 @@ def install(args: argparse.Namespace) -> int:
         version_check = {"stdout": result.stdout.strip(), "exitCode": result.returncode,
                          "ok": result.returncode == 0 and result.stdout.strip() == version}
 
-    receipt_dir = prefix / "receipts" / f"{version}-{platform}"
+    receipt_dir = inside_prefix(prefix, prefix / "receipts" / f"{version}-{platform}")
     receipt_dir.mkdir(parents=True, exist_ok=True)
     receipt = {
         "schema": RECEIPT_SCHEMA,
@@ -475,17 +734,40 @@ def one_shot(launcher: Path, args: argparse.Namespace, cwd: Path, tools: bool, b
     return run
 
 
-def venv_fingerprint(venv: Path) -> list[list] | None:
-    """mtime/size of a venv's structural entries: a write that installs,
-    removes or rebuilds anything in it moves at least one of them."""
-    if not venv.exists():
+def tree_identity(root: Path) -> list[str] | None:
+    """One line per entry under `root` (itself included, links not followed):
+    relative path, type, size, mtime_ns, and a link's target. A write
+    anywhere in the tree, in place or not, changes at least one line."""
+    if not root.exists():
         return None
-    entries = [venv, venv / "bin", venv / "pyvenv.cfg"]
-    for site in sorted(venv.glob("lib/python*/site-packages")):
-        entries.append(site)
-        entries.extend(sorted(site.iterdir()))
-    return [[str(entry.relative_to(venv)), entry.lstat().st_mtime_ns, entry.lstat().st_size]
-            for entry in entries if entry.exists() or entry.is_symlink()]
+
+    def line(path: Path) -> str | None:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:  # removed mid-walk: its absence is the change
+            return None
+        kind = ("link" if stat.S_ISLNK(info.st_mode) else "dir" if stat.S_ISDIR(info.st_mode)
+                else "file" if stat.S_ISREG(info.st_mode) else "other")
+        target = os.readlink(path) if kind == "link" else ""
+        return f"{path.relative_to(root)}\t{kind}\t{info.st_size}\t{info.st_mtime_ns}\t{target}"
+
+    lines = [line(root)]
+    for dirpath, dirnames, filenames in os.walk(root):
+        lines.extend(line(Path(dirpath) / name) for name in dirnames + filenames)
+    return sorted(entry for entry in lines if entry is not None)
+
+
+def identity_digest(lines: list[str] | None) -> dict | None:
+    """What a receipt keeps of a tree_identity: its size and digest."""
+    if lines is None:
+        return None
+    return {"entries": len(lines), "sha256": hashlib.sha256("\n".join(lines).encode()).hexdigest()}
+
+
+def identity_changes(before: list[str] | None, after: list[str] | None, limit: int = 20) -> list[str]:
+    """The relative paths whose identity differs, for diagnosis (bounded)."""
+    changed = set(before or []) ^ set(after or [])
+    return sorted({entry.split("\t", 1)[0] for entry in changed})[:limit]
 
 
 def launcher_env(launcher: Path) -> dict[str, str]:
@@ -497,25 +779,30 @@ def launcher_env(launcher: Path) -> dict[str, str]:
     return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
 
 
+def ts_kernel_venvs() -> list[Path]:
+    """Where the TS product keeps its kernel venv (both agent-dir layouts)."""
+    return list(dict.fromkeys([TS_AGENT_DIR / "kernel-venv", data_home() / "prime" / "agent" / "kernel-venv",
+                               HOME / ".local" / "share" / "prime" / "agent" / "kernel-venv"]))
+
+
 def probe(args: argparse.Namespace) -> int:
-    prefix = args.prefix.expanduser()
-    bin_dir = args.bin_dir.expanduser()
+    prefix, bin_dir = cli_dirs(args)
+    check_prefix_tree(prefix)
     launcher = bin_dir / LAUNCHER_NAME
     current = prefix / "current"
     if not current.is_symlink():
         raise SystemExit(f"error: {current} is not an installed release")
     version = json.loads((current / "package.json").read_text())["version"]
+    check_version(version)
     platform = next((name.split(f"{version}-", 1)[1] for name in os.listdir(prefix / "receipts")
                      if name.startswith(f"{version}-")), "unknown")
     effective = launcher_env(launcher)
     rs_socket_dir = Path(effective["PRIME_AGENT_SOCKET_DIR"])
     rs_venv = Path(effective["PRIME_AGENT_KERNEL_VENV"])
-    tmp = Path(os.environ.get("TMPDIR") or "/tmp")
-    ts_socket_dir = tmp / f"prime-agent-{os.getuid()}"
-    ts_venvs = [HOME / ".prime" / "agent" / "kernel-venv",
-                Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local" / "share") / "prime" / "agent" / "kernel-venv"]
+    ts_socket_dir = tmp_dir() / f"prime-agent-{os.getuid()}"
+    ts_venvs = ts_kernel_venvs()
     ts_launcher_before = link_state(bin_dir / TS_LAUNCHER_NAME)
-    ts_venv_before = [venv_fingerprint(venv) for venv in ts_venvs]
+    ts_venv_before = [tree_identity(venv) for venv in ts_venvs]
 
     with tempfile.TemporaryDirectory(prefix="pa-rs-probe-") as scratch:
         cwd = Path(scratch)
@@ -541,11 +828,13 @@ def probe(args: argparse.Namespace) -> int:
         "runs": runs,
     }
     ts_launcher_after = link_state(bin_dir / TS_LAUNCHER_NAME)
-    ts_venv_after = [venv_fingerprint(venv) for venv in ts_venvs]
+    ts_venv_after = [tree_identity(venv) for venv in ts_venvs]
     checks = {
-        "agentDirOutsideTsAgentDir": not overlaps(Path(effective["PRIME_AGENT_CODING_AGENT_DIR"]), TS_AGENT_DIR),
-        "socketDirOutsideTsState": not any(overlaps(rs_socket_dir, root) for root in protected_roots()),
-        "kernelVenvOutsideTsVenvs": not any(overlaps(rs_venv, venv) for venv in ts_venvs),
+        "agentDirOutsideTsState": outside_ts_state("agent dir", effective["PRIME_AGENT_CODING_AGENT_DIR"]),
+        "socketDirOutsideTsState": outside_ts_state("socket dir", str(rs_socket_dir)),
+        "kernelVenvOutsideTsState": outside_ts_state("kernel venv", str(rs_venv)),
+        # The launcher runs the release this probe reads the version of.
+        "launcherRunsProbedRelease": Path(effective["binary"]) == (prefix / version / "prime-agent").resolve(),
         "selfUpdateDisabled": effective.get("PRIME_AGENT_DISABLE_SELF_UPDATE") == "1",
         "tsLauncherUnchanged": ts_launcher_before == ts_launcher_after,
         "tsKernelVenvsUnchanged": ts_venv_before == ts_venv_after,
@@ -556,11 +845,13 @@ def probe(args: argparse.Namespace) -> int:
         "rsSocketDir": {"path": str(rs_socket_dir), "entries": dir_listing(rs_socket_dir)},
         "tsSocketDir": {"path": str(ts_socket_dir), "entries": dir_listing(ts_socket_dir)},
         "rsKernelVenv": {"path": str(rs_venv), "exists": rs_venv.exists()},
-        "tsKernelVenvs": [str(venv) for venv in ts_venvs],
+        "tsKernelVenvs": [{"path": str(venv), "before": identity_digest(before), "after": identity_digest(after),
+                           "changed": identity_changes(before, after)}
+                          for venv, before, after in zip(ts_venvs, ts_venv_before, ts_venv_after)],
         "tsLauncher": ts_launcher_after,
     }
     receipt["ok"] = all(run["ok"] for run in runs.values()) and all(checks.values())
-    receipt_dir = prefix / "receipts" / f"{version}-{platform}"
+    receipt_dir = inside_prefix(prefix, prefix / "receipts" / f"{version}-{platform}")
     receipt_dir.mkdir(parents=True, exist_ok=True)
     # The full event stream rides beside the receipt; the receipt keeps a tail.
     for name, run in runs.items():
@@ -580,8 +871,8 @@ def probe(args: argparse.Namespace) -> int:
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--prefix", type=Path, default=DEFAULT_PREFIX)
-    parser.add_argument("--bin-dir", type=Path, default=DEFAULT_BIN_DIR)
+    parser.add_argument("--prefix", help="install tree (default ~/.local/share/prime-agent-oneiron-rs)")
+    parser.add_argument("--bin-dir", help="launcher dir (default ~/.local/bin)")
     commands = parser.add_subparsers(dest="command", required=True)
 
     install_cmd = commands.add_parser("install", help="install a staged release side by side")
@@ -592,6 +883,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                              "(must extend the staged version, e.g. 0.9.8-oneiron.20261001.1)")
     install_cmd.add_argument("--no-activate", dest="activate", action="store_false",
                              help="copy the release without flipping current or writing the launcher")
+    install_cmd.add_argument("--refresh-skills", action="store_true",
+                             help="replace the agent dir's skills snapshot with a fresh one of the TS skills")
 
     probe_cmd = commands.add_parser("probe", help="probe the installed launcher")
     probe_cmd.add_argument("--provider", default="cpa-r")

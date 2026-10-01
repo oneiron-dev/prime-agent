@@ -47,20 +47,35 @@ when the diff is identical, otherwise drop it by hand.
   2026-10-01). It would move sessions into `sessions-archive`, delete TS update manifests at
   every boot, recover and back off TS schedules, rewrite `settings.json` wholesale, race OAuth
   refresh, and write differently-limited kernel snapshots. The installer seeds the Rust agent dir
-  with links to `models.json` and `skills/` (read-only inputs: `models.json` loads unchanged) and
-  a one-time copy of `settings.json`. It never copies `auth.json` (cpa providers carry their keys
-  in `models.json`; a copied OAuth refresh token would still race TS).
+  with a link to `models.json` (no Rust writer; it loads unchanged), a Rust-owned snapshot of
+  `skills/` and a one-time copy of `settings.json`. The snapshot holds files only (a link becomes a
+  copy of what it names; `__pycache__`, `*.egg-info`, `.venv`, `node_modules` stay behind): the
+  kernel installs Python skills editable and imports them, writing beside the source, so a link
+  would write into the TS tree. An existing snapshot is kept, `install --refresh-skills` replaces
+  it, and an old-layout `skills` link is replaced on the next install. It never copies `auth.json`
+  (cpa providers carry their keys in `models.json`; a copied OAuth refresh token would still race
+  TS).
   Consequence: during the trial, Rust and TS sessions are separate stores. Sharing them needs the
   fork-only shared-store guard (`PRIME_AGENT_SHARED_STORE`), a follow-up lane.
 - The launcher exports `PRIME_AGENT_CODING_AGENT_DIR=~/.prime/agent-rs`,
   `PRIME_AGENT_SOCKET_DIR=${TMPDIR:-/tmp}/pa-rs-<uid>` (0700, owner-checked),
   `PRIME_AGENT_DAEMON_SOCKET=<that dir>/daemon.sock` and
-  `PRIME_AGENT_KERNEL_VENV=~/.prime/agent-rs/kernel-venv`. It clears inherited session-dir
-  overrides and always overwrites the generic names. Override only with
-  `PRIME_AGENT_RS_AGENT_DIR` / `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`; each is
-  validated before anything is created: absolute, canonical through symlinked ancestors, and no
-  overlap with TS state. The short `pa-rs-<uid>` name keeps macOS worker socket paths under the
-  104-byte `sun_path` limit.
+  `PRIME_AGENT_KERNEL_VENV=~/.prime/agent-rs/kernel-venv`. It always overwrites the generic names
+  and clears inherited session dirs and harness/debug sinks (`RLM_SESSION_DIR`,
+  `RLM_HARNESS_STATE_DIR`, `RLM_GLOBAL_HARNESS_STATE_DIR`, `PA_COMPACTION_TRACE`,
+  `PA_MCP_LOGIN_URL_FILE`, `PA_DAEMON_EVENT_LOG`). Override only with `PRIME_AGENT_RS_AGENT_DIR` /
+  `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`. The short `pa-rs-<uid>` name keeps
+  macOS worker socket paths under the 104-byte `sun_path` limit.
+- One protected set for every path the installer or launcher writes (prefix, receipts, bin dir,
+  agent dir, socket dir, kernel venv): `PROTECTED_STATE` in `side_by_side.py`, which also renders
+  the launcher's list. It is the TS socket dirs `<tmp>/prime-agent-<uid>` and
+  `<tmp>/prime-agent-user` (under `$TMPDIR` and `/tmp`), the TS agent dir `~/.prime/agent` and its
+  XDG location `${XDG_DATA_HOME:-~/.local/share}/prime/agent`, and the TS install tree. No path may
+  equal, sit in or contain one. Paths must be absolute with no empty, `.` or `..` component, are
+  judged by their canonical target (a link to a missing dir is refused), and are all checked before
+  anything is written. The agent dir may hold no link but `models.json` (to a regular file), a
+  linked dir in the kernel venv must stay inside it (uv's `lib64 -> lib`), and the prefix may hold
+  no link but `current`. A tree that cannot be scanned is refused.
 - Self-update is shut. Upstream's `prime-agent update` and the TUI `/update` fetch and run the
   takeover installer, so the launcher sets `PRIME_AGENT_DISABLE_SELF_UPDATE=1`. That fork-only guard
   refuses both, plus the staged native updater. It also points `PRIME_AGENT_RUST_INSTALLER_URL` and
@@ -89,8 +104,9 @@ scripts/oneiron/gate.sh crates pa-core pa-daemon -- <filter>   # focused, same s
 
 Never run a bare `cargo test --workspace` on a machine with a live TS fleet. The kernel e2e suites
 bootstrap the ambient kernel venv and probe the default daemon socket dir. `gate.sh` runs every test
-under a throwaway HOME and TMPDIR, with the product env scrubbed, TZ=UTC and the TS binary off
-PATH, the way a CI runner sees it.
+under a throwaway HOME and TMPDIR, with the product env scrubbed (`PRIME_AGENT_*`, `PI_*`, `RLM_*`,
+`PA_*`; an explicit `PA_TS_BINARY` is kept), TZ=UTC and the TS binary off PATH, the way a CI runner
+sees it. A failed build or bootstrap fails the gate.
 
 ## Re-pinning
 

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -24,10 +25,14 @@ import test_policy_gate  # noqa: E402
 
 VERSION = "0.9.8-oneiron.20261001.1"
 PLATFORM = "linux-x64"
+# A fixture mtime far in the past: any later write moves it, even one that
+# lands in the same clock tick as the fixture's creation.
+OLD_NS = 1_000_000_000 * 10**9
 
 # The fake binary prints the exe-adjacent manifest version (as the real one
-# does), or the isolation env it was launched with, so the launcher's exports
-# are asserted on what the process really saw.
+# does), the isolation env it was launched with, or (for `-p`) one JSON event
+# carrying the requested model as its responseModel. FAKE_MUTATE_FILE, when
+# set, is rewritten in place first: a stand-in for a run that writes TS state.
 FAKE_BINARY = """#!/bin/sh
 if [ "$1" = "--version" ]; then
   sed -n 's/.*"version": *"\\([^"]*\\)".*/\\1/p' "$(dirname "$0")/package.json"; exit 0
@@ -37,7 +42,21 @@ if [ "$1" = "env" ]; then
     "KERNEL_VENV=$PRIME_AGENT_KERNEL_VENV" "SKIP=$PI_SKIP_VERSION_CHECK" "PACKAGE_DIR=${PI_PACKAGE_DIR-unset}" \\
     "NO_UPDATE=$PRIME_AGENT_DISABLE_SELF_UPDATE" "INSTALLER=$PRIME_AGENT_RUST_INSTALLER_URL" \\
     "DOWNLOAD=$PRIME_AGENT_DOWNLOAD_BASE_URL" "KERNEL_PYTHON=${PRIME_AGENT_KERNEL_PYTHON-unset}" \\
-    "AGENT_DIR=$PRIME_AGENT_CODING_AGENT_DIR" "SESSION_DIR=${PRIME_AGENT_SESSION_DIR-unset}"
+    "AGENT_DIR=$PRIME_AGENT_CODING_AGENT_DIR" "SESSION_DIR=${PRIME_AGENT_SESSION_DIR-unset}" \\
+    "RLM_SESSION_DIR=${RLM_SESSION_DIR-unset}" "RLM_HARNESS_STATE_DIR=${RLM_HARNESS_STATE_DIR-unset}" \\
+    "RLM_GLOBAL_HARNESS_STATE_DIR=${RLM_GLOBAL_HARNESS_STATE_DIR-unset}" \\
+    "PA_COMPACTION_TRACE=${PA_COMPACTION_TRACE-unset}" "PA_MCP_LOGIN_URL_FILE=${PA_MCP_LOGIN_URL_FILE-unset}" \\
+    "PA_DAEMON_EVENT_LOG=${PA_DAEMON_EVENT_LOG-unset}"
+  exit 0
+fi
+if [ "$1" = "-p" ]; then
+  model=
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--model" ]; then model=$2; fi
+    shift
+  done
+  if [ -n "${FAKE_MUTATE_FILE:-}" ]; then printf 'y' > "$FAKE_MUTATE_FILE"; fi
+  printf '{"type":"message_end","message":{"role":"assistant","responseModel":"%s"}}\\n' "${model#*/}"
   exit 0
 fi
 exit 3
@@ -55,96 +74,124 @@ def make_stage(parent: Path, version: str = VERSION) -> Path:
     return stage
 
 
+def files_of(root: Path) -> dict[str, str]:
+    return {str(path.relative_to(root)): path.read_text() for path in sorted(root.rglob("*")) if path.is_file()}
+
+
 def write_executable(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     path.chmod(0o755)
 
 
-class SideBySideTests(unittest.TestCase):
+class Fixture(unittest.TestCase):
+    """A throwaway HOME, TMPDIR, /tmp stand-in and XDG data home with a fake
+    TS agent dir; the module's HOME-derived roots point into it."""
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
+        self.saved_env = dict(os.environ)
+        self.saved_module = {name: getattr(side_by_side, name) for name in ("HOME", "TS_AGENT_DIR", "SYSTEM_TMP")}
+        self.saved_cwd = os.getcwd()
+        self.home = self.root / "home"
+        self.ts_agent = self.home / ".prime" / "agent"
+        self.fake_tmp = self.root / "tmp"
+        self.system_tmp = self.root / "systmp"
+        self.data_home = self.root / "xdg-data"
+        for path in (self.fake_tmp, self.system_tmp):
+            path.mkdir()
+        side_by_side.HOME = self.home
+        side_by_side.TS_AGENT_DIR = self.ts_agent
+        side_by_side.SYSTEM_TMP = self.system_tmp
+        (self.ts_agent / "skills" / "grok").mkdir(parents=True)
+        (self.ts_agent / "skills" / "grok" / "SKILL.md").write_text("# grok\n")
+        (self.ts_agent / "models.json").write_text('{"providers": {}}')
+        (self.ts_agent / "settings.json").write_text('{"theme": "dark"}')
+        (self.ts_agent / "auth.json").write_text('{"secret": true}')
         self.prefix = self.root / "share" / "prime-agent-oneiron-rs"
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
         self.ts_target = self.root / "ts-cli.js"
         self.ts_target.write_text("ts")
         (self.bin_dir / "prime-agent").symlink_to(self.ts_target)
-        self.sock_dir = self.root / "sock"
-        self.fake_tmp = self.root / "tmp"
-        self.fake_tmp.mkdir()
-        self.saved_env = {key: os.environ.get(key) for key in
-                          ("PRIME_AGENT_RS_SOCKET_DIR", "PRIME_AGENT_RS_KERNEL_VENV",
-                           "PRIME_AGENT_DAEMON_SOCKET", "PRIME_AGENT_KERNEL_VENV", "PI_PACKAGE_DIR",
-                           "PRIME_AGENT_KERNEL_PYTHON", "PRIME_AGENT_RUST_INSTALLER_URL", "TMPDIR",
-                           "PRIME_AGENT_RS_PRINT_ENV", "PRIME_AGENT_RS_AGENT_DIR", "PRIME_AGENT_SESSION_DIR")}
-        os.environ["TMPDIR"] = str(self.fake_tmp)
-        # A fake TS agent dir to seed from, and a temp Rust agent dir.
-        self.ts_agent = self.root / "ts-agent"
-        (self.ts_agent / "skills" / "grok").mkdir(parents=True)
-        (self.ts_agent / "models.json").write_text('{"providers": {}}')
-        (self.ts_agent / "settings.json").write_text('{"theme": "dark"}')
-        (self.ts_agent / "auth.json").write_text('{"secret": true}')
-        self.saved_ts_agent = side_by_side.TS_AGENT_DIR
-        side_by_side.TS_AGENT_DIR = self.ts_agent
         self.agent_dir = self.root / "agent-rs"
-        os.environ["PRIME_AGENT_RS_AGENT_DIR"] = str(self.agent_dir)
-        os.environ["PRIME_AGENT_SESSION_DIR"] = str(self.ts_agent / "sessions")
-        os.environ["PRIME_AGENT_RS_SOCKET_DIR"] = str(self.sock_dir)
-        os.environ["PRIME_AGENT_RS_KERNEL_VENV"] = str(self.root / "venv-rs")
-        # Inherited TS-side or upstream values must never reach the Rust process.
-        os.environ["PRIME_AGENT_DAEMON_SOCKET"] = "/tmp/prime-agent-ts/daemon.sock"
-        os.environ["PRIME_AGENT_KERNEL_VENV"] = "/ts/kernel-venv"
-        os.environ["PI_PACKAGE_DIR"] = "/ts/package"
-        os.environ["PRIME_AGENT_KERNEL_PYTHON"] = "/ts/python"
-        os.environ["PRIME_AGENT_RUST_INSTALLER_URL"] = "https://example.invalid/install.sh"
+        self.sock_dir = self.root / "sock"
+        self.venv = self.root / "venv-rs"
+        self.stages = 0
+        for name in ("PRIME_AGENT_RS_PRINT_ENV", "FAKE_MUTATE_FILE"):
+            os.environ.pop(name, None)
+        os.environ.update({
+            "HOME": str(self.home), "TMPDIR": str(self.fake_tmp), "XDG_DATA_HOME": str(self.data_home),
+            "PRIME_AGENT_RS_AGENT_DIR": str(self.agent_dir), "PRIME_AGENT_RS_SOCKET_DIR": str(self.sock_dir),
+            "PRIME_AGENT_RS_KERNEL_VENV": str(self.venv),
+            # Inherited TS-side or upstream values must never reach the Rust process.
+            "PRIME_AGENT_SESSION_DIR": str(self.ts_agent / "sessions"),
+            "PRIME_AGENT_DAEMON_SOCKET": "/tmp/prime-agent-ts/daemon.sock",
+            "PRIME_AGENT_KERNEL_VENV": "/ts/kernel-venv", "PI_PACKAGE_DIR": "/ts/package",
+            "PRIME_AGENT_KERNEL_PYTHON": "/ts/python",
+            "PRIME_AGENT_RUST_INSTALLER_URL": "https://example.invalid/install.sh",
+            "RLM_SESSION_DIR": str(self.ts_agent / "sessions" / "s1"),
+            "RLM_HARNESS_STATE_DIR": str(self.ts_agent / "harness"),
+            "RLM_GLOBAL_HARNESS_STATE_DIR": str(self.ts_agent / "harness-global"),
+            "PA_COMPACTION_TRACE": str(self.ts_agent / "trace.jsonl"),
+            "PA_MCP_LOGIN_URL_FILE": str(self.ts_agent / "login-url"),
+            "PA_DAEMON_EVENT_LOG": str(self.ts_agent / "events.jsonl"),
+        })
 
     def tearDown(self) -> None:
-        side_by_side.TS_AGENT_DIR = self.saved_ts_agent
-        for key, value in self.saved_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        os.chdir(self.saved_cwd)
+        for name, value in self.saved_module.items():
+            setattr(side_by_side, name, value)
+        os.environ.clear()
+        os.environ.update(self.saved_env)
         self.tmp.cleanup()
+
+    @contextlib.contextmanager
+    def env(self, **values: str):
+        saved = {name: os.environ.get(name) for name in values}
+        os.environ.update(values)
+        try:
+            yield
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
     def run_main(self, *argv: str) -> int:
         return side_by_side.main(["--prefix", str(self.prefix), "--bin-dir", str(self.bin_dir), *argv])
 
-    def launcher_env(self) -> dict[str, str]:
-        out = subprocess.run([str(self.bin_dir / "prime-agent-rs"), "env"], check=True,
-                             capture_output=True, text=True).stdout
-        return dict(line.split("=", 1) for line in out.splitlines())
+    def stage(self, version: str = VERSION) -> Path:
+        self.stages += 1
+        parent = self.root / f"stage-{self.stages}"
+        parent.mkdir()
+        return make_stage(parent, version)
 
+    def install(self, *extra: str, version: str = VERSION) -> None:
+        self.assertEqual(self.run_main("install", "--stage-dir", str(self.stage(version)), *extra), 0)
+
+    def receipt(self, version: str = VERSION, name: str = "INSTALL-RECEIPT.json") -> dict:
+        return json.loads((self.prefix / "receipts" / f"{version}-{PLATFORM}" / name).read_text())
+
+
+class InstallerTests(Fixture):
     def test_install_activates_an_isolated_launcher_and_leaves_ts_alone(self) -> None:
-        stage = make_stage(self.root)
-        self.assertEqual(self.run_main("install", "--stage-dir", str(stage)), 0)
-
+        self.install()
         self.assertEqual(os.readlink(self.prefix / "current"), VERSION)
         self.assertEqual(os.readlink(self.bin_dir / "prime-agent"), str(self.ts_target))
-        self.assertEqual(self.launcher_env(), {
-            "SOCKET_DIR": str(self.sock_dir.resolve()),
-            "DAEMON_SOCKET": str(self.sock_dir.resolve() / "daemon.sock"),
-            "KERNEL_VENV": str((self.root / "venv-rs").resolve()),
-            "SKIP": "1",
-            "PACKAGE_DIR": "unset",
-            "NO_UPDATE": "1",
-            "INSTALLER": "http://127.0.0.1:1/oneiron-self-update-disabled",
-            "DOWNLOAD": "http://127.0.0.1:1/oneiron-feed-disabled",
-            "KERNEL_PYTHON": "unset",
-            "AGENT_DIR": str(self.agent_dir.resolve()),
-            "SESSION_DIR": "unset",
-        })
-        self.assertEqual(oct(self.sock_dir.stat().st_mode & 0o777), oct(0o700))
-        receipt = json.loads((self.prefix / "receipts" / f"{VERSION}-{PLATFORM}" /
-                              "INSTALL-RECEIPT.json").read_text())
+        receipt = self.receipt()
         self.assertEqual(
             {key: receipt[key] for key in ("schema", "version", "platform", "activated", "current",
-                                           "versionCheck")},
+                                           "versionCheck", "agentDir")},
             {"schema": side_by_side.RECEIPT_SCHEMA, "version": VERSION, "platform": PLATFORM,
              "activated": True, "current": {"before": None, "after": VERSION},
-             "versionCheck": {"stdout": VERSION, "exitCode": 0, "ok": True}})
+             "versionCheck": {"stdout": VERSION, "exitCode": 0, "ok": True},
+             "agentDir": {"path": str(self.agent_dir), "seeded": {
+                 "models.json": f"linked -> {self.ts_agent / 'models.json'}",
+                 "skills": {"snapshotOf": str(self.ts_agent / "skills"), "skipped": [], "replaced": None},
+                 "settings.json": f"copied once from {self.ts_agent / 'settings.json'}"}}})
         self.assertEqual(receipt["tsLauncher"]["before"], {"kind": "symlink", "target": str(self.ts_target)})
         self.assertEqual(receipt["tsLauncher"]["before"], receipt["tsLauncher"]["after"])
 
@@ -153,8 +200,7 @@ class SideBySideTests(unittest.TestCase):
         self.assertEqual(self.run_main("install", "--stage-dir", str(stage), "--version", VERSION), 0)
         self.assertEqual(json.loads((self.prefix / VERSION / "package.json").read_text()), {"version": VERSION})
         self.assertEqual(json.loads((stage / "package.json").read_text()), {"version": "0.9.8"})
-        receipt = json.loads((self.prefix / "receipts" / f"{VERSION}-{PLATFORM}" /
-                              "INSTALL-RECEIPT.json").read_text())
+        receipt = self.receipt()
         self.assertEqual((receipt["version"], receipt["stagedVersion"], receipt["versionCheck"]["ok"]),
                          (VERSION, "0.9.8", True))
 
@@ -171,20 +217,18 @@ class SideBySideTests(unittest.TestCase):
             self.run_main("install", "--stage-dir", str(stage))
 
     def test_second_release_records_the_previous_current(self) -> None:
-        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
+        self.install()
         newer = "0.9.8-oneiron.20261001.2"
-        (self.root / "b").mkdir()
-        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root / "b", newer))), 0)
-        receipt = json.loads((self.prefix / "receipts" / f"{newer}-{PLATFORM}" /
-                              "INSTALL-RECEIPT.json").read_text())
-        self.assertEqual(receipt["current"], {"before": VERSION, "after": newer})
+        self.install(version=newer)
+        self.assertEqual(self.receipt(newer)["current"], {"before": VERSION, "after": newer})
         self.assertEqual(os.readlink(self.prefix / "current"), newer)
 
     def test_no_activate_copies_without_launcher_or_current(self) -> None:
-        self.assertEqual(self.run_main("install", "--no-activate", "--stage-dir", str(make_stage(self.root))), 0)
+        self.install("--no-activate")
         self.assertTrue((self.prefix / VERSION / "prime-agent").is_file())
         self.assertFalse((self.prefix / "current").exists())
         self.assertFalse((self.bin_dir / "prime-agent-rs").exists())
+        self.assertFalse(self.agent_dir.exists())
 
     def test_tarball_install_matches_the_staged_layout(self) -> None:
         stage = make_stage(self.root)
@@ -197,107 +241,208 @@ class SideBySideTests(unittest.TestCase):
             sorted(str(p.relative_to(self.prefix / VERSION)) for p in (self.prefix / VERSION).rglob("*")),
             sorted(str(p.relative_to(stage)) for p in stage.rglob("*")))
 
-    def test_prefix_overlapping_the_ts_tree_is_refused(self) -> None:
-        with self.assertRaisesRegex(SystemExit, "overlaps protected TS state"):
-            side_by_side.check_prefix(side_by_side.TS_PREFIX / "rs", self.bin_dir)
-
-    def test_launcher_follows_a_safe_alias_and_exports_its_canonical_target(self) -> None:
-        # Aliases resolve before the checks (macOS TMPDIR itself sits behind
-        # /var -> /private/var); ownership and TS overlap are judged on the
-        # canonical target, which is what the process receives.
-        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
-        elsewhere = self.root / "elsewhere"
-        elsewhere.mkdir()
-        self.sock_dir.rmdir()
-        self.sock_dir.symlink_to(elsewhere)
-        self.assertEqual(self.launcher_env()["SOCKET_DIR"], str(elsewhere.resolve()))
-
-    def run_launcher(self, **env: str) -> subprocess.CompletedProcess:
-        home = self.root / "home"
-        home.mkdir(exist_ok=True)
-        return subprocess.run([str(self.bin_dir / "prime-agent-rs"), "env"], capture_output=True, text=True,
-                              env={**os.environ, "HOME": str(home), **env})
-
-    def test_launcher_refuses_relative_overrides_without_creating_anything(self) -> None:
-        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
-        for name in ("PRIME_AGENT_RS_SOCKET_DIR", "PRIME_AGENT_RS_KERNEL_VENV"):
-            result = self.run_launcher(**{name: "relative/dir"})
-            self.assertEqual((result.returncode, result.stdout), (1, ""))
-            self.assertIn(f"{name} must be an absolute path", result.stderr)
-        self.assertFalse((self.root / "relative").exists())
-
-    def test_launcher_refuses_ts_socket_dir_directly_and_through_an_alias(self) -> None:
-        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
-        ts_sock = self.fake_tmp / f"prime-agent-{os.getuid()}"
-        ts_sock.mkdir()
-        alias = self.root / "alias"
-        alias.symlink_to(ts_sock)
-        for override in (ts_sock, ts_sock / "inner", alias / "inner", self.root / "home" / ".prime" / "x"):
-            result = self.run_launcher(PRIME_AGENT_RS_SOCKET_DIR=str(override))
-            self.assertEqual(result.returncode, 1, override)
-            self.assertIn("overlaps TS state", result.stderr)
-        self.assertEqual(sorted(os.listdir(ts_sock)), [])
-
-    def test_launcher_refuses_the_ts_kernel_venv(self) -> None:
-        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
-        home = self.root / "home"
-        for override in (home / ".prime" / "agent" / "kernel-venv",
-                         home / ".prime" / "agent" / "kernel-venv" / "nested",
-                         home / ".local" / "share" / "prime" / "agent" / "kernel-venv"):
-            result = self.run_launcher(PRIME_AGENT_RS_KERNEL_VENV=str(override))
-            self.assertEqual(result.returncode, 1, override)
-            self.assertIn("overlaps the TS kernel venv", result.stderr)
-
-    def test_launcher_print_env_reports_the_effective_isolation(self) -> None:
-        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
-        os.environ.pop("PRIME_AGENT_RS_KERNEL_VENV")
-        effective = side_by_side.launcher_env(self.bin_dir / "prime-agent-rs")
-        self.assertEqual(
-            {key: effective[key] for key in ("PRIME_AGENT_SOCKET_DIR", "PRIME_AGENT_DAEMON_SOCKET",
-                                             "PRIME_AGENT_KERNEL_VENV", "PRIME_AGENT_DISABLE_SELF_UPDATE")},
-            {"PRIME_AGENT_SOCKET_DIR": str(self.sock_dir.resolve()),
-             "PRIME_AGENT_DAEMON_SOCKET": f"{self.sock_dir.resolve()}/daemon.sock",
-             "PRIME_AGENT_KERNEL_VENV": str(self.agent_dir.resolve() / "kernel-venv"),
-             "PRIME_AGENT_DISABLE_SELF_UPDATE": "1"})
-        self.assertEqual(effective["binary"], str((self.prefix / VERSION / "prime-agent").resolve()))
-
     def test_install_seeds_an_isolated_agent_dir_once(self) -> None:
-        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
-        self.assertEqual(
-            {name: os.readlink(self.agent_dir / name) for name in ("models.json", "skills")},
-            {"models.json": str(self.ts_agent / "models.json"), "skills": str(self.ts_agent / "skills")})
+        self.install()
+        self.assertEqual(os.readlink(self.agent_dir / "models.json"), str(self.ts_agent / "models.json"))
+        self.assertEqual(files_of(self.agent_dir / "skills"), {"grok/SKILL.md": "# grok\n"})
         self.assertEqual(json.loads((self.agent_dir / "settings.json").read_text()), {"theme": "dark"})
-        self.assertFalse((self.agent_dir / "settings.json").is_symlink())
-        self.assertFalse((self.agent_dir / "auth.json").exists())
+        self.assertEqual(sorted(os.listdir(self.agent_dir)), ["models.json", "settings.json", "skills"])
         # A later install keeps the Rust side's own settings edits.
         (self.agent_dir / "settings.json").write_text('{"theme": "light"}')
-        (self.root / "b").mkdir()
-        self.assertEqual(self.run_main("install", "--stage-dir",
-                                       str(make_stage(self.root / "b", "0.9.8-oneiron.20261001.2"))), 0)
+        self.install(version="0.9.8-oneiron.20261001.2")
         self.assertEqual(json.loads((self.agent_dir / "settings.json").read_text()), {"theme": "light"})
 
-    def test_agent_dir_overlapping_the_ts_agent_dir_is_refused(self) -> None:
-        stage = make_stage(self.root)
-        os.environ["PRIME_AGENT_RS_AGENT_DIR"] = str(self.ts_agent / "rs")
-        with self.assertRaisesRegex(SystemExit, "overlaps the TS agent dir"):
-            self.run_main("install", "--stage-dir", str(stage))
-        self.assertFalse((self.ts_agent / "rs").exists())
-        os.environ["PRIME_AGENT_RS_AGENT_DIR"] = str(self.agent_dir)
-        shutil.rmtree(self.prefix)
-        self.assertEqual(self.run_main("install", "--stage-dir", str(stage)), 0)
-        home = self.root / "home"
-        result = self.run_launcher(PRIME_AGENT_RS_AGENT_DIR=str(home / ".prime" / "agent"))
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("overlaps the TS agent dir", result.stderr)
+    def test_skills_snapshot_copies_files_never_links_and_leaves_ts_skills_alone(self) -> None:
+        skills = self.ts_agent / "skills"
+        (skills / "grok" / "src" / "grok").mkdir(parents=True)
+        (skills / "grok" / "src" / "grok" / "__init__.py").write_text("X = 1\n")
+        for junk in ("grok/__pycache__/m.cpython-313.pyc", "grok/src/grok.egg-info/PKG-INFO",
+                     "grok/.venv/pyvenv.cfg", "grok/node_modules/x/index.js", "grok/.pytest_cache/README.md"):
+            (skills / junk).parent.mkdir(parents=True, exist_ok=True)
+            (skills / junk).write_text("junk")
+        (skills / "grok" / ".venv" / "python").symlink_to(sys.executable)
+        (self.ts_agent / "shared.md").write_text("# shared\n")
+        (skills / "linked.md").symlink_to("../shared.md")  # relative, to a file outside the skills dir
+        extra = self.root / "extra-skill"
+        extra.mkdir()
+        (extra / "SKILL.md").write_text("# extra\n")
+        (skills / "extra").symlink_to(extra)  # a dir elsewhere
+        (skills / "loop").symlink_to(".")
+        (skills / "dangling.md").symlink_to("missing.md")
+        ts_before = side_by_side.tree_identity(self.ts_agent)
+        self.install()
+        snapshot = self.agent_dir / "skills"
+        self.assertEqual(files_of(snapshot), {"extra/SKILL.md": "# extra\n", "grok/SKILL.md": "# grok\n",
+                                              "grok/src/grok/__init__.py": "X = 1\n", "linked.md": "# shared\n"})
+        self.assertEqual(side_by_side.tree_links(snapshot), [])
+        self.assertEqual(self.receipt()["agentDir"]["seeded"]["skills"],
+                         {"snapshotOf": str(skills), "replaced": None,
+                          "skipped": [str(skills / "dangling.md"), f"{skills / 'loop'} (link cycle)"]})
+        # The kernel's editable install and imports write beside the skill
+        # source: in the snapshot, never in the TS tree.
+        (snapshot / "grok" / "__pycache__").mkdir()
+        (snapshot / "grok" / "__pycache__" / "x.cpython-313.pyc").write_bytes(b"pyc")
+        self.assertEqual(side_by_side.tree_identity(self.ts_agent), ts_before)
 
-    def test_installer_refuses_protected_destinations(self) -> None:
-        ts_sock = self.fake_tmp / f"prime-agent-{os.getuid()}"
-        for prefix in (side_by_side.HOME / ".prime" / "rs", ts_sock / "rs", side_by_side.TS_PREFIX):
-            with self.assertRaisesRegex(SystemExit, "overlaps protected TS state"):
-                side_by_side.check_prefix(prefix, self.bin_dir)
-        with self.assertRaisesRegex(SystemExit, "sits inside protected TS state"):
-            side_by_side.check_prefix(self.prefix, side_by_side.HOME / ".prime" / "bin")
-        self.assertFalse(ts_sock.exists())
+    def test_old_skills_link_is_replaced_by_a_snapshot(self) -> None:
+        self.agent_dir.mkdir()
+        (self.agent_dir / "skills").symlink_to(self.ts_agent / "skills")
+        ts_before = side_by_side.tree_identity(self.ts_agent)
+        self.install()
+        self.assertFalse((self.agent_dir / "skills").is_symlink())
+        self.assertEqual(files_of(self.agent_dir / "skills"), {"grok/SKILL.md": "# grok\n"})
+        self.assertEqual(self.receipt()["agentDir"]["seeded"]["skills"]["replaced"],
+                         f"link -> {self.ts_agent / 'skills'}")
+        self.assertEqual(side_by_side.tree_identity(self.ts_agent), ts_before)
+
+    def test_existing_snapshot_is_kept_unless_refreshed(self) -> None:
+        self.install()
+        (self.agent_dir / "skills" / "local.md").write_text("mine")
+        (self.ts_agent / "skills" / "new").mkdir()
+        (self.ts_agent / "skills" / "new" / "SKILL.md").write_text("# new\n")
+        second, third = "0.9.8-oneiron.20261001.2", "0.9.8-oneiron.20261001.3"
+        self.install(version=second)
+        self.assertEqual(files_of(self.agent_dir / "skills"), {"grok/SKILL.md": "# grok\n", "local.md": "mine"})
+        self.assertEqual(self.receipt(second)["agentDir"]["seeded"]["skills"],
+                         "kept (install --refresh-skills replaces it)")
+        self.install("--refresh-skills", version=third)
+        self.assertEqual(files_of(self.agent_dir / "skills"), {"grok/SKILL.md": "# grok\n", "new/SKILL.md": "# new\n"})
+        self.assertEqual(self.receipt(third)["agentDir"]["seeded"]["skills"]["replaced"], "snapshot")
+        self.assertEqual(sorted(os.listdir(self.agent_dir)), ["models.json", "settings.json", "skills"])
+
+    def test_every_destination_role_refuses_every_protected_root(self) -> None:
+        roots = side_by_side.protected_roots()
+        self.assertEqual(roots, [
+            self.fake_tmp / f"prime-agent-{os.getuid()}", self.system_tmp / f"prime-agent-{os.getuid()}",
+            self.fake_tmp / "prime-agent-user", self.system_tmp / "prime-agent-user", self.ts_agent,
+            self.data_home / "prime" / "agent", self.home / ".local" / "share" / "prime" / "agent",
+            self.home / ".local" / "share" / "prime-agent-oneiron"])
+        stage = make_stage(self.root)
+        before = side_by_side.tree_identity(self.root)
+        for root in roots:
+            for target in (root, root / "inner", root.parent):
+                for role, argv, env in (("prefix", ["--prefix", str(target)], {}),
+                                        ("bin dir", ["--bin-dir", str(target)], {}),
+                                        ("agent dir", [], {"PRIME_AGENT_RS_AGENT_DIR": str(target)}),
+                                        ("socket dir", [], {"PRIME_AGENT_RS_SOCKET_DIR": str(target)}),
+                                        ("kernel venv", [], {"PRIME_AGENT_RS_KERNEL_VENV": str(target)})):
+                    with self.subTest(role=role, target=str(target)), self.env(**env):
+                        with self.assertRaisesRegex(SystemExit, f"refusing {role} .*: it overlaps TS state at"):
+                            self.run_main(*argv, "install", "--stage-dir", str(stage))
+        self.assertEqual(side_by_side.tree_identity(self.root), before)
+
+    def test_relative_and_dotted_paths_are_refused_before_any_write(self) -> None:
+        os.chdir(self.root)
+        stage = make_stage(self.root)
+        before = side_by_side.tree_identity(self.root)
+        absolute = "must be an absolute path"
+        components = "must not hold empty, . or .. components"
+        values = (("relative/dir", absolute), (f"{self.root}/./x", components),
+                  (f"{self.root}/x/../y", components), (f"{self.root}//x", components))
+        for name in ("PRIME_AGENT_RS_AGENT_DIR", "PRIME_AGENT_RS_SOCKET_DIR", "PRIME_AGENT_RS_KERNEL_VENV",
+                     "TMPDIR", "--prefix", "--bin-dir", "XDG_DATA_HOME"):
+            for value, message in values:
+                if name == "XDG_DATA_HOME" and message == absolute:
+                    continue  # a relative XDG_DATA_HOME is ignored, as the XDG spec says
+                argv = [name, value] if name.startswith("--") else []
+                env = {} if name.startswith("--") else {name: value}
+                with self.subTest(name=name, value=value), self.env(**env):
+                    with self.assertRaisesRegex(SystemExit, f"{re.escape(name)} {message}"):
+                        self.run_main(*argv, "install", "--stage-dir", str(stage))
+        self.assertEqual(side_by_side.tree_identity(self.root), before)
+
+    def test_installer_refuses_a_link_to_a_missing_dir(self) -> None:
+        link = self.root / "dangling"
+        link.symlink_to(self.fake_tmp / f"prime-agent-{os.getuid()}")
+        stage = make_stage(self.root)
+        for name in ("PRIME_AGENT_RS_AGENT_DIR", "PRIME_AGENT_RS_SOCKET_DIR", "PRIME_AGENT_RS_KERNEL_VENV"):
+            for value in (link, link / "inner"):
+                with self.subTest(name=name, value=str(value)), self.env(**{name: str(value)}):
+                    with self.assertRaisesRegex(SystemExit, f"{re.escape(str(link))} is a link but not to a dir"):
+                        self.run_main("install", "--stage-dir", str(stage))
+        self.assertEqual(os.listdir(self.fake_tmp), [])
+        self.assertFalse(self.prefix.exists())
+
+    def test_seeding_never_writes_into_the_xdg_ts_agent_dir(self) -> None:
+        xdg_agent = self.data_home / "prime" / "agent"
+        xdg_agent.mkdir(parents=True)
+        with self.env(PRIME_AGENT_RS_AGENT_DIR=str(xdg_agent)):
+            with self.assertRaisesRegex(SystemExit, "refusing agent dir .*: it overlaps TS state"):
+                self.run_main("install", "--stage-dir", str(make_stage(self.root)))
+        self.assertEqual(os.listdir(xdg_agent), [])
+        self.assertFalse(self.prefix.exists())
+
+    def test_installer_refuses_links_out_of_the_agent_dir(self) -> None:
+        sessions = self.ts_agent / "sessions" / "--cwd--"
+        sessions.mkdir(parents=True)
+        (sessions / "s.jsonl").write_text("{}\n")
+        stage = make_stage(self.root)
+        ts_before = side_by_side.tree_identity(self.ts_agent)
+        cases = {
+            "sessions": lambda link: link.symlink_to(self.ts_agent / "sessions"),
+            "sessions/--cwd--/s.jsonl": lambda link: link.symlink_to(sessions / "s.jsonl"),
+            "models.json": lambda link: link.symlink_to(self.ts_agent / "sessions"),  # a dir, not a file
+        }
+        for rel, make in cases.items():
+            with self.subTest(rel):
+                shutil.rmtree(self.agent_dir, ignore_errors=True)
+                link = self.agent_dir / rel
+                link.parent.mkdir(parents=True)
+                make(link)
+                with self.assertRaisesRegex(SystemExit, "only models.json may be a link in it, found: "
+                                                        f"{re.escape(str(link))}$"):
+                    self.run_main("install", "--stage-dir", str(stage))
+                self.assertFalse(self.prefix.exists())
+        self.assertEqual(side_by_side.tree_identity(self.ts_agent), ts_before)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 dir")
+    def test_installer_refuses_an_agent_dir_it_cannot_scan(self) -> None:
+        locked = self.agent_dir / "locked"
+        locked.mkdir(parents=True)
+        locked.chmod(0)
+        try:
+            with self.assertRaisesRegex(SystemExit, f"cannot scan {re.escape(str(self.agent_dir))} for links"):
+                self.run_main("install", "--stage-dir", str(make_stage(self.root)))
+        finally:
+            locked.chmod(0o700)
+        self.assertFalse(self.prefix.exists())
+
+    def test_installer_admits_uv_links_in_the_kernel_venv_but_no_dir_leading_out(self) -> None:
+        os.environ.pop("PRIME_AGENT_RS_KERNEL_VENV")
+        venv = self.agent_dir / "kernel-venv"
+        site = venv / "lib" / "python3.13" / "site-packages"
+        site.mkdir(parents=True)
+        (venv / "bin").mkdir()
+        (venv / "lib64").symlink_to("lib")
+        (venv / "bin" / "python").symlink_to(sys.executable)
+        self.install()
+        ts_site = self.ts_agent / "kernel-venv" / "lib" / "python3.13" / "site-packages"
+        ts_site.mkdir(parents=True)
+        shutil.rmtree(site)
+        site.symlink_to(ts_site)
+        newer = self.stage("0.9.8-oneiron.20261001.2")
+        with self.assertRaisesRegex(SystemExit, f"refusing kernel venv {re.escape(str(venv))}: "
+                                                f"a linked dir in it leads out of it: {re.escape(str(site))}$"):
+            self.run_main("install", "--stage-dir", str(newer))
+        with self.env(PRIME_AGENT_RS_KERNEL_VENV=str(self.agent_dir)):
+            with self.assertRaisesRegex(SystemExit, "it holds the agent dir"):
+                self.run_main("install", "--stage-dir", str(newer))
+        self.assertEqual(os.listdir(ts_site), [])
+
+    def test_installer_refuses_links_in_the_prefix(self) -> None:
+        self.prefix.mkdir(parents=True)
+        (self.prefix / "receipts").symlink_to(self.ts_agent)
+        ts_before = side_by_side.tree_identity(self.ts_agent)
+        with self.assertRaisesRegex(SystemExit, "only `current` may be a link in it, found: .*/receipts$"):
+            self.run_main("install", "--stage-dir", str(make_stage(self.root)))
+        self.assertEqual(os.listdir(self.prefix), ["receipts"])
+        self.assertEqual(side_by_side.tree_identity(self.ts_agent), ts_before)
+
+    def test_launcher_may_not_alias_the_ts_launcher(self) -> None:
+        (self.bin_dir / "prime-agent-rs").symlink_to(self.ts_target)
+        with self.assertRaisesRegex(SystemExit, "would alias the TS prime-agent launcher"):
+            self.run_main("install", "--stage-dir", str(make_stage(self.root)))
+        self.assertFalse(self.prefix.exists())
 
     def test_version_labels_cannot_escape_the_prefix(self) -> None:
         stage = make_stage(self.root, "0.9.8")
@@ -317,16 +462,19 @@ class SideBySideTests(unittest.TestCase):
         self.assertEqual(json.loads(outside.read_text()), {"version": "0.9.8"})
         self.assertFalse(self.prefix.exists())
 
-    def test_venv_fingerprint_moves_when_site_packages_change(self) -> None:
-        venv = self.root / "venv"
-        site = venv / "lib" / "python3.13" / "site-packages"
-        site.mkdir(parents=True)
-        (venv / "bin").mkdir()
-        (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
-        before = side_by_side.venv_fingerprint(venv)
-        (site / "newpkg").mkdir()
-        self.assertNotEqual(side_by_side.venv_fingerprint(venv), before)
-        self.assertIsNone(side_by_side.venv_fingerprint(self.root / "absent"))
+    def test_tree_identity_sees_an_in_place_same_size_rewrite(self) -> None:
+        tree = self.root / "venv"
+        module = tree / "lib" / "m.py"
+        module.parent.mkdir(parents=True)
+        module.write_text("x")
+        os.utime(module, ns=(OLD_NS, OLD_NS))
+        before = side_by_side.tree_identity(tree)
+        module.write_text("y")
+        after = side_by_side.tree_identity(tree)
+        self.assertNotEqual(after, before)
+        self.assertEqual(side_by_side.identity_changes(before, after), ["lib/m.py"])
+        self.assertEqual(side_by_side.identity_digest(before)["entries"], 3)
+        self.assertIsNone(side_by_side.tree_identity(self.root / "absent"))
 
     def test_response_models_reads_every_event(self) -> None:
         stream = "\n".join([
@@ -336,6 +484,233 @@ class SideBySideTests(unittest.TestCase):
             json.dumps({"type": "agent_end", "messages": [{"role": "assistant", "responseModel": "gpt-6.1-sol"}]}),
         ])
         self.assertEqual(side_by_side.response_models(stream), ["gpt-6.1-sol", "gpt-6.1-sol"])
+
+
+class LauncherTests(Fixture):
+    """The generated launcher, run through its #!/bin/sh line; the subclasses
+    run it under `bash --posix` and dash."""
+
+    shell: tuple[str, ...] = ()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.install()
+
+    def run_launcher(self, *args: str, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run([*self.shell, str(self.bin_dir / "prime-agent-rs"), *args], capture_output=True,
+                              text=True, cwd=self.root, env={**os.environ, **env})
+
+    def launcher_env(self, **env: str) -> dict[str, str]:
+        result = self.run_launcher("env", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return dict(line.split("=", 1) for line in result.stdout.splitlines())
+
+    def assert_refused(self, pattern: str, **env: str) -> None:
+        result = self.run_launcher("env", **env)
+        self.assertEqual((result.returncode, result.stdout), (1, ""), env)
+        self.assertRegex(result.stderr, pattern)
+
+    def test_launcher_exports_the_isolation_env_and_clears_inherited_sinks(self) -> None:
+        self.assertEqual(self.launcher_env(), {
+            "SOCKET_DIR": str(self.sock_dir),
+            "DAEMON_SOCKET": str(self.sock_dir / "daemon.sock"),
+            "KERNEL_VENV": str(self.venv),
+            "SKIP": "1",
+            "PACKAGE_DIR": "unset",
+            "NO_UPDATE": "1",
+            "INSTALLER": "http://127.0.0.1:1/oneiron-self-update-disabled",
+            "DOWNLOAD": "http://127.0.0.1:1/oneiron-feed-disabled",
+            "KERNEL_PYTHON": "unset",
+            "AGENT_DIR": str(self.agent_dir),
+            "SESSION_DIR": "unset",
+            "RLM_SESSION_DIR": "unset",
+            "RLM_HARNESS_STATE_DIR": "unset",
+            "RLM_GLOBAL_HARNESS_STATE_DIR": "unset",
+            "PA_COMPACTION_TRACE": "unset",
+            "PA_MCP_LOGIN_URL_FILE": "unset",
+            "PA_DAEMON_EVENT_LOG": "unset",
+        })
+        self.assertEqual(stat.S_IMODE(self.sock_dir.stat().st_mode), 0o700)
+
+    def test_launcher_follows_a_safe_alias_and_exports_its_canonical_target(self) -> None:
+        # Aliases resolve before the checks (macOS TMPDIR itself sits behind
+        # /var -> /private/var); ownership and TS overlap are judged on the
+        # canonical target, which is what the process receives.
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        self.sock_dir.rmdir()
+        self.sock_dir.symlink_to(elsewhere)
+        self.assertEqual(self.launcher_env()["SOCKET_DIR"], str(elsewhere))
+
+    def test_launcher_refuses_every_protected_root_for_every_role(self) -> None:
+        roots = side_by_side.protected_roots()
+        self.assertEqual(len(roots), 8)
+        before = {path: side_by_side.tree_identity(path) for path in (self.home, self.fake_tmp, self.system_tmp)}
+        for root in roots:
+            for target in (root, root / "inner", root.parent):
+                for role, name in (("socket dir", "PRIME_AGENT_RS_SOCKET_DIR"),
+                                   ("agent dir", "PRIME_AGENT_RS_AGENT_DIR"),
+                                   ("kernel venv", "PRIME_AGENT_RS_KERNEL_VENV")):
+                    with self.subTest(role=role, target=str(target)):
+                        self.assert_refused(f"refusing {role} .*: it overlaps TS state at", **{name: str(target)})
+        self.assertEqual({path: side_by_side.tree_identity(path) for path in before}, before)
+
+    def test_launcher_refuses_relative_and_dotted_paths_without_creating_anything(self) -> None:
+        before = side_by_side.tree_identity(self.root)
+        absolute = "must be an absolute path"
+        components = "must not hold empty, . or .. components"
+        values = (("relative/dir", absolute), (f"{self.root}/./x", components),
+                  (f"{self.root}/x/../y", components), (f"{self.root}//x", components))
+        for name in ("PRIME_AGENT_RS_SOCKET_DIR", "PRIME_AGENT_RS_AGENT_DIR", "PRIME_AGENT_RS_KERNEL_VENV",
+                     "HOME", "TMPDIR", "XDG_DATA_HOME"):
+            for value, message in values:
+                if name == "XDG_DATA_HOME" and message == absolute:
+                    continue  # a relative XDG_DATA_HOME is ignored, as the XDG spec says
+                with self.subTest(name=name, value=value):
+                    self.assert_refused(f"{name} {message}", **{name: value})
+        self.assertEqual(side_by_side.tree_identity(self.root), before)
+
+    def test_launcher_refuses_a_missing_dir_dotdot_into_the_ts_socket_dir(self) -> None:
+        ts_sock = self.fake_tmp / f"prime-agent-{os.getuid()}"
+        ts_sock.mkdir()
+        ts_sock.chmod(0o755)
+        self.assert_refused("PRIME_AGENT_RS_SOCKET_DIR must not hold empty, . or .. components",
+                            PRIME_AGENT_RS_SOCKET_DIR=f"{self.fake_tmp}/missing/../prime-agent-{os.getuid()}")
+        self.assertEqual(stat.S_IMODE(ts_sock.stat().st_mode), 0o755)
+        self.assertEqual(os.listdir(self.fake_tmp), [ts_sock.name])
+
+    def test_launcher_refuses_a_link_to_a_missing_dir(self) -> None:
+        link = self.root / "dangling"
+        link.symlink_to(self.fake_tmp / f"prime-agent-{os.getuid()}")
+        for name in ("PRIME_AGENT_RS_SOCKET_DIR", "PRIME_AGENT_RS_AGENT_DIR", "PRIME_AGENT_RS_KERNEL_VENV"):
+            for value in (link, link / "inner"):
+                with self.subTest(name=name, value=str(value)):
+                    self.assert_refused(f"{re.escape(str(link))} is a link but not to a dir", **{name: str(value)})
+        self.assertEqual(os.listdir(self.fake_tmp), [])
+
+    def test_launcher_refuses_links_out_of_the_agent_dir(self) -> None:
+        sessions = self.ts_agent / "sessions" / "--cwd--"
+        sessions.mkdir(parents=True)
+        (sessions / "s.jsonl").write_text("{}\n")
+        ts_before = side_by_side.tree_identity(self.ts_agent)
+        cases = {
+            "sessions": self.ts_agent / "sessions",
+            "sessions/--cwd--/s.jsonl": sessions / "s.jsonl",
+            "models.json": self.ts_agent / "sessions",  # a dir, not a file
+            "skills": self.ts_agent / "skills",  # the old layout's link
+        }
+        for index, (rel, target) in enumerate(cases.items()):
+            with self.subTest(rel):
+                agent_dir = self.root / f"agent-case-{index}"
+                link = agent_dir / rel
+                link.parent.mkdir(parents=True)
+                link.symlink_to(target)
+                self.assert_refused(f"refusing agent dir {re.escape(str(agent_dir))}: only models.json may be a "
+                                    f"link in it, found: {re.escape(str(link))}$",
+                                    PRIME_AGENT_RS_AGENT_DIR=str(agent_dir))
+        self.assertEqual(self.launcher_env()["AGENT_DIR"], str(self.agent_dir))  # models.json -> a file: fine
+        self.assertEqual(side_by_side.tree_identity(self.ts_agent), ts_before)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 dir")
+    def test_launcher_refuses_an_agent_dir_it_cannot_scan(self) -> None:
+        locked = self.agent_dir / "locked"
+        locked.mkdir()
+        locked.chmod(0)
+        try:
+            self.assert_refused(f"cannot scan the agent dir {re.escape(str(self.agent_dir))} for links")
+        finally:
+            locked.chmod(0o700)
+
+    def test_launcher_admits_uv_links_in_the_kernel_venv_but_no_dir_leading_out(self) -> None:
+        os.environ.pop("PRIME_AGENT_RS_KERNEL_VENV")
+        venv = self.agent_dir / "kernel-venv"
+        site = venv / "lib" / "python3.13" / "site-packages"
+        site.mkdir(parents=True)
+        (venv / "bin").mkdir()
+        (venv / "lib64").symlink_to("lib")
+        (venv / "bin" / "python").symlink_to(sys.executable)
+        self.assertEqual(self.launcher_env()["KERNEL_VENV"], str(venv))
+        ts_site = self.ts_agent / "kernel-venv" / "lib" / "python3.13" / "site-packages"
+        ts_site.mkdir(parents=True)
+        shutil.rmtree(site)
+        site.symlink_to(ts_site)
+        self.assert_refused(f"refusing kernel venv {re.escape(str(venv))}: a linked dir in it leads out of it: "
+                            f"{re.escape(str(site))}$")
+        self.assert_refused("it holds the agent dir", PRIME_AGENT_RS_KERNEL_VENV=str(self.agent_dir))
+        self.assertEqual(os.listdir(ts_site), [])
+
+
+class LauncherUnderPosixBashTests(LauncherTests):
+    shell = ("bash", "--posix")
+
+
+@unittest.skipUnless(shutil.which("dash"), "dash is not installed")
+class LauncherUnderDashTests(LauncherTests):
+    shell = ("dash",)
+
+
+class ProbeTests(Fixture):
+    def setUp(self) -> None:
+        super().setUp()
+        self.install()
+        self.ts_venv = self.ts_agent / "kernel-venv"
+        self.ts_module = self.ts_venv / "lib" / "python3.13" / "site-packages" / "pkg" / "existing.py"
+        self.ts_module.parent.mkdir(parents=True)
+        self.ts_module.write_text("x")
+        os.utime(self.ts_module, ns=(OLD_NS, OLD_NS))
+        (self.ts_venv / "lib64").symlink_to("lib")
+
+    def probe(self, prefix: Path | None = None) -> tuple[int, dict]:
+        prefix = prefix or self.prefix
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = side_by_side.main(["--prefix", str(prefix), "--bin-dir", str(self.bin_dir), "probe"])
+        receipt = json.loads((prefix / "receipts" / f"{VERSION}-{PLATFORM}" / "PROBE-RECEIPT.json").read_text())
+        return code, receipt
+
+    def checks(self, **failed: bool) -> dict[str, bool]:
+        return {name: failed.get(name, True) for name in (
+            "agentDirOutsideTsState", "socketDirOutsideTsState", "kernelVenvOutsideTsState",
+            "launcherRunsProbedRelease", "selfUpdateDisabled", "tsLauncherUnchanged", "tsKernelVenvsUnchanged")}
+
+    def test_probe_passes_an_isolated_run(self) -> None:
+        code, receipt = self.probe()
+        self.assertEqual((code, receipt["ok"]), (0, True))
+        self.assertEqual(receipt["isolation"]["checks"], self.checks())
+        self.assertEqual({name: (run["ok"], run.get("responseModels")) for name, run in receipt["runs"].items()},
+                         {"version": (True, None), "oneShot": (True, ["gpt-6.1-sol"])})
+        venvs = receipt["isolation"]["tsKernelVenvs"]
+        self.assertEqual([venv["path"] for venv in venvs], [str(path) for path in side_by_side.ts_kernel_venvs()])
+        self.assertEqual(venvs[0]["before"], venvs[0]["after"])
+        self.assertEqual((venvs[0]["before"]["entries"], venvs[0]["changed"]), (7, []))
+        self.assertEqual([(venv["before"], venv["after"]) for venv in venvs[1:]], [(None, None), (None, None)])
+
+    def test_probe_fails_when_a_ts_venv_file_changes_in_place(self) -> None:
+        with self.env(FAKE_MUTATE_FILE=str(self.ts_module)):
+            code, receipt = self.probe()
+        self.assertEqual((code, receipt["ok"]), (1, False))
+        self.assertEqual(self.ts_module.stat().st_size, 1)  # same size: only the identity moved
+        self.assertEqual(receipt["isolation"]["checks"], self.checks(tsKernelVenvsUnchanged=False))
+        self.assertTrue(receipt["runs"]["oneShot"]["ok"])
+        self.assertEqual(receipt["isolation"]["tsKernelVenvs"][0]["changed"],
+                         ["lib/python3.13/site-packages/pkg/existing.py"])
+
+    def test_probe_fails_when_the_launcher_runs_another_release(self) -> None:
+        other = self.root / "share" / "other-rs"
+        self.assertEqual(side_by_side.main(["--prefix", str(other), "--bin-dir", str(self.bin_dir), "install",
+                                            "--no-activate", "--stage-dir", str(self.stage())]), 0)
+        (other / "current").symlink_to(VERSION)
+        code, receipt = self.probe(other)
+        self.assertEqual((code, receipt["ok"]), (1, False))
+        self.assertEqual(receipt["isolation"]["checks"], self.checks(launcherRunsProbedRelease=False))
+        self.assertEqual(receipt["isolation"]["effective"]["binary"], str(self.prefix / VERSION / "prime-agent"))
+
+    def test_probe_refuses_a_linked_receipts_dir(self) -> None:
+        shutil.rmtree(self.prefix / "receipts")
+        (self.prefix / "receipts").symlink_to(self.ts_agent)
+        ts_before = side_by_side.tree_identity(self.ts_agent)
+        with self.assertRaisesRegex(SystemExit, "only `current` may be a link in it, found: .*/receipts$"):
+            self.probe()
+        self.assertEqual(side_by_side.tree_identity(self.ts_agent), ts_before)
 
 
 GATE = HERE / "gate.sh"
