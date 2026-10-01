@@ -1,0 +1,5 @@
+# check-test-policy.mjs violations at the pinned Rust base (TEST_POLICY_BASE=oneiron/main).
+prime-agent-runtime/test/test_bash.py [wall-clock-sleep] test_activity_handles_are_scoped_and_tail_is_bounded: sleep/delay call
+prime-agent-runtime/test/test_mcp.py [wall-clock-sleep] test_status_isolates_failures_and_timeouts: sleep/delay call
+prime-agent-runtime/test/test_repl.py [wall-clock-sleep] test_bash_activity_is_available_while_cell_is_running: sleep/delay call
+prime-agent-runtime/test/test_repl.py [wall-clock-sleep] test_owner_death_kills_orphan_kernel: sleep/delay call
