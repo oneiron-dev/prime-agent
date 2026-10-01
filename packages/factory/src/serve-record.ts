@@ -5,9 +5,10 @@ import { getProcessStartId } from "./process-identity.js";
 
 /**
  * How the watchdog knows a factory's `serve` (or `run`) is up: each scheduling process records its own identity in
- * the factory's `serve/` directory, one file per process, and a record counts only while that exact process (pid
- * and start identity) lives and runs this package's entry. No command line is parsed, and one scheduler starting or
- * stopping never touches another's record.
+ * the factory's `serve/` directory, and a record counts only while that exact process (pid and start identity) lives
+ * and runs this package's entry. No command line is parsed. Every registration gets a file name of its own (the pid
+ * and a random id), written once and never reused: removing a stale record, or a scheduler forgetting its own, can
+ * never take away a record another scheduler published, even one whose process reuses that pid.
  */
 export interface ServeRecord {
 	version: 1;
@@ -21,7 +22,7 @@ function records(directory: string): Array<{ path: string; record: Partial<Serve
 	const root = join(directory, "serve");
 	let names: string[];
 	try {
-		names = readdirSync(root).filter((name) => /^\d+\.json$/.test(name));
+		names = readdirSync(root).filter((name) => /^\d+-[\da-f-]{36}\.json$/.test(name));
 	} catch {
 		return [];
 	}
@@ -54,23 +55,21 @@ function live(record: Partial<ServeRecord>): boolean {
 
 /**
  * Record this process as one of the factory's schedulers, dropping records of schedulers that no longer run. The
- * returned function removes this process's record while it is still this process's.
+ * returned function removes this registration's record.
  */
 export function recordServe(directory: string, entry: string): () => void {
 	const startId = getProcessStartId(process.pid);
 	if (!startId) return () => undefined;
+	// A stale record's path belonged to its registration alone, so what was read there is still what gets removed.
 	for (const { path, record } of records(directory)) if (!live(record)) rmSync(path, { force: true });
 	const record: ServeRecord = { version: 1, pid: process.pid, startId, entry };
 	const root = join(directory, "serve");
 	mkdirSync(root, { recursive: true, mode: 0o700 });
-	const path = join(root, `${process.pid}.json`);
-	const temporary = `${path}.${randomUUID()}.tmp`;
+	const path = join(root, `${process.pid}-${randomUUID()}.json`);
+	const temporary = `${path}.tmp`;
 	writeFileSync(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
 	renameSync(temporary, path);
-	return () => {
-		const current = records(directory).find((candidate) => candidate.path === path)?.record;
-		if (current?.pid === record.pid && current.startId === record.startId) rmSync(path, { force: true });
-	};
+	return () => rmSync(path, { force: true });
 }
 
 /** Whether a recorded scheduler of the factory is alive: the same process, still running the package entry `entry`. */

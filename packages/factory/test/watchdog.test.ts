@@ -1,6 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, inject, it } from "vitest";
@@ -96,10 +106,13 @@ it("sees a serve only while a recorded process lives and runs this entry, and re
 	const factory = mkdtempSync(join(tmpdir(), "factory-serve-"));
 	roots.push(factory);
 	const entry = "/opt/prime-agent-factory/dist/cli-entry.js";
-	const recordOf = (pid: number) => join(factory, "serve", `${pid}.json`);
+	const serve = join(factory, "serve");
+	// A record as another scheduler publishes it: a file of its own, named by its pid and a random id.
 	const write = (pid: number, startId: string) => {
-		mkdirSync(join(factory, "serve"), { recursive: true });
-		writeFileSync(recordOf(pid), JSON.stringify({ version: 1, pid, startId, entry }));
+		mkdirSync(serve, { recursive: true });
+		const name = `${pid}-${randomUUID()}.json`;
+		writeFileSync(join(serve, name), JSON.stringify({ version: 1, pid, startId, entry }));
+		return name;
 	};
 	const startId = getProcessStartId(process.pid)!;
 	// Nothing recorded, then this live process recorded as a serve of this entry, then forgotten again.
@@ -107,12 +120,12 @@ it("sees a serve only while a recorded process lives and runs this entry, and re
 	const forget = recordServe(factory, entry);
 	const recorded = [serveRunning(factory, entry), serveRunning(factory, "/elsewhere/dist/cli-entry.js")];
 	forget();
-	expect([before, ...recorded, serveRunning(factory, entry), existsSync(recordOf(process.pid))]).toEqual([
+	expect([before, ...recorded, serveRunning(factory, entry), readdirSync(serve)]).toEqual([
 		false,
 		true,
 		false,
 		false,
-		false,
+		[],
 	]);
 	// Records outliving their process: the pid now names another process start, or no process at all.
 	const exited = spawnSync(process.execPath, ["-e", ""]).pid;
@@ -122,9 +135,9 @@ it("sees a serve only while a recorded process lives and runs this entry, and re
 	// Another scheduler of the same factory starting and stopping leaves a live one's record alone; stale ones go.
 	const other = spawn(process.execPath, ["-e", "process.stdin.resume()"], { stdio: ["pipe", "ignore", "ignore"] });
 	try {
-		write(other.pid!, getProcessStartId(other.pid!)!);
+		const live = write(other.pid!, getProcessStartId(other.pid!)!);
 		recordServe(factory, entry)();
-		expect([serveRunning(factory, entry), existsSync(recordOf(exited))]).toEqual([true, false]);
+		expect([serveRunning(factory, entry), readdirSync(serve)]).toEqual([true, [live]]);
 	} finally {
 		other.stdin!.end();
 		await once(other, "exit");
