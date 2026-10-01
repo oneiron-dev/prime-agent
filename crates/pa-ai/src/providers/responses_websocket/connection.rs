@@ -274,20 +274,17 @@ pub(crate) async fn connect(
     let handshake = tokio_tungstenite::connect_async(request);
     let (stream, _response) = match cancel {
         Some(cancel) => {
-            // The handshake settles once, like the TS connect promise, and a
-            // cancellation that fired by then settles it (TS `onAbort` runs
-            // synchronously and removes the error listener): it wins over a
-            // failure that is ready at the same time. A failure returned
-            // from here stays that failure.
-            let result = tokio::select! {
+            // The handshake settles once, at this select, like the TS connect
+            // promise: a cancellation that fired by then settles it (TS
+            // `onAbort` runs synchronously and removes the error listener),
+            // winning over a failure ready at the same poll; a failure the
+            // select returned settled first and stays that failure, even if
+            // a cancellation lands a moment later.
+            tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(ConnectFailure::Cancelled),
                 result = handshake => result,
-            };
-            if result.is_err() && cancel.is_cancelled() {
-                return Err(ConnectFailure::Cancelled);
             }
-            result
         }
         None => handshake.await,
     }
