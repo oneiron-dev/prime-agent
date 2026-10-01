@@ -27,10 +27,11 @@
 //! operator ruled too many — this port's chain gives up inside the
 //! operator's 5-8 band, anchored like TS's own wait `maxParks: 8`);
 //! (2) the default per-provider budget is the TS quick-retry `maxRetries`
-//! (3), down from 5; (3) the retry waits carry ±20% jitter
-//! (TS `providerRetryDelay` has none) so a fleet of retried sessions
-//! spreads off the same exponential-ladder ticks; the jittered value is
-//! both waited and reported, keeping the countdown honest.
+//! (3), down from 5; (3) the retry waits carry ±25% jitter floored at
+//! the server-requested wait (the fork TS `providerRetryDelay` rule) so a
+//! fleet of retried sessions spreads off the same exponential-ladder
+//! ticks; the jittered value is both waited and reported, keeping the
+//! countdown honest.
 
 use std::future::Future;
 
@@ -38,7 +39,7 @@ use pa_agent::abort::AbortSignal;
 use pa_agent::types::{AssistantMessage, StopReason};
 use pa_types::ai::Model;
 
-use super::auto_retry::{run_turn_with_auto_retry, AutoRetryEvent, RetryStartReason};
+use super::auto_retry::{run_turn_with_auto_retry, AutoRetryEvent, RetryEpisode, RetryStartReason};
 use super::provider_park::{is_quota_block_failure, ParkDecisionCallback};
 use super::provider_retry::{
     has_provider_stream_failure, is_agent_lifecycle_failure, is_context_overflow_failure,
@@ -150,6 +151,7 @@ pub async fn run_turn_with_provider_failover<A, AF, E, EF, W, WF, S, SF, R, RF>(
     candidates: &[Model],
     context_window: u64,
     signal: Option<&AbortSignal>,
+    episode: &RetryEpisode,
     mut attempt: A,
     mut emit: E,
     mut wait: W,
@@ -176,6 +178,7 @@ where
             quick_policy,
             context_window,
             signal,
+            episode,
             attempt,
             emit,
             wait,
@@ -183,13 +186,16 @@ where
         )
         .await;
     }
-    let mut total_retries = 0u32;
     let mut retries_on_provider = 0u32;
     let mut candidate_index = 0usize;
     let mut switched = false;
     loop {
+        let retries_before_attempt = episode.retries();
         let message = attempt().await?;
         if message.stop_reason != StopReason::Error {
+            // An episode the host already closed at a successful message
+            // inside this attempt reads zero: no second end.
+            let total_retries = episode.take();
             if switched {
                 let restored_model = restore().await?;
                 emit(AutoRetryEvent::End {
@@ -215,6 +221,13 @@ where
                 let _ = restore().await?;
             }
             return Ok(with_stop_reason_aborted(message));
+        }
+        // A successful message inside this attempt closed the episode (the
+        // host's reset, only before a provider switch): this provider's
+        // budget starts over with it.
+        let total_retries = episode.retries();
+        if total_retries < retries_before_attempt {
+            retries_on_provider = 0;
         }
         // Permanent and deterministic failures never walk the chain: a
         // rejected request fails the same way on every provider, and
@@ -254,7 +267,7 @@ where
             }
             return Ok(message);
         }
-        total_retries += 1;
+        let total_retries = episode.bump();
         retries_on_provider += 1;
         // The whole-episode ceiling binds first (the operator's 5-8 band):
         // a long candidate chain gives up here instead of stacking one
@@ -294,6 +307,10 @@ where
             let backup_model = format!("{}/{}", next.provider, next.id);
             switch(next).await?;
             switched = true;
+            // The primary's restore closes this episode when the turn
+            // settles, so a success on the backup inside the turn keeps it
+            // open.
+            episode.hold_for_restore();
             // The TS backup-model retry re-issues immediately on the
             // backup (`delayMs: 0`): no wait, no countdown.
             emit(AutoRetryEvent::Start {
@@ -313,13 +330,16 @@ where
             quick_policy.max_retry_delay_ms,
         );
         let delay_ms = match delay {
-            // Jittered (SANCTIONED DIVERGENCE, operator ruling 2026-09-23):
+            // Jittered (operator ruling 2026-09-23; the fork TS
+            // `providerRetryDelay` rule: ±25%, floored at the server wait):
             // the jittered value is both waited and reported, so the
             // interactive countdown stays honest while retried sessions
             // spread off the same ladder ticks.
-            ProviderRetryDelay::Wait { delay_ms } => {
-                jittered_delay_ms(delay_ms, retry_jitter_rand01())
-            }
+            ProviderRetryDelay::Wait { delay_ms } => jittered_delay_ms(
+                delay_ms,
+                provider_stream_failure_retry_after_ms(&message),
+                retry_jitter_rand01(),
+            ),
             ProviderRetryDelay::ExceedsCap { retry_after_ms } => {
                 if switched {
                     let _ = restore().await?;
@@ -514,6 +534,7 @@ mod tests {
             candidates,
             0,
             None,
+            &RetryEpisode::default(),
             {
                 let script = Arc::clone(&script);
                 let attempts = Arc::clone(&attempts);
@@ -639,13 +660,13 @@ mod tests {
         assert_eq!(harness.attempts, 4);
         assert_eq!(harness.switches, vec!["backup-a/glm-5.3"]);
         assert_eq!(harness.restores, vec![Some("primary/glm-5.3".to_string())]);
-        // Two quick waits on the primary (jittered around the 5ms/10ms
-        // ladder steps: [4, 7] and [8, 14]), then the immediate backup
+        // Two quick waits on the primary (jittered ±25% around the 5ms/10ms
+        // ladder steps: [4, 6] and [8, 13]), then the immediate backup
         // re-issue (no wait between the switch and the next attempt).
         assert_eq!(harness.waits.len(), 2, "waits: {:?}", harness.waits);
         assert!(
-            (4..=7).contains(&harness.waits[0]) && (8..=14).contains(&harness.waits[1]),
-            "jittered waits {:?} outside the [4,7]/[8,14] bands",
+            (4..=6).contains(&harness.waits[0]) && (8..=13).contains(&harness.waits[1]),
+            "jittered waits {:?} outside the [4,6]/[8,13] bands",
             harness.waits
         );
         // The progression: two quick starts, the backup switch, the
@@ -873,9 +894,9 @@ mod tests {
         let harness = drive(&disabled, &candidates, script).await;
         assert_eq!(harness.attempts, 4);
         assert!(harness.switches.is_empty());
-        // Jittered around the 2s/4s/8s ladder (±20% with rounding
-        // headroom: [1600, 2800], [3200, 5600], [6400, 11200]).
-        let band = |base: u64| (base * 4 / 5, base * 7 / 5);
+        // Jittered around the 2s/4s/8s ladder (±25%: [1500, 2500],
+        // [3000, 5000], [6000, 10000]).
+        let band = |base: u64| (base * 3 / 4, base * 5 / 4);
         for (wait, base) in harness.waits.iter().zip([2000u64, 4000, 8000]) {
             let (low, high) = band(base);
             assert!(
@@ -903,7 +924,7 @@ mod tests {
         let harness = drive(&fast_failover(), &[], script).await;
         assert_eq!(harness.attempts, 4);
         assert!(harness.switches.is_empty());
-        let band = |base: u64| (base * 4 / 5, base * 7 / 5);
+        let band = |base: u64| (base * 3 / 4, base * 5 / 4);
         for (wait, base) in harness.waits.iter().zip([2000u64, 4000, 8000]) {
             let (low, high) = band(base);
             assert!(

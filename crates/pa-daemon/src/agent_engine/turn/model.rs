@@ -189,6 +189,11 @@ impl AgentSessionEngine {
             Some(route) => route.target.model.context_window,
             None => model.context_window,
         };
+        // The turn's retry episode (TS `_retryAttempt`): each successful
+        // assistant message inside an attempt closes it right after that
+        // message, so a later failure in the same tool turn starts a fresh
+        // budget instead of spending the earlier call's retries.
+        let episode = pa_core::session_engine::auto_retry::RetryEpisode::default();
         let result = self.runtime.block_on(
             pa_core::session_engine::provider_failover::run_turn_with_provider_failover(
                 &policy,
@@ -196,6 +201,7 @@ impl AgentSessionEngine {
                 &candidates,
                 overflow_window,
                 None,
+                &episode,
                 || {
                     let mut emit = emit_cell.borrow_mut();
                     let first = first_attempt.get();
@@ -203,6 +209,8 @@ impl AgentSessionEngine {
                     let agent = agent.clone();
                     let prompt = prompt.clone();
                     let model = model.clone();
+                    let telemetry = telemetry.clone();
+                    let episode = &episode;
                     async move {
                         // A retry re-issues the failed turn: the failed
                         // assistant message leaves the loop context first
@@ -211,6 +219,25 @@ impl AgentSessionEngine {
                         if !first {
                             drop_trailing_assistant(&agent).await;
                         }
+                        let mut emit_settling = |event: EngineEvent| -> bool {
+                            let succeeded = matches!(
+                                &event,
+                                EngineEvent::AssistantMessage(message)
+                                    if message.get("stopReason").and_then(serde_json::Value::as_str)
+                                        != Some("error")
+                            );
+                            if !(**emit)(event) {
+                                return false;
+                            }
+                            let Some(end) = succeeded.then(|| episode.settle_success()).flatten()
+                            else {
+                                return true;
+                            };
+                            if let Some(telemetry) = &telemetry {
+                                telemetry.note_auto_retry_event(&end);
+                            }
+                            (**emit)(retry_event_to_engine_event(end))
+                        };
                         match self
                             .run_turn_once(
                                 &agent,
@@ -218,7 +245,7 @@ impl AgentSessionEngine {
                                 first,
                                 boundary_passed,
                                 aborted,
-                                &mut **emit,
+                                &mut emit_settling,
                             )
                             .await
                         {

@@ -174,29 +174,42 @@ pub fn is_permanent_provider_failure_kind(
         // row still fires — the failure-scoped outcome).
         Some("invalid_request" | "refusal" | "permission" | "safety" | "payment_required") => true,
         Some("auth") => retries_performed > 0,
+        // Every other kind is transient, the WebSocket `transport` class
+        // included: the connection failed before any provider verdict, so
+        // whatever its message says, the request can be re-issued.
         _ => false,
     }
 }
 
-/// Jitter band on the computed backoff (SANCTIONED DIVERGENCE from TS
-/// `providerRetryDelay`, which has none): every retry wait stretches or
+/// Jitter band on the computed backoff (TS `providerWaitJitter`, which the
+/// fork's `providerRetryDelay` applies): every backoff wait stretches or
 /// shrinks by up to [`RETRY_JITTER_FRACTION`] on each side, so a fleet of
 /// sessions hammering one rate-limited provider does not re-converge on the
 /// same exponential-ladder ticks (the 429-storm operator incident: every
 /// session retried in lockstep). The jittered value is what the caller
 /// waits AND what `auto_retry_start` reports, so the live countdown stays
 /// honest.
-const RETRY_JITTER_FRACTION: f64 = 0.2;
+const RETRY_JITTER_FRACTION: f64 = 0.25;
 
-/// The retry wait for `delay_ms`, jittered by `rand01` (a uniform sample in
-/// `[0, 1]`; `0.5` is the no-change identity). Pure so tests stay
-/// deterministic: `jittered_delay_ms(1000, 0.0) == 800`,
-/// `jittered_delay_ms(1000, 1.0) == 1200`.
+/// The retry wait for a [`ProviderRetryDelay::Wait`] of `delay_ms` (TS
+/// `providerRetryDelay`): a server-requested wait (`retry_after_ms`) at or
+/// above the backoff is used as-is; otherwise the backoff is jittered by
+/// `rand01` (a uniform sample in `[0, 1]`; `0.5` is the identity) and
+/// floored at the server wait, so the jitter never cuts a requested wait
+/// short. Pure so tests stay deterministic:
+/// `jittered_delay_ms(1000, None, 0.0) == 750`,
+/// `jittered_delay_ms(1000, None, 1.0) == 1250`.
 #[must_use]
-pub fn jittered_delay_ms(delay_ms: u64, rand01: f64) -> u64 {
+pub fn jittered_delay_ms(delay_ms: u64, retry_after_ms: Option<u64>, rand01: f64) -> u64 {
+    if retry_after_ms.is_some_and(|retry_after_ms| retry_after_ms >= delay_ms) {
+        return delay_ms;
+    }
     let rand01 = rand01.clamp(0.0, 1.0);
     let factor = 1.0 + RETRY_JITTER_FRACTION * (2.0 * rand01 - 1.0);
-    ((delay_ms as f64) * factor).round() as u64
+    let jittered = ((delay_ms as f64) * factor).round() as u64;
+    jittered
+        .max(retry_after_ms.unwrap_or(0))
+        .min(MAX_TIMER_DELAY_MS)
 }
 
 /// One uniform sample in `[0, 1]` for [`jittered_delay_ms`]: a time-seeded
@@ -301,7 +314,11 @@ where
         let ProviderRetryDelay::Wait { delay_ms } = delay else {
             return Ok(message);
         };
-        let delay_ms = jittered_delay_ms(delay_ms, retry_jitter_rand01());
+        let delay_ms = jittered_delay_ms(
+            delay_ms,
+            provider_stream_failure_retry_after_ms(&message),
+            retry_jitter_rand01(),
+        );
         if !wait(std::time::Duration::from_millis(delay_ms)).await {
             return Ok(with_stop_reason_aborted(message));
         }
@@ -375,26 +392,42 @@ mod tests {
         }
     }
 
-    /// The jitter band (SANCTIONED DIVERGENCE, operator ruling 2026-09-23):
-    /// the wait stretches/shrinks by up to ±20% around the computed backoff,
-    /// clamped inputs stay inside the band, and the mid-point sample is the
-    /// identity.
+    /// The jitter band (TS `providerWaitJitter`): the wait stretches or
+    /// shrinks by up to ±25% around the computed backoff, clamped inputs
+    /// stay inside the band, and the mid-point sample is the identity.
     #[test]
     fn jitter_stays_inside_the_band_and_mid_is_identity() {
-        assert_eq!(jittered_delay_ms(1000, 0.5), 1000);
-        assert_eq!(jittered_delay_ms(1000, 0.0), 800);
-        assert_eq!(jittered_delay_ms(1000, 1.0), 1200);
-        assert_eq!(jittered_delay_ms(1000, 7.5), 1200); // clamped high
-        assert_eq!(jittered_delay_ms(1000, -0.5), 800); // clamped low
-        assert_eq!(jittered_delay_ms(0, 0.1), 0);
-        assert_eq!(jittered_delay_ms(1, 0.5), 1);
-        assert_eq!(jittered_delay_ms(1, 0.1), 1); // 0.8 rounds to 1
-        assert_eq!(jittered_delay_ms(2, 0.0), 2); // 1.6 rounds to 2
-                                                  // The live rand stays a valid fraction.
+        assert_eq!(jittered_delay_ms(1000, None, 0.5), 1000);
+        assert_eq!(jittered_delay_ms(1000, None, 0.0), 750);
+        assert_eq!(jittered_delay_ms(1000, None, 1.0), 1250);
+        assert_eq!(jittered_delay_ms(1000, None, 7.5), 1250); // clamped high
+        assert_eq!(jittered_delay_ms(1000, None, -0.5), 750); // clamped low
+        assert_eq!(jittered_delay_ms(0, None, 0.1), 0);
+        assert_eq!(jittered_delay_ms(1, None, 0.5), 1);
+        assert_eq!(jittered_delay_ms(1, None, 0.1), 1); // 0.8 rounds to 1
+        assert_eq!(jittered_delay_ms(2, None, 0.0), 2); // 1.5 rounds to 2
+                                                        // The live rand stays a valid fraction.
         for _ in 0..64 {
             let sample = retry_jitter_rand01();
             assert!((0.0..=1.0).contains(&sample), "sample {sample}");
         }
+    }
+
+    /// A server-requested wait is a floor the jitter never cuts (TS
+    /// `providerRetryDelay`): at or above the backoff it is waited
+    /// unjittered; below it the jittered backoff is floored at it. The
+    /// ±20% jitter used to apply after the server wait won, so a 9s
+    /// `Retry-After` could be retried after 7.2s.
+    #[test]
+    fn jitter_never_cuts_a_server_requested_wait() {
+        // `provider_retry_delay` already chose the server wait (9000 over
+        // the 2000 backoff): waited as-is at either end of the band.
+        assert_eq!(jittered_delay_ms(9000, Some(9000), 0.0), 9000);
+        assert_eq!(jittered_delay_ms(9000, Some(9000), 1.0), 9000);
+        // A server wait below the backoff floors the low end of the band.
+        assert_eq!(jittered_delay_ms(4000, Some(3500), 0.0), 3500);
+        assert_eq!(jittered_delay_ms(4000, Some(2000), 0.0), 3000);
+        assert_eq!(jittered_delay_ms(4000, Some(3500), 1.0), 5000);
     }
 
     #[test]
@@ -636,6 +669,37 @@ mod tests {
             panic!("text content");
         };
         assert_eq!(text.text, "done");
+    }
+
+    /// The one-shot helper (compaction summaries, side questions) retries
+    /// the structured WebSocket transport class like any transient
+    /// failure: the socket dropped before a provider verdict.
+    #[tokio::test]
+    async fn transport_failures_retry_in_the_one_shot_helper() {
+        let policy = ProviderRetryPolicy {
+            enabled: true,
+            max_retries: 3,
+            base_delay_ms: 5,
+            max_retry_delay_ms: 50,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
+        };
+        let mut attempts = 0;
+        let message = complete_with_provider_retry(
+            &policy,
+            None,
+            |_| async { true },
+            || {
+                attempts += 1;
+                std::future::ready(Ok(if attempts < 3 {
+                    error_message(Some("transport"), None, None)
+                } else {
+                    ok_message()
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((attempts, message.stop_reason), (3, StopReason::Stop));
     }
 
     #[tokio::test]
