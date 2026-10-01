@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -32,7 +33,8 @@ OLD_NS = 1_000_000_000 * 10**9
 # The fake binary prints the exe-adjacent manifest version (as the real one
 # does), the isolation env it was launched with, or (for `-p`) one JSON event
 # carrying the requested model as its responseModel. FAKE_MUTATE_FILE, when
-# set, is rewritten in place first: a stand-in for a run that writes TS state.
+# set, is rewritten in place first: a stand-in for a run that writes TS state
+# (and, with FAKE_MTIME_REF, puts the old mtime back to hide it).
 FAKE_BINARY = """#!/bin/sh
 if [ "$1" = "--version" ]; then
   sed -n 's/.*"version": *"\\([^"]*\\)".*/\\1/p' "$(dirname "$0")/package.json"; exit 0
@@ -46,7 +48,8 @@ if [ "$1" = "env" ]; then
     "RLM_SESSION_DIR=${RLM_SESSION_DIR-unset}" "RLM_HARNESS_STATE_DIR=${RLM_HARNESS_STATE_DIR-unset}" \\
     "RLM_GLOBAL_HARNESS_STATE_DIR=${RLM_GLOBAL_HARNESS_STATE_DIR-unset}" \\
     "PA_COMPACTION_TRACE=${PA_COMPACTION_TRACE-unset}" "PA_MCP_LOGIN_URL_FILE=${PA_MCP_LOGIN_URL_FILE-unset}" \\
-    "PA_DAEMON_EVENT_LOG=${PA_DAEMON_EVENT_LOG-unset}"
+    "PA_DAEMON_EVENT_LOG=${PA_DAEMON_EVENT_LOG-unset}" "ROSTER=${PRIME_AGENT_UPDATE_ROSTER-unset}" \\
+    "INTERNAL=$(env | sed -n 's/^\\(PRIME_AGENT_INTERNAL_[A-Za-z0-9_]*\\)=.*/\\1/p' | tr '\\n' ' ')"
   exit 0
 fi
 if [ "$1" = "-p" ]; then
@@ -56,6 +59,7 @@ if [ "$1" = "-p" ]; then
     shift
   done
   if [ -n "${FAKE_MUTATE_FILE:-}" ]; then printf 'y' > "$FAKE_MUTATE_FILE"; fi
+  if [ -n "${FAKE_MTIME_REF:-}" ]; then touch -m -r "$FAKE_MTIME_REF" "$FAKE_MUTATE_FILE"; fi
   printf '{"type":"message_end","message":{"role":"assistant","responseModel":"%s"}}\\n' "${model#*/}"
   exit 0
 fi
@@ -174,6 +178,8 @@ class Fixture(unittest.TestCase):
             "PA_COMPACTION_TRACE": str(self.ts_agent / "trace.jsonl"),
             "PA_MCP_LOGIN_URL_FILE": str(self.ts_agent / "login-url"),
             "PA_DAEMON_EVENT_LOG": str(self.ts_agent / "events.jsonl"),
+            "PRIME_AGENT_UPDATE_ROSTER": str(self.ts_agent / "update-restarts" / "roster.json"),
+            "PRIME_AGENT_INTERNAL_DAEMON_WORKER": "1", "PRIME_AGENT_INTERNAL_SESSION_HANDOFF": "/ts/handoff",
         })
 
     def tearDown(self) -> None:
@@ -483,6 +489,22 @@ class InstallerTests(Fixture):
             self.run_main("install", "--stage-dir", str(make_stage(self.root)))
         self.assertFalse(self.prefix.exists())
 
+    def test_launcher_is_never_written_through_a_planted_temp_link(self) -> None:
+        protected = self.ts_agent / "settings.json"
+        protected.chmod(0o600)
+        before = (protected.read_bytes(), stat.S_IMODE(protected.stat().st_mode))
+        planted = self.bin_dir / f".prime-agent-rs.tmp-{os.getpid()}"
+        planted.symlink_to(protected)
+        self.install()
+        self.assertEqual((protected.read_bytes(), stat.S_IMODE(protected.stat().st_mode)), before)
+        launcher = self.bin_dir / "prime-agent-rs"
+        self.assertFalse(launcher.is_symlink())
+        self.assertEqual(stat.S_IMODE(launcher.stat().st_mode), 0o755)
+        self.assertTrue(launcher.read_text().startswith("#!/bin/sh\n# prime-agent-rs:"))
+        self.assertEqual(sorted(path.name for path in self.bin_dir.iterdir()),
+                         sorted(["prime-agent", "prime-agent-rs", planted.name]))
+        self.assertEqual(os.readlink(planted), str(protected))
+
     def test_version_labels_cannot_escape_the_prefix(self) -> None:
         stage = make_stage(self.root, "0.9.8")
         for version in ("0.9.8-/../../escape", "0.9.8-a/b", "0.9.8-.."):
@@ -514,6 +536,27 @@ class InstallerTests(Fixture):
         self.assertEqual(side_by_side.identity_changes(before, after), ["lib/m.py"])
         self.assertEqual(side_by_side.identity_digest(before)["entries"], 3)
         self.assertIsNone(side_by_side.tree_identity(self.root / "absent"))
+
+    def test_tree_identity_sees_a_same_size_replacement_with_its_mtime_restored(self) -> None:
+        tree = self.root / "venv"
+        module = tree / "lib" / "m.py"
+        module.parent.mkdir(parents=True)
+        module.write_text("x")
+        os.utime(module, ns=(OLD_NS, OLD_NS))
+        before = side_by_side.tree_identity(tree)
+        replacement = module.with_name(".m.py.new")
+        replacement.write_text("y")
+        os.utime(replacement, ns=(OLD_NS, OLD_NS))
+        os.replace(replacement, module)
+        os.utime(module.parent, ns=(OLD_NS, OLD_NS))
+        after = side_by_side.tree_identity(tree)
+
+        def row(lines: list[str], path: str) -> list[str]:
+            return next(line.split("\t") for line in lines if line.split("\t", 1)[0] == path)
+
+        # Path, type, size and mtime all match; the inode and ctime do not.
+        self.assertEqual(row(after, "lib/m.py")[:4], row(before, "lib/m.py")[:4])
+        self.assertIn("lib/m.py", side_by_side.identity_changes(before, after))
 
     def test_response_models_reads_every_event(self) -> None:
         stream = "\n".join([
@@ -598,6 +641,8 @@ class SkillHubTests(Fixture):
             ("missing commit", lambda: lock_path.write_text(json.dumps({**lock, "source_commit": missing})),
              self.repo, f"^checking out {missing} failed"),
             ("no lock", lock_path.unlink, self.repo, f"^{NO_LOCK}$"),
+            ("malformed lock", lambda: lock_path.write_text(json.dumps({**lock, "files": None})), self.repo,
+             "^the TS LOCK.host.json is not a render-host.py lock \\(files and changes records\\)$"),
             ("render differs", lambda: lock_path.write_text(json.dumps(tampered)), self.repo,
              f"^the render differs from the TS deploy at {self.commit} in 1 files, e.g. hubs/alpha/ROUTES.md$"),
         )
@@ -614,6 +659,15 @@ class SkillHubTests(Fixture):
                 self.assertEqual(seeded, {"skillsSource": "snapshot-fallback", "snapshotOf": str(self.ts_skills),
                                           "skipped": [], "replaced": None})
                 self.assertEqual(files_of(agent_dir / "skills"), files_of(self.ts_skills))
+
+    def test_skills_fall_back_to_a_snapshot_when_the_renderer_cannot_start(self) -> None:
+        with mock.patch.object(side_by_side.sys, "executable", str(self.root / "no-python")):
+            self.install("--skill-hubs", str(self.repo))
+        seeded = self.receipt()["agentDir"]["seeded"]["skills"]
+        self.assertRegex(seeded.pop("reason"), "^render-host.py could not start: ")
+        self.assertEqual(seeded, {"skillsSource": "snapshot-fallback", "snapshotOf": str(self.ts_skills),
+                                  "skipped": [], "replaced": None})
+        self.assertEqual(files_of(self.agent_dir / "skills"), files_of(self.ts_skills))
 
 
 class LauncherTests(Fixture):
@@ -659,6 +713,8 @@ class LauncherTests(Fixture):
             "PA_COMPACTION_TRACE": "unset",
             "PA_MCP_LOGIN_URL_FILE": "unset",
             "PA_DAEMON_EVENT_LOG": "unset",
+            "ROSTER": "unset",
+            "INTERNAL": "",
         })
         self.assertEqual(stat.S_IMODE(self.sock_dir.stat().st_mode), 0o700)
 
@@ -741,6 +797,22 @@ class LauncherTests(Fixture):
         self.assertEqual(self.launcher_env()["AGENT_DIR"], str(self.agent_dir))  # models.json -> a file: fine
         self.assertEqual(side_by_side.tree_identity(self.ts_agent), ts_before)
 
+    def test_launcher_refuses_links_whose_names_hold_a_newline(self) -> None:
+        os.environ.pop("PRIME_AGENT_RS_KERNEL_VENV")
+        venv = self.agent_dir / "kernel-venv"
+        (venv / "lib").mkdir(parents=True)
+        escape = venv / "escape\n"
+        escape.symlink_to(self.ts_agent)
+        self.assert_refused(f"refusing kernel venv {re.escape(str(venv))}: a linked dir in it leads out of it: "
+                            f"{re.escape(str(escape))}")
+        escape.unlink()
+        named = self.agent_dir / "esc\nape"
+        named.symlink_to(self.ts_agent)
+        self.assert_refused(f"refusing agent dir {re.escape(str(self.agent_dir))}: only models.json may be a link "
+                            f"in it, found: {re.escape(str(named))}")
+        named.unlink()
+        self.assertEqual(self.launcher_env()["KERNEL_VENV"], str(venv))
+
     @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 dir")
     def test_launcher_refuses_an_agent_dir_it_cannot_scan(self) -> None:
         locked = self.agent_dir / "locked"
@@ -821,6 +893,18 @@ class ProbeTests(Fixture):
         self.assertEqual(self.ts_module.stat().st_size, 1)  # same size: only the identity moved
         self.assertEqual(receipt["isolation"]["checks"], self.checks(tsKernelVenvsUnchanged=False))
         self.assertTrue(receipt["runs"]["oneShot"]["ok"])
+        self.assertEqual(receipt["isolation"]["tsKernelVenvs"][0]["changed"],
+                         ["lib/python3.13/site-packages/pkg/existing.py"])
+
+    def test_probe_fails_when_a_ts_venv_file_changes_in_place_and_its_mtime_is_put_back(self) -> None:
+        reference = self.root / "old-mtime"
+        reference.write_text("")
+        os.utime(reference, ns=(OLD_NS, OLD_NS))
+        with self.env(FAKE_MUTATE_FILE=str(self.ts_module), FAKE_MTIME_REF=str(reference)):
+            code, receipt = self.probe()
+        self.assertEqual((code, self.ts_module.read_text()), (1, "y"))
+        self.assertEqual((self.ts_module.stat().st_size, self.ts_module.stat().st_mtime_ns), (1, OLD_NS))
+        self.assertEqual(receipt["isolation"]["checks"], self.checks(tsKernelVenvsUnchanged=False))
         self.assertEqual(receipt["isolation"]["tsKernelVenvs"][0]["changed"],
                          ["lib/python3.13/site-packages/pkg/existing.py"])
 

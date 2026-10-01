@@ -160,24 +160,25 @@ case "$agent_dir/" in "$kernel_venv"/*) die "refusing kernel venv $kernel_venv: 
 # links (its interpreter, lib64 -> lib): a linked dir there must stay inside
 # the venv, or package installs would land elsewhere. A tree that cannot be
 # fully scanned is refused too.
+# Each link is judged with its name as an argument (find -exec), never as a
+# line of find's output: a name may hold a newline.
 if [ -d "$agent_dir" ]; then
-  found=$(find "$agent_dir" -type l) || die "cannot scan the agent dir $agent_dir for links"
-  links=$(printf '%s\\n' "$found" | while IFS= read -r link; do
-    case "$link" in
-      ''|"$kernel_venv"/*) ;;
-      "$agent_dir/models.json") [ -f "$link" ] || printf '%s\\n' "$link" ;;
-      *) printf '%s\\n' "$link" ;;
-    esac
-  done)
+  links=$(find "$agent_dir" -type l -exec sh -c '
+    agent=$1 venv=$2; shift 2
+    for link; do
+      case "$link" in "$venv"/*) continue ;; esac
+      if [ "$link" = "$agent/models.json" ] && [ -f "$link" ]; then continue; fi
+      printf "%s\\n" "$link"
+    done' sh "$agent_dir" "$kernel_venv" {{}} +) || die "cannot scan the agent dir $agent_dir for links"
   if [ -n "$links" ]; then die "refusing agent dir $agent_dir: only models.json may be a link in it, found: $links"; fi
 fi
 if [ -d "$kernel_venv" ]; then
-  found=$(find "$kernel_venv" -type l) || die "cannot scan the kernel venv $kernel_venv for links"
-  links=$(printf '%s\\n' "$found" | while IFS= read -r link; do
-    if [ -n "$link" ] && [ -d "$link" ]; then
-      case "$(cd -P "$link" && pwd)/" in "$kernel_venv"/*) ;; *) printf '%s\\n' "$link" ;; esac
-    fi
-  done)
+  links=$(find "$kernel_venv" -type l -exec sh -c '
+    venv=$1; shift
+    for link; do
+      [ -d "$link" ] || continue
+      case "$(cd -P "$link" 2>/dev/null && pwd)/" in "$venv"/*) ;; *) printf "%s\\n" "$link" ;; esac
+    done' sh "$kernel_venv" {{}} +) || die "cannot scan the kernel venv $kernel_venv for links"
   if [ -n "$links" ]; then die "refusing kernel venv $kernel_venv: a linked dir in it leads out of it: $links"; fi
 fi
 
@@ -199,10 +200,14 @@ PI_SKIP_VERSION_CHECK=1
 export PRIME_AGENT_CODING_AGENT_DIR PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV \\
   PRIME_AGENT_DISABLE_SELF_UPDATE PRIME_AGENT_RUST_INSTALLER_URL PRIME_AGENT_DOWNLOAD_BASE_URL PI_SKIP_VERSION_CHECK
 # Inherited state paths and debug sinks would point the Rust process at TS
-# sessions, a TS session's harness state, or a parent's trace and log files.
+# sessions, a TS session's harness state, or a parent's trace and log files;
+# an inherited restart roster would be replayed by the Rust daemon.
 unset PI_PACKAGE_DIR PRIME_AGENT_KERNEL_PYTHON PRIME_AGENT_SESSION_DIR PRIME_AGENT_CODING_AGENT_SESSION_DIR \\
   RLM_SESSION_DIR RLM_HARNESS_STATE_DIR RLM_GLOBAL_HARNESS_STATE_DIR \\
-  PA_COMPACTION_TRACE PA_MCP_LOGIN_URL_FILE PA_DAEMON_EVENT_LOG
+  PA_COMPACTION_TRACE PA_MCP_LOGIN_URL_FILE PA_DAEMON_EVENT_LOG PRIME_AGENT_UPDATE_ROSTER
+# PRIME_AGENT_INTERNAL_* are supervisor-to-worker switches; the supervisor
+# spawns its workers directly, and this launcher is a user entry point.
+for name in $(env | sed -n 's/^\\(PRIME_AGENT_INTERNAL_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset "$name"; done
 dir=$(cd "$prefix/current" && pwd -P)
 if [ "${{PRIME_AGENT_RS_PRINT_ENV:-}}" = 1 ]; then
   # The probe's view of what a real run gets (no binary is started).
@@ -512,6 +517,21 @@ class HubRenderUnavailable(Exception):
     skills are then a plain snapshot of the TS dir, hub files included."""
 
 
+def lock_records(lock: object, name: str) -> tuple[dict[str, str], set[str]]:
+    """A render-host.py lock's files (path -> sha256) and the paths it
+    rewrote the agent root in; any other shape cannot be compared."""
+    files = lock.get("files") if isinstance(lock, dict) else None
+    changes = lock.get("changes") if isinstance(lock, dict) else None
+    if not (isinstance(files, list) and isinstance(changes, list)
+            and all(isinstance(entry, dict) and isinstance(entry.get("path"), str)
+                    and isinstance(entry.get("sha256"), str) for entry in files)
+            and all(isinstance(change, dict) and isinstance(change.get("path"), str)
+                    and isinstance(change.get("kind"), str) for change in changes)):
+        raise HubRenderUnavailable(f"{name} is not a render-host.py lock (files and changes records)")
+    return ({entry["path"]: entry["sha256"] for entry in files},
+            {change["path"] for change in changes if change["kind"] == "prime-agent-root-rewrite"})
+
+
 def render_hubs(ts_skills: Path, repo: Path, agent_dir: Path, scratch: Path) -> tuple[dict, Path]:
     """Render the TS skills dir's hub categories for `agent_dir` the way the
     TS deploy was made: the hubs checkout's own scripts/render-host.py, at
@@ -522,11 +542,12 @@ def render_hubs(ts_skills: Path, repo: Path, agent_dir: Path, scratch: Path) -> 
     TS lock and the render output (hubs/<hub>/…, LOCK.host.json)."""
     try:
         ts_lock = json.loads((ts_skills / HUB_LOCK).read_text())
-        commit, profile, hubs = ts_lock["source_commit"], ts_lock["host_profile"], ts_lock["hubs"]
     except FileNotFoundError:
         raise HubRenderUnavailable(f"the TS skills dir has no {HUB_LOCK}") from None
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError) as error:
         raise HubRenderUnavailable(f"unreadable TS {HUB_LOCK}: {error!r}") from None
+    ts_files, _ = lock_records(ts_lock, f"the TS {HUB_LOCK}")
+    commit, profile, hubs = ts_lock.get("source_commit"), ts_lock.get("host_profile"), ts_lock.get("hubs")
     if not (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit)
             and isinstance(profile, str) and re.fullmatch(r"[a-z0-9-]+", profile)
             and isinstance(hubs, list) and all(isinstance(hub, str) and HUB_NAME.match(hub) for hub in hubs)):
@@ -537,7 +558,10 @@ def render_hubs(ts_skills: Path, repo: Path, agent_dir: Path, scratch: Path) -> 
     clone, out = scratch / "hubs", scratch / "rendered"
 
     def run(step: str, command: list[str]) -> None:
-        result = subprocess.run(command, capture_output=True, text=True, env=env)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, env=env)
+        except OSError as error:
+            raise HubRenderUnavailable(f"{step} could not start: {error}") from None
         if result.returncode != 0:
             raise HubRenderUnavailable(f"{step} failed (exit {result.returncode}): {result.stderr.strip()[-500:]}")
 
@@ -553,14 +577,11 @@ def render_hubs(ts_skills: Path, repo: Path, agent_dir: Path, scratch: Path) -> 
         lock = json.loads((out / HUB_LOCK).read_text())
     except (OSError, ValueError) as error:
         raise HubRenderUnavailable(f"render-host.py wrote no readable {HUB_LOCK}: {error!r}") from None
+    files, rewritten = lock_records(lock, f"the rendered {HUB_LOCK}")
     expected = {"source_commit": commit, "host_profile": profile, "hubs": hubs, "prime_agent_dir": str(agent_dir)}
     stamped = {key: lock.get(key) for key in expected}
     if stamped != expected:
         raise HubRenderUnavailable(f"the rendered {HUB_LOCK} says {stamped}, not {expected}")
-    rewritten = {change.get("path") for change in lock.get("changes", [])
-                 if change.get("kind") == "prime-agent-root-rewrite"}
-    ts_files = {entry["path"]: entry["sha256"] for entry in ts_lock.get("files", [])}
-    files = {entry["path"]: entry["sha256"] for entry in lock.get("files", [])}
     differ = sorted(path for path in ts_files.keys() | files.keys()
                     if path not in rewritten and ts_files.get(path) != files.get(path))
     if differ:
@@ -652,12 +673,20 @@ def seed_agent_dir(agent_dir: Path, ts_agent_dir: Path, hubs_repo: Path, *, refr
 def write_launcher(bin_dir: Path, prefix: Path) -> Path:
     bin_dir.mkdir(parents=True, exist_ok=True)
     launcher = bin_dir / LAUNCHER_NAME
-    temp = bin_dir / f".{LAUNCHER_NAME}.tmp-{os.getpid()}"
-    temp.write_text(LAUNCHER_TEMPLATE.format(prefix=shlex.quote(str(prefix)),
-                                             system_tmp=shlex.quote(str(SYSTEM_TMP)),
-                                             protected_roots=shell_protected_roots()))
-    temp.chmod(0o755)
-    os.replace(temp, launcher)
+    # A temp created here, exclusively (O_EXCL: never an existing name a link
+    # could sit at), written and made executable through its descriptor, then
+    # moved over the launcher.
+    fd, temp = tempfile.mkstemp(prefix=f".{LAUNCHER_NAME}.tmp-", dir=bin_dir)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(LAUNCHER_TEMPLATE.format(prefix=shlex.quote(str(prefix)),
+                                                  system_tmp=shlex.quote(str(SYSTEM_TMP)),
+                                                  protected_roots=shell_protected_roots()))
+            os.fchmod(handle.fileno(), 0o755)
+        os.replace(temp, launcher)
+    except BaseException:
+        os.unlink(temp)
+        raise
     return launcher
 
 
@@ -828,8 +857,10 @@ def one_shot(launcher: Path, args: argparse.Namespace, cwd: Path, tools: bool, b
 
 def tree_identity(root: Path) -> list[str] | None:
     """One line per entry under `root` (itself included, links not followed):
-    relative path, type, size, mtime_ns, and a link's target. A write
-    anywhere in the tree, in place or not, changes at least one line."""
+    relative path, type, size, mtime_ns, inode, mode, ctime_ns, and a link's
+    target. A write anywhere in the tree, in place or not, changes at least
+    one line: a writer can restore mtime but not ctime, and a replacement
+    file has a new inode."""
     if not root.exists():
         return None
 
@@ -841,7 +872,8 @@ def tree_identity(root: Path) -> list[str] | None:
         kind = ("link" if stat.S_ISLNK(info.st_mode) else "dir" if stat.S_ISDIR(info.st_mode)
                 else "file" if stat.S_ISREG(info.st_mode) else "other")
         target = os.readlink(path) if kind == "link" else ""
-        return f"{path.relative_to(root)}\t{kind}\t{info.st_size}\t{info.st_mtime_ns}\t{target}"
+        return (f"{path.relative_to(root)}\t{kind}\t{info.st_size}\t{info.st_mtime_ns}\t{info.st_ino}"
+                f"\t{info.st_mode:o}\t{info.st_ctime_ns}\t{target}")
 
     lines = [line(root)]
     for dirpath, dirnames, filenames in os.walk(root):

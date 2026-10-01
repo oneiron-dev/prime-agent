@@ -70,9 +70,10 @@ when the diff is identical, otherwise drop it by hand.
   `PRIME_AGENT_KERNEL_VENV=~/.prime/agent-rs/kernel-venv`. It always overwrites the generic names
   and clears inherited session dirs and harness/debug sinks (`RLM_SESSION_DIR`,
   `RLM_HARNESS_STATE_DIR`, `RLM_GLOBAL_HARNESS_STATE_DIR`, `PA_COMPACTION_TRACE`,
-  `PA_MCP_LOGIN_URL_FILE`, `PA_DAEMON_EVENT_LOG`). Override only with `PRIME_AGENT_RS_AGENT_DIR` /
-  `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`. The short `pa-rs-<uid>` name keeps
-  macOS worker socket paths under the 104-byte `sun_path` limit.
+  `PA_MCP_LOGIN_URL_FILE`, `PA_DAEMON_EVENT_LOG`), an inherited restart roster
+  (`PRIME_AGENT_UPDATE_ROSTER`) and every `PRIME_AGENT_INTERNAL_*` switch. Override only with
+  `PRIME_AGENT_RS_AGENT_DIR` / `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`. The
+  short `pa-rs-<uid>` name keeps macOS worker socket paths under the 104-byte `sun_path` limit.
 - One protected set for every path the installer or launcher writes (prefix, receipts, bin dir,
   agent dir, socket dir, kernel venv): `PROTECTED_STATE` in `side_by_side.py`, which also renders
   the launcher's list. It is the TS socket dirs `<tmp>/prime-agent-<uid>` and
