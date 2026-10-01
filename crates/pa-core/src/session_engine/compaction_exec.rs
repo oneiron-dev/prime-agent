@@ -231,29 +231,46 @@ pub async fn complete_summary_call(
         ..DEFAULT_PROVIDER_RETRY_POLICY
     });
     let attempt = || {
-        let stream_options = stream_options.clone();
+        let mut stream_options = stream_options.clone();
         let on_delta = on_delta.clone();
         let context = &context;
         async move {
-            let assistant = match on_delta {
-                None => pa_ai::complete_simple(model, context, Some(stream_options)).await?,
-                Some(on_delta) => {
-                    // The live path rides the same provider stream
-                    // `complete_simple` awaits the end of: every text
-                    // delta is forwarded to the sink as it arrives, and
-                    // the terminal event's message is the summary exactly
-                    // like the one-shot arm. Thinking deltas stay off the
-                    // sink — the final summary carries only the text
-                    // blocks.
-                    let mut stream = pa_ai::stream_simple(model, context, Some(stream_options))?;
-                    while let Some(event) = stream.next_event().await {
-                        if let pa_types::ai::AssistantMessageEvent::TextDelta { delta, .. } = &event
-                        {
-                            on_delta(delta);
+            // The provider request races the run's abort (TS passes the
+            // signal to `completeSimple`): the abort, and the attempt being
+            // dropped by an outer abort race, cancel the in-flight request
+            // instead of leaving it running (and holding the session's
+            // socket) after the compaction gave up.
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let _cancel_on_drop = cancel.clone().drop_guard();
+            stream_options.base.signal = Some(cancel.clone());
+            let request = async {
+                anyhow::Ok(match on_delta {
+                    None => pa_ai::complete_simple(model, context, Some(stream_options)).await?,
+                    Some(on_delta) => {
+                        // The live path rides the same provider stream
+                        // `complete_simple` awaits the end of: every text
+                        // delta is forwarded to the sink as it arrives, and
+                        // the terminal event's message is the summary exactly
+                        // like the one-shot arm. Thinking deltas stay off the
+                        // sink — the final summary carries only the text
+                        // blocks.
+                        let mut stream =
+                            pa_ai::stream_simple(model, context, Some(stream_options))?;
+                        while let Some(event) = stream.next_event().await {
+                            if let pa_types::ai::AssistantMessageEvent::TextDelta {
+                                delta, ..
+                            } = &event
+                            {
+                                on_delta(delta);
+                            }
                         }
+                        stream.result().await
                     }
-                    stream.result().await
-                }
+                })
+            };
+            let assistant = match abort {
+                Some(signal) => pa_agent::abort::race_with_abort(request, signal).await??,
+                None => request.await?,
             };
             // The retry policy classifies the loop's message shape; the
             // wire shapes are shared, so the crossing is lossless.
@@ -274,14 +291,22 @@ pub async fn complete_summary_call(
     let settled = complete_with_provider_retry(&policy, abort, wait, attempt).await?;
     let assistant: pa_types::ai::AssistantMessage = json_round_trip(&settled)
         .ok_or_else(|| anyhow::anyhow!("{failure}: summary reply conversion failed"))?;
-    if assistant.stop_reason == pa_types::ai::StopReason::Error {
-        anyhow::bail!(
+    match assistant.stop_reason {
+        pa_types::ai::StopReason::Error => anyhow::bail!(
             "{failure}: {}",
             assistant
                 .error_message
                 .as_deref()
                 .unwrap_or("Unknown error")
-        );
+        ),
+        // A cancelled summary is never a summary (TS throws "Compaction
+        // cancelled" for an aborted reply): the provider settles a request
+        // as aborted when the session that owns it is disposed, even
+        // without the run's own abort.
+        pa_types::ai::StopReason::Aborted => return Err(pa_agent::abort::aborted_error()),
+        pa_types::ai::StopReason::Stop
+        | pa_types::ai::StopReason::Length
+        | pa_types::ai::StopReason::ToolUse => {}
     }
     let summary = assistant
         .content
