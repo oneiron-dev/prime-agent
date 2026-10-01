@@ -12,10 +12,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// Default ceiling on a snapshot payload. Over-cap variables are skipped + reported.
-pub const DEFAULT_SNAPSHOT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Aggregate ceiling for one retained kernel snapshot. Over-cap variables are
+/// skipped + reported (the runtime keeps the newest data bindings first).
+pub const DEFAULT_SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Default ceiling for one serialized variable.
-pub const DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES: u64 = 8 * 1024 * 1024;
 
 const KERNEL_STATE_BASENAME: &str = "kernel-state";
 
@@ -32,7 +33,8 @@ pub struct SnapshotResult {
     pub saved: Vec<String>,
     /// Names that could not be serialized, with a short reason.
     pub skipped: Vec<SnapshotSkip>,
-    /// Oversized live variables removed by an explicit compaction snapshot.
+    /// Live variables outside the bounded snapshot budget, removed by an
+    /// explicit compaction snapshot.
     pub pruned: Option<Vec<String>>,
     /// Payload size on disk, in bytes.
     pub bytes: u64,

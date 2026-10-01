@@ -1142,3 +1142,61 @@ async fn skill_sync_falls_back_to_per_skill_installs_on_batch_failure() {
         .collect::<Vec<_>>();
     assert_eq!(recorded, vec!["edit"], "only the healthy skill is recorded");
 }
+
+/// The delivered-runtime check (the TS fork's production-bundle verifier,
+/// moved to where the Rust product actually loads the runtime): the
+/// readiness probe executes the file-handle snapshot guard inside whatever
+/// `rlm` the interpreter imports. The shipped sidecar passes; the same tree
+/// with the guard missing (an older install, a stale venv) is refused, so a
+/// kernel never runs on a runtime whose snapshots can reopen and truncate a
+/// durable file.
+#[cfg(unix)]
+#[test]
+fn runtime_probe_requires_the_delivered_snapshot_guard() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../prime-agent-runtime/src/rlm")
+        .canonicalize()
+        .expect("the shipped runtime sidecar sits at the workspace root");
+    let dir = tempfile::tempdir().unwrap();
+    let install = |name: &str, strip_guard: bool| -> String {
+        let rlm = dir.path().join(name).join("rlm");
+        std::fs::create_dir_all(&rlm).unwrap();
+        let mut sources = Vec::new();
+        collect_python_files(&shipped, &mut sources).unwrap();
+        for source in sources {
+            let relative = source.strip_prefix(&shipped).unwrap();
+            let target = rlm.join(relative);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let mut text = std::fs::read_to_string(&source).unwrap();
+            if strip_guard && relative == Path::new("repl.py") {
+                assert!(text.contains("def _has_filehandle_reducer("));
+                text = text.replace("def _has_filehandle_reducer(", "def _guard_removed(");
+            }
+            std::fs::write(target, text).unwrap();
+        }
+        // The interpreter a kernel would run: python3 importing this tree.
+        let python = dir.path().join(format!("{name}-python"));
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nPYTHONPATH='{}' exec python3 \"$@\"\n",
+                dir.path().join(name).display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        python.to_string_lossy().to_string()
+    };
+
+    let current = install("current", false);
+    let stale = install("stale", true);
+    assert_eq!(
+        (
+            has_prime_agent_runtime(&current),
+            has_prime_agent_runtime(&stale)
+        ),
+        (true, false)
+    );
+}

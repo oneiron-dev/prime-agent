@@ -1,0 +1,3 @@
+- Kernel snapshots no longer save open or closed file handles: a variable holding one is skipped and dropped from the namespace after the snapshot commits (the file itself is untouched), a value with a handle inside it is skipped, and restoring an older snapshot never reopens or truncates a file.
+- Kernel snapshots now keep at most 64 MB (8 MB per variable) and save the newest variables first, so the latest work survives when a namespace outgrows the cap.
+- An error in a cell now names the cell's own failing line, and an interrupted cell releases the memory its local variables held.

@@ -4,7 +4,9 @@
 one persistent `__main__` namespace on a single asyncio event loop. The wire
 format is newline-delimited JSON: one object per line, UTF-8, no other framing.
 The current protocol version is `3`; the runtime announces it in the `ready`
-event.
+event, together with `features`: the optional requests beyond the version-3
+base that this runtime serves (`trim_memory`, `memory_notice`,
+`memory_report`). A host checks `features` before sending one of them.
 
 ## Channels
 
@@ -35,17 +37,20 @@ event.
 | `list_names` | `{"type":"list_names","id":str}` |
 | `mcp_status` | `{"type":"mcp_status","id":str,"servers":[str,...],"timeout_ms"?:number}` — host-side view query: per-server tool listing (opens each server on demand, bounded by `timeout_ms` per server; default 10s); the `done` frame carries `connections: [{server, tools: [{name, description}] | null, error: str | null}]` |
 | `bash_activity` | `{"type":"bash_activity","id":str,"action":"list"|"tail"|"kill","activityId"?:str,"lines"?:int}` — out-of-band even during a running cell; tail lines 1–200, response capped at 16 KiB; opaque IDs resolve only against this kernel’s handles |
+| `trim_memory` | `{"type":"trim_memory","id":str,"target_bytes"?:int,"min_bytes"?:int,"count"?:int}` |
+| `memory_notice` | `{"type":"memory_notice","id":str,"pids":[int,...],"text":str}` — replies `done` from the reader thread |
+| `memory_report` | `{"type":"memory_report","id":str,"count"?:int}` — replies `done` off the request queue |
 | `shutdown` | `{"type":"shutdown","id"?:str}` |
 
-Requests other than `interrupt`, `host_reply`, and `bash_activity` run strictly in order, one at
-a time. A malformed line
+Requests other than `interrupt`, `host_reply`, `bash_activity`, `memory_notice` and
+`memory_report` run strictly in order, one at a time. A malformed line
 produces `{"event":"error","id":null,"ename":"ProtocolError",...}` and the
 runtime keeps serving. Closing stdin is equivalent to `shutdown`.
 
 ## Events
 
-- `{"event":"ready","protocol":3,"python":"3.13.11"}` — sent once at startup;
-  the handshake. No banner precedes it.
+- `{"event":"ready","protocol":3,"python":"3.13.11","features":[str,...]}` —
+  sent once at startup; the handshake. No banner precedes it.
 - `{"event":"stdout"|"stderr","id":str|null,"text":str}` — captured output.
   `id` is the cell whose Python execution context performed the write; asyncio
   tasks inherit the spawning cell's id (even after that cell finished). `null`
@@ -70,14 +75,20 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
   carrying the same id. `data` is subject to the same encoding cap as a
   `display` payload: `host_request()` raises `ValueError` in the calling cell
   instead of sending an oversized request.
-- `{"event":"error","id":str|null,"ename":str,"evalue":str,"traceback":[str,...]}`
+- `{"event":"error","id":str|null,"ename":str,"evalue":str,"traceback":[str,...],"line"?:{"lineno":int,"source":str}}`
   — `evalue` and each `traceback` entry are capped like `result` text (same
-  cap, same trailing marker).
+  cap, same trailing marker). `line` is the failing cell's own innermost
+  traceback line (for an interrupt, the line the cell was stopped at); a call
+  into a function from an earlier cell names this cell's calling line. The
+  source text is stripped and capped at 200 characters.
 - `{"event":"done","id":str,"status":"ok"|"error"}` — exactly one per id'd
   request, always after all of that request's other events. A snapshot `done`
   adds `saved`, `skipped`, `pruned`, `bytes`; a restore `done` adds `restored`,
-  `failed`; a `list_names` `done` adds `names`; a failed snapshot/restore adds
-  `reason`. Bash activity `done` carries `activities` (list), `tail` (tail),
+  `failed`; a `list_names` `done` adds `names`; a `trim_memory` `done` adds
+  `dropped`, `largest`, `more`, `freed_bytes`; a `memory_notice` `done` adds
+  `matched` and `awaited`; a `memory_report` `done` adds `line`, `names`, `more`;
+  a failed snapshot/restore/trim adds `reason`. A snapshot `done` also adds
+  `purgedFileHandles`. Bash activity `done` carries `activities` (list), `tail` (tail),
   or `killed` (kill); `status:"error"` with `reason` on unknown IDs.
   The daemon advertises `kernel_bash_activity`; clients poll `list_kernel_bash`
   for updates (no push events). Each row contains opaque `id`, `command`,
@@ -169,9 +180,27 @@ names exceeding the per-variable cap (`max_variable_bytes`) are also deleted
 from the namespace and listed in `pruned`; names skipped for the aggregate
 `max_bytes` cap are reported in `skipped` but kept in the namespace. The
 payload is written atomically (tmp file + `os.replace`) and a JSON manifest
-(`version`, `savedNames`, `skipped`, `pruned`, `bytes`, `pythonVersion`,
-`timestamp`) is written to `manifest_path`. A manifest write failure fails the
-snapshot (and nothing is pruned).
+(`version` 2, `savedNames`, `skipped`, `pruned`, `purgedFileHandles`, `bytes`,
+`pythonVersion`, `timestamp`) is written to `manifest_path`. A manifest write
+failure fails the snapshot (and nothing is pruned or purged). Modules and
+callables are considered first, then data names newest binding first (the
+namespace's insertion order reversed), so under the aggregate cap the latest
+work survives; with `prune_oversized`, names skipped for the aggregate cap are
+pruned too. Default caps are 64 MiB aggregate and 8 MiB per variable.
+
+File handles never enter a snapshot: a top-level `io.IOBase` value (open or
+closed, any mode) is skipped with `unsafe file handle (io.IOBase)` and, once
+the payload and manifest commit, its name is deleted from the namespace (and
+from `Out`) and listed in `purgedFileHandles`; the handle itself is not closed
+and its file is not touched. A value whose pickle references dill's
+`_create_filehandle` reducer (a handle nested in a container or object) is
+skipped with `unsafe dill file-handle reducer` and kept in the namespace.
+Restore checks every blob before `dill.loads`: a non-bytes blob fails with
+`corrupt snapshot variable: not bytes`, and a blob carrying the file-handle
+reducer fails with `unsafe legacy dill file-handle reducer rejected`, so an
+older snapshot can never reopen (or, for a write mode, truncate) a file. This
+guards durable files against snapshot round trips; it is not a sandbox for
+untrusted payloads.
 
 `restore` loads the payload and revives each name independently; a missing
 file yields an ok empty restore with `reason:"snapshot not found"`, a corrupt
@@ -181,6 +210,50 @@ fail with `status:"error"` and a `reason`.
 
 `list_names` replies with `done` carrying `names`: the sorted user-defined
 top-level names under the same filter the snapshot applies.
+
+## Memory ceiling
+
+The host measures the kernel and every process it starts and enforces a memory
+limit per kernel tree (see `crates/pa-core/src/kernel/memory_guard/`). These
+requests serve it; their sizing lives in `rlm/memory.py`.
+
+`trim_memory` frees memory held by top-level variables. Every top-level name
+except dunders, the always-skipped names above, modules, classes and functions
+is sized by in-memory bytes: numpy-style `nbytes`, pandas
+`memory_usage(deep=True)`, polars `estimated_size()`, `sys.getsizeof` for
+`bytes`/`bytearray`/`str`, and a bounded walk (100,000 objects, then
+extrapolated) through containers and instance `__dict__`s. Names bound to the
+same object, or to numpy views of the same base array, form one group. Groups
+are deleted largest first until their sizes add up to `target_bytes`; a group
+under `min_bytes` is never deleted. Matching `Out` entries and `sys.last_*`
+are cleared, `gc.collect()` runs, and the C heap is handed back to the OS
+(`malloc_trim` on glibc, `malloc_zone_pressure_relief` on macOS). The `done`
+carries `dropped` and `largest` (the `count` largest remaining groups, default
+3), plus `more` (how many remaining groups `largest` leaves out) and
+`freed_bytes`. Each entry is `{"name","bytes","type"}`, where `name` joins a
+group's names with `", "`; a numpy, pandas, polars or torch value adds `shape`
+(a list of ints) and `dtype` (a frame's distinct column dtypes joined with
+`/`, at most three), and a list, tuple, set, dict or deque adds `length`.
+`target_bytes` 0 only reports. The request is not interruptible. A cell
+stopped by an interrupt also releases the locals its frames held, so a trim
+right after it frees what the cell built.
+
+`memory_notice` is handled on the reader thread, like `interrupt`: the host
+sends it right before it SIGKILLs a process group the kernel started. When a
+live `bash()` handle owns one of `pids`, the handle keeps `text` and appends it
+to its output once the kill ends it, so the awaited `bash()` call returns the
+reason. The `done` reply carries `matched`: whether such a handle existed, and
+`awaited`: whether the running cell awaits it (directly or through asyncio
+wrappers). When `awaited` is false the host delivers the text itself.
+
+`memory_report` is answered on a thread of its own, so it works while a cell
+runs: the host sends it right before it ends the kernel. The `done` carries
+`line`, the running cell's current line as `{"lineno","source"}` (its innermost
+frame in its own code, following the await chain of a suspended cell; `null`
+when no cell runs), and `names`: the `count` largest groups (default 30) in
+the `trim_memory` entry format, measured with a smaller walk (10,000 objects
+per value), plus `more`. A main thread that holds the GIL in one long C call
+delays the reply; the host does not wait for it long.
 
 ## Shutdown
 

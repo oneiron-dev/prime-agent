@@ -290,9 +290,9 @@ pub struct KernelSnapshotConfig {
     pub path: std::path::PathBuf,
     /// Absolute path for the JSON manifest written alongside the payload.
     pub manifest_path: std::path::PathBuf,
-    /// Maximum aggregate snapshot size. Default 256 MiB.
+    /// Maximum aggregate snapshot size. Default 64 MiB.
     pub max_bytes: Option<u64>,
-    /// Maximum serialized size of one variable. Default 16 MiB.
+    /// Maximum serialized size of one variable. Default 8 MiB.
     pub max_variable_bytes: Option<u64>,
     /// Debounce window for the auto-snapshot after a successful execution. Default 1500 ms.
     pub debounce_ms: Option<u64>,
