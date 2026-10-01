@@ -17,7 +17,8 @@ const UNKNOWN: &str = "unknown";
 const MAX_VERSION_LENGTH: usize = 64;
 
 /// The catalog's property-rule revision (additive rule changes bump it).
-/// 3: the additive `kernel memory action` and `kernel snapshot guard` rules.
+/// 3: the additive `agent provider transport used`, `kernel memory action`,
+/// `kernel snapshot guard` and `agent headless invoked` rules.
 pub const SCHEMA_REVISION: u64 = 3;
 
 /// The `cpu_baseline` values.

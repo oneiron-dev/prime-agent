@@ -167,7 +167,15 @@ fn parse_script_step(entry: &Value) -> Result<FauxResponseStep, String> {
             ..Default::default()
         },
     );
-    Ok(if delay_ms > 0 {
+    // `holdUntilAborted` holds the request until the turn aborts, with no
+    // timer (verification harness only).
+    let held = entry
+        .get("holdUntilAborted")
+        .and_then(Value::as_bool)
+        .unwrap_or_default();
+    Ok(if held {
+        FauxResponseStep::HeldUntilAborted(message)
+    } else if delay_ms > 0 {
         FauxResponseStep::Delayed { message, delay_ms }
     } else {
         FauxResponseStep::Message(message)

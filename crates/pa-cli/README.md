@@ -58,6 +58,36 @@ the first-turn boundary, the compaction `compaction_start`/`compaction_end`
 pairs with their durable outcome rows, the `goal_update`/`session_action_update`
 frames of the goal loop, and the refinement rows with
 `refine_complete`/`refine_failed`. Verifier: the `print_runtime_e2e` rows.
+`--json-event-profile all|factory-completed` (`json_output.rs`, TS
+print-mode `JsonEventProfile`) is a stdout projection only: the reduced
+profile marks the header with `jsonEventProfile` and drops whole
+`message_update`/`tool_execution_update` events before they are
+serialized; event generation, persistence and the daemon wire never see
+it. `--no-skills`/`--no-prompt-templates`/`--no-context-files` reach the
+session assembly as pa-core's `ResourceLoadingPolicy`.
+`--daemon-hosted` (`hosted_print.rs`) runs the same print/json flow over a
+resident daemon session through `pa_daemon::headless_client`: the session
+selection stays client-side (`-c` picks the newest saved session for this
+cwd and session dir, `--resume` its selector, and the daemon is asked for
+that file by path, since the supervisor refuses `continueRecent`), the
+client ensures the daemon on the resolved socket, and exit or
+SIGINT/SIGTERM/SIGHUP (130/143/129) detach and close without stopping the
+session. Flags the create contract cannot carry (`--no-skills`,
+`--no-prompt-templates`, `--no-context-files`, `--goal`, `--offline`,
+`--fork`) fail before any daemon starts, and so do a factory seat's
+`W7_CARGO_*` launch overlay (a daemon worker runs with the daemon's
+environment) and the flag in rpc/acp mode. Ambient process policy such as
+`PI_OFFLINE` reaches a daemon this run starts, not one already running.
+Each prompt carries its own `admissionId` (when the daemon advertises
+`prompt_admission_cancellation`; without it a timed-out prompt fails);
+when the supervisor's route budget answers first,
+`cancel_prompt_admission` reads that admission back:
+a started turn (`owned`, whatever the submission was, `/skill:` and
+session commands included) is waited out to idle, a prompt still queued is
+withdrawn and the run fails, and a prompt nothing holds fails the run
+rather than report one that may never have run. Each print/json run reports `agent headless invoked` (mode,
+daemon_hosted, json_event_profile). Verifiers: `headless_flags_e2e`,
+`hosted_print_e2e`.
 
 ## Daemon client
 The daemon-backed public commands (`list`, `stop`, `rename`, `send`, `schedule`) talk to the

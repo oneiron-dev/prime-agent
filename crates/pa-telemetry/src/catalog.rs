@@ -1245,7 +1245,7 @@ const SKILL_USED: EventRule = EventRule {
     ],
 };
 
-/// `agent provider transport used` (v2, additive): a session's provider
+/// `agent provider transport used` (v2, schema revision 3): a session's provider
 /// requests reached the model over the Responses WebSocket transport
 /// (the 101 upgrade), once per session. The API name and the transport
 /// only: never a URL, header, key, close reason, or response id.
@@ -1437,6 +1437,28 @@ const SESSION_ARCHIVED: EventRule = EventRule {
     properties: &[
         ("session_id", required(uuid())),
         ("duration_ms", required(duration())),
+    ],
+};
+
+/// The headless output modes (`agent headless invoked`).
+pub const HEADLESS_MODES: &[&str] = &["text", "json"];
+
+/// The `--json-event-profile` values (`agent headless invoked`).
+pub const JSON_EVENT_PROFILES: &[&str] = &["all", "factory-completed"];
+
+/// `agent headless invoked` (v2, schema revision 3): one per print/json run, the
+/// headless flags it used (`--mode`, `--daemon-hosted`,
+/// `--json-event-profile`).
+const AGENT_HEADLESS_INVOKED: EventRule = EventRule {
+    name: "agent headless invoked",
+    since: 2,
+    properties: &[
+        ("mode", required(enum_rule(HEADLESS_MODES, "text"))),
+        ("daemon_hosted", required(boolean())),
+        (
+            "json_event_profile",
+            required(enum_rule(JSON_EVENT_PROFILES, "all")),
+        ),
     ],
 };
 
@@ -1776,6 +1798,7 @@ pub fn catalog() -> Vec<&'static EventRule> {
         &KERNEL_MEMORY_ACTION,
         &KERNEL_SNAPSHOT_GUARD,
         &SESSION_ARCHIVED,
+        &AGENT_HEADLESS_INVOKED,
     ];
     all.extend(TUI_EVENTS.iter());
     all.extend(UPDATE_EVENTS.iter());

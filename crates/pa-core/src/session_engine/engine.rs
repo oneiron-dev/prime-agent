@@ -11,7 +11,9 @@ use pa_agent::agent::{Agent, AgentInitialState, AgentOptions};
 use pa_agent::stream::StreamFn;
 use pa_agent::types::{Model, ThinkingLevel};
 
-use crate::resources::{load_resources, ResourceLoaderOptions};
+use crate::resources::{
+    load_resources, ResourceDiscovery, ResourceLoaderOptions, ResourceLoadingPolicy,
+};
 use crate::session::manager::SessionManager;
 use crate::skills::PromptTemplate;
 
@@ -59,6 +61,10 @@ pub struct SessionEngineConfig {
     pub additional_skill_paths: Vec<String>,
     /// Extra prompt-template paths.
     pub additional_prompt_paths: Vec<String>,
+    /// What the session discovers beyond the explicit paths above (TS
+    /// `--no-skills`/`--no-prompt-templates`/`--no-context-files`); the
+    /// default discovers everything.
+    pub resource_loading: ResourceLoadingPolicy,
     /// Force-exclude patterns for built-in skills (e.g. unauthenticated
     /// integrations); the MCP manager seam.
     pub extra_builtin_skill_overrides: Vec<String>,
@@ -292,6 +298,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             generic_mcp_servers.push(server);
         }
     }
+    let discovery_disabled = |discovery| discovery == ResourceDiscovery::Disabled;
     let resources = load_resources(ResourceLoaderOptions {
         cwd: cwd.clone(),
         agent_dir: config.agent_dir.clone(),
@@ -299,9 +306,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         extra_builtin_skill_overrides,
         additional_skill_paths: config.additional_skill_paths.clone(),
         additional_prompt_paths: config.additional_prompt_paths.clone(),
-        no_skills: false,
-        no_prompt_templates: false,
-        no_context_files: false,
+        no_skills: discovery_disabled(config.resource_loading.skills),
+        no_prompt_templates: discovery_disabled(config.resource_loading.prompt_templates),
+        no_context_files: discovery_disabled(config.resource_loading.context_files),
         system_prompt: config.custom_system_prompt.clone(),
         append_system_prompt: Vec::new(),
         ..Default::default()

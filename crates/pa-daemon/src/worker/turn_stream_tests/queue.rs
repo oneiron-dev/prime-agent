@@ -841,3 +841,65 @@ async fn abort_and_send_queued_acks_before_the_follow_up_delivery() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A prompt whose admission a cancel withdrew while it was in no lane
+/// (the cancel landed between the prompt's registration and its enqueue,
+/// so the cancel's drop found nothing) never runs: the pickup commits
+/// each admission under the lock the cancel takes and refuses a cancelled
+/// one, so a cancel answers `cancelled` only for a prompt that will not
+/// run. The prompt behind it still runs, its admission committed (and
+/// cleared at its settle); the refused one's waiter fails like a dropped
+/// queue row and its admission settles.
+#[tokio::test]
+async fn a_prompt_cancelled_before_its_pickup_never_runs() {
+    let engine: Arc<dyn SessionEngine> = Arc::new(
+        ScriptedEngine::from_value(&json!({ "responses": ["reply"] })).unwrap_or_default(),
+    );
+    let runner = burst_runner(Arc::clone(&engine));
+    let admissions = runner.prompt_admissions.clone();
+    admissions.register("adm-withdrawn");
+    admissions.register("adm-live");
+    assert_eq!(
+        admissions.cancel("adm-withdrawn"),
+        Some(crate::prompt_admission::AdmissionStatus::Cancelled)
+    );
+    let admitted = |message: &str, admission_id: &str, done| QueuedItem {
+        admission_id: Some(admission_id.to_string()),
+        done: Some(done),
+        queue_visible: false,
+        ..queued_prompt(message, TurnPolicy::Direct)
+    };
+    let (withdrawn_tx, withdrawn_rx) = oneshot::channel();
+    let (live_tx, live_rx) = oneshot::channel();
+    {
+        let mut core = runner.core.lock().unwrap();
+        core.steering
+            .push_back(admitted("withdrawn", "adm-withdrawn", withdrawn_tx));
+        core.steering
+            .push_back(admitted("live", "adm-live", live_tx));
+    }
+    let mut subscription = runner.events.subscribe();
+    let running = tokio::spawn(async move { runner.run().await });
+    let live = tokio::time::timeout(std::time::Duration::from_secs(5), live_rx)
+        .await
+        .expect("the live prompt settles");
+    let withdrawn = tokio::time::timeout(std::time::Duration::from_secs(5), withdrawn_rx)
+        .await
+        .expect("the withdrawn prompt's waiter resolves");
+    running.abort();
+    assert_eq!(live, Ok(TurnSettle::Completed));
+    assert!(
+        withdrawn.is_err(),
+        "the withdrawn prompt ran: {withdrawn:?}"
+    );
+    assert_eq!(
+        delivered_rows(&runner_events(&mut subscription)),
+        vec![
+            ("user".to_string(), "live".to_string()),
+            ("assistant".to_string(), "reply".to_string()),
+        ]
+    );
+    // Both admissions settled: nothing answers for either any more.
+    assert_eq!(admissions.cancel("adm-withdrawn"), None);
+    assert_eq!(admissions.cancel("adm-live"), None);
+}

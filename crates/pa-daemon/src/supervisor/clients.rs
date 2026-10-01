@@ -104,8 +104,13 @@ impl Supervisor {
         };
         write_line(&mut writer, &serde_json::to_value(&hello)?).await?;
 
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
+        // `Lines::next_line` keeps a partly received command line across
+        // the select below: when an event or a dispatch completion wins
+        // the race, the bytes already read stay buffered for the next
+        // poll. (`read_line` is not cancel safe: a command whose newline
+        // had not arrived yet was dropped, and the client waited forever
+        // for its response.)
+        let mut lines = BufReader::new(reader).lines();
         let mut events = self.events.subscribe();
         let connection_id = client_id.clone();
         // Session events ride this per-connection queue (the subscriber
@@ -152,13 +157,9 @@ impl Supervisor {
             crate::backpressure::CLIENT_DISPATCH_CONCURRENCY,
         ));
         loop {
-            line.clear();
             tokio::select! {
-                read = reader.read_line(&mut line), if dispatch_slots.available_permits() > 0 => {
-                    let Ok(read) = read else { break };
-                    if read == 0 {
-                        break;
-                    }
+                read = lines.next_line(), if dispatch_slots.available_permits() > 0 => {
+                    let Ok(Some(line)) = read else { break };
                     let trimmed = line.trim().to_string();
                     if trimmed.is_empty() {
                         continue;
@@ -1253,6 +1254,137 @@ mod tests {
         assert!(
             line.contains("events dropped"),
             "the log names the dropped count: {line}"
+        );
+        connection.abort();
+    }
+
+    /// The server half of a socket pair whose read half reports every
+    /// chunk it hands the connection loop (its byte count), so a test can
+    /// wait until the loop has consumed what the client wrote.
+    struct ReportingStream {
+        inner: tokio::net::UnixStream,
+        consumed: tokio::sync::mpsc::UnboundedSender<usize>,
+    }
+
+    struct ReportingRead {
+        inner: tokio::net::unix::OwnedReadHalf,
+        consumed: tokio::sync::mpsc::UnboundedSender<usize>,
+    }
+
+    impl tokio::io::AsyncRead for ReportingRead {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+            let read = buf.filled().len() - before;
+            if read > 0 {
+                let _ = self.consumed.send(read);
+            }
+            polled
+        }
+    }
+
+    impl TransportStream for ReportingStream {
+        fn split(
+            self: Box<Self>,
+        ) -> (
+            Box<dyn pa_types::platform::transport::AsyncReadHalf>,
+            Box<dyn pa_types::platform::transport::AsyncWriteHalf>,
+        ) {
+            let (reader, writer) = self.inner.into_split();
+            let reader = ReportingRead {
+                inner: reader,
+                consumed: self.consumed,
+            };
+            (Box::new(reader), Box::new(writer))
+        }
+    }
+
+    /// A command whose newline arrives after an event won the connection
+    /// loop's select still dispatches and answers: the partly received
+    /// line survives the cancelled read. (A cancelled `read_line` dropped
+    /// the consumed bytes, the late newline read as an empty line, and the
+    /// client waited forever for its response - a second client attaching
+    /// to a busy session hung that way.) The reporting read half proves
+    /// the command's bytes were consumed before the event, and the
+    /// broadcast marker proves the event arm ran before the newline.
+    #[tokio::test]
+    async fn a_command_split_around_an_event_still_answers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir: dir.path().join("agent"),
+        };
+        let supervisor = Arc::new(Supervisor::new(options).expect("supervisor"));
+        let (server_side, client_side) = tokio::net::UnixStream::pair().expect("socket pair");
+        let (consumed_tx, mut consumed_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let connection = {
+            let supervisor = Arc::clone(&supervisor);
+            let stream: Box<dyn TransportStream> = Box::new(ReportingStream {
+                inner: server_side,
+                consumed: consumed_tx,
+            });
+            tokio::spawn(async move { supervisor.handle_client(stream).await })
+        };
+        let (client_read, mut client_write) = client_side.into_split();
+        let mut client = BufReader::new(client_read).lines();
+        // Failure bound for one awaited line (never a readiness wait).
+        let bound = Duration::from_secs(30);
+        let mut next_line = async || -> Value {
+            let line = tokio::time::timeout(bound, client.next_line())
+                .await
+                .expect("a supervisor line inside the bound")
+                .expect("readable connection")
+                .expect("an open connection");
+            serde_json::from_str(&line).expect("one JSON object per line")
+        };
+        assert_eq!(next_line().await["type"], "daemon_hello");
+        let envelope = |id: &str| {
+            json!({
+                "type": "command",
+                "id": id,
+                "protocol": { "name": "prime-agent.daemon", "version": 7 },
+                "command": { "type": "list" },
+            })
+            .to_string()
+        };
+        // A whole command answered: the loop subscribed to the event ring
+        // and is parked on its next read.
+        client_write
+            .write_all(format!("{}\n", envelope("whole")).as_bytes())
+            .await
+            .unwrap();
+        let answered = next_line().await;
+        assert_eq!(
+            (&answered["type"], &answered["id"], &answered["success"]),
+            (&json!("response"), &json!("whole"), &json!(true))
+        );
+        // Everything read so far was the first command.
+        while consumed_rx.try_recv().is_ok() {}
+
+        // The second command without its newline, consumed by the loop.
+        let split = envelope("split");
+        client_write.write_all(split.as_bytes()).await.unwrap();
+        let mut consumed = 0;
+        while consumed < split.len() {
+            consumed += consumed_rx.recv().await.expect("the loop reads");
+        }
+        // An event wins the select while that read waits for its newline.
+        let marker = json!({ "type": "marker" });
+        supervisor
+            .events
+            .send((ClientRouting::Broadcast, Arc::new(marker.clone())))
+            .expect("the connection is subscribed");
+        assert_eq!(next_line().await, marker);
+        // The newline completes the command the read had started.
+        client_write.write_all(b"\n").await.unwrap();
+        let answered = next_line().await;
+        assert_eq!(
+            (&answered["type"], &answered["id"], &answered["success"]),
+            (&json!("response"), &json!("split"), &json!(true))
         );
         connection.abort();
     }

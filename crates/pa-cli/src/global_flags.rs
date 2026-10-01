@@ -5,8 +5,9 @@
 use std::collections::HashSet;
 
 /// Global flags that consume the next argument as their value.
-pub const GLOBAL_VALUE_FLAGS: [&str; 24] = [
+pub const GLOBAL_VALUE_FLAGS: [&str; 25] = [
     "--mode",
+    "--json-event-profile",
     "--daemon-socket",
     "--provider",
     "--model",
@@ -42,13 +43,15 @@ pub const PROMPT_RUN_FLAGS: [&str; 4] =
     ["--print", "-p", "--system-prompt", "--append-system-prompt"];
 
 /// parseArgs-known long flags that take no separate value.
-const GLOBAL_BOOLEAN_FLAGS: [&str; 13] = [
+const GLOBAL_BOOLEAN_FLAGS: [&str; 15] = [
     "--help",
     "--version",
     "--continue",
     "--no-session",
+    "--daemon-hosted",
     "--no-tools",
     "--no-builtin-tools",
+    "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
@@ -262,6 +265,32 @@ mod tests {
             &removed,
         );
         assert_eq!(rotated, args(&["status", "--provider", "status"]));
+    }
+
+    /// The headless fork flags route like parseArgs reads them: the profile
+    /// consumes its value, the boolean flags leave the command free.
+    #[test]
+    fn headless_flags_leave_the_command_positional_free() {
+        let (public, removed) = sets();
+        for (argv, rotated) in [
+            (
+                ["--json-event-profile", "all", "status"].as_slice(),
+                ["status", "--json-event-profile", "all"].as_slice(),
+            ),
+            (
+                ["--daemon-hosted", "status"].as_slice(),
+                ["status", "--daemon-hosted"].as_slice(),
+            ),
+            (
+                ["--no-extensions", "status"].as_slice(),
+                ["status", "--no-extensions"].as_slice(),
+            ),
+        ] {
+            assert_eq!(
+                rotate_global_flags_before_command(&args(argv), &public, &removed),
+                args(rotated)
+            );
+        }
     }
 
     #[test]

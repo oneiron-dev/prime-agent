@@ -71,6 +71,8 @@ fn run_options_for_continue(dir: &std::path::Path) -> RunOptions {
         offline: false,
         agents_view_requested: false,
         attach_agent: None,
+        json_event_profile: crate::json_output::JsonEventProfile::All,
+        headless_hosting: crate::mode::HeadlessHosting::InProcess,
     }
 }
 
@@ -247,6 +249,8 @@ fn onboarding_gate_follows_settings_and_auth() {
             offline: false,
             agents_view_requested: false,
             attach_agent: None,
+            json_event_profile: crate::json_output::JsonEventProfile::All,
+            headless_hosting: crate::mode::HeadlessHosting::InProcess,
         }
     }
 
@@ -459,6 +463,8 @@ fn build_tui_options_reads_code_block_indent_settings() {
             offline: false,
             agents_view_requested: false,
             attach_agent: None,
+            json_event_profile: crate::json_output::JsonEventProfile::All,
+            headless_hosting: crate::mode::HeadlessHosting::InProcess,
         }
     }
 
