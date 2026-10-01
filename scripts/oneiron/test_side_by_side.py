@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -29,7 +30,8 @@ if [ "$1" = "env" ]; then
   printf '%s\\n' "SOCKET_DIR=$PRIME_AGENT_SOCKET_DIR" "DAEMON_SOCKET=$PRIME_AGENT_DAEMON_SOCKET" \\
     "KERNEL_VENV=$PRIME_AGENT_KERNEL_VENV" "SKIP=$PI_SKIP_VERSION_CHECK" "PACKAGE_DIR=${PI_PACKAGE_DIR-unset}" \\
     "NO_UPDATE=$PRIME_AGENT_DISABLE_SELF_UPDATE" "INSTALLER=$PRIME_AGENT_RUST_INSTALLER_URL" \\
-    "DOWNLOAD=$PRIME_AGENT_DOWNLOAD_BASE_URL" "KERNEL_PYTHON=${PRIME_AGENT_KERNEL_PYTHON-unset}"
+    "DOWNLOAD=$PRIME_AGENT_DOWNLOAD_BASE_URL" "KERNEL_PYTHON=${PRIME_AGENT_KERNEL_PYTHON-unset}" \\
+    "AGENT_DIR=$PRIME_AGENT_CODING_AGENT_DIR" "SESSION_DIR=${PRIME_AGENT_SESSION_DIR-unset}"
   exit 0
 fi
 exit 3
@@ -64,8 +66,19 @@ class SideBySideTests(unittest.TestCase):
                           ("PRIME_AGENT_RS_SOCKET_DIR", "PRIME_AGENT_RS_KERNEL_VENV",
                            "PRIME_AGENT_DAEMON_SOCKET", "PRIME_AGENT_KERNEL_VENV", "PI_PACKAGE_DIR",
                            "PRIME_AGENT_KERNEL_PYTHON", "PRIME_AGENT_RUST_INSTALLER_URL", "TMPDIR",
-                           "PRIME_AGENT_RS_PRINT_ENV")}
+                           "PRIME_AGENT_RS_PRINT_ENV", "PRIME_AGENT_RS_AGENT_DIR", "PRIME_AGENT_SESSION_DIR")}
         os.environ["TMPDIR"] = str(self.fake_tmp)
+        # A fake TS agent dir to seed from, and a temp Rust agent dir.
+        self.ts_agent = self.root / "ts-agent"
+        (self.ts_agent / "skills" / "grok").mkdir(parents=True)
+        (self.ts_agent / "models.json").write_text('{"providers": {}}')
+        (self.ts_agent / "settings.json").write_text('{"theme": "dark"}')
+        (self.ts_agent / "auth.json").write_text('{"secret": true}')
+        self.saved_ts_agent = side_by_side.TS_AGENT_DIR
+        side_by_side.TS_AGENT_DIR = self.ts_agent
+        self.agent_dir = self.root / "agent-rs"
+        os.environ["PRIME_AGENT_RS_AGENT_DIR"] = str(self.agent_dir)
+        os.environ["PRIME_AGENT_SESSION_DIR"] = str(self.ts_agent / "sessions")
         os.environ["PRIME_AGENT_RS_SOCKET_DIR"] = str(self.sock_dir)
         os.environ["PRIME_AGENT_RS_KERNEL_VENV"] = str(self.root / "venv-rs")
         # Inherited TS-side or upstream values must never reach the Rust process.
@@ -76,6 +89,7 @@ class SideBySideTests(unittest.TestCase):
         os.environ["PRIME_AGENT_RUST_INSTALLER_URL"] = "https://example.invalid/install.sh"
 
     def tearDown(self) -> None:
+        side_by_side.TS_AGENT_DIR = self.saved_ts_agent
         for key, value in self.saved_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -107,6 +121,8 @@ class SideBySideTests(unittest.TestCase):
             "INSTALLER": "http://127.0.0.1:1/oneiron-self-update-disabled",
             "DOWNLOAD": "http://127.0.0.1:1/oneiron-feed-disabled",
             "KERNEL_PYTHON": "unset",
+            "AGENT_DIR": str(self.agent_dir.resolve()),
+            "SESSION_DIR": "unset",
         })
         self.assertEqual(oct(self.sock_dir.stat().st_mode & 0o777), oct(0o700))
         receipt = json.loads((self.prefix / "receipts" / f"{VERSION}-{PLATFORM}" /
@@ -229,9 +245,38 @@ class SideBySideTests(unittest.TestCase):
                                              "PRIME_AGENT_KERNEL_VENV", "PRIME_AGENT_DISABLE_SELF_UPDATE")},
             {"PRIME_AGENT_SOCKET_DIR": str(self.sock_dir.resolve()),
              "PRIME_AGENT_DAEMON_SOCKET": f"{self.sock_dir.resolve()}/daemon.sock",
-             "PRIME_AGENT_KERNEL_VENV": str(Path.home().resolve() / ".prime" / "agent" / "kernel-venv-rs"),
+             "PRIME_AGENT_KERNEL_VENV": str(self.agent_dir.resolve() / "kernel-venv"),
              "PRIME_AGENT_DISABLE_SELF_UPDATE": "1"})
         self.assertEqual(effective["binary"], str((self.prefix / VERSION / "prime-agent").resolve()))
+
+    def test_install_seeds_an_isolated_agent_dir_once(self) -> None:
+        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
+        self.assertEqual(
+            {name: os.readlink(self.agent_dir / name) for name in ("models.json", "skills")},
+            {"models.json": str(self.ts_agent / "models.json"), "skills": str(self.ts_agent / "skills")})
+        self.assertEqual(json.loads((self.agent_dir / "settings.json").read_text()), {"theme": "dark"})
+        self.assertFalse((self.agent_dir / "settings.json").is_symlink())
+        self.assertFalse((self.agent_dir / "auth.json").exists())
+        # A later install keeps the Rust side's own settings edits.
+        (self.agent_dir / "settings.json").write_text('{"theme": "light"}')
+        (self.root / "b").mkdir()
+        self.assertEqual(self.run_main("install", "--stage-dir",
+                                       str(make_stage(self.root / "b", "0.9.8-oneiron.20261001.2"))), 0)
+        self.assertEqual(json.loads((self.agent_dir / "settings.json").read_text()), {"theme": "light"})
+
+    def test_agent_dir_overlapping_the_ts_agent_dir_is_refused(self) -> None:
+        stage = make_stage(self.root)
+        os.environ["PRIME_AGENT_RS_AGENT_DIR"] = str(self.ts_agent / "rs")
+        with self.assertRaisesRegex(SystemExit, "overlaps the TS agent dir"):
+            self.run_main("install", "--stage-dir", str(stage))
+        self.assertFalse((self.ts_agent / "rs").exists())
+        os.environ["PRIME_AGENT_RS_AGENT_DIR"] = str(self.agent_dir)
+        shutil.rmtree(self.prefix)
+        self.assertEqual(self.run_main("install", "--stage-dir", str(stage)), 0)
+        home = self.root / "home"
+        result = self.run_launcher(PRIME_AGENT_RS_AGENT_DIR=str(home / ".prime" / "agent"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("overlaps the TS agent dir", result.stderr)
 
     def test_installer_refuses_protected_destinations(self) -> None:
         ts_sock = self.fake_tmp / f"prime-agent-{os.getuid()}"

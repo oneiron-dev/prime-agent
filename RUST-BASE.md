@@ -42,11 +42,25 @@ when the diff is identical, otherwise drop it by hand.
 
 - Install tree `~/.local/share/prime-agent-oneiron-rs/<version>/` (immutable per version) with
   `current -> <version>`; launcher `~/.local/bin/prime-agent-rs`.
-- The launcher exports `PRIME_AGENT_SOCKET_DIR=${TMPDIR:-/tmp}/pa-rs-<uid>` (0700, owner-checked),
+- Own agent dir `~/.prime/agent-rs` (`PRIME_AGENT_CODING_AGENT_DIR`). The TS fleet's
+  `~/.prime/agent` is shared mutable state, and a Rust daemon would act on it (audit,
+  2026-10-01). It would move sessions into `sessions-archive`, delete TS update manifests at
+  every boot, recover and back off TS schedules, rewrite `settings.json` wholesale, race OAuth
+  refresh, and write differently-limited kernel snapshots. The installer seeds the Rust agent dir
+  with links to `models.json` and `skills/` (read-only inputs: `models.json` loads unchanged) and
+  a one-time copy of `settings.json`. It never copies `auth.json` (cpa providers carry their keys
+  in `models.json`; a copied OAuth refresh token would still race TS).
+  Consequence: during the trial, Rust and TS sessions are separate stores. Sharing them needs the
+  fork-only shared-store guard (`PRIME_AGENT_SHARED_STORE`), a follow-up lane.
+- The launcher exports `PRIME_AGENT_CODING_AGENT_DIR=~/.prime/agent-rs`,
+  `PRIME_AGENT_SOCKET_DIR=${TMPDIR:-/tmp}/pa-rs-<uid>` (0700, owner-checked),
   `PRIME_AGENT_DAEMON_SOCKET=<that dir>/daemon.sock` and
-  `PRIME_AGENT_KERNEL_VENV=~/.prime/agent/kernel-venv-rs`. It always overwrites those generic
-  names; override only with `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`. The short
-  `pa-rs-<uid>` name keeps macOS worker socket paths under the 104-byte `sun_path` limit.
+  `PRIME_AGENT_KERNEL_VENV=~/.prime/agent-rs/kernel-venv`. It clears inherited session-dir
+  overrides and always overwrites the generic names. Override only with
+  `PRIME_AGENT_RS_AGENT_DIR` / `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`; each is
+  validated before anything is created: absolute, canonical through symlinked ancestors, and no
+  overlap with TS state. The short `pa-rs-<uid>` name keeps macOS worker socket paths under the
+  104-byte `sun_path` limit.
 - Self-update is shut. Upstream's `prime-agent update` and the TUI `/update` fetch and run the
   takeover installer, so the launcher sets `PRIME_AGENT_DISABLE_SELF_UPDATE=1`. That fork-only guard
   refuses both, plus the staged native updater. It also points `PRIME_AGENT_RUST_INSTALLER_URL` and
@@ -56,23 +70,27 @@ when the diff is identical, otherwise drop it by hand.
 - `~/.local/bin/prime-agent`, the TS install tree, the TS socket dir and the TS kernel venv are
   never written. Never run upstream `install-rust.sh` or any `curl … | sh`: it stops every TS
   daemon and replaces `~/.local/bin/prime-agent`.
-- Sessions, `models.json` and auth stay shared in `~/.prime/agent` (same session format, v3). Do
-  not resume on Rust a TS session whose last compaction was remote: Rust ignores
-  `remoteCompaction`, and the only history left is the placeholder summary.
-- During the trial, never run `prime-agent-rs update` or a daemon stop without an explicit
-  `--daemon-socket`. Daemon discovery's state root also covers `~/.prime/agent`.
+- Never point a Rust run at TS sessions (`--session-dir ~/.prime/agent/sessions`). A Rust daemon
+  housekeeps whatever sessions dir it serves. When sessions are shared again, do not resume on
+  Rust a TS session whose last compaction was remote: Rust ignores `remoteCompaction`, and the only
+  history left is the placeholder summary.
+- During the trial, never run a daemon stop without an explicit `--daemon-socket`.
 - Known leak: child processes of a Rust session (bash tool, kernel) inherit the launcher's env.
-  TS reads `PRIME_AGENT_KERNEL_VENV`, so a TS `sol --tools` started from inside a `prime-agent-rs`
-  session runs its kernel from `kernel-venv-rs`. The TS kernel venv stays untouched. This goes
-  away at cutover, when Rust moves to the default venv.
+  TS reads `PRIME_AGENT_KERNEL_VENV` and `PRIME_AGENT_CODING_AGENT_DIR`, so a TS `sol` started from
+  inside a `prime-agent-rs` session runs against the Rust agent dir and venv. The TS state stays
+  untouched; that TS run just sees Rust's store. This goes away at cutover.
 
 ## Gates (local; upstream CI only runs on `main`)
 
 ```
-make check                                    # fmt, clippy -D warnings, test --workspace, release build (Rust 1.98.1)
-python3 scripts/oneiron/test_policy_gate.py   # TEST_POLICY_BASE=oneiron/main
-python3 scripts/oneiron/test_side_by_side.py
+scripts/oneiron/gate.sh all     # fmt, clippy -D warnings, policy (TEST_POLICY_BASE=oneiron/main), sandboxed workspace tests
+scripts/oneiron/gate.sh crates pa-core pa-daemon -- <filter>   # focused, same sandbox
 ```
+
+Never run a bare `cargo test --workspace` on a machine with a live TS fleet. The kernel e2e suites
+bootstrap the ambient kernel venv and probe the default daemon socket dir. `gate.sh` runs every test
+under a throwaway HOME and TMPDIR, with the product env scrubbed, TZ=UTC and the TS binary off
+PATH, the way a CI runner sees it.
 
 ## Re-pinning
 

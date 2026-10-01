@@ -46,6 +46,10 @@ HOME = Path.home()
 DEFAULT_PREFIX = HOME / ".local" / "share" / "prime-agent-oneiron-rs"
 DEFAULT_BIN_DIR = HOME / ".local" / "bin"
 TS_PREFIX = HOME / ".local" / "share" / "prime-agent-oneiron"
+TS_AGENT_DIR = HOME / ".prime" / "agent"
+DEFAULT_AGENT_DIR = HOME / ".prime" / "agent-rs"
+# Read-only inputs the Rust build shares with TS by link (no Rust writer).
+SHARED_READ_ONLY = ("models.json", "skills")
 LAUNCHER_NAME = "prime-agent-rs"
 TS_LAUNCHER_NAME = "prime-agent"
 RECEIPT_SCHEMA = "prime-agent-oneiron-rs.install/1"
@@ -99,7 +103,20 @@ if [ -L "$sock_dir" ] || [ ! -d "$sock_dir" ] || [ ! -O "$sock_dir" ]; then
 fi
 chmod 700 "$sock_dir"
 
-kernel_venv=${{PRIME_AGENT_RS_KERNEL_VENV:-$HOME/.prime/agent/kernel-venv-rs}}
+# Own agent dir: the TS fleet's ~/.prime/agent is shared mutable state the
+# Rust daemon would sweep, migrate and rewrite (session archiving, update
+# manifests, schedules, settings, OAuth refresh). The installer seeds it with
+# read-only links to models.json and skills/ and a one-time settings copy.
+agent_dir=${{PRIME_AGENT_RS_AGENT_DIR:-$HOME/.prime/agent-rs}}
+absolute PRIME_AGENT_RS_AGENT_DIR "$agent_dir"
+agent_dir=$(canon "$agent_dir")
+for protected in "$HOME/.prime/agent" "${{XDG_DATA_HOME:-$HOME/.local/share}}/prime/agent"; do
+  protected=$(canon "$protected")
+  if overlaps "$agent_dir" "$protected"; then die "refusing agent dir $agent_dir: it overlaps the TS agent dir $protected"; fi
+done
+if [ ! -e "$agent_dir" ]; then (umask 077 && mkdir -p "$agent_dir"); fi
+
+kernel_venv=${{PRIME_AGENT_RS_KERNEL_VENV:-$agent_dir/kernel-venv}}
 absolute PRIME_AGENT_RS_KERNEL_VENV "$kernel_venv"
 kernel_venv=$(canon "$kernel_venv")
 for protected in "$HOME/.prime/agent/kernel-venv" "${{XDG_DATA_HOME:-$HOME/.local/share}}/prime/agent/kernel-venv"; do
@@ -107,6 +124,7 @@ for protected in "$HOME/.prime/agent/kernel-venv" "${{XDG_DATA_HOME:-$HOME/.loca
   if overlaps "$kernel_venv" "$protected"; then die "refusing kernel venv $kernel_venv: it overlaps the TS kernel venv $protected"; fi
 done
 
+PRIME_AGENT_CODING_AGENT_DIR=$agent_dir
 PRIME_AGENT_SOCKET_DIR=$sock_dir
 PRIME_AGENT_DAEMON_SOCKET=$sock_dir/daemon.sock
 PRIME_AGENT_KERNEL_VENV=$kernel_venv
@@ -114,13 +132,15 @@ PRIME_AGENT_DISABLE_SELF_UPDATE=1
 PRIME_AGENT_RUST_INSTALLER_URL=http://127.0.0.1:1/oneiron-self-update-disabled
 PRIME_AGENT_DOWNLOAD_BASE_URL=http://127.0.0.1:1/oneiron-feed-disabled
 PI_SKIP_VERSION_CHECK=1
-export PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV PRIME_AGENT_DISABLE_SELF_UPDATE \\
-  PRIME_AGENT_RUST_INSTALLER_URL PRIME_AGENT_DOWNLOAD_BASE_URL PI_SKIP_VERSION_CHECK
-unset PI_PACKAGE_DIR PRIME_AGENT_KERNEL_PYTHON
+export PRIME_AGENT_CODING_AGENT_DIR PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV \\
+  PRIME_AGENT_DISABLE_SELF_UPDATE PRIME_AGENT_RUST_INSTALLER_URL PRIME_AGENT_DOWNLOAD_BASE_URL PI_SKIP_VERSION_CHECK
+# Inherited session-dir overrides would point the Rust daemon at TS sessions.
+unset PI_PACKAGE_DIR PRIME_AGENT_KERNEL_PYTHON PRIME_AGENT_SESSION_DIR PRIME_AGENT_CODING_AGENT_SESSION_DIR
 dir=$(cd "$prefix/current" && pwd -P)
 if [ "${{PRIME_AGENT_RS_PRINT_ENV:-}}" = 1 ]; then
   # The probe's view of what a real run gets (no binary is started).
-  printf '%s\\n' "PRIME_AGENT_SOCKET_DIR=$PRIME_AGENT_SOCKET_DIR" \\
+  printf '%s\\n' "PRIME_AGENT_CODING_AGENT_DIR=$PRIME_AGENT_CODING_AGENT_DIR" \\
+    "PRIME_AGENT_SOCKET_DIR=$PRIME_AGENT_SOCKET_DIR" \\
     "PRIME_AGENT_DAEMON_SOCKET=$PRIME_AGENT_DAEMON_SOCKET" "PRIME_AGENT_KERNEL_VENV=$PRIME_AGENT_KERNEL_VENV" \\
     "PRIME_AGENT_DISABLE_SELF_UPDATE=$PRIME_AGENT_DISABLE_SELF_UPDATE" \\
     "PRIME_AGENT_RUST_INSTALLER_URL=$PRIME_AGENT_RUST_INSTALLER_URL" \\
@@ -260,6 +280,34 @@ def extract_tarball(tarball: Path, into: Path) -> Path:
     return stage
 
 
+def seed_agent_dir(agent_dir: Path, ts_agent_dir: Path) -> dict:
+    """Create the Rust agent dir: links to the read-only shared inputs, a
+    one-time copy of settings.json, nothing else (no auth, no sessions)."""
+    if overlaps(agent_dir, ts_agent_dir):
+        raise SystemExit(f"error: agent dir {agent_dir} overlaps the TS agent dir {ts_agent_dir}")
+    agent_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    actions = {}
+    for name in SHARED_READ_ONLY:
+        source, target = ts_agent_dir / name, agent_dir / name
+        if target.exists() or target.is_symlink():
+            actions[name] = "kept"
+        elif source.exists():
+            target.symlink_to(source)
+            actions[name] = f"linked -> {source}"
+        else:
+            actions[name] = "absent in TS agent dir"
+    settings, settings_copy = ts_agent_dir / "settings.json", agent_dir / "settings.json"
+    if settings_copy.exists() or settings_copy.is_symlink():
+        actions["settings.json"] = "kept"
+    elif settings.is_file():
+        shutil.copyfile(settings, settings_copy)
+        settings_copy.chmod(0o600)
+        actions["settings.json"] = f"copied once from {settings}"
+    else:
+        actions["settings.json"] = "absent in TS agent dir"
+    return {"path": str(agent_dir), "seeded": actions}
+
+
 def write_launcher(bin_dir: Path, prefix: Path) -> Path:
     bin_dir.mkdir(parents=True, exist_ok=True)
     launcher = bin_dir / LAUNCHER_NAME
@@ -323,7 +371,10 @@ def install(args: argparse.Namespace) -> int:
 
     current_before = None
     launcher = bin_dir / LAUNCHER_NAME
+    agent = None
     if args.activate:
+        agent_dir = Path(os.environ.get("PRIME_AGENT_RS_AGENT_DIR") or DEFAULT_AGENT_DIR)
+        agent = seed_agent_dir(agent_dir, TS_AGENT_DIR)
         current_before = flip_current(prefix, version)
         launcher = write_launcher(bin_dir, prefix)
 
@@ -355,6 +406,7 @@ def install(args: argparse.Namespace) -> int:
         "activated": args.activate,
         "current": {"before": current_before, "after": version if args.activate else current_before},
         "launcher": ({"path": str(launcher), "sha256": sha256_file(launcher)} if args.activate else None),
+        "agentDir": agent,
         "tsLauncher": {"path": str(ts_launcher), "before": ts_before, "after": ts_after,
                        "unchanged": True},
         "versionCheck": version_check,
@@ -491,6 +543,7 @@ def probe(args: argparse.Namespace) -> int:
     ts_launcher_after = link_state(bin_dir / TS_LAUNCHER_NAME)
     ts_venv_after = [venv_fingerprint(venv) for venv in ts_venvs]
     checks = {
+        "agentDirOutsideTsAgentDir": not overlaps(Path(effective["PRIME_AGENT_CODING_AGENT_DIR"]), TS_AGENT_DIR),
         "socketDirOutsideTsState": not any(overlaps(rs_socket_dir, root) for root in protected_roots()),
         "kernelVenvOutsideTsVenvs": not any(overlaps(rs_venv, venv) for venv in ts_venvs),
         "selfUpdateDisabled": effective.get("PRIME_AGENT_DISABLE_SELF_UPDATE") == "1",
