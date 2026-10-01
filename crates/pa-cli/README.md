@@ -76,7 +76,11 @@ session. Flags the create contract cannot carry (`--no-skills`,
 `--no-prompt-templates`, `--no-context-files`, `--goal`, `--offline`,
 `--fork`) fail before any daemon starts, and so do a factory seat's
 `W7_CARGO_*` launch overlay (a daemon worker runs with the daemon's
-environment) and the flag in rpc/acp mode. Each print/json run reports `agent headless invoked` (mode,
+environment) and the flag in rpc/acp mode. Ambient process policy such as
+`PI_OFFLINE` reaches a daemon this run starts, not one already running. A
+prompt whose route budget runs out counts as running only when its own
+user message started on the stream; otherwise the run fails rather than
+report a prompt that may never have run. Each print/json run reports `agent headless invoked` (mode,
 daemon_hosted, json_event_profile). Verifiers: `headless_flags_e2e`,
 `hosted_print_e2e`.
 

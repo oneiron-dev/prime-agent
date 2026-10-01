@@ -15,7 +15,6 @@
 //! seen must have its `agent_end`, before the run counts as finished.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,9 +91,10 @@ pub struct HostedHeadlessSession {
     link: Arc<DaemonLink>,
     active_session_id: String,
     progress: watch::Sender<StreamProgress>,
-    /// `agent_start` frames received, counted by the frame consumer in
-    /// wire order, so a response sees every run start that preceded it.
-    runs_started_on_wire: Arc<AtomicU64>,
+    /// The text of every user message that started on the wire, recorded
+    /// by the frame consumer in wire order, so a response sees every user
+    /// row that preceded it.
+    user_messages_on_wire: Arc<std::sync::Mutex<Vec<String>>>,
     /// The frames the consumer forwarded, waiting for the sink.
     pending_events: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
 }
@@ -113,25 +113,28 @@ impl HostedHeadlessSession {
     ) -> anyhow::Result<(Self, HostedSessionOpened)> {
         let link = Arc::new(DaemonLink::connect(&options.socket_path, "headless").await?);
         let (event_tx, event_rx) = mpsc::unbounded_channel::<Value>();
-        let runs_started_on_wire = Arc::new(AtomicU64::new(0));
+        let user_messages_on_wire = Arc::new(std::sync::Mutex::new(Vec::new()));
         // The consumer owns the frame order: an event observed before a
-        // response is forwarded (and counted) before that response
+        // response is forwarded (and recorded) before that response
         // resolves its caller.
         {
             let link = Arc::clone(&link);
-            let runs_started_on_wire = Arc::clone(&runs_started_on_wire);
+            let user_messages_on_wire = Arc::clone(&user_messages_on_wire);
             tokio::spawn(async move {
                 let mut frames = link.frames.lock().await;
                 while let Some(frame) = frames.recv().await {
                     match frame {
                         LinkFrame::Response(response) => link.resolve(response),
                         LinkFrame::Event(frame) => {
-                            let event_type = frame
-                                .get("event")
-                                .and_then(|event| event.get("type"))
-                                .and_then(Value::as_str);
-                            if event_type == Some("agent_start") {
-                                runs_started_on_wire.fetch_add(1, Ordering::SeqCst);
+                            let event = frame.get("event").unwrap_or(&Value::Null);
+                            let message = event.get("message").unwrap_or(&Value::Null);
+                            if event.get("type").and_then(Value::as_str) == Some("message_start")
+                                && message.get("role").and_then(Value::as_str) == Some("user")
+                            {
+                                user_messages_on_wire
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(user_message_text(message));
                             }
                             let _ = event_tx.send(frame);
                         }
@@ -148,7 +151,7 @@ impl HostedHeadlessSession {
             link,
             active_session_id: String::new(),
             progress: watch::Sender::new(StreamProgress::default()),
-            runs_started_on_wire,
+            user_messages_on_wire,
             pending_events: std::sync::Mutex::new(Some(event_rx)),
         };
         session.establish(options).await
@@ -303,24 +306,27 @@ impl HostedHeadlessSession {
     }
 
     /// Run one prompt to its settled turn (`prompt_and_wait`). A turn that
-    /// outlives the supervisor's route budget is still running: when an
-    /// agent run started on the wire after the prompt was sent, the client
-    /// waits for the session to go idle instead of failing it.
+    /// outlives the supervisor's route budget is still running: when this
+    /// prompt's user message started on the wire after it was sent, the
+    /// client waits for the session to go idle instead of failing it.
     ///
     /// # Errors
     ///
     /// Returns the prompt's rejection (the worker's admission or settle
-    /// error), the route budget's timeout when no run started after the
-    /// prompt (the same failure answers a prompt that never reached the
-    /// worker, so nothing proves it ran), or a transport failure.
+    /// error), the route budget's timeout when this prompt's user message
+    /// was not seen to start (the same failure answers a prompt that never
+    /// reached the worker; a prompt the worker rewrote, such as an expanded
+    /// template, fails this way too rather than counting as run), or a
+    /// transport failure.
     pub async fn prompt(&self, prompt: HostedPrompt) -> anyhow::Result<()> {
         let images = (!prompt.images.is_empty())
             .then(|| serde_json::to_value(&prompt.images))
             .transpose()?;
+        let message = prompt.message;
         let command = DaemonCommand::PromptAndWait {
             id: None,
             active_session_id: self.active_session_id.clone(),
-            message: prompt.message,
+            message: message.clone(),
             input: PromptInput {
                 content: None,
                 images,
@@ -337,13 +343,22 @@ impl HostedHeadlessSession {
             },
             rest: Map::default(),
         };
-        let runs_before = self.runs_started_on_wire.load(Ordering::SeqCst);
+        let seen_before = self
+            .user_messages_on_wire
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
         let response = self
             .link
             .request(command, ResponseWait::UntilAnswered)
             .await?;
         if is_route_timeout(&response) {
-            if self.runs_started_on_wire.load(Ordering::SeqCst) == runs_before {
+            let started = self
+                .user_messages_on_wire
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[seen_before..]
+                .contains(&message);
+            if !started {
                 anyhow::bail!(
                     "{SESSION_WORKER_TIMED_OUT} before the prompt was seen to start; it may not have run"
                 );
@@ -428,14 +443,17 @@ impl HostedHeadlessSession {
     }
 
     /// The session's messages (`get_messages`), for the text-mode result.
-    /// Each message decodes on its own: a row the session types do not
-    /// model (an in-process run's harness digest carries an ISO timestamp)
-    /// is skipped, like the in-process terminal selection drops what its
-    /// round trip cannot carry, instead of failing the whole read.
+    /// The daemon's session view rejoins a `custom_message` entry with the
+    /// entry's ISO timestamp; the message form (TS `createCustomMessage`)
+    /// carries epoch milliseconds, so custom rows convert before decoding
+    /// and keep the terminal rows they carry (command results, compaction
+    /// outcomes).
     ///
     /// # Errors
     ///
-    /// Returns the daemon's refusal or a transport failure.
+    /// Returns the daemon's refusal, a transport failure, or a row the
+    /// session types cannot read (never silently dropped: a missing row
+    /// could change the run's output or exit code).
     pub async fn messages(&self) -> anyhow::Result<Vec<pa_types::session::AgentMessage>> {
         let command = DaemonCommand::GetMessages {
             id: None,
@@ -443,13 +461,25 @@ impl HostedHeadlessSession {
             rest: Map::default(),
         };
         let data = success_data(self.link.request(command, REQUEST_BOUND).await?)?;
-        Ok(data
-            .get("messages")
+        data.get("messages")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter_map(|message| serde_json::from_value(message.clone()).ok())
-            .collect())
+            .map(|message| {
+                let mut message = message.clone();
+                if message.get("role").and_then(Value::as_str) == Some("custom") {
+                    if let Some(millis) = message
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .and_then(crate::util::iso_to_unix_ms)
+                    {
+                        message["timestamp"] = Value::from(millis);
+                    }
+                }
+                serde_json::from_value(message)
+                    .map_err(|error| anyhow::anyhow!("unreadable session message: {error}"))
+            })
+            .collect()
     }
 
     /// Leave the session running: detach (bounded), then close the
@@ -513,6 +543,18 @@ fn stream_frame(
             true
         }
         _ => false,
+    }
+}
+
+/// A user message's text: its string content, or its text blocks joined.
+fn user_message_text(message: &Value) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect(),
+        _ => String::new(),
     }
 }
 
