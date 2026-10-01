@@ -14,7 +14,10 @@ unless the Rust supervisor is idle, and idle is proven, never assumed:
                  path in its hello, or an executable outside the prefix); it is
                  never sent a command
   unknown        no hello, a failed or timed-out `list`, or not a socket
-  refused        the path overlaps TS state; it is never connected to
+  refused        the path overlaps TS state (under $TMPDIR or /tmp); it is
+                 never connected to
+  replaced       (retiring only) a supervisor other than the one checked
+                 before the swap answers; it is sent nothing
 
 Only absent, not-listening and idle permit the swap. The check speaks the
 daemon wire (newline-delimited JSON: the supervisor's `daemon_hello`, then a
@@ -23,12 +26,20 @@ daemon wire (newline-delimited JSON: the supervisor's `daemon_hello`, then a
 pa-cli's `probe_daemon` does. It never scans for daemons and never touches
 the TS socket dir.
 
-It stops nothing unless asked (`inspect(..., retire=True)`, behind
---retire-idle-daemon): a supervisor of another version with the same
+It stops nothing unless asked (`inspect(..., retire=<expected identity>)`,
+behind --retire-idle-daemon): a supervisor of another release with the same
 protocol and schema stays `current` to new clients and spawns every worker
 from its own binary, so after a swap it keeps new sessions on the old
-version until it exits. Retiring sends `shutdown` (never forced) on the
-same connection that just found it idle and ours.
+release until it exits. Retiring checks that the hello on the retiring
+connection is the supervisor observed before the swap (pid, process start
+and executable), sends `list` again, and only on an empty answer sends
+`shutdown` (never forced) on that same connection. That is the narrowest
+fence the daemon wire offers, not an atomic one: the supervisor accepts
+`shutdown` unconditionally, so a session another client creates between
+that `list` answer and the `shutdown` would be stopped too (the same
+window as pa-cli's own stale-daemon replacement,
+crates/pa-cli/src/interactive_mode/daemon.rs shutdown_stale_daemon). A
+supervisor with sessions in its `list` answer is never sent `shutdown`.
 """
 
 from __future__ import annotations
@@ -45,6 +56,8 @@ import side_by_side as sbs
 
 DAEMON_PROTOCOL_NAME = "prime-agent.daemon"
 IDLE_STATES = frozenset({"absent", "not-listening", "idle"})
+# What makes the retiring connection's supervisor the one observed earlier.
+RETIRE_IDENTITY = ("supervisorPid", "supervisorProcessStartId", "executablePath")
 CONNECT_TIMEOUT_SECONDS = 2.0
 # pa-cli's probe_daemon waits 1.5s for the hello and 30s for `list` (a busy
 # supervisor answers list from every worker's state).
@@ -107,6 +120,20 @@ def hello_identity(hello: dict) -> dict:
     }
 
 
+def install_of(identity: dict, prefix: Path) -> str | None:
+    """The install (<prefix>/<version>/) whose executable the supervisor
+    runs, or None when its executable is not in one. Linux reports a
+    replaced binary as "<path> (deleted)"."""
+    executable = identity.get("executablePath")
+    if not isinstance(executable, str):
+        return None
+    try:
+        relative = Path(executable.removesuffix(" (deleted)")).resolve().relative_to(prefix.resolve())
+    except ValueError:
+        return None
+    return relative.parts[0] if len(relative.parts) == 2 and relative.parts[1] == "prime-agent" else None
+
+
 def foreign_reason(identity: dict, socket_path: Path, prefix: Path) -> str | None:
     """Why this hello is not the Rust supervisor of this install, or None."""
     protocol = identity["protocol"]
@@ -115,13 +142,8 @@ def foreign_reason(identity: dict, socket_path: Path, prefix: Path) -> str | Non
     hello_socket = identity["helloSocketPath"]
     if not isinstance(hello_socket, str) or Path(hello_socket).resolve() != socket_path.resolve():
         return f"its hello names socket {hello_socket!r}, not {socket_path}"
-    executable = identity["executablePath"]
-    if not isinstance(executable, str):
-        return "its hello carries no runtime executable path"
-    # Linux reports a replaced binary as "<path> (deleted)".
-    executable_path = Path(executable.removesuffix(" (deleted)")).resolve()
-    if not sbs.is_within(executable_path, prefix.resolve()):
-        return f"its executable {executable} is not under {prefix}"
+    if install_of(identity, prefix) is None:
+        return f"its executable {identity['executablePath']!r} is not an install's prime-agent under {prefix}"
     return None
 
 
@@ -148,12 +170,14 @@ def wait_until_gone(socket_path: Path, deadline: float) -> bool:
         time.sleep(0.1)
 
 
-def inspect(socket_path: Path, prefix: Path, *, retire: bool = False) -> dict:
+def inspect(socket_path: Path, prefix: Path, *, retire: dict | None = None) -> dict:
     """The Rust supervisor at socket_path, classified (see the module doc).
 
-    retire=True also stops it, but only when this same connection found it
-    idle and ours: `shutdown` (never forced), then a bounded wait until the
-    socket stops accepting. Recorded under "retire"."""
+    retire=<the RETIRE_IDENTITY fields observed before the swap> also stops
+    it, but only when this connection's hello is that same supervisor and
+    its `list` comes back empty: `shutdown` (never forced) on this
+    connection, then a bounded wait until the socket stops accepting.
+    Recorded under "retire"."""
     socket_path = Path(os.path.abspath(socket_path))
     report: dict = {"socket": str(socket_path)}
     for root in sbs.protected_roots():
@@ -182,6 +206,12 @@ def inspect(socket_path: Path, prefix: Path, *, retire: bool = False) -> dict:
         problem = foreign_reason(report, socket_path, prefix)
         if problem:
             return {**report, "state": "foreign", "detail": problem}
+        if retire is not None and {key: report[key] for key in RETIRE_IDENTITY} != retire:
+            # Another supervisor answers now: it was never checked, so it is
+            # sent nothing at all.
+            return {**report, "state": "replaced",
+                    "retire": {"acknowledged": False, "stopped": False,
+                               "detail": "a different supervisor answers than the one checked before the swap"}}
         request_id, request = command_envelope(hello, "list")
         try:
             conn.sendall(request)
@@ -196,7 +226,7 @@ def inspect(socket_path: Path, prefix: Path, *, retire: bool = False) -> dict:
         if response.get("success") is not True or not isinstance(sessions, list):
             return {**report, "state": "unknown", "detail": f"list failed: {response.get('error')!r}"}
         report.update(state="busy" if sessions else "idle", sessionCount=len(sessions))
-        if not retire or sessions:
+        if retire is None or sessions:
             return report
         request_id, request = command_envelope(hello, "shutdown")
         try:

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -110,17 +111,31 @@ def git(root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def dirty_digest(root: Path) -> str:
+    """One sha256 over a checkout's uncommitted state: the binary diff
+    against HEAD plus every untracked, unignored file by name and content,
+    so an allowed dirty release names exactly what it carried."""
+    diff = subprocess.run(["git", "-C", str(root), "diff", "HEAD", "--binary"], capture_output=True, check=True)
+    digest = hashlib.sha256(diff.stdout)
+    untracked = git(root, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
+    for name in sorted(filter(None, untracked)):
+        digest.update(f"\0{name}\0{sbs.sha256_file(root / name)}".encode())
+    return digest.hexdigest()
+
+
 def source_facts(root: Path, allow_dirty: bool) -> dict:
     """What the release attests it was built from. The binary carries no
-    commit of its own, so this is the checkout the operator names; a dirty
-    one is refused unless explicitly allowed (and then recorded)."""
+    commit of its own, so this is the checkout the operator packages from,
+    recorded as such (`attestedBy`); a dirty one is refused unless
+    explicitly allowed, and then its exact uncommitted state is digested."""
     root = root.resolve()
     dirty = bool(git(root, "status", "--porcelain"))
     if dirty and not allow_dirty:
         raise SystemExit(f"error: {root} has uncommitted changes; commit them or pass --allow-dirty")
     return {"commit": git(root, "rev-parse", "HEAD"), "tree": git(root, "rev-parse", "HEAD^{tree}"),
             "build": git(root, "describe", "--always", "--dirty"), "dirty": dirty,
-            "rustBase": sbs.git_facts(root)["rustBase"]}
+            "dirtySha256": dirty_digest(root) if dirty else None,
+            "attestedBy": "packaging-checkout", "rustBase": sbs.git_facts(root)["rustBase"]}
 
 
 def read_package_dir(package_dir: Path) -> tuple[str, str, Path, str]:
@@ -179,14 +194,16 @@ def decoder_row(decoder: Path, binary: Path, base: str, version: str, platform: 
 
 def place_artifact(source: Path, target: Path, sha256: str) -> None:
     """Copy an artifact into the release dir; one already there must be the
-    same bytes (a re-run), never replaced."""
+    same bytes (a re-run), never replaced. The copy goes through a
+    no-follow temp, so a planted link is never written through."""
     if target.exists() or target.is_symlink():
         if target.is_symlink() or sbs.sha256_file(target) != sha256:
             raise SystemExit(f"error: {target} already exists with different bytes; releases are immutable, "
                              "bump the build number")
         return
     temp = target.parent / f".{target.name}.tmp-{os.getpid()}"
-    shutil.copyfile(source, temp)
+    with source.open("rb") as reader, sbs.open_new(temp) as writer:
+        shutil.copyfileobj(reader, writer)
     os.replace(temp, target)
 
 
@@ -196,8 +213,8 @@ def publish(feed_dir: Path, version: str, base: str, source: dict, row: dict, ta
     under the feed lock, artifacts first, then SHA256SUMS, manifest.json and
     the pointers (each replaced atomically). A re-run of an already published
     platform with the same bytes changes nothing but may still promote."""
-    release_dir = feed_dir / "releases" / f"v{version}"
     with sbs.locked(feed_dir):
+        release_dir = sbs.plain_dir(feed_dir, "releases", f"v{version}")
         manifest_path = release_dir / "manifest.json"
         manifest = (json.loads(manifest_path.read_text()) if manifest_path.is_file() else
                     {"schema": FEED_SCHEMA, "version": f"v{version}", "package": "prime-agent",
@@ -211,10 +228,6 @@ def publish(feed_dir: Path, version: str, base: str, source: dict, row: dict, ta
         if existing and existing[0]["sha256"] != row["sha256"]:
             raise SystemExit(f"error: v{version} already publishes {row['platform']} with different bytes "
                              f"({existing[0]['sha256']}); releases are immutable, bump the build number")
-        if existing and existing[0].get("decoder") != row["decoder"]:
-            raise SystemExit(f"error: v{version} published {row['platform']} with decoder "
-                             f"{existing[0].get('decoder')!r}, this run says {row['decoder']!r}; releases are "
-                             "immutable, bump the build number")
         release_dir.mkdir(parents=True, exist_ok=True)
         place_artifact(tarball, release_dir / row["file"], row["sha256"])
         if decoder is not None:
@@ -228,9 +241,7 @@ def publish(feed_dir: Path, version: str, base: str, source: dict, row: dict, ta
             manifest["buildAt"] = min(entry["buildAt"] for entry in manifest["binaries"])
             artifacts = sorted(manifest["binaries"] + manifest["decoders"], key=lambda entry: entry["file"])
             sums = "".join(f"{entry['sha256']}  {entry['file']}\n" for entry in artifacts)
-            temp_sums = release_dir / f".SHA256SUMS.tmp-{os.getpid()}"
-            temp_sums.write_text(sums)
-            os.replace(temp_sums, release_dir / "SHA256SUMS")
+            sbs.replace_file(release_dir / "SHA256SUMS", sums.encode())
             sbs.write_json_atomic(manifest_path, manifest)
         # The pointers only move forward.
         promoted = False
@@ -238,9 +249,7 @@ def publish(feed_dir: Path, version: str, base: str, source: dict, row: dict, ta
         stable = stable_path.read_text().strip().removeprefix("v") if stable_path.is_file() else None
         if promote and (stable is None or version_key(version) >= version_key(stable)):
             sbs.write_json_atomic(feed_dir / "latest.json", manifest)
-            temp_stable = feed_dir / f".stable.tmp-{os.getpid()}"
-            temp_stable.write_text(f"v{version}\n")
-            os.replace(temp_stable, stable_path)
+            sbs.replace_file(stable_path, f"v{version}\n".encode())
             promoted = True
         elif promote:
             print(f"note: the feed's stable pointer names the newer v{stable}; left in place")
@@ -261,9 +270,9 @@ def package(args: argparse.Namespace) -> int:
     if platform != host_platform():
         raise SystemExit(f"error: package {platform} on the host that built it (this is {host_platform()}): "
                          "the staged binary is run to probe its versions")
-    if platform.startswith("linux-") and not (args.decoder or args.no_decoder):
+    if platform.startswith("linux-") and not args.decoder:
         raise SystemExit("error: a Linux release carries its split-debug decoder: pass --decoder "
-                         f"<prime-agent-{base}-{platform}.debug.gz> (or --no-decoder to publish without one)")
+                         f"<prime-agent-{base}-{platform}.debug.gz> (scripts/package_release.py writes it)")
     if not platform.startswith("linux-") and args.decoder:
         raise SystemExit("error: --decoder is only for Linux releases")
     package_release.validate(stage, base)
@@ -297,7 +306,9 @@ def package(args: argparse.Namespace) -> int:
                "sha256": sbs.sha256_file(tarball), "executableSha256": executable_sha256,
                "bytes": tarball.stat().st_size, "compiledVersion": compiled,
                "buildAt": utc_from_mtime(stage / "prime-agent"), "catalog": catalog,
-               "decoder": "omitted" if args.no_decoder else ("attached" if args.decoder else "not-applicable")}
+               "decoder": "attached" if args.decoder else "not-applicable"}
+        # Linux: upstream's split-debug gates (no DWARF left in the shipped
+        # ELF, the decoder paired by GNU build ID) run on every release.
         decoder = (decoder_row(args.decoder.expanduser(), stage / "prime-agent", base, version, platform, scratch)
                    if args.decoder else None)
         result = publish(feed_dir, version, base, source, row, tarball, decoder, args.promote)

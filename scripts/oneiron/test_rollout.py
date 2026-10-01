@@ -2,14 +2,17 @@
 """Contract tests for `side_by_side.py rollout|rollback|status` (rollout.py, daemon_idle.py).
 
 Run: python3 scripts/oneiron/test_rollout.py. Every path is a temp dir (HOME,
-TMPDIR, the TS launcher and agent dir, the prefix, the feed); the Rust
-"daemon" is a scripted unix-socket server speaking the hello/list frames;
-the binary is release_feed's fake. No network, no real daemon, no real prefix.
+TMPDIR, the system temp root, the TS launcher and agent dir, the prefix, the
+feed); the Rust "daemon" is a scripted unix-socket server speaking the
+hello/list/shutdown frames; the binary is release_feed's fake. No network,
+no real daemon, no real prefix.
 """
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
+import io
 import json
 import os
 import socket
@@ -19,6 +22,8 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from typing import Callable
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import daemon_idle  # noqa: E402
@@ -31,35 +36,40 @@ PLATFORM = fixtures.PLATFORM
 V1 = "0.9.8-oneiron.20261001.1"
 V2 = "0.9.8-oneiron.20261001.2"
 ENV_KEYS = ("HOME", "TMPDIR", "XDG_DATA_HOME", "PRIME_AGENT_RS_AGENT_DIR", "PRIME_AGENT_RS_SOCKET_DIR",
-            "PRIME_AGENT_RS_KERNEL_VENV", "FAKE_PROBE_FAIL", "PI_PACKAGE_DIR", "PRIME_AGENT_KERNEL_PYTHON")
+            "PRIME_AGENT_RS_KERNEL_VENV", "FAKE_PROBE_FAIL", "FAKE_PROBE_MUTATE", "PI_PACKAGE_DIR",
+            "PRIME_AGENT_KERNEL_PYTHON", "PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX")
 
 
 class FakeRustDaemon:
-    """A scripted supervisor on a unix socket: each connection gets the hello,
-    `list` gets `sessions`, and `shutdown` removes the socket (as the real
-    supervisor does on exit) before it answers. It serves exactly
-    `connections` connections and records every request it reads."""
+    """A scripted supervisor on a unix socket: connection N gets hellos[N]
+    (the last one repeats), `list` gets `sessions` (after on_list runs), and
+    `shutdown` removes the socket (as the real supervisor does on exit)
+    before it answers. It serves exactly `connections` connections and
+    records every request it reads."""
 
-    def __init__(self, path: Path, hello: dict, sessions: list, connections: int) -> None:
+    def __init__(self, path: Path, hellos: list[dict], sessions: list, connections: int,
+                 on_list: Callable[[], None] | None = None) -> None:
         self.path = path
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server.bind(str(path))
         self.server.listen(8)
-        self.hello, self.sessions, self.received = hello, sessions, []
+        self.hellos, self.sessions, self.on_list, self.received = hellos, sessions, on_list, []
         self.thread = threading.Thread(target=self.serve, args=(connections,), daemon=True)
         self.thread.start()
 
     def serve(self, connections: int) -> None:
-        for _ in range(connections):
+        for index in range(connections):
             conn, _ = self.server.accept()
             with conn, conn.makefile("rb") as reader:
-                conn.sendall((json.dumps(self.hello) + "\n").encode())
+                conn.sendall((json.dumps(self.hellos[min(index, len(self.hellos) - 1)]) + "\n").encode())
                 for line in reader:
                     request = json.loads(line)
                     self.received.append(request)
                     kind = request["command"]["type"]
                     response = {"type": "response", "id": request["id"], "command": kind, "success": True}
                     if kind == "list":
+                        if self.on_list is not None:
+                            self.on_list()
                         response["data"] = {"sessions": self.sessions}
                     else:
                         self.server.close()
@@ -82,8 +92,11 @@ class RolloutFixture(unittest.TestCase):
         self.home.mkdir()
         self.fake_tmp = self.root / "tmp"
         self.fake_tmp.mkdir()
+        self.system_tmp = self.root / "systmp"
+        self.system_tmp.mkdir()
         self.saved_env = {key: os.environ.get(key) for key in ENV_KEYS}
-        for key in ("FAKE_PROBE_FAIL", "PI_PACKAGE_DIR", "PRIME_AGENT_KERNEL_PYTHON"):
+        for key in ("FAKE_PROBE_FAIL", "FAKE_PROBE_MUTATE", "PI_PACKAGE_DIR", "PRIME_AGENT_KERNEL_PYTHON",
+                    "PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX"):
             os.environ.pop(key, None)
         os.environ.update({
             "HOME": str(self.home), "TMPDIR": str(self.fake_tmp),
@@ -93,11 +106,12 @@ class RolloutFixture(unittest.TestCase):
             "PRIME_AGENT_RS_SOCKET_DIR": str(self.root / "s"),
             "PRIME_AGENT_RS_KERNEL_VENV": str(self.root / "venv-rs"),
         })
-        self.saved = (side_by_side.HOME, side_by_side.TS_PREFIX, side_by_side.TS_AGENT_DIR,
+        self.saved = (side_by_side.HOME, side_by_side.TS_PREFIX, side_by_side.TS_AGENT_DIR, side_by_side.SYSTEM_TMP,
                       release_feed.host_platform)
         side_by_side.HOME = self.home
         side_by_side.TS_PREFIX = self.home / ".local" / "share" / "prime-agent-oneiron"
         side_by_side.TS_AGENT_DIR = self.home / ".prime" / "agent"
+        side_by_side.SYSTEM_TMP = self.system_tmp
         side_by_side.TS_AGENT_DIR.mkdir(parents=True)
         (side_by_side.TS_AGENT_DIR / "models.json").write_text('{"providers": {}}')
         (side_by_side.TS_AGENT_DIR / "auth.json").write_text('{"secret": true}')
@@ -112,7 +126,7 @@ class RolloutFixture(unittest.TestCase):
         self.source = fixtures.make_source_repo(self.root / "src")
 
     def tearDown(self) -> None:
-        (side_by_side.HOME, side_by_side.TS_PREFIX, side_by_side.TS_AGENT_DIR,
+        (side_by_side.HOME, side_by_side.TS_PREFIX, side_by_side.TS_AGENT_DIR, side_by_side.SYSTEM_TMP,
          release_feed.host_platform) = self.saved
         for key, value in self.saved_env.items():
             if value is None:
@@ -127,8 +141,7 @@ class RolloutFixture(unittest.TestCase):
     def publish(self, version: str) -> None:
         package_dir = fixtures.make_package_dir(self.root / f"pkg-{version}")
         self.assertEqual(self.main("package", "--package-dir", str(package_dir), "--version", version,
-                                   "--source-root", str(self.source), "--allow-fixture-catalog",
-                                   "--no-decoder"), 0)
+                                   "--source-root", str(self.source), "--allow-fixture-catalog"), 0)
 
     def receipt(self, version: str, name: str = "ACTIVATION-RECEIPT.json") -> dict:
         return json.loads((self.prefix / "receipts" / f"{version}-{PLATFORM}" / name).read_text())
@@ -137,17 +150,20 @@ class RolloutFixture(unittest.TestCase):
         return subprocess.run([str(self.bin_dir / "prime-agent-rs"), "--version"], check=True,
                               capture_output=True, text=True).stdout.strip()
 
-    def rust_hello(self, executable: Path | None = None) -> dict:
+    def rust_hello(self, version: str = V1, pid: int = 4242) -> dict:
+        """The real supervisor's hello: appVersion is the compiled Cargo
+        version, the release shows only in the executable path."""
         return {"type": "daemon_hello", "socketPath": str(self.socket_path),
                 "protocol": {"name": "prime-agent.daemon", "version": 7}, "schemaId": "protocol-7-schema-28",
-                "appVersion": V1, "supervisorPid": 4242, "supervisorProcessStartId": "start-1",
-                "runtime": {"buildId": "build-1",
-                            "executablePath": str(executable or self.prefix / V1 / "prime-agent")},
+                "appVersion": "0.9.8", "supervisorPid": pid, "supervisorProcessStartId": f"start-{pid}",
+                "runtime": {"buildId": "pa-daemon-rs-0.9.8",
+                            "executablePath": str(self.prefix / version / "prime-agent")},
                 "clientId": "c", "serverCapabilities": []}
 
-    def daemon(self, sessions: list, connections: int, hello: dict | None = None) -> FakeRustDaemon:
+    def daemon(self, sessions: list, connections: int, hellos: list[dict] | None = None,
+               on_list: Callable[[], None] | None = None) -> FakeRustDaemon:
         self.socket_path.parent.mkdir(exist_ok=True)
-        return FakeRustDaemon(self.socket_path, hello or self.rust_hello(), sessions, connections)
+        return FakeRustDaemon(self.socket_path, hellos or [self.rust_hello()], sessions, connections, on_list)
 
 
 class RolloutTests(RolloutFixture):
@@ -168,8 +184,8 @@ class RolloutTests(RolloutFixture):
             "schema": rollout.ACTIVATION_SCHEMA, "status": "activated", "phase": "old-daemon", "failure": None,
             "version": V1, "platform": PLATFORM,
             "checks": {"releaseVerified": True, "idleBeforeInstall": True, "payloadMatchesRelease": True,
-                       "probeOk": True, "idleBeforeSelect": True, "launcherVersion": True,
-                       "tsLauncherUnchanged": True},
+                       "probeOk": True, "idleBeforeSelect": True, "payloadUnchangedAtSelect": True,
+                       "launcherVersion": True, "tsLauncherUnchanged": True},
             "before": {"current": None, "previous": None, "launcher": {"kind": "absent"}, "tsLauncher": ts_before},
             "after": {"current": V1, "previous": None, "launcher": launcher_after, "tsLauncher": ts_before},
             "install": {"dir": str(self.prefix / V1), "reused": False,
@@ -192,6 +208,12 @@ class RolloutTests(RolloutFixture):
         self.assertEqual(sorted(receipt["timings"]),
                          sorted(["verify", "idle-check", "install", "agent-dir", "probe", "idle-recheck",
                                  "select", "post-check", "old-daemon", "total"]))
+        # The probe's skill import left its bytecode in the Rust agent dir's
+        # cache, not in the immutable install.
+        self.assertEqual(list((self.prefix / V1).rglob("__pycache__")), [])
+        cache = self.root / "agent-rs" / "python-cache"
+        self.assertEqual([path.parent.relative_to(cache) for path in cache.rglob("demo_skill.*.pyc")],
+                         [Path(*(self.prefix / V1 / "skills" / "demo").resolve().parts[1:])])
         # The agent dir is seeded (models.json linked, never auth.json); TS untouched.
         self.assertEqual(os.readlink(self.root / "agent-rs" / "models.json"),
                          str(side_by_side.TS_AGENT_DIR / "models.json"))
@@ -217,20 +239,32 @@ class RolloutTests(RolloutFixture):
                                                         "checks", "launcherVersion")}, {
             "schema": rollout.ROLLBACK_SCHEMA, "status": "rolled-back", "failure": None,
             "fromVersion": V2, "toVersion": V1,
-            "checks": {"vouchedByReceipt": True, "idleBeforeSelect": True, "launcherVersion": True,
-                       "tsLauncherUnchanged": True},
+            "checks": {"vouchedByReceipt": True, "idleBeforeSelect": True, "payloadUnchangedAtSelect": True,
+                       "launcherVersion": True, "tsLauncherUnchanged": True},
             "launcherVersion": {"stdout": V1, "exitCode": 0}})
-        # V1's activation receipt vouches for exactly the installed payload.
+        # V1's activation receipt vouches for exactly the installed payload,
+        # which ran a probe (a skill import) without changing.
         activation = self.receipt(V1)
         installed = {"sha256": activation["release"]["executableSha256"],
                      "payloadSha256": activation["install"]["payloadSha256"]}
         self.assertEqual(receipt["executable"], {**installed, "vouchedBy": [
-            {"file": path.name, "executableSha256": installed["sha256"], "payloadSha256": installed["payloadSha256"]}
-            for path in sorted((self.prefix / "receipts" / f"{V1}-{PLATFORM}").glob("ACTIVATION-RECEIPT*.json"))]})
+            {"file": "ACTIVATION-RECEIPT.json", "executableSha256": installed["sha256"],
+             "payloadSha256": installed["payloadSha256"]}]})
         # Rolling back again toggles forward.
         self.assertEqual(self.main("rollback"), 0)
         self.assertEqual((os.readlink(self.prefix / "current"), self.launcher_version()), (V2, V2))
-        self.assertEqual(self.main("rollout", "--version", V2), 0)  # already current: a no-op
+
+    def test_rolling_out_the_current_version_again_reverifies_and_completes_it(self) -> None:
+        self.publish(V1)
+        self.assertEqual(self.main("rollout", "--version", V1), 0)
+        # A half-finished state: the launcher is gone. A re-run is not a
+        # no-op: it runs every phase and leaves a complete activation.
+        (self.bin_dir / "prime-agent-rs").unlink()
+        self.assertEqual(self.main("rollout", "--version", V1), 0)
+        receipt = self.receipt(V1)
+        self.assertEqual((receipt["status"], receipt["before"]["current"], receipt["after"]["current"],
+                          receipt["install"]["reused"], self.launcher_version()), ("activated", V1, V1, True, V1))
+        self.assertEqual(len(list((self.prefix / "receipts" / f"{V1}-{PLATFORM}").glob("ACTIVATION-RECEIPT*.json"))), 2)
 
     def test_a_busy_rust_daemon_refuses_the_rollout_before_anything_is_written(self) -> None:
         self.publish(V1)
@@ -265,8 +299,8 @@ class RolloutTests(RolloutFixture):
         self.assertEqual(observed, {
             "socket": str(self.socket_path), "state": "idle", "sessionCount": 0,
             "protocol": {"name": "prime-agent.daemon", "version": 7}, "schemaId": "protocol-7-schema-28",
-            "appVersion": V1, "supervisorPid": 4242, "supervisorProcessStartId": "start-1",
-            "helloSocketPath": str(self.socket_path), "buildId": "build-1",
+            "appVersion": "0.9.8", "supervisorPid": 4242, "supervisorProcessStartId": "start-4242",
+            "helloSocketPath": str(self.socket_path), "buildId": "pa-daemon-rs-0.9.8",
             "executablePath": str(self.prefix / V1 / "prime-agent")})
         # The exact wire envelope: protocol echoed from the hello, a list
         # command and nothing else.
@@ -279,9 +313,8 @@ class RolloutTests(RolloutFixture):
         self.publish(V1)
         self.publish(V2)
         self.assertEqual(self.main("rollout", "--version", V1), 0)
-        old_hello = self.rust_hello(executable=self.prefix / V1 / "prime-agent")
 
-        daemon = self.daemon(sessions=[], connections=2, hello=old_hello)
+        daemon = self.daemon(sessions=[], connections=2, hellos=[self.rust_hello(V1)])
         self.assertEqual(self.main("rollout", "--version", V2), 0)
         daemon.finish()
         self.assertEqual([request["command"]["type"] for request in daemon.received], ["list", "list"])
@@ -291,8 +324,8 @@ class RolloutTests(RolloutFixture):
         self.assertTrue(self.socket_path.exists())
         self.socket_path.unlink()
 
-        # Rolling back to V1, the version that supervisor runs: nothing to retire.
-        daemon = self.daemon(sessions=[], connections=1, hello=old_hello)
+        # Rolling back to V1, the release that supervisor runs: nothing to retire.
+        daemon = self.daemon(sessions=[], connections=1, hellos=[self.rust_hello(V1)])
         self.assertEqual(self.main("rollback", "--retire-idle-daemon"), 0)
         daemon.finish()
         self.assertEqual([request["command"]["type"] for request in daemon.received], ["list"])
@@ -300,12 +333,23 @@ class RolloutTests(RolloutFixture):
         self.assertEqual(("retire" in receipt["rustDaemon"], "notice" in receipt), (False, False))
         self.assertTrue(self.socket_path.exists())
 
+    def test_a_supervisor_already_on_the_selected_release_is_never_retired(self) -> None:
+        # Every Oneiron build of one base reports the same appVersion; the
+        # running release is read from the executable path instead.
+        self.publish(V2)
+        daemon = self.daemon(sessions=[], connections=2, hellos=[self.rust_hello(V2)])
+        self.assertEqual(self.main("rollout", "--version", V2, "--retire-idle-daemon"), 0)
+        daemon.finish()
+        self.assertEqual([request["command"]["type"] for request in daemon.received], ["list", "list"])
+        receipt = self.receipt(V2)
+        self.assertEqual(("retire" in receipt["rustDaemon"], "notice" in receipt), (False, False))
+        self.assertTrue(self.socket_path.exists())
+
     def test_retire_idle_daemon_stops_the_old_supervisor_after_the_swap(self) -> None:
         self.publish(V1)
         self.publish(V2)
         self.assertEqual(self.main("rollout", "--version", V1), 0)
-        daemon = self.daemon(sessions=[], connections=3,
-                             hello=self.rust_hello(executable=self.prefix / V1 / "prime-agent"))
+        daemon = self.daemon(sessions=[], connections=3, hellos=[self.rust_hello(V1)])
         self.assertEqual(self.main("rollout", "--version", V2, "--retire-idle-daemon"), 0)
         daemon.finish()
         self.assertEqual([request["command"]["type"] for request in daemon.received],
@@ -315,14 +359,31 @@ class RolloutTests(RolloutFixture):
                          ("activated", {"acknowledged": True, "stopped": True}, False))
         self.assertFalse(self.socket_path.exists())
 
+    def test_retiring_never_reaches_a_supervisor_other_than_the_one_checked(self) -> None:
+        self.publish(V1)
+        self.publish(V2)
+        self.assertEqual(self.main("rollout", "--version", V1), 0)
+        # Before the swap: supervisor 4242 runs V1. When retiring: 5151 answers.
+        daemon = self.daemon(sessions=[], connections=3,
+                             hellos=[self.rust_hello(V1), self.rust_hello(V1), self.rust_hello(V1, pid=5151)])
+        self.assertEqual(self.main("rollout", "--version", V2, "--retire-idle-daemon"), 0)
+        daemon.finish()
+        self.assertEqual([request["command"]["type"] for request in daemon.received], ["list", "list"])
+        receipt = self.receipt(V2)
+        self.assertEqual((receipt["rustDaemon"]["retire"]["state"], receipt["rustDaemon"]["retire"]["retire"]),
+                         ("replaced", {"acknowledged": False, "stopped": False,
+                                       "detail": "a different supervisor answers than the one checked before the swap"}))
+        self.assertIn(f"still runs {V1}", receipt["notice"])
+        self.assertTrue(self.socket_path.exists())
+
     def test_a_foreign_daemon_is_never_sent_a_command(self) -> None:
         self.publish(V1)
-        foreign = [self.rust_hello(executable=self.root / "elsewhere" / "prime-agent"),
+        foreign = [{**self.rust_hello(), "runtime": {"buildId": "b", "executablePath": str(self.root / "x" / "pa")}},
                    {**self.rust_hello(), "socketPath": str(self.root / "other.sock")},
                    {**self.rust_hello(), "protocol": {"name": "something-else", "version": 7}}]
         for hello in foreign:
             with self.subTest(hello=hello):
-                daemon = self.daemon(sessions=[], connections=1, hello=hello)
+                daemon = self.daemon(sessions=[], connections=1, hellos=[hello])
                 self.assertEqual(self.main("rollout", "--version", V1), 1)
                 daemon.finish()
                 self.socket_path.unlink()
@@ -332,20 +393,24 @@ class RolloutTests(RolloutFixture):
         self.assertFalse((self.prefix / V1).exists())
 
     def test_a_socket_inside_ts_state_is_never_connected_to(self) -> None:
+        # The TS socket dir under this shell's TMPDIR, and under the fixed
+        # system temp root when the TS daemon was started with another one.
         self.publish(V1)
-        ts_dir = self.fake_tmp / f"prime-agent-{os.getuid()}"
-        ts_dir.mkdir()
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(ts_dir / "daemon.sock"))
-        server.listen(1)
-        with server:
-            for skip in ([], ["--force-idle-check-skip"]):
-                self.assertEqual(self.main("rollout", "--version", V1, "--rust-socket",
-                                           str(ts_dir / "daemon.sock"), *skip), 1)
-                self.assertEqual(self.receipt(V1)["rustDaemon"]["idleBeforeInstall"]["state"], "refused")
-            server.setblocking(False)
-            with self.assertRaises(BlockingIOError):
-                server.accept()  # no connection was ever queued
+        for tmp in (self.fake_tmp, self.system_tmp):
+            ts_dir = tmp / f"prime-agent-{os.getuid()}"
+            ts_dir.mkdir()
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(ts_dir / "daemon.sock"))
+            server.listen(1)
+            with server:
+                for skip in ([], ["--force-idle-check-skip"]):
+                    with self.subTest(tmp=tmp, skip=skip):
+                        self.assertEqual(self.main("rollout", "--version", V1, "--rust-socket",
+                                                   str(ts_dir / "daemon.sock"), *skip), 1)
+                        self.assertEqual(self.receipt(V1)["rustDaemon"]["idleBeforeInstall"]["state"], "refused")
+                server.setblocking(False)
+                with self.assertRaises(BlockingIOError):
+                    server.accept()  # no connection was ever queued
         self.assertFalse((self.prefix / V1).exists())
 
     def test_a_socket_nobody_listens_on_counts_as_no_daemon(self) -> None:
@@ -405,6 +470,18 @@ class RolloutTests(RolloutFixture):
         self.assertEqual(readme.read_text(), "changed\n")
         self.assertFalse((self.prefix / "current").is_symlink())
 
+    def test_an_install_changed_after_verification_is_never_selected(self) -> None:
+        # The probe (the installed binary itself) changes a file of the
+        # install between the install check and the swap.
+        self.publish(V1)
+        os.environ["FAKE_PROBE_MUTATE"] = "1"
+        self.assertEqual(self.main("rollout", "--version", V1), 1)
+        receipt = self.receipt(V1)
+        self.assertEqual((receipt["status"], receipt["phase"], receipt["checks"]["payloadUnchangedAtSelect"],
+                          receipt["after"]["current"]), ("failed", "select", False, None))
+        self.assertIn("changed after it was verified", receipt["failure"]["message"])
+        self.assertFalse((self.bin_dir / "prime-agent-rs").exists())
+
     def test_a_concurrent_run_is_turned_away_before_it_records_anything(self) -> None:
         self.publish(V1)
         self.publish(V2)
@@ -420,6 +497,40 @@ class RolloutTests(RolloutFixture):
         self.assertEqual({path.relative_to(self.prefix): path.read_bytes()
                           for path in (self.prefix / "receipts").rglob("*.json")}, receipts_before)
         self.assertEqual((os.readlink(self.prefix / "current"), os.readlink(self.prefix / "previous")), (V2, V1))
+
+    def test_an_unexpected_error_is_recorded_and_leaves_current_alone(self) -> None:
+        self.publish(V1)
+        real_write_launcher = side_by_side.write_launcher
+
+        def unwritable_bin_dir(bin_dir: Path, prefix: Path) -> Path:
+            if bin_dir == self.bin_dir:  # the probe's scratch launcher still works
+                raise PermissionError(13, "Permission denied")
+            return real_write_launcher(bin_dir, prefix)
+
+        with mock.patch.object(side_by_side, "write_launcher", side_effect=unwritable_bin_dir):
+            self.assertEqual(self.main("rollout", "--version", V1), 1)
+        receipt = self.receipt(V1)
+        self.assertEqual((receipt["status"], receipt["phase"], receipt["failure"]["message"], receipt["after"]["current"]),
+                         ("failed", "select", "PermissionError: [Errno 13] Permission denied", None))
+        self.assertFalse((self.prefix / "current").is_symlink())
+
+    def test_a_crash_mid_run_leaves_the_phase_it_died_in_on_disk(self) -> None:
+        self.publish(V1)
+        with mock.patch.object(side_by_side, "flip_current", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            self.main("rollout", "--version", V1)
+        receipt = self.receipt(V1)
+        self.assertEqual((receipt["status"], receipt["phase"], receipt["finishedAt"]), ("running", "select", None))
+        self.assertEqual(receipt["checks"]["payloadUnchangedAtSelect"], True)
+
+    def test_a_symlinked_receipts_dir_is_refused_before_anything_is_written(self) -> None:
+        self.publish(V1)
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (self.prefix / "receipts").symlink_to(elsewhere, target_is_directory=True)
+        with self.assertRaisesRegex(SystemExit, "is not a plain directory"):
+            self.main("rollout", "--version", V1)
+        self.assertEqual((os.listdir(elsewhere), (self.prefix / V1).exists()), ([], False))
 
     def test_rollback_refuses_what_it_cannot_vouch_for(self) -> None:
         self.publish(V1)
@@ -446,6 +557,22 @@ class RolloutTests(RolloutFixture):
                 self.assertIn("is not what its receipts recorded", receipt["failure"]["message"])
                 self.assertEqual(os.readlink(self.prefix / "current"), V2)
                 changed.write_bytes(original)
+
+    def test_rollback_rechecks_the_payload_right_before_the_swap(self) -> None:
+        self.publish(V1)
+        self.publish(V2)
+        self.assertEqual(self.main("rollout", "--version", V1), 0)
+        self.assertEqual(self.main("rollout", "--version", V2), 0)
+        readme = self.prefix / V1 / "README.md"
+        # The idle check is where the time goes; the install changes there.
+        daemon = self.daemon(sessions=[], connections=1, hellos=[self.rust_hello(V2)],
+                             on_list=lambda: readme.write_text("changed\n"))
+        self.assertEqual(self.main("rollback"), 1)
+        daemon.finish()
+        receipt = self.receipt(V1, "ROLLBACK-RECEIPT.json")
+        self.assertEqual((receipt["status"], receipt["phase"], receipt["checks"]["vouchedByReceipt"],
+                          receipt["checks"]["payloadUnchangedAtSelect"]), ("failed", "select", True, False))
+        self.assertEqual(os.readlink(self.prefix / "current"), V2)
 
     def test_rollback_accepts_a_version_the_install_command_activated(self) -> None:
         self.publish(V1)
@@ -482,8 +609,7 @@ class RolloutTests(RolloutFixture):
         self.publish(V2)
         self.assertEqual(self.main("rollout", "--version", V1), 0)
         self.assertEqual(self.main("rollout", "--version", V2), 0)
-        daemon = self.daemon(sessions=[{"sessionId": "a"}], connections=1,
-                             hello=self.rust_hello(executable=self.prefix / V2 / "prime-agent"))
+        daemon = self.daemon(sessions=[{"sessionId": "a"}], connections=1, hellos=[self.rust_hello(V2)])
         self.assertEqual(self.main("rollback"), 1)
         daemon.finish()
         self.assertEqual(self.receipt(V1, "ROLLBACK-RECEIPT.json")["status"], "refused")
@@ -494,10 +620,10 @@ class RolloutTests(RolloutFixture):
         self.publish(V2)
         self.assertEqual(self.main("rollout", "--version", V1), 0)
         self.assertEqual(self.main("rollout", "--version", V2), 0)
-        output = subprocess.run([sys.executable, str(Path(side_by_side.__file__)), "--prefix", str(self.prefix),
-                                 "--bin-dir", str(self.bin_dir), "status", "--json"],
-                                check=True, capture_output=True, text=True).stdout
-        state = json.loads(output)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(self.main("status", "--json"), 0)
+        state = json.loads(output.getvalue())
         self.assertEqual({key: state[key] for key in ("current", "previous", "feed")}, {
             "current": V2, "previous": V1,
             "feed": {"dir": str(self.prefix / "feed"), "stable": f"v{V2}", "latest": f"v{V2}",

@@ -68,6 +68,9 @@ TS_LAUNCHER_NAME = "prime-agent"
 RECEIPT_SCHEMA = "prime-agent-oneiron-rs.install/1"
 PROBE_SCHEMA = "prime-agent-oneiron-rs.probe/1"
 REQUIRED_STAGE_PATHS = ("prime-agent", "package.json", "prime-agent-runtime/src/rlm", "skills")
+# The fixed system temp root: the TS daemon's socket dir may sit here even
+# when this shell's $TMPDIR points elsewhere, so it is always protected.
+SYSTEM_TMP = Path("/tmp")
 
 # POSIX sh, so the same launcher runs under dash (Arch) and bash 3.2 (macOS).
 # The socket dir name stays short: macOS sun_path holds 104 bytes and $TMPDIR
@@ -106,7 +109,8 @@ absolute() {{ case "$2" in /*) ;; *) die "$1 must be an absolute path: $2" ;; es
 sock_dir=${{PRIME_AGENT_RS_SOCKET_DIR:-$tmp/pa-rs-$uid}}
 absolute PRIME_AGENT_RS_SOCKET_DIR "$sock_dir"
 sock_dir=$(canon "$sock_dir")
-for protected in "$tmp/prime-agent-$uid" "$tmp/prime-agent-user" "$HOME/.prime"; do
+for protected in "$tmp/prime-agent-$uid" "$tmp/prime-agent-user" {system_tmp}/prime-agent-"$uid" \\
+    {system_tmp}/prime-agent-user "$HOME/.prime"; do
   protected=$(canon "$protected")
   if overlaps "$sock_dir" "$protected"; then die "refusing socket dir $sock_dir: it overlaps TS state at $protected"; fi
 done
@@ -145,8 +149,13 @@ PRIME_AGENT_DISABLE_SELF_UPDATE=1
 PRIME_AGENT_RUST_INSTALLER_URL=http://127.0.0.1:1/oneiron-self-update-disabled
 PRIME_AGENT_DOWNLOAD_BASE_URL=http://127.0.0.1:1/oneiron-feed-disabled
 PI_SKIP_VERSION_CHECK=1
+# The kernel imports bundled Python skills in place (editable installs from
+# the release dir): their bytecode goes here, never into the immutable
+# install, whose payload digest rollout and rollback check.
+PYTHONPYCACHEPREFIX=$agent_dir/python-cache
 export PRIME_AGENT_CODING_AGENT_DIR PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV \\
-  PRIME_AGENT_DISABLE_SELF_UPDATE PRIME_AGENT_RUST_INSTALLER_URL PRIME_AGENT_DOWNLOAD_BASE_URL PI_SKIP_VERSION_CHECK
+  PRIME_AGENT_DISABLE_SELF_UPDATE PRIME_AGENT_RUST_INSTALLER_URL PRIME_AGENT_DOWNLOAD_BASE_URL PI_SKIP_VERSION_CHECK \\
+  PYTHONPYCACHEPREFIX
 # Inherited session-dir overrides would point the Rust daemon at TS sessions.
 unset PI_PACKAGE_DIR PRIME_AGENT_KERNEL_PYTHON PRIME_AGENT_SESSION_DIR PRIME_AGENT_CODING_AGENT_SESSION_DIR
 dir=$(cd "$prefix/current" && pwd -P)
@@ -158,7 +167,8 @@ if [ "${{PRIME_AGENT_RS_PRINT_ENV:-}}" = 1 ]; then
     "PRIME_AGENT_DISABLE_SELF_UPDATE=$PRIME_AGENT_DISABLE_SELF_UPDATE" \\
     "PRIME_AGENT_RUST_INSTALLER_URL=$PRIME_AGENT_RUST_INSTALLER_URL" \\
     "PRIME_AGENT_DOWNLOAD_BASE_URL=$PRIME_AGENT_DOWNLOAD_BASE_URL" \\
-    "PI_SKIP_VERSION_CHECK=$PI_SKIP_VERSION_CHECK" "binary=$dir/prime-agent"
+    "PI_SKIP_VERSION_CHECK=$PI_SKIP_VERSION_CHECK" "PYTHONPYCACHEPREFIX=$PYTHONPYCACHEPREFIX" \\
+    "binary=$dir/prime-agent"
   exit 0
 fi
 exec "$dir/prime-agent" "$@"
@@ -216,14 +226,41 @@ def read_link(path: Path) -> str | None:
     return os.readlink(path) if path.is_symlink() else None
 
 
-def write_json_atomic(path: Path, data: dict) -> None:
-    """Write-then-rename, so a reader (or a crash) never sees half a file."""
+def open_new(path: Path, mode: int = 0o644):
+    """A fresh file at `path`, opened for binary writing without ever
+    following a link: whatever sits there (a stale temp, a planted symlink)
+    is unlinked first, then the file is created exclusively."""
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+    return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode), "wb")
+
+
+def replace_file(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Write-then-rename through a no-follow temp beside `path`, so a reader
+    (or a crash) never sees half a file and no link is written through."""
     temp = path.parent / f".{path.name}.tmp-{os.getpid()}"
-    with temp.open("w") as handle:
-        handle.write(json.dumps(data, indent=2) + "\n")
+    with open_new(temp, mode) as handle:
+        handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temp, path)
+
+
+def write_json_atomic(path: Path, data: dict) -> None:
+    replace_file(path, (json.dumps(data, indent=2) + "\n").encode())
+
+
+def plain_dir(root: Path, *parts: str) -> Path:
+    """root/parts..., refusing any part below `root` that exists as anything
+    but a real directory: a symlinked `releases/` or `receipts/` would send
+    the writes meant for this tree somewhere else (TS state included).
+    Missing parts are left for the caller to create."""
+    path = root
+    for part in parts:
+        path = path / part
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise SystemExit(f"error: {path} is not a plain directory; refusing to write through it")
+    return path
 
 
 @contextlib.contextmanager
@@ -231,7 +268,8 @@ def locked(directory: Path) -> Iterator[None]:
     """One writer at a time per install prefix (or feed): concurrent rollouts,
     rollbacks or packages would otherwise flip pointers over each other."""
     directory.mkdir(parents=True, exist_ok=True)
-    with (directory / ".lock").open("a") as handle:
+    fd = os.open(directory / ".lock", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -262,9 +300,14 @@ def git_facts(root: Path) -> dict:
 
 
 def protected_roots() -> list[Path]:
-    """TS product state an install may never write into (or contain)."""
-    tmp = Path(os.environ.get("TMPDIR") or "/tmp")
-    return [TS_PREFIX, HOME / ".prime", tmp / f"prime-agent-{os.getuid()}", tmp / "prime-agent-user"]
+    """TS product state an install may never write into (or contain), and
+    socket dirs never to connect to: the TS socket dirs under this shell's
+    $TMPDIR and under the fixed system temp root (the TS daemon may have
+    been started with another $TMPDIR)."""
+    roots = [TS_PREFIX, HOME / ".prime"]
+    for tmp in dict.fromkeys((Path(os.environ.get("TMPDIR") or SYSTEM_TMP), SYSTEM_TMP)):
+        roots += [tmp / f"prime-agent-{os.getuid()}", tmp / "prime-agent-user"]
+    return roots
 
 
 def overlaps(path: Path, root: Path) -> bool:
@@ -380,13 +423,14 @@ def seed_agent_dir(agent_dir: Path, ts_agent_dir: Path) -> dict:
     return {"path": str(agent_dir), "seeded": actions}
 
 
+def launcher_text(prefix: Path) -> str:
+    return LAUNCHER_TEMPLATE.format(prefix=shlex.quote(str(prefix)), system_tmp=shlex.quote(str(SYSTEM_TMP)))
+
+
 def write_launcher(bin_dir: Path, prefix: Path) -> Path:
     bin_dir.mkdir(parents=True, exist_ok=True)
     launcher = bin_dir / LAUNCHER_NAME
-    temp = bin_dir / f".{LAUNCHER_NAME}.tmp-{os.getpid()}"
-    temp.write_text(LAUNCHER_TEMPLATE.format(prefix=shlex.quote(str(prefix))))
-    temp.chmod(0o755)
-    os.replace(temp, launcher)
+    replace_file(launcher, launcher_text(prefix).encode(), 0o755)
     return launcher
 
 
@@ -410,11 +454,12 @@ def flip_current(prefix: Path, version: str) -> str | None:
 
 
 def select_version(prefix: Path, bin_dir: Path, version: str) -> str | None:
-    """Make an installed version the one `prime-agent-rs` runs: flip current,
-    then (re)write the launcher. Returns the version current left."""
-    before = flip_current(prefix, version)
+    """Make an installed version the one `prime-agent-rs` runs: (re)write the
+    launcher, which follows `current` and is the same for every version,
+    then flip current. A launcher that cannot be written leaves `current`
+    where it was. Returns the version current left."""
     write_launcher(bin_dir, prefix)
-    return before
+    return flip_current(prefix, version)
 
 
 def rs_agent_dir() -> Path:
@@ -493,6 +538,7 @@ def install(args: argparse.Namespace) -> int:
     with staged_payload(args.tarball, args.stage_dir, args.version) as payload:
         version, staged_version, platform = payload.version, payload.staged_version, payload.platform
         check_install_target(prefix, version)
+        plain_dir(prefix, "receipts", f"{version}-{platform}")  # refuse before anything is written
         with locked(prefix):
             target = commit_payload(prefix, payload)
             if args.activate:
@@ -509,7 +555,7 @@ def install(args: argparse.Namespace) -> int:
         version_check = {"stdout": result.stdout.strip(), "exitCode": result.returncode,
                          "ok": result.returncode == 0 and result.stdout.strip() == version}
 
-    receipt_dir = prefix / "receipts" / f"{version}-{platform}"
+    receipt_dir = plain_dir(prefix, "receipts", f"{version}-{platform}")
     receipt_dir.mkdir(parents=True, exist_ok=True)
     receipt = {
         "schema": RECEIPT_SCHEMA,
@@ -628,8 +674,8 @@ def probe(args: argparse.Namespace) -> int:
     version = json.loads((current / "package.json").read_text())["version"]
     platform = next((name.split(f"{version}-", 1)[1] for name in os.listdir(prefix / "receipts")
                      if name.startswith(f"{version}-")), "unknown")
-    receipt = run_probe(bin_dir / LAUNCHER_NAME, version, platform, prefix / "receipts" / f"{version}-{platform}",
-                        bin_dir / TS_LAUNCHER_NAME, args)
+    receipt = run_probe(bin_dir / LAUNCHER_NAME, version, platform,
+                        plain_dir(prefix, "receipts", f"{version}-{platform}"), bin_dir / TS_LAUNCHER_NAME, args)
     return 0 if receipt["ok"] else 1
 
 
@@ -694,7 +740,7 @@ def run_probe(launcher: Path, version: str, platform: str, receipt_dir: Path, ts
     receipt_dir.mkdir(parents=True, exist_ok=True)
     # The full event stream rides beside the receipt; the receipt keeps a tail.
     for name, run in runs.items():
-        (receipt_dir / f"probe-{name}.out").write_text(run["stdout"])
+        replace_file(receipt_dir / f"probe-{name}.out", run["stdout"].encode())
         run["stdoutFile"] = str(receipt_dir / f"probe-{name}.out")
         run["stdout"] = run["stdout"][-4000:]
     write_json_atomic(receipt_dir / "PROBE-RECEIPT.json", receipt)
@@ -749,11 +795,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     package_cmd.add_argument("--package-dir", type=Path, required=True,
                              help="scripts/package_release.py --out-dir (binaries.json + the staged layout)")
     package_cmd.add_argument("--version", required=True, help="<base>-oneiron.YYYYMMDD.N, e.g. 0.9.8-oneiron.20261001.1")
-    decoder = package_cmd.add_mutually_exclusive_group()
-    decoder.add_argument("--decoder", type=Path,
-                         help="Linux: the split-debug prime-agent-<base>-linux-x64.debug.gz package_release.py made")
-    decoder.add_argument("--no-decoder", action="store_true",
-                         help="Linux: publish without the split-debug decoder (recorded in the manifest)")
+    package_cmd.add_argument("--decoder", type=Path,
+                             help="Linux (required): the split-debug prime-agent-<base>-linux-x64.debug.gz "
+                                  "package_release.py made")
     package_cmd.add_argument("--feed-dir", type=Path, help="default: <prefix>/feed")
     package_cmd.add_argument("--source-root", type=Path, default=ROOT,
                              help="the checkout the binary was built from (provenance; default: this repo)")

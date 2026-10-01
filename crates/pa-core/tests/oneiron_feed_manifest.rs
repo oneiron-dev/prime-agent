@@ -20,8 +20,9 @@ use pa_core::update::release::{
 const BASE: &str = "0.9.8";
 const VERSION: &str = "0.9.8-oneiron.20261001.1";
 
-/// Stands in for the Rust binary: `--version` reads the exe-adjacent
-/// manifest (`PI_PACKAGE_DIR` wins) and falls back to the compiled version.
+/// Stands in for the Rust binary on darwin: `--version` reads the
+/// exe-adjacent manifest (`PI_PACKAGE_DIR` wins) and falls back to the
+/// compiled version.
 const FAKE_BINARY: &str = r#"#!/bin/sh
 dir=${PI_PACKAGE_DIR:-$(dirname "$0")}
 if [ "$1" = --version ] && [ -f "$dir/package.json" ]; then
@@ -29,6 +30,41 @@ if [ "$1" = --version ] && [ -f "$dir/package.json" ]; then
 fi
 if [ "$1" = --version ]; then echo 0.9.8; exit 0; fi
 exit 3
+"#;
+
+/// The same `--version` logic as a real ELF: a Linux release ships a
+/// split-debug ELF with its paired decoder (the packer runs upstream's
+/// split-debug gates on it), so the fixture compiles and splits one.
+const FAKE_ELF_SOURCE: &str = r#"
+#include <libgen.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  char exe[4096], path[4200], buf[65536];
+  const char *dir = getenv("PI_PACKAGE_DIR");
+  if (argc < 2 || strcmp(argv[1], "--version") != 0) return 3;
+  if (!dir || !*dir) {
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n < 0) return 4;
+    exe[n] = 0;
+    dir = dirname(exe);
+  }
+  snprintf(path, sizeof path, "%s/package.json", dir);
+  FILE *f = fopen(path, "r");
+  if (!f) { puts("0.9.8"); return 0; }
+  size_t len = fread(buf, 1, sizeof buf - 1, f);
+  buf[len] = 0;
+  fclose(f);
+  char *key = strstr(buf, "\"version\"");
+  char *start = key ? strchr(key + 9, '"') : NULL;
+  char *end = start ? strchr(start + 1, '"') : NULL;
+  if (!end) return 5;
+  *end = 0;
+  puts(start + 1);
+  return 0;
+}
 "#;
 
 fn workspace_root() -> PathBuf {
@@ -53,8 +89,40 @@ fn write(path: &Path, body: &str) {
     std::fs::write(path, body).expect("write the fixture file");
 }
 
+/// The binary `package_release.py` stages on this host, and on Linux the
+/// split-debug decoder it writes beside it.
+fn shipped_binary(work: &Path, platform: &str) -> (PathBuf, Option<PathBuf>) {
+    if platform != "linux-x64" {
+        let binary = work.join("prime-agent");
+        write(&binary, FAKE_BINARY);
+        run(Command::new("chmod").arg("755").arg(&binary));
+        return (binary, None);
+    }
+    let source = work.join("prime-agent.c");
+    write(&source, FAKE_ELF_SOURCE);
+    let raw = work.join("cargo-prime-agent");
+    run(Command::new("gcc")
+        .args(["-g", "-Wl,--build-id", "-o"])
+        .arg(&raw)
+        .arg(&source));
+    let dist = work.join("dist");
+    run(Command::new("python3")
+        .arg(workspace_root().join("scripts/release/split_debug.py"))
+        .arg("--binary")
+        .arg(&raw)
+        .arg("--shipped")
+        .arg(dist.join("prime-agent"))
+        .arg("--out")
+        .arg(&dist)
+        .args(["--version", BASE, "--target", "x86_64-unknown-linux-gnu"]));
+    (
+        dist.join("prime-agent"),
+        Some(dist.join(format!("prime-agent-{BASE}-linux-x64.debug.gz"))),
+    )
+}
+
 /// What `package_release.py --out-dir <out>` leaves on this host.
-fn package_release_output(out: &Path, platform: &str) {
+fn package_release_output(out: &Path, platform: &str, binary: &Path) {
     let stage = out.join(format!("prime-agent-{BASE}-{platform}"));
     run(Command::new("python3")
         .arg(workspace_root().join("scripts/release/bundle_catalog.py"))
@@ -75,10 +143,9 @@ fn package_release_output(out: &Path, platform: &str) {
         &stage.join("package.json"),
         &format!("{{\n  \"name\": \"prime-agent\",\n  \"version\": \"{BASE}\"\n}}\n"),
     );
-    let binary = stage.join("prime-agent");
-    write(&binary, FAKE_BINARY);
-    run(Command::new("chmod").arg("755").arg(&binary));
-    let executable = sha256_hex(&std::fs::read(&binary).expect("read the fixture binary"));
+    let staged = stage.join("prime-agent");
+    std::fs::copy(binary, &staged).expect("stage the fixture binary");
+    let executable = sha256_hex(&std::fs::read(&staged).expect("read the fixture binary"));
     let binaries = serde_json::json!({"version": format!("v{BASE}"), "binaries": [{
         "platform": platform, "file": format!("prime-agent-{BASE}-{platform}.tar.gz"),
         "sha256": "0".repeat(64), "executableSha256": executable}]});
@@ -112,8 +179,9 @@ fn oneiron_feed_manifests_parse_as_native_channel_manifests() {
         return;
     }
     let dir = tempfile::TempDir::new().expect("temp dir");
+    let (binary, decoder) = shipped_binary(dir.path(), platform);
     let out = dir.path().join("package-out");
-    package_release_output(&out, platform);
+    package_release_output(&out, platform, &binary);
     let source = dir.path().join("source");
     write(&source.join("README.md"), "fixture source\n");
     git(&source, &["init", "-q"]);
@@ -131,8 +199,8 @@ fn oneiron_feed_manifests_parse_as_native_channel_manifests() {
         .arg(&out)
         .arg("--source-root")
         .arg(&source);
-    if platform == "linux-x64" {
-        package.arg("--no-decoder");
+    if let Some(decoder) = &decoder {
+        package.arg("--decoder").arg(decoder);
     }
     run(&mut package);
 

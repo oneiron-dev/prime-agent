@@ -3,7 +3,9 @@
 
 Run: python3 scripts/oneiron/test_release_feed.py. Everything happens in temp
 dirs: a fake package_release.py output, a throwaway git checkout as the
-source, and a temp feed. No network, no real prefix, no daemon.
+source, and a temp feed. No network, no real prefix, no daemon. The shell
+stand-in binary is packaged as darwin-arm64 (no split-debug decoder); Linux
+releases need a real split ELF, built with gcc in LinuxDecoderTests.
 """
 
 from __future__ import annotations
@@ -30,13 +32,16 @@ from bundle_catalog import fixture_catalog_bodies, validate_bundled_catalog_dir 
 
 BASE = "0.9.8"
 VERSION = "0.9.8-oneiron.20261001.1"
-PLATFORM = "linux-x64"
+PLATFORM = "darwin-arm64"
+LINUX = "linux-x64"
 SCRIPTS = Path(__file__).resolve().parent.parent
 
 # Stands in for the Rust binary: `--version` reads the exe-adjacent manifest
 # (PI_PACKAGE_DIR wins, as in pa-cli config::version) and falls back to the
-# compiled-in version; `-p` (the probe's one-shot) answers as the requested
-# model unless FAKE_PROBE_FAIL is set.
+# compiled-in version; `-p` (the probe's one-shot) imports the bundled
+# Python skill in place, as a kernel does (so bytecode lands wherever Python
+# puts it), then answers as the requested model. FAKE_PROBE_FAIL fails the
+# run; FAKE_PROBE_MUTATE also changes a file of the install it runs from.
 FAKE_BINARY = """#!/bin/sh
 dir=${PI_PACKAGE_DIR:-$(dirname "$0")}
 case "$1" in
@@ -49,6 +54,8 @@ case "$1" in
   exit 0 ;;
 -p)
   [ -z "$FAKE_PROBE_FAIL" ] || exit 1
+  python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import demo_skill' "$dir/skills/demo" || exit 4
+  [ -z "$FAKE_PROBE_MUTATE" ] || echo mutated >> "$dir/README.md"
   model=
   while [ $# -gt 0 ]; do
     if [ "$1" = --model ]; then model=$2; fi
@@ -104,6 +111,7 @@ def make_package_dir(parent: Path, platform: str = PLATFORM, base: str = BASE, c
     (stage / "prime-agent-runtime" / "src" / "rlm" / "repl.py").write_text("# repl\n")
     (stage / "skills" / "demo").mkdir(parents=True)
     (stage / "skills" / "demo" / "SKILL.md").write_text("# demo\n")
+    (stage / "skills" / "demo" / "demo_skill.py").write_text("VALUE = 1\n")
     (stage / "README.md").write_text(readme)
     (stage / "LICENSE").write_text("license\n")
     for name, body in fixture_catalog_bodies().items():
@@ -144,17 +152,20 @@ class FeedFixture(unittest.TestCase):
     """A temp prefix (whose feed/ is the default feed), one source checkout,
     and host_platform pinned to the platform under test."""
 
+    host = PLATFORM
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.prefix = self.root / "share" / "prime-agent-oneiron-rs"
         self.feed = self.prefix / "feed"
         self.source = make_source_repo(self.root / "src")
-        self.saved_host = release_feed.host_platform
-        release_feed.host_platform = lambda: PLATFORM
+        self.saved = (release_feed.host_platform, side_by_side.TS_PREFIX)
+        release_feed.host_platform = lambda: self.host
+        side_by_side.TS_PREFIX = self.root / "ts-install"
 
     def tearDown(self) -> None:
-        release_feed.host_platform = self.saved_host
+        release_feed.host_platform, side_by_side.TS_PREFIX = self.saved
         self.tmp.cleanup()
 
     def package(self, package_dir: Path, *extra: str, version: str = VERSION, source: Path | None = None) -> int:
@@ -165,12 +176,15 @@ class FeedFixture(unittest.TestCase):
     def release(self, version: str = VERSION) -> Path:
         return self.feed / "releases" / f"v{version}"
 
+    def tree(self, path: Path) -> dict[str, bytes]:
+        return {str(item.relative_to(path)): item.read_bytes() for item in path.rglob("*") if item.is_file()}
+
 
 class PackageTests(FeedFixture):
     def test_package_publishes_a_stamped_release_and_moves_the_feed_pointers(self) -> None:
         package_dir = make_package_dir(self.root / "pkg")
         stage = package_dir / f"prime-agent-{BASE}-{PLATFORM}"
-        self.assertEqual(self.package(package_dir, "--no-decoder"), 0)
+        self.assertEqual(self.package(package_dir), 0)
 
         release = self.release()
         tarball = release / f"prime-agent-{VERSION}-{PLATFORM}.tar.gz"
@@ -186,15 +200,16 @@ class PackageTests(FeedFixture):
             "source": {"commit": git_out(self.source, "rev-parse", "HEAD"),
                        "tree": git_out(self.source, "rev-parse", "HEAD^{tree}"),
                        "build": git_out(self.source, "describe", "--always", "--dirty"),
-                       "dirty": False, "rustBase": "5784abc2aef523a78d5a8850a0c0be89883388b2"},
+                       "dirty": False, "dirtySha256": None, "attestedBy": "packaging-checkout",
+                       "rustBase": "5784abc2aef523a78d5a8850a0c0be89883388b2"},
             "binaries": [{
-                "platform": PLATFORM, "target": "x86_64-unknown-linux-gnu", "file": tarball.name,
+                "platform": PLATFORM, "target": "aarch64-apple-darwin", "file": tarball.name,
                 "sha256": side_by_side.sha256_file(tarball),
                 "executableSha256": side_by_side.sha256_file(stage_binary),
                 "bytes": tarball.stat().st_size, "compiledVersion": BASE,
                 "buildAt": release_feed.utc_from_mtime(stage_binary),
                 "catalog": {"fixture": True, "counts": validate_bundled_catalog_dir(stage), **catalog},
-                "decoder": "omitted"}],
+                "decoder": "not-applicable"}],
             "decoders": [],
             "buildAt": release_feed.utc_from_mtime(stage_binary),
         })
@@ -222,72 +237,56 @@ class PackageTests(FeedFixture):
 
     def test_repackaging_is_byte_identical_and_a_no_op(self) -> None:
         package_dir = make_package_dir(self.root / "pkg")
-        self.assertEqual(self.package(package_dir, "--no-decoder"), 0)
+        self.assertEqual(self.package(package_dir), 0)
         tarball = self.release() / f"prime-agent-{VERSION}-{PLATFORM}.tar.gz"
         first = {path.name: path.read_bytes() for path in self.release().iterdir()}
-        self.assertEqual(self.package(package_dir, "--no-decoder"), 0)
+        self.assertEqual(self.package(package_dir), 0)
         self.assertEqual({path.name: path.read_bytes() for path in self.release().iterdir()}, first)
         # A fresh feed from the same inputs gets the same archive bytes.
         other_prefix = self.root / "other"
         self.assertEqual(side_by_side.main([
             "--prefix", str(other_prefix), "package", "--package-dir", str(package_dir), "--version", VERSION,
-            "--source-root", str(self.source), "--allow-fixture-catalog", "--no-decoder"]), 0)
+            "--source-root", str(self.source), "--allow-fixture-catalog"]), 0)
         self.assertEqual((other_prefix / "feed" / "releases" / f"v{VERSION}" / tarball.name).read_bytes(),
                          tarball.read_bytes())
 
     def test_a_published_platform_is_never_replaced(self) -> None:
-        self.assertEqual(self.package(make_package_dir(self.root / "pkg"), "--no-decoder"), 0)
+        self.assertEqual(self.package(make_package_dir(self.root / "pkg")), 0)
         before = {path.name: path.read_bytes() for path in self.release().iterdir()}
         changed = make_package_dir(self.root / "pkg2", readme="changed\n")
         with self.assertRaisesRegex(SystemExit, "immutable, bump the build number"):
-            self.package(changed, "--no-decoder")
+            self.package(changed)
         self.assertEqual({path.name: path.read_bytes() for path in self.release().iterdir()}, before)
 
     def test_a_rerun_promotes_a_release_first_published_without_promotion(self) -> None:
         package_dir = make_package_dir(self.root / "pkg")
-        self.assertEqual(self.package(package_dir, "--no-decoder", "--no-promote"), 0)
+        self.assertEqual(self.package(package_dir, "--no-promote"), 0)
         self.assertEqual(((self.feed / "stable").exists(), (self.feed / "latest.json").exists()), (False, False))
         release = {path.name: path.read_bytes() for path in self.release().iterdir()}
-        self.assertEqual(self.package(package_dir, "--no-decoder"), 0)
+        self.assertEqual(self.package(package_dir), 0)
         self.assertEqual({path.name: path.read_bytes() for path in self.release().iterdir()}, release)
         self.assertEqual(((self.feed / "stable").read_text(), json.loads((self.feed / "latest.json").read_text())),
                          (f"v{VERSION}\n", json.loads(release["manifest.json"])))
-
-    def test_a_second_platform_joins_only_from_the_same_source(self) -> None:
-        self.assertEqual(self.package(make_package_dir(self.root / "linux"), "--no-decoder"), 0)
-        release_feed.host_platform = lambda: "darwin-arm64"
-        other_source = make_source_repo(self.root / "src2", marker="two")
-        darwin = make_package_dir(self.root / "darwin", platform="darwin-arm64")
-        with self.assertRaisesRegex(SystemExit, "same source"):
-            self.package(darwin, source=other_source)
-        self.assertEqual(self.package(darwin), 0)
-        manifest = json.loads((self.release() / "manifest.json").read_text())
-        self.assertEqual([(row["platform"], row["target"], row["decoder"]) for row in manifest["binaries"]],
-                         [("darwin-arm64", "aarch64-apple-darwin", "not-applicable"),
-                          ("linux-x64", "x86_64-unknown-linux-gnu", "omitted")])
-        self.assertEqual((self.release() / "SHA256SUMS").read_text(),
-                         "".join(f"{row['sha256']}  {row['file']}\n" for row in manifest["binaries"]))
-        self.assertEqual(json.loads((self.feed / "latest.json").read_text()), manifest)
 
     def test_the_version_is_the_oneiron_form_of_the_staged_base(self) -> None:
         package_dir = make_package_dir(self.root / "pkg")
         for version in ("0.9.9-oneiron.20261001.1", "0.9.8-rc.1", "0.9.8", "0.9.8-oneiron.2026101.1"):
             with self.assertRaisesRegex(SystemExit, "must be 0.9.8-oneiron.YYYYMMDD.N"):
-                self.package(package_dir, "--no-decoder", version=version)
+                self.package(package_dir, version=version)
         self.assertFalse(self.feed.exists())
 
     def test_packaging_refuses_inputs_it_cannot_vouch_for(self) -> None:
         cases = [
-            ("wrong host", make_package_dir(self.root / "darwin", platform="darwin-arm64"),
-             ["--allow-fixture-catalog", "--no-decoder"], "on the host that built it"),
-            ("no decoder choice", make_package_dir(self.root / "a"), ["--allow-fixture-catalog"],
-             "carries its split-debug decoder"),
-            ("fixture catalog", make_package_dir(self.root / "b"), ["--no-decoder"],
-             "synthetic --fixture snapshot"),
-            ("compiled version", make_package_dir(self.root / "c", compiled="0.9.7"),
-             ["--allow-fixture-catalog", "--no-decoder"], "compiled-in version is '0.9.7'"),
+            ("wrong host", PLATFORM, make_package_dir(self.root / "linux", platform=LINUX),
+             ["--allow-fixture-catalog"], "on the host that built it"),
+            ("linux without its decoder", LINUX, make_package_dir(self.root / "a", platform=LINUX),
+             ["--allow-fixture-catalog"], "carries its split-debug decoder"),
+            ("fixture catalog", PLATFORM, make_package_dir(self.root / "b"), [], "synthetic --fixture snapshot"),
+            ("compiled version", PLATFORM, make_package_dir(self.root / "c", compiled="0.9.7"),
+             ["--allow-fixture-catalog"], "compiled-in version is '0.9.7'"),
         ]
-        for label, package_dir, extra, message in cases:
+        for label, host_platform, package_dir, extra, message in cases:
+            release_feed.host_platform = lambda value=host_platform: value
             with self.subTest(label), self.assertRaisesRegex(SystemExit, message):
                 side_by_side.main(["--prefix", str(self.prefix), "package", "--package-dir", str(package_dir),
                                    "--version", VERSION, "--source-root", str(self.source), *extra])
@@ -298,23 +297,27 @@ class PackageTests(FeedFixture):
         binary = package_dir / f"prime-agent-{BASE}-{PLATFORM}" / "prime-agent"
         binary.write_text(binary.read_text() + "# swapped\n")
         with self.assertRaisesRegex(SystemExit, "does not match binaries.json executableSha256"):
-            self.package(package_dir, "--no-decoder")
+            self.package(package_dir)
         self.assertFalse(self.feed.exists())
 
-    def test_a_dirty_source_needs_allow_dirty_and_is_recorded(self) -> None:
+    def test_a_dirty_source_needs_allow_dirty_and_records_its_exact_state(self) -> None:
         (self.source / "marker").write_text("edited")
+        (self.source / "untracked.txt").write_text("new file")
         package_dir = make_package_dir(self.root / "pkg")
         with self.assertRaisesRegex(SystemExit, "uncommitted changes"):
-            self.package(package_dir, "--no-decoder")
-        self.assertEqual(self.package(package_dir, "--no-decoder", "--allow-dirty"), 0)
+            self.package(package_dir)
+        self.assertEqual(self.package(package_dir, "--allow-dirty"), 0)
         source = json.loads((self.release() / "manifest.json").read_text())["source"]
-        self.assertEqual((source["dirty"], source["build"].endswith("-dirty")), (True, True))
+        self.assertEqual((source["dirty"], source["build"].endswith("-dirty"), source["dirtySha256"]),
+                         (True, True, release_feed.dirty_digest(self.source)))
+        # Another uncommitted state is another digest.
+        (self.source / "untracked.txt").write_text("other content")
+        self.assertNotEqual(release_feed.dirty_digest(self.source), source["dirtySha256"])
 
     def test_feed_pointers_never_move_back(self) -> None:
         newer = "0.9.8-oneiron.20261001.10"
-        self.assertEqual(self.package(make_package_dir(self.root / "a"), "--no-decoder", version=newer), 0)
-        self.assertEqual(self.package(make_package_dir(self.root / "b"), "--no-decoder",
-                                      version="0.9.8-oneiron.20261001.9"), 0)
+        self.assertEqual(self.package(make_package_dir(self.root / "a"), version=newer), 0)
+        self.assertEqual(self.package(make_package_dir(self.root / "b"), version="0.9.8-oneiron.20261001.9"), 0)
         self.assertEqual((self.feed / "stable").read_text(), f"v{newer}\n")
         self.assertEqual(json.loads((self.feed / "latest.json").read_text())["version"], f"v{newer}")
         self.assertEqual(sorted(os.listdir(self.feed / "releases")),
@@ -322,13 +325,28 @@ class PackageTests(FeedFixture):
 
     def test_a_feed_inside_ts_state_is_refused(self) -> None:
         with self.assertRaisesRegex(SystemExit, "overlaps protected TS state"):
-            self.package(make_package_dir(self.root / "pkg"), "--no-decoder",
-                         "--feed-dir", str(side_by_side.TS_PREFIX / "feed"))
+            self.package(make_package_dir(self.root / "pkg"), "--feed-dir", str(side_by_side.TS_PREFIX / "feed"))
+
+    def test_a_symlinked_dir_inside_the_feed_is_never_written_through(self) -> None:
+        # The feed root is checked against TS state; a link further down
+        # (releases/, or one release dir) must not carry the writes there.
+        side_by_side.TS_PREFIX.mkdir()
+        for parts in (("releases",), ("releases", f"v{VERSION}")):
+            with self.subTest(parts=parts):
+                link = self.feed.joinpath(*parts)
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(side_by_side.TS_PREFIX, target_is_directory=True)
+                with self.assertRaisesRegex(SystemExit, "is not a plain directory"):
+                    self.package(make_package_dir(self.root / f"pkg-{len(parts)}"))
+                self.assertEqual(os.listdir(side_by_side.TS_PREFIX), [])
+                link.unlink()
 
 
 @unittest.skipUnless(host.system() == "Linux" and shutil.which("gcc") and shutil.which("readelf"),
                      "the split-debug decoder is a GNU/Linux ELF artifact (needs gcc + binutils)")
 class LinuxDecoderTests(FeedFixture):
+    host = LINUX
+
     def build_split(self, name: str, marker: str) -> tuple[Path, Path]:
         """A real ELF through upstream's split_debug.py, as package_release.py
         does on Linux: the shipped image and its decoder."""
@@ -342,12 +360,12 @@ class LinuxDecoderTests(FeedFixture):
         subprocess.run([sys.executable, str(SCRIPTS / "release" / "split_debug.py"), "--binary", str(raw),
                         "--shipped", str(out / "prime-agent"), "--out", str(out), "--version", BASE,
                         "--target", "x86_64-unknown-linux-gnu"], check=True, capture_output=True)
-        return out / "prime-agent", out / f"prime-agent-{BASE}-{PLATFORM}.debug.gz"
+        return out / "prime-agent", out / f"prime-agent-{BASE}-{LINUX}.debug.gz"
 
     def test_the_decoder_is_paired_by_build_id_and_published_beside_the_tarball(self) -> None:
         shipped, decoder = self.build_split("good", "one")
         _, other_decoder = self.build_split("other", "two")
-        package_dir = make_package_dir(self.root / "pkg", binary=shipped)
+        package_dir = make_package_dir(self.root / "pkg", platform=LINUX, binary=shipped)
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
             self.package(package_dir, "--decoder", str(other_decoder))
@@ -356,7 +374,7 @@ class LinuxDecoderTests(FeedFixture):
 
         self.assertEqual(self.package(package_dir, "--decoder", str(decoder)), 0)
         manifest = json.loads((self.release() / "manifest.json").read_text())
-        published = self.release() / f"prime-agent-{VERSION}-{PLATFORM}.debug.gz"
+        published = self.release() / f"prime-agent-{VERSION}-{LINUX}.debug.gz"
         self.assertEqual(published.read_bytes(), decoder.read_bytes())
         self.assertEqual(manifest["decoders"], [{
             "target": "x86_64-unknown-linux-gnu", "file": published.name,
@@ -372,16 +390,39 @@ class LinuxDecoderTests(FeedFixture):
             self.assertEqual(handle.read(4), b"\x7fELF")
             self.assertFalse(any(name.endswith((".debug", ".debug.gz")) for name in archive.getnames()))
 
-    def test_a_release_published_without_its_decoder_never_gains_one(self) -> None:
+    def test_an_unsplit_elf_is_refused(self) -> None:
+        # The shipped ELF must have its DWARF split out, whatever decoder
+        # comes with it: package runs upstream's gate, not a bypass.
+        work = self.root / "unsplit"
+        work.mkdir()
+        (work / "prime-agent.c").write_text(FAKE_ELF_SOURCE)
+        raw = work / "prime-agent"
+        subprocess.run(["gcc", "-g", "-Wl,--build-id", "-o", str(raw), str(work / "prime-agent.c")], check=True)
+        _, decoder = self.build_split("good", "one")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            self.package(make_package_dir(self.root / "pkg", platform=LINUX, binary=raw), "--decoder", str(decoder))
+        self.assertIn("still has DWARF", stderr.getvalue())
+        self.assertFalse(self.feed.exists())
+
+    def test_a_second_platform_joins_only_from_the_same_source(self) -> None:
         shipped, decoder = self.build_split("good", "one")
-        package_dir = make_package_dir(self.root / "pkg", binary=shipped)
-        self.assertEqual(self.package(package_dir, "--no-decoder"), 0)
-        before = {path.name: path.read_bytes() for path in self.release().iterdir()}
-        # The same tarball bytes, now with a decoder: the published row says
-        # it was released without one, so this is a different release.
-        with self.assertRaisesRegex(SystemExit, "with decoder 'omitted', this run says 'attached'"):
-            self.package(package_dir, "--decoder", str(decoder))
-        self.assertEqual({path.name: path.read_bytes() for path in self.release().iterdir()}, before)
+        linux = make_package_dir(self.root / "linux", platform=LINUX, binary=shipped)
+        self.assertEqual(self.package(linux, "--decoder", str(decoder)), 0)
+        self.host = PLATFORM
+        other_source = make_source_repo(self.root / "src2", marker="two")
+        darwin = make_package_dir(self.root / "darwin")
+        with self.assertRaisesRegex(SystemExit, "same source"):
+            self.package(darwin, source=other_source)
+        self.assertEqual(self.package(darwin), 0)
+        manifest = json.loads((self.release() / "manifest.json").read_text())
+        self.assertEqual([(row["platform"], row["target"], row["decoder"]) for row in manifest["binaries"]],
+                         [("darwin-arm64", "aarch64-apple-darwin", "not-applicable"),
+                          ("linux-x64", "x86_64-unknown-linux-gnu", "attached")])
+        self.assertEqual(sorted((self.release() / "SHA256SUMS").read_text().splitlines()),
+                         sorted(f"{row['sha256']}  {row['file']}" for row in
+                                manifest["binaries"] + manifest["decoders"]))
+        self.assertEqual(json.loads((self.feed / "latest.json").read_text()), manifest)
 
 
 if __name__ == "__main__":

@@ -33,7 +33,6 @@ import datetime as dt
 import json
 import os
 import re
-import shlex
 import shutil
 import socket
 import subprocess
@@ -57,18 +56,31 @@ class Refused(Exception):
 
 
 class Receipt:
-    """One rollout/rollback record: the current phase, per-phase timings, and
-    the outcome, written whether the run succeeds, is refused or fails."""
+    """One rollout/rollback record, journaled as it goes: written `running`
+    before the first check and again on entering every phase (so a crash
+    leaves the phase it died in on disk, a selection included), then with
+    the outcome, whether the run succeeds, is refused or fails. An earlier
+    receipt of the same name is kept, renamed to <stem>.<its UTC mtime>.json."""
 
-    def __init__(self, schema: str, **fields: object) -> None:
+    def __init__(self, path: Path, schema: str, **fields: object) -> None:
+        self.path = path
         self.started = time.monotonic()
         self.data: dict = {"schema": schema, **fields, "host": socket.gethostname(), "startedAt": sbs.utc_now(),
                            "finishedAt": None, "status": "running", "phase": None, "failure": None,
                            "checks": {}, "timings": {}}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() or path.is_symlink():
+            stamp = dt.datetime.fromtimestamp(path.lstat().st_mtime, dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+            path.rename(path.parent / f"{path.stem}.{stamp}.json")
+        self.persist()
+
+    def persist(self) -> None:
+        sbs.write_json_atomic(self.path, self.data)
 
     @contextlib.contextmanager
     def phase(self, name: str) -> Iterator[None]:
         self.data["phase"] = name
+        self.persist()
         started = time.monotonic()
         try:
             yield
@@ -76,8 +88,9 @@ class Receipt:
             self.data["timings"][name] = round(time.monotonic() - started, 3)
 
     def run(self, steps) -> int:
-        """Run steps(); record success, a refusal or a failure (SystemExit
-        from the shared install/probe code is a failure with its message)."""
+        """Run steps(); record success, a refusal or a failure: SystemExit
+        from the shared install/probe code with its message, any other
+        error (a permission, archive, JSON or spawn error) with its type."""
         try:
             steps()
             self.data["status"] = "done"
@@ -86,21 +99,12 @@ class Receipt:
         except SystemExit as error:
             message = str(error.code).removeprefix("error: ") if error.code not in (None, 0) else "exited"
             self.data.update(status="failed", failure={"phase": self.data["phase"], "message": message})
+        except Exception as error:  # noqa: BLE001 (every failure is recorded, never lost)
+            self.data.update(status="failed", failure={"phase": self.data["phase"],
+                                                       "message": f"{type(error).__name__}: {error}"})
         self.data["finishedAt"] = sbs.utc_now()
         self.data["timings"]["total"] = round(time.monotonic() - self.started, 3)
         return 0 if self.data["status"] == "done" else 1
-
-
-def write_receipt(directory: Path, name: str, receipt: dict) -> Path:
-    """Write directory/name; an earlier receipt there is kept, renamed to
-    <stem>.<its UTC mtime>.json, never overwritten."""
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / name
-    if path.exists():
-        stamp = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        path.rename(directory / f"{path.stem}.{stamp}.json")
-    sbs.write_json_atomic(path, receipt)
-    return path
 
 
 def pointer_state(prefix: Path, bin_dir: Path) -> dict:
@@ -138,21 +142,28 @@ def idle_gate(receipt: Receipt, key: str, args: argparse.Namespace, prefix: Path
 
 
 def retire_old_daemon(receipt: Receipt, args: argparse.Namespace, prefix: Path, version: str) -> None:
-    """The swap does not reach a running supervisor: one of another version
+    """The swap does not reach a running supervisor: one of another release
     but the same protocol and schema is still `current` to new clients, and
-    it spawns every worker from its own (old) binary. On request, and only
-    when it is idle and ours on the retiring connection, stop it, so the
-    next prime-agent-rs run starts `version`; otherwise say so."""
+    it spawns every worker from its own (old) binary. Its release is told by
+    its executable path (the hello's appVersion is the compiled Cargo
+    version, the same for every Oneiron build of one base). On request, and
+    only when the retiring connection finds that same supervisor (pid,
+    process start, executable) still idle, stop it, so the next
+    prime-agent-rs run starts `version`; otherwise say so."""
     observed = receipt.data["rustDaemon"]["idleBeforeSelect"]
-    if observed["state"] not in ("idle", "busy") or observed.get("appVersion") == version:
+    if observed["state"] not in ("idle", "busy"):
+        return
+    running = daemon_idle.install_of(observed, prefix)
+    if running == version:
         return
     if args.retire_idle_daemon:
-        result = daemon_idle.inspect(rust_socket(args), prefix, retire=True)
+        result = daemon_idle.inspect(rust_socket(args), prefix,
+                                     retire={key: observed.get(key) for key in daemon_idle.RETIRE_IDENTITY})
         receipt.data["rustDaemon"]["retire"] = result
         if result.get("retire", {}).get("stopped"):
             return
-    receipt.data["notice"] = (f"the Rust supervisor at {observed['socket']} still runs "
-                              f"{observed.get('appVersion')}; new sessions start on it until it exits"
+    receipt.data["notice"] = (f"the Rust supervisor at {observed['socket']} still runs {running}; new sessions "
+                              "start on it until it exits"
                               + ("" if args.retire_idle_daemon else " (--retire-idle-daemon stops it when idle)"))
     print(f"note: {receipt.data['notice']}")
 
@@ -184,13 +195,14 @@ def rollout(args: argparse.Namespace) -> int:
     sbs.check_version(version)
 
     # The whole run, receipt included, holds the prefix lock: a concurrent
-    # rollout or rollback is turned away before it records anything.
+    # rollout or rollback is turned away before it records anything. A
+    # version that is already current runs through every phase again (that
+    # re-verifies it, and finishes an interrupted activation or a requested
+    # retirement); the swap itself is then a no-op.
     with sbs.locked(prefix):
-        if sbs.read_link(prefix / "current") == version:
-            print(f"{version} is already current; nothing to do")
-            return 0
-        receipt = Receipt(ACTIVATION_SCHEMA, version=version, platform=platform, feedDir=str(feed_dir),
-                          before=pointer_state(prefix, bin_dir))
+        receipt_dir = sbs.plain_dir(prefix, "receipts", f"{version}-{platform}")
+        receipt = Receipt(receipt_dir / "ACTIVATION-RECEIPT.json", ACTIVATION_SCHEMA, version=version,
+                          platform=platform, feedDir=str(feed_dir), before=pointer_state(prefix, bin_dir))
         checks = receipt.data["checks"]
 
         def steps() -> None:
@@ -212,7 +224,7 @@ def rollout(args: argparse.Namespace) -> int:
                 with receipt.phase("idle-recheck"):
                     idle_gate(receipt, "idleBeforeSelect", args, prefix)
                 with receipt.phase("select"):
-                    sbs.select_version(prefix, bin_dir, version)
+                    select_checked(receipt, prefix, bin_dir, version, receipt.data["install"]["payloadSha256"])
                 with receipt.phase("post-check"):
                     post_check(receipt, prefix, bin_dir, version)
                 with receipt.phase("old-daemon"):
@@ -222,10 +234,27 @@ def rollout(args: argparse.Namespace) -> int:
         receipt.data["after"] = pointer_state(prefix, bin_dir)
         if receipt.data["status"] == "done":
             receipt.data["status"] = "activated"
-        path = write_receipt(prefix / "receipts" / f"{version}-{platform}", "ACTIVATION-RECEIPT.json",
-                             receipt.data)
-    report(receipt.data, path)
+        receipt.persist()
+    report(receipt.data, receipt.path)
     return code
+
+
+def select_checked(receipt: Receipt, prefix: Path, bin_dir: Path, version: str, payload_sha256: str) -> None:
+    """The swap, after one last look under the lock: `current`, `previous`
+    and the launcher are still what the run started from, and the install
+    still holds the payload verified earlier (a probe or a slow idle check
+    ran in between). Then select."""
+    pointers = ("current", "previous", "launcher")
+    before, now = receipt.data["before"], pointer_state(prefix, bin_dir)
+    if {key: now[key] for key in pointers} != {key: before[key] for key in pointers}:
+        raise Refused("current, previous or the launcher changed while the run was checking; run it again")
+    actual = sbs.payload_digest(prefix / version)
+    receipt.data["checks"]["payloadUnchangedAtSelect"] = actual == payload_sha256
+    if actual != payload_sha256:
+        raise SystemExit(f"error: {prefix / version} changed after it was verified (payload {actual}, "
+                         f"verified {payload_sha256}); nothing was selected")
+    receipt.persist()  # the swap is about to happen: journal that first
+    sbs.select_version(prefix, bin_dir, version)
 
 
 def verify_release(feed_dir: Path, version: str, platform: str, scratch: Path) -> dict:
@@ -382,8 +411,9 @@ def rollback(args: argparse.Namespace) -> int:
     platform = receipt_platform(prefix, target) or release_feed.host_platform()
 
     with sbs.locked(prefix):
-        receipt = Receipt(ROLLBACK_SCHEMA, fromVersion=current, toVersion=target, platform=platform,
-                          before=pointer_state(prefix, bin_dir))
+        receipt_dir = sbs.plain_dir(prefix, "receipts", f"{target}-{platform}")
+        receipt = Receipt(receipt_dir / "ROLLBACK-RECEIPT.json", ROLLBACK_SCHEMA, fromVersion=current,
+                          toVersion=target, platform=platform, before=pointer_state(prefix, bin_dir))
         checks = receipt.data["checks"]
 
         def steps() -> None:
@@ -405,7 +435,7 @@ def rollback(args: argparse.Namespace) -> int:
             with receipt.phase("idle-check"):
                 idle_gate(receipt, "idleBeforeSelect", args, prefix)
             with receipt.phase("select"):
-                sbs.select_version(prefix, bin_dir, target)
+                select_checked(receipt, prefix, bin_dir, target, receipt.data["executable"]["payloadSha256"])
             with receipt.phase("post-check"):
                 post_check(receipt, prefix, bin_dir, target)
             with receipt.phase("old-daemon"):
@@ -415,8 +445,8 @@ def rollback(args: argparse.Namespace) -> int:
         receipt.data["after"] = pointer_state(prefix, bin_dir)
         if receipt.data["status"] == "done":
             receipt.data["status"] = "rolled-back"
-        path = write_receipt(prefix / "receipts" / f"{target}-{platform}", "ROLLBACK-RECEIPT.json", receipt.data)
-    report(receipt.data, path)
+        receipt.persist()
+    report(receipt.data, receipt.path)
     return code
 
 
@@ -457,7 +487,7 @@ def status(args: argparse.Namespace) -> int:
             "receipts": [receipt_summary(path) for path in sorted(receipt_dir.glob("*.json"))]
             if platform else []})
     launcher = bin_dir / sbs.LAUNCHER_NAME
-    expected_launcher = sbs.LAUNCHER_TEMPLATE.format(prefix=shlex.quote(str(prefix)))
+    expected_launcher = sbs.launcher_text(prefix)
     feed = {"dir": str(feed_dir),
             "stable": (feed_dir / "stable").read_text().strip() if (feed_dir / "stable").is_file() else None,
             "latest": (json.loads((feed_dir / "latest.json").read_text()).get("version")
