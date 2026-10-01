@@ -990,3 +990,58 @@ async fn bot_edges_the_give_up_never_double_counts_the_chain() {
         "the give-up never inflated the chain to 2"
     );
 }
+
+/// `agent provider transport used`: the session's first WebSocket upgrade
+/// (the transport's synthetic 101) reports once, with the API name and the
+/// transport only; plain HTTP responses and later upgrades never report,
+/// and every request's own response hook still runs.
+#[tokio::test]
+async fn provider_transport_used_reports_the_first_upgrade_once() {
+    let fixture = fixture();
+    let adoption =
+        Arc::new(crate::session_engine::transport_adoption::TransportAdoption::default());
+    adoption.set_telemetry(Arc::new(SessionTelemetry::detached(
+        fixture.client.clone(),
+        fixture.state.clone(),
+        "interactive".to_string(),
+    )));
+    let provider: pa_agent::stream::StreamFn = Arc::new(|model, _context, options| {
+        Box::pin(async move {
+            let hook = options.on_response.expect("the request's hook");
+            for status in [200, 101, 101] {
+                hook(
+                    pa_agent::stream::ProviderResponse {
+                        status,
+                        headers: std::collections::BTreeMap::new(),
+                    },
+                    &model,
+                );
+            }
+            Err(anyhow::anyhow!("scripted provider"))
+        })
+    });
+    let stream_fn = adoption.instrument(provider);
+    let statuses = Arc::new(Mutex::new(Vec::new()));
+    for _ in 0..2 {
+        let seen = Arc::clone(&statuses);
+        let options = pa_agent::stream::StreamRequestOptions {
+            on_response: Some(Arc::new(move |response, _model| {
+                seen.lock().unwrap().push(response.status);
+            })),
+            ..Default::default()
+        };
+        let mut model = pa_agent::types::Model::unknown();
+        model.api = "openai-responses".to_string();
+        let outcome = stream_fn(model, pa_agent::stream::LlmContext::default(), options).await;
+        assert!(outcome.is_err());
+    }
+    fixture.client.flush().await.unwrap();
+    let events = event_properties(&fixture.mock, "agent provider transport used").await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["api"], serde_json::json!("openai-responses"));
+    assert_eq!(events[0]["transport"], serde_json::json!("websocket"));
+    assert_eq!(
+        *statuses.lock().unwrap(),
+        vec![200, 101, 101, 200, 101, 101]
+    );
+}

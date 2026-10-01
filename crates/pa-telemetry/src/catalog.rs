@@ -1230,6 +1230,29 @@ const SKILL_USED: EventRule = EventRule {
     ],
 };
 
+/// `agent provider transport used` (v2, additive): a session's provider
+/// requests reached the model over the Responses WebSocket transport
+/// (the 101 upgrade), once per session. The API name and the transport
+/// only: never a URL, header, key, close reason, or response id.
+const PROVIDER_TRANSPORT_USED: EventRule = EventRule {
+    name: "agent provider transport used",
+    since: 2,
+    properties: &[
+        ("session_id", required(uuid())),
+        (
+            "api",
+            required(enum_rule(
+                &["openai-responses", "openai-codex-responses"],
+                "openai-responses",
+            )),
+        ),
+        (
+            "transport",
+            required(enum_rule(&["websocket"], "websocket")),
+        ),
+    ],
+};
+
 /// `startup` (v1): process entry to ready interactive session environment.
 const STARTUP: EventRule = EventRule {
     name: "startup",
@@ -1686,6 +1709,7 @@ pub fn catalog() -> Vec<&'static EventRule> {
         &AGENT_INPUT_STAGE,
         &AGENT_INSTALLATION_STAGE,
         &SKILL_USED,
+        &PROVIDER_TRANSPORT_USED,
         &STARTUP,
         &DAEMON_EVENT,
         &MODEL_REFUSED,
@@ -1814,6 +1838,7 @@ mod tests {
             "agent startup stage",
             "agent input stage",
             "agent installation stage",
+            "agent provider transport used",
         ] {
             let rule = catalog
                 .iter()

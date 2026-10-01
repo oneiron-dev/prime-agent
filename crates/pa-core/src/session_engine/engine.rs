@@ -634,6 +634,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             &config.agent_dir,
         )),
     );
+    // The `agent provider transport used` adoption seam: it observes the
+    // provider's WebSocket upgrade on the stream path and reports through
+    // the session telemetry installed below.
+    let transport_adoption =
+        std::sync::Arc::new(super::transport_adoption::TransportAdoption::default());
     let agent = Agent::new(AgentOptions {
         initial_state: AgentInitialState {
             system_prompt: Some(system_prompt.clone()),
@@ -644,7 +649,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         },
         stream_fn: Some(super::request_timing::instrument_stream_fn(
             std::sync::Arc::clone(&request_timing_wiring),
-            stream_fn,
+            transport_adoption.instrument(stream_fn),
         )),
         // The session conversion rules apply at the loop's LLM boundary
         // (TS `convertToLlm`): bookkeeping custom rows drop, everything
@@ -819,6 +824,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // Same lifetime for the `rlm child usage attributed` adoption
         // event: the producer's flush reports through this handle.
         wiring.rlm_usage.set_telemetry(telemetry.clone());
+        transport_adoption.set_telemetry(telemetry.clone());
     }
     let goal_driver = wiring.runtime.goal_driver().clone();
     Ok(SessionEngine {

@@ -559,6 +559,17 @@ impl SessionTelemetry {
         self.client.track("rlm child usage attributed", properties);
     }
 
+    /// `agent provider transport used`: the session's provider requests
+    /// reached the model over the Responses WebSocket transport (fed once
+    /// per session by the transport adoption seam). The API name only.
+    pub fn note_provider_transport_used(&self, api: &str) {
+        let mut properties = self.session_properties();
+        properties.set("api", Value::from(api));
+        properties.set("transport", Value::from("websocket"));
+        self.client
+            .track("agent provider transport used", properties);
+    }
+
     /// `agent command used`: builtin session commands only, canonical name.
     /// Feed from `session_commands::execute_session_command` (TS
     /// `captureAgentCommandUsed`).
