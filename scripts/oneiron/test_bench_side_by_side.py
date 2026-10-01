@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -13,11 +14,16 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_side_by_side as bench  # noqa: E402
+
+# A sleeper whose environment `ps -E` can read on macOS: the OS hides it for
+# platform binaries such as /bin/sleep, and the sandbox match needs HOME=.
+SLEEPER = [sys.executable, "-c", "import time; time.sleep(30)"]
 
 TS_READY = """
    ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.9.6-oneiron.20261001.1
@@ -210,6 +216,50 @@ class FrameAndRoleTests(unittest.TestCase):
         self.assertEqual(bench.classify(9, info("/home/u/.local/bin/uv pip install x")), "bootstrap")
         self.assertEqual(bench.classify(9, info("fd --version")), "other")
 
+    def test_mac_table_reads_argv_apart_from_the_environment(self) -> None:
+        # `ps -E` puts the environment in the command column. The sandbox env carries
+        # UV_CACHE_DIR=<home>/.cache/uv, which the bootstrap rule must not read as a uv argv.
+        start, later = "Thu Oct  2 02:47:53 2026", "Thu Oct  2 02:49:01 2026"
+        daemon = "/r/prime-agent --mode daemon --daemon-socket /tmp/pb.x/t/prime-agent-user/daemon.sock"
+        env = "HOME=/tmp/pb.x/h TMPDIR=/tmp/pb.x/t UV_CACHE_DIR=/Users/u/.cache/uv"
+        rows = {  # pid: (lstart in the -E call, argv, environment, lstart in the argv call or None)
+            101: (start, daemon, env, start),
+            102: (start, "/r/prime-agent", env + " PRIME_AGENT_INTERNAL_DAEMON_WORKER=1", start),
+            103: (start, "/Users/u/.local/bin/uv pip install x", env, start),
+            104: (start, "/r/prime-agent --mode daemon", env, None),        # gone before the argv call
+            105: (start, "/r/prime-agent --mode daemon", env, later),       # pid reused between the calls
+        }
+        with_env = [f"{pid} 1 2048 S {s} {argv} {e}" for pid, (s, argv, e, _) in rows.items()]
+        with_env.append(f"106 1 0 Z {start} /r/zombie {env}")
+        argv_only = [f"{pid} {a} {argv}" for pid, (_, argv, _, a) in rows.items() if a]
+        # Same pid and start, but the argv is not the -E column's prefix (retitled between the calls).
+        with_env.append(f"107 1 2048 S {start} /r/prime-agent --mode daemon {env}")
+        argv_only.append(f"107 {start} node /x/cli.js")
+        # A retitled process: its padded title replaces argv and hides the environment in both calls.
+        with_env.append(f"108 1 2048 S {start} prime-agent      ")
+        argv_only.append(f"108 {start} prime-agent      ")
+
+        def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess:
+            lines = with_env if "-E" in command else argv_only
+            return subprocess.CompletedProcess(command, 0, "\n".join(lines) + "\n", "")
+
+        with unittest.mock.patch.object(bench.subprocess, "run", fake_run):
+            table = bench._mac_table()
+        self.assertEqual(sorted(table), [101, 102, 103, 104, 105, 107, 108])
+        self.assertEqual(table[101]["cmd"], daemon)
+        self.assertEqual(table[101]["ident"], "Thu Oct 2 02:47:53 2026")
+        self.assertLessEqual({"HOME=/tmp/pb.x/h", "TMPDIR=/tmp/pb.x/t", "UV_CACHE_DIR=/Users/u/.cache/uv"},
+                             table[101]["env"])
+        self.assertEqual(bench.classify(101, table[101]), "daemon")
+        self.assertEqual(bench.classify(102, table[102]), "worker")
+        self.assertEqual(bench.classify(103, table[103]), "bootstrap")
+        # No trustworthy argv: the -E column stays the command, as before.
+        self.assertTrue(table[104]["cmd"].endswith("UV_CACHE_DIR=/Users/u/.cache/uv"))
+        self.assertTrue(table[105]["cmd"].endswith("UV_CACHE_DIR=/Users/u/.cache/uv"))
+        self.assertTrue(table[107]["cmd"].endswith("UV_CACHE_DIR=/Users/u/.cache/uv"))
+        self.assertEqual(table[108]["cmd"], "prime-agent")
+        self.assertEqual(bench.classify(108, table[108]), "cli")
+
     def test_json_events_and_final_assistant(self) -> None:
         stream = "\n".join([
             "not json",
@@ -319,9 +369,9 @@ class SandboxTests(unittest.TestCase):
         sandbox = bench.Sandbox("ts", "t", self.base, "http://127.0.0.1:9/v1", None)
         outsider = subprocess.Popen(["sleep", "30"])
         try:
-            direct = subprocess.Popen(["sleep", "30"], env=sandbox.env)
+            direct = subprocess.Popen(SLEEPER, env=sandbox.env)
             # A detached grandchild (its parent exits at once) still carries the HOME.
-            subprocess.run(["sh", "-c", "sleep 30 >/dev/null 2>&1 &"], env=sandbox.env, check=True)
+            subprocess.run(["sh", "-c", f"{shlex.join(SLEEPER)} >/dev/null 2>&1 &"], env=sandbox.env, check=True)
             # A spawned root without the sandbox HOME is tracked by descent.
             rooted = subprocess.Popen(["sleep", "30"], env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
             sandbox.add_root(rooted.pid)
@@ -350,7 +400,7 @@ class SandboxTests(unittest.TestCase):
 
     def test_signal_skips_a_pid_whose_identity_changed(self) -> None:
         sandbox = bench.Sandbox("ts", "t", self.base, "http://127.0.0.1:9/v1", None)
-        child = subprocess.Popen(["sleep", "30"], env=sandbox.env)
+        child = subprocess.Popen(SLEEPER, env=sandbox.env)
         try:
             deadline = time.monotonic() + 5
             while child.pid not in sandbox.processes() and time.monotonic() < deadline:
