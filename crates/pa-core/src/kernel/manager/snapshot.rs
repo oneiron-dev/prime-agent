@@ -8,11 +8,21 @@ use super::{
     DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES, REPAIR_STEP_TIMEOUT_MS, RESTORE_EXECUTION_TIMEOUT_MS,
     SNAPSHOT_EXECUTION_TIMEOUT_MS,
 };
+use crate::kernel::shared::{KernelSnapshotGuardStats, SnapshotGuardPhase};
 
 /// The runtime snapshot writer's reason for a name above the per-variable
 /// cap (prime-agent-runtime/src/rlm/repl.py): such a skipped name is a live
 /// over-cap survivor unless the same capture also pruned it.
 const OVER_CAP_SKIP_REASON: &str = "exceeds per-variable snapshot size cap";
+
+/// The runtime's file-handle guard reasons: a direct `io.IOBase` value or a
+/// pickle reaching dill's file-handle reducer skipped at capture, and a blob
+/// carrying that reducer refused at restore.
+const FILE_HANDLE_GUARD_REASONS: &[&str] = &[
+    "unsafe file handle (io.IOBase)",
+    "unsafe dill file-handle reducer",
+    "unsafe legacy dill file-handle reducer rejected",
+];
 
 /// Bound on the witness stat pair's await: a stalled (network/FUSE)
 /// artifacts filesystem must not wedge a capture; a timed-out stat reads
@@ -95,6 +105,14 @@ impl Inner {
                     bytes: fields.get("bytes").and_then(Value::as_u64).unwrap_or(0),
                     path: cfg.path.clone(),
                 };
+                self.report_snapshot_guard(
+                    SnapshotGuardPhase::Capture,
+                    &committed.skipped,
+                    fields
+                        .get("purgedFileHandles")
+                        .and_then(Value::as_array)
+                        .map_or(0, |names| names.len() as u64),
+                );
                 // This capture's commit sequence: the arm may only run
                 // while no LATER capture has committed, or a straggling
                 // earlier record's delayed stat probe could pair its stale
@@ -134,6 +152,31 @@ impl Inner {
                 self.append_diagnostic(&format!("state snapshot error: {error:#}"));
                 None
             }
+        }
+    }
+
+    /// `kernel snapshot guard` telemetry: what the runtime's file-handle
+    /// guard skipped or refused in one snapshot direction, and the direct
+    /// handle names a capture purged; silent when the guard did nothing.
+    fn report_snapshot_guard(
+        &self,
+        phase: SnapshotGuardPhase,
+        skips: &[SnapshotSkip],
+        purged: u64,
+    ) {
+        let rejected = skips
+            .iter()
+            .filter(|skip| FILE_HANDLE_GUARD_REASONS.contains(&skip.reason.as_str()))
+            .count() as u64;
+        if rejected == 0 && purged == 0 {
+            return;
+        }
+        if let Some(report) = &self.options.on_snapshot_guard {
+            report(KernelSnapshotGuardStats {
+                phase,
+                rejected_count: rejected,
+                purged_count: purged,
+            });
         }
     }
 
@@ -323,6 +366,7 @@ impl Inner {
                 // leaves the on-disk payload the fuller copy: the dispose
                 // flush must not overwrite it either.
                 let incomplete = !failed.is_empty();
+                self.report_snapshot_guard(SnapshotGuardPhase::Restore, &failed, 0);
                 {
                     let mut g = lock(&self.guarded);
                     g.pending_restore = false;
@@ -614,4 +658,68 @@ fn as_reason_array(fields: &Value, key: &str) -> Vec<SnapshotSkip> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::kernel::manager::ReplKernelManager;
+    use crate::kernel::shared::KernelManagerOptions;
+
+    /// Only the file-handle guard's own reasons count as rejections (a size
+    /// cap or a corrupt blob is not the guard), and a direction where the
+    /// guard did nothing stays silent.
+    #[test]
+    fn the_snapshot_guard_reports_its_own_rejections_and_purges_only() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            on_snapshot_guard: Some(Arc::new({
+                let reports = Arc::clone(&reports);
+                move |stats| lock(&reports).push(stats)
+            })),
+            ..KernelManagerOptions::default()
+        });
+        let skip = |name: &str, reason: &str| SnapshotSkip {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        };
+        let over_cap = skip("huge", OVER_CAP_SKIP_REASON);
+        manager.inner.report_snapshot_guard(
+            SnapshotGuardPhase::Capture,
+            &[
+                skip("log", "unsafe file handle (io.IOBase)"),
+                skip("holder", "unsafe dill file-handle reducer"),
+                over_cap.clone(),
+            ],
+            1,
+        );
+        manager
+            .inner
+            .report_snapshot_guard(SnapshotGuardPhase::Capture, &[over_cap], 0);
+        manager.inner.report_snapshot_guard(
+            SnapshotGuardPhase::Restore,
+            &[
+                skip("old", "unsafe legacy dill file-handle reducer rejected"),
+                skip("bad", "corrupt snapshot variable: not bytes"),
+            ],
+            0,
+        );
+        assert_eq!(
+            *lock(&reports),
+            vec![
+                KernelSnapshotGuardStats {
+                    phase: SnapshotGuardPhase::Capture,
+                    rejected_count: 2,
+                    purged_count: 1,
+                },
+                KernelSnapshotGuardStats {
+                    phase: SnapshotGuardPhase::Restore,
+                    rejected_count: 1,
+                    purged_count: 0,
+                },
+            ]
+        );
+    }
 }

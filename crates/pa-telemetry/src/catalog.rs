@@ -762,6 +762,15 @@ const fn tokens() -> PropKind {
     }
 }
 
+/// A process or machine memory size in bytes, capped at 1 PiB.
+const fn memory_bytes() -> PropKind {
+    PropKind::Number {
+        max: 1 << 50,
+        integer: true,
+        nullable: false,
+    }
+}
+
 const fn duration() -> PropKind {
     PropKind::Number {
         max: 31_536_000_000,
@@ -1351,6 +1360,47 @@ const KERNEL_BOOTSTRAP: EventRule = EventRule {
     ],
 };
 
+/// The memory steps a kernel takes, smallest first.
+const KERNEL_MEMORY_ACTIONS: &[&str] = &["warn", "child", "trim", "end"];
+
+/// Why a kernel memory step fired.
+const KERNEL_MEMORY_CAUSES: &[&str] = &["limit", "hard", "grace", "machine"];
+
+/// `kernel memory action` (v2, additive): one per memory step a kernel
+/// takes - a warning owed to the model, a stopped child process unit, the
+/// largest variables deleted, or the kernel ended. Sizes are bytes; no
+/// variable or process name, pid, path, or message text.
+const KERNEL_MEMORY_ACTION: EventRule = EventRule {
+    name: "kernel memory action",
+    since: 2,
+    properties: &[
+        ("action", required(enum_rule(KERNEL_MEMORY_ACTIONS, "warn"))),
+        ("cause", required(enum_rule(KERNEL_MEMORY_CAUSES, "limit"))),
+        ("tree_bytes", required(memory_bytes())),
+        ("kernel_bytes", required(memory_bytes())),
+        ("limit_bytes", required(memory_bytes())),
+        ("after_bytes", optional(memory_bytes())),
+        ("dropped_count", optional(count())),
+        ("cell_running", required(boolean())),
+    ],
+};
+
+/// `kernel snapshot guard` (v2, additive): a namespace snapshot capture or
+/// restore whose file-handle guard skipped, refused, or purged at least one
+/// value. Counts only; no names or snapshot content.
+const KERNEL_SNAPSHOT_GUARD: EventRule = EventRule {
+    name: "kernel snapshot guard",
+    since: 2,
+    properties: &[
+        (
+            "phase",
+            required(enum_rule(&["capture", "restore"], "capture")),
+        ),
+        ("rejected_count", required(count())),
+        ("purged_count", required(count())),
+    ],
+};
+
 /// `session archived` (v1): the daemon `kill` path.
 const SESSION_ARCHIVED: EventRule = EventRule {
     name: "session archived",
@@ -1693,6 +1743,8 @@ pub fn catalog() -> Vec<&'static EventRule> {
         &RLM_CHILD_USAGE,
         &TOOL_EXECUTED,
         &KERNEL_BOOTSTRAP,
+        &KERNEL_MEMORY_ACTION,
+        &KERNEL_SNAPSHOT_GUARD,
         &SESSION_ARCHIVED,
     ];
     all.extend(TUI_EVENTS.iter());
@@ -1903,6 +1955,47 @@ mod tests {
             "unknown key dropped"
         );
         assert_eq!(adjusted, 2, "one fallback + one dropped key");
+    }
+
+    /// The kernel memory events keep their primitive sizes and counts and
+    /// drop anything else a seam might try to attach (a variable name, a
+    /// cell's source).
+    #[test]
+    fn kernel_memory_events_carry_sizes_and_counts_only() {
+        let mut action = Properties::new();
+        action.set("action", json!("trim"));
+        action.set("cause", json!("pressure")); // out of vocabulary
+        action.set("tree_bytes", json!(17_179_869_185u64));
+        action.set("kernel_bytes", json!(16_000_000_000u64));
+        action.set("limit_bytes", json!(17_179_869_184u64));
+        action.set("after_bytes", json!(u64::MAX)); // past the 1 PiB cap
+        action.set("dropped_count", json!(2));
+        action.set("cell_running", json!(true));
+        action.set("variable", json!("frames"));
+        action.set("source", json!("x = load()"));
+        sanitize("kernel memory action", &mut action);
+        let mut expected = Properties::new();
+        expected.set("action", json!("trim"));
+        expected.set("cause", json!("limit"));
+        expected.set("tree_bytes", json!(17_179_869_185u64));
+        expected.set("kernel_bytes", json!(16_000_000_000u64));
+        expected.set("limit_bytes", json!(17_179_869_184u64));
+        expected.set("after_bytes", json!(1u64 << 50));
+        expected.set("dropped_count", json!(2));
+        expected.set("cell_running", json!(true));
+        assert_eq!(action, expected);
+
+        let mut guard = Properties::new();
+        guard.set("phase", json!("restore"));
+        guard.set("rejected_count", json!(1));
+        guard.set("purged_count", json!(0));
+        guard.set("names", json!("log_file"));
+        sanitize("kernel snapshot guard", &mut guard);
+        let mut expected = Properties::new();
+        expected.set("phase", json!("restore"));
+        expected.set("rejected_count", json!(1));
+        expected.set("purged_count", json!(0));
+        assert_eq!(guard, expected);
     }
 
     #[test]
