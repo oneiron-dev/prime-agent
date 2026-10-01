@@ -1,6 +1,7 @@
 //! Request plumbing: enqueue/execute state machine, signal enum, and failure
 //! description helpers.
 
+use super::memory::SettledRequest;
 use super::{
     anyhow, json, lock, merge_signals, oneshot, AbortSignal, ActiveExecution, Arc, AsyncWriteExt,
     Duration, ExecBuffers, ExecuteOptions, ExecuteResult, ExecuteStatus, Instant,
@@ -136,10 +137,21 @@ impl ReplKernelManager {
         let merged = merge_signals(opts.signal.as_ref(), timeout_signal.clone());
         let mut opts = opts;
         opts.signal = merged;
+        let internal = opts.internal;
         let result = self.execute_inner(request, code, opts, started).await;
         if let Some(signal) = &timeout_signal {
             signal.abort();
         }
+        // Still holding the slot: a memory trim runs before anything else can allocate.
+        if let Ok(settled) = &result {
+            let settled = if internal {
+                SettledRequest::Internal(&settled.result)
+            } else {
+                SettledRequest::User(&settled.result)
+            };
+            self.run_memory_follow_up(settled).await;
+        }
+        drop(queue_guard);
         result
     }
 
@@ -148,7 +160,7 @@ impl ReplKernelManager {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn execute_inner(
+    pub(super) async fn execute_inner(
         &self,
         request: Request,
         code: &str,
@@ -185,7 +197,18 @@ impl ReplKernelManager {
         let (namespace_code, restores_namespace) = match &request {
             Request::Execute { .. } => (true, false),
             Request::Restore { .. } => (false, true),
-            _ => (false, false),
+            // A trim that may delete names mutates the namespace (internal
+            // or not): the capture memo must not replay a dump that still
+            // holds them. A target of 0 only reports.
+            Request::TrimMemory { target_bytes, .. } => (*target_bytes > 0, false),
+            Request::Interrupt
+            | Request::HostReply { .. }
+            | Request::Snapshot { .. }
+            | Request::ListNames
+            | Request::McpStatus { .. }
+            | Request::MemoryNotice { .. }
+            | Request::MemoryReport { .. }
+            | Request::Shutdown => (false, false),
         };
         let execution = Arc::new(ActiveExecution {
             request_id: request_id.clone(),
@@ -219,7 +242,14 @@ impl ReplKernelManager {
                 let Some(inner) = inner.upgrade() else {
                     return;
                 };
-                let _ = inner.interrupt(Some(&execution.request_id)).await;
+                // Bounded: a runtime that stopped draining stdin leaves the
+                // request's own write holding the writer, and the interrupt
+                // would wait on it forever; the force-abort must still come.
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(KERNEL_ABORT_GRACE_MS),
+                    inner.interrupt(Some(&execution.request_id)),
+                )
+                .await;
                 tokio::time::sleep(Duration::from_millis(KERNEL_ABORT_GRACE_MS)).await;
                 // The execution stays active until its done event arrives;
                 // clearing it early would let a new cell race the interrupted

@@ -274,6 +274,7 @@ impl Inner {
             g.capture_freshness = None;
             g.freshness_epoch += 1;
         }
+        self.watch_memory();
         Ok(())
     }
 

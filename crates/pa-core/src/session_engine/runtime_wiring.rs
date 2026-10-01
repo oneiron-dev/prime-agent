@@ -211,34 +211,60 @@ pub fn kernel_python_skills(skills: &[Skill]) -> Vec<KernelPythonSkill> {
         .collect()
 }
 
-/// Build the kernel provisioner for a session: host handlers for the
-/// goal/heartbeat bridge plus the pre-imported Python skills.
-///
-/// The session's agent dir is propagated explicitly into the kernel env
-/// (`PRIME_AGENT_CODING_AGENT_DIR`): ambient inheritance is correct for the
-/// product paths, but an embedding host whose ambient env differs from the
-/// session's agent dir must not leak its own paths into the kernel. Same
-/// discipline as the daemon worker env (#109).
-///
-/// `cwd` is the SESSION's working directory (TS
-/// `new IpythonKernelProvisioner(this._cwd, ...)`), not the host process's:
-/// the kernel-resident tools (bash/edit) run there, and a runtime whose
-/// session cwd differs from the process cwd (a daemon worker switched onto
-/// another session file) must spawn the kernel in the session's cwd.
-#[allow(clippy::too_many_arguments)] // one wiring funnel, same style as AgentSession::from_session_arc
+/// Everything one session's kernel provisioner is built from.
+pub struct KernelProvisionerWiring<'a> {
+    pub session_id: String,
+    /// Host handlers for the goal/heartbeat bridge.
+    pub handlers: HostRequestHandlers,
+    /// The pre-imported Python skills.
+    pub python_skills: Vec<KernelPythonSkill>,
+    /// The SESSION's working directory (TS
+    /// `new IpythonKernelProvisioner(this._cwd, ...)`), not the host
+    /// process's: the kernel-resident tools (bash/edit) run there, and a
+    /// runtime whose session cwd differs from the process cwd (a daemon
+    /// worker switched onto another session file) must spawn the kernel in
+    /// the session's cwd.
+    pub cwd: std::path::PathBuf,
+    /// Propagated explicitly into the kernel env
+    /// (`PRIME_AGENT_CODING_AGENT_DIR`): ambient inheritance is correct for
+    /// the product paths, but an embedding host whose ambient env differs
+    /// from the session's agent dir must not leak its own paths into the
+    /// kernel. Same discipline as the daemon worker env (#109).
+    pub agent_dir: &'a std::path::Path,
+    /// Only persistent sessions (which have an artifact dir) get a
+    /// revivable snapshot, TS `snapshotDir` (the session artifact dir).
+    pub snapshot_dir: Option<std::path::PathBuf>,
+    pub on_restore: Option<crate::kernel::provisioner::RestoreCallback>,
+    pub on_background_work_settled: Option<crate::kernel::shared::BackgroundWorkSettledCallback>,
+    pub on_unavailable_skills: Option<crate::kernel::provisioner::UnavailableSkillsCallback>,
+    pub on_bootstrap_result: Option<crate::kernel::provisioner::KernelBootstrapResultHandler>,
+    /// The resolved `kernelMemoryLimitGb` (0 turns the memory ladder off).
+    pub memory_limit_gb: f64,
+    /// The resolved `kernelMemoryBackstop`.
+    pub memory_backstop: bool,
+    pub on_memory_action: Option<crate::kernel::shared::KernelMemoryActionHandler>,
+    pub on_snapshot_guard: Option<crate::kernel::shared::KernelSnapshotGuardHandler>,
+}
+
+/// Build the kernel provisioner for a session.
 #[must_use]
-pub fn kernel_provisioner(
-    session_id: String,
-    handlers: HostRequestHandlers,
-    python_skills: Vec<KernelPythonSkill>,
-    cwd: std::path::PathBuf,
-    agent_dir: &std::path::Path,
-    snapshot_dir: Option<std::path::PathBuf>,
-    on_restore: Option<crate::kernel::provisioner::RestoreCallback>,
-    on_background_work_settled: Option<crate::kernel::shared::BackgroundWorkSettledCallback>,
-    on_unavailable_skills: Option<crate::kernel::provisioner::UnavailableSkillsCallback>,
-    on_bootstrap_result: Option<crate::kernel::provisioner::KernelBootstrapResultHandler>,
-) -> Arc<KernelProvisioner> {
+pub fn kernel_provisioner(wiring: KernelProvisionerWiring<'_>) -> Arc<KernelProvisioner> {
+    let KernelProvisionerWiring {
+        session_id,
+        handlers,
+        python_skills,
+        cwd,
+        agent_dir,
+        snapshot_dir,
+        on_restore,
+        on_background_work_settled,
+        on_unavailable_skills,
+        on_bootstrap_result,
+        memory_limit_gb,
+        memory_backstop,
+        on_memory_action,
+        on_snapshot_guard,
+    } = wiring;
     let mut env = HashMap::with_capacity(1);
     env.insert(
         "PRIME_AGENT_CODING_AGENT_DIR".to_string(),
@@ -254,15 +280,16 @@ pub fn kernel_provisioner(
             session_id: Some(session_id),
             host_handlers: handlers,
             python_skills,
-            // Only persistent sessions (which have an artifact dir) get a
-            // revivable snapshot, TS `snapshotDir` (the session artifact
-            // dir).
             snapshot_dir,
             ready_gate: None,
             on_restore,
             on_background_work_settled,
             on_unavailable_skills,
             on_bootstrap_result,
+            memory_limit_gb: Some(memory_limit_gb),
+            memory_backstop: Some(memory_backstop),
+            on_memory_action,
+            on_snapshot_guard,
         },
     ))
 }
@@ -353,7 +380,10 @@ fn convert_execute_result(
             ename: error.ename,
             evalue: error.evalue,
             traceback: error.traceback,
+            line: error.line,
         }),
+        queued_memory_notices: result.queued_memory_notices,
+        memory_notices: result.memory_notices,
         attachments: result
             .attachments
             .unwrap_or_default()
@@ -367,11 +397,16 @@ fn convert_execute_result(
     }
 }
 
-/// Build the ipython tool options for a wired kernel provisioner.
+/// Build the ipython tool options for a wired kernel provisioner;
+/// `memory_limit_gb` is the resolved `kernelMemoryLimitGb` its description states.
 #[must_use]
-pub fn ipython_tool_options(provisioner: Arc<KernelProvisioner>) -> IpythonToolOptions {
+pub fn ipython_tool_options(
+    provisioner: Arc<KernelProvisioner>,
+    memory_limit_gb: f64,
+) -> IpythonToolOptions {
     IpythonToolOptions {
         provisioner,
         ui: None,
+        memory_limit_gb,
     }
 }

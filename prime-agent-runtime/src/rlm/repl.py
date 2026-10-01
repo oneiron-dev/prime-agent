@@ -29,12 +29,15 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .bash import _kill_live_handles
+from .bash import _kill_live_handles, record_memory_notice
+from .memory import REPORT_WALK_NODES, sized_entry, sized_groups, trim_memory
 
 PROTOCOL_VERSION = 3
+# Request types beyond the version-3 base; the ready event lists them so a host can gate on them.
+FEATURES = ("trim_memory", "memory_notice", "memory_report")
 
-DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
-DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
+DEFAULT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
+DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 8 * 1024 * 1024
 
 # Plain ASCII, never a pickle start: _restore_state sniffs it to tell v2 framed
 # payloads from legacy (single dill-pickled dict) ones.
@@ -82,6 +85,10 @@ _current_cell_execution: contextvars.ContextVar[_CellExecution | None] = context
 )
 _active: dict[str, Any] = {"task": None, "rid": None, "interrupted": False}
 _cell_counter = 0
+# Code filename of the cell being executed, so its line can be named in errors and memory reports.
+_cell_file: str | None = None
+# The user namespace, for the memory report the reader thread answers.
+_user_ns: dict[str, Any] | None = None
 _pending_host: dict[str, "asyncio.Future[dict[str, Any]]"] = {}
 # Set on the loop thread once stdin hits EOF or a shutdown request arrives; no
 # host reply can arrive after that, so waiting (and future) host_request calls fail.
@@ -548,6 +555,30 @@ def _cap_traceback_lines(lines: list[str]) -> list[str]:
     return kept
 
 
+_LINE_SOURCE_CAP = 200
+
+
+def _line_of(filename: str, lineno: int | None) -> dict[str, Any] | None:
+    if not lineno:
+        return None
+    source = linecache.getline(filename, lineno).strip()
+    if len(source) > _LINE_SOURCE_CAP:
+        source = source[:_LINE_SOURCE_CAP] + "..."
+    return {"lineno": lineno, "source": source}
+
+
+def _with_cell_line(event: dict[str, Any], stack: traceback.StackSummary | None) -> dict[str, Any]:
+    """Add the running cell's innermost traceback line (a call into an earlier cell names this cell's call)."""
+    filename = _cell_file
+    for frame in reversed(stack or []):
+        if filename is not None and frame.filename == filename:
+            line = _line_of(filename, frame.lineno)
+            if line:
+                event["line"] = line
+            break
+    return event
+
+
 def _error_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
     # No cell frame (e.g. SyntaxError): exception-only keeps filename, source, and caret.
     te = traceback.TracebackException.from_exception(exc)
@@ -557,13 +588,23 @@ def _error_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
     else:
         te.stack = stack
         lines = list(te.format())
-    return {
+    event = {
         "event": "error",
         "id": cell_id,
         "ename": type(exc).__name__,
         "evalue": _cap_text(_safe_str(exc)),
         "traceback": _cap_traceback_lines([_cap_text(line) for line in lines]),
     }
+    return _with_cell_line(event, stack)
+
+
+def _clear_frames(exc: BaseException | None) -> None:
+    """Release the locals an interrupted cell's frames still hold (its data would outlive it)."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        traceback.clear_frames(exc.__traceback__)
+        exc = exc.__cause__ or exc.__context__
 
 
 def _interrupt_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
@@ -574,7 +615,8 @@ def _interrupt_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
         lines = ["Traceback (most recent call last):\n"]
         lines.extend(stack.format())
     lines.append("KeyboardInterrupt\n")
-    return {"event": "error", "id": cell_id, "ename": "KeyboardInterrupt", "evalue": "", "traceback": lines}
+    event = {"event": "error", "id": cell_id, "ename": "KeyboardInterrupt", "evalue": "", "traceback": lines}
+    return _with_cell_line(event, stack)
 
 
 def _compile_cell(code: str, filename: str) -> tuple[list[types.CodeType], bool]:
@@ -617,10 +659,15 @@ async def _run_guarded(task: asyncio.Task[Any], rid: str) -> tuple[str, Any, dic
         return "ok", value, None
     except asyncio.CancelledError as exc:
         if _active["interrupted"]:
-            return "error", None, _interrupt_event(rid, exc)
+            event = _interrupt_event(rid, exc)
+            _clear_frames(exc)
+            return "error", None, event
         return "error", None, _error_event(rid, exc)
     except BaseException as exc:  # noqa: BLE001 - every cell failure becomes an error event
-        return "error", None, _error_event(rid, exc)
+        event = _error_event(rid, exc)
+        if _active["interrupted"] and isinstance(exc, KeyboardInterrupt):
+            _clear_frames(exc)
+        return "error", None, event
     finally:
         with _interrupt_lock:
             global _finishing_rid
@@ -634,10 +681,11 @@ async def _run_guarded(task: asyncio.Task[Any], rid: str) -> tuple[str, Any, dic
 
 
 async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
-    global _cell_counter
+    global _cell_counter, _cell_file
     cell_id = req["id"]
     _cell_counter += 1
     filename = f"<cell-{_cell_counter}>"
+    _cell_file = filename
     execution = _CellExecution()
     cell_token = _current_cell.set(cell_id)
     execution_token = _current_cell_execution.set(execution)
@@ -672,6 +720,7 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
             _send(error)
         _send({"event": "done", "id": cell_id, "status": status})
     finally:
+        _cell_file = None
         execution.owner = None
         execution.finished.set()
         _current_cell_execution.reset(execution_token)
@@ -709,6 +758,52 @@ class _CappedWriter:
         self._sink.write(chunk)
         self.written += size
         return size
+
+
+_PICKLE_STRING_OPS = frozenset({"UNICODE", "BINUNICODE", "SHORT_BINUNICODE", "BINUNICODE8"})
+_PICKLE_GET_OPS = frozenset({"GET", "BINGET", "LONG_BINGET"})
+_PICKLE_PUT_OPS = frozenset({"PUT", "BINPUT", "LONG_BINPUT"})
+
+
+def _has_filehandle_reducer(blob: bytes | bytearray) -> bool:
+    """Reject dill reducers that can reopen or truncate durable files.
+
+    A STACK_GLOBAL takes its module and name from the two values pushed just
+    before it, and dill memoizes its module string after the first use, so the
+    walk tracks the memo: a later reference fetches ``dill._dill`` with a GET.
+    """
+    if b"_create_filehandle" not in blob:
+        return False
+    import pickletools
+
+    # The last two values pushed: their text when they are strings, else None.
+    pushed: list[str | None] = []
+    memo: dict[int, str | None] = {}
+    try:
+        for opcode, arg, _pos in pickletools.genops(blob):
+            name = opcode.name
+            if name in {"GLOBAL", "INST"}:
+                if arg == "dill._dill _create_filehandle":
+                    return True
+                pushed.append(None)
+            elif name == "STACK_GLOBAL":
+                if pushed[-2:] == ["dill._dill", "_create_filehandle"]:
+                    return True
+                pushed.append(None)
+            elif name in _PICKLE_STRING_OPS:
+                pushed.append(arg)
+            elif name in _PICKLE_GET_OPS:
+                pushed.append(memo.get(arg))
+            elif name == "MEMOIZE":
+                memo[len(memo)] = pushed[-1] if pushed else None
+            elif name in _PICKLE_PUT_OPS:
+                memo[arg] = pushed[-1] if pushed else None
+            elif opcode.stack_after:
+                pushed.append(None)
+            del pushed[:-2]
+    except Exception:  # noqa: BLE001 - a suspicious, undisassemblable blob fails closed
+        return True
+    return False
 
 
 def _read_snapshot_records(fh: Any, max_bytes: int, max_variable_bytes: int) -> dict[str, bytes]:
@@ -771,7 +866,22 @@ def _snapshot_state(
     saved: list[str] = []
     skipped: list[dict[str, str]] = []
     oversized: list[str] = []
+    unsafe_handles: list[str] = []
     missing = object()
+    candidate_names = [
+        name for name in list(ns.keys())
+        if isinstance(name, str) and not name.startswith("_") and name not in _ALWAYS_SKIP
+    ]
+    # Imports/helpers are cheap and useful across turns. For data, prefer the
+    # newest top-level bindings: dict insertion order is the namespace's only
+    # recency signal.
+    stable_names = [
+        name for name in candidate_names
+        if name in ns and (isinstance(ns[name], types.ModuleType) or callable(ns[name]))
+    ]
+    stable_name_set = set(stable_names)
+    data_names = [name for name in candidate_names if name not in stable_name_set]
+    candidate_names = stable_names + list(reversed(data_names))
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     temps: list[str] = []
@@ -813,13 +923,15 @@ def _snapshot_state(
                 # into the staged temp. The record header is charged against the aggregate
                 # cap up front, so a completed record can never overflow it (no prefix re-dump).
                 total = fh.write(_SNAPSHOT_MAGIC)
-                for name in list(ns.keys()):
-                    if name.startswith("_") or name in _ALWAYS_SKIP:
-                        continue
+                for name in candidate_names:
                     value = ns.get(name, missing)
                     if value is missing:
                         # A background thread deleted the name after the key listing.
                         skipped.append({"name": name, "reason": "deleted during snapshot"})
+                        continue
+                    if isinstance(value, io.IOBase):
+                        skipped.append({"name": name, "reason": "unsafe file handle (io.IOBase)"})
+                        unsafe_handles.append(name)
                         continue
                     try:
                         encoded = name.encode("utf-8")
@@ -839,6 +951,9 @@ def _snapshot_state(
                     try:
                         dill.dump(value, _CappedWriter(buffer, limit))
                         blob = buffer.getvalue()
+                        if _has_filehandle_reducer(blob):
+                            skipped.append({"name": name, "reason": "unsafe dill file-handle reducer"})
+                            continue
                     except _SnapshotSizeLimitExceeded:
                         if not prune_oversized and budget < max_variable_bytes:
                             skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
@@ -852,6 +967,8 @@ def _snapshot_state(
                     if total + 12 + len(encoded) + len(blob) > max_bytes:
                         # Only reachable in prune mode, where the measurement cap ignores the budget.
                         skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
+                        if prune_oversized:
+                            oversized.append(name)
                         continue
                     fh.write(len(encoded).to_bytes(4, "little"))
                     fh.write(encoded)
@@ -862,10 +979,11 @@ def _snapshot_state(
                 saved.sort()
                 pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
                 manifest = {
-                    "version": 1,
+                    "version": 2,
                     "savedNames": saved,
                     "skipped": skipped,
                     "pruned": pruned,
+                    "purgedFileHandles": sorted(unsafe_handles),
                     "bytes": total,
                     "pythonVersion": sys.version.split()[0],
                     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -893,9 +1011,25 @@ def _snapshot_state(
         except OSError as err:
             # Fail before the prune deletions so a bad manifest path never destroys state.
             return {"error": f"manifest write failed: {err}"}
-        for name in pruned:
+        purge_names = sorted(set(pruned + unsafe_handles))
+        purge_ids = {id(ns[name]) for name in purge_names if name in ns}
+        for name in purge_names:
             ns.pop(name, None)
-        result = {"saved": saved, "skipped": skipped, "pruned": pruned, "bytes": total}
+        output_cache = ns.get("Out")
+        if isinstance(output_cache, dict):
+            for key in list(output_cache):
+                if id(output_cache[key]) in purge_ids:
+                    del output_cache[key]
+        import gc
+
+        gc.collect()
+        result = {
+            "saved": saved,
+            "skipped": skipped,
+            "pruned": pruned,
+            "purgedFileHandles": sorted(unsafe_handles),
+            "bytes": total,
+        }
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
             committed.append(result)
@@ -1089,6 +1223,14 @@ def _restore_state(
     for name, blob in payload.items():
         if name in _RESTORE_SKIP:
             continue
+        if not isinstance(blob, (bytes, bytearray)):
+            failed.append({"name": name, "reason": "corrupt snapshot variable: not bytes"})
+            continue
+        # Legacy snapshots may reduce handles through dill._dill._create_filehandle.
+        # Reject before dill.loads so restore cannot reopen/truncate durable files.
+        if _has_filehandle_reducer(blob):
+            failed.append({"name": name, "reason": "unsafe legacy dill file-handle reducer rejected"})
+            continue
         try:
             staged[name] = dill.loads(blob)
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
@@ -1256,6 +1398,18 @@ async def _handle_list_names(req: dict[str, Any], ns: dict[str, Any]) -> None:
     _send({"event": "done", "id": req["id"], "status": "ok", "names": _list_names(ns)})
 
 
+async def _handle_trim_memory(req: dict[str, Any], ns: dict[str, Any]) -> None:
+    fields = {}
+    for field, default in (("target_bytes", 0), ("min_bytes", 0), ("count", 3)):
+        value = req.get(field, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            _send({"event": "done", "id": req["id"], "status": "error", "reason": f"{field} must be a non-negative integer"})
+            return
+        fields[field] = value
+    result = trim_memory(ns, _ALWAYS_SKIP, fields["target_bytes"], fields["min_bytes"], fields["count"])
+    _send({"event": "done", "id": req["id"], "status": "ok", **result})
+
+
 async def _handle_mcp_status(req: dict[str, Any], ns: dict[str, Any]) -> None:
     from . import mcp as mcp_mod
 
@@ -1324,6 +1478,8 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
             await _handle_request(_handle_list_names, req, ns)
         elif rtype == "mcp_status":
             await _handle_request(_handle_mcp_status, req, ns)
+        elif rtype == "trim_memory":
+            await _handle_request(_handle_trim_memory, req, ns)
 
 
 def _handle_bash_activity(req: dict[str, Any]) -> None:
@@ -1381,8 +1537,72 @@ _REQUIRED_FIELDS = {
     # string-required field; the handler validates the list itself.
     "mcp_status": ("id",),
     "bash_activity": ("id", "action"),
+    "trim_memory": ("id",),
     "shutdown": (),
 }
+
+
+def _handle_memory_notice(req: dict[str, Any]) -> None:
+    """Reader-thread half of the child step: record why these pids die, then acknowledge.
+
+    Out-of-band like interrupt: the host kills the group right after this
+    acknowledgement, so the bash() call that owned it can return the reason.
+    """
+    rid, pids, text = req.get("id"), req.get("pids"), req.get("text")
+    if (
+        not isinstance(rid, str)
+        or not isinstance(text, str)
+        or not isinstance(pids, list)
+        or not all(isinstance(pid, int) and not isinstance(pid, bool) for pid in pids)
+    ):
+        _protocol_error("memory_notice request needs string id and text and an int pids list")
+        return
+    matched, awaited = record_memory_notice(pids, text)
+    _send({"event": "done", "id": rid, "status": "ok", "matched": matched, "awaited": awaited})
+
+
+def _running_line() -> dict[str, Any] | None:
+    """The line the running cell executes now: its innermost frame in its own code, read from another thread."""
+    filename = _cell_file
+    if filename is None:
+        return None
+    frame = sys._current_frames().get(threading.main_thread().ident)
+    while frame is not None and frame.f_code.co_filename != filename:
+        frame = frame.f_back
+    if frame is None:
+        # Suspended at an await: the cell's frames hang off its task's await chain.
+        task = _active["task"]
+        awaitable: Any = task.get_coro() if task is not None else None
+        for _ in range(64):
+            inner = getattr(awaitable, "cr_frame", None)
+            if inner is not None and inner.f_code.co_filename == filename:
+                frame = inner
+            awaitable = getattr(awaitable, "cr_await", None)
+            if awaitable is None:
+                break
+    return _line_of(filename, frame.f_lineno) if frame is not None else None
+
+
+def _handle_memory_report(req: dict[str, Any]) -> None:
+    """Answer off the request queue, like interrupt: the host asks right before it ends the kernel,
+    usually while a cell is still running, for the running line and the names it holds."""
+    rid, count = req.get("id"), req.get("count", 30)
+    if not isinstance(rid, str) or isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        _protocol_error("memory_report request needs a string id and a non-negative int count")
+        return
+
+    def report() -> None:
+        try:
+            line = _running_line()
+            groups = sized_groups(_user_ns if _user_ns is not None else {}, _ALWAYS_SKIP, REPORT_WALK_NODES)
+            names = [sized_entry(group) for group in groups[:count]]
+            more = max(0, len(groups) - count)
+            _send({"event": "done", "id": rid, "status": "ok", "line": line, "names": names, "more": more})
+        except Exception as exc:  # noqa: BLE001 - the host falls back to what it already knows
+            _send({"event": "done", "id": rid, "status": "error", "reason": _safe_str(exc)})
+
+    # Its own thread: sizing a large namespace must not hold up interrupts on the reader thread.
+    threading.Thread(target=report, name="rlm-memory-report", daemon=True).start()
 
 
 def _protocol_error(message: str) -> None:
@@ -1400,6 +1620,12 @@ def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> No
             _protocol_error("interrupt request id must be a string")
             return
         _request_interrupt(req.get("id"))
+        return
+    if rtype == "memory_notice":
+        _handle_memory_notice(req)
+        return
+    if rtype == "memory_report":
+        _handle_memory_report(req)
         return
     if rtype == "host_reply":
         # Bypass the FIFO queue: the awaiting cell IS the in-flight
@@ -1567,7 +1793,7 @@ def _setup_fds() -> int:
 
 
 def main() -> None:
-    global _loop, _serve_task
+    global _loop, _serve_task, _user_ns
     stdin_fd = _setup_fds()
     _start_owner_watchdog()
 
@@ -1578,6 +1804,7 @@ def main() -> None:
     user_module = types.ModuleType("__main__")
     user_module.__dict__["__builtins__"] = __builtins__
     sys.modules["__main__"] = user_module
+    _user_ns = user_module.__dict__
 
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
@@ -1585,7 +1812,14 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sigint_handler)
     threading.Thread(target=_read_requests, args=(stdin_fd, queue), daemon=True).start()
 
-    _send({"event": "ready", "protocol": PROTOCOL_VERSION, "python": platform.python_version()})
+    _send(
+        {
+            "event": "ready",
+            "protocol": PROTOCOL_VERSION,
+            "python": platform.python_version(),
+            "features": list(FEATURES),
+        }
+    )
 
     _serve_task = _loop.create_task(_serve(queue, user_module.__dict__))
     # A KeyboardInterrupt escaping a cell or background task stops

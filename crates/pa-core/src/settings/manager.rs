@@ -942,6 +942,34 @@ impl SettingsManager {
         self.merged.request_timing.unwrap_or(false)
     }
 
+    /// `kernelMemoryLimitGb`: the memory ceiling per Python kernel and the
+    /// processes it starts, in GiB. A finite setting `>= 0` wins, else
+    /// `PRIME_AGENT_KERNEL_MEMORY_LIMIT_GB`, else 16; `0` turns the memory
+    /// ladder off (TS `getKernelMemoryLimitGb`).
+    #[must_use]
+    pub fn get_kernel_memory_limit_gb(&self) -> f64 {
+        crate::kernel::memory_guard::resolve_kernel_memory_limit_gb(
+            self.merged.kernel_memory_limit_gb,
+            std::env::var(crate::kernel::memory_guard::KERNEL_MEMORY_LIMIT_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// `kernelMemoryBackstop`: end the heaviest kernel tree when the machine
+    /// runs out of memory. The setting wins, else
+    /// `PRIME_AGENT_KERNEL_MEMORY_BACKSTOP` (`0`/`false`/`off`/`no` turn it
+    /// off), else on (TS `getKernelMemoryBackstop`).
+    #[must_use]
+    pub fn get_kernel_memory_backstop(&self) -> bool {
+        crate::kernel::memory_guard::resolve_kernel_memory_backstop(
+            self.merged.kernel_memory_backstop,
+            std::env::var(crate::kernel::memory_guard::KERNEL_MEMORY_BACKSTOP_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
     #[must_use]
     pub fn get_session_dir(&self) -> Option<std::path::PathBuf> {
         let session_dir = self.merged.session_dir.as_ref()?;
@@ -1160,6 +1188,61 @@ mod tests {
         let manager = SettingsManager::from_storage(storage);
         assert_eq!(manager.get_default_provider(), None);
         assert_eq!(manager.get_theme(), Some("prime"));
+    }
+
+    /// `kernelMemoryLimitGb` / `kernelMemoryBackstop` (TS
+    /// `getKernelMemoryLimitGb` / `getKernelMemoryBackstop`): a valid
+    /// setting wins, the project scope over the global one; a wrong-typed
+    /// or negative one is unset, so the environment (else the default)
+    /// decides.
+    #[test]
+    fn kernel_memory_settings_win_when_valid_and_fall_back_otherwise() {
+        let manager = |global: &str, project: &str| {
+            let storage: Arc<dyn SettingsStorage> =
+                Arc::new(super::super::storage::InMemorySettingsStorage::default());
+            for (scope, content) in [
+                (SettingsScope::Global, global),
+                (SettingsScope::Project, project),
+            ] {
+                storage
+                    .with_lock(scope, &mut |_| Some(content.to_string()))
+                    .unwrap();
+            }
+            let manager = SettingsManager::from_storage(storage);
+            (
+                manager.get_kernel_memory_limit_gb(),
+                manager.get_kernel_memory_backstop(),
+            )
+        };
+        let from_env = (
+            crate::kernel::memory_guard::resolve_kernel_memory_limit_gb(
+                None,
+                std::env::var(crate::kernel::memory_guard::KERNEL_MEMORY_LIMIT_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+            crate::kernel::memory_guard::resolve_kernel_memory_backstop(
+                None,
+                std::env::var(crate::kernel::memory_guard::KERNEL_MEMORY_BACKSTOP_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+        );
+        assert_eq!(
+            [
+                manager(
+                    r#"{ "kernelMemoryLimitGb": 8, "kernelMemoryBackstop": true }"#,
+                    r#"{ "kernelMemoryLimitGb": 2.5, "kernelMemoryBackstop": false }"#
+                ),
+                manager(r#"{ "kernelMemoryLimitGb": 0 }"#, "{}"),
+                manager(
+                    r#"{ "kernelMemoryLimitGb": "8", "kernelMemoryBackstop": "off" }"#,
+                    "{}"
+                ),
+                manager(r#"{ "kernelMemoryLimitGb": -1 }"#, "{}"),
+            ],
+            [(2.5, false), (0.0, from_env.1), from_env, from_env]
+        );
     }
 
     #[test]

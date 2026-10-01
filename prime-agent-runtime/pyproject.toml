@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["dill"]
+dev = ["dill", "numpy"]
 
 [build-system]
 requires = ["hatchling"]

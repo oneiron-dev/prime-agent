@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 
 use crate::kernel::shared::parse_sent_agent_message;
-use crate::kernel::shared::KernelSentAgentMessage;
+use crate::kernel::shared::{KernelCellLine, KernelSentAgentMessage};
 
 /// Protocol version the manager speaks; the runtime announces its own in the
 /// `ready` event and the handshake must match exactly.
@@ -44,6 +44,25 @@ pub enum Request {
         servers: Vec<String>,
         timeout_ms: u64,
     },
+    /// Delete the largest top-level values (none under `min_bytes`) until
+    /// `target_bytes` are freed; `target_bytes` 0 only reports. Queued like
+    /// every state request. Feature-gated (`trim_memory`).
+    TrimMemory {
+        target_bytes: u64,
+        min_bytes: u64,
+        count: u64,
+    },
+    /// Out of band: record why these pids are about to be killed (`SIGKILL`)
+    /// so the `bash()` call that owns them returns the reason. Feature-gated.
+    MemoryNotice {
+        pids: Vec<i32>,
+        text: String,
+    },
+    /// Out of band: the running line and the largest held names, right
+    /// before the kernel ends. Feature-gated.
+    MemoryReport {
+        count: u64,
+    },
     Shutdown,
 }
 
@@ -58,6 +77,9 @@ impl Request {
             Request::Restore { .. } => "restore",
             Request::ListNames => "list_names",
             Request::McpStatus { .. } => "mcp_status",
+            Request::TrimMemory { .. } => "trim_memory",
+            Request::MemoryNotice { .. } => "memory_notice",
+            Request::MemoryReport { .. } => "memory_report",
             Request::Shutdown => "shutdown",
         }
     }
@@ -101,6 +123,22 @@ impl Request {
                 "servers": servers,
                 "timeout_ms": timeout_ms,
             }),
+            Request::TrimMemory {
+                target_bytes,
+                min_bytes,
+                count,
+            } => json!({
+                "type": "trim_memory",
+                "target_bytes": target_bytes,
+                "min_bytes": min_bytes,
+                "count": count,
+            }),
+            Request::MemoryNotice { pids, text } => json!({
+                "type": "memory_notice",
+                "pids": pids,
+                "text": text,
+            }),
+            Request::MemoryReport { count } => json!({ "type": "memory_report", "count": count }),
             Request::Shutdown => json!({ "type": "shutdown" }),
         }
     }
@@ -111,6 +149,8 @@ impl Request {
 pub enum Event {
     Ready {
         protocol: i64,
+        /// Optional requests beyond the version-3 base this runtime serves.
+        features: Vec<String>,
     },
     Stdout {
         id: Option<String>,
@@ -137,6 +177,8 @@ pub enum Event {
         ename: String,
         evalue: String,
         traceback: Vec<String>,
+        /// The cell's own line the error happened at.
+        line: Option<KernelCellLine>,
     },
     Done {
         id: String,
@@ -205,9 +247,21 @@ pub fn parse_event(line: &str) -> Result<Event, String> {
     }
     let id =
         |key: &str| -> Option<String> { obj.get(key).and_then(Value::as_str).map(str::to_string) };
+    let strings = |key: &str| -> Vec<String> {
+        obj.get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     match kind {
         "ready" => Ok(Event::Ready {
             protocol: obj.get("protocol").and_then(Value::as_i64).unwrap_or(-1),
+            features: strings("features"),
         }),
         "stdout" | "stderr" => {
             let id = id("id");
@@ -249,16 +303,8 @@ pub fn parse_event(line: &str) -> Result<Event, String> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            traceback: obj
-                .get("traceback")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            traceback: strings("traceback"),
+            line: obj.get("line").and_then(KernelCellLine::from_value),
         }),
         "done" => {
             let id = id("id").ok_or_else(|| format!("done frame without id: {}", clip(line)))?;
@@ -293,7 +339,7 @@ mod tests {
     fn parses_ready() {
         let e = parse_event(r#"{"event":"ready","protocol":3,"python":"3.11.16"}"#).unwrap();
         match e {
-            Event::Ready { protocol } => assert_eq!(protocol, 3),
+            Event::Ready { protocol, .. } => assert_eq!(protocol, 3),
             other => panic!("{other:?}"),
         }
     }
@@ -344,6 +390,31 @@ mod tests {
     }
 
     #[test]
+    fn memory_requests_serialize_the_runtime_field_names() {
+        assert_eq!(
+            [
+                Request::TrimMemory {
+                    target_bytes: 5,
+                    min_bytes: 268_435_456,
+                    count: 30
+                }
+                .to_json(),
+                Request::MemoryNotice {
+                    pids: vec![41, 42],
+                    text: "Memory limit: stopped".into()
+                }
+                .to_json(),
+                Request::MemoryReport { count: 30 }.to_json(),
+            ],
+            [
+                json!({"type": "trim_memory", "target_bytes": 5, "min_bytes": 268_435_456, "count": 30}),
+                json!({"type": "memory_notice", "pids": [41, 42], "text": "Memory limit: stopped"}),
+                json!({"type": "memory_report", "count": 30}),
+            ]
+        );
+    }
+
+    #[test]
     fn late_sent_agent_message_needs_id() {
         let data = json!({ crate::kernel::shared::AGENT_MESSAGE_DISPLAY_MIME: json!({
             "id": "m1", "message": "hi", "deliveryStatus": "delivered",
@@ -357,11 +428,34 @@ mod tests {
     fn parses_every_event_kind_verbatim() {
         assert_eq!(
             parse_event(r#"{"event":"ready","protocol":3,"python":"3.13.11"}"#).unwrap(),
-            Event::Ready { protocol: 3 }
+            Event::Ready {
+                protocol: 3,
+                features: Vec::new()
+            }
         );
         assert_eq!(
             parse_event(r#"{"event":"ready"}"#).unwrap(),
-            Event::Ready { protocol: -1 }
+            Event::Ready {
+                protocol: -1,
+                features: Vec::new()
+            }
+        );
+        // Non-string features drop like TS `asStringArray`; unknown names
+        // ride along, and the host gates on the names it knows.
+        assert_eq!(
+            parse_event(
+                r#"{"event":"ready","protocol":3,"features":["trim_memory","memory_notice",7,"memory_report","later"]}"#
+            )
+            .unwrap(),
+            Event::Ready {
+                protocol: 3,
+                features: vec![
+                    "trim_memory".into(),
+                    "memory_notice".into(),
+                    "memory_report".into(),
+                    "later".into()
+                ]
+            }
         );
         assert_eq!(
             parse_event(r#"{"event":"stdout","id":"c1","text":"out"}"#).unwrap(),
@@ -408,6 +502,7 @@ mod tests {
                 ename: "KeyboardInterrupt".into(),
                 evalue: "in cell".into(),
                 traceback: vec!["a".into(), "b".into()],
+                line: None,
             }
         );
         assert_eq!(
@@ -417,6 +512,35 @@ mod tests {
                 ename: "Error".into(),
                 evalue: String::new(),
                 traceback: Vec::new(),
+                line: None,
+            }
+        );
+        assert_eq!(
+            parse_event(
+                r#"{"event":"error","id":"c1","ename":"KeyboardInterrupt","evalue":"","traceback":[],"line":{"lineno":5,"source":"time.sleep(600)"}}"#
+            )
+            .unwrap(),
+            Event::Error {
+                id: Some("c1".into()),
+                ename: "KeyboardInterrupt".into(),
+                evalue: String::new(),
+                traceback: Vec::new(),
+                line: Some(KernelCellLine {
+                    lineno: 5,
+                    source: "time.sleep(600)".into()
+                }),
+            }
+        );
+        // A malformed line is no line (TS `asCellLine`), never a bad frame.
+        assert_eq!(
+            parse_event(r#"{"event":"error","id":"c1","line":{"lineno":"5","source":"x"}}"#)
+                .unwrap(),
+            Event::Error {
+                id: Some("c1".into()),
+                ename: "Error".into(),
+                evalue: String::new(),
+                traceback: Vec::new(),
+                line: None,
             }
         );
         assert_eq!(

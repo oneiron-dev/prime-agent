@@ -31,6 +31,8 @@ pub struct KernelErrorInfo {
     pub ename: String,
     pub evalue: String,
     pub traceback: Vec<String>,
+    /// The cell's own line the error (or interrupt) happened at.
+    pub line: Option<crate::kernel::shared::KernelCellLine>,
 }
 
 /// A media attachment loaded into context (e.g. by the attach-image skill).
@@ -65,6 +67,10 @@ pub struct ExecuteResult {
     /// Agent messages sent from this cell, in order (TS
     /// `sentAgentMessages` on the tool-result details).
     pub sent_agent_messages: Vec<crate::kernel::shared::KernelSentAgentMessage>,
+    /// What the kernel memory ceiling did while no cell ran; shown above the output.
+    pub queued_memory_notices: Option<Vec<String>>,
+    /// What the kernel memory ceiling did during this cell; shown after the output.
+    pub memory_notices: Option<Vec<String>>,
 }
 
 /// The wire form of one sent agent message (TS `KernelSentAgentMessage`):
@@ -343,6 +349,9 @@ pub struct IpythonToolOptions {
     pub provisioner: Arc<dyn IpythonKernelProvisioner>,
     /// UI surface; `None` in headless sessions.
     pub ui: Option<Arc<dyn IpythonToolUi>>,
+    /// The resolved kernel memory ceiling in GiB the description states
+    /// (`0` leaves the line out: the ladder is off).
+    pub memory_limit_gb: f64,
 }
 
 pub fn ipython_tool_schema() -> serde_json::Value {
@@ -358,8 +367,15 @@ pub fn ipython_tool_schema() -> serde_json::Value {
     })
 }
 
-pub fn ipython_tool_description() -> &'static str {
-    "Execute Python code in a persistent Python REPL. Top-level `await` is supported. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). Run shell commands with `bash('cmd')` / `await bash('cmd')`. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment."
+/// The model-facing description; a positive memory ceiling appends the
+/// kernel memory line (TS `kernelMemoryPromptLine`).
+#[must_use]
+pub fn ipython_tool_description(memory_limit_gb: f64) -> String {
+    let base = "Execute Python code in a persistent Python REPL. Top-level `await` is supported. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). Run shell commands with `bash('cmd')` / `await bash('cmd')`. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.";
+    match crate::kernel::memory_guard::kernel_memory_prompt_line(memory_limit_gb) {
+        Some(line) => format!("{base} {line}"),
+        None => base.to_string(),
+    }
 }
 
 /// Execute one ipython tool call against a provisioner.
@@ -433,6 +449,11 @@ pub async fn execute_ipython(
             format!("{}\n\n{}", kernel_restart_notice(), text)
         };
     }
+    text = crate::kernel::memory_guard::messages::place_memory_notices(
+        &text,
+        r.queued_memory_notices.as_deref().unwrap_or_default(),
+        r.memory_notices.as_deref().unwrap_or_default(),
+    );
 
     let image_blocks = image_blocks_from_attachments(&r.attachments);
     let mut content = vec![ToolContentBlock::text(text)];
@@ -467,7 +488,16 @@ pub async fn execute_ipython(
             "evalue": error.evalue,
             "traceback": error.traceback,
         });
+        if let Some(line) = &error.line {
+            details["error"]["line"] = json!({ "lineno": line.lineno, "source": line.source });
+        }
         details["errorEname"] = json!(error.ename);
+    }
+    if let Some(notices) = &r.queued_memory_notices {
+        details["queuedMemoryNotices"] = json!(notices);
+    }
+    if let Some(notices) = &r.memory_notices {
+        details["memoryNotices"] = json!(notices);
     }
     if !r.sent_agent_messages.is_empty() {
         details["sentAgentMessages"] = json!(r
@@ -487,6 +517,7 @@ pub async fn execute_ipython(
 /// The `ipython` tool definition: exact name, schema, and description.
 #[must_use]
 pub fn create_ipython_tool_definition(_cwd: &str, options: IpythonToolOptions) -> ToolDefinition {
+    let description = ipython_tool_description(options.memory_limit_gb);
     let options = Arc::new(options);
     let execute: crate::tools::tool_definition::ExecuteFn = {
         let options = options;
@@ -505,7 +536,7 @@ pub fn create_ipython_tool_definition(_cwd: &str, options: IpythonToolOptions) -
     ToolDefinition {
         name: "ipython".to_string(),
         label: "ipython".to_string(),
-        description: ipython_tool_description().to_string(),
+        description,
         prompt_snippet:
             "ipython - persistent Python REPL for code, state, and bash() orchestration".to_string(),
         // The kernel is single-threaded; calls must not run in parallel.

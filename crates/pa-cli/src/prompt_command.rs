@@ -121,6 +121,7 @@ fn assemble_breakdown(
             allow_recursion: Some(true),
             generic_mcp_servers: generic_servers,
             rlm_depth: Some(0),
+            kernel_memory_limit_gb: Some(settings.get_kernel_memory_limit_gb()),
             ..Default::default()
         },
     ))
