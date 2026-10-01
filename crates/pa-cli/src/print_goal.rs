@@ -1260,16 +1260,51 @@ mod tests {
     #[tokio::test]
     async fn threshold_hold_mints_before_the_compaction_and_runs_after() {
         let _guard = FAUX_TEST_LOCK.lock().await;
-        // A small output budget keeps the 20k window's combined
-        // input+output ceiling satisfiable (threshold 13_904: window
-        // minus the 2_000 budget and the 4_096 estimate-error floor).
+        // Probe: the crossing turn's settled usage, measured rather than
+        // modelled. The session's requests (the compaction summary's
+        // included, TS `runRollingSummary` passes the session id) share
+        // the faux provider's per-session prompt cache, so the summary
+        // request replaces the cached prompt and the held turn reports
+        // its whole prompt twice (input and cache write) instead of a
+        // cache hit on the crossing prompt.
+        let mut probe_script = script(&json!(["crossing reply"]), 1_000_000);
+        probe_script["maxTokens"] = json!(2_000);
+        let probe = goal_bed_with_resumed_goal(probe_script, no_compaction()).await;
+        probe.prompt("crossing turn").await;
+        let crossing_usage = probe
+            .engine
+            .session
+            .entries()
+            .await
+            .into_iter()
+            .find_map(|entry| match entry {
+                pa_types::session::FileEntry::Message {
+                    message: pa_types::session::AgentMessage::Assistant(assistant),
+                    ..
+                } if matches!(
+                    assistant.content.first(),
+                    Some(pa_types::ai::AssistantContentBlock::Text(text))
+                        if text.text == "crossing reply"
+                ) =>
+                {
+                    Some(assistant.usage.total_tokens)
+                }
+                _ => None,
+            })
+            .expect("the probe's crossing reply");
+        drop(probe);
+        // The threshold (the window minus the 2_000 output budget and the
+        // 4_096 estimate-error floor) sits 12k tokens under the crossing
+        // turn: the ~15k-token resumed history crosses it, and the
+        // post-compaction held turn (its prompt is the system prompt plus
+        // the summary, counted twice) stays under it.
         let mut model_script = script(
             &json!([
                 "crossing reply",
                 "the compaction summary",
                 "continuation reply",
             ]),
-            20_000,
+            crossing_usage - 12_000 + 2_000 + 4_096,
         );
         model_script["maxTokens"] = json!(2_000);
         let bed = goal_bed_with_resumed_goal(
