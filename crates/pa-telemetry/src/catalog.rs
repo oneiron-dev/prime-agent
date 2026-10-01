@@ -1361,6 +1361,28 @@ const SESSION_ARCHIVED: EventRule = EventRule {
     ],
 };
 
+/// The headless output modes (`agent headless invoked`).
+pub const HEADLESS_MODES: &[&str] = &["text", "json"];
+
+/// The `--json-event-profile` values (`agent headless invoked`).
+pub const JSON_EVENT_PROFILES: &[&str] = &["all", "factory-completed"];
+
+/// `agent headless invoked` (v2, additive): one per print/json run, the
+/// headless flags it used (`--mode`, `--daemon-hosted`,
+/// `--json-event-profile`).
+const AGENT_HEADLESS_INVOKED: EventRule = EventRule {
+    name: "agent headless invoked",
+    since: 2,
+    properties: &[
+        ("mode", required(enum_rule(HEADLESS_MODES, "text"))),
+        ("daemon_hosted", required(boolean())),
+        (
+            "json_event_profile",
+            required(enum_rule(JSON_EVENT_PROFILES, "all")),
+        ),
+    ],
+};
+
 /// The `tui *` adoption events (v1).
 const TUI_EVENTS: &[EventRule] = &[
     EventRule {
@@ -1694,6 +1716,7 @@ pub fn catalog() -> Vec<&'static EventRule> {
         &TOOL_EXECUTED,
         &KERNEL_BOOTSTRAP,
         &SESSION_ARCHIVED,
+        &AGENT_HEADLESS_INVOKED,
     ];
     all.extend(TUI_EVENTS.iter());
     all.extend(UPDATE_EVENTS.iter());

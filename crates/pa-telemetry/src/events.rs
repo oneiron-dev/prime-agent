@@ -499,6 +499,60 @@ impl AgentInstallationStage {
     }
 }
 
+/// The output mode of a headless run (`--mode text|json`, `-p`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadlessMode {
+    Text,
+    Json,
+}
+
+impl HeadlessMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+/// The json stream selection of a headless run (`--json-event-profile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadlessJsonEventProfile {
+    All,
+    FactoryCompleted,
+}
+
+impl HeadlessJsonEventProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::FactoryCompleted => "factory-completed",
+        }
+    }
+}
+
+/// `agent headless invoked`: one per print/json run, the headless flags it
+/// used. Primitives only: no prompt, path, or session identity.
+#[derive(Debug, Clone)]
+pub struct AgentHeadlessInvoked {
+    pub mode: HeadlessMode,
+    pub daemon_hosted: bool,
+    pub json_event_profile: HeadlessJsonEventProfile,
+}
+
+impl AgentHeadlessInvoked {
+    pub fn track(&self, client: &TelemetryClient) {
+        let mut properties = Properties::new();
+        properties.set("mode", Value::from(self.mode.as_str()));
+        properties.set("daemon_hosted", Value::Bool(self.daemon_hosted));
+        properties.set(
+            "json_event_profile",
+            Value::from(self.json_event_profile.as_str()),
+        );
+        client.track("agent headless invoked", properties);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -643,6 +697,49 @@ mod tests {
         assert_eq!(properties["http_status"], serde_json::json!(429));
         assert_eq!(properties["classifier_revision"], serde_json::json!(2));
         assert!(!properties.contains_key("error_message"), "no raw message");
+    }
+
+    /// The headless adoption event carries exactly its three primitives,
+    /// inside the catalog vocabularies (waits on the flush, not a sleep).
+    #[tokio::test]
+    async fn headless_invoked_carries_the_headless_flags() {
+        let mock = Arc::new(MockSink::new());
+        let client = recording_client(&mock);
+        AgentHeadlessInvoked {
+            mode: HeadlessMode::Json,
+            daemon_hosted: true,
+            json_event_profile: HeadlessJsonEventProfile::FactoryCompleted,
+        }
+        .track(&client);
+        client.flush().await.unwrap();
+        let tracked: Vec<serde_json::Map<String, serde_json::Value>> = mock
+            .events()
+            .into_iter()
+            .filter(|event| event.name == "agent headless invoked")
+            .map(|event| {
+                let mut properties: serde_json::Map<String, serde_json::Value> =
+                    event.properties.into();
+                properties.retain(|key, _| {
+                    ["mode", "daemon_hosted", "json_event_profile"].contains(&key.as_str())
+                });
+                properties
+            })
+            .collect();
+        let expected = serde_json::json!({
+            "mode": "json",
+            "daemon_hosted": true,
+            "json_event_profile": "factory-completed",
+        });
+        assert_eq!(tracked, vec![expected.as_object().unwrap().clone()]);
+        for mode in [HeadlessMode::Text, HeadlessMode::Json] {
+            assert!(crate::catalog::HEADLESS_MODES.contains(&mode.as_str()));
+        }
+        for profile in [
+            HeadlessJsonEventProfile::All,
+            HeadlessJsonEventProfile::FactoryCompleted,
+        ] {
+            assert!(crate::catalog::JSON_EVENT_PROFILES.contains(&profile.as_str()));
+        }
     }
 
     #[test]
