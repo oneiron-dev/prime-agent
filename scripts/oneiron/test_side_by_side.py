@@ -990,7 +990,7 @@ class GateTests(unittest.TestCase):
             write_executable(self.dirs[2] / name, "#!/bin/sh\nexit 99\n")
         write_executable(self.dirs[2] / "pa_gate_tool", "#!/bin/sh\necho d3\n")
         write_executable(self.dirs[2] / "pa_gate_last", "#!/bin/sh\necho d3\n")
-        self.path = [str(stubs), *map(str, self.dirs), "/usr/bin"]
+        self.path = [str(stubs), *map(str, self.dirs), "/usr/bin", "/bin"]
         self.env = {"PATH": ":".join(self.path), "HOME": str(self.root / "home"),
                     "GATE_TARGET_DIR": str(self.root / "target"), "STUB_OUT": str(self.out), "LANG": "C"}
 
@@ -1058,7 +1058,7 @@ class GateTests(unittest.TestCase):
         result, sandbox = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.out / "path").read_text().strip().split(":"),
-                         [self.path[0], f"{sandbox}/bin/1", self.path[2], f"{sandbox}/bin/2", "/usr/bin"])
+                         [self.path[0], f"{sandbox}/bin/1", self.path[2], f"{sandbox}/bin/2", "/usr/bin", "/bin"])
         self.assertEqual(dict(line.split("=", 1) for line in (self.out / "which").read_text().splitlines()), {
             "prime-agent": "absent", "sol": "absent", "pa_gate_tool": str(self.dirs[1] / "pa_gate_tool"),
             "pa_gate_first": f"{sandbox}/bin/1/pa_gate_first", "pa_gate_last": f"{sandbox}/bin/2/pa_gate_last"})
@@ -1095,7 +1095,7 @@ esac
         (self.kit / "hosts").write_text("box1:2:8:/home/b/w8-build;\nbox2:2:8:/home/b/w8-build\n")
         self.write_env_sh()
         write_executable(self.root / "decoy" / "cargo", '#!/bin/sh\necho "LOCAL $*" >> "$STUB_OUT/log"\nexit 99\n')
-        self.env = {"PATH": f"{self.root / 'decoy'}:/usr/bin", "HOME": str(self.root / "home"), "LANG": "C",
+        self.env = {"PATH": f"{self.root / 'decoy'}:/usr/bin:/bin", "HOME": str(self.root / "home"), "LANG": "C",
                     "STUB_OUT": str(self.out), "W7_CARGO_LOCAL": "1",
                     "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
         subprocess.run(["git", "init", "--quiet", str(self.repo)], check=True, env=self.env)
