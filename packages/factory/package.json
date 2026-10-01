@@ -1,0 +1,33 @@
+{
+	"name": "@primeintellect/prime-agent-factory",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Durable work factory for Prime Agent: a DAG of foreground commands on configured hosts, driving the prime-agent binary for its model seats",
+	"license": "MIT",
+	"type": "module",
+	"bin": {
+		"prime-agent-factory": "dist/cli-entry.js"
+	},
+	"files": [
+		"dist",
+		"assets",
+		"README.md",
+		"LICENSE"
+	],
+	"engines": {
+		"node": ">=22.13.0"
+	},
+	"scripts": {
+		"build": "node scripts/build.mjs dist",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"test": "vitest run",
+		"policy": "python3 ../../scripts/oneiron/test_policy_gate.py",
+		"check": "npm run typecheck && npm run test && npm run policy"
+	},
+	"devDependencies": {
+		"@types/node": "^24.3.0",
+		"tsx": "^4.20.5",
+		"typescript": "^7.0.2",
+		"vitest": "^4.1.10"
+	}
+}

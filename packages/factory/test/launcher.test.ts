@@ -1,0 +1,209 @@
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, expect, it } from "vitest";
+import type { OneironLauncherSettings } from "../src/adapters/oneiron-settings.js";
+import {
+	importSplits,
+	launcherPlan,
+	launchTickets,
+	readLauncherSettings,
+	readLauncherTickets,
+	ticketEntryArgv,
+} from "../src/launcher.js";
+import { FactoryStore } from "../src/store.js";
+
+const roots: string[] = [];
+const stores: FactoryStore[] = [];
+afterEach(() => {
+	for (const store of stores.splice(0)) store.close();
+	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+it("turns the ticket DAG into submit and merge actions, then stacks a writer's SPLIT leftover behind its parent", () => {
+	const root = mkdtempSync(join(tmpdir(), "factory-launcher-"));
+	roots.push(root);
+	const manifest = join(root, "w7-manifest.json");
+	const plan = join(root, "mint-plan.json");
+	writeFileSync(
+		manifest,
+		JSON.stringify({
+			tickets: [
+				{ identifier: "(OF-1-a)", key: "OF-1-a", row: "OF-1", title: "A", tier: "two", blocked_by: [] },
+				{
+					identifier: "(OF-1-b)",
+					key: "OF-1-b",
+					row: "OF-1",
+					title: "B",
+					tier: "three",
+					blocked_by: ["(OF-1-a)", "(OF-9-missing)"],
+				},
+				{ identifier: "(OF-2-c)", key: "OF-2-c", row: "OF-2", title: "C", blocked_by: [] },
+			],
+		}),
+	);
+	writeFileSync(
+		plan,
+		JSON.stringify({
+			creates: [
+				{ key: "OF-1-a", contract: "Do a.", acceptance: "a passes" },
+				{ key: "OF-1-b", contract: "Do b.", acceptance: "b passes" },
+			],
+		}),
+	);
+	const { tickets: read, skipped } = readLauncherTickets(manifest, plan);
+	expect(skipped).toEqual(["OF-2-c"]);
+	expect(read.map((t) => [t.key, t.tier, t.blockedBy])).toEqual([
+		["OF-1-a", "two", []],
+		["OF-1-b", "three", ["OF-1-a", "OF-9-missing"]],
+	]);
+	const settings: OneironLauncherSettings = { host: "arch", repo: join(root, "repo"), work: join(root, "work") };
+	const store = new FactoryStore(join(root, "factory.db"));
+	stores.push(store);
+	store.pause("initialized");
+	const entry = [process.execPath, "/entry.js"];
+	// A blocker the launch cannot resolve fails it, naming the ticket and the missing id; nothing is written.
+	expect(() => launchTickets(store, settings, read, entry)).toThrow(
+		"ticket OF-1-b is blocked by OF-9-missing, which this launch does not carry",
+	);
+	expect([store.actions(), existsSync(join(root, "work", "tickets"))]).toEqual([[], false]);
+	const tickets = read.map((t) => ({ ...t, blockedBy: t.blockedBy.filter((b) => b !== "OF-9-missing") }));
+	const launched = launchTickets(store, settings, tickets, entry);
+	expect(launched).toEqual({
+		imported: ["OF-1-a", "OF-1-b"],
+		existing: [],
+		rewritten: ["OF-1-a", "OF-1-b"],
+		frozen: [],
+		revision: 1,
+	});
+	const actions = Object.fromEntries(store.actions().map((a) => [a.id, a]));
+	expect(Object.keys(actions)).toEqual(["OF-1-a:submit", "OF-1-a:merge", "OF-1-b:submit", "OF-1-b:merge"]);
+	expect(actions["OF-1-b:submit"]).toMatchObject({
+		state: "QUEUED",
+		dependencies: ["OF-1-a:submit"],
+		requirements: { host: "arch", slotId: "slot:OF-1-b:submit" },
+		command: { argv: [...entry, "submit", join(root, "work", "tickets", "OF-1-b", "ticket.json")] },
+	});
+	expect(actions["OF-1-b:merge"]?.dependencies).toEqual(["OF-1-b:submit", "OF-1-a:merge"]);
+	expect(actions["OF-1-a:submit"]?.state).toBe("READY");
+	expect(store.slots().map((s) => s.id)).toContain("slot:OF-1-a:merge");
+	const run = JSON.parse(readFileSync(join(root, "work", "tickets", "OF-1-a", "ticket.json"), "utf8"));
+	expect(run).toMatchObject({
+		version: 1,
+		key: "OF-1-a",
+		contract: "Do a.",
+		tier: "two",
+		blockedBy: [],
+		launcher: settings,
+	});
+	expect(launchTickets(store, settings, tickets, entry)).toEqual({
+		imported: [],
+		existing: ["OF-1-a", "OF-1-b"],
+		rewritten: ["OF-1-a", "OF-1-b"],
+		frozen: [],
+		revision: 1,
+	});
+
+	// A relaunch with a corrected DAG rewrites ticket.json and re-imports the actions that have not started.
+	const corrected = tickets.map((t) => (t.key === "OF-1-b" ? { ...t, blockedBy: [] } : t));
+	const relaunched = launchTickets(store, settings, corrected, entry);
+	expect(relaunched).toMatchObject({ imported: [], rewritten: ["OF-1-a", "OF-1-b"], frozen: [], revision: 2 });
+	expect(store.actions().find((a) => a.id === "OF-1-b:submit")).toMatchObject({
+		state: "READY",
+		dependencies: [],
+	});
+	expect(store.actions().find((a) => a.id === "OF-1-b:merge")?.dependencies).toEqual(["OF-1-b:submit"]);
+	expect(JSON.parse(readFileSync(join(root, "work", "tickets", "OF-1-b", "ticket.json"), "utf8")).blockedBy).toEqual(
+		[],
+	);
+
+	// A started action keeps its spec: the relaunch reports it frozen instead of failing the whole launch.
+	store.resume();
+	const claimed = store.claim("OF-1-a:submit", "slot:OF-1-a:submit");
+	expect(store.markSubmitted(claimed!.attempt.id)).toBe(true);
+	const afterStart = launchTickets(store, settings, tickets, entry);
+	expect(afterStart).toMatchObject({ frozen: ["OF-1-a:submit"], rewritten: ["OF-1-a", "OF-1-b"] });
+	expect(store.actions().find((a) => a.id === "OF-1-a:submit")?.dependencies).toEqual([]);
+	expect(store.actions().find((a) => a.id === "OF-1-b:submit")?.dependencies).toEqual(["OF-1-a:submit"]);
+	store.pause("initialized");
+
+	mkdirSync(join(root, "work", "tickets", "OF-1-a"), { recursive: true });
+	writeFileSync(
+		join(root, "work", "tickets", "OF-1-a", "split.json"),
+		JSON.stringify({ key: "OF-1-a", remains: "the rest of a" }),
+	);
+	expect(importSplits(store, settings, entry)).toEqual(["OF-1-a-split"]);
+	expect(importSplits(store, settings, entry)).toEqual([]);
+	const split = store.actions().find((a) => a.id === "OF-1-a-split:submit");
+	expect(split).toMatchObject({ ticketId: "OF-1-a-split", dependencies: ["OF-1-a:submit"] });
+	expect(store.actions().find((a) => a.id === "OF-1-a-split:merge")?.dependencies).toEqual([
+		"OF-1-a-split:submit",
+		"OF-1-a:merge",
+	]);
+	const follow = JSON.parse(readFileSync(join(root, "work", "tickets", "OF-1-a-split", "ticket.json"), "utf8"));
+	expect(follow.contract).toContain("the rest of a");
+	expect(follow.blockedBy).toEqual(["OF-1-a"]);
+	expect(existsSync(join(root, "work", "tickets", "OF-1-a-split"))).toBe(true);
+	expect(store.allEvents().some((e) => e.kind === "split_imported")).toBe(true);
+
+	// No stacks: a child's submit waits for its parent's merge, so it never starts on an unmerged parent.
+	const flat = launcherPlan(tickets, { ...settings, noStacks: true }, entry);
+	expect(flat.actions.find((a) => a.id === "OF-1-b:submit")?.dependencies).toEqual(["OF-1-a:merge"]);
+});
+
+it("validates launcher cargo jobs, merge policy and polling settings before import", () => {
+	const root = mkdtempSync(join(tmpdir(), "factory-launcher-"));
+	roots.push(root);
+	const path = join(root, "launcher.json");
+	const settings = (cargoJobs: unknown, extra = "") => {
+		writeFileSync(
+			path,
+			`{"host":"arch","repo":"/repo","work":"/work","cargoJobs":${JSON.stringify(cargoJobs)}${extra}}`,
+		);
+		return () => readLauncherSettings(path);
+	};
+	for (const bad of [0, 2.5, 65, "4"])
+		expect(settings(bad)).toThrow("launcher.cargoJobs must be an integer from 1 to 64");
+	expect(settings(4)().cargoJobs).toBe(4);
+	for (const bad of ['"current_base"', '"auto"', "null", "1"])
+		expect(settings(4, `,"mergePolicy":${bad}`)).toThrow("launcher.mergePolicy must be github or current-base");
+	for (const bad of ["null", "[]", "false"])
+		expect(settings(4, `,"timeouts":${bad}`)).toThrow("launcher.timeouts must be an object");
+	for (const field of ["mergePollMs", "propagationPollMs"])
+		for (const bad of ["null", "0", "-1", "1.5", '"5"', "1e999"])
+			expect(settings(4, `,"timeouts":{"${field}":${bad}}`)).toThrow(
+				`launcher.timeouts.${field} must be a positive integer`,
+			);
+	expect(
+		settings(4, ',"mergePolicy":"current-base","timeouts":{"mergePollMs":1,"propagationPollMs":2}')().timeouts,
+	).toEqual({ mergePollMs: 1, propagationPollMs: 2 });
+	expect(settings(4)().timeouts).toBeUndefined();
+});
+
+it("validates the agent binary selection and seat hosting before import", () => {
+	const root = mkdtempSync(join(tmpdir(), "factory-launcher-"));
+	roots.push(root);
+	const path = join(root, "launcher.json");
+	const settings = (extra: string) => {
+		writeFileSync(path, `{"host":"arch","repo":"/repo","work":"/work"${extra}}`);
+		return () => readLauncherSettings(path);
+	};
+	for (const bad of ['""', '"  "', "1", "null", '"bin\\u0000ary"', '"line\\nbreak"'])
+		expect(settings(`,"primeAgentBin":${bad}`)).toThrow("launcher.primeAgentBin must name the agent binary");
+	for (const bad of ['"resident"', '"Owned"', "true", "null"])
+		expect(settings(`,"seatHosting":${bad}`)).toThrow("launcher.seatHosting must be owned or daemon");
+	expect(settings(',"primeAgentBin":"/opt/prime-agent-rs","seatHosting":"daemon"')()).toEqual({
+		host: "arch",
+		repo: "/repo",
+		work: "/work",
+		primeAgentBin: "/opt/prime-agent-rs",
+		seatHosting: "daemon",
+	});
+});
+
+it("persists the ticket runner as Node plus the package's own adapter entry", () => {
+	const [node, ...rest] = ticketEntryArgv();
+	expect(node).toBe(process.execPath);
+	expect(rest.at(-1)).toBe(fileURLToPath(new URL("../src/adapters/oneiron-ticket-entry.ts", import.meta.url)));
+});

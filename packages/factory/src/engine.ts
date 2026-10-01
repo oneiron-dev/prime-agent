@@ -1,0 +1,185 @@
+import { existsSync } from "node:fs";
+import type { FactoryFilePin } from "./runtime.js";
+import type { FactoryStore } from "./store.js";
+import type {
+	AttemptContext,
+	DecisionEvidence,
+	FactoryAdapter,
+	FactoryEngineOptions,
+	FactoryPlan,
+	FactoryStatus,
+	Inspection,
+	TickResult,
+} from "./types.js";
+
+/** Scheduling policy over the durable journal. It never imports Prime Agent or a model SDK. */
+export class FactoryEngine {
+	constructor(
+		readonly store: FactoryStore,
+		private readonly adapter: FactoryAdapter,
+		private readonly options: FactoryEngineOptions = {},
+	) {
+		if (
+			options.maxLaunchesPerTick !== undefined &&
+			(!Number.isSafeInteger(options.maxLaunchesPerTick) || options.maxLaunchesPerTick < 1)
+		)
+			throw new Error("maxLaunchesPerTick must be a positive integer");
+	}
+	private externalPause(): boolean {
+		return this.options.pauseFile !== undefined && existsSync(this.options.pauseFile);
+	}
+	private paused(): boolean {
+		return this.externalPause() || this.store.isPaused();
+	}
+	private requireUnpaused(): void {
+		if (this.paused()) throw new Error("Factory is paused; changes are blocked");
+	}
+	applyPlan(
+		plan: FactoryPlan,
+		expectedRevision?: number,
+		mutationId?: string,
+		initialRuntime?: FactoryFilePin,
+	): number {
+		this.requireUnpaused();
+		return this.store.applyPlan(plan, expectedRevision, mutationId, initialRuntime);
+	}
+	pause(reason: string): void {
+		this.store.pause(reason);
+	}
+	requireOwnerUnpaused(): void {
+		if (this.externalPause()) throw new Error("External owner pause remains in place");
+	}
+	resume(): void {
+		this.requireOwnerUnpaused();
+		this.store.resume();
+	}
+	supersede(actionId: string, replacementId: string, evidence: DecisionEvidence, expectedRevision?: number): number {
+		this.requireUnpaused();
+		return this.store.supersede(actionId, replacementId, evidence, expectedRevision);
+	}
+	resolveForRetry(attemptId: string, evidence: DecisionEvidence, expectedRevision?: number): void {
+		this.requireUnpaused();
+		this.store.resolveForRetry(attemptId, evidence, expectedRevision);
+	}
+	/**
+	 * Admit one owner-selected action while the factory stays paused. The durable SUBMITTED claim and the mutation
+	 * receipt commit before the launch; a replayed mutation never launches again, and an ambiguous launch is left
+	 * UNCERTAIN for ordinary reconciliation. An external owner pause file is never overridden.
+	 */
+	async recoverAdmit(
+		plan: FactoryPlan,
+		options: {
+			select: string;
+			supersede?: string;
+			expectedRevision: number;
+			mutationId: string;
+			evidence: DecisionEvidence;
+		},
+	): Promise<{
+		revision: number;
+		replayed: boolean;
+		actionId: string;
+		attemptId: string;
+		attemptState: string;
+		paused: boolean;
+	}> {
+		this.requireOwnerUnpaused();
+		const selected = this.store.recoverAndClaim(plan, options);
+		if (!selected.replayed) {
+			try {
+				this.record(selected.context, await this.adapter.launch(selected.context));
+			} catch (error) {
+				this.store.markUncertain(
+					selected.context.attempt.id,
+					`Launch outcome unknown: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+		const current = this.store.context(selected.context.attempt.id);
+		return {
+			revision: selected.revision,
+			replayed: selected.replayed,
+			actionId: current.action.id,
+			attemptId: current.attempt.id,
+			attemptState: current.attempt.state,
+			paused: this.paused(),
+		};
+	}
+	status(): FactoryStatus {
+		const status = this.store.status();
+		if (this.externalPause()) {
+			status.paused = true;
+			status.pauseReason = `External owner pause: ${this.options.pauseFile}`;
+		}
+		return status;
+	}
+	private record(context: AttemptContext, result: Inspection): void {
+		if (result.kind === "terminal") {
+			if (result.receipt.attemptId !== context.attempt.id) throw new Error("Receipt attempt identity mismatch");
+			this.store.complete(result.receipt);
+		} else if (result.kind === "running") this.store.markRunning(context.attempt.id, result.processIdentity);
+		else if (result.kind === "uncertain") this.store.markUncertain(context.attempt.id, result.reason);
+		else throw new Error("Unknown adapter inspection result");
+	}
+	private async inspect(context: AttemptContext): Promise<void> {
+		try {
+			this.record(context, await this.adapter.inspect(context));
+		} catch (error) {
+			this.store.markUncertain(
+				context.attempt.id,
+				`Inspection failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+	/** Reconcile even while paused, then fill compatible free slots when explicitly enabled. */
+	async tick(): Promise<TickResult> {
+		const result: TickResult = { launched: [], reconciled: [], paused: this.paused() };
+		const active = this.store.attempts(true);
+		for (let offset = 0; offset < active.length; offset += 8) {
+			await Promise.all(
+				active.slice(offset, offset + 8).map(async (attempt) => {
+					if (attempt.state === "PREPARED") {
+						// CAS against submission: a concurrent controller can launch only if it wins that CAS first.
+						if (!this.paused()) this.store.abandonPrepared(attempt.id);
+					} else await this.inspect(this.store.context(attempt.id));
+					result.reconciled.push(attempt.id);
+				}),
+			);
+		}
+		if (!this.options.enabled || this.paused()) {
+			result.paused = this.paused();
+			return result;
+		}
+		const budget = this.options.maxLaunchesPerTick ?? 16;
+		for (let count = 0; count < budget && !this.paused(); count++) {
+			let claimed: AttemptContext | undefined;
+			for (const action of this.store.actions()) {
+				if (action.state !== "READY") continue;
+				for (const slot of this.store.slots()) {
+					if (this.paused()) break;
+					claimed = this.store.claim(action.id, slot.id);
+					if (claimed) break;
+				}
+				if (claimed || this.paused()) break;
+			}
+			if (!claimed) break;
+			if (this.paused()) {
+				this.store.abandonPrepared(claimed.attempt.id);
+				break;
+			}
+			if (!this.store.markSubmitted(claimed.attempt.id)) continue;
+			const submitted = this.store.context(claimed.attempt.id);
+			result.launched.push(submitted.attempt.id);
+			try {
+				this.record(submitted, await this.adapter.launch(submitted));
+			} catch (error) {
+				this.store.markUncertain(
+					submitted.attempt.id,
+					`Launch outcome unknown: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+		result.paused = this.paused();
+		return result;
+	}
+}
