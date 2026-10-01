@@ -1152,3 +1152,81 @@ async fn a_cancel_from_the_retry_start_observer_prevents_a_second_request() {
     .unwrap();
     assert_eq!((attempts, message.stop_reason), (1, StopReason::Aborted));
 }
+
+/// Transport failures exhaust the quick-retry budget like any transient
+/// failure: the initial attempt plus three retries, then the final error
+/// row carries the socket text.
+#[tokio::test]
+async fn transport_failures_exhaust_with_the_final_error() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut attempts = 0;
+    let message = run_turn_with_auto_retry(
+        &fast_policy(),
+        0,
+        None,
+        &RetryEpisode::default(),
+        || {
+            attempts += 1;
+            std::future::ready(Ok(transport_message("WebSocket error", "error")))
+        },
+        recording_emit(&events),
+        |_| async { true },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!((attempts, message.stop_reason), (4, StopReason::Error));
+    assert_eq!(
+        without_delays(&events.lock().unwrap()),
+        vec![
+            quick_start(1, 3, "WebSocket error"),
+            quick_start(2, 3, "WebSocket error"),
+            quick_start(3, 3, "WebSocket error"),
+            AutoRetryEvent::End {
+                success: false,
+                attempt: 3,
+                final_error: Some("WebSocket error".to_string()),
+                restored_model: None,
+            },
+        ]
+    );
+}
+
+/// With retries disabled a transport failure settles on its first attempt
+/// and still discloses once (the failure-scoped outcome row).
+#[tokio::test]
+async fn disabled_retries_disclose_a_transport_failure_once() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut attempts = 0;
+    let message = run_turn_with_auto_retry(
+        &ProviderRetryPolicy {
+            enabled: false,
+            ..fast_policy()
+        },
+        0,
+        None,
+        &RetryEpisode::default(),
+        || {
+            attempts += 1;
+            std::future::ready(Ok(transport_message(
+                "WebSocket closed before response.completed",
+                "closed",
+            )))
+        },
+        recording_emit(&events),
+        |_| async { true },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!((attempts, message.stop_reason), (1, StopReason::Error));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![AutoRetryEvent::End {
+            success: false,
+            attempt: 0,
+            final_error: Some("WebSocket closed before response.completed".to_string()),
+            restored_model: None,
+        }]
+    );
+}

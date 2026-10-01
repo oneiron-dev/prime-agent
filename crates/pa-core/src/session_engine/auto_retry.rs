@@ -78,9 +78,12 @@ pub struct RetryEpisode {
     retries: AtomicU32,
     /// A provider-failover switch is active: the failover driver restores
     /// the primary (and closes the episode with the restored model) when
-    /// the turn settles, so a successful message inside the turn leaves the
-    /// episode open.
+    /// the turn settles, so a successful message inside the turn resets
+    /// the budget without closing the episode.
     held_for_restore: AtomicBool,
+    /// The retry count the first successful message after the switch
+    /// reset: the restore's closing end reports it.
+    retries_before_restore: AtomicU32,
 }
 
 impl RetryEpisode {
@@ -90,10 +93,20 @@ impl RetryEpisode {
     /// Returns that end event for the host to emit right after the
     /// message, or `None` when no retry is in flight.
     pub fn settle_success(&self) -> Option<AutoRetryEvent> {
+        let retries = self.retries.swap(0, Ordering::SeqCst);
         if self.held_for_restore.load(Ordering::SeqCst) {
+            // The budget starts over all the same; the episode's end waits
+            // for the primary's restore when the turn settles.
+            if retries > 0 {
+                let _ = self.retries_before_restore.compare_exchange(
+                    0,
+                    retries,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
             return None;
         }
-        let retries = self.retries.swap(0, Ordering::SeqCst);
         (retries > 0).then_some(AutoRetryEvent::End {
             success: true,
             attempt: retries,
@@ -120,6 +133,17 @@ impl RetryEpisode {
     /// A provider switch is active for the rest of the turn.
     pub(crate) fn hold_for_restore(&self) {
         self.held_for_restore.store(true, Ordering::SeqCst);
+    }
+
+    /// Close the held episode at the primary's restore: the count the
+    /// first successful message after the switch reset, else the open
+    /// count.
+    pub(crate) fn take_for_restore(&self) -> u32 {
+        let open = self.take();
+        match self.retries_before_restore.swap(0, Ordering::SeqCst) {
+            0 => open,
+            reset => reset,
+        }
     }
 }
 

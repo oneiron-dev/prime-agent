@@ -194,8 +194,13 @@ where
         let message = attempt().await?;
         if message.stop_reason != StopReason::Error {
             // An episode the host already closed at a successful message
-            // inside this attempt reads zero: no second end.
-            let total_retries = episode.take();
+            // inside this attempt reads zero: no second end. A switched
+            // episode closes here, with the restore.
+            let total_retries = if switched {
+                episode.take_for_restore()
+            } else {
+                episode.take()
+            };
             if switched {
                 let restored_model = restore().await?;
                 emit(AutoRetryEvent::End {
@@ -308,8 +313,8 @@ where
             switch(next).await?;
             switched = true;
             // The primary's restore closes this episode when the turn
-            // settles, so a success on the backup inside the turn keeps it
-            // open.
+            // settles; a success on the backup inside the turn still
+            // resets the budget.
             episode.hold_for_restore();
             // The TS backup-model retry re-issues immediately on the
             // backup (`delayMs: 0`): no wait, no countdown.
@@ -961,5 +966,66 @@ mod tests {
         assert!(harness.events.is_empty());
         assert!(harness.switches.is_empty());
         assert!(harness.restores.is_empty());
+    }
+
+    /// After a provider switch, each successful message on the backup
+    /// still resets the retry budget (TS resets at every successful
+    /// assistant message): three backup failures separated by successful
+    /// tool calls stay inside a two-retry per-provider budget, and the
+    /// restore's end reports the episode the first success closed. The
+    /// held episode used to keep counting, so the third backup failure
+    /// exhausted the chain and the turn died.
+    #[tokio::test]
+    async fn backup_successes_reset_the_budget_while_the_switch_holds() {
+        let episode = RetryEpisode::default();
+        let mut attempts = 0usize;
+        let mut events = Vec::new();
+        let mut switches = Vec::new();
+        let message = run_turn_with_provider_failover(
+            &quick_policy(),
+            &fast_failover(),
+            &[model("backup-a")],
+            0,
+            None,
+            &episode,
+            || {
+                attempts += 1;
+                // Attempts 1-3 fail on the primary; on the backup each
+                // re-issue completes a tool call (the host's settle) and
+                // then fails, until the seventh attempt finishes.
+                if attempts > 4 {
+                    assert_eq!(episode.settle_success(), None, "the switch holds the end");
+                }
+                std::future::ready(Ok(if attempts < 7 {
+                    error_message(Some("server_error"), Some(500), "down")
+                } else {
+                    ok_message("done")
+                }))
+            },
+            |event| {
+                events.push(event);
+                std::future::ready(Ok(()))
+            },
+            |_| async { true },
+            |next: &Model| {
+                switches.push(format!("{}/{}", next.provider, next.id));
+                std::future::ready(Ok(()))
+            },
+            || std::future::ready(Ok(Some("primary/glm-5.3".to_string()))),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((attempts, message.stop_reason), (7, StopReason::Stop));
+        assert_eq!(switches, vec!["backup-a/glm-5.3".to_string()]);
+        assert_eq!(
+            events.last(),
+            Some(&AutoRetryEvent::End {
+                success: true,
+                attempt: 4,
+                final_error: None,
+                restored_model: Some("primary/glm-5.3".to_string()),
+            })
+        );
     }
 }
