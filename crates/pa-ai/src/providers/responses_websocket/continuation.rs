@@ -18,6 +18,12 @@ pub(crate) struct ContinuationAnchor {
     pub(crate) response_items: Vec<Value>,
 }
 
+/// The serialized JSON (TS `JSON.stringify`): the workspace's
+/// `preserve_order` keeps key order, which `Value` equality ignores.
+fn serialized(value: &Value) -> String {
+    value.to_string()
+}
+
 /// The body without the fields a continuation rewrites.
 fn without_input(body: &Value) -> Value {
     let mut stripped = body.clone();
@@ -33,7 +39,9 @@ fn without_input(body: &Value) -> Value {
 /// continue it: a non-array input on either side, any other body field
 /// changed (model, reasoning, tools, instructions, ...), or an input that
 /// no longer starts with the exact baseline (compaction, history rewrite).
-/// An empty delta is a valid continuation.
+/// An empty delta is a valid continuation. Like TS, the comparisons are on
+/// the serialized JSON (`JSON.stringify`, key order included), not on
+/// semantic equality.
 pub(crate) fn input_delta(
     body: &Value,
     previous_body: &Value,
@@ -45,15 +53,18 @@ pub(crate) fn input_delta(
         None => &[],
         Some(_) => return None,
     };
-    if without_input(body) != without_input(previous_body) {
+    if serialized(&without_input(body)) != serialized(&without_input(previous_body)) {
         return None;
     }
     let baseline_len = previous.len() + response_items.len();
     if current.len() < baseline_len {
         return None;
     }
-    let (head, tail) = current.split_at(previous.len());
-    if head != previous || tail[..response_items.len()] != *response_items {
+    let mut baseline = previous.to_vec();
+    baseline.extend_from_slice(response_items);
+    if serialized(&Value::Array(current[..baseline_len].to_vec()))
+        != serialized(&Value::Array(baseline))
+    {
         return None;
     }
     Some(current[baseline_len..].to_vec())
@@ -165,6 +176,36 @@ mod tests {
         assert_eq!(
             input_delta(&shorter, &previous.body, &previous.response_items),
             None
+        );
+    }
+
+    /// The comparisons are on the serialized JSON like TS `JSON.stringify`:
+    /// a body or input item whose keys arrive in another order does not
+    /// continue the anchor, even though the values are equal (semantic
+    /// equality used to continue it).
+    #[test]
+    fn reordered_keys_do_not_continue_the_anchor() {
+        let previous = anchor(
+            json!({ "model": "m", "store": false, "input": [{ "type": "a", "id": "1" }] }),
+            Vec::new(),
+        );
+        let reordered_body = json!({ "store": false, "model": "m",
+                                     "input": [{ "type": "a", "id": "1" }, { "type": "b" }] });
+        assert_eq!(
+            input_delta(&reordered_body, &previous.body, &previous.response_items),
+            None
+        );
+        let reordered_item = json!({ "model": "m", "store": false,
+                                     "input": [{ "id": "1", "type": "a" }, { "type": "b" }] });
+        assert_eq!(
+            input_delta(&reordered_item, &previous.body, &previous.response_items),
+            None
+        );
+        let same_order = json!({ "model": "m", "store": false,
+                                 "input": [{ "type": "a", "id": "1" }, { "type": "b" }] });
+        assert_eq!(
+            input_delta(&same_order, &previous.body, &previous.response_items),
+            Some(vec![json!({ "type": "b" })])
         );
     }
 
