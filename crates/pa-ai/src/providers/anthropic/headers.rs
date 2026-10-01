@@ -5,9 +5,10 @@
 //! `getSessionAffinityHeaders`, `mergeHeaders`).
 //!
 //! Every Rust Anthropic request builds its headers here (there is no
-//! supplied-client mode), so one layering covers every request:
-//! client defaults < model headers < generated affinity < explicit options,
-//! each later layer replacing an earlier header case-insensitively.
+//! supplied-client mode), so one layering covers every request: the SDK's
+//! version and auth < client defaults < model headers < generated affinity
+//! < explicit options, each later layer replacing an earlier header
+//! case-insensitively.
 
 use std::collections::HashMap;
 
@@ -93,6 +94,13 @@ pub(crate) fn build_request_headers(
             .collect()
     });
 
+    // The SDK client's own headers, beneath its `defaultHeaders`: the API
+    // version and `authHeaders()` (a client `apiKey` sends `x-api-key`, an
+    // `authToken` a bearer `authorization`). The cloudflare gateway client
+    // sets neither; its key rides `cf-aig-authorization`.
+    let mut sdk_headers = Map::new();
+    sdk_headers.insert("anthropic-version".into(), json!("2023-06-01"));
+    let bearer = json!(format!("Bearer {api_key}"));
     let mut client_defaults = Map::new();
     client_defaults.insert("accept".into(), json!("application/json"));
     client_defaults.insert(
@@ -101,10 +109,7 @@ pub(crate) fn build_request_headers(
     );
     match model.provider.as_str() {
         "cloudflare-ai-gateway" => {
-            client_defaults.insert(
-                "cf-aig-authorization".into(),
-                json!(format!("Bearer {api_key}")),
-            );
+            client_defaults.insert("cf-aig-authorization".into(), bearer);
             client_defaults.insert("x-api-key".into(), Value::Null);
             client_defaults.insert("Authorization".into(), Value::Null);
             if let Some(beta) = &beta_header {
@@ -112,12 +117,14 @@ pub(crate) fn build_request_headers(
             }
         }
         "github-copilot" => {
+            sdk_headers.insert("authorization".into(), bearer);
             if let Some(beta) = &beta_header {
                 client_defaults.insert("anthropic-beta".into(), json!(beta));
             }
         }
         _ => {
             if is_oauth {
+                sdk_headers.insert("authorization".into(), bearer);
                 client_defaults.insert(
                     "anthropic-beta".into(),
                     json!(["claude-code-20250219", "oauth-2025-04-20"]
@@ -132,17 +139,22 @@ pub(crate) fn build_request_headers(
                     json!(format!("claude-cli/{CLAUDE_CODE_VERSION}")),
                 );
                 client_defaults.insert("x-app".into(), json!("cli"));
-            } else if let Some(beta) = &beta_header {
-                client_defaults.insert("anthropic-beta".into(), json!(beta));
+            } else {
+                sdk_headers.insert("x-api-key".into(), json!(api_key));
+                if let Some(beta) = &beta_header {
+                    client_defaults.insert("anthropic-beta".into(), json!(beta));
+                }
             }
         }
     }
     // TS `mergeHeaders`, as the SDK applies it: layers in order, names
     // lowercased so a later layer replaces an earlier header whatever its
     // casing (a mixed-case explicit `X-Session-Affinity` never rides beside
-    // the generated one). A `null` drops the name from the layered map.
+    // the generated one, an explicit `X-Api-Key` replaces the client's).
+    // A `null` drops the name from the layered map.
     let mut headers = Map::new();
     for layer in [
+        Some(sdk_headers),
         Some(client_defaults),
         model_headers,
         affinity_headers,
@@ -163,20 +175,13 @@ pub(crate) fn build_request_headers(
         }
     }
 
-    let mut pairs: Vec<(String, String)> = headers
+    let pairs: Vec<(String, String)> = headers
         .into_iter()
         .filter_map(|(key, value)| match value {
             Value::String(text) => Some((key, text)),
             _ => None,
         })
         .collect();
-    // The Anthropic SDK always sends the API version; mirror it.
-    pairs.insert(0, ("anthropic-version".into(), "2023-06-01".into()));
-    if model.provider == "cloudflare-ai-gateway" || model.provider == "github-copilot" || is_oauth {
-        pairs.push(("Authorization".into(), format!("Bearer {api_key}")));
-    } else {
-        pairs.push(("x-api-key".into(), api_key.to_string()));
-    }
     (pairs, is_oauth)
 }
 
