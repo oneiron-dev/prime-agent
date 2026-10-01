@@ -17,10 +17,11 @@ use super::config_options::{
     config_options_value, model_value, publish_config_options, session_config_options, PickerModel,
     SessionConfigOption,
 };
-use super::daemon::{DaemonAcpState, DaemonLink, REQUEST_TIMEOUT_MS, TURN_TIMEOUT_MS};
+use super::daemon::{DaemonAcpState, REQUEST_TIMEOUT, TURN_TIMEOUT};
 use super::jsonrpc;
 use super::producer::{self, UpdateProducer};
 use super::types;
+use crate::daemon_link::DaemonLink;
 use pa_types::daemon::DaemonCommand;
 
 /// The hosted session's picker state: the published options, the
@@ -197,7 +198,7 @@ async fn apply_wire_config(
                         model_id: model.id.clone(),
                         rest: Map::default(),
                     },
-                    TURN_TIMEOUT_MS,
+                    TURN_TIMEOUT,
                 )
                 .await
                 .map_err(|error| WireConfigError::internal(error.to_string()))?;
@@ -257,7 +258,7 @@ async fn apply_wire_config(
                         level: value.to_string(),
                         rest: Map::default(),
                     },
-                    TURN_TIMEOUT_MS,
+                    TURN_TIMEOUT,
                 )
                 .await
                 .map_err(|error| WireConfigError::internal(error.to_string()))?;
@@ -289,7 +290,7 @@ pub(super) async fn fetch_connection_state(
                 active_session_id: active_session_id.to_string(),
                 rest: Map::default(),
             },
-            REQUEST_TIMEOUT_MS,
+            REQUEST_TIMEOUT,
         )
         .await
         .ok()?;
@@ -311,7 +312,7 @@ pub(super) async fn fetch_available_models(
                 active_session_id: active_session_id.to_string(),
                 rest: Map::default(),
             },
-            REQUEST_TIMEOUT_MS,
+            REQUEST_TIMEOUT,
         )
         .await?;
     if !response.success {

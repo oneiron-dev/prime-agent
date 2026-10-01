@@ -826,7 +826,7 @@ impl Supervisor {
                 // launch-budget failure so a loaded-box launch failure says
                 // what actually happened (never the generic route timeout
                 // text, which pointed triage at the wrong seam).
-                if error.to_string() == "Session worker timed out" {
+                if error.to_string() == super::routing::SESSION_WORKER_TIMED_OUT {
                     // The worker answered nothing inside the launch budget:
                     // its captured stderr tail rides the failure (the same
                     // evidence the probe arm carries).
