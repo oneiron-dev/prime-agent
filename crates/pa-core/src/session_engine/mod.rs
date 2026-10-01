@@ -204,6 +204,10 @@ pub struct AgentSession {
     /// summarizer completion — no deltas, no broadcast, no behavior
     /// change.
     compaction_summary_sink: std::sync::Mutex<Option<compaction_exec::SummaryDeltaSink>>,
+    /// The shared provider retry policy the compaction summary requests
+    /// run under (TS `providerRetryPolicy(settingsManager)`); `None` makes
+    /// a single attempt.
+    summary_retry: Option<provider_retry::ProviderRetryPolicy>,
 }
 
 impl AgentSession {
@@ -269,6 +273,7 @@ impl AgentSession {
             skill_telemetry: None,
             image_model_router: None,
             compaction_summary_sink: std::sync::Mutex::new(None),
+            summary_retry: None,
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)

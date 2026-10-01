@@ -29,6 +29,8 @@ async fn execute_compaction_with_pre_aborted_signal_never_runs_the_summarizer() 
             harness_digest: None,
             auxiliary: None,
             summary_delta: None,
+            summary_requests:
+                crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
         },
     )
     .await
@@ -84,6 +86,8 @@ async fn execute_compaction_with_late_abort_cancels_before_the_commit() {
             harness_digest: None,
             auxiliary: None,
             summary_delta: None,
+            summary_requests:
+                crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
         },
     )
     .await
@@ -119,6 +123,8 @@ async fn execute_compaction_skips_short_sessions() {
             harness_digest: None,
             auxiliary: None,
             summary_delta: None,
+            summary_requests:
+                crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
         },
     )
     .await
@@ -162,6 +168,8 @@ async fn execute_compaction_skips_when_already_compacted() {
             harness_digest: None,
             auxiliary: None,
             summary_delta: None,
+            summary_requests:
+                crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
         },
     )
     .await

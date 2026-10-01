@@ -137,16 +137,48 @@ pub fn build_turn_prefix_request(messages: &[AgentMessage]) -> Vec<AgentMessage>
 /// (see `execute_compaction`'s split-turn flush).
 pub type SummaryDeltaSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
+/// How a compaction's summarizer requests run (TS `runRollingSummary`'s
+/// `completeSimple` options and its `completeWithProviderRetry` policy).
+/// The transport stays the provider default (TS passes none), so a
+/// WebSocket-capable route summarizes over the session's socket.
+#[derive(Debug, Clone, Default)]
+pub struct SummaryRequestOptions {
+    /// The session id the summary requests carry (TS `sessionId`): the
+    /// provider's per-session state is the session's — the prompt-cache
+    /// key, and the session's Responses WebSocket connection, where the
+    /// summary's replacement body never continues the generation's
+    /// response and the next generation request validates its own prefix.
+    pub session_id: Option<String>,
+    /// The shared provider retry policy (TS `providerRetryPolicy`):
+    /// transient summary failures re-issue before the run fails. `None`
+    /// makes a single attempt.
+    pub retry: Option<super::provider_retry::ProviderRetryPolicy>,
+}
+
+/// One summarizer call's provider inputs.
+pub struct SummaryProvider<'a> {
+    /// The routed model's resolved key.
+    pub api_key: Option<String>,
+    /// The routed model's merged request headers (TS
+    /// `_resolveAuxiliaryModel` returns `headers` alongside the model and
+    /// key); the session-model fallback passes None — its path never
+    /// wired them.
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    pub requests: &'a SummaryRequestOptions,
+    /// The run's abort signal: a retry wait ends on it (TS `sleep(delay,
+    /// signal)`), settling the attempt as aborted.
+    pub abort: Option<&'a pa_agent::abort::AbortSignal>,
+}
+
 /// Run one summarizer wire call through `pa_ai::complete_simple` (TS
-/// `completeSimple` under `SUMMARIZATION_SYSTEM_PROMPT`). `headers` are
-/// the routed model's merged request headers (TS `_resolveAuxiliaryModel`
-/// returns `headers` alongside the model and key); the session-model
-/// fallback passes None — its path never wired them.
+/// `completeSimple` under `SUMMARIZATION_SYSTEM_PROMPT`), re-issued under
+/// the shared provider retry policy (TS `completeWithProviderRetry`).
 /// `on_delta` is the live summary sink ([`SummaryDeltaSink`]): `Some`
 /// consumes the provider stream event-by-event and forwards every text
-/// delta (the live compaction block the expanded TUI renders); `None`
-/// keeps the one-shot `complete_simple` completion, byte-identical to the
-/// pre-streaming path.
+/// delta (the live compaction block the expanded TUI renders; a retried
+/// call streams its re-issue too, and the committed summary still comes
+/// from the final reply); `None` keeps the one-shot `complete_simple`
+/// completion, byte-identical to the pre-streaming path.
 /// `failure` labels the error-stop bail exactly like the TS throw sites:
 /// "Summarization failed" for the history call, "Turn prefix
 /// summarization failed" for the turn-prefix call.
@@ -154,16 +186,19 @@ pub type SummaryDeltaSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 /// # Errors
 ///
 /// Returns an error when the summarizer wire call fails, or when its reply
-/// stops with an error (labeled with `failure`).
+/// stops with an error (labeled with `failure`) after the retries.
 pub async fn complete_summary_call(
     model: &pa_types::ai::Model,
-    api_key: Option<String>,
-    headers: Option<std::collections::BTreeMap<String, String>>,
+    provider: SummaryProvider<'_>,
     max_tokens: u64,
     request_messages: Vec<AgentMessage>,
     on_delta: Option<SummaryDeltaSink>,
     failure: &'static str,
 ) -> anyhow::Result<SummarySlice> {
+    use super::provider_adapter::json_round_trip;
+    use super::provider_retry::{
+        complete_with_provider_retry, ProviderRetryPolicy, DEFAULT_PROVIDER_RETRY_POLICY,
+    };
     let messages = request_messages
         .into_iter()
         .filter_map(|message| match message {
@@ -177,31 +212,68 @@ pub async fn complete_summary_call(
         messages,
         tools: None,
     };
+    let SummaryProvider {
+        api_key,
+        headers,
+        requests,
+        abort,
+    } = provider;
     let stream_options =
         pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
             max_tokens: Some(max_tokens),
             api_key,
             headers: headers.map(|headers| headers.into_iter().collect()),
+            session_id: requests.session_id.clone(),
             ..Default::default()
         });
-    let assistant = match on_delta {
-        None => pa_ai::complete_simple(model, &context, Some(stream_options)).await?,
-        Some(on_delta) => {
-            // The live path rides the same provider stream
-            // `complete_simple` awaits the end of: every text delta is
-            // forwarded to the sink as it arrives, and the terminal
-            // event's message is the summary exactly like the one-shot
-            // arm. Thinking deltas stay off the sink — the final summary
-            // carries only the text blocks.
-            let mut stream = pa_ai::stream_simple(model, &context, Some(stream_options))?;
-            while let Some(event) = stream.next_event().await {
-                if let pa_types::ai::AssistantMessageEvent::TextDelta { delta, .. } = &event {
-                    on_delta(delta);
+    let policy = requests.retry.clone().unwrap_or(ProviderRetryPolicy {
+        enabled: false,
+        ..DEFAULT_PROVIDER_RETRY_POLICY
+    });
+    let attempt = || {
+        let stream_options = stream_options.clone();
+        let on_delta = on_delta.clone();
+        let context = &context;
+        async move {
+            let assistant = match on_delta {
+                None => pa_ai::complete_simple(model, context, Some(stream_options)).await?,
+                Some(on_delta) => {
+                    // The live path rides the same provider stream
+                    // `complete_simple` awaits the end of: every text
+                    // delta is forwarded to the sink as it arrives, and
+                    // the terminal event's message is the summary exactly
+                    // like the one-shot arm. Thinking deltas stay off the
+                    // sink — the final summary carries only the text
+                    // blocks.
+                    let mut stream = pa_ai::stream_simple(model, context, Some(stream_options))?;
+                    while let Some(event) = stream.next_event().await {
+                        if let pa_types::ai::AssistantMessageEvent::TextDelta { delta, .. } = &event
+                        {
+                            on_delta(delta);
+                        }
+                    }
+                    stream.result().await
                 }
-            }
-            stream.result().await
+            };
+            // The retry policy classifies the loop's message shape; the
+            // wire shapes are shared, so the crossing is lossless.
+            json_round_trip::<_, pa_agent::types::AssistantMessage>(&assistant)
+                .ok_or_else(|| anyhow::anyhow!("{failure}: summary reply conversion failed"))
         }
     };
+    let wait = |delay: std::time::Duration| async move {
+        if let Some(signal) = abort {
+            pa_agent::abort::race_with_abort(tokio::time::sleep(delay), signal)
+                .await
+                .is_ok()
+        } else {
+            tokio::time::sleep(delay).await;
+            true
+        }
+    };
+    let settled = complete_with_provider_retry(&policy, abort, wait, attempt).await?;
+    let assistant: pa_types::ai::AssistantMessage = json_round_trip(&settled)
+        .ok_or_else(|| anyhow::anyhow!("{failure}: summary reply conversion failed"))?;
     if assistant.stop_reason == pa_types::ai::StopReason::Error {
         anyhow::bail!(
             "{failure}: {}",

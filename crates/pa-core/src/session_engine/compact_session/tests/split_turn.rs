@@ -108,6 +108,8 @@ async fn split_turn_compaction_runs_two_summarizer_calls_and_merges_the_turn_con
             harness_digest: None,
             auxiliary: None,
             summary_delta: None,
+            summary_requests:
+                crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
         },
     )
     .await
@@ -282,6 +284,8 @@ async fn injected_custom_turn_cuts_whole_turns_the_double_row_splits() {
             harness_digest: None,
             auxiliary: None,
             summary_delta: None,
+            summary_requests:
+                crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
         },
     )
     .await
@@ -339,6 +343,8 @@ async fn injected_custom_turn_cuts_whole_turns_the_double_row_splits() {
             harness_digest: None,
             auxiliary: None,
             summary_delta: None,
+            summary_requests:
+                crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
         },
     )
     .await
@@ -458,6 +464,8 @@ async fn split_turn_without_history_makes_only_the_prefix_call() {
             harness_digest: None,
             auxiliary: None,
             summary_delta: None,
+            summary_requests:
+                crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
         },
     )
     .await

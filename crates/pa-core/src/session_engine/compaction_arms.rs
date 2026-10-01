@@ -226,6 +226,13 @@ impl AgentSession {
                     harness_digest: digest_inputs,
                     auxiliary: self.auxiliary_model.as_ref(),
                     summary_delta,
+                    // TS `runRollingSummary`: the summary requests carry the
+                    // session id and run under the shared retry policy.
+                    summary_requests:
+                        crate::session_engine::compaction_exec::SummaryRequestOptions {
+                            session_id: self.agent.session_id().map(str::to_string),
+                            retry: self.summary_retry.clone(),
+                        },
                 },
             )
             .await?

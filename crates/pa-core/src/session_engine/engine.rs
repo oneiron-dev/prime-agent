@@ -270,6 +270,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // snapshot is fixed for the session anyway — while the `PI_REQUEST_TIMING`
     // env half stays live inside the wrappers' per-request check.
     let request_timing_settings = settings.get_request_timing();
+    // TS passes `providerRetryPolicy(settingsManager)` to every compaction
+    // summary call.
+    let summary_retry_policy = settings.get_provider_retry_policy();
     let (mcp_skill_overrides, mcp_generic_servers, built_manager) =
         mcp_gating(&settings, config.agent_dir.clone()).await?;
     let mcp_manager = config
@@ -716,6 +719,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             agent_dir: config.agent_dir.clone(),
         },
     );
+    session.set_summary_retry_policy(summary_retry_policy);
     // The kernel-state probe behind the post-compaction `ipython_state`
     // notice (TS `AgentSession._ipythonKernelProvisioner`): the engine's
     // provisioner is the session's kernel whether it added the `ipython`
