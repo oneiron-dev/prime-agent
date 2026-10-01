@@ -803,6 +803,10 @@ async fn start_kernel_impl(
             &bootstrap_code,
             ExecuteOptions {
                 signal: Some(dispose_signal.clone()),
+                // Host work, not a user cell (the TS fork's final bootstrap
+                // is internal too): it must not take the memory notices owed
+                // to the model's next cell, nor count as a running user cell.
+                internal: true,
                 ..Default::default()
             },
         )

@@ -23,7 +23,7 @@ use crate::kernel::memory_guard::messages::{
 use crate::kernel::memory_guard::policy::{KernelEndCause, MachinePressure};
 use crate::kernel::memory_guard::tree::KernelTreeUsage;
 use crate::kernel::memory_guard::watcher::{
-    kernel_identity, ChildStep, KernelMemoryGuard, MemoryGuardedKernel, MemoryWatch,
+    kernel_identity, ChildStep, KernelMemoryGuard, MeasuredTree, MemoryGuardedKernel, MemoryWatch,
 };
 use crate::kernel::memory_guard::{
     resolve_kernel_memory_backstop, resolve_kernel_memory_limit_gb, GIB,
@@ -41,6 +41,8 @@ const MEMORY_TRIM_TIMEOUT: Duration = Duration::from_secs(30);
 const MEMORY_NOTICE_ACK_TIMEOUT: Duration = Duration::from_millis(200);
 /// Before the last step the kernel names its running line and variables; one long C call holding the GIL cannot answer.
 const MEMORY_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
+/// The variable step's interrupt of a running request, like the abort path's: a kernel that stopped reading its input must not hold the task.
+const MEMORY_INTERRUPT_TIMEOUT: Duration = Duration::from_millis(super::KERNEL_ABORT_GRACE_MS);
 /// The last step's message lists this many of the names the kernel held.
 const MEMORY_HELD_NAMES: u64 = 30;
 /// The warning names this many of the largest variables.
@@ -349,9 +351,13 @@ impl Inner {
     async fn stop_child(self: Arc<Self>, step: ChildStep) -> anyhow::Result<()> {
         let ChildStep {
             unit,
-            usage,
+            measured: MeasuredTree { usage, generation },
             pressure,
         } = step;
+        // Measured on an earlier kernel start: none of that tree is this kernel's.
+        if self.start_stale(generation) {
+            return Ok(());
+        }
         let machine = pressure == MachinePressure::BackstopVictim;
         let text = memory_child_message(&ChildStepContext {
             child: StoppedChild {
@@ -364,7 +370,6 @@ impl Inner {
             limit_bytes: self.memory.limit_bytes,
             machine,
         });
-        let generation = self.current_generation();
         let pids: Vec<i32> = unit
             .pgid
             .into_iter()
@@ -386,7 +391,15 @@ impl Inner {
             return Ok(());
         }
         let cell_running = self.user_cell_running();
-        kill_child_unit(unit.pgid, &unit.pids);
+        if let Err(error) = kill_child_unit(unit.pgid, &unit.pids) {
+            // Not stopped: claim nothing (no notice, no telemetry); the next
+            // pass measures the tree again.
+            self.log_memory(&format!(
+                "child-step failed child={} process={}: {error:#}",
+                unit.pid, unit.name
+            ));
+            return Err(error);
+        }
         self.log_memory(&format!(
             "child-step {}{} child={} process={} child_gb={}",
             if machine { "machine " } else { "" },
@@ -421,13 +434,14 @@ impl Inner {
 
     async fn end_kernel(
         self: Arc<Self>,
-        usage: KernelTreeUsage,
+        measured: MeasuredTree,
         cause: KernelEndCause,
     ) -> anyhow::Result<()> {
-        if lock(&self.guarded).state != KernelState::Running {
+        let MeasuredTree { usage, generation } = measured;
+        // Measured on an earlier kernel start: this kernel is not the one that outgrew the limit.
+        if lock(&self.guarded).state != KernelState::Running || self.start_stale(generation) {
             return Ok(());
         }
-        let generation = self.current_generation();
         // Asked before the kill: the kernel names the line it runs and the variables it holds.
         let report = self
             .send_out_of_band(
@@ -482,7 +496,14 @@ impl Inner {
             }
         ));
         for unit in &usage.units {
-            kill_child_unit(unit.pgid, &unit.pids);
+            // The kernel itself ends below either way; a unit that cannot be
+            // signaled is reported, not hidden.
+            if let Err(error) = kill_child_unit(unit.pgid, &unit.pids) {
+                self.log_memory(&format!(
+                    "last-step child failed child={} process={}: {error:#}",
+                    unit.pid, unit.name
+                ));
+            }
         }
         // Owed before the settle: the awaiting execute() collects notices as soon as it wakes.
         self.note_memory(text.clone(), NoticePlacement::for_cell(cell_running));
@@ -540,15 +561,19 @@ impl MemoryGuardedKernel for Inner {
             return None;
         }
         let pid = lock(&self.child).as_ref().map(|child| child.pid)?;
-        let bash_pgids = {
+        let (generation, bash_pgids) = {
             let g = lock(&self.guarded);
             if g.state != KernelState::Running {
                 return None;
             }
-            g.background_bash_handles.values().copied().collect()
+            (
+                g.start_generation,
+                g.background_bash_handles.values().copied().collect(),
+            )
         };
         Some(MemoryWatch {
             pid,
+            generation,
             limit_bytes: self.memory.limit_bytes,
             backstop: self.memory.backstop,
             python: self
@@ -560,7 +585,11 @@ impl MemoryGuardedKernel for Inner {
         })
     }
 
-    fn warn_memory(&self, usage: &KernelTreeUsage) {
+    fn warn_memory(&self, measured: &MeasuredTree) {
+        if self.start_stale(measured.generation) {
+            return;
+        }
+        let usage = &measured.usage;
         self.log_memory(&format!("warn {}", self.describe_tree(usage)));
         {
             let mut g = lock(&self.guarded);
@@ -587,7 +616,11 @@ impl MemoryGuardedKernel for Inner {
         Box::pin(self.stop_child(step))
     }
 
-    fn trim_memory(self: Arc<Self>, target_bytes: u64, usage: &KernelTreeUsage) {
+    fn trim_memory(self: Arc<Self>, target_bytes: u64, measured: &MeasuredTree) {
+        if self.start_stale(measured.generation) {
+            return;
+        }
+        let usage = &measured.usage;
         let cell_stopped = self.user_cell_running();
         self.log_memory(&format!(
             "variable-step {} target={}GB cell={cell_stopped}",
@@ -614,27 +647,53 @@ impl MemoryGuardedKernel for Inner {
                 .as_ref()
                 .map(|execution| execution.request_id.clone())
         };
-        match active_id {
-            // The trim runs in the stopped request's slot once it settles.
-            Some(request_id) => {
-                tokio::spawn(async move {
-                    if let Err(error) = self.interrupt(Some(&request_id)).await {
+        // The trim runs in the stopped request's slot once it settles.
+        if let Some(request_id) = active_id {
+            tokio::spawn(async move {
+                // Bounded: a runtime that stopped draining its input must
+                // not keep this task, and with it the kernel, alive.
+                match tokio::time::timeout(
+                    MEMORY_INTERRUPT_TIMEOUT,
+                    self.interrupt(Some(&request_id)),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
                         self.log_memory(&format!("variable-step interrupt failed: {error:#}"));
                     }
-                });
-            }
-            None => {
-                tokio::spawn(ReplKernelManager { inner: self }.run_idle_memory_follow_up());
-            }
+                    Err(_) => self.log_memory(
+                        "variable-step interrupt timed out: the kernel is not reading its input",
+                    ),
+                }
+            });
+            return;
+        }
+        if lock(&self.guarded).flushing_snapshot_for_dispose {
+            return;
+        }
+        // Idle: reserve the slot now, before any request can queue ahead of
+        // the trim (TS chains it onto the queue synchronously). A slot
+        // already held by a request leaves the trim to that request's
+        // follow-up, which runs before the slot is released.
+        let queue = Arc::clone(&self.execution_queue);
+        let manager = ReplKernelManager { inner: self };
+        if let Ok(slot) = Arc::clone(&queue).try_lock_owned() {
+            tokio::spawn(manager.run_idle_memory_follow_up(slot));
+        } else {
+            tokio::spawn(async move {
+                let slot = queue.lock_owned().await;
+                manager.run_idle_memory_follow_up(slot).await;
+            });
         }
     }
 
     fn end_memory_kernel(
         self: Arc<Self>,
-        usage: KernelTreeUsage,
+        measured: MeasuredTree,
         cause: KernelEndCause,
     ) -> BoxFuture<'static, anyhow::Result<()>> {
-        Box::pin(self.end_kernel(usage, cause))
+        Box::pin(self.end_kernel(measured, cause))
     }
 }
 
@@ -740,12 +799,8 @@ impl ReplKernelManager {
         );
     }
 
-    /// A trim asked for while no request ran takes its own serialized slot.
-    async fn run_idle_memory_follow_up(self) {
-        if lock(&self.inner.guarded).flushing_snapshot_for_dispose {
-            return;
-        }
-        let _slot = self.inner.execution_queue.lock().await;
+    /// A trim asked for while no request ran, in the serialized slot it holds.
+    async fn run_idle_memory_follow_up(self, _slot: tokio::sync::OwnedMutexGuard<()>) {
         self.run_memory_follow_up(SettledRequest::Idle).await;
     }
 

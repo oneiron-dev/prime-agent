@@ -86,20 +86,56 @@ fn a_done_outside_the_active_execution_hands_its_fields_to_the_waiter() {
     assert_eq!(rx.try_recv().ok(), Some(fields));
 }
 
+fn measured(generation: u64) -> MeasuredTree {
+    MeasuredTree {
+        usage: KernelTreeUsage {
+            kernel_pid: 1,
+            kernel_bytes: 10,
+            total_bytes: 10,
+            units: Vec::new(),
+        },
+        generation,
+    }
+}
+
 #[test]
 fn trim_without_the_runtime_feature_leaves_the_last_step_to_decide() {
     let manager = manager();
-    let usage = KernelTreeUsage {
-        kernel_pid: 1,
-        kernel_bytes: 10,
-        total_bytes: 10,
-        units: Vec::new(),
-    };
-    Arc::clone(&manager.inner).trim_memory(5, &usage);
+    let current = measured(manager.inner.current_generation());
+    Arc::clone(&manager.inner).trim_memory(5, &current);
     assert!(lock(&manager.inner.guarded).memory.pending_trim.is_none());
     assert!(manager
         .kernel_stderr()
         .contains("[kernel] memory variable-step unavailable: the kernel runtime has no trim_memory; the last step decides"));
+}
+
+/// A step measured on another kernel start (the kernel restarted while the
+/// pass read its table) does nothing to the kernel running now.
+#[tokio::test]
+async fn steps_measured_on_another_kernel_start_are_ignored() {
+    let manager = manager();
+    manager.inner.handle_event(Event::Ready {
+        protocol: 3,
+        features: vec!["trim_memory".into()],
+    });
+    let other_start = measured(manager.inner.current_generation() + 1);
+    manager.inner.warn_memory(&other_start);
+    Arc::clone(&manager.inner).trim_memory(5, &other_start);
+    let ended = Arc::clone(&manager.inner)
+        .end_memory_kernel(other_start, KernelEndCause::Hard)
+        .await;
+    let g = lock(&manager.inner.guarded);
+    assert_eq!(
+        (
+            ended.ok(),
+            g.memory.pending_warning.is_none(),
+            g.memory.pending_trim.is_none(),
+            g.memory.notices.len()
+        ),
+        (Some(()), true, true, 0)
+    );
+    drop(g);
+    assert_eq!(manager.kernel_stderr(), "");
 }
 
 #[test]
@@ -146,4 +182,55 @@ fn runtime_records_parse_like_the_ts_host() {
         ),
         (7, 0, 0, 0)
     );
+}
+
+/// A runtime that stopped reading its input: the request's own write blocks
+/// on the full pipe and holds the writer, so the abort's interrupt cannot be
+/// written either. The request's deadline must still settle it (the memory
+/// trim's 30 s budget rides this path) instead of holding the slot forever.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_deadline_settles_a_request_whose_write_never_drains() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let deaf = dir.path().join("deaf-kernel");
+    std::fs::write(
+        &deaf,
+        "#!/bin/sh\necho '{\"event\":\"ready\",\"protocol\":3,\"python\":\"3.12.0\",\"features\":[\"trim_memory\"]}'\nexec tail -f /dev/null\n",
+    )
+    .expect("write the fake runtime");
+    std::fs::set_permissions(&deaf, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let manager = ReplKernelManager::with_memory_guard(
+        KernelManagerOptions {
+            python: Some(deaf),
+            cwd: Some(dir.path().to_path_buf()),
+            ..KernelManagerOptions::default()
+        },
+        // No reader: this test is about the transport, not the ladder.
+        KernelMemoryGuard::new(None, None, Arc::new(Instant::now)),
+    );
+    manager
+        .start(crate::kernel::manager::KernelStartOptions::default())
+        .await
+        .expect("the fake kernel starts");
+    // Far past any pipe buffer: the write cannot complete.
+    let code = "x".repeat(8 * 1024 * 1024);
+    let settled = tokio::time::timeout(
+        Duration::from_secs(60),
+        manager.enqueue_request(
+            Request::Execute { code: code.clone() },
+            &code,
+            ExecuteOptions {
+                internal: true,
+                ..ExecuteOptions::default()
+            },
+            Some(200),
+        ),
+    )
+    .await
+    .expect("the deadline settles the request")
+    .expect("no transport error");
+    assert_eq!(settled.result.status, ExecuteStatus::Aborted);
+    manager.kill();
 }

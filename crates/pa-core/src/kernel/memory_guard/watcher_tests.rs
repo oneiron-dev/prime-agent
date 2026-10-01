@@ -29,6 +29,7 @@ impl FakeKernel {
         Arc::new(Self {
             watch: Mutex::new(Some(MemoryWatch {
                 pid,
+                generation: 1,
                 limit_bytes: limit_bytes as f64,
                 backstop,
                 python: None,
@@ -48,8 +49,8 @@ impl MemoryGuardedKernel for FakeKernel {
         lock(&self.watch).clone()
     }
 
-    fn warn_memory(&self, usage: &KernelTreeUsage) {
-        lock(&self.calls).push(Call::Warn(usage.total_bytes));
+    fn warn_memory(&self, measured: &MeasuredTree) {
+        lock(&self.calls).push(Call::Warn(measured.usage.total_bytes));
     }
 
     fn stop_memory_child(
@@ -63,13 +64,13 @@ impl MemoryGuardedKernel for FakeKernel {
         Box::pin(async { Ok(()) })
     }
 
-    fn trim_memory(self: Arc<Self>, target_bytes: u64, _usage: &KernelTreeUsage) {
+    fn trim_memory(self: Arc<Self>, target_bytes: u64, _measured: &MeasuredTree) {
         lock(&self.calls).push(Call::Trim(target_bytes));
     }
 
     fn end_memory_kernel(
         self: Arc<Self>,
-        _usage: KernelTreeUsage,
+        _measured: MeasuredTree,
         cause: KernelEndCause,
     ) -> BoxFuture<'static, anyhow::Result<()>> {
         lock(&self.calls).push(Call::End(cause));
@@ -349,4 +350,80 @@ async fn the_timer_runs_one_pass_per_interval_after_the_first_watch_and_stops_wi
         .guard
         .unwatch(kernel_identity(kernel.as_ref() as &dyn MemoryGuardedKernel));
     assert!(lock(&harness.guard.state).timer.is_none());
+}
+
+/// A kernel restarted while the table was read is measured as the process
+/// now running (TS reads `memoryWatch` after the read), and the older pass
+/// never steps the restart's fresh ladder: the replaced process's overage
+/// does not reach its successor.
+#[tokio::test]
+async fn a_restart_during_the_read_never_steps_the_successor_with_the_old_tree() {
+    let harness = Harness::new();
+    let kernel = FakeKernel::new(100, 10 * GIB, true);
+    harness.watch(&kernel);
+    harness.reader.serve(
+        vec![
+            (row(100, 1, 1, "python"), 11 * GIB),
+            (row(200, 1, 1, "python"), 7 * GIB),
+        ],
+        false,
+    );
+    let gate = Arc::new(Notify::new());
+    *lock(&harness.reader.gate) = Some(Arc::clone(&gate));
+    let pass = tokio::spawn({
+        let guard = Arc::clone(&harness.guard);
+        async move { guard.tick().await }
+    });
+    harness.reader.entered.notified().await;
+    // The restart: a new process for a new start, watched afresh.
+    let successor = MemoryWatch {
+        pid: 200,
+        generation: 2,
+        ..kernel.memory_watch().expect("watched")
+    };
+    *lock(&kernel.watch) = Some(successor);
+    harness.watch(&kernel);
+    gate.notify_one();
+    pass.await.expect("the pass");
+    let during_restart = kernel.calls();
+    *lock(&harness.reader.gate) = None;
+    harness.guard.tick().await;
+    // The successor's own ladder starts armed: its first pass warns.
+    assert_eq!(
+        (during_restart, kernel.calls()),
+        (vec![], vec![Call::Warn(7 * GIB)])
+    );
+}
+
+/// Unwatching the last kernel while a pass waits on the table (the timer's
+/// pass, cancelled with the timer) keeps nothing alive: the pass holds
+/// kernels weakly across the read, and the registry lets go of the pass.
+#[tokio::test]
+async fn unwatching_the_last_kernel_mid_pass_keeps_nothing_alive() {
+    let harness = Harness::new();
+    let kernel = FakeKernel::new(100, 10 * GIB, true);
+    harness.watch(&kernel);
+    harness
+        .reader
+        .serve(vec![(row(100, 1, 1, "python"), GIB)], false);
+    *lock(&harness.reader.gate) = Some(Arc::new(Notify::new()));
+    let pass = tokio::spawn({
+        let guard = Arc::clone(&harness.guard);
+        async move { guard.tick().await }
+    });
+    harness.reader.entered.notified().await;
+    pass.abort();
+    let _ = pass.await;
+    let weak = Arc::downgrade(&kernel);
+    harness
+        .guard
+        .unwatch(kernel_identity(kernel.as_ref() as &dyn MemoryGuardedKernel));
+    drop(kernel);
+    assert_eq!(
+        (
+            weak.upgrade().is_none(),
+            lock(&harness.guard.state).ticking.is_none()
+        ),
+        (true, true)
+    );
 }

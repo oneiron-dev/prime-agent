@@ -25,6 +25,9 @@ use crate::platform::kernel_memory::{platform_memory_reader, MemoryReader, Proce
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MemoryWatch {
     pub pid: i32,
+    /// The kernel start this process belongs to: a step measured on one
+    /// start never acts on its successor.
+    pub generation: u64,
     pub limit_bytes: f64,
     pub backstop: bool,
     /// The kernel's interpreter (the macOS reader runs it).
@@ -33,11 +36,19 @@ pub(crate) struct MemoryWatch {
     pub bash_pgids: Vec<i32>,
 }
 
+/// One kernel start's tree as a pass measured it.
+#[derive(Debug, Clone)]
+pub(crate) struct MeasuredTree {
+    pub usage: KernelTreeUsage,
+    /// [`MemoryWatch::generation`] at the measurement.
+    pub generation: u64,
+}
+
 /// The child step's inputs.
 #[derive(Debug, Clone)]
 pub(crate) struct ChildStep {
     pub unit: ChildUnit,
-    pub usage: KernelTreeUsage,
+    pub measured: MeasuredTree,
     pub pressure: MachinePressure,
 }
 
@@ -46,21 +57,22 @@ pub(crate) struct ChildStep {
 /// The guard holds implementations weakly and calls them from its pass:
 /// `memory_watch` answers `None` while no kernel process runs or the ladder
 /// is off; `warn_memory` and `trim_memory` only record or schedule work and
-/// return at once; the child and end steps act on the measurement they are
-/// given, must re-check after any await that the measured kernel process is
-/// still the current one, and report real failures as errors (the guard logs
-/// them and goes on with the other kernels).
+/// return at once. Every step carries the kernel start it measured and must
+/// do nothing once that start is no longer the running one (a restart while
+/// the table was read, or during the step's own awaits). The child and end
+/// steps report real failures as errors (the guard logs them and goes on
+/// with the other kernels).
 pub(crate) trait MemoryGuardedKernel: Send + Sync {
     fn memory_watch(&self) -> Option<MemoryWatch>;
-    fn warn_memory(&self, usage: &KernelTreeUsage);
+    fn warn_memory(&self, measured: &MeasuredTree);
     fn stop_memory_child(
         self: Arc<Self>,
         step: ChildStep,
     ) -> BoxFuture<'static, anyhow::Result<()>>;
-    fn trim_memory(self: Arc<Self>, target_bytes: u64, usage: &KernelTreeUsage);
+    fn trim_memory(self: Arc<Self>, target_bytes: u64, measured: &MeasuredTree);
     fn end_memory_kernel(
         self: Arc<Self>,
-        usage: KernelTreeUsage,
+        measured: MeasuredTree,
         cause: KernelEndCause,
     ) -> BoxFuture<'static, anyhow::Result<()>>;
 }
@@ -70,6 +82,9 @@ type TickPass = Shared<BoxFuture<'static, ()>>;
 
 struct Watched {
     kernel: Weak<dyn MemoryGuardedKernel>,
+    /// Which watch this entry is: a re-watch (a kernel restart) starts a
+    /// fresh ladder that an older pass must not step.
+    registration: u64,
     ladder: LadderState,
 }
 
@@ -82,8 +97,11 @@ impl Watched {
 #[derive(Default)]
 struct GuardState {
     kernels: Vec<Watched>,
+    registrations: u64,
     timer: Option<tokio::task::JoinHandle<()>>,
-    ticking: Option<TickPass>,
+    /// The pass in flight, by number, so only its own completion clears it.
+    ticking: Option<(u64, TickPass)>,
+    passes: u64,
 }
 
 #[derive(PartialEq, Eq)]
@@ -156,8 +174,11 @@ impl KernelMemoryGuard {
         let identity = kernel_identity(kernel.as_ref());
         let mut state = lock(&self.state);
         state.kernels.retain(|watched| !watched.is(identity));
+        state.registrations += 1;
+        let registration = state.registrations;
         state.kernels.push(Watched {
             kernel: Arc::downgrade(kernel),
+            registration,
             ladder: LadderState::default(),
         });
         // A timer whose runtime is gone (a finished test runtime) restarts.
@@ -170,7 +191,9 @@ impl KernelMemoryGuard {
         }
     }
 
-    /// Stop watching; the timer stops with the last kernel.
+    /// Stop watching; the timer stops with the last kernel, and so does the
+    /// registry's hold on a pass the timer was running (a pass someone else
+    /// awaits still finishes for them).
     pub(crate) fn unwatch(&self, kernel: *const ()) {
         let mut state = lock(&self.state);
         state
@@ -180,6 +203,7 @@ impl KernelMemoryGuard {
             if let Some(timer) = state.timer.take() {
                 timer.abort();
             }
+            state.ticking = None;
         }
     }
 
@@ -245,17 +269,26 @@ impl KernelMemoryGuard {
     pub(crate) async fn tick(self: &Arc<Self>) {
         let pass = {
             let mut state = lock(&self.state);
-            if let Some(pass) = &state.ticking {
+            if let Some((_, pass)) = &state.ticking {
                 pass.clone()
             } else {
+                state.passes += 1;
+                let number = state.passes;
                 let guard = Arc::clone(self);
                 let pass = async move {
                     guard.run_tick().await;
-                    lock(&guard.state).ticking = None;
+                    let mut state = lock(&guard.state);
+                    if state
+                        .ticking
+                        .as_ref()
+                        .is_some_and(|(current, _)| *current == number)
+                    {
+                        state.ticking = None;
+                    }
                 }
                 .boxed()
                 .shared();
-                state.ticking = Some(pass.clone());
+                state.ticking = Some((number, pass.clone()));
                 pass
             }
         };
@@ -267,19 +300,23 @@ impl KernelMemoryGuard {
         let Some(reader) = self.reader.clone() else {
             return;
         };
-        let kernels: Vec<Arc<dyn MemoryGuardedKernel>> = lock(&self.state)
+        // Weak across the table read: the pass never keeps a manager alive
+        // while it waits on the OS.
+        let registered: Vec<(Weak<dyn MemoryGuardedKernel>, u64)> = lock(&self.state)
             .kernels
             .iter()
-            .filter_map(|watched| watched.kernel.upgrade())
+            .map(|watched| (watched.kernel.clone(), watched.registration))
             .collect();
-        let live: Vec<(Arc<dyn MemoryGuardedKernel>, MemoryWatch)> = kernels
-            .into_iter()
-            .filter_map(|kernel| kernel.memory_watch().map(|watch| (kernel, watch)))
-            .collect();
-        let Some((_, first)) = live.first() else {
+        // The macOS reader runs the first live kernel's interpreter.
+        let Some(python) = registered.iter().find_map(|(kernel, _)| {
+            kernel
+                .upgrade()
+                .and_then(|kernel| kernel.memory_watch())
+                .map(|watch| watch.python)
+        }) else {
             return;
         };
-        let table = match reader.read(first.python.clone()).await {
+        let table = match reader.read(python).await {
             Ok(table) => table,
             Err(error) => {
                 // An unreadable table skips this pass; the next one retries.
@@ -287,9 +324,23 @@ impl KernelMemoryGuard {
                 return;
             }
         };
+        // Each kernel's watch is read after the table (TS reads
+        // `memoryWatch` there too): a kernel restarted during the read is
+        // measured as the process now running, never as the one it replaced.
+        let live: Vec<(Arc<dyn MemoryGuardedKernel>, u64, MemoryWatch)> = registered
+            .iter()
+            .filter_map(|(kernel, registration)| {
+                let kernel = kernel.upgrade()?;
+                let watch = kernel.memory_watch()?;
+                Some((kernel, *registration, watch))
+            })
+            .collect();
+        if live.is_empty() {
+            return;
+        }
         let critical = table.critical;
         let guard = Arc::clone(self);
-        let watches: Vec<MemoryWatch> = live.iter().map(|(_, watch)| watch.clone()).collect();
+        let watches: Vec<MemoryWatch> = live.iter().map(|(_, _, watch)| watch.clone()).collect();
         let usages = match tokio::task::spawn_blocking(move || {
             guard.measure_trees(&table, &watches)
         })
@@ -310,7 +361,7 @@ impl KernelMemoryGuard {
             measured
                 .iter()
                 .filter(|(index, usage)| {
-                    live[*index].1.backstop && usage.total_bytes >= BACKSTOP_MIN_TREE_BYTES
+                    live[*index].2.backstop && usage.total_bytes >= BACKSTOP_MIN_TREE_BYTES
                 })
                 .fold(
                     None::<&(usize, KernelTreeUsage)>,
@@ -325,32 +376,37 @@ impl KernelMemoryGuard {
         };
         let now = (self.clock)();
         for (index, usage) in measured {
-            let (kernel, watch) = &live[index];
+            let (kernel, registration, watch) = &live[index];
             let pressure = if victim == Some(index) {
                 MachinePressure::BackstopVictim
             } else {
                 MachinePressure::Normal
             };
-            let steps = {
-                let identity = kernel_identity(kernel.as_ref());
-                let mut state = lock(&self.state);
-                let Some(entry) = state
-                    .kernels
-                    .iter_mut()
-                    .find(|watched| watched.is(identity))
-                else {
-                    continue;
+            let steps =
+                {
+                    let identity = kernel_identity(kernel.as_ref());
+                    let mut state = lock(&self.state);
+                    // Re-watched since the pass began (a restart): that start's
+                    // fresh ladder is not this measurement's to step.
+                    let Some(entry) = state.kernels.iter_mut().find(|watched| {
+                        watched.is(identity) && watched.registration == *registration
+                    }) else {
+                        continue;
+                    };
+                    decide_memory_steps(&usage, watch.limit_bytes, &mut entry.ladder, now, pressure)
                 };
-                decide_memory_steps(&usage, watch.limit_bytes, &mut entry.ladder, now, pressure)
+            let measured = MeasuredTree {
+                usage,
+                generation: watch.generation,
             };
             for step in steps {
                 // One kernel's failed step must not stop the pass for the others.
                 match step {
-                    MemoryStep::Warn => kernel.warn_memory(&usage),
+                    MemoryStep::Warn => kernel.warn_memory(&measured),
                     MemoryStep::Child(unit) => {
                         let step = ChildStep {
                             unit,
-                            usage: usage.clone(),
+                            measured: measured.clone(),
                             pressure,
                         };
                         if let Err(error) = Arc::clone(kernel).stop_memory_child(step).await {
@@ -358,11 +414,11 @@ impl KernelMemoryGuard {
                         }
                     }
                     MemoryStep::Trim { target_bytes } => {
-                        Arc::clone(kernel).trim_memory(target_bytes, &usage);
+                        Arc::clone(kernel).trim_memory(target_bytes, &measured);
                     }
                     MemoryStep::Kill(cause) => {
                         if let Err(error) = Arc::clone(kernel)
-                            .end_memory_kernel(usage.clone(), cause)
+                            .end_memory_kernel(measured.clone(), cause)
                             .await
                         {
                             tracing::warn!(error = %format!("{error:#}"), pid = watch.pid, "kernel memory last step failed");

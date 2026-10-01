@@ -270,8 +270,9 @@ struct CaptureFreshness {
     /// except the prune, whose names are already gone from the live
     /// namespace (a fresh prune finds nothing).
     result: SnapshotResult,
-    /// Live names above the per-variable cap survived the commit: a pruning
-    /// capture must still run to remove and disclose them (#227 semantics).
+    /// Live names above the per-variable or the aggregate cap survived the
+    /// commit: a pruning capture must still run to remove and disclose them
+    /// (#227 semantics).
     live_over_cap: bool,
 }
 
@@ -391,7 +392,8 @@ pub(crate) struct Inner {
     child: Mutex<Option<ChildHandle>>,
     busy_notify: Notify,
     /// Serializes `execute()` calls — the runtime runs one request at a time.
-    execution_queue: tokio::sync::Mutex<()>,
+    /// Shared so an idle memory trim can reserve its slot synchronously.
+    execution_queue: Arc<tokio::sync::Mutex<()>>,
     start_memo: Mutex<Option<Arc<MemoSlot>>>,
     shutdown_memo: Mutex<Option<Arc<MemoSlot>>>,
     rebootstrap_memo: Mutex<Option<Arc<MemoSlot>>>,
@@ -518,7 +520,7 @@ impl ReplKernelManager {
             }),
             child: Mutex::new(None),
             busy_notify: Notify::new(),
-            execution_queue: tokio::sync::Mutex::new(()),
+            execution_queue: Arc::new(tokio::sync::Mutex::new(())),
             start_memo: Mutex::new(None),
             shutdown_memo: Mutex::new(None),
             rebootstrap_memo: Mutex::new(None),

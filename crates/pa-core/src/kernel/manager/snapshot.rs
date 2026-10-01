@@ -15,6 +15,11 @@ use crate::kernel::shared::{KernelSnapshotGuardStats, SnapshotGuardPhase};
 /// over-cap survivor unless the same capture also pruned it.
 const OVER_CAP_SKIP_REASON: &str = "exceeds per-variable snapshot size cap";
 
+/// The writer's reason for a name past the aggregate cap: a pruning capture
+/// removes those too (prime-agent-runtime prunes aggregate overflow with
+/// the per-variable overflow), so they are live survivors the same way.
+const AGGREGATE_CAP_SKIP_REASON: &str = "exceeds aggregate snapshot size cap";
+
 /// The runtime's file-handle guard reasons: a direct `io.IOBase` value or a
 /// pickle reaching dill's file-handle reducer skipped at capture, and a blob
 /// carrying that reducer refused at restore.
@@ -266,7 +271,7 @@ impl Inner {
         let (payload_stat, manifest_stat) =
             stats_after_commit(&self.freshness_stat_probe, cfg).await;
         let live_over_cap = result.skipped.iter().any(|skip| {
-            skip.reason == OVER_CAP_SKIP_REASON
+            (skip.reason == OVER_CAP_SKIP_REASON || skip.reason == AGGREGATE_CAP_SKIP_REASON)
                 && !result
                     .pruned
                     .as_ref()
@@ -667,6 +672,55 @@ mod tests {
     use super::*;
     use crate::kernel::manager::ReplKernelManager;
     use crate::kernel::shared::KernelManagerOptions;
+
+    /// A capture that skipped names past the aggregate cap left them live,
+    /// like per-variable overflow: the memo must not stand in for the
+    /// pruning capture that removes them (/compact).
+    #[tokio::test]
+    async fn aggregate_overflow_keeps_the_pruning_capture_from_the_memo() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = crate::kernel::shared::KernelSnapshotConfig {
+            path: dir.path().join("kernel-state.dill"),
+            manifest_path: dir.path().join("kernel-state.json"),
+            max_bytes: None,
+            max_variable_bytes: None,
+            debounce_ms: None,
+        };
+        std::fs::write(&cfg.path, b"payload").expect("payload");
+        std::fs::write(&cfg.manifest_path, b"{}").expect("manifest");
+        let manager = ReplKernelManager::new(KernelManagerOptions {
+            snapshot: Some(cfg.clone()),
+            ..KernelManagerOptions::default()
+        });
+        let memo_after = |skipped: Vec<SnapshotSkip>| {
+            let inner = Arc::clone(&manager.inner);
+            let cfg = cfg.clone();
+            async move {
+                let result = SnapshotResult {
+                    saved: vec!["kept".to_string()],
+                    skipped,
+                    pruned: None,
+                    bytes: 7,
+                    path: cfg.path.clone(),
+                };
+                inner.record_capture_freshness(&cfg, &result, 0, 0, 0).await;
+                let g = lock(&inner.guarded);
+                g.capture_freshness.as_ref().map(|memo| memo.live_over_cap)
+            }
+        };
+        let skip = |reason: &str| SnapshotSkip {
+            name: "frames".to_string(),
+            reason: reason.to_string(),
+        };
+        assert_eq!(
+            [
+                memo_after(vec![skip("exceeds aggregate snapshot size cap")]).await,
+                memo_after(vec![skip(OVER_CAP_SKIP_REASON)]).await,
+                memo_after(vec![skip("unsafe file handle (io.IOBase)")]).await,
+            ],
+            [Some(true), Some(true), Some(false)]
+        );
+    }
 
     /// Only the file-handle guard's own reasons count as rejections (a size
     /// cap or a corrupt blob is not the guard), and a direction where the

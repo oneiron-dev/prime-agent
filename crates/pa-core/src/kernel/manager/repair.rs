@@ -232,6 +232,18 @@ impl Inner {
                 let run_slot = slot.clone();
                 tokio::spawn(async move {
                     let ok = inner.reprovision_fresh_kernel().await;
+                    // In flight only (TS clears its rebootstrap promise when
+                    // it settles): the next discarded kernel must run its own
+                    // reprovision instead of joining this finished one.
+                    {
+                        let mut memo = lock(&inner.rebootstrap_memo);
+                        if memo
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &run_slot))
+                        {
+                            *memo = None;
+                        }
+                    }
                     run_slot.finish(
                         (!ok).then(|| anyhow!("Kernel bootstrap failed after protocol repair")),
                     );

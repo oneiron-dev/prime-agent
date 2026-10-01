@@ -116,24 +116,69 @@ pub(crate) fn platform_memory_reader() -> Option<Arc<dyn MemoryReader>> {
 /// SIGKILL one stoppable unit under a kernel: its whole process group when
 /// the unit owns one, else each measured member. A subtree that shares the
 /// kernel's (and host's) group is never signaled through that group.
-/// Exited members are expected races, not errors.
+/// Exited members are expected races, not errors; a member that cannot be
+/// signaled (permission) is an error naming it.
 #[cfg(unix)]
-pub(crate) fn kill_child_unit(pgid: Option<i32>, pids: &[i32]) {
+pub(crate) fn kill_child_unit(pgid: Option<i32>, pids: &[i32]) -> anyhow::Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{kill, killpg, Signal};
+    use nix::unistd::Pid;
+
+    let mut group_error = None;
     if let Some(pgid) = pgid.filter(|pgid| *pgid > 1) {
-        // SAFETY: plain kill(2) on a negative group id; no memory is shared.
-        if unsafe { libc::kill(-pgid, libc::SIGKILL) } == 0 {
-            return;
+        match killpg(Pid::from_raw(pgid), Signal::SIGKILL) {
+            Ok(()) => return Ok(()),
+            // The group is gone: its measured members may have moved on.
+            Err(Errno::ESRCH) => {}
+            Err(error) => group_error = Some(format!("group {pgid}: {error}")),
         }
     }
-    for &pid in pids {
-        let _ = super::process::kill_pid(pid, super::process::Signal::Kill);
+    let mut failures: Vec<String> = Vec::new();
+    for &pid in pids.iter().filter(|pid| **pid > 0) {
+        match kill(Pid::from_raw(pid), Signal::SIGKILL) {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(error) => failures.push(format!("pid {pid}: {error}")),
+        }
     }
+    // Every measured member died by this signal or was already gone.
+    if failures.is_empty() {
+        return Ok(());
+    }
+    failures.extend(group_error);
+    anyhow::bail!("could not stop the process unit ({})", failures.join(", "))
 }
 
 /// No reader runs on this platform, so no unit is ever measured.
 #[cfg(not(unix))]
-pub(crate) fn kill_child_unit(_pgid: Option<i32>, pids: &[i32]) {
+pub(crate) fn kill_child_unit(_pgid: Option<i32>, pids: &[i32]) -> anyhow::Result<()> {
     for &pid in pids {
         let _ = super::process::kill_pid(pid, super::process::Signal::Kill);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+
+    use super::*;
+
+    /// A unit with its own group dies by the group signal; a unit whose
+    /// processes already exited is stopped too (nothing is left running).
+    #[test]
+    fn a_group_unit_is_killed_and_an_exited_one_is_already_stopped() {
+        let mut child = std::process::Command::new("tail")
+            .args(["-f", "/dev/null"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn a child in its own group");
+        let pid = i32::try_from(child.id()).expect("pid fits i32");
+        let killed = kill_child_unit(Some(pid), &[pid]).map_err(|error| error.to_string());
+        let status = child.wait().expect("reap the child");
+        let exited = kill_child_unit(Some(pid), &[pid]).map_err(|error| error.to_string());
+        assert_eq!(
+            (killed, status.signal(), exited),
+            (Ok(()), Some(libc::SIGKILL), Ok(()))
+        );
     }
 }

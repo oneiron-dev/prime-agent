@@ -242,7 +242,14 @@ impl ReplKernelManager {
                 let Some(inner) = inner.upgrade() else {
                     return;
                 };
-                let _ = inner.interrupt(Some(&execution.request_id)).await;
+                // Bounded: a runtime that stopped draining stdin leaves the
+                // request's own write holding the writer, and the interrupt
+                // would wait on it forever; the force-abort must still come.
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(KERNEL_ABORT_GRACE_MS),
+                    inner.interrupt(Some(&execution.request_id)),
+                )
+                .await;
                 tokio::time::sleep(Duration::from_millis(KERNEL_ABORT_GRACE_MS)).await;
                 // The execution stays active until its done event arrives;
                 // clearing it early would let a new cell race the interrupted
