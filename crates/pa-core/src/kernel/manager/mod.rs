@@ -396,7 +396,9 @@ pub(crate) struct Inner {
     execution_queue: Arc<tokio::sync::Mutex<()>>,
     start_memo: Mutex<Option<Arc<MemoSlot>>>,
     shutdown_memo: Mutex<Option<Arc<MemoSlot>>>,
-    rebootstrap_memo: Mutex<Option<Arc<MemoSlot>>>,
+    /// The in-flight reprovision of a discarded kernel, keyed by the kernel
+    /// start it reprovisions.
+    rebootstrap_memo: Mutex<Option<(u64, Arc<MemoSlot>)>>,
     flush_memo: Mutex<Option<Arc<MemoSlot>>>,
     snapshot_timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stderr_closed: Notify,

@@ -104,6 +104,8 @@ struct OwedNotice {
 struct PendingTrim {
     target_bytes: u64,
     usage: KernelTreeUsage,
+    /// The kernel start measured: the trim and its message are that start's only.
+    generation: u64,
     cell_stopped: bool,
 }
 
@@ -641,6 +643,7 @@ impl MemoryGuardedKernel for Inner {
             g.memory.pending_trim = Some(PendingTrim {
                 target_bytes,
                 usage: usage.clone(),
+                generation: measured.generation,
                 cell_stopped,
             });
             g.active_execution
@@ -717,9 +720,17 @@ impl ReplKernelManager {
             return;
         }
         let trim = lock(&inner.guarded).memory.pending_trim.take();
+        // A trim measured on an earlier kernel start has nothing left to trim.
+        let trim = trim.filter(|trim| !inner.start_stale(trim.generation));
         if let Some(trim) = trim {
             if let Some(report) = self.request_trim(trim.target_bytes).await {
                 let after = inner.memory.guard.measure(inner.as_ref()).await;
+                // Ended (and maybe restarted) while trimming or measuring: the
+                // end's own message speaks for that kernel; nothing of this
+                // step may reach the successor (its warning, its grace clock).
+                if inner.start_stale(trim.generation) {
+                    return;
+                }
                 let dropped = report
                     .dropped
                     .iter()

@@ -849,3 +849,85 @@ async fn internal_requests_leave_owed_notices_for_the_next_user_cell() {
     );
     ladder.shutdown().await;
 }
+
+/// A trim owed by an earlier kernel start (it ended, a successor runs) has
+/// nothing to trim: it never deletes the successor's values nor speaks for it.
+#[tokio::test]
+async fn a_trim_owed_by_an_earlier_start_never_runs_on_the_successor() {
+    let Some(python) = python3() else {
+        return;
+    };
+    let ladder = Ladder::start(python, Setup::default()).await;
+    ladder
+        .run(&format!("{SIZED_CLASS}big = Sized({})", 400 * MIB))
+        .await;
+    {
+        let mut g = lock(&ladder.manager.inner.guarded);
+        g.memory.pending_trim = Some(PendingTrim {
+            target_bytes: 1,
+            usage: KernelTreeUsage {
+                kernel_pid: 0,
+                kernel_bytes: 0,
+                total_bytes: 0,
+                units: Vec::new(),
+            },
+            generation: g.start_generation + 1,
+            cell_stopped: false,
+        });
+    }
+    let next = ladder.run("'big' in globals()").await;
+    let after = ladder.run("'big' in globals()").await;
+    assert_eq!(
+        (
+            next.queued_memory_notices,
+            next.memory_notices,
+            after.result,
+            lock(&ladder.manager.inner.guarded)
+                .memory
+                .pending_trim
+                .is_none()
+        ),
+        (None, None, Some("True".to_string()), true)
+    );
+    ladder.shutdown().await;
+}
+
+/// A reprovision for a kernel start that ended (here: one that already
+/// failed) never stands in for the running start's own: the running kernel
+/// is bootstrapped, not refused or discarded.
+#[tokio::test]
+async fn a_reprovision_of_an_earlier_start_never_stands_in_for_this_one() {
+    let Some(python) = python3() else {
+        return;
+    };
+    let ladder = Ladder::start(
+        python,
+        Setup {
+            bootstrap_code: Some("booted = 'yes'".to_string()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    ladder.run("x = 1").await;
+    let earlier = super::super::MemoSlot::new();
+    earlier.finish(Some(anyhow::anyhow!(
+        "the earlier start's bootstrap failed"
+    )));
+    {
+        let generation = ladder.manager.inner.current_generation();
+        *lock(&ladder.manager.inner.rebootstrap_memo) = Some((generation + 1, earlier));
+        lock(&ladder.manager.inner.guarded).pending_rebootstrap = true;
+    }
+    let reprovisioned = ladder
+        .manager
+        .inner
+        .ensure_kernel_rebootstrapped(None)
+        .await
+        .map_err(|error| error.to_string());
+    let booted = ladder.run("(globals().get('booted'), x)").await;
+    assert_eq!(
+        (reprovisioned, booted.result),
+        (Ok(()), Some("('yes', 1)".to_string()))
+    );
+    ladder.shutdown().await;
+}
