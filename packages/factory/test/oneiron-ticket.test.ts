@@ -11,6 +11,7 @@ import {
 	WRITER_LINES,
 } from "../src/adapters/oneiron-ticket.js";
 import type { OneironLauncherSettings, OneironTicketRun } from "../src/adapters/oneiron-settings.js";
+import { SEAT_IDLE_EXIT_CODE } from "../src/adapters/seat-process.js";
 import { getProcessStartId } from "../src/process-identity.js";
 import { factoryCargoBinDirectory } from "../src/runtime.js";
 
@@ -472,6 +473,52 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		});
 		expect([absent.code, absent.activity, absent.bytes > 0]).toEqual([127, false, true]);
 	});
+
+	const event = (value: object) => `${JSON.stringify(value)}\n`;
+	const reply = (text: string) =>
+		event({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } });
+	const started = event({ type: "agent_start" });
+	const ended = event({ type: "agent_end" });
+	const STOPS = "stops before prompting that session again";
+	const CONTINUES = "continues the same session";
+	it.each([
+		["daemon", "died mid-turn", STOPS, 1, started],
+		["daemon", "was killed for silence before its turn began", STOPS, SEAT_IDLE_EXIT_CODE, "\nIDLE 1800s"],
+		["daemon", "was killed for silence after its turn ended", CONTINUES, SEAT_IDLE_EXIT_CODE, started + reply("") + ended],
+		["owned", "died mid-turn", CONTINUES, 1, started],
+	] as const)(
+		"under %s custody, a writer whose seat client %s %s",
+		async (hosting, _case, outcome, code, output) => {
+			const f = setup();
+			const ticket = f.ticket("custody-one");
+			ticket.launcher = {
+				...f.launcher,
+				seatHosting: hosting,
+				seats: { writer: { provider: "p", model: "m", thinking: "low" } },
+			};
+			const runner = new OneironTicketRunner(ticket, {
+				env: f.env,
+				routing: {},
+				agentArgv: ["/opt/prime-agent-rs"],
+				sleep: async () => undefined,
+			});
+			mkdirSync(runner.worktree, { recursive: true });
+			const calls: string[][] = [];
+			runner.run = async (argv) => {
+				calls.push(argv);
+				return calls.length === 1 ? { code, output } : { code: 0, output: started + reply("DONE custody-one") + ended };
+			};
+			const rounds = runner.writerRounds("write", "start", "continue");
+			if (outcome === STOPS) {
+				await expect(rounds).rejects.toThrow("before its daemon-hosted turn ended; that turn may still be running");
+				expect(calls).toHaveLength(1);
+			} else {
+				expect((await rounds).final).toBe("DONE custody-one");
+				expect(calls.map((argv) => argv.includes("-c"))).toEqual([false, true]);
+			}
+			expect(calls[0]!.includes("--daemon-hosted")).toBe(hosting === "daemon");
+		},
+	);
 
 	it("continues a writer's existing session on round 1 and delivers the owner's note once", async () => {
 		const f = setup();

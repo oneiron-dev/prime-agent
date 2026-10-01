@@ -53,6 +53,7 @@ import {
 	type SessionEntry,
 	reviewVerdict,
 	sessionEntries,
+	turnState,
 	writerTerminal,
 } from "./terminal-output.js";
 
@@ -382,6 +383,18 @@ export class OneironTicketRunner {
 			onIdle: (idleMs) => this.noteIdle(step, idleMs),
 		});
 		writeFileSync(logPath, result.output, { flag: "a" });
+		// A daemon-hosted turn outlives its client: one whose stream never reached agent_end, or a client killed for
+		// silence before it saw the turn begin, may still be running in the daemon. Prompting that session again
+		// would overlap it, so the seat stops here and the owner settles the turn.
+		if (!("command" in spec) && this.settings.seatHosting === "daemon") {
+			const turn = turnState(result.output);
+			if (turn === "open" || (turn === "none" && result.code === SEAT_IDLE_EXIT_CODE)) {
+				const session = options.resumeSession ?? (options.session && join(this.directory, "sessions", options.session));
+				throw new TicketFailure(
+					`${name} seat client exited rc=${result.code}${result.code === SEAT_IDLE_EXIT_CODE ? " (killed for silence)" : ""} before its daemon-hosted turn ended; that turn may still be running in ${session || "a new daemon session"}, so nothing more is sent to it. Preserve the session and logs/${options.logName}; settle the turn (attach and wait for it, or stop it) before resolving this attempt.`,
+				);
+			}
+		}
 		// Never the raw stream: it carries the prompts, which quote the completion line.
 		const final = "command" in spec ? result.output.trim() : finalAssistantText(result.output);
 		return {

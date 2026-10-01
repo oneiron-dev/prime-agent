@@ -56,6 +56,28 @@ export function finalAssistantText(jsonl: string): string {
 	return ended ? final : "";
 }
 
+/**
+ * Where a seat's stream left its turn: `none` before any `agent_start`, `open` when the last `agent_start` has no
+ * `agent_end` after it, `closed` when it has.
+ */
+export type TurnState = "none" | "open" | "closed";
+export function turnState(jsonl: string): TurnState {
+	let state: TurnState = "none";
+	for (const line of jsonl.split("\n")) {
+		if (!line.trim()) continue;
+		let event: unknown;
+		try {
+			event = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		const type = event && typeof event === "object" ? (event as { type?: unknown }).type : undefined;
+		if (type === "agent_start") state = "open";
+		else if (type === "agent_end") state = "closed";
+	}
+	return state;
+}
+
 /** Lines of `text` that sit outside fenced code blocks; fence markers themselves are dropped. */
 function unfencedLines(text: string): { lines: string[]; open: boolean } {
 	const lines: string[] = [];

@@ -7,6 +7,7 @@ import {
 	finalAssistantText,
 	reviewVerdict,
 	type SessionEntry,
+	turnState,
 	writerTerminal,
 } from "../src/adapters/terminal-output.js";
 
@@ -49,6 +50,20 @@ describe("Rust JSON streams through the factory's terminal parsing", () => {
 			"",
 		]);
 		expect([fixture("provider-error.exit"), fixture("length-cutoff.exit")]).toEqual(["0\n", "0\n"]);
+	});
+
+	it("tells a turn that never began, one still open and one that ended, whatever the run's outcome", () => {
+		const done = lines(captured.done);
+		const toolEnd = lines(captured.review).findIndex((line) => JSON.parse(line).type === "tool_execution_end");
+		expect([
+			turnState(""),
+			turnState("spawn failed\nIDLE 1800s"),
+			turnState(lines(captured.review).slice(0, toolEnd + 1).join("\n")),
+			turnState(factoryCompleted(done.slice(0, -1).join("\n"))),
+			turnState(captured.done),
+			turnState(factoryCompleted(captured.error)),
+			turnState(`${captured.done}\n${done.slice(0, 2).join("\n")}`),
+		]).toEqual(["none", "none", "open", "open", "closed", "closed", "open"]);
 	});
 
 	it("drops a stream without agent_end, a later failed run and a turn stopped at its tool call", () => {
