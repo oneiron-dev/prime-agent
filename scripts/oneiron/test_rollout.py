@@ -9,6 +9,7 @@ the binary is release_feed's fake. No network, no real daemon, no real prefix.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import socket
@@ -166,13 +167,14 @@ class RolloutTests(RolloutFixture):
             "install", "launcherVersion")}, {
             "schema": rollout.ACTIVATION_SCHEMA, "status": "activated", "phase": "old-daemon", "failure": None,
             "version": V1, "platform": PLATFORM,
-            "checks": {"releaseVerified": True, "idleBeforeInstall": True, "executableSha256Matches": True,
+            "checks": {"releaseVerified": True, "idleBeforeInstall": True, "payloadMatchesRelease": True,
                        "probeOk": True, "idleBeforeSelect": True, "launcherVersion": True,
                        "tsLauncherUnchanged": True},
             "before": {"current": None, "previous": None, "launcher": {"kind": "absent"}, "tsLauncher": ts_before},
             "after": {"current": V1, "previous": None, "launcher": launcher_after, "tsLauncher": ts_before},
             "install": {"dir": str(self.prefix / V1), "reused": False,
-                        "executableSha256": manifest["binaries"][0]["executableSha256"]},
+                        "executableSha256": manifest["binaries"][0]["executableSha256"],
+                        "payloadSha256": side_by_side.payload_digest(self.prefix / V1)},
             "launcherVersion": {"stdout": V1, "exitCode": 0}})
         self.assertEqual(receipt["release"], {
             "dir": str(release), "manifestSha256": side_by_side.sha256_file(release / "manifest.json"),
@@ -215,10 +217,16 @@ class RolloutTests(RolloutFixture):
                                                         "checks", "launcherVersion")}, {
             "schema": rollout.ROLLBACK_SCHEMA, "status": "rolled-back", "failure": None,
             "fromVersion": V2, "toVersion": V1,
-            "checks": {"executableMatchesReceipt": True, "idleBeforeSelect": True, "launcherVersion": True,
+            "checks": {"vouchedByReceipt": True, "idleBeforeSelect": True, "launcherVersion": True,
                        "tsLauncherUnchanged": True},
             "launcherVersion": {"stdout": V1, "exitCode": 0}})
-        self.assertEqual(receipt["executable"]["recorded"], receipt["executable"]["sha256"])
+        # V1's activation receipt vouches for exactly the installed payload.
+        activation = self.receipt(V1)
+        installed = {"sha256": activation["release"]["executableSha256"],
+                     "payloadSha256": activation["install"]["payloadSha256"]}
+        self.assertEqual(receipt["executable"], {**installed, "vouchedBy": [
+            {"file": path.name, "executableSha256": installed["sha256"], "payloadSha256": installed["payloadSha256"]}
+            for path in sorted((self.prefix / "receipts" / f"{V1}-{PLATFORM}").glob("ACTIVATION-RECEIPT*.json"))]})
         # Rolling back again toggles forward.
         self.assertEqual(self.main("rollback"), 0)
         self.assertEqual((os.readlink(self.prefix / "current"), self.launcher_version()), (V2, V2))
@@ -381,6 +389,38 @@ class RolloutTests(RolloutFixture):
         self.assertEqual(self.main("rollout", "--version", V1), 0)
         self.assertEqual((self.receipt(V1)["install"]["reused"], os.readlink(self.prefix / "current")), (True, V1))
 
+    def test_a_left_behind_install_is_reused_only_when_its_whole_payload_matches(self) -> None:
+        self.publish(V1)
+        os.environ["FAKE_PROBE_FAIL"] = "1"
+        self.assertEqual(self.main("rollout", "--version", V1), 1)
+        del os.environ["FAKE_PROBE_FAIL"]
+        # Same executable, one other file changed: not this release.
+        readme = self.prefix / V1 / "README.md"
+        readme.write_text("changed\n")
+        self.assertEqual(self.main("rollout", "--version", V1), 1)
+        receipt = self.receipt(V1)
+        self.assertEqual((receipt["status"], receipt["phase"], "payloadMatchesRelease" in receipt["checks"]),
+                         ("failed", "install", False))
+        self.assertIn("does not hold this release's payload", receipt["failure"]["message"])
+        self.assertEqual(readme.read_text(), "changed\n")
+        self.assertFalse((self.prefix / "current").is_symlink())
+
+    def test_a_concurrent_run_is_turned_away_before_it_records_anything(self) -> None:
+        self.publish(V1)
+        self.publish(V2)
+        self.assertEqual(self.main("rollout", "--version", V1), 0)
+        self.assertEqual(self.main("rollout", "--version", V2), 0)
+        receipts_before = {path.relative_to(self.prefix): path.read_bytes()
+                           for path in (self.prefix / "receipts").rglob("*.json")}
+        with (self.prefix / ".lock").open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for argv in (("rollout", "--version", V1), ("rollback",)):
+                with self.subTest(argv=argv), self.assertRaisesRegex(SystemExit, "another side_by_side.py run"):
+                    self.main(*argv)
+        self.assertEqual({path.relative_to(self.prefix): path.read_bytes()
+                          for path in (self.prefix / "receipts").rglob("*.json")}, receipts_before)
+        self.assertEqual((os.readlink(self.prefix / "current"), os.readlink(self.prefix / "previous")), (V2, V1))
+
     def test_rollback_refuses_what_it_cannot_vouch_for(self) -> None:
         self.publish(V1)
         self.publish(V2)
@@ -392,14 +432,50 @@ class RolloutTests(RolloutFixture):
         with self.assertRaisesRegex(SystemExit, "already current"):
             self.main("rollback", "--to", V1)
         self.assertEqual(self.main("rollout", "--version", V2), 0)
-        # An executable that no longer matches its receipt is not selected.
-        binary = self.prefix / V1 / "prime-agent"
-        binary.write_text(binary.read_text() + "# changed\n")
-        self.assertEqual(self.main("rollback"), 1)
-        receipt = self.receipt(V1, "ROLLBACK-RECEIPT.json")
-        self.assertEqual((receipt["status"], receipt["phase"], receipt["checks"]),
-                         ("failed", "verify", {"executableMatchesReceipt": False}))
-        self.assertEqual(os.readlink(self.prefix / "current"), V2)
+        # A payload that no longer matches its receipt is not selected: the
+        # executable, or any other file of the install.
+        for name in ("prime-agent", "README.md"):
+            with self.subTest(changed=name):
+                changed = self.prefix / V1 / name
+                original = changed.read_bytes()
+                changed.write_bytes(original + b"# changed\n")
+                self.assertEqual(self.main("rollback"), 1)
+                receipt = self.receipt(V1, "ROLLBACK-RECEIPT.json")
+                self.assertEqual((receipt["status"], receipt["phase"], receipt["checks"]),
+                                 ("failed", "verify", {"vouchedByReceipt": False}))
+                self.assertIn("is not what its receipts recorded", receipt["failure"]["message"])
+                self.assertEqual(os.readlink(self.prefix / "current"), V2)
+                changed.write_bytes(original)
+
+    def test_rollback_accepts_a_version_the_install_command_activated(self) -> None:
+        self.publish(V1)
+        self.publish(V2)
+        tarball = self.prefix / "feed" / "releases" / f"v{V1}" / f"prime-agent-{V1}-{PLATFORM}.tar.gz"
+        self.assertEqual(self.main("install", "--tarball", str(tarball)), 0)
+        self.assertEqual(self.main("rollout", "--version", V2), 0)
+        self.assertEqual(self.main("rollback"), 0)
+        install = self.receipt(V1, "INSTALL-RECEIPT.json")
+        self.assertEqual(self.receipt(V1, "ROLLBACK-RECEIPT.json")["executable"], {
+            "sha256": install["binary"]["sha256"], "payloadSha256": install["payloadSha256"],
+            "vouchedBy": [{"file": "INSTALL-RECEIPT.json", "executableSha256": install["binary"]["sha256"],
+                           "payloadSha256": install["payloadSha256"]}]})
+        self.assertEqual((os.readlink(self.prefix / "current"), self.launcher_version()), (V1, V1))
+
+    def test_rollback_refuses_an_install_that_never_ran_as_current(self) -> None:
+        self.publish(V1)
+        self.publish(V2)
+        self.assertEqual(self.main("rollout", "--version", V1), 0)
+        # V2 installs, fails its probe and is never selected.
+        os.environ["FAKE_PROBE_FAIL"] = "1"
+        self.assertEqual(self.main("rollout", "--version", V2), 1)
+        del os.environ["FAKE_PROBE_FAIL"]
+        self.assertTrue((self.prefix / V2 / "prime-agent").is_file())
+        self.assertEqual(self.main("rollback", "--to", V2), 1)
+        receipt = self.receipt(V2, "ROLLBACK-RECEIPT.json")
+        self.assertEqual((receipt["status"], receipt["phase"], receipt["checks"], receipt["executable"]["vouchedBy"]),
+                         ("failed", "verify", {"vouchedByReceipt": False}, []))
+        self.assertIn(f"no receipt shows {V2} ever ran as current", receipt["failure"]["message"])
+        self.assertEqual(os.readlink(self.prefix / "current"), V1)
 
     def test_rollback_refuses_while_the_rust_daemon_is_busy(self) -> None:
         self.publish(V1)

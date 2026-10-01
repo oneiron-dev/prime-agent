@@ -177,6 +177,24 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def payload_digest(directory: Path) -> str:
+    """One sha256 over an install's whole payload: every dir and regular
+    file by relative path, with each file's executable bit and content hash.
+    Equal digests mean equal trees, so a reused or rolled-back install is
+    checked in full, not just by its executable."""
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory).as_posix()
+        if path.is_symlink() or not (path.is_dir() or path.is_file()):
+            raise SystemExit(f"error: {path} is neither a plain file nor a dir; installs hold only those")
+        if path.is_dir():
+            digest.update(f"d {relative}\n".encode())
+        else:
+            executable = "x" if os.access(path, os.X_OK) else "-"
+            digest.update(f"f {relative} {executable} {sha256_file(path)}\n".encode())
+    return digest.hexdigest()
+
+
 def is_within(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -504,6 +522,7 @@ def install(args: argparse.Namespace) -> int:
         "installDir": str(target),
         "binary": {"sha256": sha256_file(target / "prime-agent"),
                    "bytes": (target / "prime-agent").stat().st_size},
+        "payloadSha256": payload_digest(target),
         "tarball": ({"path": str(args.tarball), "sha256": sha256_file(args.tarball)}
                     if args.tarball else None),
         "activated": args.activate,
@@ -514,7 +533,7 @@ def install(args: argparse.Namespace) -> int:
                        "unchanged": True},
         "versionCheck": version_check,
     }
-    (receipt_dir / "INSTALL-RECEIPT.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    write_json_atomic(receipt_dir / "INSTALL-RECEIPT.json", receipt)
     print(f"installed {version} ({platform}) at {target}")
     print(f"receipt {receipt_dir / 'INSTALL-RECEIPT.json'}")
     if version_check and not version_check["ok"]:

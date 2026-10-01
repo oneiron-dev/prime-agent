@@ -3,20 +3,23 @@
   rollout   feed release -> verify (manifest row, SHA256SUMS, tarball sha256,
             on a private copy) -> idle check -> install (immutable
             <prefix>/<ver>/, or reuse one already installed with the same
-            executable) -> probe the new version through a scratch launcher
+            payload tree) -> probe the new version through a scratch launcher
             BEFORE it is selected -> idle re-check -> flip current, rewrite
             the launcher -> `prime-agent-rs --version` -> ACTIVATION-RECEIPT.json
   rollback  flip current to <prefix>/previous (or --to <ver>), an installed
-            version whose executable still matches its receipts; rewrite the
-            launcher; ROLLBACK-RECEIPT.json. Code only: sessions, settings
-            and the kernel venv are not rolled back.
+            version whose executable and payload match a receipt that shows
+            it once ran as current; rewrite the launcher;
+            ROLLBACK-RECEIPT.json. Code only: sessions, settings and the
+            kernel venv are not rolled back.
   status    installed versions, current/previous, the launcher, receipts,
             the TS launcher, the feed pointers
 
 Both swaps refuse unless the Rust supervisor is idle (daemon_idle.py). They
 stop it only with --retire-idle-daemon, after the swap, when it is still idle
 and runs another version; otherwise the receipt notes that it keeps new
-sessions on its version until it exits. Every refusal or failure after the arguments check out is
+sessions on its version until it exits. Each run holds the prefix lock from
+its first check to its receipt, so a concurrent run is turned away before it
+records anything. Every refusal or failure after the arguments check out is
 written as a receipt; an earlier receipt of the same name is kept beside it
 under its timestamp. The TS launcher, install tree, socket dir and agent dir
 are never written; the receipt proves the TS launcher unchanged.
@@ -179,27 +182,29 @@ def rollout(args: argparse.Namespace) -> int:
             raise SystemExit(f"error: no --version and no {stable} pointer")
         version = stable.read_text().strip().removeprefix("v")
     sbs.check_version(version)
-    if sbs.read_link(prefix / "current") == version:
-        print(f"{version} is already current; nothing to do")
-        return 0
 
-    receipt = Receipt(ACTIVATION_SCHEMA, version=version, platform=platform, feedDir=str(feed_dir),
-                      before=pointer_state(prefix, bin_dir))
-    checks = receipt.data["checks"]
+    # The whole run, receipt included, holds the prefix lock: a concurrent
+    # rollout or rollback is turned away before it records anything.
+    with sbs.locked(prefix):
+        if sbs.read_link(prefix / "current") == version:
+            print(f"{version} is already current; nothing to do")
+            return 0
+        receipt = Receipt(ACTIVATION_SCHEMA, version=version, platform=platform, feedDir=str(feed_dir),
+                          before=pointer_state(prefix, bin_dir))
+        checks = receipt.data["checks"]
 
-    def steps() -> None:
-        with tempfile.TemporaryDirectory(prefix="pa-rs-rollout-") as scratch_name:
-            scratch = Path(scratch_name)
-            with receipt.phase("verify"):
-                release = verify_release(feed_dir, version, platform, scratch)
-                receipt.data["release"] = {key: value for key, value in release.items() if key != "copy"}
-                checks["releaseVerified"] = True
-            with receipt.phase("idle-check"):
-                idle_gate(receipt, "idleBeforeInstall", args, prefix)
-            with sbs.locked(prefix):
+        def steps() -> None:
+            with tempfile.TemporaryDirectory(prefix="pa-rs-rollout-") as scratch_name:
+                scratch = Path(scratch_name)
+                with receipt.phase("verify"):
+                    release = verify_release(feed_dir, version, platform, scratch)
+                    receipt.data["release"] = {key: value for key, value in release.items() if key != "copy"}
+                    checks["releaseVerified"] = True
+                with receipt.phase("idle-check"):
+                    idle_gate(receipt, "idleBeforeInstall", args, prefix)
                 with receipt.phase("install"):
                     receipt.data["install"] = install_release(prefix, version, platform, release)
-                    checks["executableSha256Matches"] = True
+                    checks["payloadMatchesRelease"] = True
                 with receipt.phase("agent-dir"):
                     receipt.data["agentDir"] = sbs.seed_agent_dir(sbs.rs_agent_dir(), sbs.TS_AGENT_DIR)
                 with receipt.phase("probe"):
@@ -213,11 +218,12 @@ def rollout(args: argparse.Namespace) -> int:
                 with receipt.phase("old-daemon"):
                     retire_old_daemon(receipt, args, prefix, version)
 
-    code = receipt.run(steps)
-    receipt.data["after"] = pointer_state(prefix, bin_dir)
-    if receipt.data["status"] == "done":
-        receipt.data["status"] = "activated"
-    path = write_receipt(prefix / "receipts" / f"{version}-{platform}", "ACTIVATION-RECEIPT.json", receipt.data)
+        code = receipt.run(steps)
+        receipt.data["after"] = pointer_state(prefix, bin_dir)
+        if receipt.data["status"] == "done":
+            receipt.data["status"] = "activated"
+        path = write_receipt(prefix / "receipts" / f"{version}-{platform}", "ACTIVATION-RECEIPT.json",
+                             receipt.data)
     report(receipt.data, path)
     return code
 
@@ -260,15 +266,10 @@ def verify_release(feed_dir: Path, version: str, platform: str, scratch: Path) -
 
 def install_release(prefix: Path, version: str, platform: str, release: dict) -> dict:
     """Install the verified copy, or reuse <prefix>/<version>/ when an earlier
-    (unselected) attempt already installed the same executable."""
+    (unselected) attempt already installed exactly this payload: the whole
+    tree must equal the verified tarball's, not just the executable."""
     target = prefix / version
     expected = release["executableSha256"]
-    if target.exists() or target.is_symlink():
-        binary = target / "prime-agent"
-        if target.is_symlink() or not binary.is_file() or sbs.sha256_file(binary) != expected \
-                or installed_package_version(target) != version:
-            raise SystemExit(f"error: {target} exists but is not this release; installs are immutable")
-        return {"dir": str(target), "reused": True, "executableSha256": expected}
     with sbs.staged_payload(release["copy"], None, None) as payload:
         if (payload.version, payload.platform) != (version, platform):
             raise SystemExit(f"error: the tarball holds {payload.version} ({payload.platform}), "
@@ -276,8 +277,14 @@ def install_release(prefix: Path, version: str, platform: str, release: dict) ->
         actual = sbs.sha256_file(payload.stage / "prime-agent")
         if actual != expected:
             raise SystemExit(f"error: the tarball's prime-agent is {actual}, the release says {expected}")
-        sbs.commit_payload(prefix, payload)
-    return {"dir": str(target), "reused": False, "executableSha256": expected}
+        digest = sbs.payload_digest(payload.stage)
+        reused = target.exists() or target.is_symlink()
+        if not reused:
+            sbs.commit_payload(prefix, payload)
+        if target.is_symlink() or not target.is_dir() or sbs.payload_digest(target) != digest:
+            raise SystemExit(f"error: {target} does not hold this release's payload; installs are immutable, "
+                             "bump the build number")
+    return {"dir": str(target), "reused": reused, "executableSha256": expected, "payloadSha256": digest}
 
 
 def probe_unselected(receipt: Receipt, prefix: Path, bin_dir: Path, version: str, platform: str,
@@ -322,20 +329,38 @@ def receipt_platform(prefix: Path, version: str) -> str | None:
                  if name.startswith(f"{version}-") and PLATFORM_TAG.match(name[len(version) + 1:])), None)
 
 
-def recorded_executable(prefix: Path, version: str, platform: str) -> str | None:
-    """The executable sha256 an install or rollout of `version` recorded."""
+def vouching_receipts(prefix: Path, version: str, platform: str) -> list[dict]:
+    """What the receipts that show `version` once ran as `current` recorded
+    about its payload: a rollout that ended `activated`, an install that
+    activated and passed its --version check, a rollback that ended
+    `rolled-back` (earlier copies kept under their timestamps count too).
+    A failed or refused rollout, or an install that never activated, does
+    not vouch for anything."""
     directory = prefix / "receipts" / f"{version}-{platform}"
-    for name, path in (("ACTIVATION-RECEIPT.json", ("release", "executableSha256")),
-                       ("INSTALL-RECEIPT.json", ("binary", "sha256"))):
+    vouchers = []
+    for path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
         try:
-            value = json.loads((directory / name).read_text())
+            receipt = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        for key in path:
-            value = value.get(key) if isinstance(value, dict) else None
-        if isinstance(value, str):
-            return value
-    return None
+        if not isinstance(receipt, dict):
+            continue
+        schema = receipt.get("schema")
+        if schema == ACTIVATION_SCHEMA and receipt.get("status") == "activated":
+            executable = (receipt.get("release") or {}).get("executableSha256")
+            payload = (receipt.get("install") or {}).get("payloadSha256")
+        elif schema == sbs.RECEIPT_SCHEMA and receipt.get("activated") \
+                and (receipt.get("versionCheck") or {}).get("ok"):
+            executable = (receipt.get("binary") or {}).get("sha256")
+            payload = receipt.get("payloadSha256")
+        elif schema == ROLLBACK_SCHEMA and receipt.get("status") == "rolled-back":
+            executable = (receipt.get("executable") or {}).get("sha256")
+            payload = (receipt.get("executable") or {}).get("payloadSha256")
+        else:
+            continue
+        if isinstance(executable, str):
+            vouchers.append({"file": path.name, "executableSha256": executable, "payloadSha256": payload})
+    return vouchers
 
 
 def rollback(args: argparse.Namespace) -> int:
@@ -356,35 +381,41 @@ def rollback(args: argparse.Namespace) -> int:
         raise SystemExit(f"error: {target} is not installed in {prefix}")
     platform = receipt_platform(prefix, target) or release_feed.host_platform()
 
-    receipt = Receipt(ROLLBACK_SCHEMA, fromVersion=current, toVersion=target, platform=platform,
-                      before=pointer_state(prefix, bin_dir))
-    checks = receipt.data["checks"]
+    with sbs.locked(prefix):
+        receipt = Receipt(ROLLBACK_SCHEMA, fromVersion=current, toVersion=target, platform=platform,
+                          before=pointer_state(prefix, bin_dir))
+        checks = receipt.data["checks"]
 
-    def steps() -> None:
-        with receipt.phase("verify"):
-            expected = recorded_executable(prefix, target, platform)
-            actual = sbs.sha256_file(binary)
-            receipt.data["executable"] = {"sha256": actual, "recorded": expected}
-            checks["executableMatchesReceipt"] = expected is None or expected == actual
-            if not checks["executableMatchesReceipt"]:
-                raise SystemExit(f"error: {binary} is {actual}, its receipt recorded {expected}")
-        with receipt.phase("idle-check"):
-            idle_gate(receipt, "idleBeforeSelect", args, prefix)
-        with sbs.locked(prefix):
-            with receipt.phase("select"):
+        def steps() -> None:
+            with receipt.phase("verify"):
                 if sbs.read_link(prefix / "current") != current:
-                    raise Refused("current moved while the rollback was checking; run it again")
+                    raise Refused("current moved before the rollback took the lock; run it again")
+                vouchers = vouching_receipts(prefix, target, platform)
+                actual = {"sha256": sbs.sha256_file(binary), "payloadSha256": sbs.payload_digest(install_dir)}
+                receipt.data["executable"] = {**actual, "vouchedBy": vouchers}
+                checks["vouchedByReceipt"] = any(
+                    voucher["executableSha256"] == actual["sha256"]
+                    and voucher["payloadSha256"] in (None, actual["payloadSha256"]) for voucher in vouchers)
+                if not vouchers:
+                    raise SystemExit(f"error: no receipt shows {target} ever ran as current (an activated rollout "
+                                     "or install, or a rollback); roll it out instead")
+                if not checks["vouchedByReceipt"]:
+                    raise SystemExit(f"error: {install_dir} (executable {actual['sha256']}, payload "
+                                     f"{actual['payloadSha256']}) is not what its receipts recorded")
+            with receipt.phase("idle-check"):
+                idle_gate(receipt, "idleBeforeSelect", args, prefix)
+            with receipt.phase("select"):
                 sbs.select_version(prefix, bin_dir, target)
             with receipt.phase("post-check"):
                 post_check(receipt, prefix, bin_dir, target)
             with receipt.phase("old-daemon"):
                 retire_old_daemon(receipt, args, prefix, target)
 
-    code = receipt.run(steps)
-    receipt.data["after"] = pointer_state(prefix, bin_dir)
-    if receipt.data["status"] == "done":
-        receipt.data["status"] = "rolled-back"
-    path = write_receipt(prefix / "receipts" / f"{target}-{platform}", "ROLLBACK-RECEIPT.json", receipt.data)
+        code = receipt.run(steps)
+        receipt.data["after"] = pointer_state(prefix, bin_dir)
+        if receipt.data["status"] == "done":
+            receipt.data["status"] = "rolled-back"
+        path = write_receipt(prefix / "receipts" / f"{target}-{platform}", "ROLLBACK-RECEIPT.json", receipt.data)
     report(receipt.data, path)
     return code
 
