@@ -395,6 +395,36 @@ mod tests {
         }
     }
 
+    /// ~12k tokens of deterministic extra context on the crossing turn
+    /// (the faux cache simulation's first request counts its prompt
+    /// twice, so the crossing prompt must outweigh the whole seed
+    /// request).
+    fn crossing_prompt() -> String {
+        format!("crossing turn {}", "x".repeat(48_000))
+    }
+
+    /// The threshold headroom midway between the seed and crossing
+    /// turns' measured usage: a probe bed replays both turns, because the
+    /// session's requests carry its id and the faux provider simulates
+    /// prompt caching — a turn's usage is not its serialized-context
+    /// estimate.
+    async fn threshold_headroom() -> u64 {
+        let mut probe = acp_autorefine_bed(
+            json!({ "responses": [{ "text": "seed reply" }, { "text": "crossing reply" }] }),
+            1,
+        )
+        .await;
+        probe.prompt("seed turn".to_string()).await;
+        let seed_usage = probe.latest_usage().await;
+        probe.prompt(crossing_prompt()).await;
+        let crossing_usage = probe.latest_usage().await;
+        assert!(
+            seed_usage > 0 && crossing_usage > seed_usage + 2_000 && crossing_usage < 100_000,
+            "usage: {seed_usage} -> {crossing_usage}"
+        );
+        seed_usage + (crossing_usage - seed_usage) / 2
+    }
+
     /// The threshold compaction at the settled boundary arms the trigger
     /// and the serialized checkpoint consumes it in the same prompt: the
     /// review declines (the queued reply after it serves the next turn)
@@ -404,20 +434,7 @@ mod tests {
         let _faux = FAUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Probe: the seed turn's usage.
-        let mut probe =
-            acp_autorefine_bed(json!({ "responses": [{ "text": "seed reply" }] }), 1).await;
-        probe
-            .prompt(format!("seed turn {}", "x".repeat(48_000)))
-            .await;
-        let seed_usage = probe.latest_usage().await;
-        assert!(
-            seed_usage > 0 && seed_usage < 100_000,
-            "usage: {seed_usage}"
-        );
-        drop(probe);
-
-        let crossing_delta = (8_000 + "seed turn  crossing".len() as u64).div_ceil(4);
+        let headroom = threshold_headroom().await;
         let mut bed = acp_autorefine_bed(
             json!({
                 "responses": [
@@ -429,20 +446,16 @@ mod tests {
                 ]
             }),
             128_000u64
-                .saturating_sub(FAUX_REQUEST_BUDGET + seed_usage + crossing_delta / 4)
+                .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
                 .max(1),
         )
         .await;
-        let (response, notifications) = bed
-            .prompt(format!("seed turn {}", "x".repeat(48_000)))
-            .await;
+        let (response, notifications) = bed.prompt("seed turn".to_string()).await;
         assert_eq!(response["result"]["stopReason"], "end_turn");
         assert!(AcpAutorefineBed::compaction_metas(&notifications).is_empty());
         // The crossing turn compacts and the checkpoint consumes the
         // armed trigger: the decline review ran and surfaced nothing.
-        let (response, notifications) = bed
-            .prompt(format!("crossing turn {}", "x".repeat(8_000)))
-            .await;
+        let (response, notifications) = bed.prompt(crossing_prompt()).await;
         assert_eq!(response["result"]["stopReason"], "end_turn");
         assert_eq!(AcpAutorefineBed::compaction_metas(&notifications).len(), 1);
         assert!(
@@ -479,18 +492,9 @@ mod tests {
         let _faux = FAUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Probe: the seed turn's usage.
-        let mut probe =
-            acp_autorefine_bed(json!({ "responses": [{ "text": "seed reply" }] }), 1).await;
-        probe
-            .prompt(format!("seed turn {}", "x".repeat(48_000)))
-            .await;
-        let seed_usage = probe.latest_usage().await;
-        drop(probe);
-
+        let headroom = threshold_headroom().await;
         let review = r#"{"shouldRefine": true, "rationale": "the turn shows a reusable tactic"}"#;
         let plan = r#"{"summary":"note the tactic","rationale":"repeated","expectedOutcome":"recall","edits":[{"action":"create","kind":"memory","id":"m1","title":"Tactic","content":"Use tactic A"}]}"#;
-        let crossing_delta = (8_000 + "seed turn  crossing".len() as u64).div_ceil(4);
         let mut bed = acp_autorefine_bed(
             json!({
                 "responses": [
@@ -502,17 +506,13 @@ mod tests {
                 ]
             }),
             128_000u64
-                .saturating_sub(FAUX_REQUEST_BUDGET + seed_usage + crossing_delta / 4)
+                .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
                 .max(1),
         )
         .await;
-        let (response, _) = bed
-            .prompt(format!("seed turn {}", "x".repeat(48_000)))
-            .await;
+        let (response, _) = bed.prompt("seed turn".to_string()).await;
         assert_eq!(response["result"]["stopReason"], "end_turn");
-        let (response, notifications) = bed
-            .prompt(format!("crossing turn {}", "x".repeat(8_000)))
-            .await;
+        let (response, notifications) = bed.prompt(crossing_prompt()).await;
         assert_eq!(response["result"]["stopReason"], "end_turn");
         let metas = AcpAutorefineBed::refinement_metas(&notifications);
         assert_eq!(metas.len(), 1, "one refinement meta: {metas:?}");

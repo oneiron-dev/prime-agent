@@ -250,31 +250,38 @@ fn overflow_error(delay_ms: u64) -> serde_json::Value {
 /// The threshold arm on the ACP turn path: a settled turn whose usage
 /// crosses the reserve headroom runs one compaction at the boundary
 /// and publishes the `compaction` meta (tokensBefore + summary), and
-/// the turn still settles with `end_turn`. The faux provider
-/// estimates usage from the serialized context, so the probe measures
-/// one seed turn's usage and the reserve sits between the two turns'
-/// usage (the daemon engine tests' environment-independent recipe).
+/// the turn still settles with `end_turn`. The probe replays both
+/// turns and the headroom sits midway between their measured usage
+/// (the environment-independent recipe): the session's requests carry
+/// its id, so the faux provider simulates prompt caching and a turn's
+/// usage is not its serialized-context estimate.
 #[tokio::test]
 async fn threshold_arm_compacts_and_publishes_the_acp_meta() {
     let _faux = FAUX_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Probe: the seed turn's total usage (system prompt included).
-    let mut probe = acp_test_bed(json!({ "responses": [{ "text": "seed reply" }] }), 1, 10).await;
-    probe
-        .prompt(format!("seed turn {}", "x".repeat(48_000)))
-        .await;
+    // ~12k tokens of deterministic extra context on the crossing turn
+    // (the cache simulation's first request counts its prompt twice, so
+    // the crossing prompt must outweigh the whole seed request).
+    let crossing = format!("crossing turn {}", "x".repeat(48_000));
+    // Probe: both turns' total usage (system prompt included).
+    let mut probe = acp_test_bed(
+        json!({ "responses": [{ "text": "seed reply" }, { "text": "crossing reply" }] }),
+        1,
+        10,
+    )
+    .await;
+    probe.prompt("seed turn".to_string()).await;
     let seed_usage = probe.latest_usage().await;
+    probe.prompt(crossing.clone()).await;
+    let crossing_usage = probe.latest_usage().await;
     assert!(
-        seed_usage > 0 && seed_usage < 100_000,
-        "usage: {seed_usage}"
+        seed_usage > 0 && crossing_usage > seed_usage + 2_000 && crossing_usage < 100_000,
+        "usage: {seed_usage} -> {crossing_usage}"
     );
     drop(probe);
 
-    // The crossing prompt adds ~2000 tokens; the headroom sits
-    // between the two turns' usage (500-token margins on both
-    // sides).
-    let crossing_delta = (8_000 + "seed turn  crossing".len() as u64).div_ceil(4);
+    let headroom = seed_usage + (crossing_usage - seed_usage) / 2;
     let mut bed = acp_test_bed(
         json!({
             "responses": [
@@ -284,23 +291,19 @@ async fn threshold_arm_compacts_and_publishes_the_acp_meta() {
             ]
         }),
         128_000u64
-            .saturating_sub(FAUX_REQUEST_BUDGET + seed_usage + crossing_delta / 4)
+            .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
             .max(1),
         10,
     )
     .await;
     // The seed turn stays below the headroom: no compaction.
-    let (response, notifications) = bed
-        .prompt(format!("seed turn {}", "x".repeat(48_000)))
-        .await;
+    let (response, notifications) = bed.prompt("seed turn".to_string()).await;
     assert_eq!(response["result"]["stopReason"], "end_turn");
     assert!(AcpTestBed::compaction_metas(&notifications).is_empty());
     // The threshold-crossing turn: the settled usage fires one
     // compaction at the boundary (the summarizer consumed the third
     // scripted response).
-    let (response, notifications) = bed
-        .prompt(format!("crossing turn {}", "x".repeat(8_000)))
-        .await;
+    let (response, notifications) = bed.prompt(crossing).await;
     assert_eq!(response["result"]["stopReason"], "end_turn");
     let metas = AcpTestBed::compaction_metas(&notifications);
     assert_eq!(metas.len(), 1, "one compaction meta: {metas:?}");
