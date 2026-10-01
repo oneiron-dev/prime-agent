@@ -11,6 +11,12 @@
   package   stamp a package_release.py layout into a feed release
             (release_feed.py): feed/releases/v<version>/ with the tarball,
             SHA256SUMS and manifest.json, plus feed-level latest.json/stable
+  rollout   install a feed release after verifying its sums, probe it before
+            selecting it, then flip current; idle Rust daemon only; writes
+            ACTIVATION-RECEIPT.json (rollout.py)
+  rollback  select the previous (or a named) installed version again; writes
+            ROLLBACK-RECEIPT.json (rollout.py)
+  status    installed versions, current/previous, launcher, receipts, feed
 
 The TS product is never touched: the `prime-agent` launcher, its install tree
 (~/.local/share/prime-agent-oneiron/), its daemon socket dir and its kernel
@@ -691,6 +697,18 @@ def add_probe_args(command: argparse.ArgumentParser) -> None:
                          help="also run a tools turn (bootstraps the separate kernel venv)")
 
 
+def add_idle_args(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--rust-socket", type=Path,
+                         help="the Rust supervisor socket to check (default: the launcher's "
+                              "${PRIME_AGENT_RS_SOCKET_DIR:-$TMPDIR/pa-rs-<uid>}/daemon.sock)")
+    command.add_argument("--force-idle-check-skip", action="store_true",
+                         help="proceed even when the Rust daemon has live sessions or cannot be "
+                              "checked (they keep running the old binary)")
+    command.add_argument("--retire-idle-daemon", action="store_true",
+                         help="after the swap, stop the Rust supervisor if it is still idle and runs "
+                              "another version, so the next run starts the selected one")
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--prefix", type=Path, default=DEFAULT_PREFIX)
@@ -727,6 +745,19 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     package_cmd.add_argument("--no-promote", dest="promote", action="store_false",
                              help="publish the release without moving feed latest.json/stable")
 
+    rollout_cmd = commands.add_parser("rollout", help="verify, install, probe and select a feed release")
+    rollout_cmd.add_argument("--version", help="release to roll out (default: the feed's stable pointer)")
+    rollout_cmd.add_argument("--feed-dir", type=Path, help="default: <prefix>/feed")
+    add_probe_args(rollout_cmd)
+    add_idle_args(rollout_cmd)
+
+    rollback_cmd = commands.add_parser("rollback", help="select the previous (or a named) installed version")
+    rollback_cmd.add_argument("--to", help="installed version to select (default: <prefix>/previous)")
+    add_idle_args(rollback_cmd)
+
+    status_cmd = commands.add_parser("status", help="installed versions, pointers, launcher, receipts, feed")
+    status_cmd.add_argument("--feed-dir", type=Path, help="default: <prefix>/feed")
+    status_cmd.add_argument("--json", action="store_true", help="print the status as JSON")
     return parser.parse_args(argv)
 
 
@@ -736,14 +767,18 @@ def main(argv: list[str] | None = None) -> int:
         return install(args)
     if args.command == "probe":
         return probe(args)
-    # The release module imports this one for its primitives, so it loads
+    # The release modules import this one for its primitives, so they load
     # here, at dispatch time, not at module import.
-    import release_feed
-    return release_feed.package(args)
+    if args.command == "package":
+        import release_feed
+        return release_feed.package(args)
+    import rollout
+    commands = {"rollout": rollout.rollout, "rollback": rollout.rollback, "status": rollout.status}
+    return commands[args.command](args)
 
 
 if __name__ == "__main__":
-    # Run through the importable module, so the release module (which
-    # `import side_by_side`) shares this one's state instead of a second copy.
+    # Run through the importable module, so the release modules (which
+    # `import side_by_side`) share this one's state instead of a second copy.
     import side_by_side
     sys.exit(side_by_side.main())
