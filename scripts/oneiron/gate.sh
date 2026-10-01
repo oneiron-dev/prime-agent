@@ -1,58 +1,114 @@
 #!/usr/bin/env bash
-# The local merge gate for rust-oneiron lanes (upstream CI only runs on main).
+# The merge gate for rust-oneiron lanes (upstream CI only runs on main).
 #
 #   scripts/oneiron/gate.sh [fmt|clippy|test|policy|all] [-- extra cargo test args]
-#   scripts/oneiron/gate.sh crates <crate>... [-- test filters]   (focused, same sandbox)
+#   scripts/oneiron/gate.sh crates <crate>... [-- test filters]   (focused)
 #
 # Same gates as `make check` on the toolchain upstream CI pins, plus the fork
-# gates. Tests run sandboxed: HOME and TMPDIR point at a throwaway dir, so the
-# kernel e2e suites bootstrap their own venv and every test daemon listens in
-# the sandbox. Unsandboxed, `cargo test --workspace` would bootstrap into the
-# real ~/.prime/agent/kernel-venv and probe the real daemon socket dir: the
-# live TS fleet's. The real cargo, rustup, sccache and uv caches are reused.
+# gates, in one of two modes:
+#
+# - offload (Arch, where $offload/env.sh exists; owner rule: no compiles
+#   here): clippy and tests run on the build boxes through the offload cargo
+#   wrapper, as `cargo +<toolchain> …`. No local build, bootstrap or sandbox:
+#   the remote run gets none of this host's env (the boxes run no TS fleet).
+#   fmt stays local. The wrapper silently runs cargo HERE when it is not first
+#   on PATH, W7_CARGO_WORK is unset or the worktree is not one it accepts, so
+#   the gate refuses to run cargo at all in those cases.
+# - local (no offload kit, the Mac): tests run sandboxed. HOME and TMPDIR
+#   point at a throwaway dir, so the kernel e2e suites bootstrap their own venv
+#   and every test daemon listens in the sandbox. Unsandboxed, `cargo test
+#   --workspace` would bootstrap into the real ~/.prime/agent/kernel-venv and
+#   probe the real daemon socket dir: a live TS fleet's. The real cargo,
+#   rustup, sccache and uv caches are reused.
 set -euo pipefail
+
+offload=/home/lexi/w8-opus/offload
+# The worktree roots the offload wrapper offloads from (one level below).
+offload_roots="/home/lexi/code/oneiron-impl-waves/repos/prime-agent/.claude/worktrees /home/lexi/w8-opus"
+toolchain="${RUSTUP_TOOLCHAIN:-1.98.1}"
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
 step="${1:-all}"
 [ $# -gt 0 ] && shift
-crates=()
+scope=(--workspace)
 if [ "$step" = "crates" ]; then
-  while [ $# -gt 0 ] && [ "$1" != "--" ]; do crates+=(-p "$1"); shift; done
-  [ ${#crates[@]} -gt 0 ] || { echo "usage: $0 crates <crate>... [-- test filters]" >&2; exit 2; }
+  scope=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do scope+=(-p "$1"); shift; done
+  [ ${#scope[@]} -gt 0 ] || { echo "usage: $0 crates <crate>... [-- test filters]" >&2; exit 2; }
 fi
 [ "${1:-}" = "--" ] && shift
 
-export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.98.1}"
-export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
-if command -v sccache >/dev/null 2>&1; then
-  export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
-  export SCCACHE_DIR="${SCCACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sccache}"
-  # The sccache server is a long-lived daemon that keeps the environment it
-  # was spawned with: started inside a test sandbox, it would keep the
-  # sandbox TMPDIR and fail every compile once the sandbox is removed. Start
-  # it (if none is running) from the real environment, and never idle out.
-  SCCACHE_IDLE_TIMEOUT=0 sccache --start-server >/dev/null 2>&1 || true
+if [ -f "$offload/env.sh" ]; then
+  mode=offload
+  echo "gate: offload mode (build boxes)"
+  # shellcheck source=/dev/null
+  . "$offload/env.sh"
+  unset W7_CARGO_LOCAL
+  cargo=(cargo "+$toolchain")
+else
+  mode=local
+  echo "gate: local mode"
+  cargo=(cargo)
+  export RUSTUP_TOOLCHAIN="$toolchain"
+  export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+  export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+  if command -v sccache >/dev/null 2>&1; then
+    export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
+    export SCCACHE_DIR="${SCCACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sccache}"
+    # The sccache server is a long-lived daemon that keeps the environment it
+    # was spawned with: started inside a test sandbox, it would keep the
+    # sandbox TMPDIR and fail every compile once the sandbox is removed. Start
+    # it (if none is running) from the real environment, and never idle out.
+    SCCACHE_IDLE_TIMEOUT=0 sccache --start-server >/dev/null 2>&1 || true
+  fi
+  export UV_CACHE_DIR="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
+  # mold cuts link time and memory when several lanes build at once (Linux x64 only).
+  if [ "$(uname -s)-$(uname -m)" = "Linux-x86_64" ] && command -v mold >/dev/null 2>&1; then
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:--C link-arg=-fuse-ld=mold}"
+  fi
+  # The gate's build gets its own target dir so it never blocks on (or
+  # invalidates) the release build's lock in target/. It must keep the
+  # `<...>/target/<profile>/` shape: pa-daemon's lease-holder classifier
+  # recognizes a cargo build by it (`target/gate/debug` reads as a foreign
+  # process), so it lives outside the worktree.
+  export CARGO_TARGET_DIR="${GATE_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/pa-gate/$(basename "$root")/target}"
 fi
-export UV_CACHE_DIR="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
-# mold cuts link time and memory when several lanes build at once (Linux x64 only).
-if [ "$(uname -s)-$(uname -m)" = "Linux-x86_64" ] && command -v mold >/dev/null 2>&1; then
-  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:--C link-arg=-fuse-ld=mold}"
-fi
-# The gate's build gets its own target dir so it never blocks on (or
-# invalidates) the release build's lock in target/. It must keep the
-# `<...>/target/<profile>/` shape: pa-daemon's lease-holder classifier
-# recognizes a cargo build by it (`target/gate/debug` reads as a foreign
-# process), so it lives outside the worktree.
-export CARGO_TARGET_DIR="${GATE_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/pa-gate/$(basename "$root")/target}"
 
-run_fmt() { cargo fmt --all --check; }
-run_clippy() { cargo clippy --workspace --all-targets --locked -- -D warnings; }
+# Offload mode only: refuse (before any cargo call) every case in which the
+# wrapper would run cargo on this host instead of a build box.
+require_offload() {
+  local refuse="gate: offload mode, refusing to run cargo on this host:" top accepted ok=""
+  [ "$(command -v cargo)" = "$offload/bin/cargo" ] ||
+    { echo "$refuse cargo on PATH is $(command -v cargo || echo nothing), not $offload/bin/cargo" >&2; exit 1; }
+  [ -n "${W7_CARGO_WORK:-}" ] || { echo "$refuse W7_CARGO_WORK is unset" >&2; exit 1; }
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" && top="$(cd "$top" && pwd -P)" || top=""
+  for accepted in $offload_roots; do
+    case "$top" in "$accepted"/*/*) ;; "$accepted"/?*) ok=1 ;; esac
+  done
+  [ -n "$ok" ] && [ "$top" = "$(pwd -P)" ] ||
+    { echo "$refuse $root is not a worktree the wrapper offloads from (one level under: $offload_roots)" >&2; exit 1; }
+}
+
+run_fmt() { "${cargo[@]}" fmt --all --check; }
+
+run_clippy() {
+  if [ "$mode" = offload ]; then require_offload; fi
+  "${cargo[@]}" clippy --workspace --all-targets --locked -- -D warnings
+}
 
 run_test() {
-  local scope=(--workspace) sandbox
-  if [ ${#crates[@]} -gt 0 ]; then scope=("${crates[@]}"); fi
+  if [ "$mode" = offload ]; then
+    require_offload
+    "${cargo[@]}" test --locked "${scope[@]}" --no-fail-fast "$@"
+  else
+    run_sandboxed_test "$@"
+  fi
+}
+
+# Local mode's build, bootstrap and tests, under a throwaway HOME and TMPDIR.
+run_sandboxed_test() {
+  local sandbox
   # Short paths: tests bind unix sockets under TMPDIR and sun_path holds
   # ~104-108 bytes, so the sandbox sits directly in /tmp as on a CI runner.
   sandbox="$(mktemp -d /tmp/pg.XXXXXX)"

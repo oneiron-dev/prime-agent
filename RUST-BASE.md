@@ -102,18 +102,32 @@ when the diff is identical, otherwise drop it by hand.
   inside a `prime-agent-rs` session runs against the Rust agent dir and venv. The TS state stays
   untouched; that TS run just sees Rust's store. This goes away at cutover.
 
-## Gates (local; upstream CI only runs on `main`)
+## Gates (upstream CI only runs on `main`)
 
 ```
-scripts/oneiron/gate.sh all     # fmt, clippy -D warnings, policy (TEST_POLICY_BASE=oneiron/main), sandboxed workspace tests
-scripts/oneiron/gate.sh crates pa-core pa-daemon -- <filter>   # focused, same sandbox
+scripts/oneiron/gate.sh all     # fmt, clippy -D warnings, policy (TEST_POLICY_BASE=oneiron/main), workspace tests
+scripts/oneiron/gate.sh crates pa-core pa-daemon -- <filter>   # focused
 ```
 
-Never run a bare `cargo test --workspace` on a machine with a live TS fleet. The kernel e2e suites
-bootstrap the ambient kernel venv and probe the default daemon socket dir. `gate.sh` runs every test
-under a throwaway HOME and TMPDIR, with the product env scrubbed (`PRIME_AGENT_*`, `PI_*`, `RLM_*`,
-`PA_*`; an explicit `PA_TS_BINARY` is kept), TZ=UTC and the TS binary off PATH, the way a CI runner
-sees it. A failed build or bootstrap fails the gate.
+`gate.sh` runs in one of two modes and prints which.
+
+- Offload (`gate: offload mode (build boxes)`), wherever `/home/lexi/w8-opus/offload/env.sh` exists
+  (Arch; owner rule: no compiles there). It sources that file, so the offload cargo wrapper is
+  first on PATH and `W7_CARGO_WORK` is set, and runs clippy and tests on the build boxes as
+  `cargo +1.98.1 …` (the toolchain travels in the command; `RUSTUP_TOOLCHAIN` does not). No local
+  build, bootstrap or sandbox: the remote run gets none of this host's env, and the boxes run no TS
+  fleet. `fmt` stays local. The wrapper silently runs cargo on this host when it is not first on
+  PATH, `W7_CARGO_WORK` is unset or the worktree is not directly under
+  `…/prime-agent/.claude/worktrees/` (or `/home/lexi/w8-opus/`), so the gate refuses to run cargo
+  at all in those cases. A remote failure that is not the code (sync, ssh, toolchain): say so and
+  rerun once; never fall back to a local run. `cargo build` stays local (`-j 8`, the gate target
+  dir).
+- Local (`gate: local mode`), without the offload kit (the Mac). Never run a bare `cargo test
+  --workspace` on a machine with a live TS fleet: the kernel e2e suites bootstrap the ambient kernel
+  venv and probe the default daemon socket dir. The gate builds, bootstraps and tests under a
+  throwaway HOME and TMPDIR, with the product env scrubbed (`PRIME_AGENT_*`, `PI_*`, `RLM_*`,
+  `PA_*`; an explicit `PA_TS_BINARY` is kept), TZ=UTC and the TS binary off PATH, the way a CI
+  runner sees it. A failed build or bootstrap fails the gate.
 
 ## Re-pinning
 

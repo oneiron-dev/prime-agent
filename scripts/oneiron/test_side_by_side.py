@@ -866,13 +866,30 @@ exit "${STUB_BOOTSTRAP_EXIT:-0}"
 """
 
 
+def gate_copy(repo: Path, offload: Path, offload_roots: Path) -> Path:
+    """gate.sh at <repo>/scripts/oneiron/, its offload kit and accepted
+    worktree roots pointed at test paths: the real kit exists on Arch, where
+    the real gate would hand cargo to the build boxes."""
+    text = GATE.read_text()
+    for line, value in (("offload=/home/lexi/w8-opus/offload", f"offload={offload}"),
+                        ('offload_roots="/home/lexi/code/oneiron-impl-waves/repos/prime-agent/.claude/worktrees '
+                         '/home/lexi/w8-opus"', f'offload_roots="{offload_roots}"')):
+        assert text.count(f"\n{line}\n") == 1, line
+        text = text.replace(f"\n{line}\n", f"\n{value}\n")
+    copy = repo / "scripts" / "oneiron" / "gate.sh"
+    write_executable(copy, text)
+    return copy
+
+
 class GateTests(unittest.TestCase):
-    """gate.sh's sandboxed test step with stub cargo/sccache/bootstrap binaries
-    on PATH: no build, no real sccache server, no product run."""
+    """gate.sh's local mode (no offload kit): the sandboxed test step with stub
+    cargo/sccache/bootstrap binaries on PATH, no build, no real sccache server,
+    no product run."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
+        self.gate = gate_copy(self.root / "repo", self.root / "no-offload-kit", self.root / "no-worktrees")
         self.out = self.root / "out"
         self.out.mkdir()
         stubs = self.root / "stubs"
@@ -897,8 +914,9 @@ class GateTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_gate(self, **env: str) -> tuple[subprocess.CompletedProcess, Path]:
-        result = subprocess.run(["bash", str(GATE), "crates", "pa-core", "--", "some_filter"], capture_output=True,
-                                text=True, env={**self.env, **env})
+        result = subprocess.run(["bash", str(self.gate), "crates", "pa-core", "--", "some_filter"],
+                                capture_output=True, text=True, env={**self.env, **env})
+        self.assertTrue(result.stdout.startswith("gate: local mode\n"), result.stdout)
         sandbox = Path(re.search(r"^gate: sandbox (\S+)$", result.stdout, re.M)[1])
         self.addCleanup(shutil.rmtree, sandbox, ignore_errors=True)
         return result, sandbox
@@ -962,6 +980,96 @@ class GateTests(unittest.TestCase):
             "pa_gate_first": f"{sandbox}/bin/1/pa_gate_first", "pa_gate_last": f"{sandbox}/bin/2/pa_gate_last"})
         self.assertEqual((self.out / "tool").read_text(), "d2\n")
         self.assertEqual((self.out / "first-link").read_text().strip(), str(self.dirs[0] / "pa_gate_first"))
+
+
+class OffloadGateTests(unittest.TestCase):
+    """gate.sh's offload mode against a fake offload kit: its bin/cargo
+    records each call (what the build boxes would run, and from where), and a
+    decoy `cargo` earlier on PATH would record any local run."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.out = self.root / "out"
+        self.out.mkdir()
+        self.kit = self.root / "offload"
+        self.worktrees = self.root / "worktrees"
+        self.repo = self.worktrees / "lane-x"
+        self.gate = gate_copy(self.repo, self.kit, self.worktrees)
+        write_executable(self.kit / "bin" / "cargo", """#!/bin/sh
+printf '%s|%s|%s|%s\\n' "$*" "$W7_CARGO_WORK" "${W7_CARGO_LOCAL-unset}" "$(pwd -P)" >> "$STUB_OUT/log"
+case "$2" in test|clippy) exit "${STUB_EXIT:-0}" ;; esac
+""")
+        self.write_env_sh()
+        write_executable(self.root / "decoy" / "cargo", '#!/bin/sh\necho "LOCAL $*" >> "$STUB_OUT/log"\nexit 99\n')
+        self.env = {"PATH": f"{self.root / 'decoy'}:/usr/bin", "HOME": str(self.root / "home"), "LANG": "C",
+                    "STUB_OUT": str(self.out), "W7_CARGO_LOCAL": "1",
+                    "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+        subprocess.run(["git", "init", "--quiet", str(self.repo)], check=True, env=self.env)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def write_env_sh(self, *, path: bool = True, work: bool = True) -> None:
+        lines = [f"export PATH={self.kit / 'bin'}:$PATH"] if path else []
+        lines += [f"export W7_CARGO_WORK={self.kit}"] if work else []
+        (self.kit / "env.sh").write_text("".join(f"{line}\n" for line in lines))
+
+    def run_gate(self, gate: Path | None = None, *args: str, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", str(gate or self.gate), *args], capture_output=True, text=True,
+                              env={**self.env, **env})
+
+    def log(self) -> list[str]:
+        log = self.out / "log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def remote(self, args: str) -> str:
+        return f"+1.98.1 {args}|{self.kit}|unset|{self.repo}"
+
+    def test_offload_tests_run_on_the_build_boxes_with_no_local_build(self) -> None:
+        result = self.run_gate(None, "crates", "pa-core", "pa-cli", "--", "some_filter")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "gate: offload mode (build boxes)\ngate: crates passed\n")
+        self.assertEqual(self.log(), [self.remote("test --locked -p pa-core -p pa-cli --no-fail-fast some_filter")])
+
+    def test_offload_clippy_runs_remotely_and_fmt_through_the_wrapper(self) -> None:
+        for step in ("fmt", "clippy", "test"):
+            result = self.run_gate(None, step)
+            self.assertEqual((result.returncode, result.stdout),
+                             (0, f"gate: offload mode (build boxes)\ngate: {step} passed\n"), result.stderr)
+        self.assertEqual(self.log(), [self.remote("fmt --all --check"),
+                                      self.remote("clippy --workspace --all-targets --locked -- -D warnings"),
+                                      self.remote("test --locked --workspace --no-fail-fast")])
+
+    def test_offload_failure_is_the_gate_result(self) -> None:
+        result = self.run_gate(None, "test", STUB_EXIT="3")
+        self.assertEqual(result.returncode, 3)
+        self.assertNotIn("passed", result.stdout)
+
+    def test_offload_refuses_every_case_the_wrapper_would_run_here(self) -> None:
+        refuse = "gate: offload mode, refusing to run cargo on this host: "
+        outside = gate_copy(self.root / "elsewhere" / "lane-y", self.kit, self.worktrees)
+        nested = gate_copy(self.worktrees / "a" / "b", self.kit, self.worktrees)
+        bare = gate_copy(self.worktrees / "not-a-repo", self.kit, self.worktrees)
+        for repo in (outside.parents[2], nested.parents[2]):
+            subprocess.run(["git", "init", "--quiet", str(repo)], check=True, env=self.env)
+        cases = (
+            ("wrapper not first", {"path": False}, None,
+             f"cargo on PATH is {self.root / 'decoy' / 'cargo'}, not {self.kit / 'bin' / 'cargo'}"),
+            ("no W7_CARGO_WORK", {"work": False}, None, "W7_CARGO_WORK is unset"),
+            *((name, {}, gate, f"{gate.parents[2]} is not a worktree the wrapper offloads from")
+              for name, gate in (("outside the accepted roots", outside), ("nested below a worktree", nested),
+                                 ("not a git worktree", bare))),
+        )
+        for name, env_sh, gate, message in cases:
+            for step in ("test", "clippy"):
+                with self.subTest(name, step=step):
+                    self.write_env_sh(**env_sh)
+                    result = self.run_gate(gate, step)
+                    self.assertEqual((result.returncode, result.stdout),
+                                     (1, "gate: offload mode (build boxes)\n"), result.stderr)
+                    self.assertIn(refuse + message, result.stderr)
+                    self.assertEqual(self.log(), [])
 
 
 class PolicyGateTests(unittest.TestCase):
