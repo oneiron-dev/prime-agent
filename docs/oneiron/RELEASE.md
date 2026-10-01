@@ -61,8 +61,11 @@ feed/latest.json, feed/stable                                       (moved only 
 the Rust updater's channel-manifest parser reads (`pa-core` `update::release`;
 `crates/pa-core/tests/oneiron_feed_manifest.rs` checks this).
 
-Re-running `package` with the same inputs changes nothing. Different bytes for a platform that
-is already published are refused, so bump `N`. A second platform joins a release only if it was
+Re-running `package` with the same inputs changes nothing in the release. It still moves the
+feed pointers forward, so a release first published with `--no-promote` can be promoted by
+running `package` again without it. Different bytes for a platform that is already published
+are refused, so bump `N`. So is a different decoder choice for the same bytes (a Linux build
+published with `--no-decoder` never gains a decoder later). A second platform joins a release only if it was
 built from the same commit and tree. To get both platforms into one feed, copy the feed dir to
 the Mac (for example with rsync), run `package --feed-dir <copy>` there, and copy it back. There
 is no upload step.
@@ -74,7 +77,8 @@ python3 scripts/oneiron/side_by_side.py status
 python3 scripts/oneiron/side_by_side.py rollout [--version <version>] [--tools]
 ```
 
-In order:
+In order (the whole run holds the install prefix's lock, so a second `rollout` or `rollback`
+started meanwhile is turned away before it writes anything):
 
 1. **Verify.** Reads the release's row for this host's platform. `manifest.json`,
    `SHA256SUMS` and the tarball's sha256 must all agree. The hash is taken on a private copy,
@@ -87,7 +91,9 @@ In order:
    connected to. Nothing is ever stopped. `--force-idle-check-skip` proceeds anyway and records
    that it did. Live sessions keep running the old binary until their supervisor restarts.
 3. **Install** to `<prefix>/<version>/`. The executable must match the release row. If an
-   earlier attempt left the same version installed but unselected, it is reused.
+   earlier attempt left the same version installed but unselected, it is reused only when its
+   whole payload (every file, its content and executable bit) equals the verified tarball's.
+   The receipt records that payload digest; `rollback` checks it later.
 4. **Probe before selecting.** A scratch launcher (the real template) points at the new
    install. `--version` and a one-shot on `cpa-r`/`gpt-6.1-sol` must succeed; this is a real
    provider call. `--tools` also runs a kernel turn. If the probe fails, the version stays

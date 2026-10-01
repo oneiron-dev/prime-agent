@@ -33,9 +33,14 @@ prime-agent-rs --version
 `rollback`:
 
 1. Refuses a version that is not installed (an executable `prime-agent` plus a `package.json`
-   naming that version) and the version that is already current.
-2. Re-hashes the target's executable. It must match what its activation or install receipt
-   recorded.
+   naming that version) and the version that is already current. It holds the install
+   prefix's lock until its receipt is written, so a concurrent `rollout` or `rollback` is
+   turned away.
+2. Re-hashes the target's executable and its whole payload. Both must match a receipt that
+   shows the version once ran as `current`: a rollout that ended `activated`, an install that
+   activated and passed its `--version` check, or an earlier rollback that ended `rolled-back`.
+   A version that was installed but never selected (for example, its probe failed) is refused;
+   roll it out instead.
 3. Checks the Rust supervisor, the same way `rollout` does: it connects only to the Rust socket
    and refuses while there are live sessions. `--force-idle-check-skip` overrides the refusal,
    and the override is recorded.
