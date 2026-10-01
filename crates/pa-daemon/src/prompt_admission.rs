@@ -9,7 +9,11 @@
 //! TS parse errors), the route rewrites the admission id to a
 //! supervisor-scoped one (`supervisor-admission:<uuid>`) and records the
 //! worker, a successful prompt commits the admission (`owned`), and the
-//! admission clears once the route settles. `cancel_prompt_admission`
+//! admission clears once the route settles. A route that ran out of its
+//! budget (shorter than TS's 24-hour worker forward) keeps the admission
+//! until one `cancel_prompt_admission` has read the worker's status for
+//! it, so a client can still tell a running turn from a queued or lost
+//! prompt. `cancel_prompt_admission`
 //! answers the TS status ladder - `unknown` for an unregistered id,
 //! `cancelled` for a waiting admission (aborting the in-flight prompt
 //! with the TS `Prompt admission was cancelled.` failure), `owned` for a
@@ -25,6 +29,7 @@ use crate::backpressure::RouteAdmission;
 use crate::protocol::{response_failure, response_line, response_success, DaemonResponse};
 use crate::supervisor::{
     client_command_payload, Supervisor, LONG_ROUTE_TIMEOUT_MS, ROUTE_TIMEOUT_MS,
+    SESSION_WORKER_TIMED_OUT,
 };
 use crate::worker::Worker;
 
@@ -47,6 +52,13 @@ struct PromptAdmission {
     status: AdmissionStatus,
     worker_id: Option<String>,
     worker_active_session_id: Option<String>,
+    /// The route ran out of its budget with the prompt possibly still on
+    /// the worker (queued behind work, or a turn longer than the budget).
+    /// TS keeps an admission for as long as its 24-hour worker forward
+    /// holds the prompt; this port's route budget is shorter, so the
+    /// record outlives its route until one `cancel_prompt_admission` has
+    /// read the worker's status for it.
+    route_timed_out: bool,
 }
 
 /// The per-connection admission registry.
@@ -102,6 +114,7 @@ impl PromptAdmissionTable {
                 status: AdmissionStatus::Waiting,
                 worker_id: None,
                 worker_active_session_id: None,
+                route_timed_out: false,
             },
         );
         Ok(())
@@ -350,10 +363,20 @@ impl Supervisor {
         let mut response = match response {
             Ok(response) => response,
             Err(error) => {
-                // The route failed: the admission clears with it (TS
-                // deletes in the finally).
-                connection.prompt_admissions.remove(&key);
-                return Self::admission_failure(&command_id, &type_name, &error.to_string());
+                let error = error.to_string();
+                if error == SESSION_WORKER_TIMED_OUT {
+                    // The budget ran out, not the worker's answer: the
+                    // admission stays readable so the client can learn
+                    // whether this prompt started.
+                    connection
+                        .prompt_admissions
+                        .update(&key, |admission| admission.route_timed_out = true);
+                } else {
+                    // The route failed: the admission clears with it (TS
+                    // deletes in the finally).
+                    connection.prompt_admissions.remove(&key);
+                }
+                return Self::admission_failure(&command_id, &type_name, &error);
             }
         };
         if response.success {
@@ -487,17 +510,26 @@ impl Supervisor {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                     .to_string();
-                connection
+                let route_timed_out = connection
                     .prompt_admissions
-                    .update(&key, |admission| match status.as_str() {
-                        "owned" => admission.status = AdmissionStatus::Owned,
-                        "cancelled" => admission.status = AdmissionStatus::Cancelled,
-                        _ => {
-                            if admission.status != AdmissionStatus::Cancelled {
-                                admission.status = AdmissionStatus::Waiting;
+                    .update(&key, |admission| {
+                        match status.as_str() {
+                            "owned" => admission.status = AdmissionStatus::Owned,
+                            "cancelled" => admission.status = AdmissionStatus::Cancelled,
+                            _ => {
+                                if admission.status != AdmissionStatus::Cancelled {
+                                    admission.status = AdmissionStatus::Waiting;
+                                }
                             }
                         }
-                    });
+                        admission.route_timed_out
+                    })
+                    .unwrap_or(false);
+                if route_timed_out {
+                    // No route settles a timed-out admission: its one read
+                    // is done, so the record leaves the table.
+                    connection.prompt_admissions.remove(&key);
+                }
                 response.id = Some(command_id.to_string());
                 (vec![response_line(&response)], false)
             }
@@ -720,6 +752,152 @@ mod tests {
         table.register("sess-b", "adm-1").expect("register");
         assert_eq!(table.sole_key_for_admission_id("adm-1"), None);
         assert_eq!(table.sole_key_for_admission_id(""), None);
+    }
+
+    /// An admitted `prompt_and_wait` whose route runs out of budget while
+    /// the worker still holds the prompt (a turn longer than the budget)
+    /// keeps its admission: the client's `cancel_prompt_admission` reaches
+    /// the worker with the rewritten id and answers the worker's status
+    /// (`owned`: the turn started) instead of `unknown`. That one read
+    /// consumes the record.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_prompt_route_keeps_its_admission_for_one_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(crate::supervisor::SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .expect("supervisor"),
+        );
+        let descriptor: pa_types::daemon::DaemonWorkerDescriptor = serde_json::from_value(json!({
+            "version": 2,
+            "workerId": "w-adm",
+            "pid": 0,
+            "socketPath": "/tmp/none.sock",
+            "recoveryJournalPath": "/tmp/none.jsonl",
+            "supervisorSocketPath": "/tmp/none.sock",
+            "authenticationToken": "test",
+            "rootActiveSessionId": "w-adm",
+            "createdAt": "t",
+            "updatedAt": "t",
+            "lifecycle": "ready",
+            "createCommand": {},
+            "consecutiveFailures": 0,
+        }))
+        .expect("descriptor");
+        let resident = Arc::new(crate::registry::ResidentWorker::new(
+            "w-adm".to_string(),
+            descriptor,
+            dir.path().join("w-adm.descriptor.json"),
+        ));
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<crate::registry::WorkerRequest>(4);
+        *resident.cmd_tx.lock().await = Some(cmd_tx);
+        resident.note_connection_live();
+        resident.note_session_ready();
+        supervisor.registry.insert(Arc::clone(&resident)).await;
+        // The fake worker holds the prompt past the budget (its turn is
+        // still running), then answers the forwarded read as a worker
+        // whose turn committed the admission.
+        let worker = {
+            let resident = Arc::clone(&resident);
+            tokio::spawn(async move {
+                let prompt = cmd_rx.recv().await.expect("the prompt is routed");
+                let read = cmd_rx.recv().await.expect("the read is forwarded");
+                let reply = resident
+                    .pending
+                    .lock()
+                    .await
+                    .remove(&read.request_id)
+                    .expect("the forwarded read holds a reply slot");
+                let _ = reply.send(crate::registry::WorkerReply::Typed(response_success(
+                    None,
+                    "cancel_prompt_admission",
+                    Some(json!({ "status": "owned" })),
+                )));
+                (prompt, read)
+            })
+        };
+        let connection = Arc::new(crate::input_pause_lease::ClientConnectionState::new());
+        let (queue, _queue_rx) = tokio::sync::mpsc::channel(4);
+        let attached = crate::supervisor::subscribers::ClientSubscriptions::new(
+            connection.connection_id().to_string(),
+            queue,
+        );
+        let prompt: pa_types::daemon::DaemonCommand = serde_json::from_value(json!({
+            "type": "prompt_and_wait",
+            "activeSessionId": "w-adm",
+            "message": "long turn",
+            "admissionId": "adm-1",
+        }))
+        .unwrap();
+        connection
+            .prompt_admissions
+            .register("w-adm", "adm-1")
+            .expect("register");
+        let (lines, _) = supervisor
+            .route_prompt_with_admission(
+                &connection,
+                &prompt,
+                "client-1",
+                &attached,
+                "p-1".to_string(),
+                "prompt_and_wait".to_string(),
+                "w-adm",
+            )
+            .await;
+        assert_eq!(
+            lines,
+            vec![response_line(&response_failure(
+                Some("p-1"),
+                "prompt_and_wait",
+                SESSION_WORKER_TIMED_OUT,
+                None,
+            ))]
+        );
+        let read: pa_types::daemon::DaemonCommand = serde_json::from_value(json!({
+            "type": "cancel_prompt_admission",
+            "activeSessionId": "w-adm",
+            "admissionId": "adm-1",
+        }))
+        .unwrap();
+        let (lines, _) = supervisor
+            .handle_cancel_prompt_admission(&connection, &read, "c-1", "cancel_prompt_admission")
+            .await;
+        assert_eq!(
+            lines,
+            vec![response_line(&response_success(
+                Some("c-1"),
+                "cancel_prompt_admission",
+                Some(json!({ "status": "owned" })),
+            ))]
+        );
+        let (routed_prompt, forwarded_read) = worker.await.unwrap();
+        assert_eq!(routed_prompt.command_type, "prompt_and_wait");
+        let worker_admission_id = routed_prompt.payload["admissionId"].clone();
+        assert!(
+            worker_admission_id
+                .as_str()
+                .is_some_and(|id| id.starts_with("supervisor-admission:")),
+            "{worker_admission_id}"
+        );
+        assert_eq!(forwarded_read.command_type, "cancel_prompt_admission");
+        assert_eq!(
+            forwarded_read.payload,
+            json!({ "activeSessionId": "w-adm", "admissionId": worker_admission_id })
+        );
+        // The read consumed the record: nothing answers for it any more.
+        let (lines, _) = supervisor
+            .handle_cancel_prompt_admission(&connection, &read, "c-2", "cancel_prompt_admission")
+            .await;
+        assert_eq!(
+            lines,
+            vec![response_line(&response_success(
+                Some("c-2"),
+                "cancel_prompt_admission",
+                Some(json!({ "status": "unknown" })),
+            ))]
+        );
     }
 
     #[test]
