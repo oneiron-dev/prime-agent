@@ -122,9 +122,12 @@ impl TurnRunner {
             };
             if item.as_ref().is_some_and(Vec::is_empty) {
                 // Every picked prompt was withdrawn: nothing runs. The
-                // journal settles (the prompt's own admission checkpoint
-                // may have landed after its cancel's) and the lanes are
-                // read again.
+                // queue projection drops the rows (an unchanged one stays
+                // silent), the journal settles (the prompt's own admission
+                // checkpoint may have landed after its cancel's), and the
+                // lanes are read again.
+                let snapshot = Self::snapshot_from(&self.core.lock().unwrap());
+                let _ = self.emit_action_update(&snapshot);
                 checkpoint_queue_recovery(
                     &self.recovery,
                     &self.core,
