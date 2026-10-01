@@ -173,10 +173,11 @@ export class OneironTicketRunner {
 			env?: NodeJS.ProcessEnv;
 			routing?: RoutingSeats;
 			now?: () => number;
-			/** Pause after a round whose seat process failed to start or died. Never a limit on the work itself. */
-			retryDelayMs?: number;
-			/** How often a runner waiting on its blockers re-reads their state (default one minute). */
-			waitMs?: number;
+			/**
+			 * Internal test override of every wait this runner takes: backoffs, polls, the pause after a failed seat
+			 * round and the wait on blockers. Never a limit on the work itself.
+			 */
+			sleep?: (ms: number) => Promise<void>;
 		} = {},
 	) {
 		const l = ticket.launcher;
@@ -247,6 +248,9 @@ export class OneironTicketRunner {
 		} catch {}
 		return this.ticket.blockedBy;
 	}
+	private delay(ms: number): Promise<void> {
+		return (this.options.sleep ?? sleep)(ms);
+	}
 
 	/** One child of this ticket, in the worktree unless told otherwise; see `runProcess` for the deadlines. */
 	async run(
@@ -306,7 +310,7 @@ export class OneironTicketRunner {
 			/cannot lock ref|could not lock config file|Unable to create '[^']*\.lock'/i.test(result.output);
 			attempt++
 		) {
-			await sleep(1_000 + Math.floor(Math.random() * 4_000) * attempt);
+			await this.delay(1_000 + Math.floor(Math.random() * 4_000) * attempt);
 			result = await this.run(["git", ...args], { cwd, timeoutMs: this.t.ghMs });
 		}
 		if (result.code !== 0) throw new TicketFailure(`git ${args[0]} failed: ${tail(result.output, 20)}`);
@@ -505,7 +509,7 @@ ${rendered || "(no bot comments)"}`;
 					"base",
 					`waiting${this.settings.noStacks ? " for every blocker to merge (noStacks)" : ""}: ${unmerged.length} blockers unmerged (${unmerged.map((p) => `${p.key}:${p.state?.pr ? "submitted" : "not submitted"}`).join(", ")})`,
 				);
-			await sleep(this.options.waitMs ?? 60_000);
+			await this.delay(60_000);
 		}
 	}
 	private async verifyWorktreeBranch(): Promise<void> {
@@ -675,7 +679,7 @@ ${rendered || "(no bot comments)"}`;
 			if (silent >= MAX_SILENT_ROUNDS)
 				throw new TicketFailure(`the writer seat produced no output in ${silent} consecutive rounds`);
 			// A provider error in JSON mode exits 0 with no reply; without a pause the rounds would spin.
-			if (!clean || !final.trim()) await sleep(this.options.retryDelayMs ?? 30_000);
+			if (!clean || !final.trim()) await this.delay(30_000);
 		}
 	}
 	/** How a writer hands a durable validation to the factory instead of polling it in model rounds. */
@@ -747,7 +751,7 @@ ${rendered || "(no bot comments)"}`;
 		const floor = this.settings.diskFloorGiB;
 		for (let waited = 0; freeGiB(this.settings.work) < floor; waited++) {
 			if (waited % 12 === 0) this.log("disk", `free space below the ${floor} GiB floor; waiting`);
-			await sleep(5_000);
+			await this.delay(5_000);
 		}
 		const release = await acquireSlot(join(this.settings.work, "build-slots"), this.settings.buildSlots, this.log);
 		try {
@@ -932,7 +936,7 @@ ${rendered || "(no bot comments)"}`;
 			if (verdict) return verdict === "LANDABLE" ? "LANDABLE" : `DEFECTS\n${result.final}`;
 			pending = true;
 			this.log(`review:${name}`, `incomplete rc=0; continuing same session ${session}`);
-			if (!result.final.trim()) await sleep(this.options.retryDelayMs ?? 30_000);
+			if (!result.final.trim()) await this.delay(30_000);
 			if ("command" in spec || (resumeSession === undefined && !hasSessionFile(sessionDir)))
 				throw new TicketFailure(
 					`review ${name} incomplete; no resumable native session; preserve logs and recover before retrying`,
@@ -1136,7 +1140,7 @@ ${rendered || "(no bot comments)"}`;
 				(r) => report.completed.includes(r) || report.unavailable.includes(r),
 			);
 			if (settled) break;
-			await sleep(60_000);
+			await this.delay(60_000);
 			report = await fetchOneironBotReviews(
 				this.ghJson,
 				repo,
@@ -1215,7 +1219,7 @@ ${rendered || "(no bot comments)"}`;
 			const pending = this.blockers().filter((key) => !this.stateOf(key)?.merged);
 			if (!pending.length) return;
 			if (waited % 10 === 0) this.log("merge", `waiting for blockers to merge: ${pending.join(", ")}`);
-			await sleep(this.options.waitMs ?? 60_000);
+			await this.delay(60_000);
 		}
 	}
 	private async mergedOnGitHub(repo: string): Promise<boolean> {
@@ -1260,7 +1264,7 @@ ${rendered || "(no bot comments)"}`;
 				if (!(error instanceof GitHubRateLimit)) throw error;
 				if (Date.now() >= deadline)
 					throw new TicketFailure("post-push propagation timed out while GitHub was rate limited");
-				await sleep(Math.min(this.t.mergePollMs, Math.max(0, deadline - Date.now())));
+				await this.delay(Math.min(this.t.mergePollMs, Math.max(0, deadline - Date.now())));
 				continue;
 			}
 			if (view.state !== "OPEN" && view.state !== "MERGED")
@@ -1282,7 +1286,7 @@ ${rendered || "(no bot comments)"}`;
 				throw new TicketFailure(
 					`the pull request did not show the pushed head ${testedHead} within the gh budget; keep the tested commit and retry the merge only`,
 				);
-			await sleep(Math.min(this.t.propagationPollMs, Math.max(0, deadline - Date.now())));
+			await this.delay(Math.min(this.t.propagationPollMs, Math.max(0, deadline - Date.now())));
 		}
 	}
 	/**
@@ -1381,7 +1385,7 @@ ${rendered || "(no bot comments)"}`;
 				if (Date.now() >= deadline)
 					throw new TicketFailure("merge readiness timed out while GitHub was rate limited");
 			}
-			await sleep(Math.min(this.t.mergePollMs, Math.max(0, deadline - Date.now())));
+			await this.delay(Math.min(this.t.mergePollMs, Math.max(0, deadline - Date.now())));
 		}
 	}
 	private acquireMergeMutex(): Promise<() => void> {
@@ -1664,7 +1668,7 @@ ${rendered || "(no bot comments)"}`;
 				if (!(error instanceof GitHubRateLimit)) throw error;
 				if (Date.now() >= deadline)
 					throw new TicketFailure("merge preparation timed out while GitHub was rate limited");
-				await sleep(Math.min(this.t.mergePollMs, Math.max(0, deadline - Date.now())));
+				await this.delay(Math.min(this.t.mergePollMs, Math.max(0, deadline - Date.now())));
 				continue;
 			}
 			if (view.state === "MERGED") return undefined;
@@ -1783,7 +1787,7 @@ ${rendered || "(no bot comments)"}`;
 					if (!(error instanceof GitHubRateLimit)) throw error;
 					if (Date.now() >= deadline)
 						throw new TicketFailure("merge preparation timed out while GitHub was rate limited");
-					await sleep(Math.min(this.t.mergePollMs, deadline - Date.now()));
+					await this.delay(Math.min(this.t.mergePollMs, deadline - Date.now()));
 					continue;
 				}
 				if (!candidate) return;
@@ -1797,7 +1801,7 @@ ${rendered || "(no bot comments)"}`;
 				);
 				if (outcome === "rate-limited" && Date.now() >= deadline)
 					throw new TicketFailure("merge finalization timed out while GitHub was rate limited");
-				await sleep(outcome === "rate-limited" ? Math.min(this.t.mergePollMs, deadline - Date.now()) : 1_000);
+				await this.delay(outcome === "rate-limited" ? Math.min(this.t.mergePollMs, deadline - Date.now()) : 1_000);
 			}
 		} finally {
 			releaseTicket();

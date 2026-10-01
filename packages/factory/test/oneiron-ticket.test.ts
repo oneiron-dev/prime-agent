@@ -261,28 +261,40 @@ describe("Oneiron ticket runner", () => {
 		writeFileSync(parentState, JSON.stringify(parent));
 		const ticket = f.ticket("child", ["parent"]);
 		ticket.launcher = { ...f.launcher, noStacks: true };
-		ticket.launcher.timeouts = { ...f.launcher.timeouts, propagationPollMs: 1 };
-		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {}, waitMs: 5 });
-		const log = runner.log;
-		const waiting = new Promise<void>((resolveWait) => {
-			runner.log = (step, message) => {
-				log(step, message);
-				if (step === "base" && message?.includes("noStacks")) resolveWait();
-			};
+		// The runner's first wait holds until the test has looked and merged the parent; later waits return at once.
+		const waits: number[] = [];
+		let hold: (release: () => void) => void = () => undefined;
+		const held = new Promise<() => void>((resolveHold) => {
+			hold = resolveHold;
+		});
+		const runner = new OneironTicketRunner(ticket, {
+			env: f.env,
+			routing: {},
+			sleep: (ms) => {
+				waits.push(ms);
+				return waits.length === 1 ? new Promise<void>((release) => hold(release)) : Promise.resolve();
+			},
 		});
 		// The parent is submitted but not merged: with stacks the child would branch from it now.
 		const submitted = runner.submit();
 		submitted.catch(() => undefined);
-		await waiting;
-		expect(runner.state.base).toBeUndefined();
+		const release = await held;
+		expect([runner.state.base, readFileSync(runner.logPath, "utf8")]).toEqual([
+			undefined,
+			expect.stringContaining("noStacks"),
+		]);
 		writeFileSync(parentState, JSON.stringify({ ...parent, merged: true }));
+		release();
 		await submitted;
 		expect(runner.state).toMatchObject({ base: "origin/main", stacked: false, pr: 7 });
+		// It re-read its blockers once a minute.
+		expect(waits).toEqual([60_000]);
 		// The pull request API still shows the head from before the last push: the merge waits for it to follow.
 		const ghState = join(f.root, "gh-state.json");
 		writeFileSync(ghState, JSON.stringify({ ...JSON.parse(readFileSync(ghState, "utf8")), lag: 2 }));
 		await runner.merge();
 		expect(readFileSync(runner.logPath, "utf8")).toContain("waiting for the pull request head");
+		expect(waits.slice(1)).toEqual([10_000]);
 		const gh = readFileSync(join(f.root, "gh.log"), "utf8");
 		expect(gh).not.toMatch(/^stack /m);
 		expect(gh).toContain("--base main --head w7/child");
@@ -380,10 +392,17 @@ process.stdout.write("DONE late-one\\n");
 			...f.launcher,
 			seats: { ...f.launcher.seats, writer: { command: [process.execPath, join(f.root, "late.js")] } },
 		};
-		const writer = new OneironTicketRunner(late, { env: f.env, routing: {}, retryDelayMs: 0 });
+		const waits: number[] = [];
+		const writer = new OneironTicketRunner(late, {
+			env: f.env,
+			routing: {},
+			sleep: async (ms) => void waits.push(ms),
+		});
 		mkdirSync(writer.worktree, { recursive: true });
 		const { final } = await writer.writerRounds("write", "start", "continue");
 		expect([final.includes("DONE late-one"), readFileSync(join(f.root, "rounds"), "utf8")]).toEqual([true, "15"]);
+		// Each failed round pauses before the next one; the pause never counts toward an end.
+		expect(waits).toEqual(Array(14).fill(30_000));
 	});
 
 	it("keeps a writer session going when DONE is only quoted, and ends it on the exact line", async () => {
@@ -404,11 +423,20 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 			...f.launcher,
 			seats: { ...f.launcher.seats, writer: { command: [process.execPath, join(f.root, "quoting.js")] } },
 		};
-		const writer = new OneironTicketRunner(quoting, { env: f.env, routing: {}, retryDelayMs: 0 });
+		const waits: number[] = [];
+		const writer = new OneironTicketRunner(quoting, {
+			env: f.env,
+			routing: {},
+			sleep: async (ms) => void waits.push(ms),
+		});
 		mkdirSync(writer.worktree, { recursive: true });
 		const { final } = await writer.writerRounds("write", "start", "continue");
-		// Round 3 prints the exact line and then exits 1: a failed seat has not ended its round.
-		expect([final, readFileSync(join(f.root, "quoting"), "utf8")]).toEqual(["Tests pass.\nDONE quote-one", "4"]);
+		// Round 3 prints the exact line and then exits 1: a failed seat has not ended its round, and only it pauses.
+		expect([final, readFileSync(join(f.root, "quoting"), "utf8"), waits]).toEqual([
+			"Tests pass.\nDONE quote-one",
+			"4",
+			[30_000],
+		]);
 		const intents = readFileSync(join(writer.directory, "routing.jsonl"), "utf8").trim().split("\n");
 		expect(intents.map((line) => JSON.parse(line).choice)).toEqual(["continue", "continue", "continue", "done"]);
 	});
@@ -556,7 +584,12 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		f.git(["config", "branch.autoSetupMerge", "true"], f.repo);
 		const ticket = f.ticket("lock-one");
 		ticket.launcher = { ...f.launcher, branchPrefix: "w8", skipBots: true };
-		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		const waits: number[] = [];
+		const runner = new OneironTicketRunner(ticket, {
+			env: f.env,
+			routing: {},
+			sleep: async (ms) => void waits.push(ms),
+		});
 		const execute = runner.run.bind(runner);
 		let locks = 0;
 		let trackingOnCut: number | null = null;
@@ -575,6 +608,8 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 			random.mockRestore();
 		}
 		expect(locks).toBeGreaterThan(1);
+		// One locked fetch, one backoff: a second plus up to four jittered seconds per attempt (no jitter here).
+		expect(waits).toEqual([1_000]);
 		expect(f.git(["rev-parse", "--abbrev-ref", "HEAD"], runner.worktree)).toBe("w8/lock-one");
 		expect(trackingOnCut).toBe(1);
 	});
@@ -775,9 +810,13 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 			...f.launcher,
 			noStacks: true,
 			skipBots: true,
-			timeouts: { ...f.launcher.timeouts, mergePollMs: 1 },
 		};
-		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		const waits: number[] = [];
+		const runner = new OneironTicketRunner(ticket, {
+			env: f.env,
+			routing: {},
+			sleep: async (ms) => void waits.push(ms),
+		});
 		await runner.submit();
 		const execute = runner.run.bind(runner);
 		const log = runner.log;
@@ -808,6 +847,8 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		expect(mergeCalls).toBe(2);
 		expect(runner.state.merged).toBe(true);
 		expect(releasedBeforeBackoff).toBe(true);
+		// Each of the three rate limits backs off one merge poll interval.
+		expect(waits).toEqual([120_000, 120_000, 120_000]);
 	});
 
 	it("retries a throttled update-branch without treating it as a conflict", async () => {
@@ -818,9 +859,13 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 			noStacks: true,
 			skipBots: true,
 			skipFactoryTests: true,
-			timeouts: { ...f.launcher.timeouts, mergePollMs: 1 },
 		};
-		const runner = new OneironTicketRunner(ticket, { env: f.env, routing: {} });
+		const waits: number[] = [];
+		const runner = new OneironTicketRunner(ticket, {
+			env: f.env,
+			routing: {},
+			sleep: async (ms) => void waits.push(ms),
+		});
 		await runner.submit();
 		const statePath = join(f.root, "gh-state.json");
 		const state = JSON.parse(readFileSync(statePath, "utf8"));
@@ -847,6 +892,8 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 		await runner.merge();
 		expect(updates).toBe(1);
 		expect(runner.state.merged).toBe(true);
+		// The throttled update backs off one merge poll interval.
+		expect(waits).toEqual([120_000]);
 	});
 
 	it("confirms a remote branch advanced by a throttled update before reusing it", async () => {
