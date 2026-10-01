@@ -336,7 +336,6 @@ def one_shot(launcher: Path, args: argparse.Namespace, cwd: Path, tools: bool, b
     run["responseModels"] = models
     run["ok"] = run["exitCode"] == 0 and bool(models) and all(model == expected for model in models)
     run["stdoutLines"] = len(run["stdout"].splitlines())
-    run["stdout"] = run["stdout"][-4000:]
     return run
 
 
@@ -391,6 +390,11 @@ def probe(args: argparse.Namespace) -> int:
     receipt["ok"] = all(run["ok"] for run in runs.values())
     receipt_dir = prefix / "receipts" / f"{version}-{platform}"
     receipt_dir.mkdir(parents=True, exist_ok=True)
+    # The full event stream rides beside the receipt; the receipt keeps a tail.
+    for name, run in runs.items():
+        (receipt_dir / f"probe-{name}.out").write_text(run["stdout"])
+        run["stdoutFile"] = str(receipt_dir / f"probe-{name}.out")
+        run["stdout"] = run["stdout"][-4000:]
     (receipt_dir / "PROBE-RECEIPT.json").write_text(json.dumps(receipt, indent=2) + "\n")
     for name, run in runs.items():
         models = run.get("responseModels")
