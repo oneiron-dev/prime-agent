@@ -105,6 +105,9 @@ pub enum WebSocketTransportError {
     Runtime { message: String },
 }
 
+/// Normal closure: the code this side's own close sends (TS
+/// `closeWebSocketSilently(socket, 1000, reason)`).
+pub const WEBSOCKET_CLOSE_CODE_NORMAL: u16 = 1000;
 /// Close code the TS runtime reports for a close frame that carries none
 /// (WHATWG `Status`; probe-pinned as "WebSocket closed 1005").
 pub const WEBSOCKET_CLOSE_CODE_STATUS: u16 = 1005;

@@ -56,6 +56,17 @@ pub fn cleanup_session_resources(session_id: Option<&str>) {
     providers::openai_codex_responses::session::close_websocket_sessions(session_id);
 }
 
+/// Test support (feature `test-support`) for crates that drive the
+/// Responses WebSocket transport end to end: the scripted loopback server
+/// answering WebSocket upgrades and SSE POSTs that the transport's own
+/// tests use.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    pub use crate::providers::responses_websocket::mock_server::{
+        spawn, MockServer, Record, SseReply, Turn, Upgrade,
+    };
+}
+
 pub use providers::simple_options::{default_request_max_tokens, effective_request_max_tokens};
 pub use registry::{Provider, ProviderRegistry};
 pub use stream::{complete, complete_simple, stream, stream_simple};

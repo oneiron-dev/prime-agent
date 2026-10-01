@@ -16,8 +16,8 @@ pub(crate) mod connection;
 pub(crate) mod continuation;
 mod session;
 
-#[cfg(test)]
-mod mock_server;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod mock_server;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -51,6 +51,8 @@ pub(crate) use session::close_sessions;
 const CLOSE_CODE_ABNORMAL: u16 = 1006;
 /// The code a close frame without a status reports (WHATWG 1005).
 const CLOSE_CODE_NO_STATUS: u16 = 1005;
+/// Normal closure: the code this side's own close sends.
+const CLOSE_CODE_NORMAL: u16 = 1000;
 /// The runtime's connect-failure text (undici's handshake failure reason,
 /// which the TS collector adopts as the error event's message).
 const CONNECT_FAILURE_MESSAGE: &str = "Received network error or non-101 status code.";
@@ -227,6 +229,14 @@ fn socket_end_error(end: SocketEnd, owner: &OwnedRequest) -> ResponsesWsError {
         SocketEnd::CloseFrame { code, reason } => {
             closed_error(code.unwrap_or(CLOSE_CODE_NO_STATUS), &reason, true)
         }
+        // This side closed the socket under the request (TS `close(socket,
+        // reason)` reaches the collector as a clean 1000 close): a
+        // disposal or abort stays a cancellation, a replacement is the
+        // close.
+        SocketEnd::LocalClose(reason) => match owner.cancellation() {
+            Some(cancellation) => ResponsesWsError::from_cancellation(cancellation),
+            None => closed_error(CLOSE_CODE_NORMAL, reason.as_str(), true),
+        },
         // A socket death without a close frame is the runtime's 1006 close
         // event (not clean); a dead socket swallows the request frame the
         // same way.

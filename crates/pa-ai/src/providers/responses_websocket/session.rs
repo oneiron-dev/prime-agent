@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::connection::{connect, ConnectFailure, EventDialect, WorkerHandle};
+use super::connection::{connect, CloseReason, ConnectFailure, EventDialect, WorkerHandle};
 use super::continuation::ContinuationAnchor;
 
 /// Idle connections stay cached this long (TS `CACHE_TTL_MS`).
@@ -197,14 +197,15 @@ pub(crate) async fn acquire(
             old.expiry_generation += 1;
             if old.identity != identity {
                 // A route, credential, or handshake change invalidates the
-                // old authenticated connection.
-                old.worker.close();
+                // old authenticated connection, a busy one included: its
+                // request ends with the close.
+                old.worker.close(CloseReason::IdentityChanged);
                 retire_old = true;
             } else if !old.busy && old.worker.is_open() {
                 old.busy = true;
                 reused = Some((old.worker.clone(), old.continuation.clone()));
             } else if !old.busy {
-                old.worker.close();
+                old.worker.close(CloseReason::Done);
                 retire_old = true;
             }
         }
@@ -246,10 +247,14 @@ pub(crate) async fn acquire(
     }
     if let Some(occupant) = state.cache.get(session_id) {
         if !occupant.busy {
-            occupant.worker.close();
+            occupant.worker.close(if occupant.identity == identity {
+                CloseReason::Replaced
+            } else {
+                CloseReason::IdentityChanged
+            });
             state.cache.remove(session_id);
         } else if occupant.identity != identity {
-            occupant.worker.close();
+            occupant.worker.close(CloseReason::IdentityChanged);
         }
         // A busy same-identity occupant finishes its request; the
         // connection-id guards keep its release and timer off this entry.
@@ -295,7 +300,7 @@ pub(crate) fn is_cached(acquired: &Acquired) -> bool {
 /// Return a connection after its request (TS `release`).
 pub(crate) fn release(acquired: &Acquired, disposition: ReleaseDisposition) {
     let Some(session_id) = &acquired.slot else {
-        acquired.worker.close();
+        acquired.worker.close(CloseReason::Done);
         return;
     };
     let connection_id = acquired.worker.connection_id();
@@ -305,7 +310,7 @@ pub(crate) fn release(acquired: &Acquired, disposition: ReleaseDisposition) {
         .get(session_id)
         .is_some_and(|entry| entry.worker.connection_id() == connection_id);
     if disposition == ReleaseDisposition::Discard || !acquired.worker.is_open() {
-        acquired.worker.close();
+        acquired.worker.close(CloseReason::Done);
         if current {
             state.cache.remove(session_id);
         }
@@ -314,7 +319,7 @@ pub(crate) fn release(acquired: &Acquired, disposition: ReleaseDisposition) {
     if !current {
         // The slot moved on (identity change, newer claim): this
         // connection is no longer reusable.
-        acquired.worker.close();
+        acquired.worker.close(CloseReason::IdentityChanged);
         return;
     }
     let Some(entry) = state.cache.get_mut(session_id) else {
@@ -334,7 +339,7 @@ pub(crate) fn release(acquired: &Acquired, disposition: ReleaseDisposition) {
         });
         if expired {
             if let Some(entry) = state.cache.remove(&session_id) {
-                entry.worker.close();
+                entry.worker.close(CloseReason::IdleTimeout);
             }
         }
     });
@@ -357,12 +362,12 @@ pub(crate) fn close_sessions(session_id: Option<&str>) {
     if let Some(session_id) = session_id {
         state.claims.remove(session_id);
         if let Some(entry) = state.cache.remove(session_id) {
-            entry.worker.close();
+            entry.worker.close(CloseReason::SessionCleanup);
         }
     } else {
         state.claims.clear();
         for (_, entry) in state.cache.drain() {
-            entry.worker.close();
+            entry.worker.close(CloseReason::SessionCleanup);
         }
     }
 }

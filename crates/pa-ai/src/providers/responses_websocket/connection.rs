@@ -10,9 +10,14 @@
 //! request carries its own cancellation token, so a reusable connection is
 //! never bound to the first request's token; between requests the worker
 //! keeps watching the socket, so a peer close while idle retires the
-//! connection (callers see it through [`WorkerHandle::is_open`]).
+//! connection (callers see it through [`WorkerHandle::is_open`]). Every
+//! socket wait — the request write included, which a peer that stops
+//! reading can block — races the request's token and the connection's
+//! close signal, so neither a disposal nor a local close waits on the peer.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use futures::stream::SplitStream;
 use futures::{SinkExt, StreamExt};
@@ -26,6 +31,40 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// How long a polite close (the close frame) may wait on the peer before
+/// the socket is simply dropped.
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+/// Why this side closed a connection (TS `close(socket, reason)`): the
+/// close frame's reason, and the text a request it interrupts reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseReason {
+    /// The request finished with the connection (an ephemeral socket, a
+    /// failed or discarded request).
+    Done,
+    /// The owning session was disposed.
+    SessionCleanup,
+    /// The idle connection expired.
+    IdleTimeout,
+    /// A route, credential, or handshake-header change replaced it.
+    IdentityChanged,
+    /// A newer same-identity connection took the session's slot.
+    Replaced,
+}
+
+impl CloseReason {
+    /// The close frame's reason text (the TS wire reasons).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CloseReason::Done => "done",
+            CloseReason::SessionCleanup => "session_cleanup",
+            CloseReason::IdleTimeout => "idle_timeout",
+            CloseReason::IdentityChanged => "connection_identity_changed",
+            CloseReason::Replaced => "connection_replaced",
+        }
+    }
+}
 
 /// Which event family ends one request on the socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +115,8 @@ pub(crate) enum SocketEnd {
     ConsumerGone,
     /// The request frame could not be written (the socket is dead).
     SendFailed,
+    /// This side closed the connection while the request was in flight.
+    LocalClose(CloseReason),
 }
 
 /// A failure before the socket opened.
@@ -99,19 +140,30 @@ pub(crate) enum WorkerEvent {
     End(SocketEnd),
 }
 
-enum WorkerCommand {
-    Send {
-        body: String,
-        events: mpsc::Sender<WorkerEvent>,
-        cancel: Option<CancellationToken>,
-    },
-    Close,
+struct SendRequest {
+    body: String,
+    events: mpsc::Sender<WorkerEvent>,
+    cancel: Option<CancellationToken>,
+}
+
+/// The connection's close signal: the first close wins its reason.
+#[derive(Default)]
+struct Closing {
+    token: CancellationToken,
+    reason: OnceLock<CloseReason>,
+}
+
+impl Closing {
+    fn reason(&self) -> CloseReason {
+        self.reason.get().copied().unwrap_or(CloseReason::Done)
+    }
 }
 
 /// Command handle to one connection's worker task.
 #[derive(Clone)]
 pub(crate) struct WorkerHandle {
-    commands: mpsc::Sender<WorkerCommand>,
+    commands: mpsc::Sender<SendRequest>,
+    closing: Arc<Closing>,
     connection_id: u64,
 }
 
@@ -132,7 +184,7 @@ impl WorkerHandle {
     /// Whether the worker still holds an open socket (TS `readyState ===
     /// 1`): a worker exits once its socket closes or fails.
     pub(crate) fn is_open(&self) -> bool {
-        !self.commands.is_closed()
+        !self.commands.is_closed() && !self.closing.token.is_cancelled()
     }
 
     /// Send one request frame; the worker answers on the returned channel
@@ -145,7 +197,7 @@ impl WorkerHandle {
     ) -> Option<mpsc::Receiver<WorkerEvent>> {
         let (events, receiver) = mpsc::channel(64);
         self.commands
-            .send(WorkerCommand::Send {
+            .send(SendRequest {
                 body,
                 events,
                 cancel,
@@ -155,12 +207,27 @@ impl WorkerHandle {
         Some(receiver)
     }
 
-    /// Ask the worker to close its socket (TS `closeWebSocketSilently`).
-    /// Never blocks: a busy worker closes the socket when its request
-    /// ends, an exited worker needs nothing.
-    pub(crate) fn close(&self) {
-        let _ = self.commands.try_send(WorkerCommand::Close);
+    /// Close the connection now (TS `close(socket, reason)`): an idle
+    /// worker sends the close frame and exits; a busy one interrupts its
+    /// request, which ends with [`SocketEnd::LocalClose`]. Never blocks.
+    pub(crate) fn close(&self, reason: CloseReason) {
+        let _ = self.closing.reason.set(reason);
+        self.closing.token.cancel();
     }
+}
+
+/// Resolves when `cancel` fires; never without one.
+async fn cancelled(cancel: Option<&CancellationToken>) {
+    match cancel {
+        Some(cancel) => cancel.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Send the close frame, giving a peer that stopped reading a bounded
+/// grace before the socket is dropped.
+async fn close_politely(sink: &mut futures::stream::SplitSink<WsStream, Message>) {
+    let _ = tokio::time::timeout(CLOSE_GRACE, sink.close()).await;
 }
 
 fn next_connection_id() -> u64 {
@@ -201,10 +268,17 @@ pub(crate) async fn connect(
         None => handshake.await,
     }
     .map_err(ConnectFailure::Handshake)?;
-    let (commands, receiver) = mpsc::channel::<WorkerCommand>(4);
-    tokio::spawn(connection_worker(stream, receiver, dialect));
+    let (commands, receiver) = mpsc::channel::<SendRequest>(4);
+    let closing = Arc::new(Closing::default());
+    tokio::spawn(connection_worker(
+        stream,
+        receiver,
+        Arc::clone(&closing),
+        dialect,
+    ));
     Ok(WorkerHandle {
         commands,
+        closing,
         connection_id: next_connection_id(),
     })
 }
@@ -213,13 +287,18 @@ pub(crate) async fn connect(
 /// requests, watching the idle socket so a peer close retires it.
 async fn connection_worker(
     stream: WsStream,
-    mut commands: mpsc::Receiver<WorkerCommand>,
+    mut commands: mpsc::Receiver<SendRequest>,
+    closing: Arc<Closing>,
     dialect: EventDialect,
 ) {
     let (mut sink, mut stream) = stream.split();
     loop {
-        let command = tokio::select! {
-            command = commands.recv() => command,
+        let request = tokio::select! {
+            request = commands.recv() => request,
+            () = closing.token.cancelled() => {
+                close_politely(&mut sink).await;
+                return;
+            }
             idle = stream.next() => match idle {
                 // Control frames and stray data between requests carry
                 // nothing a request is waiting for.
@@ -233,37 +312,43 @@ async fn connection_worker(
                 // A close, EOF, or socket error while idle: the connection
                 // is gone, so the worker exits and the handle reads closed.
                 Some(Ok(Message::Close(_)) | Err(_)) | None => {
-                    let _ = sink.close().await;
+                    close_politely(&mut sink).await;
                     return;
                 }
             },
         };
-        let Some(command) = command else {
+        let Some(SendRequest {
+            body,
+            events,
+            cancel,
+        }) = request
+        else {
             return;
         };
-        match command {
-            WorkerCommand::Close => {
-                let _ = sink.close().await;
-                return;
-            }
-            WorkerCommand::Send {
-                body,
-                events,
-                cancel,
-            } => {
-                if sink.send(Message::Text(body.into())).await.is_err() {
-                    let _ = events.send(WorkerEvent::End(SocketEnd::SendFailed)).await;
-                    let _ = sink.close().await;
-                    return;
+        // A request whose token fired while it queued never reaches the
+        // wire (TS checks the signal before `send`).
+        let sent = if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            Err(SocketEnd::Cancelled)
+        } else {
+            tokio::select! {
+                sent = sink.send(Message::Text(body.into())) => {
+                    sent.map_err(|_| SocketEnd::SendFailed)
                 }
-                let end = read_request_events(&mut stream, &events, cancel.as_ref(), dialect).await;
-                let completed = matches!(end, SocketEnd::Completed);
-                let _ = events.send(WorkerEvent::End(end)).await;
-                if !completed {
-                    let _ = sink.close().await;
-                    return;
-                }
+                () = cancelled(cancel.as_ref()) => Err(SocketEnd::Cancelled),
+                () = closing.token.cancelled() => Err(SocketEnd::LocalClose(closing.reason())),
             }
+        };
+        let end = match sent {
+            Ok(()) => {
+                read_request_events(&mut stream, &events, cancel.as_ref(), &closing, dialect).await
+            }
+            Err(end) => end,
+        };
+        let completed = matches!(end, SocketEnd::Completed);
+        let _ = events.send(WorkerEvent::End(end)).await;
+        if !completed {
+            close_politely(&mut sink).await;
+            return;
         }
     }
 }
@@ -276,21 +361,17 @@ async fn read_request_events(
     stream: &mut SplitStream<WsStream>,
     events: &mpsc::Sender<WorkerEvent>,
     cancel: Option<&CancellationToken>,
+    closing: &Closing,
     dialect: EventDialect,
 ) -> SocketEnd {
     loop {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return SocketEnd::Cancelled;
         }
-        let next = stream.next();
-        let message = match cancel {
-            Some(cancel) => {
-                tokio::select! {
-                    () = cancel.cancelled() => return SocketEnd::Cancelled,
-                    message = next => message,
-                }
-            }
-            None => next.await,
+        let message = tokio::select! {
+            () = cancelled(cancel) => return SocketEnd::Cancelled,
+            () = closing.token.cancelled() => return SocketEnd::LocalClose(closing.reason()),
+            message = stream.next() => message,
         };
         let text = match message {
             None => return SocketEnd::Eof,

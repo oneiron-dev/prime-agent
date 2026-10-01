@@ -12,7 +12,7 @@ use crate::providers::openai_codex_responses::errors::CodexStreamError;
 use crate::providers::openai_codex_responses::websocket::{
     ContinuationState, SESSION_WEBSOCKET_CACHE_TTL_MS,
 };
-use crate::providers::responses_websocket::connection::WorkerHandle;
+use crate::providers::responses_websocket::connection::{CloseReason, WorkerHandle};
 
 pub use crate::providers::openai_codex_responses::websocket::WebSocketDebugStats;
 
@@ -124,7 +124,7 @@ pub fn close_websocket_sessions(session_id: Option<&str>) {
             .collect(),
     };
     for worker in entries {
-        worker.close();
+        worker.close(CloseReason::SessionCleanup);
     }
 }
 
@@ -201,7 +201,7 @@ pub fn schedule_session_websocket_expiry(session_id: &str) {
             return;
         }
         if let Some(entry) = state.connections.remove(&session_id) {
-            entry.worker.close();
+            entry.worker.close(CloseReason::IdleTimeout);
         }
     });
 }

@@ -145,22 +145,25 @@ fn seen(records: Vec<Record>) -> Vec<Seen> {
                 .map_or(0, Vec::len),
         )
     };
+    // Connection ends are timing-dependent (a socket closes after its
+    // request settles): the request shape leaves them out.
     records
         .into_iter()
-        .map(|record| match record {
-            Record::Upgrade { connection, .. } => Seen::Upgrade(connection),
+        .filter_map(|record| match record {
+            Record::Upgrade { connection, .. } => Some(Seen::Upgrade(connection)),
             Record::WsRequest { connection, body } => {
                 let (previous, inputs) = summary(&body);
-                Seen::Ws {
+                Some(Seen::Ws {
                     connection,
                     previous,
                     inputs,
-                }
+                })
             }
             Record::SseRequest { body, .. } => {
                 let (previous, inputs) = summary(&body);
-                Seen::Sse { previous, inputs }
+                Some(Seen::Sse { previous, inputs })
             }
+            Record::Closed { .. } => None,
         })
         .collect()
 }
@@ -438,7 +441,17 @@ async fn the_response_hook_sees_the_synthetic_upgrade() {
         *seen_responses.lock().unwrap(),
         vec![(101, std::collections::BTreeMap::new())]
     );
-    server.drain();
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(1),
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+        ]
+    );
 }
 
 /// `websocket` reuses the session's socket but always sends the full
@@ -792,7 +805,7 @@ async fn a_later_claim_owns_the_slot_when_an_earlier_socket_opens_late() {
     // The first handshake is in flight (observed), then the second claim
     // connects and finishes first.
     assert!(matches!(
-        server.next_record().await,
+        server.next_request().await,
         Record::Upgrade { connection: 1, .. }
     ));
     let early = run(
@@ -849,9 +862,12 @@ async fn session_disposal_cancels_stalled_and_connecting_requests() {
         &context(vec![user("a")]),
         Some(&options(Some("dispose-stalled"), None)),
     );
-    assert!(matches!(server.next_record().await, Record::Upgrade { .. }));
     assert!(matches!(
-        server.next_record().await,
+        server.next_request().await,
+        Record::Upgrade { .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
         Record::WsRequest { .. }
     ));
     crate::cleanup_session_resources(Some("dispose-stalled"));
@@ -862,7 +878,10 @@ async fn session_disposal_cancels_stalled_and_connecting_requests() {
         &context(vec![user("b")]),
         Some(&options(Some("dispose-connecting"), None)),
     );
-    assert!(matches!(server.next_record().await, Record::Upgrade { .. }));
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { .. }
+    ));
     crate::cleanup_session_resources(Some("dispose-connecting"));
     let connecting = connecting.result().await;
 
@@ -1123,4 +1142,140 @@ async fn drop_retry_continuation_and_fallback_scenario() {
             },
         ]
     );
+}
+
+/// Session disposal reaches a request whose write is blocked: the peer
+/// completed the upgrade and stopped reading, so the large request frame
+/// backs up once the socket buffers fill. The request settles as disposed
+/// instead of waiting on the peer forever (the write used to ignore the
+/// request's token).
+#[tokio::test]
+async fn disposal_interrupts_a_request_blocked_on_its_write() {
+    let mut server = mock_server::spawn(vec![Upgrade::AcceptSilent], Vec::new()).await;
+    let (opened, socket_ready) = tokio::sync::oneshot::channel::<()>();
+    let opened = std::sync::Mutex::new(Some(opened));
+    let mut request = options(Some("dispose-blocked-write"), None);
+    // The response hook fires once the socket is ready for this request,
+    // right before the frame is written.
+    request.base.on_response = Some(std::sync::Arc::new(move |_response, _model| {
+        if let Some(opened) = opened.lock().unwrap().take() {
+            let _ = opened.send(());
+        }
+    }));
+    // Far beyond the loopback socket buffers: the write cannot complete.
+    let huge = "x".repeat(24 * 1024 * 1024);
+    let pending = stream_openai_responses(
+        &ws_model(&server),
+        &context(vec![user(&huge)]),
+        Some(&request),
+    );
+    socket_ready.await.expect("the socket opened");
+    crate::cleanup_session_resources(Some("dispose-blocked-write"));
+    let message = tokio::time::timeout(std::time::Duration::from_secs(30), pending.result())
+        .await
+        .expect("the blocked write settles once the session is disposed");
+    assert_eq!(
+        (message.stop_reason, message.error_message.as_deref()),
+        (StopReason::Aborted, Some(super::SESSION_DISPOSED_MESSAGE))
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+}
+
+/// A credential change while the session's socket is busy closes that
+/// socket under its request (TS `close(socket,
+/// "connection_identity_changed")`): the started request fails with the
+/// clean close instead of streaming on a connection the session replaced,
+/// and the new request runs on a fresh socket. The close used to wait for
+/// the busy request to end on its own, which a stalled upstream never does.
+#[tokio::test]
+async fn an_identity_change_closes_the_busy_socket_under_its_request() {
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![Turn::EventsThenStall(vec![json!({
+                "type": "response.created", "response": { "id": "resp_stalled" }
+            })])]),
+            Upgrade::Accept(vec![Turn::Events(response("resp_2", "rotated"))]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let stalled = stream_openai_responses(
+        &ws,
+        &context(vec![user("one")]),
+        Some(&options(Some("rotate-busy"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 1, .. }
+    ));
+    let mut rotated = options(Some("rotate-busy"), None);
+    rotated.base.api_key = Some("rotated-key".to_string());
+    let fresh = run(&ws, &context(vec![user("two")]), &rotated).await;
+    assert_eq!(text_of(&fresh), "rotated");
+    let stalled = tokio::time::timeout(std::time::Duration::from_secs(30), stalled.result())
+        .await
+        .expect("the replaced socket's request settles");
+    assert_eq!(
+        (stalled.stop_reason, stalled.error_message.as_deref()),
+        (
+            StopReason::Error,
+            Some("WebSocket closed before response.completed 1000 connection_identity_changed")
+        )
+    );
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(2),
+            Seen::Ws {
+                connection: 2,
+                previous: None,
+                inputs: 1
+            },
+        ]
+    );
+}
+
+/// A caller abort mid-stream ends the request as aborted and closes its
+/// socket (TS `keep = false`): the server sees the connection end, and the
+/// started request never replays over SSE.
+#[tokio::test]
+async fn a_caller_abort_closes_the_streaming_socket() {
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(vec![Turn::EventsThenStall(vec![json!({
+            "type": "response.created", "response": { "id": "resp_aborted" }
+        })])])],
+        vec![SseReply::Events(response("resp_sse", "never"))],
+    )
+    .await;
+    let signal = CancellationToken::new();
+    let mut request = options(Some("abort-closes"), None);
+    request.base.signal = Some(signal.clone());
+    let pending = stream_openai_responses(
+        &ws_model(&server),
+        &context(vec![user("hi")]),
+        Some(&request),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 1, .. }
+    ));
+    signal.cancel();
+    assert_eq!(pending.result().await.stop_reason, StopReason::Aborted);
+    assert_eq!(server.next_closed().await, 1);
+    assert!(!server
+        .drain()
+        .iter()
+        .any(|record| matches!(record, Record::SseRequest { .. })));
 }

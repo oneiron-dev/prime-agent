@@ -1,9 +1,11 @@
-//! Scripted loopback Responses server for the WebSocket transport tests:
-//! one listener answers both WebSocket upgrades and SSE POSTs, and records
-//! every upgrade (with its handshake headers) and every request body in
-//! arrival order. Each record is written before the server answers, so a
-//! test that has seen the client's result reads complete records without
-//! waiting on anything else.
+//! Scripted loopback Responses server for the WebSocket transport tests
+//! (and, through the `test-support` feature, for the crates that drive the
+//! transport end to end): one listener answers both WebSocket upgrades and
+//! SSE POSTs, and records every upgrade (with its handshake headers), every
+//! request body, and every accepted socket's end in arrival order. Each
+//! request record is written before the server answers, so a test that has
+//! seen the client's result reads complete records without waiting on
+//! anything else.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -21,7 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 /// What the server does with one WebSocket upgrade.
-pub(crate) enum Upgrade {
+pub enum Upgrade {
     /// Complete the 101 handshake and answer the socket's requests with
     /// these turns, in order (requests beyond them stall).
     Accept(Vec<Turn>),
@@ -31,10 +33,13 @@ pub(crate) enum Upgrade {
     Hang,
     /// Hold the 101 answer until the gate fires, then accept.
     AcceptWhen(tokio::sync::oneshot::Receiver<()>, Vec<Turn>),
+    /// Complete the 101 handshake, then never read the socket again (the
+    /// client's writes back up once the socket buffers fill).
+    AcceptSilent,
 }
 
 /// The answer to one `response.create` frame on an accepted socket.
-pub(crate) enum Turn {
+pub enum Turn {
     /// Text frames, then wait for the next request.
     Events(Vec<Value>),
     /// The same events as binary frames.
@@ -47,17 +52,19 @@ pub(crate) enum Turn {
     RawText(Vec<&'static str>),
     /// Never answer: the request stalls until the client goes away.
     Stall,
+    /// Events, then stall until the client goes away.
+    EventsThenStall(Vec<Value>),
 }
 
 /// The answer to one SSE POST.
-pub(crate) enum SseReply {
+pub enum SseReply {
     /// `200 text/event-stream` with one `data:` record per event.
     Events(Vec<Value>),
 }
 
 /// One observed request.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Record {
+pub enum Record {
     /// A WebSocket upgrade (1-based connection number) with its headers,
     /// names lowercased, in arrival order.
     Upgrade {
@@ -71,17 +78,22 @@ pub(crate) enum Record {
         headers: Vec<(String, String)>,
         body: Value,
     },
+    /// An accepted WebSocket connection ended (the client closed or went
+    /// away, or the script ended it).
+    Closed { connection: usize },
 }
 
-pub(crate) struct MockServer {
+/// The running server: its base URL and the records it observed.
+pub struct MockServer {
     /// `http://127.0.0.1:<port>/v1`.
-    pub(crate) base_url: String,
+    pub base_url: String,
     records: mpsc::UnboundedReceiver<Record>,
 }
 
 impl MockServer {
     /// Every record observed since the last drain.
-    pub(crate) fn drain(&mut self) -> Vec<Record> {
+    #[must_use]
+    pub fn drain(&mut self) -> Vec<Record> {
         let mut records = Vec::new();
         while let Ok(record) = self.records.try_recv() {
             records.push(record);
@@ -89,10 +101,37 @@ impl MockServer {
         records
     }
 
-    /// Wait for the next record (for requests the client has not finished,
-    /// e.g. a stalled one).
-    pub(crate) async fn next_record(&mut self) -> Record {
-        self.records.recv().await.expect("mock server alive")
+    /// Wait for the next upgrade or request record (for requests the
+    /// client has not finished, e.g. a stalled one), passing over
+    /// connection ends.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the server task is gone.
+    pub async fn next_request(&mut self) -> Record {
+        loop {
+            match self.records.recv().await.expect("mock server alive") {
+                Record::Closed { .. } => {}
+                record @ (Record::Upgrade { .. }
+                | Record::WsRequest { .. }
+                | Record::SseRequest { .. }) => return record,
+            }
+        }
+    }
+
+    /// Wait for the next accepted connection to end; returns its number,
+    /// passing over request records.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the server task is gone.
+    pub async fn next_closed(&mut self) -> usize {
+        loop {
+            match self.records.recv().await.expect("mock server alive") {
+                Record::Closed { connection } => return connection,
+                Record::Upgrade { .. } | Record::WsRequest { .. } | Record::SseRequest { .. } => {}
+            }
+        }
     }
 }
 
@@ -103,7 +142,14 @@ struct Scripts {
     records: mpsc::UnboundedSender<Record>,
 }
 
-pub(crate) async fn spawn(upgrades: Vec<Upgrade>, sse: Vec<SseReply>) -> MockServer {
+/// Start a server answering upgrades and SSE POSTs with the scripts, in
+/// arrival order (an unscripted upgrade is refused with 503, an unscripted
+/// POST answered with 500).
+///
+/// # Panics
+///
+/// Panics when the loopback listener cannot bind.
+pub async fn spawn(upgrades: Vec<Upgrade>, sse: Vec<SseReply>) -> MockServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock bind");
     let port = listener.local_addr().expect("mock addr").port();
     let (records, receiver) = mpsc::unbounded_channel();
@@ -180,6 +226,7 @@ async fn serve(mut socket: TcpStream, scripts: Arc<Scripts>) {
         .pop_front()
         .unwrap_or(Upgrade::Reject(503));
     let turns = match upgrade {
+        Upgrade::AcceptSilent => None,
         Upgrade::Hang => {
             let mut sink = [0u8; 64];
             while matches!(socket.read(&mut sink).await, Ok(read) if read > 0) {}
@@ -187,7 +234,7 @@ async fn serve(mut socket: TcpStream, scripts: Arc<Scripts>) {
         }
         Upgrade::AcceptWhen(gate, turns) => {
             let _ = gate.await;
-            turns
+            Some(turns)
         }
         Upgrade::Reject(status) => {
             let reason = http::StatusCode::from_u16(status)
@@ -203,16 +250,10 @@ async fn serve(mut socket: TcpStream, scripts: Arc<Scripts>) {
             let _ = socket.shutdown().await;
             return;
         }
-        Upgrade::Accept(turns) => turns,
+        Upgrade::Accept(turns) => Some(turns),
     };
     let key = header(&headers, "sec-websocket-key").expect("upgrade key");
-    let accept = {
-        use base64::Engine as _;
-        use sha1::Digest as _;
-        base64::engine::general_purpose::STANDARD.encode(sha1::Sha1::digest(
-            format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
-        ))
-    };
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
     if socket
         .write_all(
             format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n")
@@ -223,89 +264,113 @@ async fn serve(mut socket: TcpStream, scripts: Arc<Scripts>) {
     {
         return;
     }
+    let Some(turns) = turns else {
+        // The silent peer holds the socket open and never reads it.
+        let _held = socket;
+        std::future::pending::<()>().await;
+        return;
+    };
     let mut ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
     let mut turns = VecDeque::from(turns);
-    loop {
-        let body = loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    break serde_json::from_str::<Value>(text.as_str()).expect("request json");
-                }
-                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
-                Some(Ok(Message::Binary(_) | Message::Close(_)) | Err(_)) | None => return,
-            }
-        };
-        let _ = scripts.records.send(Record::WsRequest { connection, body });
-        let Some(turn) = turns.pop_front() else {
-            // Unscripted requests stall until the client goes away.
-            while let Some(Ok(_)) = ws.next().await {}
-            return;
-        };
-        match turn {
-            Turn::Events(events) => {
-                for event in events {
-                    if ws
-                        .send(Message::Text(event.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        return;
+    // Every way the socket's turns end records the connection's end.
+    async {
+        loop {
+            let body = loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        break serde_json::from_str::<Value>(text.as_str()).expect("request json");
                     }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+                    Some(Ok(Message::Binary(_) | Message::Close(_)) | Err(_)) | None => return,
                 }
-            }
-            Turn::BinaryEvents(events) => {
-                for event in events {
-                    let bytes = event.to_string().into_bytes();
-                    if ws.send(Message::Binary(bytes.into())).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            Turn::EventsThenFin(events) => {
-                for event in events {
-                    if ws
-                        .send(Message::Text(event.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                let _ = ws.get_mut().shutdown().await;
-                return;
-            }
-            Turn::EventsThenClose(events, code, reason) => {
-                for event in events {
-                    if ws
-                        .send(Message::Text(event.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                let _ = ws
-                    .close(Some(CloseFrame {
-                        code: CloseCode::from(code),
-                        reason: reason.into(),
-                    }))
-                    .await;
+            };
+            let _ = scripts.records.send(Record::WsRequest { connection, body });
+            let Some(turn) = turns.pop_front() else {
+                // Unscripted requests stall until the client goes away.
                 while let Some(Ok(_)) = ws.next().await {}
                 return;
-            }
-            Turn::RawText(frames) => {
-                for frame in frames {
-                    if ws.send(Message::Text(frame.into())).await.is_err() {
-                        return;
+            };
+            match turn {
+                Turn::Events(events) => {
+                    for event in events {
+                        if ws
+                            .send(Message::Text(event.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
-            }
-            Turn::Stall => {
-                while let Some(Ok(_)) = ws.next().await {}
-                return;
+                Turn::BinaryEvents(events) => {
+                    for event in events {
+                        let bytes = event.to_string().into_bytes();
+                        if ws.send(Message::Binary(bytes.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Turn::EventsThenFin(events) => {
+                    for event in events {
+                        if ws
+                            .send(Message::Text(event.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let _ = ws.get_mut().shutdown().await;
+                    return;
+                }
+                Turn::EventsThenClose(events, code, reason) => {
+                    for event in events {
+                        if ws
+                            .send(Message::Text(event.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let _ = ws
+                        .close(Some(CloseFrame {
+                            code: CloseCode::from(code),
+                            reason: reason.into(),
+                        }))
+                        .await;
+                    while let Some(Ok(_)) = ws.next().await {}
+                    return;
+                }
+                Turn::RawText(frames) => {
+                    for frame in frames {
+                        if ws.send(Message::Text(frame.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Turn::Stall => {
+                    while let Some(Ok(_)) = ws.next().await {}
+                    return;
+                }
+                Turn::EventsThenStall(events) => {
+                    for event in events {
+                        if ws
+                            .send(Message::Text(event.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    while let Some(Ok(_)) = ws.next().await {}
+                    return;
+                }
             }
         }
     }
+    .await;
+    let _ = scripts.records.send(Record::Closed { connection });
 }
 
 async fn serve_sse(

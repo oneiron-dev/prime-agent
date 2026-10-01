@@ -20,14 +20,14 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use crate::providers::responses_websocket::connection::WorkerEvent;
 use crate::providers::responses_websocket::connection::{
-    connect, ConnectFailure, EventDialect, SocketEnd, WorkerHandle,
+    connect, CloseReason, ConnectFailure, EventDialect, SocketEnd, WorkerHandle,
 };
 use crate::providers::responses_websocket::continuation::input_delta;
 
 use crate::providers::openai_codex_responses::errors::{
     CodexProtocolError, CodexStreamError, WebSocketTransportError, WEBSOCKET_CLOSE_CODE_ABNORMAL,
-    WEBSOCKET_CLOSE_CODE_PROTOCOL, WEBSOCKET_CLOSE_CODE_STATUS, WEBSOCKET_CLOSE_CODE_TOO_BIG,
-    WEBSOCKET_CONNECTION_ENDED_REASON,
+    WEBSOCKET_CLOSE_CODE_NORMAL, WEBSOCKET_CLOSE_CODE_PROTOCOL, WEBSOCKET_CLOSE_CODE_STATUS,
+    WEBSOCKET_CLOSE_CODE_TOO_BIG, WEBSOCKET_CONNECTION_ENDED_REASON,
 };
 use crate::providers::openai_codex_responses::session::{session_state, CachedConnection};
 
@@ -216,6 +216,11 @@ pub(crate) fn codex_socket_end(end: SocketEnd) -> Result<(), CodexStreamError> {
             )))
         }
         SocketEnd::Read(error) => Err(CodexStreamError::Transport(bun_read_failure(&error))),
+        // This side closed the socket mid-request (session cleanup): the
+        // runtime's close event carries the code and reason it sent.
+        SocketEnd::LocalClose(reason) => Err(CodexStreamError::Transport(
+            WebSocketTransportError::close(WEBSOCKET_CLOSE_CODE_NORMAL, reason.as_str()),
+        )),
         // Port of `parseWebSocket`'s JSON failure: a non-transport protocol
         // error, thrown without SSE fallback.
         SocketEnd::InvalidJson { error, text } => {
@@ -270,9 +275,10 @@ impl AcquiredConnection {
             })
     }
 
-    /// Port of `closeWebSocketSilently`: ask the worker to close the socket.
+    /// Port of `closeWebSocketSilently` (code 1000, reason `done`): close
+    /// the socket.
     pub fn close(&self) {
-        self.worker.close();
+        self.worker.close(CloseReason::Done);
     }
 }
 
