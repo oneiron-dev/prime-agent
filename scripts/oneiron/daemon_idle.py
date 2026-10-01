@@ -56,13 +56,10 @@ LIST_TIMEOUT_SECONDS = 30.0
 
 
 def default_socket_path() -> Path:
-    """The supervisor socket prime-agent-rs exports (its launcher logic:
-    PRIME_AGENT_RS_SOCKET_DIR, else ${TMPDIR:-/tmp}/pa-rs-<uid>)."""
-    tmp = (os.environ.get("TMPDIR") or "/tmp").rstrip("/") or "/"
-    sock_dir = os.environ.get("PRIME_AGENT_RS_SOCKET_DIR") or f"{tmp}/pa-rs-{os.getuid()}"
-    if not os.path.isabs(sock_dir):
-        raise SystemExit(f"error: PRIME_AGENT_RS_SOCKET_DIR must be an absolute path: {sock_dir}")
-    return Path(sock_dir).resolve() / "daemon.sock"
+    """The supervisor socket prime-agent-rs exports: the launcher's socket
+    dir (PRIME_AGENT_RS_SOCKET_DIR, else ${TMPDIR:-/tmp}/pa-rs-<uid>), with
+    the launcher's checks (side_by_side.runtime_dirs)."""
+    return sbs.runtime_dirs()["socket dir"] / "daemon.sock"
 
 
 class LineReader:
@@ -143,9 +140,11 @@ def inspect(socket_path: Path, prefix: Path) -> dict:
     """The Rust supervisor at socket_path, classified (see the module doc)."""
     socket_path = Path(os.path.abspath(socket_path))
     report: dict = {"socket": str(socket_path)}
-    for root in sbs.protected_roots():
-        if sbs.overlaps(socket_path, root):
-            return {**report, "state": "refused", "detail": f"the socket path overlaps TS state at {root}"}
+    # Judged by its canonical spelling against the one protected set, the
+    # TS socket dirs under $TMPDIR and /tmp included (side_by_side).
+    root = sbs.ts_state_overlap(sbs.canonical("Rust socket", socket_path))
+    if root is not None:
+        return {**report, "state": "refused", "detail": f"the socket path overlaps TS state at {root}"}
     try:
         mode = socket_path.lstat().st_mode
     except FileNotFoundError:

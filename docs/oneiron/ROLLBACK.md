@@ -30,7 +30,10 @@ python3 scripts/oneiron/side_by_side.py rollback --to 0.9.8-oneiron.20261001.1
 prime-agent-rs --version
 ```
 
-`rollback`:
+`rollback` first makes the launcher's own checks, before the swap rather than after it: the
+agent dir, socket dir and kernel venv against TS state, no link in the agent dir but
+`models.json`, no link in the prefix but `current` and `previous`. An agent dir still holding
+the old `skills` link is refused here; `rollout` or `install` replaces it. Then it:
 
 1. Refuses a version that is not installed (an executable `prime-agent` plus a `package.json`
    naming that version) and the version that is already current. It holds the install

@@ -150,22 +150,25 @@ def git_out(repo: Path, *args: str) -> str:
 
 class FeedFixture(unittest.TestCase):
     """A temp prefix (whose feed/ is the default feed), one source checkout,
-    and host_platform pinned to the platform under test."""
+    host_platform pinned to the platform under test, and the module's HOME
+    and system temp root in the temp dir (so its TS install tree is too)."""
 
     host = PLATFORM
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.prefix = self.root / "share" / "prime-agent-oneiron-rs"
         self.feed = self.prefix / "feed"
         self.source = make_source_repo(self.root / "src")
-        self.saved = (release_feed.host_platform, side_by_side.TS_PREFIX)
+        self.saved = (release_feed.host_platform, side_by_side.HOME, side_by_side.SYSTEM_TMP)
         release_feed.host_platform = lambda: self.host
-        side_by_side.TS_PREFIX = self.root / "ts-install"
+        side_by_side.HOME = self.root / "home"
+        side_by_side.SYSTEM_TMP = self.root / "systmp"
+        self.ts_install = side_by_side.HOME / ".local" / "share" / "prime-agent-oneiron"
 
     def tearDown(self) -> None:
-        release_feed.host_platform, side_by_side.TS_PREFIX = self.saved
+        release_feed.host_platform, side_by_side.HOME, side_by_side.SYSTEM_TMP = self.saved
         self.tmp.cleanup()
 
     def package(self, package_dir: Path, *extra: str, version: str = VERSION, source: Path | None = None) -> int:
@@ -334,21 +337,30 @@ class PackageTests(FeedFixture):
                          ["v0.9.8-oneiron.20261001.10", "v0.9.8-oneiron.20261001.9"])
 
     def test_a_feed_inside_ts_state_is_refused(self) -> None:
-        with self.assertRaisesRegex(SystemExit, "overlaps protected TS state"):
-            self.package(make_package_dir(self.root / "pkg"), "--feed-dir", str(side_by_side.TS_PREFIX / "feed"))
+        # The feed is judged like every other destination, by its canonical
+        # spelling: an alias into the TS install tree is the TS tree.
+        self.ts_install.mkdir(parents=True)
+        alias = self.root / "alias"
+        alias.symlink_to(self.ts_install.parent)
+        package_dir = make_package_dir(self.root / "pkg")
+        for feed in (self.ts_install / "feed", self.ts_install, alias / "prime-agent-oneiron" / "feed"):
+            with self.subTest(feed=str(feed)), self.assertRaisesRegex(
+                    SystemExit, f"refusing feed dir .*: it overlaps TS state at {self.ts_install}$"):
+                self.package(package_dir, "--feed-dir", str(feed))
+        self.assertEqual(os.listdir(self.ts_install), [])
 
     def test_a_symlinked_dir_inside_the_feed_is_never_written_through(self) -> None:
         # The feed root is checked against TS state; a link further down
         # (releases/, or one release dir) must not carry the writes there.
-        side_by_side.TS_PREFIX.mkdir()
+        self.ts_install.mkdir(parents=True)
         for parts in (("releases",), ("releases", f"v{VERSION}")):
             with self.subTest(parts=parts):
                 link = self.feed.joinpath(*parts)
                 link.parent.mkdir(parents=True, exist_ok=True)
-                link.symlink_to(side_by_side.TS_PREFIX, target_is_directory=True)
+                link.symlink_to(self.ts_install, target_is_directory=True)
                 with self.assertRaisesRegex(SystemExit, "is not a plain directory"):
                     self.package(make_package_dir(self.root / f"pkg-{len(parts)}"))
-                self.assertEqual(os.listdir(side_by_side.TS_PREFIX), [])
+                self.assertEqual(os.listdir(self.ts_install), [])
                 link.unlink()
 
 

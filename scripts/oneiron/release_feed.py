@@ -71,11 +71,10 @@ def host_platform() -> str:
 
 
 def feed_dir_for(args: argparse.Namespace, prefix: Path) -> Path:
-    feed_dir = (args.feed_dir or prefix / "feed").expanduser()
-    for root in sbs.protected_roots():
-        if sbs.overlaps(feed_dir, root):
-            raise SystemExit(f"error: feed dir {feed_dir} overlaps protected TS state at {root}")
-    return feed_dir
+    """--feed-dir (default <prefix>/feed), canonical and checked against TS
+    state like every other destination (side_by_side.refuse_ts_state)."""
+    raw = os.path.expanduser(args.feed_dir) if args.feed_dir else str(prefix / "feed")
+    return sbs.refuse_ts_state("feed dir", sbs.checked_path("--feed-dir", raw))
 
 
 def version_key(version: str) -> tuple:
@@ -201,17 +200,16 @@ def decoder_row(decoder: Path, binary: Path, base: str, version: str, platform: 
 
 def place_artifact(source: Path, target: Path, sha256: str) -> None:
     """Copy an artifact into the release dir; one already there must be the
-    same bytes (a re-run), never replaced. The copy goes through a
-    no-follow temp, so a planted link is never written through."""
+    same bytes (a re-run), never replaced. The copy goes through an
+    exclusive temp (side_by_side.replacing), so a planted link is never
+    written through."""
     if target.exists() or target.is_symlink():
         if target.is_symlink() or sbs.sha256_file(target) != sha256:
             raise SystemExit(f"error: {target} already exists with different bytes; releases are immutable, "
                              "bump the build number")
         return
-    temp = target.parent / f".{target.name}.tmp-{os.getpid()}"
-    with source.open("rb") as reader, sbs.open_new(temp) as writer:
+    with source.open("rb") as reader, sbs.replacing(target) as writer:
         shutil.copyfileobj(reader, writer)
-    os.replace(temp, target)
 
 
 def publish(feed_dir: Path, version: str, base: str, source: dict, row: dict, tarball: Path,
@@ -264,8 +262,7 @@ def publish(feed_dir: Path, version: str, base: str, source: dict, row: dict, ta
 
 
 def package(args: argparse.Namespace) -> int:
-    prefix = args.prefix.expanduser()
-    feed_dir = feed_dir_for(args, prefix)
+    feed_dir = feed_dir_for(args, sbs.cli_prefix(args))
     version = args.version
     sbs.check_version(version)
     base, platform, stage, expected_executable = read_package_dir(args.package_dir.expanduser())

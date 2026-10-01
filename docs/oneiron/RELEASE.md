@@ -73,20 +73,25 @@ feed pointers forward, so a release first published with `--no-promote` can be p
 running `package` again without it. Different bytes for a platform that is already published
 are refused, so bump `N`. A second platform joins a release only from the same source facts.
 To get both platforms into one feed, copy the feed dir to the Mac (for example with rsync), run
-`package --feed-dir <copy>` there, and copy it back. There is no upload step. Below the feed
-root, `releases/` and each release dir must be real directories; a symlinked one is refused
-before anything is written through it (the same holds for `receipts/` under the install
-prefix).
+`package --feed-dir <copy>` there, and copy it back. There is no upload step. The feed dir is
+checked like every other destination (`RUST-BASE.md`, the protected set): by its canonical
+spelling, it may not equal, sit in or contain TS state. Below the feed root, `releases/` and
+each release dir must be real directories; a symlinked one is refused before anything is
+written through it. The install prefix may hold no link but `current` and `previous`, so a
+symlinked `receipts/` there is refused too.
 
 ## 2. Roll out (on each host)
 
 ```sh
 python3 scripts/oneiron/side_by_side.py status
-python3 scripts/oneiron/side_by_side.py rollout [--version <version>] [--tools]
+python3 scripts/oneiron/side_by_side.py rollout [--version <version>] [--tools] [--refresh-skills] [--skill-hubs <dir>]
 ```
 
-In order (the whole run holds the install prefix's lock, so a second `rollout` or `rollback`
-started meanwhile is turned away before it writes anything):
+First, before anything is written, the same checks as `install`: the prefix, the bin dir and
+the agent dir, socket dir and kernel venv the launcher will use are checked against TS state,
+the prefix may hold no link but `current` and `previous`, and the agent dir no link but
+`models.json`. Then, in order (the whole run holds the install prefix's lock, so a second
+`rollout` or `rollback` started meanwhile is turned away before it writes anything):
 
 1. **Verify.** Reads the release's row for this host's platform. `manifest.json`,
    `SHA256SUMS` and the tarball's sha256 must all agree. The hash is taken on a private copy,
@@ -103,7 +108,10 @@ started meanwhile is turned away before it writes anything):
 3. **Install** to `<prefix>/<version>/`. The executable must match the release row. If an
    earlier attempt left the same version installed but unselected, it is reused only when its
    whole payload (every file, its content and executable bit) equals the verified tarball's.
-   The receipt records that payload digest; `rollback` checks it later.
+   The receipt records that payload digest; `rollback` checks it later. The agent dir is then
+   seeded the way `install` seeds it (`RUST-BASE.md`): a `models.json` link, its own skills
+   (hub categories rendered for it, the rest a snapshot; kept unless `--refresh-skills`), a
+   one-time `settings.json` copy, never `auth.json`.
 4. **Probe before selecting.** A scratch launcher (the real template) points at the new
    install. `--version` and a one-shot on `cpa-r`/`gpt-6.1-sol` must succeed; this is a real
    provider call. `--tools` also runs a kernel turn. If the probe fails, the version stays

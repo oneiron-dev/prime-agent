@@ -83,7 +83,7 @@ class FakeRustDaemon:
 class RolloutFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.home = self.root / "home"
         self.home.mkdir()
         self.fake_tmp = self.root / "tmp"
@@ -102,10 +102,9 @@ class RolloutFixture(unittest.TestCase):
             "PRIME_AGENT_RS_SOCKET_DIR": str(self.root / "s"),
             "PRIME_AGENT_RS_KERNEL_VENV": str(self.root / "venv-rs"),
         })
-        self.saved = (side_by_side.HOME, side_by_side.TS_PREFIX, side_by_side.TS_AGENT_DIR, side_by_side.SYSTEM_TMP,
+        self.saved = (side_by_side.HOME, side_by_side.TS_AGENT_DIR, side_by_side.SYSTEM_TMP,
                       release_feed.host_platform)
         side_by_side.HOME = self.home
-        side_by_side.TS_PREFIX = self.home / ".local" / "share" / "prime-agent-oneiron"
         side_by_side.TS_AGENT_DIR = self.home / ".prime" / "agent"
         side_by_side.SYSTEM_TMP = self.system_tmp
         side_by_side.TS_AGENT_DIR.mkdir(parents=True)
@@ -122,7 +121,7 @@ class RolloutFixture(unittest.TestCase):
         self.source = fixtures.make_source_repo(self.root / "src")
 
     def tearDown(self) -> None:
-        (side_by_side.HOME, side_by_side.TS_PREFIX, side_by_side.TS_AGENT_DIR, side_by_side.SYSTEM_TMP,
+        (side_by_side.HOME, side_by_side.TS_AGENT_DIR, side_by_side.SYSTEM_TMP,
          release_feed.host_platform) = self.saved
         for key, value in self.saved_env.items():
             if value is None:
@@ -513,7 +512,8 @@ class RolloutTests(RolloutFixture):
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
         (self.prefix / "receipts").symlink_to(elsewhere, target_is_directory=True)
-        with self.assertRaisesRegex(SystemExit, "is not a plain directory"):
+        with self.assertRaisesRegex(SystemExit, "only `current` and `previous` may be links in it, "
+                                                "found: .*/receipts$"):
             self.main("rollout", "--version", V1)
         self.assertEqual((os.listdir(elsewhere), (self.prefix / V1).exists()), ([], False))
 
@@ -588,6 +588,44 @@ class RolloutTests(RolloutFixture):
                          ("failed", "verify", {"vouchedByReceipt": False}, []))
         self.assertIn(f"no receipt shows {V2} ever ran as current", receipt["failure"]["message"])
         self.assertEqual(os.readlink(self.prefix / "current"), V1)
+
+    def test_rollout_seeds_the_agent_dir_as_install_does_and_replaces_an_old_skills_link(self) -> None:
+        # The installer's agent-dir rules: own skills (a snapshot here: no
+        # hubs lock), never a link into the TS tree; the old layout's link is
+        # the one link a seeding run may replace.
+        ts_skills = side_by_side.TS_AGENT_DIR / "skills"
+        (ts_skills / "grok").mkdir(parents=True)
+        (ts_skills / "grok" / "SKILL.md").write_text("# grok\n")
+        agent_dir = self.root / "agent-rs"
+        agent_dir.mkdir()
+        (agent_dir / "skills").symlink_to(ts_skills)
+        self.publish(V1)
+        self.assertEqual(self.main("rollout", "--version", V1), 0)
+        skills = self.receipt(V1)["agentDir"]["seeded"]["skills"]
+        self.assertEqual((skills["skillsSource"], skills["replaced"]), ("snapshot-fallback", f"link -> {ts_skills}"))
+        self.assertFalse((agent_dir / "skills").is_symlink())
+        self.assertEqual((agent_dir / "skills" / "grok" / "SKILL.md").read_text(), "# grok\n")
+
+    def test_rollout_and_rollback_refuse_an_agent_dir_the_launcher_would_refuse(self) -> None:
+        self.publish(V1)
+        self.publish(V2)
+        self.assertEqual(self.main("rollout", "--version", V1), 0)
+        self.assertEqual(self.main("rollout", "--version", V2), 0)
+        sessions = side_by_side.TS_AGENT_DIR / "sessions"
+        sessions.mkdir()
+        link = self.root / "agent-rs" / "sessions"
+        link.symlink_to(sessions)
+        receipts_before = {path.relative_to(self.prefix): path.read_bytes()
+                           for path in (self.prefix / "receipts").rglob("*.json")}
+        for argv in (("rollback",), ("rollout", "--version", V1)):
+            with self.subTest(argv=argv), self.assertRaisesRegex(
+                    SystemExit, f"only models.json may be a link in it, found: {link}$"):
+                self.main(*argv)
+        # Refused before the lock and the swap: no receipt, the pointers as they were.
+        self.assertEqual({path.relative_to(self.prefix): path.read_bytes()
+                          for path in (self.prefix / "receipts").rglob("*.json")}, receipts_before)
+        self.assertEqual((os.readlink(self.prefix / "current"), os.readlink(self.prefix / "previous")), (V2, V1))
+        self.assertEqual(os.listdir(sessions), [])
 
     def test_rollback_refuses_while_the_rust_daemon_is_busy(self) -> None:
         self.publish(V1)

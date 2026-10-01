@@ -171,9 +171,13 @@ def launcher_version(bin_dir: Path) -> dict:
 
 
 def rollout(args: argparse.Namespace) -> int:
-    prefix = args.prefix.expanduser()
-    bin_dir = args.bin_dir.expanduser()
-    sbs.check_prefix(prefix, bin_dir)
+    # The install's checks, before anything is written: the prefix and bin
+    # dir, the agent dir, socket dir and kernel venv the seeder and the
+    # launcher will use, the links in the prefix and the agent dir, the feed.
+    prefix, bin_dir = sbs.cli_dirs(args)
+    runtime = sbs.runtime_dirs()
+    sbs.check_prefix_tree(prefix)
+    sbs.check_agent_tree(runtime["agent dir"], runtime["kernel venv"], old_skills_link=True)
     feed_dir = release_feed.feed_dir_for(args, prefix)
     platform = release_feed.host_platform()
     version = args.version
@@ -190,7 +194,7 @@ def rollout(args: argparse.Namespace) -> int:
     # re-verifies it and finishes an interrupted activation); the swap
     # itself is then a no-op.
     with sbs.locked(prefix):
-        receipt_dir = sbs.plain_dir(prefix, "receipts", f"{version}-{platform}")
+        receipt_dir = sbs.receipt_dir(prefix, version, platform)
         receipt = Receipt(receipt_dir / "ACTIVATION-RECEIPT.json", ACTIVATION_SCHEMA, version=version,
                           platform=platform, feedDir=str(feed_dir), before=pointer_state(prefix, bin_dir))
         checks = receipt.data["checks"]
@@ -208,7 +212,9 @@ def rollout(args: argparse.Namespace) -> int:
                     receipt.data["install"] = install_release(prefix, version, platform, release)
                     checks["payloadMatchesRelease"] = True
                 with receipt.phase("agent-dir"):
-                    receipt.data["agentDir"] = sbs.seed_agent_dir(sbs.rs_agent_dir(), sbs.TS_AGENT_DIR)
+                    receipt.data["agentDir"] = sbs.seed_agent_dir(runtime["agent dir"], sbs.TS_AGENT_DIR,
+                                                                  sbs.hubs_repo(args),
+                                                                  refresh_skills=args.refresh_skills)
                 with receipt.phase("probe"):
                     probe_unselected(receipt, prefix, bin_dir, version, platform, args, scratch)
                 with receipt.phase("idle-recheck"):
@@ -314,10 +320,9 @@ def probe_unselected(receipt: Receipt, prefix: Path, bin_dir: Path, version: str
     probe_prefix.mkdir()
     (probe_prefix / "current").symlink_to(prefix / version)
     launcher = sbs.write_launcher(scratch / "probe-bin", probe_prefix)
-    result = sbs.run_probe(launcher, version, platform, prefix / "receipts" / f"{version}-{platform}",
-                           bin_dir / sbs.TS_LAUNCHER_NAME, args)
-    receipt.data["probe"] = {"ok": result["ok"], "receipt": str(prefix / "receipts" / f"{version}-{platform}" /
-                                                                "PROBE-RECEIPT.json"),
+    result = sbs.run_probe(launcher, prefix, version, platform, bin_dir / sbs.TS_LAUNCHER_NAME, args)
+    receipt.data["probe"] = {"ok": result["ok"],
+                             "receipt": str(sbs.receipt_dir(prefix, version, platform) / "PROBE-RECEIPT.json"),
                              "runs": {name: {"ok": run["ok"], "exitCode": run["exitCode"], "seconds": run["seconds"]}
                                       for name, run in result["runs"].items()},
                              "isolation": result["isolation"]["checks"]}
@@ -383,9 +388,12 @@ def vouching_receipts(prefix: Path, version: str, platform: str) -> list[dict]:
 
 
 def rollback(args: argparse.Namespace) -> int:
-    prefix = args.prefix.expanduser()
-    bin_dir = args.bin_dir.expanduser()
-    sbs.check_prefix(prefix, bin_dir)
+    # The launcher's own checks, made before the swap rather than after it:
+    # a rolled-back launcher that refuses to start is no rollback.
+    prefix, bin_dir = sbs.cli_dirs(args)
+    runtime = sbs.runtime_dirs()
+    sbs.check_prefix_tree(prefix)
+    sbs.check_agent_tree(runtime["agent dir"], runtime["kernel venv"], old_skills_link=False)
     current = sbs.read_link(prefix / "current")
     target = args.to or sbs.read_link(prefix / "previous")
     if target is None:
@@ -401,7 +409,7 @@ def rollback(args: argparse.Namespace) -> int:
     platform = receipt_platform(prefix, target) or release_feed.host_platform()
 
     with sbs.locked(prefix):
-        receipt_dir = sbs.plain_dir(prefix, "receipts", f"{target}-{platform}")
+        receipt_dir = sbs.receipt_dir(prefix, target, platform)
         receipt = Receipt(receipt_dir / "ROLLBACK-RECEIPT.json", ROLLBACK_SCHEMA, fromVersion=current,
                           toVersion=target, platform=platform, before=pointer_state(prefix, bin_dir))
         checks = receipt.data["checks"]
@@ -460,8 +468,7 @@ def receipt_summary(path: Path) -> dict:
 
 
 def status(args: argparse.Namespace) -> int:
-    prefix = args.prefix.expanduser()
-    bin_dir = args.bin_dir.expanduser()
+    prefix, bin_dir = sbs.cli_dirs(args)
     feed_dir = release_feed.feed_dir_for(args, prefix)
     receipts = prefix / "receipts"
     installed = []
