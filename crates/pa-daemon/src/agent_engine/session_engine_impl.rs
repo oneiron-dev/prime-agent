@@ -402,6 +402,20 @@ impl SessionEngine for AgentSessionEngine {
         {
             target.transport = Some(transport);
         }
+        // An armed image route reinstalls its stored targets later in the
+        // episode (a failover switch, the settle's restore): they follow
+        // the switch too, or the old transport would come back.
+        if let Some(route) = self
+            .image_route
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            route.target.transport = Some(transport);
+            if let Some(session_target) = route.session_target.as_mut() {
+                session_target.transport = Some(transport);
+            }
+        }
     }
 
     fn configure_model(&self, selection: EngineModelSelection) {

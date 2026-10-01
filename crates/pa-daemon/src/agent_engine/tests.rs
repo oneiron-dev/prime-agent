@@ -22,6 +22,7 @@ mod rlm_children;
 mod saved_context;
 mod session;
 mod streaming;
+mod transport;
 
 fn bare_engine(dir: &std::path::Path) -> AgentSessionEngine {
     let agent_dir = dir.join("agent");
