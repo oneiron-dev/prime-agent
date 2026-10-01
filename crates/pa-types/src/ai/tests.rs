@@ -185,6 +185,54 @@ fn model_with_compat_roundtrip() {
     assert_roundtrip::<Model>(
         r#"{"id":"m2","name":"M2","api":"openai-completions","provider":"p","baseUrl":"https://y","reasoning":false,"input":["text"],"cost":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100,"compat":{"thinkingFormat":"openrouter","openRouterRouting":{"only":["a"],"sort":{"by":"price","partition":"model"},"max_price":{"prompt":"0.5","completion":2}}}}"#,
     );
+    // Anthropic compat holding only the shared keys (the `cpa-a`
+    // session-affinity opt-in) round-trips unchanged.
+    assert_roundtrip::<Model>(
+        r#"{"id":"m3","name":"M3","api":"anthropic-messages","provider":"cpa-a","baseUrl":"http://localhost:8317","reasoning":true,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":32000,"compat":{"sendSessionAffinityHeaders":true,"supportsLongCacheRetention":false}}"#,
+    );
+}
+
+/// The Anthropic view decodes shared-key-only objects that the key sniff
+/// files under the completions shape, ignoring keys of other shapes.
+#[test]
+fn anthropic_view_reads_shared_keys_the_sniff_files_as_completions() {
+    let compat = |value: serde_json::Value| ModelCompat {
+        raw: value.as_object().cloned().unwrap(),
+    };
+    let shared_only = compat(serde_json::json!({
+        "sendSessionAffinityHeaders": true,
+        "supportsLongCacheRetention": false,
+    }));
+    assert!(matches!(
+        shared_only.kind(),
+        Ok(CompatKind::OpenAiCompletions(_))
+    ));
+    assert_eq!(
+        shared_only.anthropic_messages().unwrap(),
+        AnthropicMessagesCompat {
+            supports_eager_tool_input_streaming: None,
+            supports_long_cache_retention: Some(false),
+            send_session_affinity_headers: Some(true),
+        }
+    );
+    let mixed = compat(serde_json::json!({
+        "supportsEagerToolInputStreaming": false,
+        "sendSessionAffinityHeaders": true,
+        "cacheControlFormat": "anthropic",
+    }));
+    assert_eq!(
+        mixed.anthropic_messages().unwrap(),
+        AnthropicMessagesCompat {
+            supports_eager_tool_input_streaming: Some(false),
+            supports_long_cache_retention: None,
+            send_session_affinity_headers: Some(true),
+        }
+    );
+    assert!(
+        compat(serde_json::json!({ "sendSessionAffinityHeaders": "yes" }))
+            .anthropic_messages()
+            .is_err()
+    );
 }
 
 #[test]

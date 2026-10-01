@@ -15,10 +15,11 @@ use crate::event_stream::{
 };
 use crate::models::{calculate_cost, CostOverrides};
 use crate::providers::anthropic::convert::map_stop_reason;
+use crate::providers::anthropic::headers::build_request_headers;
 use crate::providers::anthropic::params::build_params;
 use crate::providers::anthropic::{
-    build_request_headers, from_claude_code_name, get_cache_control,
-    should_use_fine_grained_tool_streaming_beta, AnthropicOptions,
+    from_claude_code_name, get_cache_control, should_use_fine_grained_tool_streaming_beta,
+    AnthropicOptions,
 };
 use crate::types::{
     done_reason, error_reason, AssistantContent, AssistantMessage, Context, Model,
@@ -207,6 +208,10 @@ async fn run_stream(
         .and_then(|options| options.interleaved_thinking)
         .unwrap_or(true);
     let use_fine_grained = should_use_fine_grained_tool_streaming_beta(model, context);
+    // Retention resolves first: `none` drops the body cache markers and
+    // the generated session-affinity headers alike (TS resolves it before
+    // `getSessionAffinityHeaders`).
+    let (retention, cache_control) = get_cache_control(model, base_options.cache_retention);
     let (headers, is_oauth) = build_request_headers(
         model,
         &api_key,
@@ -214,9 +219,9 @@ async fn run_stream(
         use_fine_grained,
         base_options.headers.as_ref(),
         base_options.session_id.as_deref(),
+        retention,
     );
 
-    let (_retention, cache_control) = get_cache_control(model, base_options.cache_retention);
     let uses_anthropic_cache_pricing = has_standard_anthropic_cache_pricing(model);
     let mut cache_write_cost: Option<f64> = match (&cache_control, uses_anthropic_cache_pricing) {
         (Some(cache_control), true) => Some(get_anthropic_cache_write_cost(

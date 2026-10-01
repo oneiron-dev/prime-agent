@@ -86,6 +86,12 @@ pub struct AnthropicMessagesCompat {
     pub supports_eager_tool_input_streaming: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_long_cache_retention: Option<bool>,
+    /// Send the session-affinity header pair for sticky proxy routing.
+    /// The key is shared with the OpenAI-completions shape, so it never
+    /// selects this shape in [`ModelCompat::kind`]; read it through
+    /// [`ModelCompat::anthropic_messages`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_session_affinity_headers: Option<bool>,
 }
 
 /// TS models `Model.compat` as an API-dependent conditional type. On the wire
@@ -159,5 +165,21 @@ impl ModelCompat {
                 serde_json::from_value(value)?,
             )))
         }
+    }
+
+    /// The Anthropic Messages view of the raw object, whatever shape
+    /// [`ModelCompat::kind`] would sniff. An `anthropic-messages` model
+    /// reads its own fields from the configured object (TS reads
+    /// `model.compat?.<field>` directly), and an object holding only shared
+    /// keys (`sendSessionAffinityHeaders`, `supportsLongCacheRetention`)
+    /// sniffs as the completions shape. Unknown keys are ignored, so the
+    /// view loses nothing this API reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `serde_json` error when an Anthropic key carries a value
+    /// of the wrong type.
+    pub fn anthropic_messages(&self) -> Result<AnthropicMessagesCompat, serde_json::Error> {
+        serde_json::from_value(Value::Object(self.raw.clone()))
     }
 }
