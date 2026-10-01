@@ -168,7 +168,10 @@ pub(crate) fn build_request_headers(
         }
     }
 
-    // withOpenCodeHeaders: session header for opencode providers.
+    // withOpenCodeHeaders: session header for opencode providers. Known
+    // divergence, outside session affinity: the TS fork (bf4d2c6ca) sends
+    // the raw id as `x-opencode-session` with `User-Agent: prime-agent`,
+    // both beneath the merged headers; this sends `session_id` over them.
     if model.provider == "opencode" || model.provider == "opencode-go" {
         if let Some(session_id) = session_id {
             headers.insert("session_id".into(), json!(session_id));
