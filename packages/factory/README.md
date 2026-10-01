@@ -84,10 +84,10 @@ messages through the agent binary (`send --json`): `--agent-bin`, else the recor
 the launcher host is local, else `PRIME_AGENT_FACTORY_AGENT_BIN`, else `prime-agent`. An SSH launcher host's
 recorded path names a binary over there, so the watchdog of such a factory refuses to start without `--agent-bin`
 or `PRIME_AGENT_FACTORY_AGENT_BIN`. Every pass re-reads the factory config, so a relaunch that switched binaries
-reaches a running watchdog (and a running `serve`, for the follow-ups it imports). A running `serve` (or `run`)
-records itself in `<factory>/serve.json`: its pid, its process start identity and this package's entry. The
-watchdog counts it as running only while that same process lives and the entry is the one the watchdog itself
-runs; no command line is parsed.
+reaches a running watchdog (and a running `serve`, for the follow-ups it imports). Each running `serve` (or `run`)
+records itself in `<factory>/serve/<pid>.json`: its pid, its process start identity and this package's entry. The
+watchdog counts serve as running while any recorded process is still that same process and runs the entry the
+watchdog itself runs; no command line is parsed, and one serve starting or stopping never touches another's record.
 
 ## Migrating from `prime-agent factory`
 

@@ -260,10 +260,11 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 			}
 			case "serve":
 			case "run": {
+				const intervalMs = integer(options.get("--interval-ms"), 1000, 50);
 				// The watchdog's proof that scheduling runs: this process's identity and entry, gone when it stops.
 				const forget = recordServe(directory, realpathSync(locateFactoryEntrypoint().entry));
 				try {
-					await serve(engine, integer(options.get("--interval-ms"), 1000, 50), () => {
+					await serve(engine, intervalMs, () => {
 						if (engine.status().paused) return;
 						// The launcher as the last launch wrote it: a relaunch that changed the settings or the agent
 						// binary reaches the follow-ups this running server imports.

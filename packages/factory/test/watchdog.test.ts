@@ -92,30 +92,44 @@ it("alerts once per new exception, baselines known ones, confirms a lost runner 
 });
 
 
-it("sees a serve only while its recorded process lives and runs this entry, and refuses a blank disk threshold", async () => {
+it("sees a serve only while a recorded process lives and runs this entry, and refuses a blank disk threshold", async () => {
 	const factory = mkdtempSync(join(tmpdir(), "factory-serve-"));
 	roots.push(factory);
 	const entry = "/opt/prime-agent-factory/dist/cli-entry.js";
-	const record = join(factory, "serve.json");
+	const recordOf = (pid: number) => join(factory, "serve", `${pid}.json`);
+	const write = (pid: number, startId: string) => {
+		mkdirSync(join(factory, "serve"), { recursive: true });
+		writeFileSync(recordOf(pid), JSON.stringify({ version: 1, pid, startId, entry }));
+	};
 	const startId = getProcessStartId(process.pid)!;
-	// Nothing recorded, then this live process recorded as the serve of this entry, then forgotten again.
+	// Nothing recorded, then this live process recorded as a serve of this entry, then forgotten again.
 	const before = serveRunning(factory, entry);
 	const forget = recordServe(factory, entry);
 	const recorded = [serveRunning(factory, entry), serveRunning(factory, "/elsewhere/dist/cli-entry.js")];
 	forget();
-	expect([before, ...recorded, serveRunning(factory, entry), existsSync(record)]).toEqual([
+	expect([before, ...recorded, serveRunning(factory, entry), existsSync(recordOf(process.pid))]).toEqual([
 		false,
 		true,
 		false,
 		false,
 		false,
 	]);
-	// A record outliving its process: the pid now names another process start, or no process at all.
-	writeFileSync(record, JSON.stringify({ version: 1, pid: process.pid, startId: `${startId}0`, entry }));
-	const reused = serveRunning(factory, entry);
-	const exited = spawnSync(process.execPath, ["-e", ""]);
-	writeFileSync(record, JSON.stringify({ version: 1, pid: exited.pid, startId, entry }));
-	expect([reused, serveRunning(factory, entry)]).toEqual([false, false]);
+	// Records outliving their process: the pid now names another process start, or no process at all.
+	const exited = spawnSync(process.execPath, ["-e", ""]).pid;
+	write(process.pid, `${startId}0`);
+	write(exited, startId);
+	expect(serveRunning(factory, entry)).toBe(false);
+	// Another scheduler of the same factory starting and stopping leaves a live one's record alone; stale ones go.
+	const other = spawn(process.execPath, ["-e", "process.stdin.resume()"], { stdio: ["pipe", "ignore", "ignore"] });
+	try {
+		write(other.pid!, getProcessStartId(other.pid!)!);
+		recordServe(factory, entry)();
+		expect([serveRunning(factory, entry), existsSync(recordOf(exited))]).toEqual([true, false]);
+	} finally {
+		other.stdin!.end();
+		await once(other, "exit");
+	}
+	expect(serveRunning(factory, entry)).toBe(false);
 	const usage = console.error;
 	console.error = () => undefined;
 	try {

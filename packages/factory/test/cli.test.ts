@@ -217,7 +217,9 @@ describe("prime-agent-factory CLI", () => {
 			expect(await imported).toEqual(["parent-split"]);
 			const followUp = JSON.parse(readFileSync(join(relaunched.work, "tickets", "parent-split", "ticket.json"), "utf8"));
 			expect(followUp.launcher).toEqual(relaunched);
-			// The running serve recorded itself for the watchdog; killed, its stale record no longer counts.
+			// The running serve recorded itself for the watchdog; a second serve refused for its arguments leaves that
+			// record alone, and once killed, its stale record no longer counts.
+			expect(() => invoke(["serve", f.directory, "--interval-ms", "1"])).toThrow();
 			expect(serveRunning(f.directory, realpathSync(entry()))).toBe(true);
 		} finally {
 			lines.close();
