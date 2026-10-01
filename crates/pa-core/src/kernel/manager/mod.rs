@@ -140,6 +140,8 @@ impl InternalExecuteResult {
                 status: ExecuteStatus::Aborted,
                 error: None,
                 duration_ms: started.elapsed().as_millis() as u64,
+                queued_memory_notices: None,
+                memory_notices: None,
             },
             done_fields: None,
         }
@@ -342,8 +344,10 @@ struct Guarded {
     handled_host_request_ids: (HashSet<String>, VecDeque<String>),
     /// Late agent-message handlers keyed by request id, insertion-ordered with eviction.
     late_handlers: VecDeque<(String, LateSentAgentMessageCallback)>,
-    /// Resolvers for done events outside the active execution (the shutdown reply).
-    pending_done_waiters: HashMap<String, oneshot::Sender<()>>,
+    /// Resolvers for done events outside the active execution (the shutdown
+    /// reply, the memory notice acknowledgement and report), handed the
+    /// event's fields.
+    pending_done_waiters: HashMap<String, oneshot::Sender<Value>>,
     bash_activity_waiters: HashMap<String, oneshot::Sender<Value>>,
     host_inflight: Vec<tokio::task::JoinHandle<()>>,
     active_execution: Option<Arc<ActiveExecution>>,
@@ -352,6 +356,8 @@ struct Guarded {
     /// still attribute their spawning program.
     last_cell_code: Option<String>,
     ready_tx: Option<oneshot::Sender<anyhow::Result<i64>>>,
+    /// The memory ladder's per-kernel state (features, owed steps and notices).
+    memory: memory::MemoryState,
 }
 
 struct ChildHandle {
@@ -395,6 +401,8 @@ pub(crate) struct Inner {
     stderr_closed_flag: AtomicBool,
     /// File receiving pre-ready kernel stderr, with its remaining write budget.
     stderr_log: Mutex<Option<Arc<Mutex<StderrLog>>>>,
+    /// The resolved memory ceiling for this kernel.
+    memory: memory::MemoryConfig,
 }
 
 struct StderrLog {
@@ -441,6 +449,7 @@ mod delegations;
 mod events;
 mod execution;
 mod host_requests;
+mod memory;
 mod repair;
 mod requests;
 mod snapshot;
@@ -456,6 +465,19 @@ use requests::{append_truncated, describe_failure, Signal};
 impl ReplKernelManager {
     #[must_use]
     pub fn new(options: KernelManagerOptions) -> Self {
+        Self::with_memory_guard(
+            options,
+            Arc::clone(crate::kernel::memory_guard::watcher::kernel_memory_guard()),
+        )
+    }
+
+    /// A manager that joins `guard` instead of the process-wide memory
+    /// registry (tests drive their own passes).
+    pub(crate) fn with_memory_guard(
+        options: KernelManagerOptions,
+        guard: Arc<crate::kernel::memory_guard::watcher::KernelMemoryGuard>,
+    ) -> Self {
+        let memory = memory::MemoryConfig::resolve(&options, guard);
         let inner = Arc::new(Inner {
             options,
             freshness_stat_probe: std::sync::atomic::AtomicBool::new(false),
@@ -492,6 +514,7 @@ impl ReplKernelManager {
                 active_execution: None,
                 last_cell_code: None,
                 ready_tx: None,
+                memory: memory::MemoryState::default(),
             }),
             child: Mutex::new(None),
             busy_notify: Notify::new(),
@@ -504,6 +527,7 @@ impl ReplKernelManager {
             stderr_closed: Notify::new(),
             stderr_closed_flag: AtomicBool::new(false),
             stderr_log: Mutex::new(None),
+            memory,
         });
         Self { inner }
     }
@@ -627,9 +651,15 @@ impl ReplKernelManager {
     /// enqueued execution fails (kernel error, timeout, or aborted request).
     pub async fn execute(&self, code: &str, opts: ExecuteOptions) -> anyhow::Result<ExecuteResult> {
         self.wait_for_protocol_repair(opts.signal.as_ref()).await?;
-        let result = self.enqueue_execute(code, opts, None).await?;
+        let internal = opts.internal;
+        let mut result = self.enqueue_execute(code, opts, None).await?;
         if result.result.status == ExecuteStatus::Ok {
             self.schedule_snapshot();
+        }
+        // Memory notices owed to the model ride the next user cell's result;
+        // internal requests (bootstrap, snapshots) never consume them.
+        if !internal {
+            self.inner.take_memory_notices(&mut result.result);
         }
         Ok(result.result)
     }

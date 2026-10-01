@@ -92,7 +92,7 @@ impl Inner {
             && lock(&self.child).is_some()
         {
             let id = uuid::Uuid::new_v4().to_string();
-            let (done_tx, done_rx) = oneshot::channel::<()>();
+            let (done_tx, done_rx) = oneshot::channel::<serde_json::Value>();
             lock(&self.guarded)
                 .pending_done_waiters
                 .insert(id.clone(), done_tx);
@@ -145,10 +145,14 @@ impl Inner {
     /// Tear the child down: stop timers, fail pending work, close pipes, kill
     /// the process, and reap any `bash()` process groups it journaled.
     pub(crate) fn cleanup_resources(&self, kill_signal: Signal) {
+        // The measured kernel is gone: no pass may act on its successor.
+        self.unwatch_memory();
         let had_background_work = {
             let mut g = lock(&self.guarded);
             // Any teardown invalidates in-flight starts.
             g.start_generation += 1;
+            // Owed steps die with the kernel; owed notices stay for the model.
+            g.memory.clear_kernel_steps();
             if let Some(timer) = lock(&self.snapshot_timer).take() {
                 timer.abort();
             }

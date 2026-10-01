@@ -173,6 +173,7 @@ fn test_options() -> Option<pa_core::kernel::shared::KernelManagerOptions> {
         snapshot: None,
         bootstrap_code: Some(pa_core::kernel::bootstrap::build_rlm_bootstrap_code(&[])),
         stderr_log_path: None,
+        ..pa_core::kernel::shared::KernelManagerOptions::default()
     })
 }
 

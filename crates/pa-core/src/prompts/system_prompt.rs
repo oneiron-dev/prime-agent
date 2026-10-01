@@ -93,6 +93,9 @@ pub struct BuildSystemPromptOptions<'a> {
     pub rlm_parent_agent: Option<&'a str>,
     /// Enabled user-configured generic MCP servers.
     pub generic_mcp_servers: Vec<String>,
+    /// The resolved kernel memory ceiling in GiB; with `ipython` active and
+    /// a positive value the tail states it (TS `kernelMemoryPromptLine`).
+    pub kernel_memory_limit_gb: Option<f64>,
 }
 
 /// Build the system prompt (assembled text only).
@@ -161,6 +164,18 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
         "kernel bootstrap defaults",
         packages_section(),
     ));
+
+    if has_ipython {
+        if let Some(line) = crate::kernel::memory_guard::kernel_memory_prompt_line(
+            options.kernel_memory_limit_gb.unwrap_or(0.0),
+        ) {
+            segments.push(PromptSegment::dynamic_segment(
+                "kernel-memory",
+                "kernel memory limit",
+                line,
+            ));
+        }
+    }
 
     let context = context_files_section(&options.context_files);
     if !context.is_empty() {
@@ -529,6 +544,47 @@ mod tests {
         assert!(breakdown
             .assembled
             .contains("# Additional Guidance\n\n- be careful"));
+    }
+
+    /// The kernel memory ceiling (TS `kernelMemoryPromptLine` in the RLM
+    /// block) rides the dynamic tail: stated only with ipython active and a
+    /// positive limit, and never moving the cached prefix.
+    #[test]
+    fn the_kernel_memory_line_rides_the_tail_only_while_the_ladder_is_on() {
+        let breakdown = |limit: Option<f64>, tools: Option<Vec<&'static str>>| {
+            let mut options = base_options();
+            options.kernel_memory_limit_gb = limit;
+            options.selected_tools = tools;
+            system_prompt_breakdown(&options)
+        };
+        let memory_segment = |breakdown: &SystemPromptBreakdown| {
+            breakdown
+                .segments
+                .iter()
+                .find(|segment| segment.name == "kernel-memory")
+                .map(|segment| (segment.kind, segment.text.clone()))
+        };
+        let on = breakdown(Some(16.0), None);
+        let fractional = breakdown(Some(0.5), None);
+        let off = breakdown(Some(0.0), None);
+        let unset = breakdown(None, None);
+        let without_ipython = breakdown(Some(16.0), Some(vec!["bash"]));
+        let line = |gb: &str| {
+            Some((
+                SegmentKind::Dynamic,
+                format!(
+                    "Memory: each kernel, with the processes it starts, may use up to {gb} GB. Load large data in pieces, and run a heavy one-off job as a script through `bash()`, so a breach stops only that script."
+                ),
+            ))
+        };
+        assert_eq!(
+            [&on, &fractional, &off, &unset, &without_ipython].map(memory_segment),
+            [line("16"), line("0.5"), None, None, None]
+        );
+        assert_eq!(
+            on.assembled[..on.cached_prefix_len],
+            off.assembled[..off.cached_prefix_len]
+        );
     }
 
     #[test]

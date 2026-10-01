@@ -143,6 +143,17 @@ pub struct IpythonKernelProvisionerOptions {
     /// Publishes the per-boot result for `kernel bootstrap` telemetry.
     /// Telemetry only; kernel behavior never depends on it.
     pub on_bootstrap_result: Option<KernelBootstrapResultHandler>,
+    /// Memory ceiling per kernel tree in GiB (the `kernelMemoryLimitGb`
+    /// setting); `None` resolves the environment, else 16; `0` turns the
+    /// memory ladder off.
+    pub memory_limit_gb: Option<f64>,
+    /// Machine-wide memory backstop (the `kernelMemoryBackstop` setting);
+    /// `None` resolves the environment, else on.
+    pub memory_backstop: Option<bool>,
+    /// `kernel memory action` telemetry seam. Telemetry only.
+    pub on_memory_action: Option<crate::kernel::shared::KernelMemoryActionHandler>,
+    /// `kernel snapshot guard` telemetry seam. Telemetry only.
+    pub on_snapshot_guard: Option<crate::kernel::shared::KernelSnapshotGuardHandler>,
 }
 
 /// Why and how long the last startup failed, kept so `ensure()` callers see
@@ -708,6 +719,10 @@ async fn start_kernel_impl(
         snapshot,
         bootstrap_code: Some(bootstrap_code.clone()),
         stderr_log_path,
+        memory_limit_gb: options.memory_limit_gb,
+        memory_backstop: options.memory_backstop,
+        on_memory_action: options.on_memory_action.clone(),
+        on_snapshot_guard: options.on_snapshot_guard.clone(),
     });
 
     emit_startup_progress(inner, on_progress, "Starting Python kernel...");

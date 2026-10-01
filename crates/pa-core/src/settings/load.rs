@@ -34,6 +34,8 @@ const KNOWN_FIELDS: &[&str] = &[
     "imageModel",
     "autonomous",
     "shellPath",
+    "kernelMemoryLimitGb",
+    "kernelMemoryBackstop",
     "quietStartup",
     "shellCommandPrefix",
     "npmCommand",

@@ -284,7 +284,7 @@ impl Inner {
     }
 
     /// Kill the current child and settle at clean idle, so the next start spawns fresh.
-    fn kill_child_to_idle(self: &Arc<Self>) {
+    pub(super) fn kill_child_to_idle(self: &Arc<Self>) {
         // The discarded kernel carried the runtime bootstrap and (possibly) the
         // restored namespace; a lazily started replacement must reprovision both.
         {

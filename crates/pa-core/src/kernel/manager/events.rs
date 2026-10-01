@@ -55,8 +55,10 @@ impl Inner {
                 }
                 self.dispatch_display(id.as_deref(), data);
             }
-            Event::Ready { protocol } => {
-                if let Some(tx) = lock(&self.guarded).ready_tx.take() {
+            Event::Ready { protocol, features } => {
+                let mut g = lock(&self.guarded);
+                g.memory.set_features(features);
+                if let Some(tx) = g.ready_tx.take() {
                     let _ = tx.send(Ok(protocol));
                 }
             }
@@ -78,6 +80,7 @@ impl Inner {
                 ename,
                 evalue,
                 traceback,
+                line,
             } => {
                 let execution = lock(&self.guarded).active_execution.clone();
                 match (execution.filter(|e| Some(&e.request_id) == id.as_ref()), id) {
@@ -87,6 +90,7 @@ impl Inner {
                             ename,
                             evalue,
                             traceback,
+                            line,
                         });
                         buffers.status = ExecuteStatus::Error;
                     }
@@ -121,6 +125,7 @@ impl Inner {
                                         ename: "KernelError".to_string(),
                                         evalue: reason.to_string(),
                                         traceback: Vec::new(),
+                                        line: None,
                                     });
                                 }
                             }
@@ -129,10 +134,11 @@ impl Inner {
                     self.finish_active_execution(&execution);
                     return;
                 }
-                // A done outside the active execution settles its waiter.
+                // A done outside the active execution settles its waiter
+                // (the shutdown reply, a memory notice or report answer).
                 let waiter = lock(&self.guarded).pending_done_waiters.remove(&id);
                 if let Some(tx) = waiter {
-                    let _ = tx.send(());
+                    let _ = tx.send(fields);
                 }
             }
         }

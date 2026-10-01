@@ -267,6 +267,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // snapshot is fixed for the session anyway — while the `PI_REQUEST_TIMING`
     // env half stays live inside the wrappers' per-request check.
     let request_timing_settings = settings.get_request_timing();
+    // The kernel memory ceiling (TS `getKernelMemoryLimitGb`/`Backstop`):
+    // one resolution feeds the kernel, the ipython description, and the
+    // system prompt's memory line.
+    let kernel_memory_limit_gb = settings.get_kernel_memory_limit_gb();
+    let kernel_memory_backstop = settings.get_kernel_memory_backstop();
     let (mcp_skill_overrides, mcp_generic_servers, built_manager) =
         mcp_gating(&settings, config.agent_dir.clone()).await?;
     let mcp_manager = config
@@ -470,23 +475,78 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         )
             as crate::kernel::provisioner::UnavailableSkillsCallback)
     };
-    let provisioner = super::runtime_wiring::kernel_provisioner(
-        session_id,
-        handlers,
-        python_skills,
-        cwd.clone(),
-        &config.agent_dir,
-        session_artifact_dir,
-        on_restore,
-        config.on_background_work_settled.clone(),
-        on_unavailable_skills,
-        on_bootstrap_result,
-    );
+    // `kernel memory action` / `kernel snapshot guard` telemetry: the
+    // kernel reports each memory step and each file-handle guard action
+    // (primitives only) through the session's client.
+    let on_memory_action = config.telemetry.as_ref().map(|wiring| {
+        let client = wiring.client.clone();
+        let execution_mode = wiring
+            .execution_mode
+            .clone()
+            .unwrap_or_else(|| super::telemetry::EXECUTION_MODE_UNKNOWN.to_string());
+        std::sync::Arc::new(
+            move |stats: crate::kernel::shared::KernelMemoryActionStats| {
+                let mut properties = base_properties(&execution_mode);
+                properties.set("action", serde_json::Value::from(stats.action.as_str()));
+                properties.set("cause", serde_json::Value::from(stats.cause.as_str()));
+                properties.set("tree_bytes", serde_json::Value::from(stats.tree_bytes));
+                properties.set("kernel_bytes", serde_json::Value::from(stats.kernel_bytes));
+                properties.set("limit_bytes", serde_json::Value::from(stats.limit_bytes));
+                if let Some(after) = stats.after_bytes {
+                    properties.set("after_bytes", serde_json::Value::from(after));
+                }
+                if let Some(dropped) = stats.dropped_count {
+                    properties.set("dropped_count", serde_json::Value::from(dropped));
+                }
+                properties.set("cell_running", serde_json::Value::from(stats.cell_running));
+                client.track("kernel memory action", properties);
+            },
+        ) as crate::kernel::shared::KernelMemoryActionHandler
+    });
+    let on_snapshot_guard = config.telemetry.as_ref().map(|wiring| {
+        let client = wiring.client.clone();
+        let execution_mode = wiring
+            .execution_mode
+            .clone()
+            .unwrap_or_else(|| super::telemetry::EXECUTION_MODE_UNKNOWN.to_string());
+        std::sync::Arc::new(
+            move |stats: crate::kernel::shared::KernelSnapshotGuardStats| {
+                let mut properties = base_properties(&execution_mode);
+                properties.set("phase", serde_json::Value::from(stats.phase.as_str()));
+                properties.set(
+                    "rejected_count",
+                    serde_json::Value::from(stats.rejected_count),
+                );
+                properties.set("purged_count", serde_json::Value::from(stats.purged_count));
+                client.track("kernel snapshot guard", properties);
+            },
+        ) as crate::kernel::shared::KernelSnapshotGuardHandler
+    });
+    let provisioner =
+        super::runtime_wiring::kernel_provisioner(super::runtime_wiring::KernelProvisionerWiring {
+            session_id,
+            handlers,
+            python_skills,
+            cwd: cwd.clone(),
+            agent_dir: &config.agent_dir,
+            snapshot_dir: session_artifact_dir,
+            on_restore,
+            on_background_work_settled: config.on_background_work_settled.clone(),
+            on_unavailable_skills,
+            on_bootstrap_result,
+            memory_limit_gb: kernel_memory_limit_gb,
+            memory_backstop: kernel_memory_backstop,
+            on_memory_action,
+            on_snapshot_guard,
+        });
     let mut tools = config.tools.clone();
     if !tools.iter().any(|tool| tool.name() == "ipython") {
         let definition = crate::tools::ipython::create_ipython_tool_definition(
             &cwd.to_string_lossy(),
-            super::runtime_wiring::ipython_tool_options(provisioner.clone()),
+            super::runtime_wiring::ipython_tool_options(
+                provisioner.clone(),
+                kernel_memory_limit_gb,
+            ),
         );
         tools.push(Arc::new(
             crate::session_engine::tool_bridge::ToolDefinitionBridge::new(definition),
@@ -549,6 +609,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             rlm_depth: config.rlm_depth,
             generic_mcp_servers,
             prompt_guidelines: Some(prompt_guidelines),
+            kernel_memory_limit_gb: Some(kernel_memory_limit_gb),
             ..Default::default()
         },
     );
