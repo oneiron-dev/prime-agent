@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -166,7 +167,8 @@ class SideBySideTests(unittest.TestCase):
         receipt = json.loads((self.prefix / "receipts" / f"{newer}-{PLATFORM}" /
                               "INSTALL-RECEIPT.json").read_text())
         self.assertEqual(receipt["current"], {"before": VERSION, "after": newer})
-        self.assertEqual(os.readlink(self.prefix / "current"), newer)
+        self.assertEqual((os.readlink(self.prefix / "current"), os.readlink(self.prefix / "previous")),
+                         (newer, VERSION))
 
     def test_no_activate_copies_without_launcher_or_current(self) -> None:
         self.assertEqual(self.run_main("install", "--no-activate", "--stage-dir", str(make_stage(self.root))), 0)
@@ -184,6 +186,36 @@ class SideBySideTests(unittest.TestCase):
         self.assertEqual(
             sorted(str(p.relative_to(self.prefix / VERSION)) for p in (self.prefix / VERSION).rglob("*")),
             sorted(str(p.relative_to(stage)) for p in stage.rglob("*")))
+
+    def test_tarball_members_are_checked_before_anything_is_extracted(self) -> None:
+        stage = make_stage(self.root)
+        outside = self.root / "outside.txt"
+
+        def link(info: tarfile.TarInfo) -> None:
+            info.type, info.linkname = tarfile.SYMTYPE, str(outside)
+
+        def hardlink(info: tarfile.TarInfo) -> None:
+            info.type, info.linkname = tarfile.LNKTYPE, "package.json"
+
+        def fifo(info: tarfile.TarInfo) -> None:
+            info.type = tarfile.FIFOTYPE
+
+        for label, name, shape in (("symlink", "evil", link), ("hardlink", "evil", hardlink),
+                                   ("fifo", "evil", fifo), ("parent", "../evil", None),
+                                   ("absolute", str(outside), None), ("duplicate", "package.json", None)):
+            with self.subTest(label):
+                tarball = self.root / f"{stage.name}.tar.gz"
+                with tarfile.open(tarball, "w:gz") as archive:
+                    for path in sorted(stage.rglob("*")):
+                        archive.add(path, arcname=str(path.relative_to(stage)), recursive=False)
+                    info = tarfile.TarInfo(name)
+                    if shape is not None:
+                        shape(info)
+                    archive.addfile(info, io.BytesIO(b"") if info.isfile() else None)
+                with self.assertRaisesRegex(SystemExit, "unsafe tarball member"):
+                    self.run_main("install", "--tarball", str(tarball))
+                self.assertFalse(outside.exists())
+                self.assertFalse(self.prefix.exists())
 
     def test_prefix_overlapping_the_ts_tree_is_refused(self) -> None:
         with self.assertRaisesRegex(SystemExit, "overlaps protected TS state"):

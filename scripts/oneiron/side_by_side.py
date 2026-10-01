@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Side-by-side install of the Oneiron Rust prime-agent beside the TS build.
 
-  install  copy a staged release layout (scripts/package_release.py output) to
-           ~/.local/share/prime-agent-oneiron-rs/<version>/, write the
-           ~/.local/bin/prime-agent-rs launcher, flip <prefix>/current, and
-           write receipts/<version>-<platform>/INSTALL-RECEIPT.json
-  probe    run the installed launcher: --version, a sol-shaped one-shot on
-           cpa-r (the reply's responseModel must match), optionally a tools run
-           that bootstraps the separate kernel venv; writes PROBE-RECEIPT.json
+  install   copy a staged release layout (scripts/package_release.py output) to
+            ~/.local/share/prime-agent-oneiron-rs/<version>/, write the
+            ~/.local/bin/prime-agent-rs launcher, flip <prefix>/current, and
+            write receipts/<version>-<platform>/INSTALL-RECEIPT.json
+  probe     run the installed launcher: --version, a sol-shaped one-shot on
+            cpa-r (the reply's responseModel must match), optionally a tools run
+            that bootstraps the separate kernel venv; writes PROBE-RECEIPT.json
 
 The TS product is never touched: the `prime-agent` launcher, its install tree
 (~/.local/share/prime-agent-oneiron/), its daemon socket dir and its kernel
@@ -26,7 +26,10 @@ install-rust.sh instead: it stops every TS daemon and replaces
 from __future__ import annotations
 
 import argparse
+import contextlib
+import dataclasses
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -40,6 +43,7 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
+from typing import Iterator
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 HOME = Path.home()
@@ -181,6 +185,36 @@ def link_state(path: Path) -> dict:
     return {"kind": "absent"}
 
 
+def read_link(path: Path) -> str | None:
+    return os.readlink(path) if path.is_symlink() else None
+
+
+def write_json_atomic(path: Path, data: dict) -> None:
+    """Write-then-rename, so a reader (or a crash) never sees half a file."""
+    temp = path.parent / f".{path.name}.tmp-{os.getpid()}"
+    with temp.open("w") as handle:
+        handle.write(json.dumps(data, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+@contextlib.contextmanager
+def locked(directory: Path) -> Iterator[None]:
+    """One writer at a time per install prefix (or feed): concurrent rollouts,
+    rollbacks or packages would otherwise flip pointers over each other."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".lock").open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f"error: another side_by_side.py run holds {directory / '.lock'}") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def git_facts(root: Path) -> dict:
     def run(*args: str) -> str | None:
         try:
@@ -258,19 +292,30 @@ def read_stage(stage_dir: Path) -> tuple[str, str]:
     return version, platform
 
 
+def check_tar_members(tarball: Path, archive: tarfile.TarFile) -> None:
+    """Every member is checked before any byte is written: the release
+    payload is plain files and dirs (assemble_artifacts' packer refuses
+    links), so a link, device, fifo, absolute or `..` name, or a member
+    that appears twice (the second copy would overwrite the first) means the
+    archive is not one we built."""
+    seen = set()
+    for member in archive.getmembers():
+        name = os.path.normpath(member.name)
+        if (not (member.isfile() or member.isdir()) or member.name.startswith("/")
+                or ".." in Path(member.name).parts or name in seen):
+            raise SystemExit(f"error: unsafe tarball member {member.name!r} in {tarball}")
+        seen.add(name)
+
+
 def extract_tarball(tarball: Path, into: Path) -> Path:
     with tarfile.open(tarball) as archive:
+        check_tar_members(tarball, archive)
         try:
             archive.extractall(into, filter="data")
         except TypeError:
-            # Python without the extraction-filter backport (stock macOS 3.9):
-            # the release tarball holds only files and dirs, so refuse anything
-            # else and any member that would land outside the scratch dir.
-            root = into.resolve()
-            for member in archive.getmembers():
-                if not (member.isfile() or member.isdir()) or not is_within(
-                        (root / member.name).resolve(), root):
-                    raise SystemExit(f"error: unsafe tarball member {member.name!r} in {tarball}")
+            # Python without the extraction-filter backport (stock macOS
+            # 3.9); the member check above already refused everything the
+            # data filter would.
             archive.extractall(into)
     stage = into / tarball.name.removesuffix(".tar.gz")
     stage.mkdir(exist_ok=True)
@@ -318,15 +363,35 @@ def write_launcher(bin_dir: Path, prefix: Path) -> Path:
     return launcher
 
 
-def flip_current(prefix: Path, version: str) -> str | None:
-    current = prefix / "current"
-    before = os.readlink(current) if current.is_symlink() else None
-    temp = prefix / f".current.tmp-{os.getpid()}"
+def replace_symlink(link: Path, target: str) -> None:
+    temp = link.parent / f".{link.name}.tmp-{os.getpid()}"
     if temp.is_symlink() or temp.exists():
         temp.unlink()
-    temp.symlink_to(version)
-    os.replace(temp, current)
+    temp.symlink_to(target)
+    os.replace(temp, link)
+
+
+def flip_current(prefix: Path, version: str) -> str | None:
+    """Point `current` at `version`; the version it leaves becomes `previous`
+    (what `rollback` selects by default). `previous` moves first, so
+    `current`, the pointer the launcher follows, is right at every instant."""
+    before = read_link(prefix / "current")
+    if before is not None and before != version:
+        replace_symlink(prefix / "previous", before)
+    replace_symlink(prefix / "current", version)
     return before
+
+
+def select_version(prefix: Path, bin_dir: Path, version: str) -> str | None:
+    """Make an installed version the one `prime-agent-rs` runs: flip current,
+    then (re)write the launcher. Returns the version current left."""
+    before = flip_current(prefix, version)
+    write_launcher(bin_dir, prefix)
+    return before
+
+
+def rs_agent_dir() -> Path:
+    return Path(os.environ.get("PRIME_AGENT_RS_AGENT_DIR") or DEFAULT_AGENT_DIR)
 
 
 def stamp_manifest(package_json: Path, version: str) -> None:
@@ -337,6 +402,57 @@ def stamp_manifest(package_json: Path, version: str) -> None:
     package_json.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
+@dataclasses.dataclass(frozen=True)
+class Payload:
+    """A release layout validated in scratch, not yet in the prefix."""
+    stage: Path
+    version: str
+    staged_version: str
+    platform: str
+
+
+@contextlib.contextmanager
+def staged_payload(tarball: Path | None, stage_dir: Path | None, version: str | None) -> Iterator[Payload]:
+    """Extract (or take) a release layout and validate it; nothing is written
+    outside a scratch dir until commit_payload."""
+    with tempfile.TemporaryDirectory(prefix="pa-rs-install-") as scratch:
+        stage = extract_tarball(tarball, Path(scratch)) if tarball else stage_dir
+        check_no_symlinks(stage)
+        staged_version, platform = read_stage(stage)
+        version = version or staged_version
+        check_version(version)
+        if version != staged_version and not version.startswith(f"{staged_version}-"):
+            raise SystemExit(f"error: --version {version} must extend the staged version {staged_version} "
+                             f"(e.g. {staged_version}-oneiron.YYYYMMDD.N)")
+        if not re.match(r"^[a-z0-9]+-[a-z0-9]+$", platform):
+            raise SystemExit(f"error: platform {platform!r} is not a plain <os>-<arch> tag")
+        yield Payload(stage, version, staged_version, platform)
+
+
+def check_install_target(prefix: Path, version: str) -> Path:
+    target = prefix / version
+    if target.resolve().parent != prefix.resolve():
+        raise SystemExit(f"error: {target} would land outside {prefix}")
+    if target.exists() or target.is_symlink():
+        raise SystemExit(f"error: {target} already exists; installs are immutable, bump the build number")
+    return target
+
+
+def commit_payload(prefix: Path, payload: Payload) -> Path:
+    """Copy the payload to <prefix>/<version>/ (new dirs only; renamed into
+    place whole, so a crash leaves a temp dir, never half an install)."""
+    target = check_install_target(prefix, payload.version)
+    prefix.mkdir(parents=True, exist_ok=True)
+    temp_target = prefix / f".{payload.version}.tmp-{os.getpid()}"
+    if temp_target.exists():
+        shutil.rmtree(temp_target)
+    shutil.copytree(payload.stage, temp_target, symlinks=True)
+    if payload.version != payload.staged_version:
+        stamp_manifest(temp_target / "package.json", payload.version)
+    os.rename(temp_target, target)
+    return target
+
+
 def install(args: argparse.Namespace) -> int:
     prefix = args.prefix.expanduser()
     bin_dir = args.bin_dir.expanduser()
@@ -344,39 +460,17 @@ def install(args: argparse.Namespace) -> int:
     ts_launcher = bin_dir / TS_LAUNCHER_NAME
     ts_before = link_state(ts_launcher)
 
-    with tempfile.TemporaryDirectory(prefix="pa-rs-install-") as scratch:
-        stage = extract_tarball(args.tarball, Path(scratch)) if args.tarball else args.stage_dir
-        check_no_symlinks(stage)
-        staged_version, platform = read_stage(stage)
-        version = args.version or staged_version
-        check_version(version)
-        if version != staged_version and not version.startswith(f"{staged_version}-"):
-            raise SystemExit(f"error: --version {version} must extend the staged version {staged_version} "
-                             f"(e.g. {staged_version}-oneiron.YYYYMMDD.N)")
-        if not re.match(r"^[a-z0-9]+-[a-z0-9]+$", platform):
-            raise SystemExit(f"error: platform {platform!r} is not a plain <os>-<arch> tag")
-        target = prefix / version
-        if target.resolve().parent != prefix.resolve():
-            raise SystemExit(f"error: {target} would land outside {prefix}")
-        if target.exists():
-            raise SystemExit(f"error: {target} already exists; installs are immutable, bump the build number")
-        prefix.mkdir(parents=True, exist_ok=True)
-        temp_target = prefix / f".{version}.tmp-{os.getpid()}"
-        if temp_target.exists():
-            shutil.rmtree(temp_target)
-        shutil.copytree(stage, temp_target, symlinks=True)
-        if version != staged_version:
-            stamp_manifest(temp_target / "package.json", version)
-        os.rename(temp_target, target)
-
     current_before = None
     launcher = bin_dir / LAUNCHER_NAME
     agent = None
-    if args.activate:
-        agent_dir = Path(os.environ.get("PRIME_AGENT_RS_AGENT_DIR") or DEFAULT_AGENT_DIR)
-        agent = seed_agent_dir(agent_dir, TS_AGENT_DIR)
-        current_before = flip_current(prefix, version)
-        launcher = write_launcher(bin_dir, prefix)
+    with staged_payload(args.tarball, args.stage_dir, args.version) as payload:
+        version, staged_version, platform = payload.version, payload.staged_version, payload.platform
+        check_install_target(prefix, version)
+        with locked(prefix):
+            target = commit_payload(prefix, payload)
+            if args.activate:
+                agent = seed_agent_dir(rs_agent_dir(), TS_AGENT_DIR)
+                current_before = select_version(prefix, bin_dir, version)
 
     ts_after = link_state(ts_launcher)
     if ts_after != ts_before:
@@ -500,13 +594,22 @@ def launcher_env(launcher: Path) -> dict[str, str]:
 def probe(args: argparse.Namespace) -> int:
     prefix = args.prefix.expanduser()
     bin_dir = args.bin_dir.expanduser()
-    launcher = bin_dir / LAUNCHER_NAME
     current = prefix / "current"
     if not current.is_symlink():
         raise SystemExit(f"error: {current} is not an installed release")
     version = json.loads((current / "package.json").read_text())["version"]
     platform = next((name.split(f"{version}-", 1)[1] for name in os.listdir(prefix / "receipts")
                      if name.startswith(f"{version}-")), "unknown")
+    receipt = run_probe(bin_dir / LAUNCHER_NAME, version, platform, prefix / "receipts" / f"{version}-{platform}",
+                        bin_dir / TS_LAUNCHER_NAME, args)
+    return 0 if receipt["ok"] else 1
+
+
+def run_probe(launcher: Path, version: str, platform: str, receipt_dir: Path, ts_launcher: Path,
+              args: argparse.Namespace) -> dict:
+    """Probe `version` through `launcher` (the installed one, or rollout's
+    scratch launcher for a version not yet selected) and write
+    PROBE-RECEIPT.json plus each run's full stdout into receipt_dir."""
     effective = launcher_env(launcher)
     rs_socket_dir = Path(effective["PRIME_AGENT_SOCKET_DIR"])
     rs_venv = Path(effective["PRIME_AGENT_KERNEL_VENV"])
@@ -514,7 +617,7 @@ def probe(args: argparse.Namespace) -> int:
     ts_socket_dir = tmp / f"prime-agent-{os.getuid()}"
     ts_venvs = [HOME / ".prime" / "agent" / "kernel-venv",
                 Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local" / "share") / "prime" / "agent" / "kernel-venv"]
-    ts_launcher_before = link_state(bin_dir / TS_LAUNCHER_NAME)
+    ts_launcher_before = link_state(ts_launcher)
     ts_venv_before = [venv_fingerprint(venv) for venv in ts_venvs]
 
     with tempfile.TemporaryDirectory(prefix="pa-rs-probe-") as scratch:
@@ -540,7 +643,7 @@ def probe(args: argparse.Namespace) -> int:
         "model": args.model,
         "runs": runs,
     }
-    ts_launcher_after = link_state(bin_dir / TS_LAUNCHER_NAME)
+    ts_launcher_after = link_state(ts_launcher)
     ts_venv_after = [venv_fingerprint(venv) for venv in ts_venvs]
     checks = {
         "agentDirOutsideTsAgentDir": not overlaps(Path(effective["PRIME_AGENT_CODING_AGENT_DIR"]), TS_AGENT_DIR),
@@ -560,14 +663,13 @@ def probe(args: argparse.Namespace) -> int:
         "tsLauncher": ts_launcher_after,
     }
     receipt["ok"] = all(run["ok"] for run in runs.values()) and all(checks.values())
-    receipt_dir = prefix / "receipts" / f"{version}-{platform}"
     receipt_dir.mkdir(parents=True, exist_ok=True)
     # The full event stream rides beside the receipt; the receipt keeps a tail.
     for name, run in runs.items():
         (receipt_dir / f"probe-{name}.out").write_text(run["stdout"])
         run["stdoutFile"] = str(receipt_dir / f"probe-{name}.out")
         run["stdout"] = run["stdout"][-4000:]
-    (receipt_dir / "PROBE-RECEIPT.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    write_json_atomic(receipt_dir / "PROBE-RECEIPT.json", receipt)
     for name, run in runs.items():
         models = run.get("responseModels")
         detail = f" responseModel={models[-1]}" if models else ""
@@ -575,7 +677,15 @@ def probe(args: argparse.Namespace) -> int:
     for name, passed in checks.items():
         print(f"isolation {name}: {'ok' if passed else 'FAIL'}")
     print(f"receipt {receipt_dir / 'PROBE-RECEIPT.json'}")
-    return 0 if receipt["ok"] else 1
+    return receipt
+
+
+def add_probe_args(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--provider", default="cpa-r")
+    command.add_argument("--model", default="gpt-6.1-sol")
+    command.add_argument("--thinking", default="low")
+    command.add_argument("--tools", action="store_true",
+                         help="also run a tools turn (bootstraps the separate kernel venv)")
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -593,12 +703,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     install_cmd.add_argument("--no-activate", dest="activate", action="store_false",
                              help="copy the release without flipping current or writing the launcher")
 
-    probe_cmd = commands.add_parser("probe", help="probe the installed launcher")
-    probe_cmd.add_argument("--provider", default="cpa-r")
-    probe_cmd.add_argument("--model", default="gpt-6.1-sol")
-    probe_cmd.add_argument("--thinking", default="low")
-    probe_cmd.add_argument("--tools", action="store_true",
-                           help="also run a tools turn (bootstraps the separate kernel venv)")
+    add_probe_args(commands.add_parser("probe", help="probe the installed launcher"))
+
     return parser.parse_args(argv)
 
 
