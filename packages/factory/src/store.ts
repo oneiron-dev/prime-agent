@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import type { AgentPin } from "./agent-command.js";
 import type { FactoryFilePin } from "./runtime.js";
@@ -129,7 +129,9 @@ export class FactoryStore {
 	private readonly db: DatabaseSync;
 	private inTransaction = false;
 	constructor(path: string) {
-		this.db = new DatabaseSync(path);
+		// Loaded here, not at import, so the CLI's runtime check can name a Node without node:sqlite first.
+		const { DatabaseSync: Database } = process.getBuiltinModule("node:sqlite");
+		this.db = new Database(path);
 		this.db.exec(
 			"PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
 		);

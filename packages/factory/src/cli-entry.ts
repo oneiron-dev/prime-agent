@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import { isBuiltin } from "node:module";
+import { runFactoryCli } from "./cli.js";
 import { FACTORY_HELP } from "./help.js";
+import { watchFactoryParent } from "./parent.js";
 import { supportsFactoryRuntime } from "./runtime.js";
 
-// Help never opens SQLite, a session or a daemon; everything else needs node:sqlite, loaded only after this check.
+// Help never opens SQLite, a session or a daemon. Everything else needs node:sqlite, which the store loads only when it
+// opens a database, after this check.
 const args = process.argv.slice(2);
 if (!args.length || ["help", "--help", "-h"].includes(args[0]!)) {
 	console.log(FACTORY_HELP);
@@ -11,10 +14,8 @@ if (!args.length || ["help", "--help", "-h"].includes(args[0]!)) {
 	console.error("prime-agent-factory requires Node 22.13+ with node:sqlite.");
 	process.exitCode = 1;
 } else {
-	const { watchFactoryParent } = await import("./parent.js");
 	const closeParentWatch = watchFactoryParent();
 	try {
-		const { runFactoryCli } = await import("./cli.js");
 		await runFactoryCli(args);
 	} catch (error) {
 		console.error(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
