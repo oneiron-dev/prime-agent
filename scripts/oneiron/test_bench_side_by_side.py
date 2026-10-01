@@ -34,18 +34,22 @@ TS_BINDING = """
 
 
 # A stand-in product for run_headless: reads the sandbox models.json the way
-# the real ones do, calls the mock unless told not to, prints JSON events.
+# the real ones do, calls the mock unless told not to, prints JSON events
+# with the reply it was given (argv[2]), or the failure its mode names.
 FAKE_PRODUCT = """
 import json, os, sys, urllib.request
-mode = sys.argv[1]
+mode, reply = sys.argv[1], sys.argv[2]
 models = json.load(open(os.path.join(os.environ["HOME"], ".prime/agent/models.json")))
 if mode != "no-call":
     url = models["providers"]["mock"]["baseUrl"] + "/chat/completions"
     body = json.dumps({"model": "mock-1", "messages": [{"role": "user", "content": "hi"}]}).encode()
     urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=10).read()
-stop = "error" if mode == "error" else "stop"
 print(json.dumps({"type": "agent_start"}), flush=True)
-print(json.dumps({"type": "message_end", "message": {"role": "assistant", "stopReason": stop}}), flush=True)
+if mode != "no-assistant":
+    stop = {"error": "error", "length": "length"}.get(mode, "stop")
+    text = "something else" if mode == "wrong-text" else reply
+    message = {"role": "assistant", "stopReason": stop, "content": [{"type": "text", "text": text}]}
+    print(json.dumps({"type": "message_end", "message": message}), flush=True)
 print(json.dumps({"type": "agent_end", "messages": []}), flush=True)
 sys.exit(3 if mode == "exit" else 0)
 """
@@ -320,7 +324,7 @@ class SandboxTests(unittest.TestCase):
             subprocess.run(["sh", "-c", "sleep 30 >/dev/null 2>&1 &"], env=sandbox.env, check=True)
             # A spawned root without the sandbox HOME is tracked by descent.
             rooted = subprocess.Popen(["sleep", "30"], env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
-            sandbox.roots.add(rooted.pid)
+            sandbox.add_root(rooted.pid)
             deadline = time.monotonic() + 5
             procs: dict = {}
             while time.monotonic() < deadline:
@@ -364,6 +368,37 @@ class SandboxTests(unittest.TestCase):
                 child.wait()
             sandbox.teardown()
 
+    def test_a_root_whose_pid_was_reused_is_neither_tracked_nor_signalled(self) -> None:
+        sandbox = bench.Sandbox("ts", "t", self.base, "http://127.0.0.1:9/v1", None)
+        # An unrelated process (with a child of its own) now holds the pid of
+        # a root this script launched earlier, under that root's identity.
+        reused = subprocess.Popen(["sh", "-c", "sleep 30 & wait"], env={"PATH": os.environ["PATH"]})
+        try:
+            sandbox.roots[reused.pid] = "the launched root's start time"
+            self.assertEqual(sandbox.processes(), {})
+            self.assertEqual(sandbox.reap(), [])
+            self.assertIsNone(reused.poll())
+            self.assertEqual((sandbox.roots, sandbox.known), ({}, {}))
+        finally:
+            reused.kill()
+            reused.wait()
+            sandbox.teardown()
+
+    def test_add_root_records_the_launch_identity_and_skips_a_finished_pid(self) -> None:
+        sandbox = bench.Sandbox("ts", "t", self.base, "http://127.0.0.1:9/v1", None)
+        child = subprocess.Popen(["sleep", "30"], env={"PATH": os.environ["PATH"]})
+        done = subprocess.Popen(["true"])
+        done.wait()
+        try:
+            sandbox.add_root(child.pid)
+            sandbox.add_root(done.pid)
+            self.assertEqual(sandbox.roots, {child.pid: bench.identity(child.pid)})
+            self.assertEqual(list(sandbox.processes()), [child.pid])
+        finally:
+            child.kill()
+            child.wait()
+            sandbox.teardown()
+
     def test_an_orphan_without_the_sandbox_home_stays_tracked(self) -> None:
         sandbox = bench.Sandbox("ts", "t", self.base, "http://127.0.0.1:9/v1", None)
         # The shell (a spawned root) starts a child with a scrubbed env, then
@@ -372,11 +407,11 @@ class SandboxTests(unittest.TestCase):
                                  stdout=subprocess.PIPE, text=True, env={"PATH": os.environ["PATH"]})
         orphan = int(shell.stdout.readline())
         try:
-            sandbox.roots.add(shell.pid)
+            sandbox.add_root(shell.pid)
             self.assertIn(orphan, sandbox.processes())
             shell.kill()
             shell.wait()
-            sandbox.roots.discard(shell.pid)
+            sandbox.roots.pop(shell.pid, None)
             time.sleep(0.2)
             procs = sandbox.processes()
             self.assertIn(orphan, procs)
@@ -399,8 +434,8 @@ class SandboxTests(unittest.TestCase):
         script.write_text(FAKE_PRODUCT)
         try:
             def run(mode: str) -> dict:
-                return bench.strip_events(bench.run_headless(sandbox, [sys.executable, str(script), mode],
-                                                             mock, 0.02, 30, run=0))
+                argv = [sys.executable, str(script), mode, bench.MOCK_REPLY]
+                return bench.strip_events(bench.run_headless(sandbox, argv, mock, 0.02, 30, run=0))
 
             good = run("ok")
             self.assertTrue(good["ok"], good)
@@ -410,12 +445,15 @@ class SandboxTests(unittest.TestCase):
             self.assertGreaterEqual(good["peakSandboxRssKb"], good["maxRssKb"])
             self.assertEqual(good["requests"][0]["messages"], 1)
             self.assertNotIn("stderrTail", good)
-            self.assertFalse(run("error")["ok"])
-            self.assertFalse(run("no-call")["ok"])
+            # A clean agent_end and exit 0 are not enough: no assistant
+            # message, a non-reply stop, or another reply all fail the run.
+            for mode in ("error", "no-call", "no-assistant", "length", "wrong-text"):
+                with self.subTest(mode):
+                    self.assertEqual(run(mode)["ok"], False)
             failed = run("exit")
             self.assertEqual((failed["ok"], failed["exitCode"]), (False, 3))
             self.assertIn("stderrTail", failed)
-            self.assertEqual(sandbox.roots, set())
+            self.assertEqual(sandbox.roots, {})
         finally:
             sandbox.teardown()
             mock.close()

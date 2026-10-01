@@ -148,6 +148,8 @@ LIVE_MODELS_JSON = HOME / ".prime" / "agent" / "models.json"
 MOCK_PROVIDER = "mock"
 MOCK_MODEL = "mock-1"
 MOCK_REPLY = "Hi! This is the mock provider replying."
+# The only stopReason of a final assistant message that is a real reply.
+SUCCESS_STOP_REASONS = ("stop",)
 DEAD_URL = "http://127.0.0.1:1/oneiron-bench-disabled"
 PRODUCTS = ("ts", "rs")
 LABELS = {"ts": "TS prime-agent", "rs": "Rust prime-agent-rs"}
@@ -616,14 +618,16 @@ def identity(pid: int) -> str | None:
     return " ".join(out.split()) or None
 
 
-def sandbox_processes(home: str, roots: set[int] = frozenset(),
+def sandbox_processes(home: str, roots: dict[int, str] | None = None,
                       known: dict[int, str] | None = None) -> dict[int, dict]:
     """The sandbox's live processes: every pid whose environment carries
     HOME=<home> (macOS: and TMPDIR=<sandbox>/t, as `ps -E` mixes argv and
     environment in one column), every `known` pid (pid -> identity from an
-    earlier scan) still alive under the same identity, and all live
-    descendants of those and of `roots` (the PIDs this script spawned), so a
-    child that lost its parent or its HOME stays tracked.
+    earlier scan) and every root (pid -> identity recorded when this script
+    spawned it) still alive under that same identity, and all live
+    descendants of those, so a child that lost its parent or its HOME stays
+    tracked. A root or known pid now naming another process is neither
+    admitted nor walked: its identity is never recaptured.
     pid -> {ppid, rssKb, hwmKb, name, cmd, env (KEY=VALUE tokens), envMatched, ident}."""
     tokens = {f"HOME={home}"}
     found: dict[int, dict] = {}
@@ -655,12 +659,12 @@ def sandbox_processes(home: str, roots: set[int] = frozenset(),
         def children_of(pid: int) -> list[int]:
             return kids.get(pid, [])
 
-    for pid, ident in (known or {}).items():
+    for pid, ident in {**(known or {}), **(roots or {})}.items():
         if pid not in found:
             info = lookup(pid)
             if info and info["ident"] == ident:
                 found[pid] = info
-    stack = list(set(roots) | set(found))
+    stack = list(found)
     seen = set(stack)
     while stack:
         pid = stack.pop()
@@ -709,7 +713,7 @@ def pid_alive(pid: int) -> bool:
     return bool(out) and not out.startswith("Z")
 
 
-def reap(home: str, roots: set[int] = frozenset(), exclude: set[int] = frozenset(),
+def reap(home: str, roots: dict[int, str] | None = None, exclude: set[int] = frozenset(),
          known: dict[int, str] | None = None, grace: float = 5.0,
          rounds: int = 6) -> tuple[list[dict], dict[int, dict]]:
     """SIGTERM then SIGKILL every sandbox process, by PID and identity, until
@@ -850,7 +854,8 @@ class Sandbox:
     def __init__(self, product: str, purpose: str, base: Path, mock_url: str, uv_cache: str | None) -> None:
         self.product = product
         self.purpose = purpose
-        self.roots: set[int] = set()
+        # pid -> identity, recorded when this script spawned the process.
+        self.roots: dict[int, str] = {}
         self.known: dict[int, str] = {}
         self.env: dict[str, str] = {}
         base.mkdir(parents=True, exist_ok=True)
@@ -897,6 +902,13 @@ class Sandbox:
         (agent_dir / "settings.json").write_text(json.dumps(
             {"onboardingShown": True, "telemetry": {"enabled": False, "noticeShown": True}}, indent=2) + "\n")
 
+    def add_root(self, pid: int) -> None:
+        """Track a process this script just spawned, under its identity now
+        (a pid already gone is not tracked: its number may be reused)."""
+        ident = identity(pid)
+        if ident is not None:
+            self.roots[pid] = ident
+
     def processes(self) -> dict[int, dict]:
         found = sandbox_processes(str(self.home), self.roots, self.known)
         self.known = {pid: info["ident"] for pid, info in found.items()}
@@ -904,7 +916,8 @@ class Sandbox:
 
     def reap(self, exclude: set[int] = frozenset()) -> list[dict]:
         signalled, survivors = reap(str(self.home), self.roots, exclude, self.known)
-        self.roots = {pid for pid in self.roots if pid in survivors}
+        self.roots = {pid: ident for pid, ident in self.roots.items()
+                      if pid in survivors and survivors[pid]["ident"] == ident}
         self.known = {pid: info["ident"] for pid, info in survivors.items()}
         return signalled
 
@@ -981,13 +994,28 @@ def final_assistant(events: list[dict]) -> dict | None:
     return last
 
 
+def replied(final: dict) -> bool:
+    """A final assistant message that ended its turn with a reply: `stop`
+    (not length, toolUse, error or aborted, and not a missing message)."""
+    return final.get("role") == "assistant" and final.get("stopReason") in SUCCESS_STOP_REASONS
+
+
+def reply_text(message: dict) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    return "".join(part["text"] for part in content or [] if isinstance(part, dict)
+                   and part.get("type") == "text" and isinstance(part.get("text"), str))
+
+
 def run_headless(sandbox: Sandbox, argv: list[str], mock: MockProvider | None, poll: float,
                  timeout: float, run: int) -> dict:
     """One headless run: wall time to the agent_end line on stdout and to
     exit (a blocking wait4 in its own thread), the CLI's wait4 max RSS, and
     the peak summed RSS of every sandbox process, scanned every `poll` while
-    the CLI runs. Against the mock, a run counts only when the provider got
-    a request and the final assistant message did not end in an error."""
+    the CLI runs. A run counts only with a final assistant message that
+    replied (stopReason `stop`); against the mock, also only when the
+    provider got a request and the reply is the mock's."""
     mark = mock.mark() if mock else 0
     stderr_path = sandbox.root / f"stderr-{run}.log"
     agent_end: list[float] = []
@@ -996,7 +1024,7 @@ def run_headless(sandbox: Sandbox, argv: list[str], mock: MockProvider | None, p
         started = time.monotonic()
         proc = subprocess.Popen(argv, cwd=sandbox.work, env=sandbox.env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=stderr, start_new_session=True)
-        sandbox.roots.add(proc.pid)
+        sandbox.add_root(proc.pid)
 
         def read() -> None:
             for raw in proc.stdout:
@@ -1036,15 +1064,15 @@ def run_headless(sandbox: Sandbox, argv: list[str], mock: MockProvider | None, p
             proc.stdout.close()
     if "status" in exited:
         proc.returncode = os.waitstatus_to_exitcode(exited["status"])
-        sandbox.roots.discard(proc.pid)
+        sandbox.roots.pop(proc.pid, None)
     rusage = exited.get("rusage")
     max_rss = (rusage.ru_maxrss // 1024 if IS_MAC else rusage.ru_maxrss) if rusage else None
     requests = mock.since(mark) if mock else []
     events = json_events("".join(lines))
     final = final_assistant(events) or {}
     posted = [r for r in requests if r["path"].endswith(("/chat/completions", "/responses"))]
-    ok = (proc.returncode == 0 and bool(agent_end) and final.get("stopReason") not in ("error", "aborted")
-          and (mock is None or bool(posted)))
+    ok = (proc.returncode == 0 and bool(agent_end) and replied(final)
+          and (mock is None or (bool(posted) and reply_text(final).strip() == MOCK_REPLY)))
     sample = {"run": run, "ok": ok, "exitCode": proc.returncode,
               "agentEndS": round(agent_end[0], 4) if agent_end else None,
               "exitS": round(exited["at"], 4) if "at" in exited else None,
@@ -1247,7 +1275,7 @@ class Bench:
                   *pane, check=True)
         ids = self.tmux(sandbox, "display-message", "-p", "-t", session, "#{pid} #{pane_pid}").stdout.split()
         server_pid, pane_pid = int(ids[0]), int(ids[1])
-        sandbox.roots.add(pane_pid)
+        sandbox.add_root(pane_pid)
         return started, server_pid, pane_pid
 
     def wait_ready(self, sandbox: Sandbox, session: str, started: float, timeout: float) -> dict:
@@ -1277,7 +1305,7 @@ class Bench:
             if not pid_alive(pane_pid):
                 # tmux reaped it: the pid is free for reuse, so it stops
                 # being a root the reap would signal unchecked.
-                sandbox.roots.discard(pane_pid)
+                sandbox.roots.pop(pane_pid, None)
                 return round(time.monotonic() - started, 3), True
             time.sleep(0.05)
         return None, False
@@ -1420,8 +1448,7 @@ class Bench:
                                     ("input", "output", "cacheRead", "cacheWrite", "totalTokens")}}
                 # A provider error still ends the agent cleanly: the reply
                 # must also be a real one from the requested model.
-                sample["ok"] = (raw["ok"] and sample["stopReason"] not in ("error", "aborted", None)
-                                and sample["responseModel"] in accepted)
+                sample["ok"] = raw["ok"] and replied(message) and sample["responseModel"] in accepted
                 if message.get("errorMessage"):
                     sample["errorMessage"] = redact(str(message["errorMessage"]))[:500]
                 if not sample["ok"]:
