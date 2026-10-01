@@ -300,7 +300,9 @@ async fn a_summary_between_generations_invalidates_the_continuation() {
         .drain()
         .into_iter()
         .filter_map(|record| match record {
-            Record::WsRequest { connection, body } => Some((
+            Record::WsRequest {
+                connection, body, ..
+            } => Some((
                 connection,
                 body.get("previous_response_id")
                     .and_then(serde_json::Value::as_str)

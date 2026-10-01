@@ -150,7 +150,9 @@ fn seen(records: Vec<Record>) -> (Vec<Seen>, Vec<Value>) {
     for record in records {
         match record {
             Record::Upgrade { connection, .. } => seen.push(Seen::Upgrade(connection)),
-            Record::WsRequest { connection, body } => {
+            Record::WsRequest {
+                connection, body, ..
+            } => {
                 seen.push(Seen::Ws {
                     connection,
                     previous: body["previous_response_id"].as_str().map(str::to_string),

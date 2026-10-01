@@ -169,14 +169,11 @@ fn transport_error(
 }
 
 /// A failure before the socket opened (TS `connect`'s error/close events
-/// with cause `connect`). A request already cancelled (its session
-/// disposed, or the caller aborted) reports the cancellation: a disposed
-/// session's request must never read as a transport failure the caller
-/// replays over SSE.
+/// with cause `connect`). The handshake settles once, like the TS connect
+/// promise: a failure that settled it stays that failure even when a
+/// disposal lands before the request maps it (TS rethrows the settled
+/// rejection), and only a cancellation that settled it is one.
 fn connect_error(failure: ConnectFailure, owner: &OwnedRequest) -> ResponsesWsError {
-    if let Some(cancellation) = owner.cancellation() {
-        return ResponsesWsError::from_cancellation(cancellation);
-    }
     let message = match failure {
         ConnectFailure::Cancelled => {
             return ResponsesWsError::from_cancellation(

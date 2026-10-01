@@ -151,7 +151,9 @@ fn seen(records: Vec<Record>) -> Vec<Seen> {
         .into_iter()
         .filter_map(|record| match record {
             Record::Upgrade { connection, .. } => Some(Seen::Upgrade(connection)),
-            Record::WsRequest { connection, body } => {
+            Record::WsRequest {
+                connection, body, ..
+            } => {
                 let (previous, inputs) = summary(&body);
                 Some(Seen::Ws {
                     connection,
@@ -1042,9 +1044,11 @@ async fn disposal_closes_a_caller_aborted_displaced_socket() {
 }
 
 /// A request whose session was disposed before it mapped its socket's end
-/// or its handshake failure reports the disposal: a remote close the
-/// worker queued just before the disposal is not a transport failure the
-/// caller would replay over SSE.
+/// reports the disposal: a remote close the worker queued just before the
+/// disposal is not a transport failure the caller would replay over SSE
+/// (TS `onAbort` replaces a failure the collector has not thrown). A
+/// handshake failure that already settled the connect stays the failure
+/// (TS rethrows the settled connect rejection).
 #[test]
 fn a_disposal_wins_over_an_unmapped_socket_end() {
     let owner = super::session::OwnedRequest::begin(Some("dispose-unmapped"), None);
@@ -1071,11 +1075,15 @@ fn a_disposal_wins_over_an_unmapped_socket_end() {
         super::socket_end_error(super::connection::SocketEnd::Eof, &owner),
         super::ResponsesWsError::SessionDisposed
     );
-    assert_eq!(
+    assert!(matches!(
         super::connect_error(
             super::connection::ConnectFailure::Request("Invalid WebSocket header x".to_string()),
             &owner,
         ),
+        super::ResponsesWsError::Transport(_)
+    ));
+    assert_eq!(
+        super::connect_error(super::connection::ConnectFailure::Cancelled, &owner),
         super::ResponsesWsError::SessionDisposed
     );
 }
@@ -1706,8 +1714,10 @@ fn parity_record(records: &[Record]) -> (Value, Value) {
                 chosen.sort();
                 upgrades.push(json!({ "path": path, "headers": chosen }));
             }
-            Record::WsRequest { connection, body } => {
-                frames.push(json!({ "connection": connection, "text": body.to_string() }));
+            Record::WsRequest {
+                connection, text, ..
+            } => {
+                frames.push(json!({ "connection": connection, "text": text }));
             }
             _ => {}
         }
@@ -1738,7 +1748,7 @@ fn parity_outcome(message: &AssistantMessage) -> Value {
 /// text delta, a tool-output delta, a full request after a system-prompt
 /// change, then a disposal. On session `parity-drop`: a socket the peer
 /// closes (1011) after the first events. The Rust transport sends
-/// byte-identical request frames (key order included) with the same
+/// byte-identical request frames (the received text) with the same
 /// handshake headers on the same path, the same close, and settles the
 /// drop with the same error text and diagnostics (TS stack traces aside).
 #[tokio::test]
@@ -1763,7 +1773,7 @@ async fn request_frames_match_the_ts_reference() {
     let ws = ws_model(&server);
     parity_scenario(&ws).await;
     crate::cleanup_session_resources(Some("parity"));
-    let close = server.closed(1).await;
+    let (code, reason) = server.close_frame(1).await.expect("a close frame");
     let dropped = run(
         &ws,
         &Context {
@@ -1781,7 +1791,7 @@ async fn request_frames_match_the_ts_reference() {
     assert_eq!(upgrades, reference["upgrades"]);
     assert_eq!(
         reference["closes"],
-        json!([{ "connection": 1, "code": 1000, "reason": close }])
+        json!([{ "connection": 1, "code": code, "reason": reason }])
     );
     let mut expected_drop = reference["drop"].clone();
     for diagnostic in expected_drop["diagnostics"]

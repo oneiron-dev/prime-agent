@@ -14,7 +14,7 @@
 //! each request's socket with `session_cleanup`, cached or not.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -56,10 +56,30 @@ struct Entry {
     continuation: Option<ContinuationAnchor>,
 }
 
+/// An owned request's recorded cancellation cause: set once, by whichever
+/// of the caller's abort (observed) or the session's disposal records
+/// first, and never changed after (TS keeps the first abort's reason).
+const CAUSE_NONE: u8 = 0;
+const CAUSE_ABORTED: u8 = 1;
+const CAUSE_DISPOSED: u8 = 2;
+
+/// Record a session disposal as a request's cause; `false` when a cause
+/// (the caller's observed abort) is already recorded, which then stands.
+fn record_disposal(cause: &AtomicU8) -> bool {
+    cause
+        .compare_exchange(
+            CAUSE_NONE,
+            CAUSE_DISPOSED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+}
+
 struct Owned {
     session_id: Option<String>,
     cancel: CancellationToken,
-    disposed: Arc<AtomicBool>,
+    cause: Arc<AtomicU8>,
     /// The request's connection once acquired (TS `owner.socket`), so
     /// disposal reaches a socket that never entered the session cache.
     worker: Option<WorkerHandle>,
@@ -98,13 +118,13 @@ pub(crate) enum Cancellation {
 pub(crate) struct OwnedRequest {
     id: u64,
     cancel: CancellationToken,
-    disposed: Arc<AtomicBool>,
+    cause: Arc<AtomicU8>,
 }
 
 impl OwnedRequest {
     pub(crate) fn begin(session_id: Option<&str>, caller: Option<&CancellationToken>) -> Self {
         let cancel = caller.map_or_else(CancellationToken::new, CancellationToken::child_token);
-        let disposed = Arc::new(AtomicBool::new(false));
+        let cause = Arc::new(AtomicU8::new(CAUSE_NONE));
         let mut state = lock_state();
         state.next_request += 1;
         let id = state.next_request;
@@ -113,15 +133,11 @@ impl OwnedRequest {
             Owned {
                 session_id: session_id.map(str::to_string),
                 cancel: cancel.clone(),
-                disposed: Arc::clone(&disposed),
+                cause: Arc::clone(&cause),
                 worker: None,
             },
         );
-        Self {
-            id,
-            cancel,
-            disposed,
-        }
+        Self { id, cancel, cause }
     }
 
     /// The token every stage of the request races.
@@ -135,7 +151,7 @@ impl OwnedRequest {
     /// it now.
     pub(crate) fn attach(&self, worker: &WorkerHandle) {
         let mut state = lock_state();
-        if self.disposed.load(Ordering::SeqCst) {
+        if self.cause.load(Ordering::SeqCst) == CAUSE_DISPOSED {
             worker.close(CloseReason::SessionCleanup);
         }
         if let Some(owned) = state.owned.get_mut(&self.id) {
@@ -143,24 +159,31 @@ impl OwnedRequest {
         }
     }
 
-    /// Why the request stopped, if it did. A disposal counts from the
-    /// moment it marks the request, before its token fires: the socket's
-    /// `session_cleanup` close can reach the request first.
+    /// Why the request stopped, if it did; once answered, the answer never
+    /// changes. A disposal counts from the moment it records its cause,
+    /// before its token fires (the socket's `session_cleanup` close can
+    /// reach the request first). A fired token with no recorded cause is
+    /// the caller's abort, recorded here unless a disposal recorded first.
     pub(crate) fn cancellation(&self) -> Option<Cancellation> {
-        if self.disposed.load(Ordering::SeqCst) {
-            return Some(Cancellation::SessionDisposed);
+        let recorded = match self.cause.load(Ordering::SeqCst) {
+            CAUSE_NONE if self.cancel.is_cancelled() => {
+                match self.cause.compare_exchange(
+                    CAUSE_NONE,
+                    CAUSE_ABORTED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => CAUSE_ABORTED,
+                    Err(first) => first,
+                }
+            }
+            cause => cause,
+        };
+        match recorded {
+            CAUSE_DISPOSED => Some(Cancellation::SessionDisposed),
+            CAUSE_ABORTED => Some(Cancellation::Aborted),
+            _ => None,
         }
-        if !self.cancel.is_cancelled() {
-            return None;
-        }
-        // The token fired. A disposal marks the request before it fires
-        // the token, so a disposal that landed between the first read and
-        // the token check shows here: never report it as a caller abort.
-        Some(if self.disposed.load(Ordering::SeqCst) {
-            Cancellation::SessionDisposed
-        } else {
-            Cancellation::Aborted
-        })
     }
 }
 
@@ -385,13 +408,11 @@ pub(crate) fn close_sessions(session_id: Option<&str>) {
         if !owns {
             continue;
         }
-        // A request the caller already aborted keeps that verdict; the
-        // others are marked first: whichever signal the socket's worker
-        // sees, the request reads as disposed.
-        let disposing = !owned.cancel.is_cancelled();
-        if disposing {
-            owned.disposed.store(true, Ordering::SeqCst);
-        }
+        // A request the caller already aborted keeps that verdict (its
+        // token fired before the disposal could record); the others record
+        // the disposal first, at once and for good: whichever signal the
+        // socket's worker sees, the request reads as disposed.
+        let disposing = !owned.cancel.is_cancelled() && record_disposal(&owned.cause);
         // Every owned socket closes with `session_cleanup` (TS closes
         // `request.socket` unconditionally), an aborted one included, and
         // the reason is set before the token fires.
@@ -437,6 +458,29 @@ pub(crate) fn owned_request_count(session_id: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request's cancellation cause is recorded once: a caller abort the
+    /// request already observed stands even when a racing disposal (past
+    /// its token check) records next, and a disposal recorded before the
+    /// caller's abort stands too. The disposal mark used to be a plain
+    /// store, flipping an observed abort to a disposal.
+    #[test]
+    fn the_first_recorded_cancellation_cause_stands() {
+        let caller = CancellationToken::new();
+        let aborted = OwnedRequest::begin(Some("cause-abort-first"), Some(&caller));
+        caller.cancel();
+        assert_eq!(aborted.cancellation(), Some(Cancellation::Aborted));
+        // The racing disposal's record step, after its token check passed.
+        assert!(!record_disposal(&aborted.cause));
+        assert_eq!(aborted.cancellation(), Some(Cancellation::Aborted));
+
+        let caller = CancellationToken::new();
+        let disposed = OwnedRequest::begin(Some("cause-dispose-first"), Some(&caller));
+        assert_eq!(disposed.cancellation(), None);
+        assert!(record_disposal(&disposed.cause));
+        caller.cancel();
+        assert_eq!(disposed.cancellation(), Some(Cancellation::SessionDisposed));
+    }
 
     #[test]
     fn identity_normalizes_header_case_order_and_duplicates() {
