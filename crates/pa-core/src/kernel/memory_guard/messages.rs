@@ -117,7 +117,8 @@ fn describe_type(variable: &SizedVariable) -> String {
     if let Some(length) = variable.length {
         return format!("{} of {length}", variable.type_name);
     }
-    let text = match &variable.dtype {
+    // TS `v.dtype ? ... : v.type`: an empty dtype (an empty frame) is none.
+    let text = match variable.dtype.as_deref().filter(|dtype| !dtype.is_empty()) {
         Some(dtype) => format!("{} {dtype}", variable.type_name),
         None => variable.type_name.clone(),
     };

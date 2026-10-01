@@ -91,6 +91,21 @@ fn warning_messages_match_the_ts_fork() {
     assert_eq!(messages, fixture().warning);
 }
 
+/// An empty frame reports an empty dtype; TS `describeType` treats it as
+/// absent (`v.dtype ? ... : v.type`), so no stray space appears.
+#[test]
+fn an_empty_dtype_reads_as_no_dtype() {
+    let empty_frame = SizedVariable {
+        shape: Some(vec![0, 0]),
+        dtype: Some(String::new()),
+        ..variable("df", 128.0, "DataFrame")
+    };
+    assert_eq!(
+        describe_variables(&[empty_frame]),
+        "df (1 KB, DataFrame, shape (0, 0))"
+    );
+}
+
 #[test]
 fn child_messages_match_the_ts_fork() {
     let child = |name: &'static str, pid: i32, gb: f64| StoppedChild {
