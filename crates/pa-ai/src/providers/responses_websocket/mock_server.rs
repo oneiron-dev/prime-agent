@@ -78,9 +78,16 @@ pub enum Record {
         headers: Vec<(String, String)>,
         body: Value,
     },
+    /// The first bytes of a request frame reached a silent peer (which
+    /// then stops reading: the client's write is under way).
+    FrameStarted { connection: usize },
     /// An accepted WebSocket connection ended (the client closed or went
-    /// away, or the script ended it).
-    Closed { connection: usize },
+    /// away, or the script ended it), with the client's close-frame reason
+    /// when it sent one.
+    Closed {
+        connection: usize,
+        reason: Option<String>,
+    },
 }
 
 /// The running server: its base URL and the records it observed.
@@ -88,50 +95,95 @@ pub struct MockServer {
     /// `http://127.0.0.1:<port>/v1`.
     pub base_url: String,
     records: mpsc::UnboundedReceiver<Record>,
+    /// Records a waiter passed over, kept for the next drain or waiter.
+    held: VecDeque<Record>,
 }
 
 impl MockServer {
-    /// Every record observed since the last drain.
+    /// Every record observed since the last drain (the ones a waiter
+    /// passed over first).
     #[must_use]
     pub fn drain(&mut self) -> Vec<Record> {
-        let mut records = Vec::new();
+        let mut records: Vec<Record> = self.held.drain(..).collect();
         while let Ok(record) = self.records.try_recv() {
             records.push(record);
         }
         records
     }
 
+    /// Wait for the first record `wanted` accepts, keeping every other
+    /// record for the next drain or waiter.
+    async fn next_matching<T>(&mut self, wanted: impl Fn(&Record) -> Option<T>) -> T {
+        if let Some(index) = self.held.iter().position(|record| wanted(record).is_some()) {
+            let record = self.held.remove(index).expect("held record");
+            return wanted(&record).expect("matched record");
+        }
+        loop {
+            let record = self.records.recv().await.expect("mock server alive");
+            match wanted(&record) {
+                Some(found) => return found,
+                None => self.held.push_back(record),
+            }
+        }
+    }
+
     /// Wait for the next upgrade or request record (for requests the
-    /// client has not finished, e.g. a stalled one), passing over
-    /// connection ends.
+    /// client has not finished, e.g. a stalled one); other records stay
+    /// for the next drain.
     ///
     /// # Panics
     ///
     /// Panics when the server task is gone.
     pub async fn next_request(&mut self) -> Record {
-        loop {
-            match self.records.recv().await.expect("mock server alive") {
-                Record::Closed { .. } => {}
-                record @ (Record::Upgrade { .. }
-                | Record::WsRequest { .. }
-                | Record::SseRequest { .. }) => return record,
+        self.next_matching(|record| match record {
+            Record::Upgrade { .. } | Record::WsRequest { .. } | Record::SseRequest { .. } => {
+                Some(record.clone())
             }
-        }
+            Record::FrameStarted { .. } | Record::Closed { .. } => None,
+        })
+        .await
     }
 
-    /// Wait for the next accepted connection to end; returns its number,
-    /// passing over request records.
+    /// Wait until a request frame starts reaching connection
+    /// `connection`'s silent peer.
     ///
     /// # Panics
     ///
     /// Panics when the server task is gone.
-    pub async fn next_closed(&mut self) -> usize {
-        loop {
-            match self.records.recv().await.expect("mock server alive") {
-                Record::Closed { connection } => return connection,
-                Record::Upgrade { .. } | Record::WsRequest { .. } | Record::SseRequest { .. } => {}
-            }
-        }
+    pub async fn frame_started(&mut self, connection: usize) {
+        self.next_matching(|record| match record {
+            Record::FrameStarted {
+                connection: started,
+            } if *started == connection => Some(()),
+            Record::Upgrade { .. }
+            | Record::WsRequest { .. }
+            | Record::SseRequest { .. }
+            | Record::FrameStarted { .. }
+            | Record::Closed { .. } => None,
+        })
+        .await;
+    }
+
+    /// Wait for connection `connection` to end; returns the client's
+    /// close-frame reason, if it sent one. Other records stay for the
+    /// next drain.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the server task is gone.
+    pub async fn closed(&mut self, connection: usize) -> Option<String> {
+        self.next_matching(|record| match record {
+            Record::Closed {
+                connection: closed,
+                reason,
+            } if *closed == connection => Some(reason.clone()),
+            Record::Upgrade { .. }
+            | Record::WsRequest { .. }
+            | Record::SseRequest { .. }
+            | Record::FrameStarted { .. }
+            | Record::Closed { .. } => None,
+        })
+        .await
     }
 }
 
@@ -167,6 +219,7 @@ pub async fn spawn(upgrades: Vec<Upgrade>, sse: Vec<SseReply>) -> MockServer {
     MockServer {
         base_url: format!("http://127.0.0.1:{port}/v1"),
         records: receiver,
+        held: VecDeque::new(),
     }
 }
 
@@ -265,13 +318,25 @@ async fn serve(mut socket: TcpStream, scripts: Arc<Scripts>) {
         return;
     }
     let Some(turns) = turns else {
-        // The silent peer holds the socket open and never reads it.
+        // The silent peer reads the first bytes of the request frame,
+        // records them, then holds the socket open and never reads again.
+        let mut first = [0u8; 4096];
+        if matches!(socket.read(&mut first).await, Ok(read) if read > 0) {
+            let _ = scripts.records.send(Record::FrameStarted { connection });
+        }
         let _held = socket;
         std::future::pending::<()>().await;
         return;
     };
     let mut ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
     let mut turns = VecDeque::from(turns);
+    // The client's close-frame reason, wherever the socket's turns end.
+    let mut close_reason: Option<String> = None;
+    let mut note_close = |message: &Message| {
+        if let Message::Close(Some(frame)) = message {
+            close_reason = Some(frame.reason.as_str().to_string());
+        }
+    };
     // Every way the socket's turns end records the connection's end.
     async {
         loop {
@@ -281,13 +346,19 @@ async fn serve(mut socket: TcpStream, scripts: Arc<Scripts>) {
                         break serde_json::from_str::<Value>(text.as_str()).expect("request json");
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
-                    Some(Ok(Message::Binary(_) | Message::Close(_)) | Err(_)) | None => return,
+                    Some(Ok(message @ (Message::Binary(_) | Message::Close(_)))) => {
+                        note_close(&message);
+                        return;
+                    }
+                    Some(Err(_)) | None => return,
                 }
             };
             let _ = scripts.records.send(Record::WsRequest { connection, body });
             let Some(turn) = turns.pop_front() else {
                 // Unscripted requests stall until the client goes away.
-                while let Some(Ok(_)) = ws.next().await {}
+                while let Some(Ok(message)) = ws.next().await {
+                    note_close(&message);
+                }
                 return;
             };
             match turn {
@@ -339,7 +410,9 @@ async fn serve(mut socket: TcpStream, scripts: Arc<Scripts>) {
                             reason: reason.into(),
                         }))
                         .await;
-                    while let Some(Ok(_)) = ws.next().await {}
+                    while let Some(Ok(message)) = ws.next().await {
+                        note_close(&message);
+                    }
                     return;
                 }
                 Turn::RawText(frames) => {
@@ -350,7 +423,9 @@ async fn serve(mut socket: TcpStream, scripts: Arc<Scripts>) {
                     }
                 }
                 Turn::Stall => {
-                    while let Some(Ok(_)) = ws.next().await {}
+                    while let Some(Ok(message)) = ws.next().await {
+                        note_close(&message);
+                    }
                     return;
                 }
                 Turn::EventsThenStall(events) => {
@@ -363,14 +438,19 @@ async fn serve(mut socket: TcpStream, scripts: Arc<Scripts>) {
                             return;
                         }
                     }
-                    while let Some(Ok(_)) = ws.next().await {}
+                    while let Some(Ok(message)) = ws.next().await {
+                        note_close(&message);
+                    }
                     return;
                 }
             }
         }
     }
     .await;
-    let _ = scripts.records.send(Record::Closed { connection });
+    let _ = scripts.records.send(Record::Closed {
+        connection,
+        reason: close_reason,
+    });
 }
 
 async fn serve_sse(

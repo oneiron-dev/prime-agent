@@ -163,7 +163,7 @@ fn seen(records: Vec<Record>) -> Vec<Seen> {
                 let (previous, inputs) = summary(&body);
                 Some(Seen::Sse { previous, inputs })
             }
-            Record::Closed { .. } => None,
+            Record::FrameStarted { .. } | Record::Closed { .. } => None,
         })
         .collect()
 }
@@ -1144,32 +1144,22 @@ async fn drop_retry_continuation_and_fallback_scenario() {
     );
 }
 
-/// Session disposal reaches a request whose write is blocked: the peer
-/// completed the upgrade and stopped reading, so the large request frame
-/// backs up once the socket buffers fill. The request settles as disposed
-/// instead of waiting on the peer forever (the write used to ignore the
-/// request's token).
+/// Session disposal reaches a request whose write is under way: the peer
+/// read the first bytes of the large request frame and stopped reading,
+/// so the write backs up once the socket buffers fill. The request settles
+/// as disposed instead of waiting on the peer forever (the write used to
+/// ignore the request's token).
 #[tokio::test]
 async fn disposal_interrupts_a_request_blocked_on_its_write() {
     let mut server = mock_server::spawn(vec![Upgrade::AcceptSilent], Vec::new()).await;
-    let (opened, socket_ready) = tokio::sync::oneshot::channel::<()>();
-    let opened = std::sync::Mutex::new(Some(opened));
-    let mut request = options(Some("dispose-blocked-write"), None);
-    // The response hook fires once the socket is ready for this request,
-    // right before the frame is written.
-    request.base.on_response = Some(std::sync::Arc::new(move |_response, _model| {
-        if let Some(opened) = opened.lock().unwrap().take() {
-            let _ = opened.send(());
-        }
-    }));
     // Far beyond the loopback socket buffers: the write cannot complete.
     let huge = "x".repeat(24 * 1024 * 1024);
     let pending = stream_openai_responses(
         &ws_model(&server),
         &context(vec![user(&huge)]),
-        Some(&request),
+        Some(&options(Some("dispose-blocked-write"), None)),
     );
-    socket_ready.await.expect("the socket opened");
+    server.frame_started(1).await;
     crate::cleanup_session_resources(Some("dispose-blocked-write"));
     let message = tokio::time::timeout(std::time::Duration::from_secs(30), pending.result())
         .await
@@ -1230,6 +1220,12 @@ async fn an_identity_change_closes_the_busy_socket_under_its_request() {
             Some("WebSocket closed before response.completed 1000 connection_identity_changed")
         )
     );
+    // The replaced socket's close frame names why (TS
+    // `close(socket, "connection_identity_changed")`).
+    assert_eq!(
+        server.closed(1).await.as_deref(),
+        Some("connection_identity_changed")
+    );
     assert_eq!(
         seen(server.drain()),
         vec![
@@ -1273,7 +1269,9 @@ async fn a_caller_abort_closes_the_streaming_socket() {
     ));
     signal.cancel();
     assert_eq!(pending.result().await.stop_reason, StopReason::Aborted);
-    assert_eq!(server.next_closed().await, 1);
+    // The aborted request retires its socket with TS `release(false)`'s
+    // `done` close.
+    assert_eq!(server.closed(1).await.as_deref(), Some("done"));
     assert!(!server
         .drain()
         .iter()

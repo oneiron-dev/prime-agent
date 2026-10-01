@@ -25,6 +25,8 @@ use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -224,10 +226,22 @@ async fn cancelled(cancel: Option<&CancellationToken>) {
     }
 }
 
-/// Send the close frame, giving a peer that stopped reading a bounded
-/// grace before the socket is dropped.
-async fn close_politely(sink: &mut futures::stream::SplitSink<WsStream, Message>) {
-    let _ = tokio::time::timeout(CLOSE_GRACE, sink.close()).await;
+/// Send the close frame (TS `socket.close(1000, reason)`: normal closure
+/// with the reason on the wire), giving a peer that stopped reading a
+/// bounded grace before the socket is dropped.
+async fn close_politely(
+    sink: &mut futures::stream::SplitSink<WsStream, Message>,
+    reason: CloseReason,
+) {
+    let frame = CloseFrame {
+        code: CloseCode::Normal,
+        reason: reason.as_str().into(),
+    };
+    let _ = tokio::time::timeout(CLOSE_GRACE, async {
+        let _ = sink.send(Message::Close(Some(frame))).await;
+        let _ = sink.close().await;
+    })
+    .await;
 }
 
 fn next_connection_id() -> u64 {
@@ -296,7 +310,7 @@ async fn connection_worker(
         let request = tokio::select! {
             request = commands.recv() => request,
             () = closing.token.cancelled() => {
-                close_politely(&mut sink).await;
+                close_politely(&mut sink, closing.reason()).await;
                 return;
             }
             idle = stream.next() => match idle {
@@ -312,7 +326,7 @@ async fn connection_worker(
                 // A close, EOF, or socket error while idle: the connection
                 // is gone, so the worker exits and the handle reads closed.
                 Some(Ok(Message::Close(_)) | Err(_)) | None => {
-                    close_politely(&mut sink).await;
+                    close_politely(&mut sink, CloseReason::Done).await;
                     return;
                 }
             },
@@ -345,9 +359,16 @@ async fn connection_worker(
             Err(end) => end,
         };
         let completed = matches!(end, SocketEnd::Completed);
+        // A request that did not complete retires the connection (TS
+        // `release(false)` closes with `done`); a local close keeps its
+        // own reason.
+        let close_reason = match &end {
+            SocketEnd::LocalClose(reason) => *reason,
+            _ => CloseReason::Done,
+        };
         let _ = events.send(WorkerEvent::End(end)).await;
         if !completed {
-            close_politely(&mut sink).await;
+            close_politely(&mut sink, close_reason).await;
             return;
         }
     }

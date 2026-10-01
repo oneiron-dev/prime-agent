@@ -189,5 +189,5 @@ async fn an_abort_cancels_the_held_summary_request() {
         "{:?}",
         outcome.map(|_| ())
     );
-    assert_eq!(server.next_closed().await, 1);
+    assert_eq!(server.closed(1).await.as_deref(), Some("done"));
 }

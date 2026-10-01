@@ -159,7 +159,7 @@ fn seen(records: Vec<Record>) -> (Vec<Seen>, Vec<Value>) {
                 bodies.push(body);
             }
             Record::SseRequest { body, .. } => panic!("unexpected SSE request: {body}"),
-            Record::Closed { .. } => {}
+            Record::FrameStarted { .. } | Record::Closed { .. } => {}
         }
     }
     (seen, bodies)
