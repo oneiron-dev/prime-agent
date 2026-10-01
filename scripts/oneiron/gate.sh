@@ -51,19 +51,23 @@ run_test() {
   sandbox="$(mktemp -d "${TMPDIR:-/tmp}/pa-gate.XXXXXX")"
   mkdir -p "$sandbox/home" "$sandbox/tmp"
   echo "gate: sandbox $sandbox"
+  local ts_reference="${PA_TS_BINARY:-}"
   (
     export HOME="$sandbox/home" TMPDIR="$sandbox/tmp" XDG_CONFIG_HOME="$sandbox/home/.config" \
       XDG_DATA_HOME="$sandbox/home/.local/share" XDG_STATE_HOME="$sandbox/home/.local/state"
+    # CI runs with a clean env. Every product switch goes: state roots
+    # (session dirs, agent dir), update roles (the restart roster), sockets,
+    # venvs, telemetry (a developer's DO_NOT_TRACK=1 flips the env-precedence
+    # tests). HOME/TMPDIR alone would not neutralize an inherited override.
+    for name in $(env | sed -n 's/^\(PRIME_AGENT_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(PI_[A-Za-z0-9_]*\)=.*/\1/p'); do
+      unset "$name"
+    done
+    unset DO_NOT_TRACK PA_TS_REFERENCE
     # The TS-differential suites run `PA_TS_BINARY`, else `prime-agent` on
-    # PATH: here that is the Oneiron TS fork, not upstream's parity ground
-    # truth, so point them at nothing and they skip as on a CI runner.
-    export PA_TS_BINARY=/nonexistent/pa-gate-no-ts-binary
-    # CI runs with a clean env: ambient product/telemetry switches (a
-    # developer's DO_NOT_TRACK=1, say) would flip the tests that pin env
-    # precedence.
-    unset PA_TS_REFERENCE PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV PRIME_AGENT_KERNEL_PYTHON \
-      PRIME_AGENT_CODING_AGENT_DIR PI_PACKAGE_DIR PI_SKIP_VERSION_CHECK PI_OFFLINE DO_NOT_TRACK \
-      PRIME_AGENT_TELEMETRY PRIME_AGENT_TELEMETRY_API_KEY PRIME_AGENT_TELEMETRY_ENDPOINT PRIME_AGENT_TELEMETRY_ORIGIN
+    # PATH: by default that is the Oneiron TS fork (not upstream's parity
+    # ground truth), so they skip as on a CI runner; an explicit
+    # PA_TS_BINARY is kept as the reference.
+    export PA_TS_BINARY="${ts_reference:-/nonexistent/pa-gate-no-ts-binary}"
     cargo build --locked --workspace --bins
     "$CARGO_TARGET_DIR/debug/prime-agent" --prime-agent-bootstrap
     cargo test --locked "${scope[@]}" --no-fail-fast "$@"

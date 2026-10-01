@@ -47,6 +47,16 @@ def main(argv: list[str] | None = None) -> int:
                         help="record the current violations as the baseline (re-pin only)")
     args = parser.parse_args(argv)
     base = os.environ.get("TEST_POLICY_BASE", "oneiron/main")
+    # check-test-policy.mjs silently falls back to another base when this one
+    # does not resolve; refuse instead, and name the exact commit checked.
+    resolved = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"],
+                              capture_output=True, text=True)
+    if resolved.returncode != 0 or not resolved.stdout.strip():
+        print(f"error: TEST_POLICY_BASE {base} does not resolve to a commit here "
+              f"(add the fork remote: git remote add oneiron git@github.com:oneiron-dev/prime-agent.git; "
+              f"git fetch oneiron)", file=sys.stderr)
+        return 1
+    base_sha = resolved.stdout.strip()
     result = subprocess.run(["node", str(ROOT / "scripts" / "check-test-policy.mjs")], cwd=ROOT,
                             env={**os.environ, "TEST_POLICY_BASE": base},
                             capture_output=True, text=True)
@@ -58,17 +68,17 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 1
     if args.write_baseline:
-        header = f"# check-test-policy.mjs violations at the pinned Rust base (TEST_POLICY_BASE={base}).\n"
+        header = f"# check-test-policy.mjs violations at the pinned Rust base (TEST_POLICY_BASE={base} = {base_sha}).\n"
         BASELINE.write_text(header + "".join(f"{key}\n" for key in sorted(found.elements())))
         print(f"recorded {sum(found.values())} baseline violations in {BASELINE.name}")
         return 0
     new = found - read_baseline()
     if new:
-        print(f"New test-policy violations against {base} (beyond the pin baseline):", file=sys.stderr)
+        print(f"New test-policy violations against {base} ({base_sha[:12]}) beyond the pin baseline:", file=sys.stderr)
         for key in sorted(new.elements()):
             print(f"  {key}", file=sys.stderr)
         return 1
-    print(f"Test policy gate passed against {base}: 0 new violations "
+    print(f"Test policy gate passed against {base} ({base_sha[:12]}): 0 new violations "
           f"({sum(found.values())} pinned upstream baseline).")
     return 0
 

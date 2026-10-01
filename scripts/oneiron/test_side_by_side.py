@@ -58,10 +58,14 @@ class SideBySideTests(unittest.TestCase):
         self.ts_target.write_text("ts")
         (self.bin_dir / "prime-agent").symlink_to(self.ts_target)
         self.sock_dir = self.root / "sock"
+        self.fake_tmp = self.root / "tmp"
+        self.fake_tmp.mkdir()
         self.saved_env = {key: os.environ.get(key) for key in
                           ("PRIME_AGENT_RS_SOCKET_DIR", "PRIME_AGENT_RS_KERNEL_VENV",
                            "PRIME_AGENT_DAEMON_SOCKET", "PRIME_AGENT_KERNEL_VENV", "PI_PACKAGE_DIR",
-                           "PRIME_AGENT_KERNEL_PYTHON", "PRIME_AGENT_RUST_INSTALLER_URL")}
+                           "PRIME_AGENT_KERNEL_PYTHON", "PRIME_AGENT_RUST_INSTALLER_URL", "TMPDIR",
+                           "PRIME_AGENT_RS_PRINT_ENV")}
+        os.environ["TMPDIR"] = str(self.fake_tmp)
         os.environ["PRIME_AGENT_RS_SOCKET_DIR"] = str(self.sock_dir)
         os.environ["PRIME_AGENT_RS_KERNEL_VENV"] = str(self.root / "venv-rs")
         # Inherited TS-side or upstream values must never reach the Rust process.
@@ -94,9 +98,9 @@ class SideBySideTests(unittest.TestCase):
         self.assertEqual(os.readlink(self.prefix / "current"), VERSION)
         self.assertEqual(os.readlink(self.bin_dir / "prime-agent"), str(self.ts_target))
         self.assertEqual(self.launcher_env(), {
-            "SOCKET_DIR": str(self.sock_dir),
-            "DAEMON_SOCKET": str(self.sock_dir / "daemon.sock"),
-            "KERNEL_VENV": str(self.root / "venv-rs"),
+            "SOCKET_DIR": str(self.sock_dir.resolve()),
+            "DAEMON_SOCKET": str(self.sock_dir.resolve() / "daemon.sock"),
+            "KERNEL_VENV": str((self.root / "venv-rs").resolve()),
             "SKIP": "1",
             "PACKAGE_DIR": "unset",
             "NO_UPDATE": "1",
@@ -166,18 +170,106 @@ class SideBySideTests(unittest.TestCase):
             sorted(str(p.relative_to(stage)) for p in stage.rglob("*")))
 
     def test_prefix_overlapping_the_ts_tree_is_refused(self) -> None:
-        with self.assertRaisesRegex(SystemExit, "overlaps the TS install tree"):
+        with self.assertRaisesRegex(SystemExit, "overlaps protected TS state"):
             side_by_side.check_prefix(side_by_side.TS_PREFIX / "rs", self.bin_dir)
 
-    def test_launcher_refuses_a_symlinked_socket_dir(self) -> None:
+    def test_launcher_follows_a_safe_alias_and_exports_its_canonical_target(self) -> None:
+        # Aliases resolve before the checks (macOS TMPDIR itself sits behind
+        # /var -> /private/var); ownership and TS overlap are judged on the
+        # canonical target, which is what the process receives.
         self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
         self.sock_dir.rmdir()
         self.sock_dir.symlink_to(elsewhere)
-        result = subprocess.run([str(self.bin_dir / "prime-agent-rs"), "env"], capture_output=True, text=True)
-        self.assertEqual((result.returncode, result.stdout), (1, ""))
-        self.assertIn("refusing socket dir", result.stderr)
+        self.assertEqual(self.launcher_env()["SOCKET_DIR"], str(elsewhere.resolve()))
+
+    def run_launcher(self, **env: str) -> subprocess.CompletedProcess:
+        home = self.root / "home"
+        home.mkdir(exist_ok=True)
+        return subprocess.run([str(self.bin_dir / "prime-agent-rs"), "env"], capture_output=True, text=True,
+                              env={**os.environ, "HOME": str(home), **env})
+
+    def test_launcher_refuses_relative_overrides_without_creating_anything(self) -> None:
+        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
+        for name in ("PRIME_AGENT_RS_SOCKET_DIR", "PRIME_AGENT_RS_KERNEL_VENV"):
+            result = self.run_launcher(**{name: "relative/dir"})
+            self.assertEqual((result.returncode, result.stdout), (1, ""))
+            self.assertIn(f"{name} must be an absolute path", result.stderr)
+        self.assertFalse((self.root / "relative").exists())
+
+    def test_launcher_refuses_ts_socket_dir_directly_and_through_an_alias(self) -> None:
+        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
+        ts_sock = self.fake_tmp / f"prime-agent-{os.getuid()}"
+        ts_sock.mkdir()
+        alias = self.root / "alias"
+        alias.symlink_to(ts_sock)
+        for override in (ts_sock, ts_sock / "inner", alias / "inner", self.root / "home" / ".prime" / "x"):
+            result = self.run_launcher(PRIME_AGENT_RS_SOCKET_DIR=str(override))
+            self.assertEqual(result.returncode, 1, override)
+            self.assertIn("overlaps TS state", result.stderr)
+        self.assertEqual(sorted(os.listdir(ts_sock)), [])
+
+    def test_launcher_refuses_the_ts_kernel_venv(self) -> None:
+        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
+        home = self.root / "home"
+        for override in (home / ".prime" / "agent" / "kernel-venv",
+                         home / ".prime" / "agent" / "kernel-venv" / "nested",
+                         home / ".local" / "share" / "prime" / "agent" / "kernel-venv"):
+            result = self.run_launcher(PRIME_AGENT_RS_KERNEL_VENV=str(override))
+            self.assertEqual(result.returncode, 1, override)
+            self.assertIn("overlaps the TS kernel venv", result.stderr)
+
+    def test_launcher_print_env_reports_the_effective_isolation(self) -> None:
+        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
+        os.environ.pop("PRIME_AGENT_RS_KERNEL_VENV")
+        effective = side_by_side.launcher_env(self.bin_dir / "prime-agent-rs")
+        self.assertEqual(
+            {key: effective[key] for key in ("PRIME_AGENT_SOCKET_DIR", "PRIME_AGENT_DAEMON_SOCKET",
+                                             "PRIME_AGENT_KERNEL_VENV", "PRIME_AGENT_DISABLE_SELF_UPDATE")},
+            {"PRIME_AGENT_SOCKET_DIR": str(self.sock_dir.resolve()),
+             "PRIME_AGENT_DAEMON_SOCKET": f"{self.sock_dir.resolve()}/daemon.sock",
+             "PRIME_AGENT_KERNEL_VENV": str(Path.home().resolve() / ".prime" / "agent" / "kernel-venv-rs"),
+             "PRIME_AGENT_DISABLE_SELF_UPDATE": "1"})
+        self.assertEqual(effective["binary"], str((self.prefix / VERSION / "prime-agent").resolve()))
+
+    def test_installer_refuses_protected_destinations(self) -> None:
+        ts_sock = self.fake_tmp / f"prime-agent-{os.getuid()}"
+        for prefix in (side_by_side.HOME / ".prime" / "rs", ts_sock / "rs", side_by_side.TS_PREFIX):
+            with self.assertRaisesRegex(SystemExit, "overlaps protected TS state"):
+                side_by_side.check_prefix(prefix, self.bin_dir)
+        with self.assertRaisesRegex(SystemExit, "sits inside protected TS state"):
+            side_by_side.check_prefix(self.prefix, side_by_side.HOME / ".prime" / "bin")
+        self.assertFalse(ts_sock.exists())
+
+    def test_version_labels_cannot_escape_the_prefix(self) -> None:
+        stage = make_stage(self.root, "0.9.8")
+        for version in ("0.9.8-/../../escape", "0.9.8-a/b", "0.9.8-.."):
+            with self.assertRaisesRegex(SystemExit, "not a plain release version"):
+                self.run_main("install", "--stage-dir", str(stage), "--version", version)
+        self.assertFalse(self.prefix.exists())
+
+    def test_symlinked_stage_assets_are_refused_and_the_target_is_untouched(self) -> None:
+        outside = self.root / "outside.json"
+        outside.write_text(json.dumps({"version": "0.9.8"}))
+        stage = make_stage(self.root, "0.9.8")
+        (stage / "package.json").unlink()
+        (stage / "package.json").symlink_to(outside)
+        with self.assertRaisesRegex(SystemExit, "holds a symlink"):
+            self.run_main("install", "--stage-dir", str(stage), "--version", VERSION)
+        self.assertEqual(json.loads(outside.read_text()), {"version": "0.9.8"})
+        self.assertFalse(self.prefix.exists())
+
+    def test_venv_fingerprint_moves_when_site_packages_change(self) -> None:
+        venv = self.root / "venv"
+        site = venv / "lib" / "python3.13" / "site-packages"
+        site.mkdir(parents=True)
+        (venv / "bin").mkdir()
+        (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+        before = side_by_side.venv_fingerprint(venv)
+        (site / "newpkg").mkdir()
+        self.assertNotEqual(side_by_side.venv_fingerprint(venv), before)
+        self.assertIsNone(side_by_side.venv_fingerprint(self.root / "absent"))
 
     def test_response_models_reads_every_event(self) -> None:
         stream = "\n".join([
