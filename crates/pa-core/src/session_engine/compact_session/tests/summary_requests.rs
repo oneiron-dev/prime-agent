@@ -191,3 +191,137 @@ async fn an_abort_cancels_the_held_summary_request() {
     );
     assert_eq!(server.closed(1).await.as_deref(), Some("done"));
 }
+
+/// One complete Responses text reply as wire events.
+fn ws_text_response(id: &str, text: &str) -> Vec<serde_json::Value> {
+    let item_id = format!("msg_{id}");
+    vec![
+        serde_json::json!({ "type": "response.created", "response": { "id": id } }),
+        serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": { "type": "message", "id": item_id, "role": "assistant",
+                      "status": "in_progress", "content": [] },
+        }),
+        serde_json::json!({
+            "type": "response.content_part.added", "output_index": 0, "content_index": 0,
+            "part": { "type": "output_text", "text": "" },
+        }),
+        serde_json::json!({
+            "type": "response.output_text.delta", "output_index": 0, "content_index": 0,
+            "delta": text,
+        }),
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "item": { "type": "message", "id": item_id, "role": "assistant", "status": "completed",
+                      "content": [{ "type": "output_text", "text": text }] },
+        }),
+        serde_json::json!({
+            "type": "response.completed",
+            "response": { "id": id, "status": "completed",
+                          "usage": { "input_tokens": 5, "output_tokens": 3, "total_tokens": 8 } },
+        }),
+    ]
+}
+
+/// Generation, then a real compaction summary, then a generation on one
+/// session's Responses WebSocket: the summary does not continue the
+/// generation's anchor (its body differs) and replaces it, so the next
+/// generation, whose input would have continued the first one, goes out
+/// in full on the same socket (TS `cachedBody` invalidation).
+#[tokio::test]
+async fn a_summary_between_generations_invalidates_the_continuation() {
+    use pa_ai::test_support::{spawn, Record, Turn, Upgrade};
+    let mut server = spawn(
+        vec![Upgrade::Accept(vec![
+            Turn::Events(ws_text_response("resp_gen_1", "first answer")),
+            Turn::Events(ws_text_response("resp_summary", "## Goal\nsummarized goal")),
+            Turn::Events(ws_text_response("resp_gen_2", "second answer")),
+        ])],
+        Vec::new(),
+    )
+    .await;
+    let model: pa_types::ai::Model = serde_json::from_value(serde_json::json!({
+        "id": "gpt-ws", "name": "gpt-ws", "api": "openai-responses", "provider": "cpa-r",
+        "baseUrl": server.base_url, "reasoning": false, "input": ["text"],
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 100_000, "maxTokens": 1000,
+        "compat": { "supportsWebSocket": true },
+    }))
+    .unwrap();
+    let generation_options = || {
+        pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
+            api_key: Some("test-key".to_string()),
+            session_id: Some("compact-chain".to_string()),
+            ..pa_ai::types::StreamOptions::default()
+        })
+    };
+    let user = |text: &str| {
+        pa_types::ai::Message::User(pa_types::ai::UserMessage {
+            content: UserContent::Text(text.to_string()),
+            timestamp: 1,
+            rest: serde_json::Map::default(),
+        })
+    };
+    let first_context = pa_types::ai::Context {
+        system_prompt: None,
+        messages: vec![user("one")],
+        tools: None,
+    };
+    let first = pa_ai::complete_simple(&model, &first_context, Some(generation_options()))
+        .await
+        .unwrap();
+    assert_eq!(first.stop_reason, pa_types::ai::StopReason::Stop);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = session_with_turns(tmp.path(), 3);
+    let mut options = cancellation_options(model.clone(), None);
+    options.summary_requests.session_id = Some("compact-chain".to_string());
+    let outcome = execute_compaction(&mut session, options).await.unwrap();
+    let CompactOutcome::Ran(run) = outcome else {
+        panic!("expected the compaction to run");
+    };
+    assert!(run.result.summary.contains("summarized goal"));
+
+    let second_context = pa_types::ai::Context {
+        system_prompt: None,
+        messages: vec![
+            user("one"),
+            pa_types::ai::Message::Assistant(first),
+            user("two"),
+        ],
+        tools: None,
+    };
+    let second = pa_ai::complete_simple(&model, &second_context, Some(generation_options()))
+        .await
+        .unwrap();
+    assert_eq!(second.stop_reason, pa_types::ai::StopReason::Stop);
+
+    let requests: Vec<(usize, Option<String>, usize)> = server
+        .drain()
+        .into_iter()
+        .filter_map(|record| match record {
+            Record::WsRequest { connection, body } => Some((
+                connection,
+                body.get("previous_response_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                body.get("input")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    // Generation, summary, generation: one socket, never a delta, and the
+    // last generation carries its whole conversation.
+    assert!(
+        requests
+            .iter()
+            .all(|(connection, previous, _)| *connection == 1 && previous.is_none()),
+        "{requests:?}"
+    );
+    assert_eq!(requests[0].2, 1);
+    assert_eq!(requests[2].2, 3);
+    pa_ai::cleanup_session_resources(Some("compact-chain"));
+}
