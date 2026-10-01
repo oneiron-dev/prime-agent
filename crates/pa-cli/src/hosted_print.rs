@@ -27,6 +27,13 @@ use crate::mode::{AppMode, RunOptions};
 /// form the daemon e2e harnesses use. The product never sets it.
 const HOSTED_DAEMON_SCRIPT_ENV: &str = "PRIME_AGENT_HOSTED_DAEMON_SCRIPT";
 
+/// The per-launch overlay a factory seat sets for the agent's own tool
+/// processes (its cargo routing: `W7_CARGO_WORK`, `W7_CARGO_HOSTS`, ...).
+/// A daemon worker runs with the daemon's environment, and the create
+/// contract carries no launch environment yet, so a hosted run refuses it
+/// instead of silently routing the seat's builds elsewhere.
+const LAUNCH_OVERLAY_ENV_PREFIX: &str = "W7_CARGO_";
+
 /// Run a print/json invocation as a daemon-hosted session.
 ///
 /// # Errors
@@ -37,7 +44,7 @@ pub(crate) fn run_hosted_print(options: &RunOptions) -> Result<i32, String> {
     // Flags the in-process run honors but the daemon create contract does
     // not carry fail here instead of being silently ignored.
     let config = &options.config;
-    let unsupported: Vec<&str> = [
+    let mut unsupported: Vec<String> = [
         (options.session.fork.is_some(), "--fork"),
         (config.no_skills, "--no-skills"),
         (config.no_prompt_templates, "--no-prompt-templates"),
@@ -46,8 +53,17 @@ pub(crate) fn run_hosted_print(options: &RunOptions) -> Result<i32, String> {
         (options.offline, "--offline"),
     ]
     .into_iter()
-    .filter_map(|(present, flag)| present.then_some(flag))
+    .filter(|(present, _)| *present)
+    .map(|(_, flag)| flag.to_string())
     .collect();
+    let mut overlay: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| name.starts_with(LAUNCH_OVERLAY_ENV_PREFIX))
+        .collect();
+    overlay.sort();
+    if !overlay.is_empty() {
+        unsupported.push(format!("the launch environment ({})", overlay.join(", ")));
+    }
     if !unsupported.is_empty() {
         return Err(format!(
             "--daemon-hosted cannot be combined with {} yet: the daemon session does not receive {}",
@@ -65,17 +81,25 @@ pub(crate) fn run_hosted_print(options: &RunOptions) -> Result<i32, String> {
 async fn hosted_print_main(options: &RunOptions) -> Result<i32, String> {
     crate::print_terminal::track_headless_invocation(options).await;
     let config = &options.config;
-    let session_dir = options
-        .session
-        .session_dir
-        .clone()
-        .unwrap_or_else(|| config.agent_dir.join("sessions"));
+    // The daemon resolves no path against this process's cwd: the session
+    // dir and a path-like `--resume` selector go out absolute (TS
+    // `SessionManager.setSessionFile` resolves the file it is handed).
+    let absolute = |path: std::path::PathBuf| {
+        std::path::absolute(&path).map_err(|error| format!("{}: {error}", path.display()))
+    };
+    let session_dir = absolute(
+        options
+            .session
+            .session_dir
+            .clone()
+            .unwrap_or_else(|| config.agent_dir.join("sessions")),
+    )?;
     let session_path = match &options.session.resume {
-        Some(selector) => Some(crate::print_runtime::resolve_resume_selector(
+        Some(selector) => Some(absolute(crate::print_runtime::resolve_resume_selector(
             selector,
             &config.cwd,
             &session_dir,
-        )?),
+        )?)?),
         None if options.session.continue_recent => {
             pa_core::session::discovery::find_most_recent_session_for_cwd(&session_dir, &config.cwd)
         }

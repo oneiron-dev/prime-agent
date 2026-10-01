@@ -74,8 +74,9 @@ client ensures the daemon on the resolved socket, and exit or
 SIGINT/SIGTERM/SIGHUP (130/143/129) detach and close without stopping the
 session. Flags the create contract cannot carry (`--no-skills`,
 `--no-prompt-templates`, `--no-context-files`, `--goal`, `--offline`,
-`--fork`) fail before any daemon starts, and so does the flag in rpc/acp
-mode. Each print/json run reports `agent headless invoked` (mode,
+`--fork`) fail before any daemon starts, and so do a factory seat's
+`W7_CARGO_*` launch overlay (a daemon worker runs with the daemon's
+environment) and the flag in rpc/acp mode. Each print/json run reports `agent headless invoked` (mode,
 daemon_hosted, json_event_profile). Verifiers: `headless_flags_e2e`,
 `hosted_print_e2e`.
 
