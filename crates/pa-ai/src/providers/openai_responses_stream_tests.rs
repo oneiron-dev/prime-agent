@@ -141,7 +141,7 @@ fn incomplete_terminal_records_model_and_stops_for_length() {
     }
 }
 
-/// Finished items arrive with their `output_index` (as OpenAI sends every
+/// Finished items arrive with their `output_index` (as `OpenAI` sends every
 /// item event): the reasoning item, the text signature, and the finished
 /// tool call land on the message. The slot used to be dropped before its
 /// lookup, so all three were lost (the next request replayed `msg_N` ids,
