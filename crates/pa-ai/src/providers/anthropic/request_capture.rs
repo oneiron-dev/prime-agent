@@ -75,7 +75,8 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
 }
 
 /// Stream one request for `model`, its base URL pointed at a fresh
-/// loopback listener, and return the request the listener read.
+/// loopback listener, and return the request the listener read. One
+/// bound covers the whole exchange (request, reply, stream settle).
 pub(super) async fn capture_request(
     mut model: Model,
     context: &Context,
@@ -93,17 +94,20 @@ pub(super) async fn capture_request(
         socket.write_all(response.as_bytes()).await.unwrap();
         request
     });
-    let reply = stream_anthropic(&model, context, Some(options))
-        .result()
-        .await;
-    assert_eq!(
-        reply.stop_reason,
-        StopReason::Stop,
-        "the loopback reply settles: {:?}",
-        reply.error_message
-    );
-    tokio::time::timeout(Duration::from_secs(10), server)
-        .await
-        .expect("the listener read the request")
-        .unwrap()
+    let server_abort = server.abort_handle();
+    let exchange = async {
+        let reply = stream_anthropic(&model, context, Some(options))
+            .result()
+            .await;
+        assert_eq!(
+            reply.stop_reason,
+            StopReason::Stop,
+            "the loopback reply settles: {:?}",
+            reply.error_message
+        );
+        server.await.unwrap()
+    };
+    let request = tokio::time::timeout(Duration::from_secs(10), exchange).await;
+    server_abort.abort();
+    request.expect("the loopback exchange settles")
 }

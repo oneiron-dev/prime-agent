@@ -129,11 +129,20 @@ async fn run_cpa_session(
     })
     .await
     .unwrap();
-    engine
-        .prompt("run the echo tool", PromptOptions::default())
-        .await
-        .unwrap();
-    engine.session.agent().wait_for_idle().await;
+    // One bound covers the whole exchange: the prompt, its tool loop, the
+    // agent settling, and the endpoint serving every reply.
+    let server_abort = server.abort_handle();
+    let exchange = async {
+        engine
+            .prompt("run the echo tool", PromptOptions::default())
+            .await
+            .unwrap();
+        engine.session.agent().wait_for_idle().await;
+        server.await.unwrap()
+    };
+    let requests = tokio::time::timeout(std::time::Duration::from_secs(30), exchange).await;
+    server_abort.abort();
+    let requests = requests.expect("the session's requests settle on the loopback endpoint");
     let session_id = engine.session.session_id().await;
     let session_file = engine
         .session
@@ -143,10 +152,6 @@ async fn run_cpa_session(
         .get_session_file()
         .expect("a persisted session has a file")
         .to_path_buf();
-    let requests = tokio::time::timeout(std::time::Duration::from_secs(10), server)
-        .await
-        .expect("the endpoint served every reply")
-        .unwrap();
     assert_eq!(requests.len(), request_count);
     for headers in &requests {
         assert!(
