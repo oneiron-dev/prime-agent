@@ -212,7 +212,9 @@ export async function runFactoryWatchdog(options: {
 	const diskLowGiB = options.diskLowGiB ?? launcher?.diskFloorGiB ?? 100;
 	const entrypoint = locateFactoryEntrypoint();
 	const factoryArgv = [entrypoint.node, ...entrypoint.execArgv, entrypoint.entry];
-	const agentArgv = options.agentArgv ?? [agentSelection(undefined, launcher?.primeAgentBin, process.env)];
+	// The recorded agent path belongs to the runner host; it names a binary here only when that host is this one.
+	const recordedAgent = host?.type === "local" ? launcher?.primeAgentBin : undefined;
+	const agentArgv = options.agentArgv ?? [agentSelection(undefined, recordedAgent, process.env)];
 	const entry = canonical(entrypoint.entry);
 	const directory = options.stateDirectory ?? join(factory, "watchdog");
 	const statePath = join(directory, "state.json");
@@ -363,7 +365,7 @@ export async function runFactoryWatchdog(options: {
 
 const USAGE = `Usage: node <package>/dist/watchdog.js --factory <absolute-dir> --session <owner-session-id> [--agent-bin <executable>] [--state-dir <absolute-dir>] [--disk-low-gib <n>]
 Messages the session only for new factory exceptions; state lives in <factory>/watchdog unless --state-dir is set.
-Messages go through the agent binary: --agent-bin, else the factory's launcher.primeAgentBin, else PRIME_AGENT_FACTORY_AGENT_BIN, else prime-agent on PATH.`;
+Messages go through the agent binary: --agent-bin, else the factory's launcher.primeAgentBin when its launcher host is local, else PRIME_AGENT_FACTORY_AGENT_BIN, else prime-agent on PATH.`;
 
 export async function runFactoryWatchdogCli(args: string[]): Promise<number> {
 	const values = new Map<string, string>();

@@ -39,7 +39,8 @@ Native seats (`{"provider","model","thinking"}`) spawn the agent binary directly
 stdin (a review diff can exceed the per-argument limit). `launch` picks the binary, first match wins:
 
 1. `prime-agent-factory launch ... --prime-agent-bin <path-or-command>`
-2. `launcher.primeAgentBin` in launcher.json
+2. `launcher.primeAgentBin` in launcher.json, else the binary an earlier launch recorded (a relaunch never switches
+   binaries through the environment)
 3. `PRIME_AGENT_FACTORY_AGENT_BIN`
 4. `prime-agent` on PATH
 
@@ -76,8 +77,9 @@ is gone: the Rust binary has no such frontend.
 
 `dist/watchdog.js` is the exception-only watchdog (`assets/factory-exception-watchdog@.service` installs it as a
 systemd user unit). It reads the factory through this package's own entry (`status`, `events`) and delivers
-messages through the agent binary (`send --json`): `--agent-bin`, else `launcher.primeAgentBin`, else
-`PRIME_AGENT_FACTORY_AGENT_BIN`, else `prime-agent`. It recognizes a running `serve` by this package's exact entry
+messages through the agent binary (`send --json`): `--agent-bin`, else the recorded `launcher.primeAgentBin` when
+the launcher host is local (an SSH host's path names a binary over there), else `PRIME_AGENT_FACTORY_AGENT_BIN`,
+else `prime-agent`. It recognizes a running `serve` by this package's exact entry
 (a bin symlink or relative path resolves to it) followed by `serve <directory>`.
 
 ## Migrating from `prime-agent factory`

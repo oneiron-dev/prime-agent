@@ -306,24 +306,27 @@ describe("launch", () => {
 		const f = launchFixture();
 		const first = fakeAgent(f.root, "first-agent");
 		const second = fakeAgent(f.root, "second-agent");
-		// A relative selection is read from the launching directory and stored absolute.
-		expect(f.launch(["--prime-agent-bin", "./first-agent"])).toMatchObject({
+		const third = fakeAgent(f.root, "third-agent");
+		// The environment chooses when nothing else names a binary.
+		expect(f.launch([], { ...process.env, [AGENT_BINARY_ENV]: first.binary })).toMatchObject({
 			agentBinary: first.binary,
 			imported: ["T-1"],
 		});
 		expect(f.persisted()).toEqual({ config: first.binary, ticket: first.binary });
-		const pinned = { host: "local", binary: first.binary, sha256: sha256(first.binary) };
+		const pin = (agent: { binary: string }) => ({ host: "local", binary: agent.binary, sha256: sha256(agent.binary) });
 		expect(f.events().filter((event) => event.kind === "agent_pinned").map((event) => event.detail)).toEqual([
-			{ previous: null, agent: pinned, reason: "launch" },
+			{ previous: null, agent: pin(first), reason: "launch" },
 		]);
-		// Relaunching with the environment's selection repins it and journals the change; the flag still wins.
-		const env = { ...process.env, [AGENT_BINARY_ENV]: second.binary };
-		expect(f.launch([], env).agentBinary).toBe(second.binary);
-		expect(f.launch(["--prime-agent-bin", first.binary], env).agentBinary).toBe(first.binary);
-		expect(f.persisted()).toEqual({ config: first.binary, ticket: first.binary });
-		expect(f.events().filter((event) => event.kind === "agent_changed").map((event) => event.detail.agent)).toEqual([
-			{ host: "local", binary: second.binary, sha256: sha256(second.binary) },
-			pinned,
+		// A relaunch keeps the recorded binary over the environment; launcher.json and the flag outrank both. A
+		// relative selection is read from the launching directory and stored absolute.
+		expect(f.launch([], { ...process.env, [AGENT_BINARY_ENV]: second.binary }).agentBinary).toBe(first.binary);
+		f.settings({ primeAgentBin: "./second-agent" });
+		expect(f.launch().agentBinary).toBe(second.binary);
+		expect(f.launch(["--prime-agent-bin", "./third-agent"]).agentBinary).toBe(third.binary);
+		expect(f.persisted()).toEqual({ config: third.binary, ticket: third.binary });
+		expect(f.events().filter((event) => event.kind === "agent_changed").map((event) => event.detail)).toEqual([
+			{ previous: pin(first), agent: pin(second), reason: "launch" },
+			{ previous: pin(second), agent: pin(third), reason: "launch" },
 		]);
 	});
 

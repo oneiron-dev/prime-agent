@@ -125,13 +125,33 @@ it("finds this package's serve by its exact entry and directory, and refuses a b
 	}
 });
 
-/** A REJECTED action in a real factory directory, and a watchdog state past its silent baseline. */
-async function rejectedFactory(root: string): Promise<string> {
+/**
+ * A REJECTED action in a real factory directory, and a watchdog state past its silent baseline. `launcher` records
+ * a launch on that configured host with that agent path.
+ */
+async function rejectedFactory(root: string, launcher?: { host: "local" | "remote"; agent: string }): Promise<string> {
 	const factory = join(root, "factory");
 	mkdirSync(factory);
+	mkdirSync(join(root, "work"));
 	writeFileSync(
 		join(factory, "config.json"),
-		JSON.stringify({ version: 1, hosts: { local: { type: "local", runnerRoot: join(root, "attempts") } } }),
+		JSON.stringify({
+			version: 1,
+			hosts: {
+				local: { type: "local", runnerRoot: join(root, "attempts") },
+				remote: { type: "ssh", sshHost: "factory-host", runnerRoot: "/attempts" },
+			},
+			...(launcher
+				? {
+						launcher: {
+							host: launcher.host,
+							repo: join(root, "repo"),
+							work: join(root, "work"),
+							primeAgentBin: launcher.agent,
+						},
+					}
+				: {}),
+		}),
 	);
 	const store = new FactoryStore(join(factory, "factory.db"));
 	try {
@@ -173,13 +193,25 @@ async function rejectedFactory(root: string): Promise<string> {
 	return factory;
 }
 
-it.each(["flag", "environment"])(
+it.each([
+	["--agent-bin", "flag"],
+	[AGENT_BINARY_ENV, "environment"],
+	["the recorded launcher.primeAgentBin of a local host", "local"],
+	["the environment, not an SSH host's recorded path", "remote"],
+] as const)(
 	"reads the factory through its own entry and delivers through the agent binary named by %s",
-	async (selection) => {
+	async (_name, selection) => {
 		const root = mkdtempSync(join(tmpdir(), "factory-watchdog-"));
 		roots.push(root);
-		const factory = await rejectedFactory(root);
 		const agent = join(root, "agent");
+		const factory = await rejectedFactory(
+			root,
+			selection === "local"
+				? { host: "local", agent }
+				: selection === "remote"
+					? { host: "remote", agent: "/remote/only/prime-agent" }
+					: undefined,
+		);
 		const calls = join(root, "agent-calls.jsonl");
 		writeFileSync(
 			agent,
@@ -197,7 +229,10 @@ it.each(["flag", "environment"])(
 				...(selection === "flag" ? ["--agent-bin", agent] : []),
 			],
 			{
-				env: { ...process.env, ...(selection === "flag" ? {} : { [AGENT_BINARY_ENV]: agent }) },
+				env: {
+					...process.env,
+					[AGENT_BINARY_ENV]: selection === "environment" || selection === "remote" ? agent : "",
+				},
 				stdio: "ignore",
 			},
 		);

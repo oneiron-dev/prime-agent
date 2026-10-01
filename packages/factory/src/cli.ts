@@ -148,8 +148,13 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 				if (!host) throw new Error(`launcher.host ${requested.host} is not a configured host`);
 				const { tickets, skipped } = readLauncherTickets(argument, choice);
 				// Every stage runs the agent binary resolved here, on the runner host, before anything is imported.
-				// Only a factory whose seats are all custom commands may launch without one.
-				const selection = agentSelection(options.get("--prime-agent-bin"), requested.primeAgentBin, process.env);
+				// The launcher setting is launcher.json's, else the one an earlier launch recorded, so a relaunch never
+				// switches binaries through the environment. Only seats that are all commands may launch without one.
+				const selection = agentSelection(
+					options.get("--prime-agent-bin"),
+					requested.primeAgentBin ?? config.launcher?.primeAgentBin,
+					process.env,
+				);
 				let agent: AgentExecutable | undefined;
 				try {
 					agent = await resolveAgentExecutable(host, selection);

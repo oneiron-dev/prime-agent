@@ -130,7 +130,8 @@ function setup() {
 		GIT_COMMITTER_NAME: "Test",
 		GIT_COMMITTER_EMAIL: "test@example.invalid",
 	};
-	const git = (args: string[], cwd: string) => execFileSync("git", args, { cwd, env, encoding: "utf8" }).trim();
+	const git = (args: string[], cwd: string) =>
+		execFileSync("git", args, { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 	const origin = join(root, "origin.git");
 	git(["init", "-q", "--bare", "-b", "main", origin], root);
 	const repo = join(root, "oneiron");
