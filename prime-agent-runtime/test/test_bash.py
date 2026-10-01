@@ -1371,13 +1371,6 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["pid"], os.getpid())
             self.assertFalse(record["active"])
 
-    async def test_unconfigured_journal_stays_permissive(self):
-        # Permissiveness is about configuration, not start-id availability.
-        with mock.patch.object(bash_module, "_process_start_id", return_value=None):
-            result = await bash("echo ok")
-        self.assertEqual(result.exit_code, 0)
-        self.assertIn("ok", result.output)
-
     async def test_memory_notice_rides_only_a_sigkill_ending(self):
         if not bash_module._IS_POSIX:
             self.skipTest("the memory guard kills POSIX process groups")
@@ -1406,6 +1399,13 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             for pid in range(1000, 1100):
                 bash_module.record_memory_notice([pid], f"notice {pid}")
             self.assertEqual(list(bash_module._memory_notices), list(range(1036, 1100)))
+
+    async def test_unconfigured_journal_stays_permissive(self):
+        # Permissiveness is about configuration, not start-id availability.
+        with mock.patch.object(bash_module, "_process_start_id", return_value=None):
+            result = await bash("echo ok")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("ok", result.output)
 
 
 async def _poll_group_dead(pgid: int, timeout: float = 5.0) -> None:
