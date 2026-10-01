@@ -323,10 +323,15 @@ fn session_rows(harness: &Harness, type_: &str) -> Vec<Value> {
         .expect("session dir readable")
         .filter_map(Result::ok)
         .map(|entry| entry.path())
+        // The session JSONL itself: its window/info cache sidecars share the
+        // name prefix, and directory order is filesystem-defined (tmpfs
+        // lists the newer sidecar first).
         .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("grown-import"))
+            path.extension().is_some_and(|ext| ext == "jsonl")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("grown-import"))
         })
         .expect("the imported session's copy in the session dir");
     std::fs::read_to_string(file)
