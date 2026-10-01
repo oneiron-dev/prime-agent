@@ -12,6 +12,7 @@ pub mod mistral;
 pub mod openai_codex_responses;
 pub mod openai_completions;
 pub mod openai_responses;
+mod openai_responses_errors;
 pub mod openai_responses_hooks;
 pub mod openai_responses_shared;
 pub mod openai_responses_stream;

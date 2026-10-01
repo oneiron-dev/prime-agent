@@ -210,6 +210,9 @@ impl CodexStreamError {
                 crate::utils_inner::stream_failure::ProviderWsTransportError {
                     message: error.message().to_string(),
                     close_code: error.close_code(),
+                    // The codex transport keeps its unclassified runtime
+                    // surface (the provider error type is the class name).
+                    transport: None,
                 },
             ),
             CodexStreamError::Aborted => ProviderError::Aborted,

@@ -853,20 +853,13 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     }
                 }
             }
+            // Flat OpenAI frames and CPA's nested envelope classify alike
+            // (TS fork 75af473b0): the provider verdict, never a socket
+            // failure.
             "error" => {
-                let code = event.get("code").and_then(|value| value.as_str());
-                let message = event
-                    .get("message")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                return Err(ProviderError::StreamFailure(StreamFailureError {
-                    message: format!("Error Code {}: {}", code.unwrap_or_default(), message),
-                    info: StreamFailureInfo {
-                        kind: classify_stream_failure(code, None),
-                        provider_error_type: code.map(std::string::ToString::to_string),
-                        ..StreamFailureInfo::unknown()
-                    },
-                }));
+                return Err(ProviderError::StreamFailure(
+                    crate::providers::openai_responses_errors::responses_error_event_failure(event),
+                ));
             }
             "response.failed" => {
                 let response = event.get("response").cloned().unwrap_or(Value::Null);
