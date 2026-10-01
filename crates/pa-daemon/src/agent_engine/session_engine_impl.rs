@@ -393,14 +393,15 @@ impl SessionEngine for AgentSessionEngine {
     }
 
     fn configure_transport(&self, transport: pa_types::ai::Transport) {
-        *self.transport.write().expect("transport lock") = Some(transport);
-        if let Some(target) = self
-            .provider_target
-            .write()
-            .expect("provider target lock")
-            .as_mut()
+        // The switch lands under the provider slot's lock: every target
+        // install reads the transport under the same lock, so an install
+        // built from an older snapshot can never undo the switch.
         {
-            target.transport = Some(transport);
+            let mut slot = self.provider_target.write().expect("provider target lock");
+            *self.transport.write().expect("transport lock") = Some(transport);
+            if let Some(target) = slot.as_mut() {
+                target.transport = Some(transport);
+            }
         }
         // An armed image route reinstalls its stored targets later in the
         // episode (a failover switch, the settle's restore): they follow

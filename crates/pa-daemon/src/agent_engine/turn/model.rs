@@ -340,7 +340,11 @@ impl AgentSessionEngine {
                             if let Some(route) = self.armed_image_route() {
                                 let mut target =
                                     self.provider_target.write().expect("provider target lock");
-                                *target = Some(route.target);
+                                // The route's snapshot serves on the
+                                // session's current transport.
+                                let mut routed = route.target;
+                                routed.transport = *self.transport.read().expect("transport lock");
+                                *target = Some(routed);
                             } else {
                                 let (api_key, headers) =
                                     self.resolve_request_key_and_headers(&next);
@@ -392,7 +396,9 @@ impl AgentSessionEngine {
                             // episode runs: the episode keeps serving the
                             // routed model across the failover restore.
                             if let Some(route) = self.armed_image_route() {
-                                *target = Some(route.target);
+                                let mut routed = route.target;
+                                routed.transport = *self.transport.read().expect("transport lock");
+                                *target = Some(routed);
                             } else {
                                 *target = Some(ProviderTarget {
                                     service_tier: *self

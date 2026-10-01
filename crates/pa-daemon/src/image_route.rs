@@ -201,7 +201,13 @@ impl AgentSessionEngine {
         let route = route.clone();
         drop(slot);
         agent.set_model_override(Some(route.agent_override));
-        *self.provider_target.write().expect("provider target lock") = Some(route.target);
+        // The route's snapshot serves on the session's current transport,
+        // read under the slot's lock (a concurrent transport switch lands
+        // under it too).
+        let mut target = self.provider_target.write().expect("provider target lock");
+        let mut routed = route.target;
+        routed.transport = *self.transport.read().expect("transport lock");
+        *target = Some(routed);
     }
 
     /// Clear the armed route and restore the session's serving target (a
@@ -239,8 +245,10 @@ impl AgentSessionEngine {
             }
             Err(_) => route.session_target,
         };
-        if let Some(target) = target.take() {
-            *self.provider_target.write().expect("provider target lock") = Some(target);
+        if let Some(mut restored) = target.take() {
+            let mut slot = self.provider_target.write().expect("provider target lock");
+            restored.transport = *self.transport.read().expect("transport lock");
+            *slot = Some(restored);
         }
     }
 
