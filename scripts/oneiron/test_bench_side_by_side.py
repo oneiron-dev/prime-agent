@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -19,6 +20,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_side_by_side as bench  # noqa: E402
+
+# A sleeper whose environment `ps -E` can read on macOS: the OS hides it for
+# platform binaries such as /bin/sleep, and the sandbox match needs HOME=.
+SLEEPER = [sys.executable, "-c", "import time; time.sleep(30)"]
 
 TS_READY = """
    ▗█▛▐█▙   ▗▄█▀▗█▀       prime agent v0.9.6-oneiron.20261001.1
@@ -364,9 +369,9 @@ class SandboxTests(unittest.TestCase):
         sandbox = bench.Sandbox("ts", "t", self.base, "http://127.0.0.1:9/v1", None)
         outsider = subprocess.Popen(["sleep", "30"])
         try:
-            direct = subprocess.Popen(["sleep", "30"], env=sandbox.env)
+            direct = subprocess.Popen(SLEEPER, env=sandbox.env)
             # A detached grandchild (its parent exits at once) still carries the HOME.
-            subprocess.run(["sh", "-c", "sleep 30 >/dev/null 2>&1 &"], env=sandbox.env, check=True)
+            subprocess.run(["sh", "-c", f"{shlex.join(SLEEPER)} >/dev/null 2>&1 &"], env=sandbox.env, check=True)
             # A spawned root without the sandbox HOME is tracked by descent.
             rooted = subprocess.Popen(["sleep", "30"], env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
             sandbox.add_root(rooted.pid)
@@ -395,7 +400,7 @@ class SandboxTests(unittest.TestCase):
 
     def test_signal_skips_a_pid_whose_identity_changed(self) -> None:
         sandbox = bench.Sandbox("ts", "t", self.base, "http://127.0.0.1:9/v1", None)
-        child = subprocess.Popen(["sleep", "30"], env=sandbox.env)
+        child = subprocess.Popen(SLEEPER, env=sandbox.env)
         try:
             deadline = time.monotonic() + 5
             while child.pid not in sandbox.processes() and time.monotonic() < deadline:
