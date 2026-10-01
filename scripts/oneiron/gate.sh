@@ -35,9 +35,12 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
 if [ "$(uname -s)-$(uname -m)" = "Linux-x86_64" ] && command -v mold >/dev/null 2>&1; then
   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:--C link-arg=-fuse-ld=mold}"
 fi
-# The gate's test build gets its own target dir so it never blocks on (or
-# invalidates) the release build's lock in target/.
-export CARGO_TARGET_DIR="${GATE_TARGET_DIR:-$root/target/gate}"
+# The gate's build gets its own target dir so it never blocks on (or
+# invalidates) the release build's lock in target/. It must keep the
+# `<...>/target/<profile>/` shape: pa-daemon's lease-holder classifier
+# recognizes a cargo build by it (`target/gate/debug` reads as a foreign
+# process), so it lives outside the worktree.
+export CARGO_TARGET_DIR="${GATE_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/pa-gate/$(basename "$root")/target}"
 
 run_fmt() { cargo fmt --all --check; }
 run_clippy() { cargo clippy --workspace --all-targets --locked -- -D warnings; }
@@ -51,10 +54,14 @@ run_test() {
   (
     export HOME="$sandbox/home" TMPDIR="$sandbox/tmp" XDG_CONFIG_HOME="$sandbox/home/.config" \
       XDG_DATA_HOME="$sandbox/home/.local/share" XDG_STATE_HOME="$sandbox/home/.local/state"
+    # The TS-differential suites run `PA_TS_BINARY`, else `prime-agent` on
+    # PATH: here that is the Oneiron TS fork, not upstream's parity ground
+    # truth, so point them at nothing and they skip as on a CI runner.
+    export PA_TS_BINARY=/nonexistent/pa-gate-no-ts-binary
     # CI runs with a clean env: ambient product/telemetry switches (a
     # developer's DO_NOT_TRACK=1, say) would flip the tests that pin env
     # precedence.
-    unset PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV PRIME_AGENT_KERNEL_PYTHON \
+    unset PA_TS_REFERENCE PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV PRIME_AGENT_KERNEL_PYTHON \
       PRIME_AGENT_CODING_AGENT_DIR PI_PACKAGE_DIR PI_SKIP_VERSION_CHECK PI_OFFLINE DO_NOT_TRACK \
       PRIME_AGENT_TELEMETRY PRIME_AGENT_TELEMETRY_API_KEY PRIME_AGENT_TELEMETRY_ENDPOINT PRIME_AGENT_TELEMETRY_ORIGIN
     cargo build --locked --workspace --bins
