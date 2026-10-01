@@ -1610,3 +1610,189 @@ async fn a_caller_abort_closes_the_streaming_socket() {
         .iter()
         .any(|record| matches!(record, Record::SseRequest { .. })));
 }
+
+/// A complete response calling the `probe` tool with `marker`.
+fn probe_call(id: &str, call_id: &str, marker: &str) -> Vec<Value> {
+    let arguments = json!({ "marker": marker }).to_string();
+    vec![
+        json!({ "type": "response.created", "response": { "id": id } }),
+        json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": { "type": "function_call", "id": format!("fc_{id}"), "call_id": call_id,
+                      "name": "probe", "arguments": "" },
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta", "output_index": 0,
+            "delta": arguments,
+        }),
+        json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": { "type": "function_call", "id": format!("fc_{id}"), "call_id": call_id,
+                      "name": "probe", "arguments": arguments, "status": "completed" },
+        }),
+        completed(id),
+    ]
+}
+
+/// The TS parity scenario's four requests on session `parity`: full,
+/// text delta, tool-output delta, full after a system-prompt change.
+async fn parity_scenario(ws: &Model) {
+    let tools = vec![crate::types::Tool {
+        name: "probe".to_string(),
+        description: "record a marker".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": { "marker": { "type": "string" } },
+            "required": ["marker"],
+        }),
+    }];
+    let request = |system: &str, messages: &[Message]| Context {
+        system_prompt: Some(system.to_string()),
+        messages: messages.to_vec(),
+        tools: Some(tools.clone()),
+    };
+    let parity = options(Some("parity"), None);
+    let mut messages = vec![user("one")];
+    let first = run(ws, &request("sys", &messages), &parity).await;
+    messages.extend([Message::Assistant(first), user("two")]);
+    let second = run(ws, &request("sys", &messages), &parity).await;
+    let call_id = second
+        .content
+        .iter()
+        .find_map(|block| match block {
+            AssistantContent::ToolCall(call) => Some(call.id.clone()),
+            AssistantContent::Text(_) | AssistantContent::Thinking(_) => None,
+        })
+        .expect("the probe call");
+    messages.push(Message::Assistant(second));
+    messages.push(
+        serde_json::from_value(json!({
+            "role": "toolResult", "toolCallId": call_id, "toolName": "probe",
+            "content": [{ "type": "text", "text": "probe ran once" }],
+            "isError": false, "timestamp": 1,
+        }))
+        .expect("tool result message"),
+    );
+    let third = run(ws, &request("sys", &messages), &parity).await;
+    messages.extend([Message::Assistant(third), user("three")]);
+    let fourth = run(ws, &request("changed sys", &messages), &parity).await;
+    assert_eq!(text_of(&fourth), "new prompt");
+}
+
+/// The observed requests in the TS harness's shape: every upgrade's path
+/// and chosen handshake headers (the WebSocket protocol's own handshake
+/// headers aside; the TS socket constructor never sees those), sorted by
+/// name, and every request frame's exact text.
+fn parity_record(records: &[Record]) -> (Value, Value) {
+    let mut upgrades = Vec::new();
+    let mut frames = Vec::new();
+    for record in records {
+        match record {
+            Record::Upgrade { path, headers, .. } => {
+                let mut chosen: Vec<(String, String)> = headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        !matches!(
+                            name.as_str(),
+                            "host"
+                                | "connection"
+                                | "upgrade"
+                                | "sec-websocket-key"
+                                | "sec-websocket-version"
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                chosen.sort();
+                upgrades.push(json!({ "path": path, "headers": chosen }));
+            }
+            Record::WsRequest { connection, body } => {
+                frames.push(json!({ "connection": connection, "text": body.to_string() }));
+            }
+            _ => {}
+        }
+    }
+    (Value::Array(upgrades), Value::Array(frames))
+}
+
+/// A failed message's outcome in the TS harness's shape: the stop reason,
+/// the error text, and the diagnostics without their timestamps.
+fn parity_outcome(message: &AssistantMessage) -> Value {
+    let mut diagnostics = serde_json::to_value(&message.diagnostics).expect("diagnostics");
+    for diagnostic in diagnostics.as_array_mut().into_iter().flatten() {
+        if let Some(fields) = diagnostic.as_object_mut() {
+            fields.remove("timestamp");
+        }
+    }
+    json!({
+        "stopReason": message.stop_reason,
+        "errorMessage": message.error_message,
+        "diagnostics": diagnostics,
+    })
+}
+
+/// TS differential evidence: the TS reference (bf4d2c6ca
+/// `streamOpenAIResponses` over a scripted socket,
+/// `fixtures/ts_parity_harness.ts`) ran these scenarios and recorded
+/// `fixtures/ts_parity.json`. On session `parity`: a full first request, a
+/// text delta, a tool-output delta, a full request after a system-prompt
+/// change, then a disposal. On session `parity-drop`: a socket the peer
+/// closes (1011) after the first events. The Rust transport sends
+/// byte-identical request frames (key order included) with the same
+/// handshake headers on the same path, the same close, and settles the
+/// drop with the same error text and diagnostics (TS stack traces aside).
+#[tokio::test]
+async fn request_frames_match_the_ts_reference() {
+    let reference: Value =
+        serde_json::from_str(include_str!("fixtures/ts_parity.json")).expect("fixture json");
+    let mut cut_off = response("resp_drop", "cut off");
+    cut_off.truncate(4);
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![
+                Turn::Events(response("resp_1", "first")),
+                Turn::Events(probe_call("resp_2", "call_1", "once")),
+                Turn::Events(response("resp_3", "after tool")),
+                Turn::Events(response("resp_4", "new prompt")),
+            ]),
+            Upgrade::Accept(vec![Turn::EventsThenClose(cut_off, 1011, "upstream reset")]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    parity_scenario(&ws).await;
+    crate::cleanup_session_resources(Some("parity"));
+    let close = server.closed(1).await;
+    let dropped = run(
+        &ws,
+        &Context {
+            system_prompt: Some("sys".to_string()),
+            messages: vec![user("drop")],
+            tools: None,
+        },
+        &options(Some("parity-drop"), None),
+    )
+    .await;
+    crate::cleanup_session_resources(Some("parity-drop"));
+
+    let (upgrades, frames) = parity_record(&server.drain());
+    assert_eq!(frames, reference["frames"]);
+    assert_eq!(upgrades, reference["upgrades"]);
+    assert_eq!(
+        reference["closes"],
+        json!([{ "connection": 1, "code": 1000, "reason": close }])
+    );
+    let mut expected_drop = reference["drop"].clone();
+    for diagnostic in expected_drop["diagnostics"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        // A TS `Error` carries its stack; the Rust error info has none.
+        if let Some(error) = diagnostic["error"].as_object_mut() {
+            error.remove("stack");
+        }
+    }
+    assert_eq!(parity_outcome(&dropped), expected_drop);
+}

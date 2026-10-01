@@ -65,10 +65,12 @@ pub enum SseReply {
 /// One observed request.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
-    /// A WebSocket upgrade (1-based connection number) with its headers,
-    /// names lowercased, in arrival order.
+    /// A WebSocket upgrade (1-based connection number) with its request
+    /// path (query included) and its headers, names lowercased, in arrival
+    /// order.
     Upgrade {
         connection: usize,
+        path: String,
         headers: Vec<(String, String)>,
     },
     /// A `response.create` frame on a connection.
@@ -268,8 +270,15 @@ async fn serve(mut socket: TcpStream, scripts: Arc<Scripts>) {
         return;
     }
     let connection = scripts.connections.fetch_add(1, Ordering::SeqCst) + 1;
+    let path = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_default()
+        .to_string();
     let _ = scripts.records.send(Record::Upgrade {
         connection,
+        path,
         headers: headers.clone(),
     });
     let upgrade = scripts
