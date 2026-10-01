@@ -768,14 +768,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
-        // The waits sit in the ±20% jitter band around the 5ms/10ms
-        // ladder steps (SANCTIONED DIVERGENCE, operator ruling
-        // 2026-09-23): [4, 7] and [8, 14] with rounding headroom.
+        // The waits sit in the ±25% jitter band around the 5ms/10ms
+        // ladder steps (the fork TS rule; operator ruling 2026-09-23),
+        // rounded: [4, 6] and [8, 13].
         let waits = waited.lock().unwrap().clone();
         assert_eq!(waits.len(), 2, "two waits: {waits:?}");
         assert!(
-            (4..=7).contains(&waits[0]) && (8..=14).contains(&waits[1]),
-            "jittered waits {waits:?} outside the [4,7]/[8,14] bands"
+            (4..=6).contains(&waits[0]) && (8..=13).contains(&waits[1]),
+            "jittered waits {waits:?} outside the [4,6]/[8,13] bands"
         );
         assert_eq!(message.stop_reason, StopReason::Stop);
         let AssistantContent::Text(text) = &message.content[0] else {
