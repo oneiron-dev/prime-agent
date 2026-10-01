@@ -126,9 +126,10 @@ impl AgentSession {
         self.skills = skills;
     }
 
-    /// Bind the telemetry handle the `skill used` adoption event reports
-    /// through (the engine wiring owns the telemetry lifetime and
-    /// installs it once the session telemetry is assembled).
+    /// Bind the telemetry handle the `skill used` and `provider session
+    /// affinity configured` adoption events report through (the engine
+    /// wiring owns the telemetry lifetime and installs it once the session
+    /// telemetry is assembled).
     pub fn set_skill_telemetry(&mut self, telemetry: std::sync::Arc<telemetry::SessionTelemetry>) {
         self.skill_telemetry = Some(telemetry);
     }

@@ -186,8 +186,10 @@ pub struct AgentSession {
     /// reads `resourceLoader.getSkills()` at expansion time; the engine
     /// wiring installs the loaded list once the session is assembled).
     skills: Vec<crate::skills::Skill>,
-    /// The telemetry handle for the `skill used` adoption event the
-    /// prompt path owns (`None` in sessions without telemetry).
+    /// The session's adoption-telemetry handle: the `skill used` event the
+    /// prompt path owns and the `provider session affinity configured`
+    /// event the model-switch methods own (`None` in sessions without
+    /// telemetry).
     skill_telemetry: Option<std::sync::Arc<telemetry::SessionTelemetry>>,
     /// The image-model routing host seam (`None` keeps the session model on
     /// image turns: verification harnesses, and the daemon worker whose
@@ -337,7 +339,8 @@ impl AgentSession {
 
     /// Model change bookkeeping (mirrors appendModelChange). The resolved
     /// model is forwarded to the loop; pa-agent and pa-types serialize to the
-    /// same camelCase wire shape, so the boundary converts through JSON.
+    /// same camelCase wire shape, so the boundary converts through JSON. A
+    /// recorded switch reports the model's session-affinity configuration.
     ///
     /// # Errors
     ///
@@ -354,17 +357,23 @@ impl AgentSession {
         )
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         self.agent.set_model(wire).await;
-        let mut session = self.session.lock().await;
-        session.append_model_change(provider, model_id)?;
+        self.session
+            .lock()
+            .await
+            .append_model_change(provider, model_id)?;
+        if let Some(telemetry) = &self.skill_telemetry {
+            telemetry.note_provider_affinity(model);
+        }
         Ok(())
     }
 
     /// The atomic model-and-level switch: one agent-lock acquisition
     /// updates both fields (the loop snapshots them together), so a
     /// concurrently admitted turn never observes the new model with the
-    /// old level mid-switch. The durable `model_change` row is the same
-    /// bookkeeping as [`AgentSession::set_model`]; the thinking level's
-    /// intent row belongs to the explicit `/thinking` path.
+    /// old level mid-switch. The durable `model_change` row and the
+    /// session-affinity report are the same bookkeeping as
+    /// [`AgentSession::set_model`]; the thinking level's intent row belongs
+    /// to the explicit `/thinking` path.
     ///
     /// # Errors
     ///
@@ -384,8 +393,13 @@ impl AgentSession {
         self.agent
             .set_model_and_thinking_level(wire, thinking_level)
             .await;
-        let mut session = self.session.lock().await;
-        session.append_model_change(provider, model_id)?;
+        self.session
+            .lock()
+            .await
+            .append_model_change(provider, model_id)?;
+        if let Some(telemetry) = &self.skill_telemetry {
+            telemetry.note_provider_affinity(model);
+        }
         Ok(())
     }
 

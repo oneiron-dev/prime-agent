@@ -1,0 +1,2 @@
+- Anthropic requests now let an `x-api-key`, `Authorization` or `anthropic-version` header set in models.json or request options replace the built-in value, whatever its letter case. Before, both values were sent.
+- Cloudflare AI Gateway Anthropic requests no longer send the gateway key in an `Authorization` header. It goes only in `cf-aig-authorization`, as in the TypeScript build.

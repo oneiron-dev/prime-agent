@@ -22,6 +22,9 @@ use serde_json::Value;
 
 use crate::properties::Properties;
 
+// The provider session-affinity adoption rule lives beside the catalog.
+mod provider_affinity;
+
 /// The current schema version stamped on every event. Bumped to 2 when the
 /// #2117 tracking vocabulary landed; additive property changes do not bump
 /// it.
@@ -1799,6 +1802,7 @@ pub fn catalog() -> Vec<&'static EventRule> {
         &KERNEL_SNAPSHOT_GUARD,
         &SESSION_ARCHIVED,
         &AGENT_HEADLESS_INVOKED,
+        &provider_affinity::PROVIDER_SESSION_AFFINITY_CONFIGURED,
     ];
     all.extend(TUI_EVENTS.iter());
     all.extend(UPDATE_EVENTS.iter());

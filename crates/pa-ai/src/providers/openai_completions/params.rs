@@ -647,4 +647,96 @@ mod tests {
         let params = reasoning_params_for(&model, ModelThinkingLevel::Max);
         assert_eq!(params.get("reasoning"), Some(&json!({ "effort": "xhigh" })));
     }
+
+    /// TS #1927 (`openai-completions-cache-control-format.test.ts`,
+    /// "advances the cache marker to the trailing tool result"): the
+    /// conversation marker lands on a trailing `role: "tool"` message. The
+    /// expected body is the TS fork's (bf4d2c6ca) captured request for the
+    /// same input.
+    #[test]
+    fn cache_marker_advances_to_the_trailing_tool_result() {
+        let model = models_generated::get_model("prime-inference", "anthropic/claude-haiku-4.5")
+            .expect("the catalog carries the Prime Inference Haiku route");
+        let context: Context = serde_json::from_value(json!({
+            "systemPrompt": "System prompt",
+            "messages": [
+                {"role": "user", "content": "Read the file", "timestamp": 1},
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "toolCall", "id": "tool-1", "name": "read",
+                        "arguments": {"path": "file.txt"}
+                    }],
+                    "api": model.api, "provider": model.provider, "model": model.id,
+                    "usage": {
+                        "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                        "totalTokens": 0,
+                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
+                    },
+                    "stopReason": "toolUse", "timestamp": 2
+                },
+                {
+                    "role": "toolResult", "toolCallId": "tool-1", "toolName": "read",
+                    "content": [{"type": "text", "text": "file contents"}],
+                    "isError": false, "timestamp": 3
+                }
+            ],
+            "tools": [{
+                "name": "read", "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }]
+        }))
+        .unwrap();
+        let compat = crate::providers::openai_completions::get_compat(model);
+        let cache_control = crate::providers::openai_completions::get_compat_cache_control(
+            &compat,
+            CacheRetention::Short,
+        );
+        let params = build_params(
+            model,
+            &context,
+            None,
+            &compat,
+            CacheRetention::Short,
+            cache_control.as_ref(),
+        );
+        let marker = json!({"type": "ephemeral"});
+        assert_eq!(
+            params,
+            json!({
+                "model": "anthropic/claude-haiku-4.5",
+                "messages": [
+                    {"role": "system", "content": [
+                        {"type": "text", "text": "System prompt", "cache_control": marker}
+                    ]},
+                    {"role": "user", "content": "Read the file"},
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "tool-1", "type": "function",
+                        "function": {"name": "read", "arguments": "{\"path\":\"file.txt\"}"}
+                    }]},
+                    {"role": "tool", "content": [
+                        {"type": "text", "text": "file contents", "cache_control": marker}
+                    ], "tool_call_id": "tool-1"}
+                ],
+                "stream": true,
+                "stream_options": {"include_usage": true},
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "read", "description": "Read a file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"]
+                        }
+                    },
+                    "cache_control": marker
+                }]
+            })
+        );
+    }
 }
