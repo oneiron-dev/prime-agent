@@ -23,8 +23,8 @@ pub use crate::providers::openai_responses_hooks::{
 };
 use crate::providers::openai_responses_shared::encode_text_signature_v1;
 use crate::types::{
-    AssistantContent, AssistantMessage, Model, StopReason, TextContent, TextSignaturePhase,
-    ThinkingContent, ToolCall, Usage, UsageCost,
+    AssistantContent, AssistantMessage, Model, ResponseModelSource, StopReason, TextContent,
+    TextSignaturePhase, ThinkingContent, ToolCall, Usage, UsageCost,
 };
 use crate::utils_inner::json_parse::{parse_streaming_json, StreamingJsonAccumulator};
 use crate::utils_inner::stream_failure::{
@@ -774,6 +774,17 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         }
                     }
                 }
+                // Some gateways synthesize requested aliases in
+                // `response.created`; only the terminal response identity is
+                // evidence of the serving model.
+                if let Some(model) = response
+                    .get("model")
+                    .and_then(|value| value.as_str())
+                    .filter(|model| !model.trim().is_empty())
+                {
+                    self.output.response_model = Some(model.to_string());
+                    self.output.response_model_source = Some(ResponseModelSource::ProviderResponse);
+                }
                 if let Some(id) = response.get("id").and_then(|value| value.as_str()) {
                     self.output.response_id = Some(id.to_string());
                 }
@@ -823,7 +834,11 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     apply(&mut self.output.usage, service_tier);
                 }
                 let status = response.get("status").and_then(|value| value.as_str());
-                self.output.stop_reason = map_responses_stop_reason(status);
+                self.output.stop_reason = if event_type == "response.incomplete" {
+                    StopReason::Length
+                } else {
+                    map_responses_stop_reason(status)
+                };
                 let has_tool_call = self
                     .output
                     .content
@@ -952,3 +967,7 @@ fn map_responses_stop_reason(status: Option<&str>) -> StopReason {
         Some(_) => StopReason::Error,
     }
 }
+
+#[cfg(test)]
+#[path = "openai_responses_stream_tests.rs"]
+mod tests;

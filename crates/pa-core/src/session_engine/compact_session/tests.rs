@@ -25,6 +25,7 @@ fn session_with_turns(cwd: &std::path::Path, turns: usize) -> SessionManager {
                 provider: "test".to_string(),
                 model: "m".to_string(),
                 response_model: None,
+                response_model_source: None,
                 response_id: None,
                 diagnostics: None,
                 usage: pa_types::ai::Usage {

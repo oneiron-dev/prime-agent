@@ -25,6 +25,7 @@ fn error_message(
         provider: "test".to_string(),
         model: "m".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: Some(vec![AssistantMessageDiagnostic {
             kind: "provider_stream_failure".to_string(),
@@ -50,6 +51,7 @@ fn ok_message() -> AssistantMessage {
         provider: "test".to_string(),
         model: "m".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: None,
         usage: Usage::zero(),
@@ -353,6 +355,7 @@ fn stream_drop_message() -> AssistantMessage {
         provider: "test".to_string(),
         model: "m".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: Some(vec![AssistantMessageDiagnostic {
             kind: "provider_stream_failure".to_string(),

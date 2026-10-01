@@ -465,6 +465,7 @@ impl AgentInner {
                 provider: model.provider.clone(),
                 model: model.id,
                 response_model: None,
+                response_model_source: None,
                 response_id: None,
                 diagnostics: if aborted {
                     None
@@ -1454,6 +1455,7 @@ mod tests {
                         provider: requested.provider,
                         model: requested.id,
                         response_model: None,
+                        response_model_source: None,
                         response_id: None,
                         diagnostics: None,
                         usage: Usage::zero(),

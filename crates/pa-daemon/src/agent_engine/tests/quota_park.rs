@@ -66,6 +66,7 @@ fn quota_failure_message(
         provider: "battery".to_string(),
         model: "mock-1".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: Some(vec![pa_agent::types::AssistantMessageDiagnostic {
             kind: "provider_stream_failure".to_string(),
@@ -122,6 +123,7 @@ async fn a_failed_park_entry_write_propagates_to_the_caller() {
                 provider: "faux".to_string(),
                 model: "faux-1".to_string(),
                 response_model: None,
+                response_model_source: None,
                 response_id: None,
                 diagnostics: None,
                 usage: pa_types::ai::Usage::default(),

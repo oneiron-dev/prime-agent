@@ -447,6 +447,7 @@ mod tests {
             provider: "test".to_string(),
             model: "m".to_string(),
             response_model: None,
+            response_model_source: None,
             response_id: None,
             diagnostics: None,
             usage: pa_types::ai::Usage::default(),

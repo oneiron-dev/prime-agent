@@ -514,6 +514,7 @@ mod tests {
             provider: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             response_model: None,
+            response_model_source: None,
             response_id: None,
             diagnostics: None,
             usage,

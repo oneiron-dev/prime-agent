@@ -283,6 +283,7 @@ mod tests {
             provider: "test".into(),
             model: "m".into(),
             response_model: None,
+            response_model_source: None,
             response_id: None,
             diagnostics: None,
             usage: Usage::default(),

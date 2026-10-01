@@ -87,6 +87,7 @@ fn assistant_message() -> AssistantMessage {
         provider: "openai".to_string(),
         model: "gpt-test".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: None,
         usage: Usage {

@@ -61,6 +61,13 @@ pub enum StopReason {
     Aborted,
 }
 
+/// Where an assistant message's `responseModel` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResponseModelSource {
+    #[serde(rename = "provider-response")]
+    ProviderResponse,
+}
+
 /// Text content block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextContent {
@@ -240,13 +247,22 @@ pub struct AssistantMessage {
     pub provider: String,
     #[serde(default)]
     pub model: String,
-    /// Concrete `chunk.model` when different from the requested model.
+    /// Model identifier reported by the provider response (not an upstream
+    /// attestation: a gateway may echo a routing alias).
     #[serde(
         rename = "responseModel",
         default,
         skip_serializing_if = "Option::is_none"
     )]
     pub response_model: Option<String>,
+    /// Set only when the transport read `response_model` from a provider
+    /// response, never from the requested selector.
+    #[serde(
+        rename = "responseModelSource",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_model_source: Option<ResponseModelSource>,
     /// Provider-specific response/message identifier when exposed.
     #[serde(
         rename = "responseId",

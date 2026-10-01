@@ -522,6 +522,51 @@ mod tests {
         assert_eq!(agent_tool_call.thought_signature.as_deref(), Some("sig-2"));
     }
 
+    /// The provider-reported model and its provenance cross the pa-ai ->
+    /// pa-agent boundary intact (pa-agent has no catch-all field, so a
+    /// missing field there silently drops it from headless JSON events and
+    /// sessions) and come back unchanged.
+    #[test]
+    fn response_model_provenance_round_trips_both_directions() {
+        let message = pa_types::ai::AssistantMessage {
+            content: Vec::new(),
+            api: "openai-responses".into(),
+            provider: "cpa-r".into(),
+            model: "gpt-6-astra".into(),
+            response_model: Some("gpt-6-astra-2026-09".into()),
+            response_model_source: Some(pa_types::ai::ResponseModelSource::ProviderResponse),
+            response_id: Some("resp_wire".into()),
+            diagnostics: None,
+            usage: pa_types::ai::Usage::default(),
+            stop_reason: pa_types::ai::StopReason::Stop,
+            stop_reason_raw: None,
+            error_message: None,
+            timestamp: 1,
+            rest: serde_json::Map::default(),
+        };
+        let agent: Option<pa_agent::types::AssistantMessage> = json_round_trip(&message);
+        assert_eq!(
+            agent,
+            Some(pa_agent::types::AssistantMessage {
+                content: Vec::new(),
+                api: "openai-responses".into(),
+                provider: "cpa-r".into(),
+                model: "gpt-6-astra".into(),
+                response_model: Some("gpt-6-astra-2026-09".into()),
+                response_model_source: Some(pa_agent::types::ResponseModelSource::ProviderResponse),
+                response_id: Some("resp_wire".into()),
+                diagnostics: None,
+                usage: pa_agent::types::Usage::zero(),
+                stop_reason: pa_agent::types::StopReason::Stop,
+                stop_reason_raw: None,
+                error_message: None,
+                timestamp: 1,
+            })
+        );
+        let back: Option<pa_types::ai::AssistantMessage> = agent.as_ref().and_then(json_round_trip);
+        assert_eq!(back, Some(message));
+    }
+
     /// The turn-abort cancels the in-flight fetch at the seam: a delayed
     /// faux response holds the request mid-wait; `ModelStream::close`
     /// (the loop's `closeIterator` abort callback, fired the moment the

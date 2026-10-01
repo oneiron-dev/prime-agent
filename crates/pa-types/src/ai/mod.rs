@@ -570,9 +570,14 @@ pub struct AssistantMessage {
     pub api: Api,
     pub provider: Provider,
     pub model: String,
-    /// Concrete `chunk.model` when different from the requested model.
+    /// Model identifier reported by the provider response. A gateway may
+    /// echo a routing alias; this is not an upstream attestation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_model: Option<String>,
+    /// Set only when the transport read `response_model` from a provider
+    /// response, never from the requested selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_model_source: Option<ResponseModelSource>,
     /// Provider-specific response identifier, when exposed upstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
@@ -590,6 +595,15 @@ pub struct AssistantMessage {
     pub timestamp: u64,
     #[serde(flatten)]
     pub rest: JsonMap,
+}
+
+/// Where an assistant message's `responseModel` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResponseModelSource {
+    /// Read from the provider's response (Anthropic `message_start`, the
+    /// terminal `OpenAI` Responses event).
+    ProviderResponse,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -107,6 +107,7 @@ pub(crate) fn aborted_message(model: &Model) -> pa_agent::types::AssistantMessag
         provider: model.provider.clone(),
         model: model.id.clone(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: None,
         usage: pa_agent::types::Usage::zero(),

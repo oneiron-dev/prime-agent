@@ -255,6 +255,7 @@ async fn split_turn_compaction_streams_in_final_order_and_converges() {
             provider: "faux".to_string(),
             model: "compact-m".to_string(),
             response_model: None,
+            response_model_source: None,
             response_id: None,
             diagnostics: None,
             usage: pa_types::ai::Usage::default(),

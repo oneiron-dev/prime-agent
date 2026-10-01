@@ -387,6 +387,7 @@ async fn placement_rig(
         provider: "test".to_string(),
         model: "digest-placement-m".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: None,
         usage: pa_types::ai::Usage {

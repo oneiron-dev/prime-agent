@@ -530,6 +530,7 @@ fn seed_session(
             provider: "openai".to_string(),
             model: "gpt-x".to_string(),
             response_model: None,
+            response_model_source: None,
             response_id: None,
             diagnostics: None,
             usage: Usage::default(),

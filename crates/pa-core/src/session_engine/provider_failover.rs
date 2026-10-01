@@ -429,6 +429,7 @@ mod tests {
             provider: "primary".to_string(),
             model: "glm-5.3".to_string(),
             response_model: None,
+            response_model_source: None,
             response_id: None,
             diagnostics: Some(vec![AssistantMessageDiagnostic {
                 kind: "provider_stream_failure".to_string(),
@@ -454,6 +455,7 @@ mod tests {
             provider: "primary".to_string(),
             model: "glm-5.3".to_string(),
             response_model: None,
+            response_model_source: None,
             response_id: None,
             diagnostics: None,
             usage: Usage::zero(),

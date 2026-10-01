@@ -118,6 +118,42 @@ fn assistant_message_roundtrip_and_unknown_fields() {
     );
 }
 
+/// The provider response-model provenance rides as a typed camelCase field
+/// and stays off the wire when unset, so existing session and daemon bytes
+/// are unchanged.
+#[test]
+fn assistant_message_response_model_source_shape() {
+    let usage = r#""usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}"#;
+    let unset = format!(
+        r#"{{"role":"assistant","content":[],"api":"openai-responses","provider":"cpa-r","model":"gpt-6-astra","responseId":"resp_wire",{usage},"stopReason":"stop","timestamp":1}}"#
+    );
+    assert_eq!(rt::<Message>(&unset), unset);
+
+    let set = format!(
+        r#"{{"role":"assistant","content":[],"api":"openai-responses","provider":"cpa-r","model":"gpt-6-astra","responseModel":"gpt-6-astra-2026-09","responseModelSource":"provider-response","responseId":"resp_wire",{usage},"stopReason":"stop","timestamp":1}}"#
+    );
+    assert_eq!(rt::<Message>(&set), set);
+    assert_eq!(
+        serde_json::from_str::<Message>(&set).unwrap(),
+        Message::Assistant(AssistantMessage {
+            content: Vec::new(),
+            api: "openai-responses".into(),
+            provider: "cpa-r".into(),
+            model: "gpt-6-astra".into(),
+            response_model: Some("gpt-6-astra-2026-09".into()),
+            response_model_source: Some(ResponseModelSource::ProviderResponse),
+            response_id: Some("resp_wire".into()),
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            stop_reason_raw: None,
+            error_message: None,
+            timestamp: 1,
+            rest: JsonMap::default(),
+        })
+    );
+}
+
 #[test]
 fn stream_event_roundtrip() {
     let msg = r#"{"role":"assistant","content":[],"api":"a","provider":"p","model":"m","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1}"#;
