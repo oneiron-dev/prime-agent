@@ -1,0 +1,1 @@
+- The daemon no longer drops a client command whose last bytes arrive while it is sending that client an event; such a command (for example attaching a second terminal to a running session) used to wait forever for its answer.
