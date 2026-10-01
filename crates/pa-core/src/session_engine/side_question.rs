@@ -24,9 +24,9 @@ use pa_agent::types::{
 
 use super::provider_retry::{
     is_agent_lifecycle_failure, is_faux_provider_queue_exhausted,
-    is_permanent_provider_failure_kind, provider_retry_delay, provider_stream_failure_kind,
-    provider_stream_failure_retry_after_ms, provider_stream_failure_status, ProviderRetryDelay,
-    ProviderRetryPolicy,
+    is_permanent_provider_failure_kind, jittered_delay_ms, provider_retry_delay,
+    provider_stream_failure_kind, provider_stream_failure_retry_after_ms,
+    provider_stream_failure_status, retry_jitter_rand01, ProviderRetryDelay, ProviderRetryPolicy,
 };
 
 /// Sink receiving partial side-question answers while the run streams.
@@ -327,6 +327,12 @@ async fn run_attempts(
         let ProviderRetryDelay::Wait { delay_ms } = delay else {
             break Ok(Some(message));
         };
+        // TS `completeWithProviderRetry` waits the jittered, capped delay.
+        let delay_ms = jittered_delay_ms(
+            delay_ms,
+            provider_stream_failure_retry_after_ms(&message),
+            retry_jitter_rand01(),
+        );
         // A cancel that raced the failure is an abort, not a provider failure.
         if race_with_abort(
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)),

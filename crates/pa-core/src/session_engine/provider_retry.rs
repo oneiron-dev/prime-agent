@@ -196,13 +196,14 @@ const RETRY_JITTER_FRACTION: f64 = 0.25;
 /// above the backoff is used as-is; otherwise the backoff is jittered by
 /// `rand01` (a uniform sample in `[0, 1]`; `0.5` is the identity) and
 /// floored at the server wait, so the jitter never cuts a requested wait
-/// short. Pure so tests stay deterministic:
+/// short. The Node timer cap applies last, to the waited value. Pure so
+/// tests stay deterministic:
 /// `jittered_delay_ms(1000, None, 0.0) == 750`,
 /// `jittered_delay_ms(1000, None, 1.0) == 1250`.
 #[must_use]
 pub fn jittered_delay_ms(delay_ms: u64, retry_after_ms: Option<u64>, rand01: f64) -> u64 {
     if retry_after_ms.is_some_and(|retry_after_ms| retry_after_ms >= delay_ms) {
-        return delay_ms;
+        return delay_ms.min(MAX_TIMER_DELAY_MS);
     }
     let rand01 = rand01.clamp(0.0, 1.0);
     let factor = 1.0 + RETRY_JITTER_FRACTION * (2.0 * rand01 - 1.0);
@@ -230,7 +231,10 @@ pub fn retry_jitter_rand01() -> f64 {
     (x % 10_000) as f64 / 10_000.0
 }
 
-/// Delay before retry `attempt` (1-based), honoring a server-requested wait.
+/// Delay before retry `attempt` (1-based), honoring a server-requested wait:
+/// the larger of the backoff and the server wait, uncapped —
+/// [`jittered_delay_ms`] turns it into the waited value and applies the
+/// timer cap last (TS `providerRetryDelay` jitters the uncapped backoff).
 #[must_use]
 pub fn provider_retry_delay(
     attempt: u32,
@@ -246,9 +250,7 @@ pub fn provider_retry_delay(
         .base_delay_ms
         .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)))
         .min(policy.max_delay_ms);
-    let delay_ms = exponential
-        .max(retry_after_ms.unwrap_or(0))
-        .min(MAX_TIMER_DELAY_MS);
+    let delay_ms = exponential.max(retry_after_ms.unwrap_or(0));
     ProviderRetryDelay::Wait { delay_ms }
 }
 
@@ -428,6 +430,32 @@ mod tests {
         assert_eq!(jittered_delay_ms(4000, Some(3500), 0.0), 3500);
         assert_eq!(jittered_delay_ms(4000, Some(2000), 0.0), 3000);
         assert_eq!(jittered_delay_ms(4000, Some(3500), 1.0), 5000);
+    }
+
+    /// The timer cap applies to the waited value, after the jitter (TS
+    /// order): a backoff above the cap jitters from its uncapped value, so
+    /// the low end of the band still waits the full cap. Capping first
+    /// shrank it to three quarters of the cap.
+    #[test]
+    fn the_timer_cap_applies_after_the_jitter() {
+        let policy = ProviderRetryPolicy {
+            enabled: true,
+            max_retries: 3,
+            base_delay_ms: 3_000_000_000,
+            max_retry_delay_ms: 60000,
+            max_delay_ms: UNBOUNDED_BACKOFF_MS,
+        };
+        let ProviderRetryDelay::Wait { delay_ms } = provider_retry_delay(1, None, &policy) else {
+            panic!("no server wait to exceed the cap");
+        };
+        assert_eq!(
+            [
+                jittered_delay_ms(delay_ms, None, 0.0),
+                jittered_delay_ms(delay_ms, None, 1.0),
+                jittered_delay_ms(3_000_000_000, Some(3_000_000_000), 0.0),
+            ],
+            [MAX_TIMER_DELAY_MS; 3]
+        );
     }
 
     #[test]
