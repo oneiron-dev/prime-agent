@@ -57,13 +57,15 @@ when the diff is identical, otherwise drop it by hand.
   fork-only shared-store guard (`PRIME_AGENT_SHARED_STORE`), a follow-up lane.
 - The launcher exports `PRIME_AGENT_CODING_AGENT_DIR=~/.prime/agent-rs`,
   `PRIME_AGENT_SOCKET_DIR=${TMPDIR:-/tmp}/pa-rs-<uid>` (0700, owner-checked),
-  `PRIME_AGENT_DAEMON_SOCKET=<that dir>/daemon.sock` and
-  `PRIME_AGENT_KERNEL_VENV=~/.prime/agent-rs/kernel-venv`. It clears inherited session-dir
-  overrides and always overwrites the generic names. Override only with
-  `PRIME_AGENT_RS_AGENT_DIR` / `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`; each is
-  validated before anything is created: absolute, canonical through symlinked ancestors, and no
-  overlap with TS state. The short `pa-rs-<uid>` name keeps macOS worker socket paths under the
-  104-byte `sun_path` limit.
+  `PRIME_AGENT_DAEMON_SOCKET=<that dir>/daemon.sock`,
+  `PRIME_AGENT_KERNEL_VENV=~/.prime/agent-rs/kernel-venv` and
+  `PYTHONPYCACHEPREFIX=~/.prime/agent-rs/python-cache` (the kernel imports bundled Python skills
+  in place from the release dir; their bytecode must stay out of the immutable install). It
+  clears inherited session-dir overrides and always overwrites the generic names. Override only
+  with `PRIME_AGENT_RS_AGENT_DIR` / `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`;
+  each is validated before anything is created: absolute, canonical through symlinked ancestors,
+  and no overlap with TS state (the TS socket dirs under both `$TMPDIR` and `/tmp`). The short
+  `pa-rs-<uid>` name keeps macOS worker socket paths under the 104-byte `sun_path` limit.
 - Self-update is shut. Upstream's `prime-agent update` and the TUI `/update` fetch and run the
   takeover installer, so the launcher sets `PRIME_AGENT_DISABLE_SELF_UPDATE=1`. That fork-only guard
   refuses both, plus the staged native updater. It also points `PRIME_AGENT_RUST_INSTALLER_URL` and
@@ -81,7 +83,9 @@ when the diff is identical, otherwise drop it by hand.
 - Known leak: child processes of a Rust session (bash tool, kernel) inherit the launcher's env.
   TS reads `PRIME_AGENT_KERNEL_VENV` and `PRIME_AGENT_CODING_AGENT_DIR`, so a TS `sol` started from
   inside a `prime-agent-rs` session runs against the Rust agent dir and venv. The TS state stays
-  untouched; that TS run just sees Rust's store. This goes away at cutover.
+  untouched; that TS run just sees Rust's store. Any Python run from a Rust session also writes
+  its bytecode under `~/.prime/agent-rs/python-cache` (`PYTHONPYCACHEPREFIX`) instead of beside
+  its sources. This goes away at cutover.
 
 ## Gates (local; upstream CI only runs on `main`)
 

@@ -37,14 +37,15 @@ cargo build --release -p pa-cli
 python3 scripts/package_release.py --skip-build --catalog-assets /tmp/catalog --out-dir /tmp/pkg
 python3 scripts/oneiron/side_by_side.py package --package-dir /tmp/pkg \
     --version 0.9.8-oneiron.20261002.1 \
-    --decoder target/release/dist/prime-agent-0.9.8-linux-x64.debug.gz   # Linux only
+    --decoder target/release/dist/prime-agent-0.9.8-linux-x64.debug.gz   # Linux: required
 ```
 
 `package` builds nothing. It checks the staged layout against `binaries.json` and re-validates
-the catalogs. It refuses a dirty checkout unless you pass `--allow-dirty`, which is then
-recorded. It runs the staged binary to confirm the compiled version is `<base>` and the stamped
-version is `<version>`. Then it packs a deterministic tarball (upstream's packer: sorted
-members, fixed owner, mtime and modes) and writes:
+the catalogs. On Linux it runs upstream's split-debug gates on every release: no DWARF left in
+the shipped ELF, and the `--decoder` paired with it by GNU build ID. There is no way to publish
+a Linux release without its decoder. It runs the staged binary to confirm the compiled version
+is `<base>` and the stamped version is `<version>`. Then it packs a deterministic tarball
+(upstream's packer: sorted members, fixed owner, mtime and modes) and writes:
 
 ```
 feed/releases/v<version>/prime-agent-<version>-<platform>.tar.gz
@@ -55,20 +56,27 @@ feed/latest.json, feed/stable                                       (moved only 
 ```
 
 `manifest.json` has `version` (`v<version>`), `package`, `baseVersion`, `source`
-(`commit`, `tree`, `build`, `dirty`, `rustBase`), `buildAt`, `binaries` (one row per platform:
-`platform`, `target`, `file`, `sha256`, `executableSha256`, `bytes`, `compiledVersion`,
-`buildAt`, `catalog`, `decoder`) and `decoders`. The `version` and `binaries` rows are what
-the Rust updater's channel-manifest parser reads (`pa-core` `update::release`;
-`crates/pa-core/tests/oneiron_feed_manifest.rs` checks this).
+(`commit`, `tree`, `build`, `dirty`, `dirtySha256`, `attestedBy`, `rustBase`), `buildAt`,
+`binaries` (one row per platform: `platform`, `target`, `file`, `sha256`, `executableSha256`,
+`bytes`, `compiledVersion`, `buildAt`, `catalog`, `decoder`) and `decoders`. The `version` and
+`binaries` rows are what the Rust updater's channel-manifest parser reads (`pa-core`
+`update::release`; `crates/pa-core/tests/oneiron_feed_manifest.rs` checks this).
+
+**Source provenance.** The binary carries no commit of its own, so `source` describes the
+checkout `package` runs from (`attestedBy: "packaging-checkout"`), not the build. Package from
+the same checkout, unchanged, that you built from. A dirty checkout is refused unless you pass
+`--allow-dirty`; then `dirtySha256` digests the exact uncommitted state (the diff against HEAD
+plus every untracked file), and a second platform must carry the same one.
 
 Re-running `package` with the same inputs changes nothing in the release. It still moves the
 feed pointers forward, so a release first published with `--no-promote` can be promoted by
 running `package` again without it. Different bytes for a platform that is already published
-are refused, so bump `N`. So is a different decoder choice for the same bytes (a Linux build
-published with `--no-decoder` never gains a decoder later). A second platform joins a release only if it was
-built from the same commit and tree. To get both platforms into one feed, copy the feed dir to
-the Mac (for example with rsync), run `package --feed-dir <copy>` there, and copy it back. There
-is no upload step.
+are refused, so bump `N`. A second platform joins a release only from the same source facts.
+To get both platforms into one feed, copy the feed dir to the Mac (for example with rsync), run
+`package --feed-dir <copy>` there, and copy it back. There is no upload step. Below the feed
+root, `releases/` and each release dir must be real directories; a symlinked one is refused
+before anything is written through it (the same holds for `receipts/` under the install
+prefix).
 
 ## 2. Roll out (on each host)
 
@@ -85,11 +93,13 @@ started meanwhile is turned away before it writes anything):
    and that copy is what gets installed.
 2. **Idle check.** The rollout connects only to the Rust supervisor socket
    (`${PRIME_AGENT_RS_SOCKET_DIR:-$TMPDIR/pa-rs-<uid>}/daemon.sock`, or `--rust-socket`). It
-   checks the hello identity: the protocol, the socket path, and an executable under the
-   prefix. Then it sends one `list` and refuses while there are live sessions. Anything that
-   is not this install's supervisor is never sent a command. The TS socket dir is never
-   connected to. Nothing is ever stopped. `--force-idle-check-skip` proceeds anyway and records
-   that it did. Live sessions keep running the old binary until their supervisor restarts.
+   checks the hello identity: the protocol, the socket path, and an executable that is an
+   install's `prime-agent` under the prefix. Then it sends one `list` and refuses while there
+   are live sessions. Anything that is not this install's supervisor is never sent a command.
+   A path in a TS socket dir (`prime-agent-<uid>` or `prime-agent-user` under `$TMPDIR` or
+   `/tmp`, whatever `$TMPDIR` says now) is never connected to. Nothing is stopped here.
+   `--force-idle-check-skip` proceeds anyway and records that it did. Live sessions keep
+   running the old binary until their supervisor restarts.
 3. **Install** to `<prefix>/<version>/`. The executable must match the release row. If an
    earlier attempt left the same version installed but unselected, it is reused only when its
    whole payload (every file, its content and executable bit) equals the verified tarball's.
@@ -97,9 +107,14 @@ started meanwhile is turned away before it writes anything):
 4. **Probe before selecting.** A scratch launcher (the real template) points at the new
    install. `--version` and a one-shot on `cpa-r`/`gpt-6.1-sol` must succeed; this is a real
    provider call. `--tools` also runs a kernel turn. If the probe fails, the version stays
-   installed and unselected.
-5. **Select.** The idle check runs again. Then `previous` is set to the old `current`,
-   `current` is flipped, and the launcher is rewritten.
+   installed and unselected. The launcher sets `PYTHONPYCACHEPREFIX` to
+   `~/.prime/agent-rs/python-cache`: the kernel imports bundled Python skills in place, and
+   their bytecode must not land inside the immutable install.
+5. **Select.** The idle check runs again. Then, under the lock, one last look: `current`,
+   `previous` and the launcher must still be what the run started from, and the install's
+   payload digest must still equal the one verified at install time. Only then is the
+   launcher rewritten, `previous` set to the old `current`, and `current` flipped. A launcher
+   that cannot be written leaves `current` where it was.
 6. **Post-check.** `prime-agent-rs --version` must print the version, and the TS launcher must
    be unchanged.
 7. **Old supervisor.** See below.
@@ -107,15 +122,30 @@ started meanwhile is turned away before it writes anything):
 `receipts/<version>-<platform>/ACTIVATION-RECEIPT.json` records the status (`activated`,
 `refused` or `failed`), the phase it stopped in, the release hashes and source, both idle
 checks with the observed daemon identity, the `current`/`previous`/launcher/TS-launcher state
-before and after, the probe summary, the checks, and per-phase timings. An earlier receipt of
-the same name is kept beside it under its timestamp.
+before and after, the probe summary, the checks, and per-phase timings. It is journaled: written
+as `running` before the first check, again on entering every phase and right before the swap,
+then with the outcome. Any error (a permission or archive error included) is recorded as
+`failed` with its type. A receipt still saying `running` means the run died in the phase it
+names; `status` and the `current` symlink tell what happened. An earlier receipt of the same
+name is kept beside it under its timestamp.
 
-A running Rust supervisor is not restarted by the swap. If it runs another version but the same
+Rolling out the version that is already current runs every phase again (the swap is then a
+no-op). That re-verifies it, and finishes an activation that was interrupted or a retirement
+you now ask for.
+
+A running Rust supervisor is not restarted by the swap. If it runs another release but the same
 protocol and schema, new `prime-agent-rs` clients still treat it as current, and it starts every
-new session's worker from its own, older binary until it exits. The receipt's `notice` says so.
-`--retire-idle-daemon` stops it after the swap, on the connection that just found it idle and
-belonging to this install (`shutdown`, never forced). The next `prime-agent-rs` run then starts
-the selected version. A supervisor with live sessions is never stopped.
+new session's worker from its own, older binary until it exits. Its release is read from its
+executable path (the hello's `appVersion` is the compiled Cargo version, the same for every
+Oneiron build of one base). The receipt's `notice` says which release it still runs.
+`--retire-idle-daemon` stops it after the swap: on a new connection whose hello must be the same
+supervisor (pid, process start, executable) checked before the swap, it sends `list` and, only on
+an empty answer, `shutdown` (never forced). The next `prime-agent-rs` run then starts the
+selected version. This is not an atomic idle fence: the supervisor accepts `shutdown`
+unconditionally, so a session another client creates in the moment between that `list` answer
+and the `shutdown` is stopped too. That is the same window as the CLI's own stale-daemon
+replacement. Retire only when nothing else is starting Rust sessions. A supervisor that lists
+sessions is never sent `shutdown`.
 
 ## Not in this release
 
