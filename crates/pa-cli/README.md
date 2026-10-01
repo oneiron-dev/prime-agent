@@ -77,10 +77,13 @@ session. Flags the create contract cannot carry (`--no-skills`,
 `--fork`) fail before any daemon starts, and so do a factory seat's
 `W7_CARGO_*` launch overlay (a daemon worker runs with the daemon's
 environment) and the flag in rpc/acp mode. Ambient process policy such as
-`PI_OFFLINE` reaches a daemon this run starts, not one already running. A
-prompt whose route budget runs out counts as running only when its own
-user message started on the stream; otherwise the run fails rather than
-report a prompt that may never have run. Each print/json run reports `agent headless invoked` (mode,
+`PI_OFFLINE` reaches a daemon this run starts, not one already running.
+Each prompt carries its own `admissionId`; when the supervisor's route
+budget answers first, `cancel_prompt_admission` reads that admission back:
+a started turn (`owned`, whatever the submission was, `/skill:` and
+session commands included) is waited out to idle, a prompt still queued is
+withdrawn and the run fails, and a prompt nothing holds fails the run
+rather than report one that may never have run. Each print/json run reports `agent headless invoked` (mode,
 daemon_hosted, json_event_profile). Verifiers: `headless_flags_e2e`,
 `hosted_print_e2e`.
 

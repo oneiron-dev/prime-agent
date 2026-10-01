@@ -13,6 +13,13 @@
 //! with a stream barrier: the worker's current event sequence (read after
 //! the run went idle) must have reached the sink, and every `agent_start`
 //! seen must have its `agent_end`, before the run counts as finished.
+//!
+//! Route budget: the supervisor answers `prompt_and_wait` with its route
+//! timeout after ten minutes even while the worker still runs the turn
+//! (TS forwards it for 24 hours). Each prompt therefore carries its own
+//! schema-30 `admissionId`, and a timed-out prompt reads its admission
+//! back with `cancel_prompt_admission` (never `cancelOwned`): only that
+//! answer says whether THIS prompt's turn started.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,6 +80,20 @@ pub struct HostedPrompt {
 /// object, never the supervisor envelope.
 pub type HostedEventSink = Arc<dyn Fn(&Value) + Send + Sync>;
 
+/// The `cancel_prompt_admission` answer for a prompt the route budget
+/// left unanswered (TS `cancelled | owned | unknown`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AdmissionAnswer {
+    /// The worker committed the admission: the prompt's turn started.
+    Owned,
+    /// The prompt was still queued; the cancel withdrew it.
+    Cancelled,
+    /// Nothing holds the admission: the prompt never reached the worker,
+    /// or it settled between the budget and the read.
+    Unknown,
+}
+
 /// The emitted stream's position, for the completion barrier.
 #[derive(Debug, Clone, Default)]
 struct StreamProgress {
@@ -91,10 +112,6 @@ pub struct HostedHeadlessSession {
     link: Arc<DaemonLink>,
     active_session_id: String,
     progress: watch::Sender<StreamProgress>,
-    /// The text of every user message that started on the wire, recorded
-    /// by the frame consumer in wire order, so a response sees every user
-    /// row that preceded it.
-    user_messages_on_wire: Arc<std::sync::Mutex<Vec<String>>>,
     /// The frames the consumer forwarded, waiting for the sink.
     pending_events: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
 }
@@ -113,32 +130,16 @@ impl HostedHeadlessSession {
     ) -> anyhow::Result<(Self, HostedSessionOpened)> {
         let link = Arc::new(DaemonLink::connect(&options.socket_path, "headless").await?);
         let (event_tx, event_rx) = mpsc::unbounded_channel::<Value>();
-        let user_messages_on_wire = Arc::new(std::sync::Mutex::new(Vec::new()));
         // The consumer owns the frame order: an event observed before a
-        // response is forwarded (and recorded) before that response
-        // resolves its caller.
+        // response is forwarded before that response resolves its caller.
         {
             let link = Arc::clone(&link);
-            let user_messages_on_wire = Arc::clone(&user_messages_on_wire);
             tokio::spawn(async move {
                 let mut frames = link.frames.lock().await;
                 while let Some(frame) = frames.recv().await {
                     match frame {
                         LinkFrame::Response(response) => link.resolve(response),
-                        LinkFrame::Event(frame) => {
-                            let event = frame.get("event").unwrap_or(&Value::Null);
-                            let message = event.get("message").unwrap_or(&Value::Null);
-                            if event.get("type").and_then(Value::as_str) == Some("message_start")
-                                && message.get("role").and_then(Value::as_str) == Some("user")
-                            {
-                                user_messages_on_wire
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .push(user_message_text(message));
-                            }
-                            let _ = event_tx.send(frame);
-                        }
-                        LinkFrame::Other(frame) => {
+                        LinkFrame::Event(frame) | LinkFrame::Other(frame) => {
                             let _ = event_tx.send(frame);
                         }
                     }
@@ -151,7 +152,6 @@ impl HostedHeadlessSession {
             link,
             active_session_id: String::new(),
             progress: watch::Sender::new(StreamProgress::default()),
-            user_messages_on_wire,
             pending_events: std::sync::Mutex::new(Some(event_rx)),
         };
         session.establish(options).await
@@ -305,28 +305,33 @@ impl HostedHeadlessSession {
         });
     }
 
-    /// Run one prompt to its settled turn (`prompt_and_wait`). A turn that
-    /// outlives the supervisor's route budget is still running: when this
-    /// prompt's user message started on the wire after it was sent, the
-    /// client waits for the session to go idle instead of failing it.
+    /// Run one prompt to its settled turn (`prompt_and_wait`). When the
+    /// supervisor's route budget answers first, the prompt's own admission
+    /// decides: `owned` means its turn started (the worker commits an
+    /// admission when the turn starts, before a `/skill:` command expands
+    /// or a session command such as `/compact` runs, so every submission
+    /// is covered and another client's prompt never is), and the client
+    /// waits for the session to go idle; a prompt still queued is
+    /// withdrawn by the same read and never runs.
     ///
     /// # Errors
     ///
     /// Returns the prompt's rejection (the worker's admission or settle
-    /// error), the route budget's timeout when this prompt's user message
-    /// was not seen to start (the same failure answers a prompt that never
-    /// reached the worker; a prompt the worker rewrote, such as an expanded
-    /// template, fails this way too rather than counting as run), or a
-    /// transport failure.
+    /// error), the route budget's timeout for a prompt that was withdrawn
+    /// while queued or that nothing holds any more (it may never have
+    /// reached the worker, so the run fails rather than report it), or a
+    /// transport failure. A turn confirmed past the budget reports the
+    /// session's idle state, not its own settle error.
     pub async fn prompt(&self, prompt: HostedPrompt) -> anyhow::Result<()> {
         let images = (!prompt.images.is_empty())
             .then(|| serde_json::to_value(&prompt.images))
             .transpose()?;
-        let message = prompt.message;
+        // TS `DaemonAgentConnection`'s admission id shape.
+        let admission_id = format!("prompt-admission:{}", uuid::Uuid::new_v4());
         let command = DaemonCommand::PromptAndWait {
             id: None,
             active_session_id: self.active_session_id.clone(),
-            message: message.clone(),
+            message: prompt.message,
             input: PromptInput {
                 content: None,
                 images,
@@ -338,35 +343,42 @@ impl HostedHeadlessSession {
                 custom_message: None,
                 queue_key: None,
                 prefix_messages: None,
-                admission_id: None,
+                admission_id: Some(admission_id.clone()),
                 rlm_notice_nonce: None,
             },
             rest: Map::default(),
         };
-        let seen_before = self
-            .user_messages_on_wire
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
         let response = self
             .link
             .request(command, ResponseWait::UntilAnswered)
             .await?;
-        if is_route_timeout(&response) {
-            let started = self
-                .user_messages_on_wire
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)[seen_before..]
-                .contains(&message);
-            if !started {
-                anyhow::bail!(
-                    "{SESSION_WORKER_TIMED_OUT} before the prompt was seen to start; it may not have run"
-                );
-            }
-            self.idle_status().await?;
-            return Ok(());
+        if !is_route_timeout(&response) {
+            return success_data(response).map(|_| ());
         }
-        success_data(response).map(|_| ())
+        let read = DaemonCommand::CancelPromptAdmission {
+            id: None,
+            active_session_id: self.active_session_id.clone(),
+            admission_id,
+            // A running turn must keep running.
+            cancel_owned: None,
+            rest: Map::default(),
+        };
+        let data = success_data(self.link.request(read, REQUEST_BOUND).await?)?;
+        let answer: AdmissionAnswer =
+            serde_json::from_value(data.get("status").cloned().unwrap_or_default())
+                .map_err(|error| anyhow::anyhow!("unreadable prompt admission status: {error}"))?;
+        match answer {
+            AdmissionAnswer::Owned => {
+                self.idle_status().await?;
+                Ok(())
+            }
+            AdmissionAnswer::Cancelled => anyhow::bail!(
+                "{SESSION_WORKER_TIMED_OUT} while the prompt was still queued; it was withdrawn and did not run"
+            ),
+            AdmissionAnswer::Unknown => anyhow::bail!(
+                "{SESSION_WORKER_TIMED_OUT} before the prompt was seen to start; it may not have run"
+            ),
+        }
     }
 
     /// Wait for the run to settle (`wait_for_headless_completion`) and for
@@ -543,18 +555,6 @@ fn stream_frame(
             true
         }
         _ => false,
-    }
-}
-
-/// A user message's text: its string content, or its text blocks joined.
-fn user_message_text(message: &Value) -> String {
-    match message.get("content") {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .collect(),
-        _ => String::new(),
     }
 }
 

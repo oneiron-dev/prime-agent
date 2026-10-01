@@ -1,0 +1,1 @@
+- `--daemon-hosted` runs that outlive the daemon's 10-minute prompt budget now keep waiting only when their own prompt started (including `/skill:` and session commands such as `/compact`); a prompt still queued at that point is withdrawn and the run fails instead of leaving it to run after the client exits.

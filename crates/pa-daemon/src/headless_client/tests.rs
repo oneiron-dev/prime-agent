@@ -1,7 +1,7 @@
 //! The hosted headless client against a scripted supervisor socket: the
 //! wire order the real supervisor can produce (a response overtaking the
-//! events published before it), the route-budget re-wait, the same-file
-//! attach, and the detach-only close.
+//! events published before it), the route budget's admission read, the
+//! same-file attach, and the detach-only close.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,11 +27,11 @@ enum Reply {
 type Script = Box<dyn FnMut(&str, &Value) -> Vec<Reply> + Send>;
 
 /// A scripted supervisor on a temp socket: one connection, the hello, then
-/// the script's lines per command; records every command type it saw.
+/// the script's lines per command; records every command it saw.
 struct FakeSupervisor {
     _dir: tempfile::TempDir,
     socket: std::path::PathBuf,
-    commands: Arc<Mutex<Vec<String>>>,
+    commands: Arc<Mutex<Vec<Value>>>,
 }
 
 impl FakeSupervisor {
@@ -57,7 +57,7 @@ impl FakeSupervisor {
                 let envelope: Value = serde_json::from_str(&line).unwrap();
                 let command = envelope["command"].clone();
                 let kind = command["type"].as_str().unwrap_or_default().to_string();
-                seen.lock().unwrap().push(kind.clone());
+                seen.lock().unwrap().push(command.clone());
                 for reply in script(&kind, &command) {
                     let frame = match reply {
                         Reply::Close => return,
@@ -98,7 +98,23 @@ impl FakeSupervisor {
     }
 
     fn commands(&self) -> Vec<String> {
-        self.commands.lock().unwrap().clone()
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|command| command["type"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The first command of `kind` the fake saw, as the client sent it.
+    fn sent(&self, kind: &str) -> Value {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|command| command["type"] == kind)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {kind} command was sent"))
     }
 }
 
@@ -219,8 +235,7 @@ async fn completion_waits_for_the_events_its_responses_overtook() {
     );
 }
 
-/// A user `message_start` with `text` (the event a prompt's admission
-/// streams).
+/// A user `message_start` with `text` (the row a turn streams).
 fn user_message_start(sequence: u64, text: &str) -> Reply {
     event(
         sequence,
@@ -231,23 +246,24 @@ fn user_message_start(sequence: u64, text: &str) -> Reply {
     )
 }
 
-/// A turn longer than the supervisor's route budget answers the prompt
-/// with the route timeout after the prompt's user message started; the
-/// client waits for the session to go idle (re-issuing the idle wait while
-/// the budget keeps running out) instead of failing the prompt.
-#[tokio::test]
-async fn a_turn_past_the_route_budget_waits_for_idle() {
+/// A supervisor whose route budget answers the prompt (after relaying
+/// `wire`, the frames published meanwhile), whose admission read answers
+/// `status`, and whose idle wait runs out of budget once before the
+/// session goes idle.
+fn timed_out_prompt(wire: Vec<Reply>, status: &'static str) -> FakeSupervisor {
+    let mut wire = Some(wire);
     let mut idle_waits = 0;
-    let fake = FakeSupervisor::start(Box::new(move |kind, _| {
+    FakeSupervisor::start(Box::new(move |kind, _| {
         if let Some(replies) = opening(kind) {
             return replies;
         }
         match kind {
-            "prompt_and_wait" => vec![
-                event(1, &json!({ "type": "agent_start" })),
-                user_message_start(2, "long turn"),
-                Reply::Fail("Session worker timed out"),
-            ],
+            "prompt_and_wait" => {
+                let mut replies = wire.take().expect("one prompt");
+                replies.push(Reply::Fail("Session worker timed out"));
+                replies
+            }
+            "cancel_prompt_admission" => vec![Reply::Ok(json!({ "status": status }))],
             "wait_for_headless_completion" => {
                 idle_waits += 1;
                 if idle_waits == 1 {
@@ -258,37 +274,125 @@ async fn a_turn_past_the_route_budget_waits_for_idle() {
             }
             other => panic!("unexpected command {other}"),
         }
-    }));
+    }))
+}
+
+/// The prompt carried its own admission id (TS's `prompt-admission:`
+/// shape), and the timed-out prompt read exactly that admission back,
+/// never with `cancelOwned` (a running turn keeps running).
+fn assert_own_admission_read(fake: &FakeSupervisor, message: &str) {
+    let sent = fake.sent("prompt_and_wait");
+    let admission_id = sent["admissionId"]
+        .as_str()
+        .expect("the prompt carries an admission id")
+        .to_string();
+    assert!(
+        admission_id.starts_with("prompt-admission:"),
+        "{admission_id}"
+    );
+    assert_eq!(
+        sent,
+        json!({
+            "type": "prompt_and_wait",
+            "activeSessionId": "s1",
+            "message": message,
+            "admissionId": admission_id,
+        })
+    );
+    assert_eq!(
+        fake.sent("cancel_prompt_admission"),
+        json!({
+            "type": "cancel_prompt_admission",
+            "activeSessionId": "s1",
+            "admissionId": admission_id,
+        })
+    );
+}
+
+/// A turn longer than the supervisor's route budget: the route answers
+/// with its timeout, the prompt's own admission reads `owned` (its turn
+/// started), and the client waits for the session to go idle (re-issuing
+/// the idle wait while the budget keeps running out) instead of failing.
+#[tokio::test]
+async fn a_turn_past_the_route_budget_waits_for_idle() {
+    let fake = timed_out_prompt(
+        vec![
+            event(1, &json!({ "type": "agent_start" })),
+            user_message_start(2, "long turn"),
+        ],
+        "owned",
+    );
     let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
         .await
         .unwrap();
     bounded(session.prompt(prompt("long turn"))).await.unwrap();
+    assert_own_admission_read(&fake, "long turn");
     assert_eq!(
         fake.commands(),
         [
             "create",
             "attach",
             "prompt_and_wait",
+            "cancel_prompt_admission",
             "wait_for_headless_completion",
             "wait_for_headless_completion",
         ]
     );
 }
 
+/// Submissions whose admitted row is not the submitted text: a `/skill:`
+/// command (the session expands it before its user row) and a session
+/// command (`/compact` records no user row at all). Their admission
+/// commits when the turn starts all the same, so a run past the route
+/// budget waits for idle instead of reporting a prompt that never ran.
+#[tokio::test]
+async fn rewritten_and_rowless_submissions_past_the_route_budget_wait_for_idle() {
+    for (message, wire) in [
+        (
+            "/skill:review the diff",
+            vec![
+                event(1, &json!({ "type": "agent_start" })),
+                user_message_start(
+                    2,
+                    "<skill name=\"review\" location=\"/skills/review/SKILL.md\">\nReview carefully.\n</skill>\n\nthe diff",
+                ),
+            ],
+        ),
+        (
+            "/compact",
+            vec![event(
+                1,
+                &json!({ "type": "compaction_start", "reason": "manual" }),
+            )],
+        ),
+    ] {
+        let fake = timed_out_prompt(wire, "owned");
+        let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
+            .await
+            .unwrap();
+        bounded(session.prompt(prompt(message))).await.unwrap();
+        assert_own_admission_read(&fake, message);
+        assert_eq!(
+            fake.commands(),
+            [
+                "create",
+                "attach",
+                "prompt_and_wait",
+                "cancel_prompt_admission",
+                "wait_for_headless_completion",
+                "wait_for_headless_completion",
+            ],
+            "{message}"
+        );
+    }
+}
+
 /// The route budget also answers a prompt that never reached the worker:
-/// with no run started after the prompt was sent, the timeout fails the
+/// nothing holds its admission (`unknown`), so the timeout fails the
 /// prompt instead of waiting for an idle session that never ran it.
 #[tokio::test]
 async fn an_unconfirmed_prompt_past_the_route_budget_fails() {
-    let fake = FakeSupervisor::start(Box::new(|kind, _| {
-        if let Some(replies) = opening(kind) {
-            return replies;
-        }
-        match kind {
-            "prompt_and_wait" => vec![Reply::Fail("Session worker timed out")],
-            other => panic!("unexpected command {other}"),
-        }
-    }));
+    let fake = timed_out_prompt(Vec::new(), "unknown");
     let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
         .await
         .unwrap();
@@ -297,35 +401,77 @@ async fn an_unconfirmed_prompt_past_the_route_budget_fails() {
         error.to_string(),
         "Session worker timed out before the prompt was seen to start; it may not have run"
     );
-    assert_eq!(fake.commands(), ["create", "attach", "prompt_and_wait"]);
+    assert_own_admission_read(&fake, "lost");
+    assert_eq!(
+        fake.commands(),
+        [
+            "create",
+            "attach",
+            "prompt_and_wait",
+            "cancel_prompt_admission"
+        ]
+    );
 }
 
-/// Another prompt's run starting meanwhile (another client of the resident
-/// session) does not confirm this prompt: the timeout still fails it.
+/// A run of the SAME text starting meanwhile (another client of the
+/// resident session sending "continue", or an earlier identical prompt's
+/// late row) is no evidence for this prompt: only its own admission is,
+/// and nothing holds it.
 #[tokio::test]
-async fn another_prompts_run_does_not_confirm_a_timed_out_prompt() {
-    let fake = FakeSupervisor::start(Box::new(|kind, _| {
-        if let Some(replies) = opening(kind) {
-            return replies;
-        }
-        match kind {
-            "prompt_and_wait" => vec![
-                event(1, &json!({ "type": "agent_start" })),
-                user_message_start(2, "another client's prompt"),
-                Reply::Fail("Session worker timed out"),
-            ],
-            other => panic!("unexpected command {other}"),
-        }
-    }));
+async fn an_identical_prompt_from_another_client_does_not_confirm_a_timed_out_prompt() {
+    let fake = timed_out_prompt(
+        vec![
+            event(1, &json!({ "type": "agent_start" })),
+            user_message_start(2, "continue"),
+        ],
+        "unknown",
+    );
     let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
         .await
         .unwrap();
-    let error = bounded(session.prompt(prompt("mine"))).await.unwrap_err();
+    let error = bounded(session.prompt(prompt("continue")))
+        .await
+        .unwrap_err();
     assert_eq!(
         error.to_string(),
         "Session worker timed out before the prompt was seen to start; it may not have run"
     );
-    assert_eq!(fake.commands(), ["create", "attach", "prompt_and_wait"]);
+    assert_own_admission_read(&fake, "continue");
+    assert_eq!(
+        fake.commands(),
+        [
+            "create",
+            "attach",
+            "prompt_and_wait",
+            "cancel_prompt_admission"
+        ]
+    );
+}
+
+/// A prompt still queued behind other work when the budget ran out: the
+/// admission read withdraws it, so it never runs after the client left,
+/// and the run fails saying so.
+#[tokio::test]
+async fn a_prompt_still_queued_past_the_route_budget_is_withdrawn() {
+    let fake = timed_out_prompt(Vec::new(), "cancelled");
+    let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
+        .await
+        .unwrap();
+    let error = bounded(session.prompt(prompt("queued"))).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Session worker timed out while the prompt was still queued; it was withdrawn and did not run"
+    );
+    assert_own_admission_read(&fake, "queued");
+    assert_eq!(
+        fake.commands(),
+        [
+            "create",
+            "attach",
+            "prompt_and_wait",
+            "cancel_prompt_admission"
+        ]
+    );
 }
 
 /// A prompt the worker rejects fails with the worker's message.
