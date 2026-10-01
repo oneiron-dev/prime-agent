@@ -1146,43 +1146,50 @@ async fn skill_sync_falls_back_to_per_skill_installs_on_batch_failure() {
 /// The delivered-runtime check (the TS fork's production-bundle verifier,
 /// moved to where the Rust product actually loads the runtime): the
 /// readiness probe executes the file-handle snapshot guard inside whatever
-/// `rlm` the interpreter imports. The shipped sidecar passes; the same tree
-/// with the guard missing (an older install, a stale venv) is refused, so a
-/// kernel never runs on a runtime whose snapshots can reopen and truncate a
-/// durable file.
+/// `rlm` the interpreter imports and checks that the snapshot writer and the
+/// restore call it. The sidecar staged by the release packer itself
+/// (`scripts/package_release.py`'s runtime copy with its shipped-content
+/// filter) passes; the same staged tree whose writer no longer calls the
+/// guard, or without the guard at all (an older install, a stale venv), is
+/// refused, so a kernel never runs on a runtime whose snapshots can reopen
+/// and truncate a durable file.
 #[cfg(unix)]
 #[test]
 fn runtime_probe_requires_the_delivered_snapshot_guard() {
     use std::os::unix::fs::PermissionsExt;
 
-    let shipped = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../prime-agent-runtime/src/rlm")
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
         .canonicalize()
-        .expect("the shipped runtime sidecar sits at the workspace root");
+        .expect("the workspace root");
     let dir = tempfile::tempdir().unwrap();
-    let install = |name: &str, strip_guard: bool| -> String {
-        let rlm = dir.path().join(name).join("rlm");
-        std::fs::create_dir_all(&rlm).unwrap();
-        let mut sources = Vec::new();
-        collect_python_files(&shipped, &mut sources).unwrap();
-        for source in sources {
-            let relative = source.strip_prefix(&shipped).unwrap();
-            let target = rlm.join(relative);
-            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-            let mut text = std::fs::read_to_string(&source).unwrap();
-            if strip_guard && relative == Path::new("repl.py") {
-                assert!(text.contains("def _has_filehandle_reducer("));
-                text = text.replace("def _has_filehandle_reducer(", "def _guard_removed(");
-            }
-            std::fs::write(target, text).unwrap();
-        }
-        // The interpreter a kernel would run: python3 importing this tree.
+    let stage = |name: &str, edit: &dyn Fn(String) -> String| -> String {
+        let staged = dir.path().join(name).join("prime-agent-runtime");
+        let packer = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); \
+                 import package_release as packer; \
+                 packer.copy_tree(Path(sys.argv[2]), Path(sys.argv[3]), \
+                 extra_excluded_names=packer.RUNTIME_EXCLUDED_NAMES, \
+                 extra_excluded_suffixes=packer.RUNTIME_EXCLUDED_SUFFIXES)",
+            )
+            .arg(root.join("scripts"))
+            .arg(root.join("prime-agent-runtime"))
+            .arg(&staged)
+            .status()
+            .expect("run the release packer's runtime copy");
+        assert!(packer.success(), "the release packer staged the runtime");
+        let repl = staged.join("src/rlm/repl.py");
+        let text = std::fs::read_to_string(&repl).unwrap();
+        std::fs::write(&repl, edit(text)).unwrap();
+        // The interpreter a kernel would run: python3 importing the staged tree.
         let python = dir.path().join(format!("{name}-python"));
         std::fs::write(
             &python,
             format!(
                 "#!/bin/sh\nPYTHONPATH='{}' exec python3 \"$@\"\n",
-                dir.path().join(name).display()
+                staged.join("src").display()
             ),
         )
         .unwrap();
@@ -1190,13 +1197,21 @@ fn runtime_probe_requires_the_delivered_snapshot_guard() {
         python.to_string_lossy().to_string()
     };
 
-    let current = install("current", false);
-    let stale = install("stale", true);
+    let current = stage("current", &|text| text);
+    // The writer's own call, not the helper: the restore still calls it.
+    let unwired = stage("unwired", &|text| {
+        assert_eq!(text.matches("if _has_filehandle_reducer(blob):").count(), 2);
+        text.replacen("if _has_filehandle_reducer(blob):", "if False:", 1)
+    });
+    let missing = stage("missing", &|text| {
+        text.replace("_has_filehandle_reducer", "_guard_removed")
+    });
     assert_eq!(
         (
             has_prime_agent_runtime(&current),
-            has_prime_agent_runtime(&stale)
+            has_prime_agent_runtime(&unwired),
+            has_prime_agent_runtime(&missing)
         ),
-        (true, false)
+        (true, false, false)
     );
 }
