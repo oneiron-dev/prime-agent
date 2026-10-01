@@ -40,11 +40,15 @@ run_test() {
   (
     export HOME="$sandbox/home" TMPDIR="$sandbox/tmp" XDG_CONFIG_HOME="$sandbox/home/.config" \
       XDG_DATA_HOME="$sandbox/home/.local/share" XDG_STATE_HOME="$sandbox/home/.local/state"
+    # CI runs with a clean env: ambient product/telemetry switches (a
+    # developer's DO_NOT_TRACK=1, say) would flip the tests that pin env
+    # precedence.
     unset PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV PRIME_AGENT_KERNEL_PYTHON \
-      PRIME_AGENT_CODING_AGENT_DIR PI_PACKAGE_DIR PI_SKIP_VERSION_CHECK PI_OFFLINE
+      PRIME_AGENT_CODING_AGENT_DIR PI_PACKAGE_DIR PI_SKIP_VERSION_CHECK PI_OFFLINE DO_NOT_TRACK \
+      PRIME_AGENT_TELEMETRY PRIME_AGENT_TELEMETRY_API_KEY PRIME_AGENT_TELEMETRY_ENDPOINT PRIME_AGENT_TELEMETRY_ORIGIN
     cargo build --locked --workspace --bins
     "$CARGO_TARGET_DIR/debug/prime-agent" --prime-agent-bootstrap
-    cargo test --locked --workspace "$@"
+    cargo test --locked --workspace --no-fail-fast "$@"
   )
   rm -rf "$sandbox"
 }
