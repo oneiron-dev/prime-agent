@@ -86,6 +86,7 @@ async fn acp_test_bed(
             generic_mcp_servers: Vec::new(),
             allow_recursion: None,
             session_manager: None,
+            provider_session_id: None,
             extra_host_handlers: None,
             conversation_log_path: None,
             additional_skill_paths: Vec::new(),

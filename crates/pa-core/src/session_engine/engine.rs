@@ -42,6 +42,12 @@ pub struct SessionEngineConfig {
     pub allow_recursion: Option<bool>,
     /// Session persistence (in-memory when None).
     pub session_manager: Option<SessionManager>,
+    /// The durable session id provider requests carry (prompt-cache key,
+    /// session-affinity routing; TS `sdk.ts` passes
+    /// `sessionManager.getSessionId()` into the Agent). `None` uses the
+    /// session manager's id; an embedding that owns persistence outside
+    /// the manager (the daemon worker's session file) supplies its own.
+    pub provider_session_id: Option<String>,
     /// Extra kernel host-request handlers (e.g. the daemon's message/observe
     /// bridges), merged over the built-in goal/heartbeat registrations.
     pub extra_host_handlers: Option<crate::kernel::shared::HostRequestHandlers>,
@@ -317,6 +323,12 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // kernel (unless the caller supplied one).
     let python_skills = super::runtime_wiring::kernel_python_skills(&resources.skills);
     let session_id = wiring.session.lock().await.get_session_id().to_string();
+    // The kernel keeps the manager's id; only the loop's provider requests
+    // take the embedding's durable override.
+    let provider_session_id = config
+        .provider_session_id
+        .take()
+        .unwrap_or_else(|| session_id.clone());
     let mut handlers = wiring.handlers.clone();
     if let Some(extra) = config.extra_host_handlers.clone() {
         handlers.merge(extra);
@@ -662,6 +674,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // the session's configured modes (default "one-at-a-time").
         steering_mode: config.steering_mode,
         follow_up_mode: config.follow_up_mode,
+        // TS `sdk.ts`: every loop request carries the session id (the
+        // summarizer side calls stay without one).
+        session_id: Some(provider_session_id),
         ..Default::default()
     });
 

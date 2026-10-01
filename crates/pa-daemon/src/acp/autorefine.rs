@@ -230,6 +230,7 @@ mod tests {
                 generic_mcp_servers: Vec::new(),
                 allow_recursion: None,
                 session_manager: Some(session_manager),
+                provider_session_id: None,
                 extra_host_handlers: None,
                 conversation_log_path: None,
                 additional_skill_paths: Vec::new(),

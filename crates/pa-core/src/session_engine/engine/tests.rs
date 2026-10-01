@@ -1,6 +1,6 @@
 //! The engine unit battery: the scripted tool loop, the child-depth
-//! stamp, the MCP-gating unlock, and the goal/heartbeat handler
-//! registration.
+//! stamp, the MCP-gating unlock, the goal/heartbeat handler
+//! registration, and the loop's provider session id.
 use super::*;
 use crate::session_engine::tool_bridge::{bridge_tool, ToolDefinitionBridge};
 use crate::tools::tool_definition::{ExecutionMode, ToolDefinition, ToolExecutionResult};
@@ -72,6 +72,7 @@ async fn engine_runs_tool_loop_and_persists() {
         generic_mcp_servers: vec![],
         allow_recursion: None,
         session_manager: None,
+        provider_session_id: None,
         extra_host_handlers: None,
         conversation_log_path: None,
         additional_skill_paths: vec![],
@@ -171,6 +172,7 @@ async fn spawned_child_prompt_stamps_its_depth() {
         generic_mcp_servers: vec![],
         allow_recursion: None,
         session_manager: None,
+        provider_session_id: None,
         extra_host_handlers: None,
         conversation_log_path: None,
         additional_skill_paths: vec![],
@@ -237,6 +239,7 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager: None,
+            provider_session_id: None,
             extra_host_handlers: None,
             conversation_log_path: None,
             additional_skill_paths: vec![],
@@ -370,5 +373,78 @@ async fn create_session_registers_goal_and_heartbeat_handlers() {
     assert!(
         names.iter().any(|name| name == "ipython"),
         "tools: {names:?}"
+    );
+}
+
+/// Every loop request carries the provider session id (TS `sdk.ts`
+/// passes `sessionManager.getSessionId()` into the Agent): both requests
+/// of a tool loop name the session manager's id, and an embedding's
+/// durable override wins over it.
+#[tokio::test]
+async fn loop_requests_carry_the_provider_session_id() {
+    async fn tool_loop_session_ids(
+        provider_session_id: Option<String>,
+    ) -> (String, Vec<Option<String>>) {
+        let model = pa_agent::types::Model {
+            id: "m".into(),
+            name: "m".into(),
+            api: "test".into(),
+            provider: "test".into(),
+            base_url: "http://localhost".into(),
+            reasoning: false,
+            cost: pa_agent::types::UsageCost::default(),
+            context_window: 1_000,
+            max_tokens: 100,
+        };
+        let provider = Arc::new(ScriptedProvider::new(model.clone()));
+        provider.push_tool_call_turn(
+            None,
+            vec![("call-1", "echo", serde_json::json!({ "text": "hi" }))],
+        );
+        provider.push_text_turn("done");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stream_fn: pa_agent::stream::StreamFn = {
+            let seen = Arc::clone(&seen);
+            let inner = provider.stream_fn();
+            Arc::new(move |model, context, options| {
+                seen.lock().unwrap().push(options.session_id.clone());
+                inner(model, context, options)
+            })
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let engine = create_session(SessionEngineConfig {
+            cwd,
+            agent_dir: tmp.path().join("agent"),
+            model: Some(model),
+            stream_fn: Some(stream_fn),
+            tools: vec![bridge_tool(echo_definition())],
+            provider_session_id,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        engine
+            .prompt("run the echo tool", PromptOptions::default())
+            .await
+            .unwrap();
+        engine.session.agent().wait_for_idle().await;
+        let manager_id = engine.session.session_id().await;
+        let seen = seen.lock().unwrap().clone();
+        (manager_id, seen)
+    }
+
+    let (manager_id, seen) = tool_loop_session_ids(None).await;
+    assert_eq!(seen, vec![Some(manager_id.clone()), Some(manager_id)]);
+
+    let (manager_id, seen) = tool_loop_session_ids(Some("durable-session".to_string())).await;
+    assert_ne!(manager_id, "durable-session");
+    assert_eq!(
+        seen,
+        vec![
+            Some("durable-session".to_string()),
+            Some("durable-session".to_string()),
+        ]
     );
 }

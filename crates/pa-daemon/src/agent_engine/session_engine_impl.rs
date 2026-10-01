@@ -309,6 +309,13 @@ impl SessionEngine for AgentSessionEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
     }
 
+    fn set_session_id(&self, session_id: String) {
+        *self
+            .session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_id);
+    }
+
     /// TS `createAgentSession`'s restored-from-session step (sdk.ts): a
     /// session that already ran on a model restores it before the startup
     /// chain — the saved model context from the session file, through the

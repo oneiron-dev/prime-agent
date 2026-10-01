@@ -463,6 +463,7 @@ impl TreeNavigation {
     pub(crate) async fn replace_with_fork(&self, forked: SessionFile) -> Result<(), String> {
         let branch_entries = forked.branch_file_entries();
         let new_path = forked.path.clone();
+        let new_session_id = forked.session_id().to_string();
         // Prime the fork store's usage fold before it enters the core: the
         // summaries the swap's roster pushes read resume from this cache
         // and fold only the appended tail (off the runtime, like the
@@ -480,6 +481,7 @@ impl TreeNavigation {
         // and the runtime.
         let _ = tokio::task::spawn_blocking(move || drop(previous)).await;
         self.engine.set_session_file(new_path.clone());
+        self.engine.set_session_id(new_session_id);
         // TS re-restores the forked session's saved model at its runtime
         // recreation (`createRuntime` -> `createAgentSession`): the fork
         // resolves to the model its own file pins, not the previous

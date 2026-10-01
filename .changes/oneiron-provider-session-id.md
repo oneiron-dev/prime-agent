@@ -1,0 +1,1 @@
+- Model requests now carry the session's durable id (the session file's id, also across fork, switch, new and import), so provider prompt caching and session-affinity routing work as in the TS build.
