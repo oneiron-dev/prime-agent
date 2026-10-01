@@ -4,16 +4,51 @@
 //! Unix: socket files under `<tmpdir>/prime-agent-<uid>/`. Windows: named
 //! pipes in the `\\.\pipe\` namespace (fixed daemon pipe name, hashed worker
 //! pipe names) - the TS product's exact split.
+//!
+//! Oneiron fork: `PRIME_AGENT_SOCKET_DIR` (an absolute path) relocates the
+//! whole Unix endpoint namespace for a side-by-side install. Worker sockets
+//! always live in the socket dir, not next to a custom
+//! `PRIME_AGENT_DAEMON_SOCKET`, so without this a second install's workers
+//! would listen inside the TS product's `prime-agent-<uid>/` dir and each
+//! side's discovery would see the other's endpoints.
 
 use std::path::{Path, PathBuf};
 
 use crate::paths::hash_key;
 
-/// Default directory holding daemon socket files (Unix).
+/// Fork-only override for the Unix socket dir; unset keeps TS parity.
 #[cfg(unix)]
+const SOCKET_DIR_ENV: &str = "PRIME_AGENT_SOCKET_DIR";
+
+/// Directory holding daemon socket files (Unix): the supervisor default,
+/// every worker endpoint, and the discovery state root's socket dir.
+#[cfg(unix)]
+#[must_use]
 pub fn socket_dir() -> PathBuf {
-    let uid = current_uid().unwrap_or_else(|| "user".to_string());
-    let tmp = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    resolve_socket_dir(
+        std::env::var_os(SOCKET_DIR_ENV),
+        std::env::var_os("TMPDIR"),
+        current_uid(),
+    )
+}
+
+/// An absolute override wins; a relative or empty one is ignored (a
+/// cwd-relative endpoint namespace would differ per process), leaving the
+/// TS default `<tmpdir>/prime-agent-<uid>`.
+#[cfg(unix)]
+fn resolve_socket_dir(
+    override_dir: Option<std::ffi::OsString>,
+    tmpdir: Option<std::ffi::OsString>,
+    uid: Option<String>,
+) -> PathBuf {
+    if let Some(dir) = override_dir
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+    {
+        return dir;
+    }
+    let uid = uid.unwrap_or_else(|| "user".to_string());
+    let tmp = tmpdir.map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     tmp.join(format!("prime-agent-{uid}"))
 }
 
@@ -99,6 +134,38 @@ mod tests {
         assert_eq!(a, worker_socket_path(supervisor, "0123456789abffff"));
         #[cfg(unix)]
         assert!(a.starts_with(socket_dir()));
+    }
+
+    /// The side-by-side override relocates the endpoint namespace only when
+    /// it is an absolute path; anything else keeps the TS default.
+    #[cfg(unix)]
+    #[test]
+    fn socket_dir_override_needs_an_absolute_path() {
+        let resolve = |override_dir: Option<&str>| {
+            resolve_socket_dir(
+                override_dir.map(std::ffi::OsString::from),
+                Some("/var/tmp".into()),
+                Some("501".to_string()),
+            )
+        };
+        assert_eq!(
+            [
+                resolve(Some("/tmp/pa-rs-501")),
+                resolve(Some("pa-rs-501")),
+                resolve(Some("")),
+                resolve(None),
+            ],
+            [
+                PathBuf::from("/tmp/pa-rs-501"),
+                PathBuf::from("/var/tmp/prime-agent-501"),
+                PathBuf::from("/var/tmp/prime-agent-501"),
+                PathBuf::from("/var/tmp/prime-agent-501"),
+            ]
+        );
+        assert_eq!(
+            resolve_socket_dir(None, None, None),
+            PathBuf::from("/tmp/prime-agent-user")
+        );
     }
 
     /// The Windows endpoint names (TS `daemon-socket.ts` /
