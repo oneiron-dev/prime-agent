@@ -43,6 +43,7 @@ when the diff is identical, otherwise drop it by hand.
 | Effective `--no-skills`/`--no-prompt-templates`/`--no-context-files` | `crates/pa-core/src/resources/mod.rs` (`ResourceLoadingPolicy`) | Upstream parses the flags but always discovered every resource; the `sol` wrapper and factory rely on `--no-skills` for prompt size. |
 | Side-by-side install + probe | `scripts/oneiron/side_by_side.py` | Installs a staged release beside the TS build and writes receipts. |
 | Test-policy gate | `scripts/check-test-policy.mjs` (from the TS fork), `scripts/oneiron/test_policy_gate.py` | Runs the fork's test policy with `TEST_POLICY_BASE=oneiron/main` and fails only on violations beyond the 4 upstream ones present at the pin (`scripts/oneiron/test-policy-baseline.txt`). |
+| Factory package | `packages/factory` (Node, not in the Cargo workspace) | The TS fork's work factory as its own package, `prime-agent-factory`; its seats run the `prime-agent` binary as a subprocess. Gate: `npm ci && npm run check` in that directory. |
 
 ## Side-by-side contract (until cutover)
 

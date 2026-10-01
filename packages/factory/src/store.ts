@@ -1,0 +1,988 @@
+import { createHash, randomUUID } from "node:crypto";
+import { isAbsolute, resolve } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import { isDeepStrictEqual } from "node:util";
+import type { AgentPin } from "./agent-command.js";
+import type { FactoryFilePin } from "./runtime.js";
+import type {
+	ActionRecord,
+	ActionSpec,
+	AttemptContext,
+	AttemptRecord,
+	CompletionReceipt,
+	DecisionEvidence,
+	FactoryEvent,
+	FactoryPlan,
+	FactoryStatus,
+	PlanMutationReceipt,
+	SlotSpec,
+	TicketRecord,
+	WakeRecord,
+} from "./types.js";
+
+type Row = Record<string, unknown>;
+const SCHEMA_VERSION = 3;
+/** Private authority of the one selected-admission transaction; never exported, so no other caller holds it. */
+const SELECTED_PAUSED_ADMISSION = Symbol("selected-paused-admission");
+const now = (): string => new Date().toISOString();
+function decode<T>(value: unknown): T {
+	return JSON.parse(String(value)) as T;
+}
+function required(value: unknown, name: string): asserts value is string {
+	if (typeof value !== "string" || !value.trim()) throw new Error(`${name} must be a nonempty string`);
+}
+function evidenceValid(evidence: DecisionEvidence): void {
+	required(evidence.actor, "evidence.actor");
+	required(evidence.reason, "evidence.reason");
+	required(evidence.ref, "evidence.ref");
+}
+function actionSpec(action: ActionSpec): ActionSpec {
+	return {
+		id: action.id,
+		description: action.description,
+		ticketId: action.ticketId,
+		dependencies: [...action.dependencies],
+		sourceFingerprint: action.sourceFingerprint,
+		command: {
+			...action.command,
+			argv: [...action.command.argv],
+			cwd: resolve(action.command.cwd),
+			env: action.command.env ? { ...action.command.env } : undefined,
+		},
+		requirements: { ...action.requirements },
+	};
+}
+function validatePlan(plan: FactoryPlan): void {
+	if (plan.version !== 1 || !Array.isArray(plan.tickets) || !Array.isArray(plan.actions) || !Array.isArray(plan.slots))
+		throw new Error("Invalid factory plan version or collections");
+	for (const [name, entries] of [
+		["ticket", plan.tickets],
+		["action", plan.actions],
+		["slot", plan.slots],
+	] as const) {
+		const ids = new Set<string>();
+		for (const entry of entries) {
+			required(entry.id, `${name}.id`);
+			if (ids.has(entry.id)) throw new Error(`Duplicate ${name}: ${entry.id}`);
+			ids.add(entry.id);
+		}
+	}
+	for (const ticket of plan.tickets) required(ticket.owner, "ticket.owner");
+	for (const slot of plan.slots) {
+		required(slot.host, "slot.host");
+		if (
+			slot.capabilities !== undefined &&
+			(!Array.isArray(slot.capabilities) || slot.capabilities.some((c) => typeof c !== "string"))
+		)
+			throw new Error("Invalid slot capabilities");
+	}
+	for (const action of plan.actions) {
+		if (
+			action.description !== undefined &&
+			(typeof action.description !== "string" || !action.description.trim() || action.description.length > 16000)
+		)
+			throw new Error("Invalid action description");
+		required(action.ticketId, "action.ticketId");
+		required(action.sourceFingerprint, "action.sourceFingerprint");
+		if (!Array.isArray(action.dependencies) || action.dependencies.some((d) => typeof d !== "string"))
+			throw new Error("Invalid action dependencies");
+		if (new Set(action.dependencies).size !== action.dependencies.length)
+			throw new Error("Duplicate action dependency");
+		if (!action.command || !Array.isArray(action.command.argv) || !action.command.argv.length)
+			throw new Error("Command argv is required");
+		for (const arg of action.command.argv)
+			if (typeof arg !== "string") throw new Error("Command argv must contain strings");
+		required(action.command.argv[0], "command executable");
+		required(action.command.cwd, "command.cwd");
+		if (!isAbsolute(action.command.cwd)) throw new Error("command.cwd must be absolute");
+		if (
+			action.command.timeoutMs !== undefined &&
+			(!Number.isSafeInteger(action.command.timeoutMs) || action.command.timeoutMs <= 0)
+		)
+			throw new Error("Invalid command timeoutMs");
+		if (
+			action.command.env !== undefined &&
+			(!action.command.env ||
+				typeof action.command.env !== "object" ||
+				Array.isArray(action.command.env) ||
+				Object.entries(action.command.env).some(
+					([name, value]) =>
+						!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || typeof value !== "string" || value.includes("\0"),
+				))
+		)
+			throw new Error("Invalid command env: expected variable names and string values without NUL");
+		if (!action.requirements || typeof action.requirements !== "object")
+			throw new Error("Action requirements are required");
+		if (action.requirements.host !== undefined) required(action.requirements.host, "requirements.host");
+		if (action.requirements.slotId !== undefined) required(action.requirements.slotId, "requirements.slotId");
+		if (
+			action.requirements.capabilities !== undefined &&
+			(!Array.isArray(action.requirements.capabilities) ||
+				action.requirements.capabilities.some((c) => typeof c !== "string"))
+		)
+			throw new Error("Invalid action capabilities");
+	}
+}
+
+/** A short-transaction journal. No process, session, model or transport is owned here. */
+export class FactoryStore {
+	private readonly db: DatabaseSync;
+	private inTransaction = false;
+	constructor(path: string) {
+		// Loaded here, not at import, so the CLI's runtime check can name a Node without node:sqlite first.
+		const { DatabaseSync: Database } = process.getBuiltinModule("node:sqlite");
+		this.db = new Database(path);
+		this.db.exec(
+			"PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+		);
+		try {
+			this.transaction(() => {
+				this.db.exec("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+				const version = this.meta("schema_version");
+				if (version !== undefined && ![1, 2, SCHEMA_VERSION].includes(Number(version)))
+					throw new Error(`Unsupported factory schema version ${version}`);
+				this.db.exec(`
+					CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, owner TEXT NOT NULL, state TEXT NOT NULL);
+					CREATE TABLE IF NOT EXISTS slots (id TEXT PRIMARY KEY, spec TEXT NOT NULL);
+					CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), spec TEXT NOT NULL, state TEXT NOT NULL);
+					CREATE TABLE IF NOT EXISTS dependencies (action_id TEXT NOT NULL REFERENCES actions(id), dependency_id TEXT NOT NULL REFERENCES actions(id), PRIMARY KEY(action_id,dependency_id));
+					CREATE INDEX IF NOT EXISTS dependencies_reverse ON dependencies(dependency_id);
+					CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, action_id TEXT NOT NULL REFERENCES actions(id), slot_id TEXT NOT NULL REFERENCES slots(id), state TEXT NOT NULL, created_at TEXT NOT NULL, submitted_at TEXT, process_identity TEXT, receipt TEXT, uncertainty TEXT, claim_released INTEGER NOT NULL DEFAULT 0);
+					CREATE UNIQUE INDEX IF NOT EXISTS attempts_action_claim ON attempts(action_id) WHERE claim_released=0;
+					CREATE UNIQUE INDEX IF NOT EXISTS attempts_slot_claim ON attempts(slot_id) WHERE claim_released=0;
+					CREATE TABLE IF NOT EXISTS events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, action_id TEXT, attempt_id TEXT, detail TEXT NOT NULL);
+					CREATE TABLE IF NOT EXISTS wakes (id INTEGER PRIMARY KEY AUTOINCREMENT, action_id TEXT NOT NULL, attempt_id TEXT, reason TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT);
+					CREATE UNIQUE INDEX IF NOT EXISTS wakes_attempt_open ON wakes(attempt_id) WHERE resolved_at IS NULL;
+					CREATE INDEX IF NOT EXISTS wakes_open_reason ON wakes(reason) WHERE resolved_at IS NULL;
+					CREATE TABLE IF NOT EXISTS plan_mutations (id TEXT PRIMARY KEY, payload_sha256 TEXT NOT NULL, previous_revision INTEGER NOT NULL, revision INTEGER NOT NULL);
+				`);
+				this.setMeta("schema_version", String(SCHEMA_VERSION));
+				if (this.meta("plan_revision") === undefined) this.setMeta("plan_revision", "0");
+				if (this.meta("paused") === undefined) this.setMeta("paused", "false");
+			});
+		} catch (error) {
+			this.db.close();
+			throw error;
+		}
+	}
+	close(): void {
+		this.db.close();
+	}
+	private transaction<T>(fn: () => T): T {
+		if (this.inTransaction) return fn();
+		this.db.exec("BEGIN IMMEDIATE");
+		this.inTransaction = true;
+		try {
+			const value = fn();
+			this.db.exec("COMMIT");
+			return value;
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		} finally {
+			this.inTransaction = false;
+		}
+	}
+	private meta(key: string): string | undefined {
+		const row = this.db.prepare("SELECT value FROM metadata WHERE key=?").get(key);
+		return row ? String(row.value) : undefined;
+	}
+	private setMeta(key: string, value: string): void {
+		this.db
+			.prepare("INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+			.run(key, value);
+	}
+	private event(
+		kind: string,
+		actionId: string | null,
+		attemptId: string | null,
+		detail: Record<string, unknown> = {},
+	): void {
+		this.db
+			.prepare("INSERT INTO events(at,kind,action_id,attempt_id,detail) VALUES(?,?,?,?,?)")
+			.run(now(), kind, actionId, attemptId, JSON.stringify(detail));
+	}
+	/** Journal a launcher observation outside the scheduling transitions, e.g. a split follow-up import. */
+	note(kind: string, actionId: string | null, detail: Record<string, unknown> = {}): void {
+		this.transaction(() => this.event(kind, actionId, null, detail));
+	}
+	ledgerSequence(): number {
+		const row = this.db.prepare("SELECT MAX(sequence) AS sequence FROM events").get();
+		return Number(row?.sequence ?? 0);
+	}
+	planRevision(): number {
+		return Number(this.meta("plan_revision"));
+	}
+	/**
+	 * Whether `applyPlan` would refuse a changed spec for this action. The same two conditions it enforces: the
+	 * action left the queue, or an attempt for it was ever submitted. A relaunch asks this before rewriting.
+	 */
+	actionStarted(actionId: string): boolean {
+		const action = this.db.prepare("SELECT state FROM actions WHERE id=?").get(actionId);
+		if (!action) return false;
+		if (action.state !== "QUEUED" && action.state !== "READY") return true;
+		return (
+			this.db
+				.prepare("SELECT id FROM attempts WHERE action_id=? AND submitted_at IS NOT NULL LIMIT 1")
+				.get(actionId) !== undefined
+		);
+	}
+	isPaused(): boolean {
+		return this.meta("paused") === "true";
+	}
+	runtimePin(): FactoryFilePin | undefined {
+		const value = this.meta("runtime_pin");
+		return value === undefined ? undefined : decode<FactoryFilePin>(value);
+	}
+	pause(reason: string): void {
+		required(reason, "pause reason");
+		this.transaction(() => {
+			this.setMeta("paused", "true");
+			this.setMeta("pause_reason", reason);
+			this.event("paused", null, null, { reason });
+		});
+	}
+	resume(): void {
+		this.transaction(() => {
+			this.setMeta("paused", "false");
+			this.setMeta("pause_reason", "");
+			this.event("scheduling_unpaused", null, null);
+		});
+	}
+	lastResumeSequence(): number {
+		const row = this.db
+			.prepare("SELECT sequence,detail FROM events WHERE kind='resumed' ORDER BY sequence DESC LIMIT 1")
+			.get();
+		return row ? Number(decode<Record<string, unknown>>(row.detail).catch_up_through ?? row.sequence) : 0;
+	}
+	/** The installed runtime changed since init. Recorded, never refused. */
+	repinRuntime(runtime: FactoryFilePin, reason: string): void {
+		required(reason, "runtime change reason");
+		this.transaction(() => {
+			const previous = this.runtimePin();
+			this.setMeta("runtime_pin", JSON.stringify(runtime));
+			this.event("runtime_changed", null, null, { previous, runtime, reason });
+		});
+	}
+	/** The agent binary the native seats run, separate from the factory's own runtime pin. */
+	agentPin(): AgentPin | undefined {
+		const value = this.meta("agent_pin");
+		return value === undefined ? undefined : decode<AgentPin>(value);
+	}
+	/** Pin the agent binary `launch` resolved. A different binary or changed bytes are journaled, never refused. */
+	pinAgent(agent: AgentPin, reason: string): void {
+		required(reason, "agent pin reason");
+		this.transaction(() => {
+			const previous = this.agentPin();
+			if (previous && isDeepStrictEqual(previous, agent)) return;
+			this.setMeta("agent_pin", JSON.stringify(agent));
+			this.event(previous ? "agent_changed" : "agent_pinned", null, null, {
+				previous: previous ?? null,
+				agent,
+				reason,
+			});
+		});
+	}
+	recordResumed(detail: Record<string, unknown>, idleActionId?: string): void {
+		this.transaction(() => {
+			if (idleActionId) {
+				this.event("idle_with_backlog", idleActionId, null, { counts: detail.counts });
+				const reason = `idle_with_backlog: ${JSON.stringify(detail.counts)}`;
+				if (this.openWakeIdForReason(reason) === undefined)
+					this.db
+						.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,NULL,?,?)")
+						.run(idleActionId, reason, now());
+			}
+			this.event("resumed", null, null, detail);
+		});
+	}
+	/** Add/upsert a plan; omitted records remain. Started actions and all source fingerprints are immutable. */
+	applyPlan(
+		plan: FactoryPlan,
+		expectedRevision?: number,
+		mutationId?: string,
+		initialRuntime?: FactoryFilePin,
+	): number {
+		validatePlan(plan);
+		if (mutationId !== undefined) {
+			required(mutationId, "mutationId");
+			if (!Number.isSafeInteger(expectedRevision) || expectedRevision! < 0)
+				throw new Error("A mutationId requires an explicit expected plan revision");
+		}
+		const payloadSha256 = createHash("sha256").update(JSON.stringify({ plan, expectedRevision })).digest("hex");
+		return this.transaction(() => {
+			if (mutationId !== undefined) {
+				const prior = this.planMutation(mutationId);
+				if (prior) {
+					if (prior.payloadSha256 !== payloadSha256)
+						throw new Error("Plan mutation identity reused for a different payload");
+					return prior.revision;
+				}
+			}
+			const revision = Number(this.meta("plan_revision"));
+			if (expectedRevision !== undefined && revision !== expectedRevision)
+				throw new Error("Factory plan revision changed");
+			if (revision === 0 && initialRuntime) {
+				this.setMeta("runtime_pin", JSON.stringify(initialRuntime));
+				this.event("runtime_pinned", null, null, { runtime: initialRuntime });
+			}
+			const existing = this.actions();
+			const unchanged =
+				revision > 0 &&
+				plan.actions.every((action) =>
+					existing.some((old) => isDeepStrictEqual(actionSpec(old), actionSpec(action))),
+				) &&
+				plan.tickets.every((ticket) =>
+					this.tickets().some((old) => old.id === ticket.id && old.owner === ticket.owner),
+				) &&
+				plan.slots.every((slot) => this.slots().some((old) => isDeepStrictEqual(old, slot))) &&
+				(plan.roles === undefined ||
+					isDeepStrictEqual(plan.roles, decode<FactoryPlan["roles"]>(this.meta("roles") ?? "{}")));
+			const recordMutation = (nextRevision: number): void => {
+				if (mutationId !== undefined)
+					this.db
+						.prepare("INSERT INTO plan_mutations(id,payload_sha256,previous_revision,revision) VALUES(?,?,?,?)")
+						.run(mutationId, payloadSha256, revision, nextRevision);
+			};
+			if (unchanged) {
+				recordMutation(revision);
+				return revision;
+			}
+			const invalidatedWakeIds = this.wakes()
+				.filter((wake) => wake.resolvedAt === null)
+				.map((wake) => wake.id);
+			const superseded = new Set(
+				existing.filter((action) => action.state === "SUPERSEDED").map((action) => action.id),
+			);
+			const combined = new Map(existing.map((a) => [a.id, actionSpec(a)]));
+			for (const action of plan.actions) combined.set(action.id, actionSpec(action));
+			const tickets = new Set([...this.tickets().map((t) => t.id), ...plan.tickets.map((t) => t.id)]);
+			const visiting = new Set<string>();
+			const visited = new Set<string>();
+			const visit = (id: string): void => {
+				if (visiting.has(id)) throw new Error("Factory dependencies contain a cycle");
+				if (visited.has(id)) return;
+				const action = combined.get(id);
+				if (!action) throw new Error(`Unknown dependency ${id}`);
+				if (!tickets.has(action.ticketId)) throw new Error(`Unknown ticket ${action.ticketId}`);
+				visiting.add(id);
+				for (const dependency of action.dependencies) {
+					if (superseded.has(dependency))
+						throw new Error(`Dependency ${dependency} is superseded; reference its replacement`);
+					visit(dependency);
+				}
+				visiting.delete(id);
+				visited.add(id);
+			};
+			for (const id of combined.keys()) visit(id);
+			for (const action of plan.actions) {
+				const old = existing.find((a) => a.id === action.id);
+				if (!old) continue;
+				if (old.sourceFingerprint !== action.sourceFingerprint)
+					throw new Error(`Source fingerprint is immutable: ${action.id}`);
+				if (!isDeepStrictEqual(actionSpec(old), actionSpec(action))) {
+					const submitted = this.db
+						.prepare("SELECT id FROM attempts WHERE action_id=? AND submitted_at IS NOT NULL LIMIT 1")
+						.get(action.id);
+					if ((old.state !== "QUEUED" && old.state !== "READY") || submitted)
+						throw new Error(`Started action is immutable: ${action.id}`);
+				}
+			}
+			for (const ticket of plan.tickets)
+				this.db
+					.prepare(
+						"INSERT INTO tickets(id,owner,state) VALUES(?,?,'ACTIVE') ON CONFLICT(id) DO UPDATE SET owner=excluded.owner",
+					)
+					.run(ticket.id, ticket.owner);
+			for (const slot of plan.slots) {
+				const old = this.db.prepare("SELECT spec FROM slots WHERE id=?").get(slot.id);
+				if (
+					old &&
+					!isDeepStrictEqual(decode<SlotSpec>(old.spec), slot) &&
+					this.db.prepare("SELECT id FROM attempts WHERE slot_id=? AND claim_released=0").get(slot.id)
+				)
+					throw new Error(`Claimed slot is immutable: ${slot.id}`);
+				this.db
+					.prepare("INSERT INTO slots(id,spec) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET spec=excluded.spec")
+					.run(slot.id, JSON.stringify(slot));
+			}
+			for (const action of plan.actions)
+				this.db
+					.prepare(
+						"INSERT INTO actions(id,ticket_id,spec,state) VALUES(?,?,?,'QUEUED') ON CONFLICT(id) DO UPDATE SET ticket_id=excluded.ticket_id,spec=excluded.spec",
+					)
+					.run(action.id, action.ticketId, JSON.stringify(actionSpec(action)));
+			for (const action of plan.actions) {
+				this.db.prepare("DELETE FROM dependencies WHERE action_id=?").run(action.id);
+				for (const dependency of action.dependencies)
+					this.db
+						.prepare("INSERT INTO dependencies(action_id,dependency_id) VALUES(?,?)")
+						.run(action.id, dependency);
+			}
+			if (plan.roles !== undefined) this.setMeta("roles", JSON.stringify(plan.roles));
+			this.setMeta("plan_revision", String(revision + 1));
+			this.refreshReadiness();
+			recordMutation(revision + 1);
+			this.event("plan_applied", null, null, {
+				previousRevision: revision,
+				revision: revision + 1,
+				actions: plan.actions.length,
+				invalidatedWakeIds,
+				mutationId: mutationId ?? null,
+			});
+			return revision + 1;
+		});
+	}
+	private refreshReadiness(): void {
+		const pending = this.db.prepare("SELECT id,state FROM actions WHERE state IN ('QUEUED','READY')").all();
+		for (const action of pending) {
+			const blocked = this.db
+				.prepare(
+					"SELECT 1 FROM dependencies d JOIN actions a ON a.id=d.dependency_id WHERE d.action_id=? AND a.state!='ACCEPTED' LIMIT 1",
+				)
+				.get(String(action.id));
+			const state = blocked ? "QUEUED" : "READY";
+			if (action.state !== state) {
+				this.db.prepare("UPDATE actions SET state=? WHERE id=?").run(state, String(action.id));
+				this.event("action_ready_changed", String(action.id), null, { state });
+			}
+		}
+		// Recompute downstream readiness first. Retiring an owner never removes dependency records.
+		for (const ticket of this.tickets()) {
+			const hasWork = this.db.prepare("SELECT 1 FROM actions WHERE ticket_id=? LIMIT 1").get(ticket.id);
+			const pendingWork = this.db
+				.prepare("SELECT 1 FROM actions WHERE ticket_id=? AND state NOT IN ('ACCEPTED','SUPERSEDED') LIMIT 1")
+				.get(ticket.id);
+			const state = hasWork && !pendingWork ? "RETIRED" : "ACTIVE";
+			if (ticket.state !== state) {
+				this.db.prepare("UPDATE tickets SET state=? WHERE id=?").run(state, ticket.id);
+				this.event("ticket_state_changed", null, null, { ticketId: ticket.id, state });
+			}
+		}
+	}
+	actions(): ActionRecord[] {
+		return this.db
+			.prepare("SELECT spec,state FROM actions ORDER BY rowid")
+			.all()
+			.map((r) => ({ ...decode<ActionSpec>(r.spec), state: String(r.state) as ActionRecord["state"] }));
+	}
+	tickets(): TicketRecord[] {
+		return this.db
+			.prepare("SELECT id,owner,state FROM tickets ORDER BY rowid")
+			.all()
+			.map((r) => ({ id: String(r.id), owner: String(r.owner), state: String(r.state) as TicketRecord["state"] }));
+	}
+	slots(): SlotSpec[] {
+		return this.db
+			.prepare("SELECT spec FROM slots ORDER BY rowid")
+			.all()
+			.map((r) => decode<SlotSpec>(r.spec));
+	}
+	private attemptRecord(r: Row): AttemptRecord {
+		return {
+			id: String(r.id),
+			actionId: String(r.action_id),
+			slotId: String(r.slot_id),
+			state: String(r.state) as AttemptRecord["state"],
+			createdAt: String(r.created_at),
+			submittedAt: r.submitted_at === null ? null : String(r.submitted_at),
+			processIdentity: r.process_identity === null ? null : String(r.process_identity),
+			receipt: r.receipt === null ? null : decode<CompletionReceipt>(r.receipt),
+			uncertainty: r.uncertainty === null ? null : String(r.uncertainty),
+			claimReleased: Number(r.claim_released) === 1,
+		};
+	}
+	attempts(activeOnly = false): AttemptRecord[] {
+		return this.db
+			.prepare(`SELECT * FROM attempts ${activeOnly ? "WHERE claim_released=0" : ""} ORDER BY rowid`)
+			.all()
+			.map((r) => this.attemptRecord(r));
+	}
+	private action(id: string): ActionRecord | undefined {
+		const row = this.db.prepare("SELECT spec,state FROM actions WHERE id=?").get(id);
+		return row ? { ...decode<ActionSpec>(row.spec), state: String(row.state) as ActionRecord["state"] } : undefined;
+	}
+	private slot(id: string): SlotSpec | undefined {
+		const row = this.db.prepare("SELECT spec FROM slots WHERE id=?").get(id);
+		return row ? decode<SlotSpec>(row.spec) : undefined;
+	}
+	context(attemptId: string): AttemptContext {
+		const row = this.db.prepare("SELECT * FROM attempts WHERE id=?").get(attemptId);
+		if (!row) throw new Error(`Unknown attempt ${attemptId}`);
+		const attempt = this.attemptRecord(row);
+		const action = this.action(attempt.actionId);
+		const slot = this.slot(attempt.slotId);
+		if (!action || !slot) throw new Error("Corrupt factory attempt references");
+		return { attempt, action, slot };
+	}
+	/**
+	 * Admit ONE owner-selected action while the factory stays paused: validate, apply the selected plan, optionally
+	 * supersede a REJECTED action, claim a slot and mark the attempt SUBMITTED, all in one transaction and before
+	 * any launch. A replayed mutation id returns its first receipt and never launches again. Nothing asynchronous
+	 * happens here, and the pause is never cleared.
+	 */
+	recoverAndClaim(
+		plan: FactoryPlan,
+		options: {
+			select: string;
+			supersede?: string;
+			expectedRevision: number;
+			mutationId: string;
+			evidence: DecisionEvidence;
+		},
+	): { revision: number; replayed: boolean; context: AttemptContext } {
+		const { select, supersede, expectedRevision, mutationId, evidence } = options;
+		validatePlan(plan);
+		required(select, "select");
+		required(mutationId, "mutationId");
+		evidenceValid(evidence);
+		if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
+			throw new Error("recover-admit requires an explicit expected revision");
+		if (supersede !== undefined) required(supersede, "supersede");
+		const payloadSha256 = createHash("sha256")
+			.update(
+				JSON.stringify({
+					operation: "recover-admit",
+					plan,
+					select,
+					supersede: supersede ?? null,
+					expectedRevision,
+					evidence,
+				}),
+			)
+			.digest("hex");
+		return this.transaction(() => {
+			// A replay answers with its first receipt even after a resume; only a new admission needs the pause.
+			const receiptKey = `recover_admit:${mutationId}`;
+			const priorMutation = this.planMutation(mutationId);
+			const priorText = this.meta(receiptKey);
+			if (priorMutation || priorText) {
+				if (!priorMutation || !priorText || priorMutation.payloadSha256 !== payloadSha256)
+					throw new Error("Mutation identity reused for a different operation or payload");
+				const prior = decode<{ payloadSha256: string; revision: number; attemptId: string }>(priorText);
+				if (prior.payloadSha256 !== payloadSha256 || prior.revision !== priorMutation.revision)
+					throw new Error("Corrupt selected-admission receipt");
+				return { revision: prior.revision, replayed: true, context: this.context(prior.attemptId) };
+			}
+			if (!this.isPaused()) throw new Error("recover-admit requires the durable factory pause to remain set");
+			if (Number(this.meta("plan_revision")) !== expectedRevision) throw new Error("Factory plan revision changed");
+			if (
+				this.db
+					.prepare(
+						"SELECT id FROM attempts WHERE claim_released=0 OR state IN ('PREPARED','SUBMITTED','RUNNING','UNCERTAIN') LIMIT 1",
+					)
+					.get() ||
+				this.actions().some((action) => action.state === "RUNNING" || action.state === "UNCERTAIN")
+			)
+				throw new Error("Strict sequential admission refused: a live, uncertain, or unreleased claim remains");
+			const old = supersede === undefined ? undefined : this.action(supersede);
+			const existing = this.action(select);
+			if (supersede !== undefined && (!old || old.state !== "REJECTED" || old.id === select))
+				throw new Error("recover-admit supersede must name a distinct REJECTED action");
+			if (plan.actions.length > 1 || plan.actions.some((action) => action.id !== select))
+				throw new Error("recover-admit plan may contain only the selected action");
+			const proposed: ActionSpec | undefined = plan.actions[0] ?? existing;
+			if (!proposed) throw new Error("Selected action is missing");
+			if (
+				!old &&
+				(!existing || existing.state !== "READY" || !isDeepStrictEqual(actionSpec(proposed), actionSpec(existing)))
+			)
+				throw new Error("Pure admission requires the unchanged existing READY action");
+			if (
+				old &&
+				(proposed.ticketId !== old.ticketId ||
+					!isDeepStrictEqual([...proposed.dependencies].sort(), [...old.dependencies].sort()))
+			)
+				throw new Error("Replacement must retain the rejected action's ticket and dependency set");
+			if (existing && !isDeepStrictEqual(actionSpec(proposed), actionSpec(existing)))
+				throw new Error("recover-admit cannot rewrite an existing action spec");
+			const ticket = this.tickets().find((item) => item.id === proposed.ticketId);
+			if (!ticket || plan.tickets.some((item) => item.id !== ticket.id || item.owner !== ticket.owner))
+				throw new Error("recover-admit cannot create or change ticket ownership");
+			if (plan.roles !== undefined && !isDeepStrictEqual(plan.roles, decode(this.meta("roles") ?? "{}")))
+				throw new Error("recover-admit cannot change role configuration");
+			if (plan.slots.length > 1) throw new Error("recover-admit plan may contain only the selected slot");
+			for (const slot of plan.slots) {
+				const current = this.slot(slot.id);
+				if (
+					slot.id !== proposed.requirements.slotId ||
+					(!current && !old) ||
+					(current && !isDeepStrictEqual(current, slot))
+				)
+					throw new Error(
+						"recover-admit may add only the selected action's exact slot; existing slots cannot change",
+					);
+			}
+			let revision = this.applyPlan(plan, expectedRevision);
+			if (old) revision = this.supersede(old.id, select, evidence, revision, SELECTED_PAUSED_ADMISSION);
+			this.refreshReadiness();
+			if (this.action(select)?.state !== "READY")
+				throw new Error("Selected action is not READY after recovery; dependency checks remain mandatory");
+			let claimed: AttemptContext | undefined;
+			for (const slot of this.slots()) {
+				claimed = this.claim(select, slot.id, SELECTED_PAUSED_ADMISSION);
+				if (claimed) break;
+			}
+			if (!claimed || !this.markSubmitted(claimed.attempt.id, SELECTED_PAUSED_ADMISSION))
+				throw new Error("Selected action cannot claim a compatible slot/cwd");
+			if (!this.isPaused()) throw new Error("Selected admission must never unset pause");
+			const receipt = {
+				payloadSha256,
+				previousRevision: expectedRevision,
+				revision,
+				select,
+				supersede: supersede ?? null,
+				attemptId: claimed.attempt.id,
+				...evidence,
+			};
+			this.setMeta(receiptKey, JSON.stringify(receipt));
+			this.db
+				.prepare("INSERT INTO plan_mutations(id,payload_sha256,previous_revision,revision) VALUES(?,?,?,?)")
+				.run(mutationId, payloadSha256, expectedRevision, revision);
+			this.event("selected_admitted", select, claimed.attempt.id, {
+				previousRevision: expectedRevision,
+				revision,
+				mutationId,
+				supersede: supersede ?? null,
+				paused: true,
+				...evidence,
+			});
+			return { revision, replayed: false, context: this.context(claimed.attempt.id) };
+		});
+	}
+	/** Atomically claims action, slot and declared host/cwd. Paths are lexical identities, not symlink resolution. */
+	claim(actionId: string, slotId: string, authority?: symbol): AttemptContext | undefined {
+		return this.transaction(() => {
+			if (this.isPaused() && authority !== SELECTED_PAUSED_ADMISSION) return undefined;
+			const action = this.action(actionId);
+			const slot = this.slot(slotId);
+			if (!action || !slot || action.state !== "READY") return undefined;
+			if (
+				(action.requirements.host && action.requirements.host !== slot.host) ||
+				(action.requirements.slotId && action.requirements.slotId !== slot.id) ||
+				action.requirements.capabilities?.some((c) => !slot.capabilities?.includes(c))
+			)
+				return undefined;
+			if (
+				this.db
+					.prepare("SELECT id FROM attempts WHERE (action_id=? OR slot_id=?) AND claim_released=0 LIMIT 1")
+					.get(actionId, slotId)
+			)
+				return undefined;
+			if (
+				this.db
+					.prepare(`
+				SELECT 1 FROM attempts p JOIN actions a ON a.id=p.action_id JOIN slots s ON s.id=p.slot_id
+				WHERE p.claim_released=0 AND json_extract(s.spec,'$.host')=? AND json_extract(a.spec,'$.command.cwd')=? LIMIT 1
+			`)
+					.get(slot.host, action.command.cwd)
+			)
+				return undefined;
+			const id = randomUUID();
+			this.db
+				.prepare("INSERT INTO attempts(id,action_id,slot_id,state,created_at) VALUES(?,?,?,'PREPARED',?)")
+				.run(id, actionId, slotId, now());
+			this.db.prepare("UPDATE actions SET state='RUNNING' WHERE id=?").run(actionId);
+			this.event("attempt_prepared", actionId, id, { slotId });
+			return this.context(id);
+		});
+	}
+	markSubmitted(attemptId: string, authority?: symbol): boolean {
+		return this.transaction(() => {
+			if (this.isPaused() && authority !== SELECTED_PAUSED_ADMISSION) return false;
+			const result = this.db
+				.prepare(
+					"UPDATE attempts SET state='SUBMITTED',submitted_at=? WHERE id=? AND state='PREPARED' AND claim_released=0",
+				)
+				.run(now(), attemptId);
+			if (!result.changes) return false;
+			this.event("attempt_submitted", this.context(attemptId).action.id, attemptId);
+			return true;
+		});
+	}
+	/** Only an intent which was never submitted can be abandoned without external evidence. */
+	abandonPrepared(attemptId: string): boolean {
+		return this.transaction(() => {
+			const result = this.db
+				.prepare(
+					"UPDATE attempts SET state='ABANDONED',claim_released=1 WHERE id=? AND state='PREPARED' AND submitted_at IS NULL AND claim_released=0",
+				)
+				.run(attemptId);
+			if (!result.changes) return false;
+			const { action } = this.context(attemptId);
+			this.db.prepare("UPDATE actions SET state='QUEUED' WHERE id=?").run(action.id);
+			this.event("prepared_abandoned", action.id, attemptId);
+			this.refreshReadiness();
+			return true;
+		});
+	}
+	markRunning(attemptId: string, processIdentity: string): void {
+		required(processIdentity, "process identity");
+		this.transaction(() => {
+			const { attempt, action } = this.context(attemptId);
+			if (attempt.claimReleased || attempt.state === "PREPARED") return;
+			if (attempt.processIdentity && attempt.processIdentity !== processIdentity) {
+				this.uncertainInternal(attemptId, "Process identity changed during reconciliation");
+				return;
+			}
+			if (attempt.state === "RUNNING" && attempt.processIdentity === processIdentity) return;
+			this.db
+				.prepare("UPDATE attempts SET state='RUNNING',process_identity=?,uncertainty=NULL WHERE id=?")
+				.run(processIdentity, attemptId);
+			this.db.prepare("UPDATE actions SET state='RUNNING' WHERE id=?").run(action.id);
+			this.resolveWakes(attemptId);
+			this.event("attempt_running", action.id, attemptId, { processIdentity });
+		});
+	}
+	private uncertainInternal(attemptId: string, reason: string): void {
+		const { attempt, action } = this.context(attemptId);
+		if (attempt.claimReleased || attempt.state === "PREPARED") return;
+		if (attempt.state === "UNCERTAIN" && attempt.uncertainty === reason) return;
+		this.db.prepare("UPDATE attempts SET state='UNCERTAIN',uncertainty=? WHERE id=?").run(reason, attemptId);
+		this.db.prepare("UPDATE actions SET state='UNCERTAIN' WHERE id=?").run(action.id);
+		this.db
+			.prepare("INSERT OR IGNORE INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,?,?,?)")
+			.run(action.id, attemptId, reason, now());
+		this.event("attempt_uncertain", action.id, attemptId, { reason });
+	}
+	markUncertain(attemptId: string, reason: string): void {
+		required(reason, "uncertainty reason");
+		this.transaction(() => this.uncertainInternal(attemptId, reason));
+	}
+	private resolveWakes(attemptId: string): void {
+		this.db
+			.prepare("UPDATE wakes SET resolved_at=? WHERE attempt_id=? AND resolved_at IS NULL")
+			.run(now(), attemptId);
+	}
+	complete(receipt: CompletionReceipt): boolean {
+		let conflict = false;
+		const changed = this.transaction(() => {
+			const { attempt, action } = this.context(receipt.attemptId);
+			if (attempt.state === "TERMINAL" && !isDeepStrictEqual(attempt.receipt, receipt)) {
+				const reason = "Conflicting terminal receipt";
+				this.event("terminal_receipt_conflict", action.id, attempt.id, { reason, receipt });
+				this.db
+					.prepare("INSERT OR IGNORE INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,?,?,?)")
+					.run(action.id, attempt.id, reason, now());
+				this.setMeta("paused", "true");
+				this.setMeta("pause_reason", `${reason}: ${attempt.id}`);
+				conflict = true;
+				return false;
+			}
+			if (receipt.sourceFingerprint !== action.sourceFingerprint)
+				throw new Error("Receipt source fingerprint mismatch");
+			required(receipt.finishedAt, "receipt.finishedAt");
+			if (
+				Number.isNaN(Date.parse(receipt.finishedAt)) ||
+				(receipt.exitCode !== null && !Number.isInteger(receipt.exitCode))
+			)
+				throw new Error("Invalid terminal receipt");
+			if (receipt.artifact) {
+				required(receipt.artifact.ref, "artifact.ref");
+				required(receipt.artifact.sourceFingerprint, "artifact.sourceFingerprint");
+			}
+			if (attempt.state === "TERMINAL") {
+				if (!isDeepStrictEqual(attempt.receipt, receipt)) throw new Error("Conflicting terminal receipt");
+				return false;
+			}
+			if (attempt.claimReleased || attempt.state === "PREPARED")
+				throw new Error("Cannot complete an unsubmitted or abandoned attempt");
+			this.db
+				.prepare("UPDATE attempts SET state='TERMINAL',receipt=?,claim_released=1,uncertainty=NULL WHERE id=?")
+				.run(JSON.stringify(receipt), attempt.id);
+			const state: ActionRecord["state"] = receipt.exitCode === 0 ? "ACCEPTED" : "REJECTED";
+			this.db.prepare("UPDATE actions SET state=? WHERE id=?").run(state, action.id);
+			this.resolveWakes(attempt.id);
+			this.event("attempt_terminal", action.id, attempt.id, {
+				exitCode: receipt.exitCode,
+				state,
+				artifactRef: receipt.artifact?.ref ?? null,
+			});
+			if (state === "REJECTED")
+				this.db
+					.prepare("INSERT INTO wakes(action_id,attempt_id,reason,created_at) VALUES(?,?,?,?)")
+					.run(action.id, attempt.id, "Process failed", now());
+			this.refreshReadiness();
+			return true;
+		});
+		if (conflict) throw new Error("Conflicting terminal receipt; factory paused for review");
+		return changed;
+	}
+	/** Replace rejected work explicitly, retaining history and updating only future dependencies. */
+	supersede(
+		actionId: string,
+		replacementId: string,
+		evidence: DecisionEvidence,
+		expectedRevision?: number,
+		authority?: symbol,
+	): number {
+		evidenceValid(evidence);
+		return this.transaction(() => {
+			if (this.isPaused() && authority !== SELECTED_PAUSED_ADMISSION)
+				throw new Error("Factory is paused; supersession is blocked");
+			const revision = Number(this.meta("plan_revision"));
+			if (expectedRevision !== undefined && revision !== expectedRevision)
+				throw new Error("Factory plan revision changed");
+			const invalidatedWakeIds = this.wakes()
+				.filter((wake) => wake.resolvedAt === null && wake.actionId !== actionId)
+				.map((wake) => wake.id);
+			const old = this.action(actionId);
+			const replacement = this.action(replacementId);
+			if (!old || old.state !== "REJECTED") throw new Error("Only rejected work may be superseded");
+			if (
+				!replacement ||
+				replacement.id === old.id ||
+				replacement.ticketId !== old.ticketId ||
+				["REJECTED", "SUPERSEDED"].includes(replacement.state)
+			)
+				throw new Error("Replacement must be a distinct current action of the same ticket");
+			const actions = this.actions();
+			const changed: ActionSpec[] = [];
+			for (const action of actions) {
+				if (!action.dependencies.includes(actionId)) continue;
+				if (
+					(action.state !== "QUEUED" && action.state !== "READY") ||
+					this.db
+						.prepare("SELECT 1 FROM attempts WHERE action_id=? AND submitted_at IS NOT NULL LIMIT 1")
+						.get(action.id)
+				)
+					throw new Error("Cannot rewire a started dependent");
+				action.dependencies = [...new Set(action.dependencies.map((id) => (id === actionId ? replacementId : id)))];
+				changed.push(actionSpec(action));
+			}
+			const graph = new Map(actions.map((action) => [action.id, action]));
+			const visiting = new Set<string>();
+			const visited = new Set<string>();
+			const visit = (id: string): void => {
+				if (visiting.has(id)) throw new Error("Supersession would create a dependency cycle");
+				if (visited.has(id)) return;
+				visiting.add(id);
+				for (const dependency of graph.get(id)?.dependencies ?? []) visit(dependency);
+				visiting.delete(id);
+				visited.add(id);
+			};
+			for (const id of graph.keys()) visit(id);
+			for (const action of changed) {
+				this.db.prepare("UPDATE actions SET spec=? WHERE id=?").run(JSON.stringify(action), action.id);
+				this.db.prepare("DELETE FROM dependencies WHERE action_id=?").run(action.id);
+				for (const dependency of action.dependencies)
+					this.db
+						.prepare("INSERT INTO dependencies(action_id,dependency_id) VALUES(?,?)")
+						.run(action.id, dependency);
+			}
+			this.db.prepare("UPDATE actions SET state='SUPERSEDED' WHERE id=?").run(actionId);
+			this.db
+				.prepare("UPDATE wakes SET resolved_at=? WHERE action_id=? AND resolved_at IS NULL")
+				.run(now(), actionId);
+			this.setMeta("plan_revision", String(revision + 1));
+			this.event("action_superseded", actionId, null, {
+				replacementId,
+				previousState: old.state,
+				previousRevision: revision,
+				revision: revision + 1,
+				invalidatedWakeIds,
+				...evidence,
+			});
+			this.refreshReadiness();
+			return revision + 1;
+		});
+	}
+	/** Operator attests the prior attempt cannot still execute. A deadline or missing PID is insufficient evidence. */
+	resolveForRetry(attemptId: string, evidence: DecisionEvidence, expectedRevision?: number): void {
+		evidenceValid(evidence);
+		this.transaction(() => {
+			if (this.isPaused()) throw new Error("Factory is paused; resolution is blocked");
+			if (expectedRevision !== undefined && Number(this.meta("plan_revision")) !== expectedRevision)
+				throw new Error("Factory plan revision changed");
+			const { attempt, action } = this.context(attemptId);
+			if (attempt.state !== "UNCERTAIN" || attempt.claimReleased)
+				throw new Error("Only an uncertain claimed attempt may be resolved for retry");
+			this.db.prepare("UPDATE attempts SET state='ABANDONED',claim_released=1 WHERE id=?").run(attemptId);
+			this.db.prepare("UPDATE actions SET state='QUEUED' WHERE id=?").run(action.id);
+			this.resolveWakes(attemptId);
+			this.event("uncertainty_resolved_for_retry", action.id, attemptId, { ...evidence });
+			this.refreshReadiness();
+		});
+	}
+	planMutation(id: string): PlanMutationReceipt | undefined {
+		const row = this.db.prepare("SELECT * FROM plan_mutations WHERE id=?").get(id);
+		return row
+			? {
+					id: String(row.id),
+					payloadSha256: String(row.payload_sha256),
+					previousRevision: Number(row.previous_revision),
+					revision: Number(row.revision),
+				}
+			: undefined;
+	}
+	/** Complete history is snapshot-bounded at entry, but unbounded in size. */
+	allEvents(afterSequence = 0): FactoryEvent[] {
+		const throughSequence = this.ledgerSequence();
+		const history: FactoryEvent[] = [];
+		let cursor = afterSequence;
+		for (;;) {
+			const page = this.events(cursor).filter((event) => event.sequence <= throughSequence);
+			history.push(...page);
+			const last = page.at(-1);
+			if (!last || last.sequence >= throughSequence) return history;
+			cursor = last.sequence;
+		}
+	}
+	private eventRecord(row: Row): FactoryEvent {
+		return {
+			sequence: Number(row.sequence),
+			at: String(row.at),
+			kind: String(row.kind),
+			actionId: row.action_id === null ? null : String(row.action_id),
+			attemptId: row.attempt_id === null ? null : String(row.attempt_id),
+			detail: decode<Record<string, unknown>>(row.detail),
+		};
+	}
+	events(afterSequence = 0, limit = 100): FactoryEvent[] {
+		if (
+			!Number.isSafeInteger(afterSequence) ||
+			afterSequence < 0 ||
+			!Number.isSafeInteger(limit) ||
+			limit < 1 ||
+			limit > 10000
+		)
+			throw new Error("Invalid event range");
+		return this.db
+			.prepare("SELECT * FROM events WHERE sequence>? ORDER BY sequence LIMIT ?")
+			.all(afterSequence, limit)
+			.map((row) => this.eventRecord(row));
+	}
+	openWakeIdForReason(reason: string): number | undefined {
+		const row = this.db
+			.prepare("SELECT id FROM wakes WHERE reason=? AND resolved_at IS NULL ORDER BY id LIMIT 1")
+			.get(reason);
+		return row ? Number(row.id) : undefined;
+	}
+	wakes(): WakeRecord[] {
+		return this.db
+			.prepare("SELECT * FROM wakes ORDER BY id")
+			.all()
+			.map((r) => ({
+				id: Number(r.id),
+				actionId: String(r.action_id),
+				attemptId: r.attempt_id === null ? null : String(r.attempt_id),
+				reason: String(r.reason),
+				createdAt: String(r.created_at),
+				resolvedAt: r.resolved_at === null ? null : String(r.resolved_at),
+			}));
+	}
+	status(): FactoryStatus {
+		return {
+			schemaVersion: SCHEMA_VERSION,
+			planRevision: Number(this.meta("plan_revision")),
+			paused: this.isPaused(),
+			pauseReason: this.meta("pause_reason") || null,
+			tickets: this.tickets(),
+			actions: this.actions(),
+			slots: this.slots(),
+			attempts: this.attempts(),
+			wakes: this.wakes(),
+			roles: decode<FactoryPlan["roles"]>(this.meta("roles") ?? "{}"),
+		};
+	}
+}
