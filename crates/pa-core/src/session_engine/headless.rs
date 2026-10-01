@@ -337,7 +337,7 @@ mod tests {
             answer.clone(),
             AgentMessage::Custom(
                 crate::session_engine::messages::create_provider_retry_outcome_message(
-                    true, 1, throttled,
+                    /*success*/ true, 1, throttled,
                 ),
             ),
         ];
@@ -359,7 +359,7 @@ mod tests {
             last_attempt.clone(),
             AgentMessage::Custom(
                 crate::session_engine::messages::create_provider_retry_outcome_message(
-                    false,
+                    /*success*/ false,
                     1,
                     "provider down",
                 ),
