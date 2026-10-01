@@ -101,6 +101,7 @@ fn manager_options(
             &bench_python_skills(),
         )),
         stderr_log_path: None,
+        ..KernelManagerOptions::default()
     }
 }
 

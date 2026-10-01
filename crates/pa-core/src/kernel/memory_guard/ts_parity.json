@@ -1,0 +1,356 @@
+{
+ "formatGb": [
+  [
+   0,
+   "0"
+  ],
+  [
+   1,
+   "0"
+  ],
+  [
+   134217728,
+   "0.13"
+  ],
+  [
+   5368709.12,
+   "0.01"
+  ],
+  [
+   1079110533.12,
+   "1"
+  ],
+  [
+   10732049530.88,
+   "9.99"
+  ],
+  [
+   10737418240,
+   "10"
+  ],
+  [
+   10791105331.2,
+   "10.1"
+  ],
+  [
+   107320495308.8,
+   "100"
+  ],
+  [
+   107374182400,
+   "100"
+  ],
+  [
+   161598144512,
+   "151"
+  ],
+  [
+   17179869184,
+   "16"
+  ],
+  [
+   25769803776,
+   "24"
+  ],
+  [
+   2684354560,
+   "2.5"
+  ],
+  [
+   402653184,
+   "0.38"
+  ],
+  [
+   1099511627776,
+   "1024"
+  ]
+ ],
+ "promptLine": [
+  [
+   16,
+   "Memory: each kernel, with the processes it starts, may use up to 16 GB. Load large data in pieces, and run a heavy one-off job as a script through `bash()`, so a breach stops only that script."
+  ],
+  [
+   0,
+   null
+  ],
+  [
+   -1,
+   null
+  ],
+  [
+   0.5,
+   "Memory: each kernel, with the processes it starts, may use up to 0.5 GB. Load large data in pieces, and run a heavy one-off job as a script through `bash()`, so a breach stops only that script."
+  ],
+  [
+   2.25,
+   "Memory: each kernel, with the processes it starts, may use up to 2.25 GB. Load large data in pieces, and run a heavy one-off job as a script through `bash()`, so a breach stops only that script."
+  ],
+  [
+   0.125,
+   "Memory: each kernel, with the processes it starts, may use up to 0.13 GB. Load large data in pieces, and run a heavy one-off job as a script through `bash()`, so a breach stops only that script."
+  ],
+  [
+   100,
+   "Memory: each kernel, with the processes it starts, may use up to 100 GB. Load large data in pieces, and run a heavy one-off job as a script through `bash()`, so a breach stops only that script."
+  ]
+ ],
+ "warning": [
+  "Memory: this kernel and its processes use 10 GB of their 16 GB limit. Largest variables: frames 9.95 GB (ndarray float64, shape (200, 1080, 1920, 3)), clips 3.1 GB (list of 200). Free what you no longer need (del name) or load the rest in pieces. At 16 GB the runtime stops the cell and deletes the largest variables. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it.",
+  "Memory: this kernel and its processes use 9.6 GB of their 16 GB limit. Largest variables: none. Free what you no longer need (del name) or load the rest in pieces. At 16 GB the runtime stops the cell and deletes the largest variables. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it.",
+  "Memory: this kernel and its processes use 0.3 GB of their 0.5 GB limit. Largest variables: v 5 MB (ndarray uint8, shape (5242880,)), n 1 KB (int), z 1 KB (NoneType), s 2 KB (str), m 2 MB (bytes), e 1 KB (list of 0). Free what you no longer need (del name) or load the rest in pieces. At 0.5 GB the runtime stops the cell and deletes the largest variables. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it."
+ ],
+ "child": [
+  "Memory limit: python3 (pid 7), started from this kernel, used 16.02 GB, above the 16 GB limit, so the runtime stopped it. Memory now: 0.08 GB. The kernel and all its variables are intact, and files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: process the data in pieces (stream, batch, memmap, compact dtypes such as uint8 or float32).",
+  "Memory limit: sort (pid 9), started from this kernel, used 9 GB and took this kernel and its processes to 16 GB, above the 16 GB limit, so the runtime stopped it. Memory now: 7 GB. The kernel and all its variables are intact, and files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: process the data in pieces (stream, batch, memmap, compact dtypes such as uint8 or float32).",
+  "The machine is nearly out of memory, and this kernel was the largest this session owns. Memory limit: sort (pid 9), started from this kernel, used 2 GB, so the runtime stopped it. Memory now: 1 GB. The kernel and all its variables are intact, and files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: process the data in pieces (stream, batch, memmap, compact dtypes such as uint8 or float32).",
+  "Memory limit: x (pid 11), started from this kernel, used 16 GB, above the 16 GB limit, so the runtime stopped it. Memory now: 0 GB. The kernel and all its variables are intact, and files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: process the data in pieces (stream, batch, memmap, compact dtypes such as uint8 or float32)."
+ ],
+ "trim": [
+  "Memory limit: this kernel used 17.2 GB, above its 16 GB limit, so the runtime stopped the cell at line 4 (`frames = np.stack([load(v) for v in videos])`) and deleted the largest variables: frames (9.95 GB, ndarray float64, shape (200, 1080, 1920, 3)), clips (3.1 GB, list of 200). Memory now: 1.2 GB. Every other variable is intact, and files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: recompute only what you need, in pieces (stream, batch, memmap, compact dtypes such as uint8 or float32).",
+  "Memory limit: this kernel used 17.2 GB, above its 16 GB limit, so the runtime stopped the cell and deleted the largest variables: frames (9.95 GB, ndarray float64, shape (200, 1080, 1920, 3)), clips (3.1 GB, list of 200). Memory now: 1.2 GB. Every other variable is intact, and files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: recompute only what you need, in pieces (stream, batch, memmap, compact dtypes such as uint8 or float32).",
+  "Memory limit: this kernel used 17.2 GB, above its 16 GB limit, so the runtime deleted the largest variables: frames (9.95 GB, ndarray float64, shape (200, 1080, 1920, 3)), clips (3.1 GB, list of 200). Memory now: 1.2 GB. Every other variable is intact, and files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: recompute only what you need, in pieces (stream, batch, memmap, compact dtypes such as uint8 or float32).",
+  "Memory limit: this kernel used 17.2 GB, above its 16 GB limit, so the runtime looked for large variables. No variable held 0.25 GB or more, so none was deleted: every variable is intact, and files on disk are untouched. Memory now: 1.2 GB. If memory stays above the limit, the runtime ends the kernel. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: recompute only what you need, in pieces (stream, batch, memmap, compact dtypes such as uint8 or float32).",
+  "Memory limit: this kernel used 17.2 GB, above its 16 GB limit, so the runtime stopped the cell at line 4 (`frames = np.stack([load(v) for v in videos])`). No variable held 0.25 GB or more, so none was deleted: every variable is intact, and files on disk are untouched. If memory stays above the limit, the runtime ends the kernel. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: recompute only what you need, in pieces (stream, batch, memmap, compact dtypes such as uint8 or float32).",
+  "Memory limit: this kernel used 16.001 GB, above its 16 GB limit, so the runtime deleted the largest variables: frames (9.95 GB, ndarray float64, shape (200, 1080, 1920, 3)). Every other variable is intact, and files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: recompute only what you need, in pieces (stream, batch, memmap, compact dtypes such as uint8 or float32)."
+ ],
+ "kill": [
+  "Memory limit: this kernel used 17.2 GB, above its 16 GB limit, and stopping the cell did not bring it down, so the runtime ended the kernel and every process it started while the cell ran line 4 (`frames = np.stack([load(v) for v in videos])`). All Python variables are gone; the next cell starts a fresh kernel. The kernel held: frames (9.95 GB, ndarray float64, shape (200, 1080, 1920, 3)), n (1 KB, int), and 2 more. Files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: rebuild state in pieces, and run a heavy one-off job as a script through bash.",
+  "Memory limit: this kernel used 17.2 GB, above its 16 GB limit and past the 24 GB hard limit, so the runtime ended the kernel and every process it started while a cell was running. All Python variables are gone; the next cell starts a fresh kernel. The kernel did not answer in time, so the names it held are not known. Files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: rebuild state in pieces, and run a heavy one-off job as a script through bash.",
+  "The machine is nearly out of memory, and this kernel was the largest this session owns. Memory limit: this kernel used 3 GB, so the runtime ended the kernel and every process it started. All Python variables are gone; the next cell starts a fresh kernel. The kernel held (at a reading 12 s earlier): clips (3.1 GB, list of 200). Files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: rebuild state in pieces, and run a heavy one-off job as a script through bash.",
+  "The machine is nearly out of memory, and this kernel was the largest this session owns. Memory limit: this kernel used 17.2 GB, above its 16 GB limit, so the runtime ended the kernel and every process it started while the cell ran line 4 (`frames = np.stack([load(v) for v in videos])`). All Python variables are gone; the next cell starts a fresh kernel. The kernel held no variables. Files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: rebuild state in pieces, and run a heavy one-off job as a script through bash.",
+  "Memory limit: this kernel used 17.2 GB, above its 16 GB limit, and deleting the largest variables did not bring it down, so the runtime ended the kernel and every process it started. All Python variables are gone; the next cell starts a fresh kernel. The kernel held (at a reading 0 s earlier): frames (9.95 GB, ndarray float64, shape (200, 1080, 1920, 3)). Files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: rebuild state in pieces, and run a heavy one-off job as a script through bash.",
+  "Memory limit: this kernel used 24 GB, above its 16 GB limit and past the 24 GB hard limit, so the runtime ended the kernel and every process it started. All Python variables are gone; the next cell starts a fresh kernel. The kernel did not answer in time, so the names it held are not known. Files on disk are untouched. The limit protects this machine: other agents and the owner's apps share it, and a process that outgrows memory freezes the whole machine and ends every session on it. Next: rebuild state in pieces, and run a heavy one-off job as a script through bash."
+ ],
+ "place": [
+  "idle\n\nout\n\nown",
+  "idle",
+  "out",
+  "",
+  "a\n\nout\n\nb\n\nc"
+ ],
+ "limit": [
+  [
+   null,
+   "<unset>",
+   16
+  ],
+  [
+   "2",
+   "<unset>",
+   2
+  ],
+  [
+   "2",
+   0,
+   0
+  ],
+  [
+   "2",
+   -1,
+   2
+  ],
+  [
+   "2",
+   3.5,
+   3.5
+  ],
+  [
+   " 4.5 ",
+   "<unset>",
+   4.5
+  ],
+  [
+   "",
+   "<unset>",
+   16
+  ],
+  [
+   "   ",
+   "<unset>",
+   16
+  ],
+  [
+   "-3",
+   "<unset>",
+   16
+  ],
+  [
+   "abc",
+   "<unset>",
+   16
+  ],
+  [
+   "0x10",
+   "<unset>",
+   16
+  ],
+  [
+   "0o10",
+   "<unset>",
+   8
+  ],
+  [
+   "0b11",
+   "<unset>",
+   3
+  ],
+  [
+   "1e1",
+   "<unset>",
+   10
+  ],
+  [
+   ".5",
+   "<unset>",
+   0.5
+  ],
+  [
+   "5.",
+   "<unset>",
+   5
+  ],
+  [
+   "+7",
+   "<unset>",
+   7
+  ],
+  [
+   "Infinity",
+   "<unset>",
+   16
+  ],
+  [
+   "-0",
+   "<unset>",
+   0
+  ],
+  [
+   "0",
+   "<unset>",
+   0
+  ],
+  [
+   "1_000",
+   "<unset>",
+   16
+  ],
+  [
+   "0x",
+   "<unset>",
+   16
+  ],
+  [
+   "-0x10",
+   "<unset>",
+   16
+  ],
+  [
+   "1e",
+   "<unset>",
+   16
+  ],
+  [
+   "1.5e+1",
+   "<unset>",
+   15
+  ],
+  [
+   "0X1F",
+   "<unset>",
+   31
+  ],
+  [
+   "2",
+   "3",
+   2
+  ],
+  [
+   "2",
+   true,
+   2
+  ],
+  [
+   "2",
+   null,
+   2
+  ],
+  [
+   "\t8\n",
+   "<unset>",
+   8
+  ],
+  [
+   "00012",
+   "<unset>",
+   12
+  ],
+  [
+   "1.2.3",
+   "<unset>",
+   16
+  ],
+  [
+   "e5",
+   "<unset>",
+   16
+  ]
+ ],
+ "backstop": [
+  [
+   null,
+   "<unset>",
+   true
+  ],
+  [
+   "0",
+   "<unset>",
+   false
+  ],
+  [
+   "false",
+   "<unset>",
+   false
+  ],
+  [
+   " OFF ",
+   "<unset>",
+   false
+  ],
+  [
+   "No",
+   "<unset>",
+   false
+  ],
+  [
+   "1",
+   "<unset>",
+   true
+  ],
+  [
+   "",
+   "<unset>",
+   true
+  ],
+  [
+   "nope",
+   "<unset>",
+   true
+  ],
+  [
+   "0",
+   true,
+   true
+  ],
+  [
+   "1",
+   false,
+   false
+  ],
+  [
+   "0",
+   "true",
+   false
+  ]
+ ]
+}

@@ -91,6 +91,7 @@ fn test_options(snapshot_dir: Option<&std::path::Path>) -> Option<KernelManagerO
         // bootstrap after start; tests match that contract.
         bootstrap_code: Some(build_rlm_bootstrap_code(&[])),
         stderr_log_path: None,
+        ..KernelManagerOptions::default()
     })
 }
 

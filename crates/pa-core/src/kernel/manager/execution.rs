@@ -134,7 +134,7 @@ impl Inner {
         self.resolve_execution(execution, true);
     }
 
-    fn resolve_execution(&self, execution: &Arc<ActiveExecution>, clear_active: bool) {
+    pub(super) fn resolve_execution(&self, execution: &Arc<ActiveExecution>, clear_active: bool) {
         let did_clear_active = if clear_active {
             let mut g = lock(&self.guarded);
             matches!(g.active_execution.as_ref(), Some(active) if Arc::ptr_eq(active, execution))
@@ -237,6 +237,9 @@ impl Inner {
                 status,
                 error: buffers.error.take(),
                 duration_ms: execution.started.elapsed().as_millis() as u64,
+                // Attached by `execute()` for user cells only.
+                queued_memory_notices: None,
+                memory_notices: None,
             };
             drop(buffers);
             if let Some(tx) = lock(&execution.result_tx).take() {

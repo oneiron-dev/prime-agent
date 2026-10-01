@@ -149,12 +149,38 @@ pub struct SentAgentMessageTarget {
     pub session_name: Option<String>,
 }
 
+/// The cell line a failed or stopped cell was running (the runtime's
+/// `line` field: its own innermost frame, source stripped and capped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelCellLine {
+    pub lineno: i64,
+    pub source: String,
+}
+
+impl KernelCellLine {
+    /// The wire `{lineno, source}` object; anything else is no line (TS `asCellLine`).
+    #[must_use]
+    pub fn from_value(value: &Value) -> Option<Self> {
+        const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+        let lineno = value.get("lineno")?.as_i64()?;
+        if lineno.unsigned_abs() > MAX_SAFE_INTEGER {
+            return None;
+        }
+        Some(Self {
+            lineno,
+            source: value.get("source")?.as_str()?.to_string(),
+        })
+    }
+}
+
 /// A kernel error reported by a failed cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelError {
     pub ename: String,
     pub evalue: String,
     pub traceback: Vec<String>,
+    /// The cell's own line the error (or interrupt) happened at.
+    pub line: Option<KernelCellLine>,
 }
 
 /// Result of executing one cell.
@@ -175,6 +201,10 @@ pub struct ExecuteResult {
     pub status: ExecuteStatus,
     pub error: Option<KernelError>,
     pub duration_ms: u64,
+    /// What the kernel memory ceiling did while no user cell ran; shown above the output.
+    pub queued_memory_notices: Option<Vec<String>>,
+    /// What the kernel memory ceiling did during this cell; shown after the output.
+    pub memory_notices: Option<Vec<String>>,
 }
 
 /// Options for one `execute` call.
@@ -290,9 +320,9 @@ pub struct KernelSnapshotConfig {
     pub path: std::path::PathBuf,
     /// Absolute path for the JSON manifest written alongside the payload.
     pub manifest_path: std::path::PathBuf,
-    /// Maximum aggregate snapshot size. Default 256 MiB.
+    /// Maximum aggregate snapshot size. Default 64 MiB.
     pub max_bytes: Option<u64>,
-    /// Maximum serialized size of one variable. Default 16 MiB.
+    /// Maximum serialized size of one variable. Default 8 MiB.
     pub max_variable_bytes: Option<u64>,
     /// Debounce window for the auto-snapshot after a successful execution. Default 1500 ms.
     pub debounce_ms: Option<u64>,
@@ -318,7 +348,118 @@ pub struct KernelManagerOptions {
     pub bootstrap_code: Option<String>,
     /// File receiving the kernel process's stderr, rotated once at each spawn.
     pub stderr_log_path: Option<std::path::PathBuf>,
+    /// Memory ceiling per kernel tree (the kernel and every process it
+    /// starts) in GiB. `None` resolves `PRIME_AGENT_KERNEL_MEMORY_LIMIT_GB`,
+    /// else 16; `0` turns the memory ladder off.
+    pub memory_limit_gb: Option<f64>,
+    /// End the heaviest kernel tree when the machine runs out of memory.
+    /// `None` resolves `PRIME_AGENT_KERNEL_MEMORY_BACKSTOP`, else on.
+    pub memory_backstop: Option<bool>,
+    /// Reports each memory step taken, for `kernel memory action`
+    /// telemetry. Telemetry only; kernel behavior never depends on it.
+    pub on_memory_action: Option<KernelMemoryActionHandler>,
+    /// Reports what the file-handle snapshot guard skipped or purged, for
+    /// `kernel snapshot guard` telemetry. Telemetry only.
+    pub on_snapshot_guard: Option<KernelSnapshotGuardHandler>,
 }
+
+/// Which memory step a kernel took (`kernel memory action` `action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelMemoryAction {
+    /// A warning is owed to the model.
+    Warn,
+    /// A child process unit was stopped.
+    Child,
+    /// The largest variables were deleted.
+    Trim,
+    /// The kernel was ended.
+    End,
+}
+
+impl KernelMemoryAction {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Warn => "warn",
+            Self::Child => "child",
+            Self::Trim => "trim",
+            Self::End => "end",
+        }
+    }
+}
+
+/// Why a memory step fired (`kernel memory action` `cause`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelMemoryCause {
+    /// The tree crossed its own limit (or the warning line).
+    Limit,
+    /// Past the hard limit (1.5x).
+    Hard,
+    /// Still over the limit after the grace window.
+    Grace,
+    /// The machine backstop.
+    Machine,
+}
+
+impl KernelMemoryCause {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Limit => "limit",
+            Self::Hard => "hard",
+            Self::Grace => "grace",
+            Self::Machine => "machine",
+        }
+    }
+}
+
+/// One memory step, as primitives only (no names, pids, or text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelMemoryActionStats {
+    pub action: KernelMemoryAction,
+    pub cause: KernelMemoryCause,
+    pub tree_bytes: u64,
+    pub kernel_bytes: u64,
+    pub limit_bytes: u64,
+    /// The tree after the step, when known.
+    pub after_bytes: Option<u64>,
+    /// How many variable groups the trim deleted.
+    pub dropped_count: Option<u64>,
+    pub cell_running: bool,
+}
+
+/// Reports kernel memory steps (`kernel memory action`).
+pub type KernelMemoryActionHandler = Arc<dyn Fn(KernelMemoryActionStats) + Send + Sync>;
+
+/// Which snapshot direction the file-handle guard acted in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotGuardPhase {
+    Capture,
+    Restore,
+}
+
+impl SnapshotGuardPhase {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+/// What the file-handle snapshot guard did in one capture or restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelSnapshotGuardStats {
+    pub phase: SnapshotGuardPhase,
+    /// Values skipped (capture) or blobs refused (restore) as file handles.
+    pub rejected_count: u64,
+    /// Direct handle names deleted from the namespace after the commit.
+    pub purged_count: u64,
+}
+
+/// Reports file-handle snapshot guard actions (`kernel snapshot guard`).
+pub type KernelSnapshotGuardHandler = Arc<dyn Fn(KernelSnapshotGuardStats) + Send + Sync>;
 
 /// Shutdown options: whether to flush a final namespace snapshot and drain
 /// in-flight host requests before tearing the kernel down.

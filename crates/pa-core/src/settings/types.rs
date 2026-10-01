@@ -332,6 +332,12 @@ pub struct Settings {
     pub image_model: Option<String>,
     pub autonomous: Option<AutonomousSettings>,
     pub shell_path: Option<String>,
+    /// Memory ceiling per Python kernel and the processes it starts, in GiB
+    /// (default 16; 0 turns the kernel memory ladder off).
+    pub kernel_memory_limit_gb: Option<f64>,
+    /// End the heaviest kernel tree when the machine runs out of memory
+    /// (default on).
+    pub kernel_memory_backstop: Option<bool>,
     pub quiet_startup: Option<bool>,
     pub shell_command_prefix: Option<String>,
     pub npm_command: Option<Vec<String>>,

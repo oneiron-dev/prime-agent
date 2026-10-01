@@ -1371,6 +1371,35 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["pid"], os.getpid())
             self.assertFalse(record["active"])
 
+    async def test_memory_notice_rides_only_a_sigkill_ending(self):
+        if not bash_module._IS_POSIX:
+            self.skipTest("the memory guard kills POSIX process groups")
+        terminated = bash("tail -f /dev/null")
+        self.assertEqual(bash_module.record_memory_notice([terminated.pid], "Memory limit: not this"), (True, False))
+        os.killpg(terminated.pid, signal.SIGTERM)
+        result = await terminated
+        self.assertEqual((result.exit_code, result.output), (-signal.SIGTERM, ""))
+
+        killed = bash("tail -f /dev/null")
+        # Any pid in the list may name the handle (the group id and the measured members ride together).
+        self.assertEqual(bash_module.record_memory_notice([4_000_000, killed.pid], "Memory limit: stopped"), (True, False))
+        os.killpg(killed.pid, signal.SIGKILL)
+        result = await killed
+        self.assertEqual((result.exit_code, result.output.strip()), (-signal.SIGKILL, "Memory limit: stopped"))
+        self.assertNotIn(killed.pid, bash_module._memory_notices)
+
+    def test_memory_notices_stay_bounded(self):
+        live = [SimpleNamespace(_pid=pid, _reaped=False, _awaiters=[]) for pid in range(1000, 1100)]
+        reaped = SimpleNamespace(_pid=7, _reaped=True, _awaiters=[])
+        with (
+            mock.patch.object(bash_module, "_live_handles", [*live, reaped]),
+            mock.patch.dict(bash_module._memory_notices, clear=True),
+        ):
+            self.assertEqual(bash_module.record_memory_notice([7], "reaped"), (False, False))
+            for pid in range(1000, 1100):
+                bash_module.record_memory_notice([pid], f"notice {pid}")
+            self.assertEqual(list(bash_module._memory_notices), list(range(1036, 1100)))
+
     async def test_unconfigured_journal_stays_permissive(self):
         # Permissiveness is about configuration, not start-id availability.
         with mock.patch.object(bash_module, "_process_start_id", return_value=None):

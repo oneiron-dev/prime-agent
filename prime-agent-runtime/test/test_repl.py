@@ -638,7 +638,7 @@ class ReplTest(unittest.TestCase):
             )  # no temp files survive a successful commit
             with open(manifest_path) as fh:
                 manifest = json.load(fh)
-            self.assertEqual(manifest["version"], 1)
+            self.assertEqual(manifest["version"], 2)
             self.assertEqual(manifest["savedNames"], done["saved"])
             self.assertEqual(manifest["bytes"], done["bytes"])
             self.assertIn("pythonVersion", manifest)
@@ -2648,16 +2648,17 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
         source = {"a": "first", "b": "second"}
         blobs = {name: dill.dumps(value) for name, value in source.items()}
         # One byte short of the full single-pass payload (magic + both records),
-        # so "a" fits exactly and "b" overflows the remaining aggregate budget.
+        # so only one record fits; newest-first ordering keeps "b".
         cap = len(_SNAPSHOT_MAGIC) + 13 + len(blobs["a"]) + 13 + len(blobs["b"]) - 1
 
         result = self._snap(source, max_bytes=cap, max_variable_bytes=cap)
-        self.assertEqual(result["saved"], ["a"])
-        self.assertEqual(result["skipped"], [{"name": "b", "reason": "exceeds aggregate snapshot size cap"}])
+        # Data bindings are considered newest-first; "b" was inserted last.
+        self.assertEqual(result["saved"], ["b"])
+        self.assertEqual(result["skipped"], [{"name": "a", "reason": "exceeds aggregate snapshot size cap"}])
         self.assertLessEqual(result["bytes"], cap)
         ns: dict = {}
         self.assertNotIn("error", _restore_state(ns, self.path))
-        self.assertEqual(ns, {"a": "first"})
+        self.assertEqual(ns, {"b": "second"})
 
     def test_zero_size_cap_writes_no_empty_payload_overhead(self):
         result = self._snap({}, max_bytes=0, max_variable_bytes=0)
@@ -2862,7 +2863,8 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
         with mock.patch.object(dill, "dump", counting_dump):
             result = self._snap({"a": 1, "b": 2, "c": 3})
         self.assertEqual(result["saved"], ["a", "b", "c"])
-        self.assertEqual(dumped, [1, 2, 3])
+        # Data bindings serialize newest-first: under an aggregate cap the latest work survives.
+        self.assertEqual(dumped, [3, 2, 1])
         self.assertEqual(result["bytes"], os.path.getsize(self.path))
         with open(self.path, "rb") as fh:
             self.assertEqual(fh.read(len(_SNAPSHOT_MAGIC)), _SNAPSHOT_MAGIC)

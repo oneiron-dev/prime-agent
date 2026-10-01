@@ -518,6 +518,7 @@ fn mock_execution(entry: &serde_json::Value) -> MockOutcome {
                         .collect()
                 })
                 .unwrap_or_default(),
+            line: None,
         });
     }
     result.attachments = Vec::<KernelAttachment>::new();
@@ -561,6 +562,7 @@ async fn golden_ipython_group_matches_ts() {
             } else {
                 None
             },
+            memory_limit_gb: 0.0,
         };
         let result =
             ipython::execute_ipython(&options, case["code"].as_str().expect("code"), None, None)
@@ -635,6 +637,10 @@ fn golden_schema_group_matches_ts() {
                         kill_calls: AtomicUsize::new(0),
                     }),
                     ui: None,
+                    // The corpus predates the memory ceiling: the ladder-off
+                    // description is the captured one (the line is pinned
+                    // by the ipython tool tests).
+                    memory_limit_gb: 0.0,
                 },
             ),
             other => panic!("unknown tool {other}"),
@@ -656,6 +662,110 @@ fn golden_schema_group_matches_ts() {
         checked += 1;
     }
     assert_eq!(checked, corpus["caseCount"].as_u64().expect("caseCount"));
+}
+
+// ---------------------------------------------------------------------------
+// The kernel memory ceiling on the ipython tool (TS fork 198a261bb; the
+// corpus above predates it).
+
+fn mock_provisioner(executions: Vec<MockOutcome>) -> Arc<MockProvisioner> {
+    Arc::new(MockProvisioner {
+        kernel: Arc::new(MockKernel {
+            executions: Mutex::new(executions),
+            exec_calls: AtomicUsize::new(0),
+            next_index: AtomicUsize::new(0),
+        }),
+        ensure_calls: AtomicUsize::new(0),
+        kill_calls: AtomicUsize::new(0),
+    })
+}
+
+/// TS `placeMemoryNotices`: what the ceiling did while no cell ran opens the
+/// result, what it did to this cell closes it; the details keep both arrays
+/// and the line the stopped cell was at.
+#[tokio::test]
+async fn ipython_places_memory_notices_around_the_cell_output() {
+    let stopped = ExecuteResult {
+        status: ExecuteStatus::Error,
+        stdout: "partial\n".to_string(),
+        duration_ms: Some(5),
+        error: Some(KernelErrorInfo {
+            ename: "KeyboardInterrupt".to_string(),
+            evalue: String::new(),
+            traceback: vec!["KeyboardInterrupt".to_string()],
+            line: Some(crate::kernel::shared::KernelCellLine {
+                lineno: 2,
+                source: "frames = load()".to_string(),
+            }),
+        }),
+        queued_memory_notices: Some(vec!["Memory limit: idle child".to_string()]),
+        memory_notices: Some(vec![
+            "Memory limit: this cell".to_string(),
+            "Memory: warning".to_string(),
+        ]),
+        ..ExecuteResult::default()
+    };
+    let options = IpythonToolOptions {
+        provisioner: mock_provisioner(vec![MockOutcome::Ok(Box::new(stopped))]),
+        ui: None,
+        memory_limit_gb: 16.0,
+    };
+    let result = ipython::execute_ipython(&options, "frames = load()", None, None)
+        .await
+        .expect("the cell settles");
+    assert_eq!(
+        (
+            result.content[0].as_text(),
+            result.details,
+            result.is_error
+        ),
+        (
+            Some(
+                "Memory limit: idle child\n\npartial\n\nKeyboardInterrupt\n\nMemory limit: this cell\n\nMemory: warning"
+            ),
+            Some(serde_json::json!({
+                "status": "error",
+                "kernelRestarted": false,
+                "durationMs": 5,
+                "stdout": "partial\n",
+                "error": {
+                    "ename": "KeyboardInterrupt",
+                    "evalue": "",
+                    "traceback": ["KeyboardInterrupt"],
+                    "line": {"lineno": 2, "source": "frames = load()"},
+                },
+                "errorEname": "KeyboardInterrupt",
+                "queuedMemoryNotices": ["Memory limit: idle child"],
+                "memoryNotices": ["Memory limit: this cell", "Memory: warning"],
+            })),
+            true
+        )
+    );
+}
+
+/// The description states the ceiling up front (TS
+/// `kernelMemoryPromptLine`), and leaves it out when the ladder is off.
+#[test]
+fn ipython_description_states_the_memory_ceiling_only_while_the_ladder_is_on() {
+    let description = |memory_limit_gb: f64| {
+        crate::tools::ipython::create_ipython_tool_definition(
+            "/tmp",
+            IpythonToolOptions {
+                provisioner: mock_provisioner(Vec::new()),
+                ui: None,
+                memory_limit_gb,
+            },
+        )
+        .description
+    };
+    let off = description(0.0);
+    assert_eq!(
+        (description(16.0), description(0.25)),
+        (
+            format!("{off} Memory: each kernel, with the processes it starts, may use up to 16 GB. Load large data in pieces, and run a heavy one-off job as a script through `bash()`, so a breach stops only that script."),
+            format!("{off} Memory: each kernel, with the processes it starts, may use up to 0.25 GB. Load large data in pieces, and run a heavy one-off job as a script through `bash()`, so a breach stops only that script."),
+        )
+    );
 }
 
 // ---------------------------------------------------------------------------

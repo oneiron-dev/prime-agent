@@ -222,22 +222,39 @@ impl Inner {
         {
             return Ok(());
         }
+        let generation = self.current_generation();
         let task = {
             let mut memo = lock(&self.rebootstrap_memo);
-            if let Some(existing) = memo.as_ref() {
-                existing.clone()
-            } else {
-                let inner = Arc::clone(self);
-                let slot = MemoSlot::new();
-                let run_slot = slot.clone();
-                tokio::spawn(async move {
-                    let ok = inner.reprovision_fresh_kernel().await;
-                    run_slot.finish(
-                        (!ok).then(|| anyhow!("Kernel bootstrap failed after protocol repair")),
-                    );
-                });
-                *memo = Some(slot.clone());
-                slot
+            match memo.as_ref() {
+                // Only this kernel start's own reprovision: one for a kernel
+                // that ended since (a memory end mid-bootstrap) never stands
+                // in for it.
+                Some((started, existing)) if *started == generation => existing.clone(),
+                Some(_) | None => {
+                    let inner = Arc::clone(self);
+                    let slot = MemoSlot::new();
+                    let run_slot = slot.clone();
+                    tokio::spawn(async move {
+                        let ok = inner.reprovision_fresh_kernel(generation).await;
+                        // In flight only (TS clears its rebootstrap promise
+                        // when it settles): the next discarded kernel must run
+                        // its own reprovision instead of joining this one.
+                        {
+                            let mut memo = lock(&inner.rebootstrap_memo);
+                            if memo
+                                .as_ref()
+                                .is_some_and(|(_, current)| Arc::ptr_eq(current, &run_slot))
+                            {
+                                *memo = None;
+                            }
+                        }
+                        run_slot.finish(
+                            (!ok).then(|| anyhow!("Kernel bootstrap failed after protocol repair")),
+                        );
+                    });
+                    *memo = Some((generation, slot.clone()));
+                    slot
+                }
             }
         };
         // An aborted request never executes, so it may skip the wait; race
@@ -256,13 +273,16 @@ impl Inner {
         }
     }
 
-    /// Restore (one-shot, best-effort) then bootstrap the lazily started fresh kernel.
-    async fn reprovision_fresh_kernel(self: &Arc<Self>) -> bool {
+    /// Restore (one-shot, best-effort) then bootstrap the lazily started
+    /// fresh kernel of start `generation`; a successor started meanwhile is
+    /// never touched.
+    async fn reprovision_fresh_kernel(self: &Arc<Self>, generation: u64) -> bool {
         if self.options.snapshot.is_some() && lock(&self.guarded).pending_restore {
             self.perform_restore(true).await; // clears pendingRestore on success
                                               // Corrupted during the restore: the spawned repair owns the kernel now.
             if lock(&self.guarded).protocol_repair.is_some()
                 || lock(&self.guarded).state != KernelState::Running
+                || self.start_stale(generation)
             {
                 return false;
             }
@@ -277,14 +297,17 @@ impl Inner {
             return true;
         }
         let ok = self.bootstrap_repaired_kernel(&code).await;
-        if !ok && lock(&self.guarded).state == KernelState::Running {
+        // A failure that ended this start (a memory end mid-bootstrap) must
+        // not discard the successor another request started since.
+        if !ok && !self.start_stale(generation) && lock(&self.guarded).state == KernelState::Running
+        {
             self.kill_child_to_idle();
         }
         ok
     }
 
     /// Kill the current child and settle at clean idle, so the next start spawns fresh.
-    fn kill_child_to_idle(self: &Arc<Self>) {
+    pub(super) fn kill_child_to_idle(self: &Arc<Self>) {
         // The discarded kernel carried the runtime bootstrap and (possibly) the
         // restored namespace; a lazily started replacement must reprovision both.
         {

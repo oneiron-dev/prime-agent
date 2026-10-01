@@ -12,6 +12,7 @@ pub mod bootstrap;
 pub mod cancellation;
 pub mod live_kernels;
 pub mod manager;
+pub(crate) mod memory_guard;
 pub mod orphan_journal;
 pub mod protocol;
 pub mod provisioner;
@@ -34,8 +35,8 @@ pub use rlm_runtime::{
 };
 pub use shared::{
     HostRequestHandler, HostRequestHandlers, HostRequestPayload, KernelBusyAfterInterruptError,
-    KernelDiffDisplay, KernelManagerOptions, KernelSentAgentMessage, KernelShutdownOptions,
-    KernelSnapshotConfig, StreamName, EXECUTE_STATUS_ABORTED, EXECUTE_STATUS_ERROR,
-    EXECUTE_STATUS_OK,
+    KernelCellLine, KernelDiffDisplay, KernelManagerOptions, KernelSentAgentMessage,
+    KernelShutdownOptions, KernelSnapshotConfig, StreamName, EXECUTE_STATUS_ABORTED,
+    EXECUTE_STATUS_ERROR, EXECUTE_STATUS_OK,
 };
 pub use state_snapshot::{manifest_path_in, snapshot_path_in, RestoreResult, SnapshotResult};
