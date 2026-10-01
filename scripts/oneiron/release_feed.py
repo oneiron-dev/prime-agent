@@ -194,7 +194,8 @@ def publish(feed_dir: Path, version: str, base: str, source: dict, row: dict, ta
             decoder: tuple[dict, Path] | None, promote: bool) -> dict:
     """Add one platform to releases/v<version>/ and move the feed pointers;
     under the feed lock, artifacts first, then SHA256SUMS, manifest.json and
-    the pointers (each replaced atomically)."""
+    the pointers (each replaced atomically). A re-run of an already published
+    platform with the same bytes changes nothing but may still promote."""
     release_dir = feed_dir / "releases" / f"v{version}"
     with sbs.locked(feed_dir):
         manifest_path = release_dir / "manifest.json"
@@ -207,25 +208,31 @@ def publish(feed_dir: Path, version: str, base: str, source: dict, row: dict, ta
             raise SystemExit(f"error: v{version} was published from {manifest.get('source')}, not {source}; "
                              "every platform of a release comes from the same source")
         existing = [entry for entry in manifest["binaries"] if entry["platform"] == row["platform"]]
-        if existing and existing[0]["sha256"] == row["sha256"]:
-            place_artifact(tarball, release_dir / row["file"], row["sha256"])
-            return {"state": "unchanged", "release": str(release_dir), "manifest": manifest, "promoted": False}
-        if existing:
+        if existing and existing[0]["sha256"] != row["sha256"]:
             raise SystemExit(f"error: v{version} already publishes {row['platform']} with different bytes "
                              f"({existing[0]['sha256']}); releases are immutable, bump the build number")
+        if existing and existing[0].get("decoder") != row["decoder"]:
+            raise SystemExit(f"error: v{version} published {row['platform']} with decoder "
+                             f"{existing[0].get('decoder')!r}, this run says {row['decoder']!r}; releases are "
+                             "immutable, bump the build number")
         release_dir.mkdir(parents=True, exist_ok=True)
         place_artifact(tarball, release_dir / row["file"], row["sha256"])
-        manifest["binaries"] = sorted(manifest["binaries"] + [row], key=lambda entry: entry["file"])
         if decoder is not None:
             place_artifact(decoder[1], release_dir / decoder[0]["file"], decoder[0]["sha256"])
-            manifest["decoders"] = sorted(manifest["decoders"] + [decoder[0]], key=lambda entry: entry["file"])
-        manifest["buildAt"] = min(entry["buildAt"] for entry in manifest["binaries"])
-        artifacts = sorted(manifest["binaries"] + manifest["decoders"], key=lambda entry: entry["file"])
-        sums = "".join(f"{entry['sha256']}  {entry['file']}\n" for entry in artifacts)
-        temp_sums = release_dir / f".SHA256SUMS.tmp-{os.getpid()}"
-        temp_sums.write_text(sums)
-        os.replace(temp_sums, release_dir / "SHA256SUMS")
-        sbs.write_json_atomic(manifest_path, manifest)
+        state = "unchanged" if existing else "published"
+        if not existing:
+            manifest["binaries"] = sorted(manifest["binaries"] + [row], key=lambda entry: entry["file"])
+            if decoder is not None:
+                manifest["decoders"] = sorted(manifest["decoders"] + [decoder[0]],
+                                              key=lambda entry: entry["file"])
+            manifest["buildAt"] = min(entry["buildAt"] for entry in manifest["binaries"])
+            artifacts = sorted(manifest["binaries"] + manifest["decoders"], key=lambda entry: entry["file"])
+            sums = "".join(f"{entry['sha256']}  {entry['file']}\n" for entry in artifacts)
+            temp_sums = release_dir / f".SHA256SUMS.tmp-{os.getpid()}"
+            temp_sums.write_text(sums)
+            os.replace(temp_sums, release_dir / "SHA256SUMS")
+            sbs.write_json_atomic(manifest_path, manifest)
+        # The pointers only move forward.
         promoted = False
         stable_path = feed_dir / "stable"
         stable = stable_path.read_text().strip().removeprefix("v") if stable_path.is_file() else None
@@ -237,7 +244,7 @@ def publish(feed_dir: Path, version: str, base: str, source: dict, row: dict, ta
             promoted = True
         elif promote:
             print(f"note: the feed's stable pointer names the newer v{stable}; left in place")
-    return {"state": "published", "release": str(release_dir), "manifest": manifest, "promoted": promoted}
+    return {"state": state, "release": str(release_dir), "manifest": manifest, "promoted": promoted}
 
 
 def package(args: argparse.Namespace) -> int:

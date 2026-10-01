@@ -243,6 +243,16 @@ class PackageTests(FeedFixture):
             self.package(changed, "--no-decoder")
         self.assertEqual({path.name: path.read_bytes() for path in self.release().iterdir()}, before)
 
+    def test_a_rerun_promotes_a_release_first_published_without_promotion(self) -> None:
+        package_dir = make_package_dir(self.root / "pkg")
+        self.assertEqual(self.package(package_dir, "--no-decoder", "--no-promote"), 0)
+        self.assertEqual(((self.feed / "stable").exists(), (self.feed / "latest.json").exists()), (False, False))
+        release = {path.name: path.read_bytes() for path in self.release().iterdir()}
+        self.assertEqual(self.package(package_dir, "--no-decoder"), 0)
+        self.assertEqual({path.name: path.read_bytes() for path in self.release().iterdir()}, release)
+        self.assertEqual(((self.feed / "stable").read_text(), json.loads((self.feed / "latest.json").read_text())),
+                         (f"v{VERSION}\n", json.loads(release["manifest.json"])))
+
     def test_a_second_platform_joins_only_from_the_same_source(self) -> None:
         self.assertEqual(self.package(make_package_dir(self.root / "linux"), "--no-decoder"), 0)
         release_feed.host_platform = lambda: "darwin-arm64"
@@ -361,6 +371,17 @@ class LinuxDecoderTests(FeedFixture):
                 self.release() / manifest["binaries"][0]["file"]) as archive:
             self.assertEqual(handle.read(4), b"\x7fELF")
             self.assertFalse(any(name.endswith((".debug", ".debug.gz")) for name in archive.getnames()))
+
+    def test_a_release_published_without_its_decoder_never_gains_one(self) -> None:
+        shipped, decoder = self.build_split("good", "one")
+        package_dir = make_package_dir(self.root / "pkg", binary=shipped)
+        self.assertEqual(self.package(package_dir, "--no-decoder"), 0)
+        before = {path.name: path.read_bytes() for path in self.release().iterdir()}
+        # The same tarball bytes, now with a decoder: the published row says
+        # it was released without one, so this is a different release.
+        with self.assertRaisesRegex(SystemExit, "with decoder 'omitted', this run says 'attached'"):
+            self.package(package_dir, "--decoder", str(decoder))
+        self.assertEqual({path.name: path.read_bytes() for path in self.release().iterdir()}, before)
 
 
 if __name__ == "__main__":
