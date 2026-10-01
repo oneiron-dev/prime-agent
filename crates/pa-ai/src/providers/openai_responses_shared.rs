@@ -433,6 +433,7 @@ mod tests {
             provider: "openai-codex".into(),
             model: model_id.into(),
             response_model: None,
+            response_model_source: None,
             response_id: None,
             diagnostics: None,
             usage: Usage::default(),

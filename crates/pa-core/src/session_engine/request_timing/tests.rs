@@ -62,6 +62,7 @@ fn empty_partial(model: &pa_agent::types::Model) -> pa_agent::types::AssistantMe
         provider: model.provider.clone(),
         model: model.id.clone(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: None,
         usage: pa_agent::types::Usage::zero(),

@@ -83,6 +83,7 @@ impl SessionNavigation {
     async fn replace_session(&self, file: SessionFile) -> Result<(), String> {
         let branch_entries = file.branch_file_entries();
         let new_path = file.path.clone();
+        let new_session_id = file.session_id().to_string();
         // Prime the new store's usage fold before it enters the core: the
         // summaries the swap's roster pushes read resume from this cache
         // and fold only the appended tail (off the runtime, like the
@@ -100,6 +101,7 @@ impl SessionNavigation {
         // and the runtime.
         let _ = tokio::task::spawn_blocking(move || drop(previous)).await;
         self.engine.set_session_file(new_path.clone());
+        self.engine.set_session_id(new_session_id);
         // TS re-restores the moved-to session's saved model at its runtime
         // recreation (`createRuntime` -> `createAgentSession`): the
         // replacement session resolves to the model its own file pins,

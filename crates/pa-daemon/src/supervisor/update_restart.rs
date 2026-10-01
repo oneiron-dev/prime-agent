@@ -74,6 +74,12 @@ impl Supervisor {
         type_name: &str,
         command: &DaemonCommand,
     ) -> DaemonResponse {
+        // Oneiron fork: a daemon whose install disables self-update never
+        // starts the transaction (no fence, snapshot, or prepared roster),
+        // so `commit_update_restart` has nothing to commit either.
+        if let Some(refusal) = pa_core::update::installer::self_update_refusal() {
+            return response_failure(Some(command_id), type_name, &refusal, None);
+        }
         let DaemonCommand::PrepareUpdateRestart { update_id, .. } = command else {
             return response_failure(
                 Some(command_id),

@@ -50,6 +50,7 @@ fn test_error_turn(
         provider: "test".to_string(),
         model: "m".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: Some(vec![pa_agent::types::AssistantMessageDiagnostic {
             kind: "provider_stream_failure".to_string(),
@@ -77,6 +78,7 @@ fn test_empty_turn(timestamp: i64) -> pa_agent::types::AssistantMessage {
         provider: "test".to_string(),
         model: "m".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: None,
         usage: pa_agent::types::Usage::zero(),
@@ -100,6 +102,7 @@ fn test_progress_turn(timestamp: i64) -> pa_agent::types::AssistantMessage {
         provider: "test".to_string(),
         model: "m".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: None,
         usage: pa_agent::types::Usage::zero(),
@@ -124,6 +127,7 @@ fn wire_error_turn(
         provider: "test".to_string(),
         model: "m".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: Some(vec![pa_types::ai::AssistantMessageDiagnostic {
             type_: "provider_stream_failure".to_string(),

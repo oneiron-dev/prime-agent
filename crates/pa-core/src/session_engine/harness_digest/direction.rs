@@ -32,6 +32,7 @@ fn wire_assistant(text: &str) -> pa_types::session::AgentMessage {
         provider: "test".to_string(),
         model: "digest-direction-m".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: None,
         usage: Usage {

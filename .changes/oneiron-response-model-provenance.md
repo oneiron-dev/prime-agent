@@ -1,0 +1,1 @@
+- Replies now record the provider-reported model id for Anthropic and OpenAI Responses (`responseModel` with `responseModelSource: "provider-response"`) without changing the requested model; an incomplete Responses reply always ends for length.

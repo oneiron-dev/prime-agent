@@ -262,6 +262,11 @@ pub struct AgentSessionEngine {
         std::sync::Mutex<Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>>,
     /// The worker-owned session file (conversation-log path), set at create.
     session_file: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// The worker-owned session's id (the store header's), set at create
+    /// and every replacement swap: each build hands it to the core engine
+    /// as the provider session id (the engine's in-memory manager carries
+    /// a generated id of its own).
+    session_id: std::sync::Mutex<Option<String>>,
     /// The authoritative model selection. Starts from the process fallback
     /// (create config or worker env) and is re-bound when a session's create
     /// command carries explicit wire flags.

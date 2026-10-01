@@ -17,10 +17,10 @@ pub use pa_types::ai::{
     ErrorStopReason, ImageContent, KnownApi, KnownProvider, MaxTokensField, Message, Model,
     ModelCompat, ModelCost, ModelInput, ModelThinkingLevel, NumOrString, OpenAiCompletionsCompat,
     OpenAiResponsesCompat, OpenRouterMaxPrice, OpenRouterRouting, OpenRouterSort,
-    OpenRouterThreshold, Provider, ProviderResponse, ServiceTier, StopReason, TextContent,
-    TextSignaturePhase, TextSignatureV1, ThinkingBudgets, ThinkingContent, ThinkingFormat,
-    ThinkingLevel, ThinkingLevelMap, Tool, ToolCall, ToolResultMessage, Transport, Usage,
-    UsageCost, UserContent as UserMessageContent, UserContentBlock as UserOrToolContent,
+    OpenRouterThreshold, Provider, ProviderResponse, ResponseModelSource, ServiceTier, StopReason,
+    TextContent, TextSignaturePhase, TextSignatureV1, ThinkingBudgets, ThinkingContent,
+    ThinkingFormat, ThinkingLevel, ThinkingLevelMap, Tool, ToolCall, ToolResultMessage, Transport,
+    Usage, UsageCost, UserContent as UserMessageContent, UserContentBlock as UserOrToolContent,
     UserMessage,
 };
 

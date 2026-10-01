@@ -1,0 +1,1 @@
+- `PRIME_AGENT_SOCKET_DIR` (an absolute path) moves the daemon socket, every worker socket and daemon discovery into a separate directory, so a second install can run beside an existing one without sharing endpoints.

@@ -399,6 +399,12 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-skills" | "-ns" => result.no_skills = true,
             "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
             "--no-themes" => result.no_themes = true,
+            // Oneiron fork: user extensions are gone (#3189), but TS-shaped
+            // command lines (the `sol` wrapper, factory workers) still pass
+            // `--no-extensions`. With no extension loader that is already the
+            // behavior, so accept it rather than fail the run. `--extension`
+            // stays an error: silently dropping a requested one would hide it.
+            "--no-extensions" | "-ne" => {}
             "--no-context-files" | "-nc" => result.no_context_files = true,
             "--autonomous" => result.autonomous = true,
             "--autonomous-gate" => {
@@ -559,6 +565,18 @@ mod tests {
             .find(|d| d.is_error)
             .map(|d| d.message.as_str())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn no_extensions_is_an_accepted_no_op() {
+        let baseline = format!("{:?}", parse(&["-p", "hi"]));
+        for flag in ["--no-extensions", "-ne"] {
+            assert_eq!(format!("{:?}", parse(&["-p", flag, "hi"])), baseline);
+        }
+        assert_eq!(
+            last_error(&parse(&["--extension", "x.ts"])),
+            "Unknown option: --extension"
+        );
     }
 
     #[test]

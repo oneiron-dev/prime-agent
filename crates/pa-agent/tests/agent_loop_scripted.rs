@@ -688,6 +688,7 @@ fn scripted_event_shapes_round_trip_through_the_event_enum() {
         provider: model.provider.clone(),
         model: model.id.clone(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: None,
         usage: pa_agent::types::Usage::zero(),

@@ -1,0 +1,1 @@
+- `PRIME_AGENT_DISABLE_SELF_UPDATE=1` makes `prime-agent update` (including `--force`, `--rollback`, and `--archive`), `package update --rollback`, and the `/update` command refuse with one message before downloading or changing anything, and the daemon refuses to prepare an update restart, for installs managed by other tooling.

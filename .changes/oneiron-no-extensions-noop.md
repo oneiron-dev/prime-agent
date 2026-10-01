@@ -1,0 +1,1 @@
+- `--no-extensions` (and `-ne`) is accepted again as a no-op, so existing scripts that pass it keep working now that user extensions are gone.

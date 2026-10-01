@@ -85,6 +85,7 @@ fn tokens_before_anchors_on_last_valid_usage_plus_trailing() {
             provider: "test".to_string(),
             model: "m".to_string(),
             response_model: None,
+            response_model_source: None,
             response_id: None,
             diagnostics: None,
             usage,

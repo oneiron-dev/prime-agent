@@ -329,6 +329,18 @@ pub trait SessionEngine: Send + Sync {
         let _ = path;
     }
 
+    /// Tell the engine the id of the session the worker owns (the store
+    /// header's id — never the supervisor's active session id; a pathless
+    /// `--no-session` store has one too). Provider requests carry it as
+    /// their session id (prompt-cache key, session affinity), like TS
+    /// `createAgentSession` passing `sessionManager.getSessionId()`. The
+    /// worker calls it whenever its store changes identity (create and
+    /// every replacement swap), before the next session build; scripted
+    /// engines ignore it.
+    fn set_session_id(&self, session_id: String) {
+        let _ = session_id;
+    }
+
     /// TS `createAgentSession`'s restored-from-session step: a session
     /// being revived (scheduled wake, update restore, worker relaunch)
     /// restores the model its file pins before the startup chain, giving

@@ -21,8 +21,8 @@ use crate::providers::anthropic::{
     should_use_fine_grained_tool_streaming_beta, AnthropicOptions,
 };
 use crate::types::{
-    done_reason, error_reason, AssistantContent, AssistantMessage, Context, Model, StopReason,
-    TextContent, ThinkingContent, ToolCall, Usage,
+    done_reason, error_reason, AssistantContent, AssistantMessage, Context, Model,
+    ResponseModelSource, StopReason, TextContent, ThinkingContent, ToolCall, Usage,
 };
 use crate::utils_inner::diagnostics::now_ms;
 use crate::utils_inner::http::{send, HttpResponse, RequestOptions};
@@ -141,6 +141,7 @@ pub fn stream_anthropic(
             provider: model.provider.clone(),
             model: model.id.clone(),
             response_model: None,
+            response_model_source: None,
             response_id: None,
             diagnostics: None,
             usage: Usage::default(),
@@ -296,6 +297,15 @@ async fn run_stream(
                         if let Some(message) = event.get("message") {
                             if let Some(id) = message.get("id").and_then(|value| value.as_str()) {
                                 output.response_id = Some(id.to_string());
+                            }
+                            if let Some(served) = message
+                                .get("model")
+                                .and_then(|value| value.as_str())
+                                .filter(|served| !served.trim().is_empty())
+                            {
+                                output.response_model = Some(served.to_string());
+                                output.response_model_source =
+                                    Some(ResponseModelSource::ProviderResponse);
                             }
                             let get = |field: &str| {
                                 message

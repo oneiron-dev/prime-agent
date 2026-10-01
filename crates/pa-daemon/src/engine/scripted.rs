@@ -739,6 +739,7 @@ fn scripted_side_question_turn(
         provider: "scripted".to_string(),
         model: "faux-1".to_string(),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: None,
         usage: pa_agent::types::Usage::zero(),

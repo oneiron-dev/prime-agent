@@ -253,6 +253,7 @@ async fn turn_boundary_host_requests_round_trip_through_a_real_kernel() {
         generic_mcp_servers: Vec::new(),
         allow_recursion: None,
         session_manager: Some(session),
+        provider_session_id: None,
         extra_host_handlers: None,
         conversation_log_path: None,
         additional_skill_paths: Vec::new(),

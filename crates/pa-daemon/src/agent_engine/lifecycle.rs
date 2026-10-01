@@ -181,6 +181,7 @@ impl AgentSessionEngine {
             kernel_release_probe: std::sync::Mutex::new(None),
             registered_jobs_probe: std::sync::Mutex::new(None),
             session_file,
+            session_id: std::sync::Mutex::new(None),
             selection: std::sync::RwLock::new(selection.clone()),
             restored_model: std::sync::Mutex::new(None),
             startup_scope: std::sync::Mutex::new(None),
@@ -1041,6 +1042,14 @@ impl AgentSessionEngine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // Provider requests carry the worker-owned session's id, not the
+        // in-memory manager's generated one below (TS passes the durable
+        // session manager's id into the Agent).
+        let provider_session_id = self
+            .session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         // The engine session carries the session's own directory (the
         // refine path's local harness state and the session's identity)
         // while staying non-persisted: the worker owns the durable
@@ -1131,6 +1140,7 @@ impl AgentSessionEngine {
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager: Some(session_manager),
+            provider_session_id,
             extra_host_handlers: self.extra_host_handlers(),
             conversation_log_path: session_file,
             additional_skill_paths: create_resources.skills,

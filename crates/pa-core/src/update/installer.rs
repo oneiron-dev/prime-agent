@@ -38,6 +38,41 @@ pub const DEFAULT_DOWNLOAD_BASE_URL: &str = "https://pub-728493de92a943e2a9b2d17
 /// override env var stays for tests and pinned installs).
 pub const OFFICIAL_INSTALLER_URL: &str = "https://app.primeintellect.ai/prime-agent/install.sh";
 
+/// Oneiron fork: `PRIME_AGENT_DISABLE_SELF_UPDATE` (`1`/`true`/`yes`), set by
+/// the side-by-side `prime-agent-rs` launcher. The takeover installer stops
+/// every daemon of the TypeScript product and replaces
+/// `~/.local/bin/prime-agent`, so a side-by-side install must never reach it.
+/// Every self-update entry refuses through [`self_update_refusal`]: the
+/// installer funnel ([`run_installer`], the CLI `update` and the TUI
+/// `/update`), the staged native updater (`update --rollback|--archive`,
+/// `package update --rollback`), the restart coordinator, and the daemon's
+/// `prepare_update_restart`.
+pub const ENV_DISABLE_SELF_UPDATE: &str = "PRIME_AGENT_DISABLE_SELF_UPDATE";
+
+/// The refusal every self-update entry reports when this process's
+/// environment disables self-update ([`ENV_DISABLE_SELF_UPDATE`]); `None`
+/// when self-update may run.
+#[must_use]
+pub fn self_update_refusal() -> Option<String> {
+    disables_self_update(std::env::var(ENV_DISABLE_SELF_UPDATE).ok().as_deref()).then(|| {
+        format!(
+            "self-update is disabled for this install ({ENV_DISABLE_SELF_UPDATE}); \
+             install new builds with its own release tooling"
+        )
+    })
+}
+
+/// Whether an `ENV_DISABLE_SELF_UPDATE` value disables self-update (the
+/// CLI's truthy-flag convention: only `1`, `true`, `yes`, case-insensitive).
+fn disables_self_update(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
 /// The small-file budget for the script download (the script is a few KB;
 /// a hung fetch must not hang the update).
 const SCRIPT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -161,6 +196,9 @@ pub async fn run_installer(
     channel: Option<&'static str>,
     output: InstallerOutput,
 ) -> std::result::Result<Installed, UpdateFailure> {
+    if let Some(message) = self_update_refusal() {
+        return Err(UpdateFailure { message });
+    }
     run_installer_from(&installer_script_url(), &install_prefix(), channel, output).await
 }
 
@@ -388,6 +426,26 @@ async fn launcher_version(prefix: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The side-by-side guard: only the truthy spellings disable the
+    /// takeover installer; unset, empty and anything else leave it alone.
+    #[test]
+    fn self_update_guard_uses_the_truthy_convention() {
+        let values = [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("1"),
+            Some(" TRUE "),
+            Some("yes"),
+        ];
+        assert_eq!(
+            values.map(disables_self_update),
+            [false, false, false, false, false, true, true, true]
+        );
+    }
 
     /// The installed-marker channel read: a beta install's update must
     /// stay on beta (the marker the installer writes at publish carries

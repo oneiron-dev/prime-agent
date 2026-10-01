@@ -159,6 +159,7 @@ pub fn stream_google_vertex(
             provider: model.provider.clone(),
             model: model.id.clone(),
             response_model: None,
+            response_model_source: None,
             response_id: None,
             diagnostics: None,
             usage: Usage::default(),

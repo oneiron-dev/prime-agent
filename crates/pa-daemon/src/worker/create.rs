@@ -497,6 +497,10 @@ impl Worker {
         if !store.path.as_os_str().is_empty() {
             self.engine.set_session_file(store.path.clone());
         }
+        // Every arm's store (opened, created, pathless) names the session
+        // the engine's provider requests identify, ahead of the background
+        // build below.
+        self.engine.set_session_id(store.session_id().to_string());
         // The session's settings-seeded switches (TS createAgentSession:
         // the service tier, the queue delivery modes, and the auto-compaction
         // toggle come from the settings manager; the durable prefix records

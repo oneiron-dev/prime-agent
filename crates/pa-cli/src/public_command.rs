@@ -129,8 +129,16 @@ pub fn handle_public_command(args: &[String]) -> PublicCommandResult {
             .iter()
             .any(|a| a == DAEMON_UPDATE_RESTART_COORDINATOR_FLAG)
     {
-        handle_package_command(&args);
-        return handled();
+        // The coordinator's own exit code (TS `process.exitCode`), so a
+        // refused or failed coordinator run does not exit 0.
+        let result = handle_package_command(&args);
+        return PublicCommandResult {
+            handled: true,
+            args: vec![],
+            explicit_agents_view: false,
+            attach_agent: None,
+            exit_code: result.exit_code,
+        };
     }
 
     let separator_index = args.iter().position(|a| a == "--");

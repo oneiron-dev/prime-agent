@@ -99,6 +99,7 @@ pub(crate) fn create_aborted_assistant_message(
             .map_or_else(|| config.model.provider.clone(), |p| p.provider.clone()),
         model: partial_message.map_or_else(|| config.model.id.clone(), |p| p.model.clone()),
         response_model: None,
+        response_model_source: None,
         response_id: None,
         diagnostics: None,
         usage: partial_message.map_or_else(crate::types::Usage::zero, |p| p.usage.clone()),

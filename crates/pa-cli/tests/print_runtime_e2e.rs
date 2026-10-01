@@ -802,21 +802,46 @@ fn print_mode_json_streams_the_threshold_compaction_pair() {
             "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 }
         }),
     );
-    // A small context window so the crossing turn exceeds the threshold:
-    // the ~8.1k seed turn stays below the combined input+output ceiling
-    // (24k window - 4_096 output budget - 4_096 headroom floor = 15_808),
-    // and the ~12k-token crossing turn pushes the context past it (the
-    // faux provider estimates usage from the serialized context).
+    let first = "seed turn".to_string();
+    let second = format!("crossing turn {}", "x".repeat(48_000));
+    // Probe: both turns' settled usage under the default window, measured
+    // rather than modelled — the session's requests carry its id, so the
+    // faux provider simulates prompt caching (its first request counts
+    // the prompt twice) and a turn's usage is not its serialized-context
+    // estimate.
+    let probe_home = isolated_home();
+    let (stdout, stderr, code) = run_in_home(
+        probe_home.path(),
+        &["--mode", "json", "-p", &first, &second],
+        &serde_json::json!({
+            "responses": [{"text": "seed reply"}, {"text": "crossing reply"}]
+        }),
+    );
+    assert_eq!(code, 0, "probe stderr: {stderr}");
+    let usages: Vec<u64> = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["type"] == "message_end" && event["message"]["role"] == "assistant")
+        .filter_map(|event| event["message"]["usage"]["totalTokens"].as_u64())
+        .collect();
+    let [seed_usage, crossing_usage] = usages[..] else {
+        panic!("two assistant usages: {usages:?}");
+    };
+    assert!(
+        crossing_usage > seed_usage + 2_000,
+        "usage: {seed_usage} -> {crossing_usage}"
+    );
+    // A window whose combined input+output ceiling (window - 4_096 output
+    // budget - 4_096 headroom floor) sits midway between the two turns:
+    // the seed turn stays below it and the crossing turn exceeds it.
     let script = serde_json::json!({
-        "contextWindow": 24000,
+        "contextWindow": seed_usage + (crossing_usage - seed_usage) / 2 + 8_192,
         "responses": [
             {"text": "seed reply"},
             {"text": "crossing reply"},
             {"text": "the compaction summary"},
         ]
     });
-    let first = "seed turn".to_string();
-    let second = format!("crossing turn {}", "x".repeat(48_000));
     let (stdout, stderr, code) = run_in_home(
         home.path(),
         &["--mode", "json", "-p", &first, &second],

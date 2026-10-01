@@ -600,6 +600,7 @@ async fn build_headless_engine_with(
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager,
+            provider_session_id: None,
             extra_host_handlers: None,
             conversation_log_path: None,
             additional_skill_paths: config
@@ -1655,6 +1656,7 @@ async fn build_faux_engine_with(
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager,
+            provider_session_id: None,
             extra_host_handlers: None,
             conversation_log_path: None,
             additional_skill_paths: vec![],

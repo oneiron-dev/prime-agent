@@ -989,6 +989,8 @@ mod prompt_image_tests;
 #[cfg(test)]
 mod compaction_admission_tests;
 #[cfg(test)]
+mod provider_session_id_tests;
+#[cfg(test)]
 mod recovery_verdict_tests;
 #[cfg(test)]
 mod replacement_gate_tests;
