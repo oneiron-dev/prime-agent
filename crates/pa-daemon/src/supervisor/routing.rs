@@ -16,6 +16,11 @@ pub(super) enum WakeRoute {
 }
 
 pub(crate) const ROUTE_TIMEOUT_MS: u64 = 30_000;
+/// The route failure for a command whose worker answered nothing inside
+/// the route budget. The worker may still be running it (a turn longer
+/// than [`LONG_ROUTE_TIMEOUT_MS`]), so a client that needs the outcome
+/// waits again rather than treating it as the command's failure.
+pub(crate) const SESSION_WORKER_TIMED_OUT: &str = "Session worker timed out";
 /// The route failure for a worker whose command channel is gone (never
 /// connected, or the writer pump broke on a dead socket): the request did
 /// not leave the supervisor, so the replacement-aware route may retry it
@@ -107,7 +112,7 @@ impl Supervisor {
                     // wait elapsed, or the semaphore closed with its
                     // resident. The budget error is the same one a wedged
                     // worker's silent route produces.
-                    Ok(Err(_)) | Err(_) => return Err(anyhow!("Session worker timed out")),
+                    Ok(Err(_)) | Err(_) => return Err(anyhow!(SESSION_WORKER_TIMED_OUT)),
                 }
             }
         };
@@ -165,7 +170,7 @@ impl Supervisor {
                         }
                         Err(_budget_elapsed) => {
                             resident.pending.lock().await.remove(&request_id);
-                            return Err(anyhow!("Session worker timed out"));
+                            return Err(anyhow!(SESSION_WORKER_TIMED_OUT));
                         }
                     }
                 }
@@ -190,7 +195,7 @@ impl Supervisor {
                 // repeated bounded-timeout routes would otherwise grow the
                 // map without bound).
                 resident.pending.lock().await.remove(&request_id);
-                Err(anyhow!("Session worker timed out"))
+                Err(anyhow!(SESSION_WORKER_TIMED_OUT))
             }
         }
     }
@@ -324,14 +329,14 @@ impl Supervisor {
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                bail!("Session worker timed out");
+                bail!(SESSION_WORKER_TIMED_OUT);
             }
             // Sleep until the route state moves or the deadline passes.
             match tokio::time::timeout_at(deadline, state.changed()).await {
                 Ok(Ok(())) => {}
                 // The resident (and its watch sender) was dropped entirely.
                 Ok(Err(_)) => bail!(WORKER_NOT_CONNECTED),
-                Err(_) => bail!("Session worker timed out"),
+                Err(_) => bail!(SESSION_WORKER_TIMED_OUT),
             }
         }
     }

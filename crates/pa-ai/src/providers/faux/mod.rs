@@ -141,6 +141,11 @@ pub enum FauxResponseStep {
         message: AssistantMessage,
         delay_ms: u64,
     },
+    /// A message held in flight until the request's abort signal fires,
+    /// which settles it as aborted; no timer releases it, so a harness can
+    /// hold a turn mid-flight and end it explicitly. A request without an
+    /// abort signal answers at once. Verification harness only.
+    HeldUntilAborted(AssistantMessage),
     Factory(FauxResponseFactory),
 }
 
@@ -512,6 +517,23 @@ fn create_error_message(
     }
 }
 
+/// The real providers' abort path for a request that dies before any
+/// event streamed (`ProviderError::Aborted`): the stream settles on the
+/// aborted message with no content.
+fn settle_aborted_before_streaming(
+    writer: &AssistantMessageEventWriter,
+    message: &AssistantMessage,
+) {
+    let mut partial = message.clone();
+    partial.content = Vec::new();
+    let aborted = create_aborted_message(&partial);
+    writer.push(AssistantMessageEvent::Error {
+        reason: ErrorStopReason::Aborted,
+        error: aborted.clone(),
+    });
+    writer.end(Some(aborted));
+}
+
 fn create_aborted_message(partial: &AssistantMessage) -> AssistantMessage {
     let mut aborted = partial.clone();
     aborted.stop_reason = StopReason::Aborted;
@@ -830,19 +852,19 @@ pub fn register_faux_provider(options: RegisterFauxProviderOptions) -> FauxProvi
                                 false
                             };
                             if cancelled {
-                                // The real providers' abort path: the request
-                                // dies mid-flight (ProviderError::Aborted),
-                                // the stream settles on the aborted message.
-                                let mut partial = message.clone();
-                                partial.content = Vec::new();
-                                let aborted = create_aborted_message(&partial);
-                                writer.push(AssistantMessageEvent::Error {
-                                    reason: ErrorStopReason::Aborted,
-                                    error: aborted.clone(),
-                                });
-                                writer.end(Some(aborted));
+                                settle_aborted_before_streaming(&writer, &message);
                                 return;
                             }
+                        }
+                        Ok(message)
+                    }
+                    FauxResponseStep::HeldUntilAborted(message) => {
+                        if let Some(signal) =
+                            options.as_ref().and_then(|options| options.signal.clone())
+                        {
+                            signal.cancelled().await;
+                            settle_aborted_before_streaming(&writer, &message);
+                            return;
                         }
                         Ok(message)
                     }

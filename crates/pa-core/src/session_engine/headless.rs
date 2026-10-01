@@ -5,7 +5,9 @@
 
 use pa_types::session::{AgentMessage, FileEntry};
 
-use super::messages::SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE;
+use super::messages::{
+    PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE, SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
+};
 
 pub const COMPACTION_OUTCOME_CUSTOM_TYPE: &str = "compaction_outcome";
 pub const HARNESS_DIGEST_CUSTOM_TYPE: &str = "harness_digest";
@@ -103,6 +105,12 @@ pub struct HeadlessTerminalResult {
 /// Pick the terminal result from the message suffix: compaction outcomes are
 /// collected, internal custom notices are skipped, and the first substantive
 /// message (assistant or slash-command result) is the primary.
+///
+/// The `provider_retry_outcome` disclosure (this port's single row for a
+/// provider-retry episode, persisted after the episode's last assistant)
+/// is skipped too: TS keeps only the per-attempt assistant rows, so its
+/// selection lands on the recovered answer or on the final failed attempt,
+/// and so does this one.
 pub fn select_headless_terminal_result(messages: &[AgentMessage]) -> HeadlessTerminalResult {
     let mut index: i64 = messages.len() as i64 - 1;
     let mut compaction_outcomes: Vec<CompactionOutcome> = Vec::new();
@@ -130,7 +138,8 @@ pub fn select_headless_terminal_result(messages: &[AgentMessage]) -> HeadlessTer
                 // without letting it hide earlier valid outcomes.
                 REFINEMENT_OUTCOME_CUSTOM_TYPE
                 | REFINEMENT_NOTICE_CUSTOM_TYPE
-                | HARNESS_DIGEST_CUSTOM_TYPE => {
+                | HARNESS_DIGEST_CUSTOM_TYPE
+                | PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE => {
                     index -= 1;
                 }
                 _ => break,
@@ -299,6 +308,73 @@ mod tests {
         assert_eq!(result.compaction_outcomes.len(), 2);
         assert_eq!(result.compaction_outcomes[0].content, "compacted 3 entries");
         assert_eq!(result.compaction_outcomes[1].outcome, "failed");
+    }
+
+    /// The rows a provider-retry episode persists, in the worker's order:
+    /// each failed attempt's assistant row, the final attempt's row, then
+    /// the episode's one `provider_retry_outcome` disclosure. The selection
+    /// lands where TS's does (TS persists the same rows minus the
+    /// disclosure): the recovered answer, or the last failed attempt.
+    #[test]
+    fn a_provider_retry_outcome_after_the_final_attempt_is_skipped() {
+        let user = AgentMessage::User(UserMessage {
+            content: UserContent::Text("go".to_string()),
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        });
+        let failed_attempt = |error: &str| {
+            let mut attempt = text_assistant("", StopReason::Error);
+            if let AgentMessage::Assistant(message) = &mut attempt {
+                message.error_message = Some(error.to_string());
+            }
+            attempt
+        };
+        let throttled = "429 Too many concurrent requests";
+        let answer = text_assistant("recovered answer", StopReason::Stop);
+        let recovered = vec![
+            user.clone(),
+            failed_attempt(throttled),
+            answer.clone(),
+            AgentMessage::Custom(
+                crate::session_engine::messages::create_provider_retry_outcome_message(
+                    /*success*/ true, 1, throttled,
+                ),
+            ),
+        ];
+        let AgentMessage::Assistant(answer) = answer else {
+            unreachable!("built as an assistant row");
+        };
+        assert_eq!(
+            select_headless_terminal_result(&recovered),
+            HeadlessTerminalResult {
+                primary: Some(HeadlessPrimary::Assistant(answer)),
+                compaction_outcomes: Vec::new(),
+            }
+        );
+
+        let last_attempt = failed_attempt("provider down");
+        let exhausted = vec![
+            user,
+            failed_attempt(throttled),
+            last_attempt.clone(),
+            AgentMessage::Custom(
+                crate::session_engine::messages::create_provider_retry_outcome_message(
+                    /*success*/ false,
+                    1,
+                    "provider down",
+                ),
+            ),
+        ];
+        let AgentMessage::Assistant(last_attempt) = last_attempt else {
+            unreachable!("built as an assistant row");
+        };
+        assert_eq!(
+            select_headless_terminal_result(&exhausted),
+            HeadlessTerminalResult {
+                primary: Some(HeadlessPrimary::Assistant(last_attempt)),
+                compaction_outcomes: Vec::new(),
+            }
+        );
     }
 
     #[test]

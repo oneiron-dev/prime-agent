@@ -100,6 +100,68 @@ pub struct RuntimeConfig {
     pub initial_goal: Option<InitialGoal>,
 }
 
+impl RuntimeConfig {
+    /// The session's resource-discovery policy from the `--no-skills`,
+    /// `--no-prompt-templates` and `--no-context-files` flags.
+    pub(crate) fn resource_loading(&self) -> pa_core::resources::ResourceLoadingPolicy {
+        use pa_core::resources::ResourceDiscovery;
+        let discovery = |disabled: bool| {
+            if disabled {
+                ResourceDiscovery::Disabled
+            } else {
+                ResourceDiscovery::Enabled
+            }
+        };
+        pa_core::resources::ResourceLoadingPolicy {
+            skills: discovery(self.no_skills),
+            prompt_templates: discovery(self.no_prompt_templates),
+            context_files: discovery(self.no_context_files),
+        }
+    }
+
+    /// The daemon `create` config for a session run in `cwd`: the session
+    /// flags the in-process engine honors, under the TS
+    /// `runtimeConfigFromArgs` names the Rust create contract carries.
+    /// `--api-key` stays off: the in-process path ignores it too, and the
+    /// create config is persisted in the worker descriptor.
+    pub(crate) fn daemon_create_config(&self, cwd: &std::path::Path) -> serde_json::Value {
+        let mut create_config = serde_json::json!({ "cwd": cwd.display().to_string() });
+        if let Some(provider) = &self.provider {
+            create_config["provider"] = serde_json::json!(provider);
+        }
+        if let Some(model) = &self.model {
+            create_config["model"] = serde_json::json!(model);
+        }
+        if let Some(thinking) = self.thinking {
+            create_config["thinking"] = serde_json::json!(thinking.wire_name());
+        }
+        if let Some(system_prompt) = &self.system_prompt {
+            create_config["systemPrompt"] = serde_json::json!(system_prompt);
+        }
+        if !self.append_system_prompt.is_empty() {
+            create_config["appendSystemPrompt"] = serde_json::json!(self.append_system_prompt);
+        }
+        for (key, paths) in [
+            ("skills", &self.skills),
+            ("promptTemplates", &self.prompt_templates),
+        ] {
+            if !paths.is_empty() {
+                create_config[key] = paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+        }
+        if let Some(autonomous) = &self.autonomous {
+            create_config["autonomous"] = serde_json::json!(
+                crate::headless_autonomous::autonomous_runtime_config(autonomous)
+            );
+        }
+        create_config
+    }
+}
+
 /// Session selection options that stay client-side.
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)] // the selection's flag set is the deliberate client-side surface
@@ -140,6 +202,22 @@ pub struct RunOptions {
     pub offline: bool,
     pub agents_view_requested: bool,
     pub attach_agent: Option<String>,
+    /// The json stream's event selection (`--json-event-profile`; output
+    /// projection only, never part of the session config).
+    pub json_event_profile: crate::json_output::JsonEventProfile,
+    /// Where a print/json session runs (`--daemon-hosted`).
+    pub headless_hosting: HeadlessHosting,
+}
+
+/// Where a print/json session runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HeadlessHosting {
+    /// In this process (the default: TS runs non-ACP sessions client-owned).
+    #[default]
+    InProcess,
+    /// Resident in the daemon (`--daemon-hosted`): listed and attachable
+    /// from another terminal while it runs; this client only detaches.
+    Daemon,
 }
 
 /// A missing runtime subsystem, reported as a typed error instead of faked

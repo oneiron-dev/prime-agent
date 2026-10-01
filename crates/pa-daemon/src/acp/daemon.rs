@@ -18,17 +18,13 @@
 //! `get_available_models` for discovery, `set_model` /
 //! `set_thinking_level` for the applied selection.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pa_types::daemon::{
-    DaemonCommand, DaemonCommandEnvelope, DaemonCommandFrameType, DaemonProtocolInfo,
-    DaemonResponse, DAEMON_PROTOCOL_NAME, DAEMON_PROTOCOL_VERSION,
-};
+use pa_types::daemon::DaemonCommand;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex};
 
 use super::jsonrpc::{self, Incoming};
 use super::meta::{self, PrimeAgentEventPhase, PrimeAgentOutcome, PrimeAgentSessionMeta};
@@ -40,158 +36,14 @@ use super::wire_config::{
 };
 use super::wire_events::{self, WireMappingState};
 
-/// Response timeout for turn-long commands (the turn itself bounds them).
-pub(crate) const TURN_TIMEOUT_MS: u64 = 600_000;
-/// Response timeout for session-scoped commands.
-pub(crate) const REQUEST_TIMEOUT_MS: u64 = 30_000;
+use crate::daemon_link::{DaemonLink, LinkFrame, ResponseWait};
 
-/// One inbound supervisor frame, classified by the reader.
-enum LinkFrame {
-    Event(Value),
-    Response(DaemonResponse),
-}
-
-/// A client connection to the supervisor socket: JSONL command envelopes
-/// out, responses matched by id, session events forwarded raw.
-pub(crate) struct DaemonLink {
-    writer: mpsc::UnboundedSender<String>,
-    pending: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<DaemonResponse>>>>,
-    frames: Mutex<mpsc::UnboundedReceiver<LinkFrame>>,
-    protocol_version: u64,
-    next_request_id: std::sync::atomic::AtomicU64,
-}
-
-impl DaemonLink {
-    /// Connect and complete the `daemon_hello` handshake.
-    async fn connect(socket_path: &Path) -> anyhow::Result<Self> {
-        let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            pa_types::platform::transport::connect_transport(socket_path),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out connecting to the daemon socket"))??;
-        let (reader_half, writer_half) = stream.split();
-        let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
-        let (frame_tx, frame_rx) = mpsc::unbounded_channel::<LinkFrame>();
-        let (hello_tx, hello_rx) = oneshot::channel::<Value>();
-        let pending: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<DaemonResponse>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
-
-        tokio::spawn(async move {
-            let mut writer = writer_half;
-            while let Some(line) = line_rx.recv().await {
-                let mut payload = line.into_bytes();
-                payload.push(b'\n');
-                if writer.write_all(&payload).await.is_err() {
-                    break;
-                }
-            }
-            let _ = writer.shutdown().await;
-        });
-        // The reader only classifies frames; the consumer loop below owns
-        // the ordering: every session event observed before a response on
-        // the wire is published before that response resolves its caller,
-        // so a turn's chunks always precede its boundary frames.
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(reader_half);
-            let mut line = String::new();
-            let mut hello_tx = Some(hello_tx);
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-                    continue;
-                };
-                match value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                {
-                    "daemon_hello" => {
-                        if let Some(tx) = hello_tx.take() {
-                            let _ = tx.send(value);
-                        }
-                    }
-                    "response" => {
-                        let Ok(response) = serde_json::from_value::<DaemonResponse>(value.clone())
-                        else {
-                            continue;
-                        };
-                        let _ = frame_tx.send(LinkFrame::Response(response));
-                    }
-                    "session_event" => {
-                        let _ = frame_tx.send(LinkFrame::Event(value));
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        let hello = tokio::time::timeout(std::time::Duration::from_secs(3), hello_rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("the daemon did not send its handshake"))?
-            .map_err(|_| anyhow::anyhow!("the daemon connection closed before the handshake"))?;
-        let protocol = hello
-            .get("protocol")
-            .cloned()
-            .and_then(|p| serde_json::from_value::<DaemonProtocolInfo>(p).ok())
-            .unwrap_or(DaemonProtocolInfo {
-                name: DAEMON_PROTOCOL_NAME.to_string(),
-                version: DAEMON_PROTOCOL_VERSION,
-            });
-        let version = protocol.version.min(DAEMON_PROTOCOL_VERSION);
-        Ok(DaemonLink {
-            writer: line_tx,
-            pending,
-            frames: Mutex::new(frame_rx),
-            protocol_version: version,
-            next_request_id: std::sync::atomic::AtomicU64::new(0),
-        })
-    }
-
-    /// Send one command envelope and wait for the matching response.
-    pub(crate) async fn request(
-        &self,
-        command: DaemonCommand,
-        timeout_ms: u64,
-    ) -> anyhow::Result<DaemonResponse> {
-        use std::sync::atomic::Ordering;
-        let id = format!(
-            "acp-{}",
-            self.next_request_id.fetch_add(1, Ordering::SeqCst) + 1
-        );
-        let envelope = DaemonCommandEnvelope {
-            frame_type: DaemonCommandFrameType::Command,
-            id: id.clone(),
-            protocol: DaemonProtocolInfo {
-                name: DAEMON_PROTOCOL_NAME.to_string(),
-                version: self.protocol_version,
-            },
-            client_id: Some(format!("acp:{}", std::process::id())),
-            command,
-        };
-        let line = serde_json::to_string(&envelope)?;
-        let (tx, rx) = oneshot::channel::<DaemonResponse>();
-        self.pending.lock().unwrap().insert(id.clone(), tx);
-        if self.writer.send(line).is_err() {
-            // A closed writer leaves the pending slot behind otherwise; a
-            // link that never answers again would grow one entry per
-            // request.
-            self.pending.lock().unwrap().remove(&id);
-            anyhow::bail!("the daemon connection is closed");
-        }
-        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx)
-            .await
-            .map_err(|_| {
-                self.pending.lock().unwrap().remove(&id);
-                anyhow::anyhow!("timed out waiting for the daemon response")
-            })?
-            .map_err(|_| anyhow::anyhow!("the daemon connection closed mid-request"))
-    }
-}
+/// Response bound for turn-long commands (the turn itself bounds them).
+pub(crate) const TURN_TIMEOUT: ResponseWait =
+    ResponseWait::Within(std::time::Duration::from_mins(10));
+/// Response bound for session-scoped commands.
+pub(crate) const REQUEST_TIMEOUT: ResponseWait =
+    ResponseWait::Within(std::time::Duration::from_secs(30));
 
 /// Everything the daemon-attached mode needs from the composition.
 #[derive(Clone)]
@@ -274,7 +126,7 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
         }
     });
 
-    let link = Arc::new(DaemonLink::connect(&options.socket_path).await?);
+    let link = Arc::new(DaemonLink::connect(&options.socket_path, "acp").await?);
     let state = Arc::new(Mutex::new(DaemonAcpState::default()));
 
     // Session events and responses share one socket, so one consumer owns
@@ -362,14 +214,15 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                             });
                         }
                     }
-                    LinkFrame::Response(response) => {
-                        let id = response.id.clone().unwrap_or_default();
-                        if let Some(tx) = link.pending.lock().unwrap().remove(&id) {
-                            let _ = tx.send(response);
-                        }
-                    }
+                    LinkFrame::Response(response) => link.resolve(response),
+                    // Lifecycle and roster frames carry nothing the ACP
+                    // surface maps (the session's own events ride
+                    // `session_event`).
+                    LinkFrame::Other(_) => {}
                 }
             }
+            // The connection ended: no response will ever arrive.
+            link.fail_pending();
         });
     }
 
@@ -558,7 +411,7 @@ async fn handle_session_new(
         launch_env: None,
         rest: Map::default(),
     };
-    let create_response = match link.request(create, REQUEST_TIMEOUT_MS).await {
+    let create_response = match link.request(create, REQUEST_TIMEOUT).await {
         Ok(response) => response,
         Err(error) => {
             *state.lock().await = DaemonAcpState::default();
@@ -593,7 +446,7 @@ async fn handle_session_new(
         launch_env: None,
         rest: Map::default(),
     };
-    if let Ok(response) = link.request(attach, REQUEST_TIMEOUT_MS).await {
+    if let Ok(response) = link.request(attach, REQUEST_TIMEOUT).await {
         if !response.success {
             let failure = response
                 .error
@@ -605,7 +458,7 @@ async fn handle_session_new(
                         active_session_id: daemon_active_session_id.clone(),
                         rest: Map::default(),
                     },
-                    REQUEST_TIMEOUT_MS,
+                    REQUEST_TIMEOUT,
                 )
                 .await;
             *state.lock().await = DaemonAcpState::default();
@@ -655,7 +508,7 @@ async fn handle_session_new(
                     active_session_id: hosted.daemon_active_session_id.clone(),
                     rest: Map::default(),
                 },
-                REQUEST_TIMEOUT_MS,
+                REQUEST_TIMEOUT,
             )
             .await;
         *state.lock().await = DaemonAcpState::default();
@@ -718,7 +571,7 @@ async fn replace_session_servers(
                 servers: serde_json::to_value(resolved)?,
                 rest: Map::default(),
             },
-            REQUEST_TIMEOUT_MS,
+            REQUEST_TIMEOUT,
         )
         .await?;
     if !response.success {
@@ -814,7 +667,7 @@ async fn handle_session_prompt(
         },
         rest: Map::default(),
     };
-    let response = match link.request(prompt, TURN_TIMEOUT_MS).await {
+    let response = match link.request(prompt, TURN_TIMEOUT).await {
         Ok(response) => response,
         Err(error) => {
             producer.finish_prompt(turn_id).await;
@@ -986,7 +839,7 @@ async fn fetch_autonomous_status(
                 wait_for_rlm_quiescence: None,
                 rest: Map::default(),
             },
-            TURN_TIMEOUT_MS,
+            TURN_TIMEOUT,
         )
         .await
         .ok()?;
@@ -1022,7 +875,7 @@ async fn session_cancel(
         rest: Map::default(),
     };
     drop(guard);
-    let _ = link.request(abort, REQUEST_TIMEOUT_MS).await;
+    let _ = link.request(abort, REQUEST_TIMEOUT).await;
     Ok(())
 }
 
@@ -1064,7 +917,7 @@ async fn handle_session_close(
                 active_session_id: hosted.daemon_active_session_id.clone(),
                 rest: Map::default(),
             },
-            REQUEST_TIMEOUT_MS,
+            REQUEST_TIMEOUT,
         )
         .await;
     if !hosted.mcp_server_names.is_empty() {
@@ -1082,7 +935,7 @@ async fn handle_session_close(
                 active_session_id: hosted.daemon_active_session_id.clone(),
                 rest: Map::default(),
             },
-            REQUEST_TIMEOUT_MS,
+            REQUEST_TIMEOUT,
         )
         .await;
     let _ = hosted.config.queue.lock().await;
@@ -1108,7 +961,7 @@ async fn teardown(link: &Arc<DaemonLink>, state: &Arc<Mutex<DaemonAcpState>>) {
                 active_session_id: hosted.daemon_active_session_id.clone(),
                 rest: Map::default(),
             },
-            REQUEST_TIMEOUT_MS,
+            REQUEST_TIMEOUT,
         )
         .await;
     let _ = link
@@ -1118,7 +971,7 @@ async fn teardown(link: &Arc<DaemonLink>, state: &Arc<Mutex<DaemonAcpState>>) {
                 active_session_id: hosted.daemon_active_session_id.clone(),
                 rest: Map::default(),
             },
-            REQUEST_TIMEOUT_MS,
+            REQUEST_TIMEOUT,
         )
         .await;
     let _ = hosted.config.queue.lock().await;

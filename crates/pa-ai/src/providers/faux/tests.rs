@@ -1164,3 +1164,53 @@ async fn unregisters_the_provider() {
         "expected no API provider registered for api: {api}"
     );
 }
+
+/// A held response streams nothing until the abort signal fires and then
+/// settles aborted: a virtual day passes first (paused time auto-advances
+/// once the runtime idles), so no timer releases the hold.
+#[tokio::test(start_paused = true)]
+async fn a_held_response_waits_for_the_abort_signal() {
+    let registration = register();
+    registration.set_responses(vec![FauxResponseStep::HeldUntilAborted(
+        faux_assistant_message(
+            vec![faux_text("held")],
+            FauxAssistantMessageOptions::default(),
+        ),
+    )]);
+    let signal = tokio_util::sync::CancellationToken::new();
+    let mut s = stream(
+        &registration.get_model(),
+        &Context {
+            system_prompt: None,
+            messages: vec![user_text("hi")],
+            tools: None,
+        },
+        Some(StreamOptions {
+            signal: Some(signal.clone()),
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+    tokio::select! {
+        event = s.next_event() => {
+            panic!("the hold released on its own: {:?}", event.map(|event| event.event_type()));
+        }
+        () = tokio::time::sleep(std::time::Duration::from_hours(24)) => {}
+    }
+    signal.cancel();
+    let mut types = Vec::new();
+    while let Some(event) = s.next_event().await {
+        types.push(event.event_type());
+    }
+    assert_eq!(types, ["error"]);
+    let settled = s.result().await;
+    assert_eq!(
+        (settled.stop_reason, settled.content, settled.error_message),
+        (
+            StopReason::Aborted,
+            Vec::new(),
+            Some("Request was aborted".to_string())
+        )
+    );
+    registration.unregister();
+}

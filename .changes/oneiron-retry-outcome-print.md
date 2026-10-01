@@ -1,0 +1,1 @@
+- A text-mode print run whose provider recovered after retries prints its answer again: the retry outcome row no longer hides the final reply.

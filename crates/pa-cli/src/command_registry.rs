@@ -277,10 +277,18 @@ const TOP_LEVEL_OPTION_GROUPS: &[OptionGroup] = &[
                 "--mode <text|json|rpc|acp|daemon>",
                 "Select the output mode (default: text)",
             ),
+            (
+                "--json-event-profile <all|factory-completed>",
+                "Select JSON events (default: all; factory omits progressive snapshots)",
+            ),
             ("--cwd <dir>", "Use a specific working directory"),
             ("--offline", "Disable startup network operations"),
             ("--verbose", "Force verbose startup"),
             ("--daemon-socket <path>", "Use a specific daemon socket"),
+            (
+                "--daemon-hosted",
+                "Let the daemon own this non-interactive session so it can be attached",
+            ),
         ],
     },
     OptionGroup {
