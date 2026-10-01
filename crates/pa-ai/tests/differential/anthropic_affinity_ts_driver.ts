@@ -9,16 +9,29 @@
  * lowercased, in wire order, and the parsed JSON body. Dropped: the headers
  * only the TS SDK client adds (`x-stainless-*`, its `Anthropic/JS`
  * user-agent, `content-type`) and transport framing (`host`, `connection`,
- * `accept-encoding`, `content-length`).
+ * `accept-encoding`, `content-length`). A case's `messages` replaces the
+ * default single user turn (the conversation cache-marker shapes).
  *
- * Run from a TS checkout of the fork with node_modules (the source of
- * truth is the deployed fork tip, bf4d2c6ca):
- *   bun anthropic_affinity_ts_driver.ts <fixture.json> > <fixture.json.new>
+ * The provider loads from the current directory, which must be the root of
+ * a disposable checkout of the TS fork at its deployed tip (bf4d2c6ca), never
+ * the live install. From this repo's root:
+ *   scratch=$(mktemp -d)
+ *   git archive --format=tar --output="$scratch/ts.tar" bf4d2c6ca
+ *   tar -xf "$scratch/ts.tar" -C "$scratch"
+ *   bun install --cwd "$scratch" --ignore-scripts
+ *   (cd "$scratch" && bun "$OLDPWD/crates/pa-ai/tests/differential/anthropic_affinity_ts_driver.ts" \
+ *     "$OLDPWD/crates/pa-ai/tests/testdata/anthropic_session_affinity_ts.json") > fixture.new
+ * then replace the fixture with `fixture.new` and run `ts_capture_parity`.
  */
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
-import { streamAnthropic } from "./packages/ai/src/providers/anthropic.ts";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const { streamAnthropic } = await import(
+	pathToFileURL(join(process.cwd(), "packages/ai/src/providers/anthropic.ts")).href
+);
 
 type CaseInput = {
 	provider?: string;
@@ -28,6 +41,7 @@ type CaseInput = {
 	sessionId?: string;
 	cacheRetention?: "none" | "short" | "long";
 	headers?: Record<string, string>;
+	messages?: unknown[];
 };
 
 const SDK_OR_TRANSPORT = new Set(["content-type", "connection", "host", "accept-encoding", "content-length"]);
@@ -69,7 +83,7 @@ for (const { name, input } of fixture) {
 		provider: input.provider ?? "cpa-a",
 		baseUrl: `http://127.0.0.1:${port}`,
 		reasoning: false,
-		input: ["text"],
+		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 200000,
 		maxTokens: 32000,
@@ -78,7 +92,7 @@ for (const { name, input } of fixture) {
 	};
 	const context = {
 		systemPrompt: "You are terse.",
-		messages: [{ role: "user", content: "Say hello.", timestamp: 1 }],
+		messages: input.messages ?? [{ role: "user", content: "Say hello.", timestamp: 1 }],
 		tools: [
 			{
 				name: "read",

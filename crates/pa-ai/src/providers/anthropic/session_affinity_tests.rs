@@ -31,6 +31,9 @@ struct CaseInput {
     session_id: Option<String>,
     cache_retention: Option<CacheRetention>,
     headers: Option<HashMap<String, String>>,
+    /// Replaces the default single user turn (the conversation
+    /// cache-marker shapes).
+    messages: Option<Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -50,7 +53,7 @@ fn model(input: &CaseInput) -> Model {
     let mut model = json!({
         "id": "claude-test", "name": "Claude Test", "api": "anthropic-messages",
         "provider": input.provider.as_deref().unwrap_or("cpa-a"),
-        "baseUrl": "https://api.anthropic.com", "reasoning": false, "input": ["text"],
+        "baseUrl": "https://api.anthropic.com", "reasoning": false, "input": ["text", "image"],
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
         "contextWindow": 200_000, "maxTokens": 32_000
     });
@@ -63,11 +66,14 @@ fn model(input: &CaseInput) -> Model {
     serde_json::from_value(model).unwrap()
 }
 
-/// The TS driver's request: a system prompt, one user turn, one tool.
-fn context() -> Context {
-    serde_json::from_value(json!({
+/// Capture the TS driver's request for `input`: a system prompt, the case's
+/// messages (one user turn by default), one tool.
+async fn capture(input: &CaseInput) -> CapturedRequest {
+    let context: Context = serde_json::from_value(json!({
         "systemPrompt": "You are terse.",
-        "messages": [{"role": "user", "content": "Say hello.", "timestamp": 1}],
+        "messages": input.messages.clone().unwrap_or_else(
+            || json!([{"role": "user", "content": "Say hello.", "timestamp": 1}])
+        ),
         "tools": [{
             "name": "read", "description": "Read a file",
             "parameters": {
@@ -77,10 +83,7 @@ fn context() -> Context {
             }
         }]
     }))
-    .unwrap()
-}
-
-async fn capture(input: &CaseInput) -> CapturedRequest {
+    .unwrap();
     let options = AnthropicOptions::from_base(StreamOptions {
         api_key: Some(input.api_key.clone().unwrap_or_else(|| "test-key".into())),
         session_id: input.session_id.clone(),
@@ -88,7 +91,7 @@ async fn capture(input: &CaseInput) -> CapturedRequest {
         headers: input.headers.clone(),
         ..Default::default()
     });
-    capture_request(model(input), &context(), &options).await
+    capture_request(model(input), &context, &options).await
 }
 
 fn opted_in(session_id: &str) -> CaseInput {
@@ -320,14 +323,15 @@ const TS_ONLY_COPILOT_HEADERS: [&str; 3] =
 /// Every fixture input crosses the wire exactly as the TS fork sent it:
 /// the provider's own headers (compared as multisets, so a duplicate shows)
 /// and the whole JSON body, cache markers included, in every client mode
-/// (API key, OAuth, cloudflare gateway, github-copilot) and under explicit
-/// overrides of the client's own version and auth headers. The transport's
-/// own framing (`host`, `content-length`, `accept-encoding`) is not
-/// compared.
+/// (API key, OAuth, cloudflare gateway, github-copilot), under explicit
+/// overrides of the client's own version and auth headers, and for the
+/// conversation-marker shapes (a final image, two final text blocks,
+/// grouped tool results, a final assistant turn). The transport's own
+/// framing (`host`, `content-length`, `accept-encoding`) is not compared.
 #[tokio::test]
 async fn ts_capture_parity() {
     let cases: Vec<ParityCase> = serde_json::from_str(TS_CAPTURE).unwrap();
-    assert_eq!(cases.len(), 25, "the fixture carries every case");
+    assert_eq!(cases.len(), 29, "the fixture carries every case");
     for mut case in cases {
         if case.input.provider.as_deref() == Some("github-copilot") {
             case.ts
