@@ -1366,7 +1366,7 @@ const KERNEL_MEMORY_ACTIONS: &[&str] = &["warn", "child", "trim", "end"];
 /// Why a kernel memory step fired.
 const KERNEL_MEMORY_CAUSES: &[&str] = &["limit", "hard", "grace", "machine"];
 
-/// `kernel memory action` (v2, additive): one per memory step a kernel
+/// `kernel memory action` (v2, schema revision 3): one per memory step a kernel
 /// takes - a warning owed to the model, a stopped child process unit, the
 /// largest variables deleted, or the kernel ended. Sizes are bytes; no
 /// variable or process name, pid, path, or message text.
@@ -1385,7 +1385,7 @@ const KERNEL_MEMORY_ACTION: EventRule = EventRule {
     ],
 };
 
-/// `kernel snapshot guard` (v2, additive): a namespace snapshot capture or
+/// `kernel snapshot guard` (v2, schema revision 3): a namespace snapshot capture or
 /// restore whose file-handle guard skipped, refused, or purged at least one
 /// value. Counts only; no names or snapshot content.
 const KERNEL_SNAPSHOT_GUARD: EventRule = EventRule {
