@@ -9,21 +9,30 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
+/// Inherited variable families the sandbox never passes on: the product's
+/// own configuration (agent and session dirs, sockets, kernel venv/python,
+/// package dir, telemetry) and a factory seat's launch overlay.
+const SCRUBBED_ENV_PREFIXES: [&str; 4] = ["PRIME_AGENT_", "PI_", "PA_DAEMON_", "W7_CARGO_"];
+
 fn run_in_home(home: &Path, args: &[&str], script: &Value) -> (String, String, i32) {
-    let output = Command::new(env!("CARGO_BIN_EXE_prime-agent"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_prime-agent"));
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|name| {
+            SCRUBBED_ENV_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        }) {
+            command.env_remove(name);
+        }
+    }
+    let output = command
         .args(args)
         .env("HOME", home)
+        .env("TMPDIR", home)
         .env("PRIME_AGENT_FAUX_SCRIPT", script.to_string())
         // The isolated HOME stays authoritative, and nothing here may
-        // reach a telemetry endpoint or flip the telemetry opt-out.
-        .env_remove("PRIME_AGENT_CODING_AGENT_DIR")
-        .env_remove("PRIME_AGENT_SESSION_DIR")
-        .env_remove("PRIME_AGENT_CODING_AGENT_SESSION_DIR")
-        .env_remove("PRIME_AGENT_TELEMETRY")
-        .env_remove("PRIME_AGENT_TELEMETRY_ENDPOINT")
-        .env_remove("PRIME_AGENT_TELEMETRY_API_KEY")
+        // flip the telemetry opt-out.
         .env_remove("DO_NOT_TRACK")
-        .env_remove("PI_OFFLINE")
         .env_remove("RLM_DEPTH")
         .current_dir(home)
         .output()
@@ -43,17 +52,23 @@ fn json_lines(stdout: &str) -> Vec<Value> {
         .expect("every stdout line is one JSON object")
 }
 
-/// Replace the per-run identity (session id, wall-clock stamps) so two
-/// runs of the same script compare whole-object.
+/// Replace the per-run identity (session id, wall-clock stamps, the usage
+/// estimate, generated tool-call ids) so two runs of the same script
+/// compare whole-object.
 fn normalized(mut value: Value) -> Value {
     fn walk(value: &mut Value) {
         match value {
             Value::Object(map) => {
+                let tool_call = map.get("type") == Some(&json!("toolCall"));
                 for (key, child) in map.iter_mut() {
-                    if key == "timestamp" {
-                        *child = json!("<timestamp>");
-                    } else {
-                        walk(child);
+                    match key.as_str() {
+                        "timestamp" => *child = json!("<timestamp>"),
+                        // The faux usage estimate sizes the run's own
+                        // system prompt, which carries per-run identity.
+                        "usage" => *child = json!("<usage>"),
+                        "toolCallId" => *child = json!("<tool-call-id>"),
+                        "id" if tool_call => *child = json!("<tool-call-id>"),
+                        _ => walk(child),
                     }
                 }
             }
@@ -119,6 +134,66 @@ fn factory_completed_stream_is_the_full_stream_minus_progressive_snapshots() {
         .cloned()
         .collect();
     assert_eq!(reduced[1..].to_vec(), expected_events);
+}
+
+/// The same projection over a richer run: two prompts, a thinking block,
+/// and a real `bash` tool call with its result. The reduced stream is still
+/// the full stream minus exactly the progressive events, with every final
+/// message, tool start/end and result retained.
+#[test]
+fn factory_completed_keeps_every_completed_event_of_a_tool_run() {
+    let home = tempfile::TempDir::new().unwrap();
+    let script = json!({ "responses": [
+        { "content": [
+            { "type": "thinking", "thinking": "plan the probe" },
+            { "type": "toolCall", "name": "bash", "arguments": { "command": "printf lane-probe" } },
+        ] },
+        "the tool printed lane-probe",
+        "second prompt answered",
+    ] });
+    let run = |profile: &str| {
+        let (stdout, stderr, code) = run_in_home(
+            home.path(),
+            &[
+                "--mode",
+                "json",
+                "--json-event-profile",
+                profile,
+                "-p",
+                "first prompt",
+                "second prompt",
+            ],
+            &script,
+        );
+        assert_eq!(code, 0, "stderr: {stderr}");
+        json_lines(&stdout)
+            .into_iter()
+            .map(normalized)
+            .collect::<Vec<_>>()
+    };
+    let all = run("all");
+    let reduced = run("factory-completed");
+    let all_types: Vec<&str> = all.iter().map(event_type).collect();
+    for retained in ["tool_execution_start", "tool_execution_end", "message_end"] {
+        assert!(all_types.contains(&retained), "{retained}: {all_types:?}");
+    }
+    assert_eq!(
+        all_types
+            .iter()
+            .filter(|kind| **kind == "agent_end")
+            .count(),
+        2,
+        "one run per prompt: {all_types:?}"
+    );
+    let mut expected_header = all[0].clone();
+    expected_header["jsonEventProfile"] = json!("factory-completed");
+    assert_eq!(reduced[0], expected_header);
+    let expected: Vec<Value> = all[1..]
+        .iter()
+        .filter(|line| !matches!(event_type(line), "message_update" | "tool_execution_update"))
+        .cloned()
+        .collect();
+    assert_eq!(reduced[1..].to_vec(), expected);
 }
 
 /// `--json-event-profile` outside an explicit json run is a usage error.

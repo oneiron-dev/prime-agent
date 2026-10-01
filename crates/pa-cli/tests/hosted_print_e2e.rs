@@ -23,6 +23,11 @@ use serde_json::{json, Value};
 /// Failure bound for one awaited step.
 const STEP_BOUND: Duration = Duration::from_mins(2);
 
+/// Inherited variable families the sandbox never passes on: the product's
+/// own configuration (agent dir, sockets, kernel venv/python, package dir,
+/// worker role, event logs) and a factory seat's launch overlay.
+const SCRUBBED_ENV_PREFIXES: [&str; 4] = ["PRIME_AGENT_", "PI_", "PA_DAEMON_", "W7_CARGO_"];
+
 /// One test's sandbox: HOME, the daemon socket, the worker socket dir, and
 /// the faux worker script. Dropping it shuts the sandbox daemon down.
 struct Sandbox {
@@ -46,10 +51,19 @@ impl Sandbox {
     }
 
     /// The CLI under test, sandboxed: nothing ambient (agent dir, sockets,
-    /// provider keys, worker role) leaks in, and the daemon it starts
-    /// inherits the same sandbox (offline, short orphan window).
+    /// kernel paths, provider keys, worker role) leaks in, and the daemon it
+    /// starts inherits the same sandbox (offline, short orphan window).
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_prime-agent"));
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| {
+                SCRUBBED_ENV_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+            }) {
+                command.env_remove(name);
+            }
+        }
         command
             .arg("--daemon-socket")
             .arg(self.socket())
@@ -359,11 +373,11 @@ fn continue_and_resume_reuse_the_live_worker() {
 /// no progressive snapshots.
 #[test]
 fn second_client_attaches_and_a_signal_only_detaches() {
-    // The turn holds in flight until aborted (the faux delay races the
-    // abort signal), so the attach and the signal land mid-run.
+    // The turn holds in flight until aborted (no timer releases it), so the
+    // attach and the signal land mid-run.
     let sandbox = Sandbox::new(&json!({
         "engine": "faux",
-        "responses": [{ "text": "held", "delayMs": 600_000 }],
+        "responses": [{ "text": "held", "holdUntilAborted": true }],
     }));
     let mut child = sandbox
         .command(&[
@@ -458,5 +472,209 @@ fn hosted_refuses_what_it_cannot_honor() {
         let (stdout, stderr, code) = sandbox.run(args);
         assert_eq!((stdout.as_str(), stderr.as_str(), code), ("", expected, 1));
     }
+    // A factory seat's cargo overlay cannot reach a daemon worker.
+    let output = sandbox
+        .command(&["--daemon-hosted", "-p", "x"])
+        .env("W7_CARGO_WORK", sandbox.home())
+        .output()
+        .expect("binary present");
+    assert_eq!(
+        (
+            String::from_utf8_lossy(&output.stdout).as_ref(),
+            String::from_utf8_lossy(&output.stderr).as_ref(),
+            output.status.code(),
+        ),
+        (
+            "",
+            "Error: --daemon-hosted cannot be combined with the launch environment (W7_CARGO_WORK) yet: the daemon session does not receive it\n",
+            Some(1),
+        )
+    );
     assert!(!sandbox.socket().exists(), "no daemon was started");
+}
+
+/// One hosted run's stream with its per-run identity masked (the session
+/// id wherever it appears, wall-clock stamps, the usage estimate), so two
+/// runs compare whole.
+fn normalized_run(lines: Vec<Value>) -> Vec<Value> {
+    fn walk(value: &mut Value, session_id: &str) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map.iter_mut() {
+                    match key.as_str() {
+                        "timestamp" => *child = json!("<timestamp>"),
+                        // The faux usage estimate sizes the run's own
+                        // system prompt, which carries per-run identity.
+                        "usage" => *child = json!("<usage>"),
+                        _ => walk(child, session_id),
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, session_id);
+                }
+            }
+            Value::String(text) => {
+                if text.contains(session_id) {
+                    *text = text.replace(session_id, "<session-id>");
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+    let session_id = lines[0]["id"].as_str().expect("the header id").to_string();
+    lines
+        .into_iter()
+        .map(|mut line| {
+            walk(&mut line, &session_id);
+            line
+        })
+        .collect()
+}
+
+/// The two json profiles over hosted sessions: the reduced stream is the
+/// full stream minus exactly the progressive `message_update` and
+/// `tool_execution_update` events, and only its header carries the marker.
+#[test]
+fn hosted_profiles_differ_by_exactly_the_progressive_snapshots() {
+    let sandbox = Sandbox::new(&json!({
+        "engine": "faux",
+        "responses": ["a hosted answer streamed in several deltas"],
+    }));
+    let run = |profile: &str| {
+        let (stdout, stderr, code) = sandbox.run(&[
+            "--mode",
+            "json",
+            "--json-event-profile",
+            profile,
+            "--daemon-hosted",
+            "-p",
+            "hi",
+        ]);
+        assert_eq!(code, 0, "stderr: {stderr}");
+        normalized_run(json_lines(&stdout))
+    };
+    let all = run("all");
+    let reduced = run("factory-completed");
+    assert!(
+        types(&all).contains(&"message_update"),
+        "the full stream carries the progressive snapshots: {:?}",
+        types(&all)
+    );
+    let mut expected_header = all[0].clone();
+    expected_header["jsonEventProfile"] = json!("factory-completed");
+    assert_eq!(reduced[0], expected_header);
+    assert_eq!(all[0].get("jsonEventProfile"), None);
+    let expected: Vec<Value> = all[1..]
+        .iter()
+        .filter(|line| {
+            !matches!(
+                line["type"].as_str(),
+                Some("message_update" | "tool_execution_update")
+            )
+        })
+        .cloned()
+        .collect();
+    assert_eq!(reduced[1..].to_vec(), expected);
+}
+
+/// `-c` resolves on the client against the exact cwd and `--session-dir`:
+/// with a newer session for another cwd in the same dir, it continues this
+/// cwd's session, and every session lands in that dir.
+#[test]
+fn continue_picks_this_cwds_session_in_the_session_dir() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ONE", "TWO"] }));
+    let sessions = sandbox.home().join("seat-sessions");
+    let project = |name: &str| {
+        let dir = sandbox.home().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.display().to_string()
+    };
+    let (project_a, project_b) = (project("project-a"), project("project-b"));
+    let run = |cwd: &str, extra: &[&str], prompt: &str| {
+        let mut args = vec![
+            "--daemon-hosted",
+            "--cwd",
+            cwd,
+            "--session-dir",
+            sessions.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        args.extend(["-p", prompt]);
+        let (_, stderr, code) = sandbox.run(&args);
+        assert_eq!(code, 0, "stderr: {stderr}");
+    };
+    run(&project_a, &[], "a one");
+    run(&project_b, &[], "b one");
+    run(&project_a, &["-c"], "a two");
+    // The session files (the dir also holds daemon bookkeeping, such as
+    // the RLM spawn ledger): each with its header cwd and user rows.
+    let mut saved: Vec<(String, Vec<String>)> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .filter_map(|entry| {
+            let file = entry.unwrap().path().display().to_string();
+            let first_line = std::fs::read_to_string(&file)
+                .ok()?
+                .lines()
+                .next()
+                .map(str::to_string)?;
+            let header: Value = serde_json::from_str(&first_line).ok()?;
+            (header["type"] == "session").then(|| {
+                (
+                    header["cwd"].as_str().unwrap().to_string(),
+                    user_texts(&file),
+                )
+            })
+        })
+        .collect();
+    saved.sort();
+    assert_eq!(
+        saved,
+        [
+            (project_a, vec!["a one".to_string(), "a two".to_string()]),
+            (project_b, vec!["b one".to_string()]),
+        ]
+    );
+}
+
+/// A path-like `--resume` selector relative to this process's directory
+/// reaches the saved file when the session's stored cwd is elsewhere: the
+/// daemon receives the absolute path (a relative one would resolve against
+/// the worker's cwd and miss the file).
+#[test]
+fn a_relative_resume_path_reaches_the_saved_session() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["HOSTED"] }));
+    let project = sandbox.home().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    // An in-process run saves the session; no daemon worker hosts it.
+    let output = sandbox
+        .command(&["--cwd", project.to_str().unwrap(), "-p", "one"])
+        .env(
+            "PRIME_AGENT_FAUX_SCRIPT",
+            json!({ "responses": ["SAVED"] }).to_string(),
+        )
+        .output()
+        .expect("binary present");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "SAVED\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved: Vec<PathBuf> = std::fs::read_dir(sandbox.home().join(".prime/agent/sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let relative = saved[0].strip_prefix(sandbox.home()).unwrap();
+    let (stdout, stderr, code) = sandbox.run(&[
+        "--daemon-hosted",
+        "--resume",
+        relative.to_str().unwrap(),
+        "-p",
+        "two",
+    ]);
+    assert_eq!((stdout.as_str(), code), ("HOSTED\n", 0), "stderr: {stderr}");
+    assert_eq!(user_texts(saved[0].to_str().unwrap()), ["one", "two"]);
 }
