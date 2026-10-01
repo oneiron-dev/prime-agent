@@ -17,7 +17,8 @@ const UNKNOWN: &str = "unknown";
 const MAX_VERSION_LENGTH: usize = 64;
 
 /// The catalog's property-rule revision (additive rule changes bump it).
-pub const SCHEMA_REVISION: u64 = 2;
+/// 3: `provider session affinity configured` joined the catalog.
+pub const SCHEMA_REVISION: u64 = 3;
 
 /// The `cpu_baseline` values.
 const CPU_AVX2: &str = "avx2";

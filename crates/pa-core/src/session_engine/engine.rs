@@ -812,6 +812,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // Same lifetime for the `rlm child usage attributed` adoption
         // event: the producer's flush reports through this handle.
         wiring.rlm_usage.set_telemetry(telemetry.clone());
+        // `provider session affinity configured`: the assembly-time model
+        // (only the full registry model carries its compat).
+        if let Some(model) = config.model_info.as_ref() {
+            telemetry.note_provider_affinity(model);
+        }
     }
     let goal_driver = wiring.runtime.goal_driver().clone();
     Ok(SessionEngine {
@@ -835,7 +840,8 @@ impl SessionEngine {
     /// Live model-facts bookkeeping for the turn-boundary surface: after
     /// a model switch the registered `model.info` handler and the context
     /// window the usage estimate reads follow the model the session now
-    /// runs (the TS runtime reads both live, not at assembly time).
+    /// runs (the TS runtime reads both live, not at assembly time). The
+    /// switched-to model's session-affinity configuration reports too.
     pub fn update_model_facts(&self, model: &pa_types::ai::Model) {
         super::turn_boundary::TurnBoundaryRequests::rebind_model_facts(
             &self.turn_boundary,
@@ -846,6 +852,9 @@ impl SessionEngine {
             },
             (model.context_window > 0).then_some(model.context_window),
         );
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.note_provider_affinity(model);
+        }
     }
 
     /// The session's kernel provisioner as a weak reference (TS

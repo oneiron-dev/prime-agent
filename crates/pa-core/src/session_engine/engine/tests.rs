@@ -448,3 +448,83 @@ async fn loop_requests_carry_the_provider_session_id() {
         ]
     );
 }
+
+/// `provider session affinity configured`: a depth-0 session reports its
+/// Anthropic model's opt-in at assembly and again at each live model
+/// switch (other APIs report nothing); a subagent session never reports.
+/// Only the configuration primitives ride the event.
+#[tokio::test]
+async fn affinity_configuration_reports_at_assembly_and_model_switch() {
+    fn registry_model(api: &str, compat: Option<serde_json::Value>) -> pa_types::ai::Model {
+        let mut model = serde_json::json!({
+            "id": "claude-test", "name": "Claude Test", "api": api, "provider": "cpa-a",
+            "baseUrl": "http://localhost:8317", "reasoning": false, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 200_000, "maxTokens": 32_000
+        });
+        if let Some(compat) = compat {
+            model["compat"] = compat;
+        }
+        serde_json::from_value(model).unwrap()
+    }
+    let opted_in = registry_model(
+        "anthropic-messages",
+        Some(serde_json::json!({ "sendSessionAffinityHeaders": true })),
+    );
+    let switches = [
+        registry_model("anthropic-messages", None),
+        registry_model(
+            "openai-completions",
+            Some(serde_json::json!({ "sendSessionAffinityHeaders": true })),
+        ),
+    ];
+    let reported = |rlm_depth: Option<u32>| {
+        let opted_in = opted_in.clone();
+        let switches = switches.clone();
+        async move {
+            let mock = Arc::new(pa_telemetry::MockSink::new());
+            let mut client_config = pa_telemetry::TelemetryClientConfig::new("install-1");
+            client_config.sinks = vec![mock.clone() as Arc<dyn pa_telemetry::TelemetrySink>];
+            let client = pa_telemetry::TelemetryClient::spawn(client_config).unwrap();
+            let agent_model: Model =
+                crate::session_engine::provider_adapter::json_round_trip(&opted_in).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = tmp.path().join("project");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let engine = create_session(SessionEngineConfig {
+                cwd,
+                agent_dir: tmp.path().join("agent"),
+                model: Some(agent_model.clone()),
+                model_info: Some(opted_in),
+                stream_fn: Some(Arc::new(ScriptedProvider::new(agent_model)).stream_fn()),
+                telemetry: Some(crate::session_engine::telemetry::TelemetryWiring {
+                    client: client.clone(),
+                    execution_mode: Some("interactive".to_string()),
+                    now: None,
+                }),
+                rlm_depth,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            for model in &switches {
+                engine.update_model_facts(model);
+            }
+            client.flush().await.unwrap();
+            mock.events()
+                .iter()
+                .filter(|event| event.name == "provider session affinity configured")
+                .map(|event| serde_json::to_value(&event.properties).unwrap())
+                .collect::<Vec<_>>()
+        }
+    };
+    let expected = |enabled: bool| {
+        let mut properties = pa_telemetry::base_properties("interactive");
+        properties.set("api", serde_json::json!("anthropic-messages"));
+        properties.set("key_format", serde_json::json!("sha256-base64url"));
+        properties.set("enabled", serde_json::json!(enabled));
+        serde_json::to_value(&properties).unwrap()
+    };
+    assert_eq!(reported(None).await, vec![expected(true), expected(false)]);
+    assert_eq!(reported(Some(1)).await, Vec::<serde_json::Value>::new());
+}
