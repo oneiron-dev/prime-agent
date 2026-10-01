@@ -188,6 +188,7 @@ impl AgentSessionEngine {
             initial_selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
             service_tier: std::sync::RwLock::new(None),
+            transport: std::sync::RwLock::new(None),
             session: tokio::sync::Mutex::new(None),
             session_build: tokio::sync::Mutex::new(()),
             pending_branch: std::sync::Mutex::new(None),
@@ -1031,6 +1032,7 @@ impl AgentSessionEngine {
                 api_key,
                 model: model.clone(),
                 headers,
+                transport: *self.transport.read().expect("transport lock"),
             });
         }
         if let Some(session_dir) = &self.config.session_dir {

@@ -392,6 +392,18 @@ impl SessionEngine for AgentSessionEngine {
         }
     }
 
+    fn configure_transport(&self, transport: pa_types::ai::Transport) {
+        *self.transport.write().expect("transport lock") = Some(transport);
+        if let Some(target) = self
+            .provider_target
+            .write()
+            .expect("provider target lock")
+            .as_mut()
+        {
+            target.transport = Some(transport);
+        }
+    }
+
     fn configure_model(&self, selection: EngineModelSelection) {
         // Merge like the TS runtime config: explicit wire flags replace the
         // current selection; absent fields keep it.
@@ -485,6 +497,7 @@ impl SessionEngine for AgentSessionEngine {
                 api_key,
                 model: model.clone(),
                 headers,
+                transport: *self.transport.read().expect("transport lock"),
             });
         }
         let session = self.session.blocking_lock();

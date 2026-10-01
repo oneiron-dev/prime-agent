@@ -327,6 +327,7 @@ impl AgentSessionEngine {
                                     api_key,
                                     model: next.clone(),
                                     headers,
+                                    transport: *self.transport.read().expect("transport lock"),
                                 });
                             }
                         }
@@ -374,6 +375,7 @@ impl AgentSessionEngine {
                                     api_key: primary_api_key,
                                     model: primary_model.clone(),
                                     headers: primary_headers,
+                                    transport: *self.transport.read().expect("transport lock"),
                                 });
                             }
                         }

@@ -302,6 +302,10 @@ pub struct AgentSessionEngine {
     /// during a live turn stay side-effect-free.
     effective_thinking: std::sync::RwLock<Option<pa_types::ai::ModelThinkingLevel>>,
     pub(crate) service_tier: std::sync::RwLock<Option<pa_types::ai::ServiceTier>>,
+    /// The session's provider transport preference (the `transport`
+    /// setting, seeded at create and switched by `set_transport`): every
+    /// provider target the engine builds carries it.
+    pub(crate) transport: std::sync::RwLock<Option<pa_types::ai::Transport>>,
     /// Built once on the first prompt, reused across prompts, shared
     /// behind an Arc: a running model turn (the admission in
     /// `run_turn_once`), a compaction summarizer, and a refinement run

@@ -144,6 +144,7 @@ impl AgentSessionEngine {
                         api_key: self.resolve_request_api_key(&resolved.model),
                         model: resolved.model.clone(),
                         headers: self.resolve_request_key_and_headers(&resolved.model).1,
+                        transport: *self.transport.read().expect("transport lock"),
                     },
                     agent_override: pa_agent::agent::AgentModelOverride {
                         thinking_level: map_thinking_level(resolved.thinking_level),
@@ -233,6 +234,7 @@ impl AgentSessionEngine {
                     api_key,
                     headers,
                     model,
+                    transport: *self.transport.read().expect("transport lock"),
                 })
             }
             Err(_) => route.session_target,
