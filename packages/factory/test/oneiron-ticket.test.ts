@@ -481,14 +481,19 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 	const ended = event({ type: "agent_end" });
 	const STOPS = "stops before prompting that session again";
 	const CONTINUES = "continues the same session";
+	const failed = (output: string) => ({ code: 1, output });
+	const silent = (output: string) => ({ code: SEAT_IDLE_EXIT_CODE, output });
+	const unstarted = { code: 127, output: "\nspawn /opt/prime-agent-rs ENOENT", spawnFailed: true as const };
 	it.each([
-		["daemon", "died mid-turn", STOPS, 1, started],
-		["daemon", "was killed for silence before its turn began", STOPS, SEAT_IDLE_EXIT_CODE, "\nIDLE 1800s"],
-		["daemon", "was killed for silence after its turn ended", CONTINUES, SEAT_IDLE_EXIT_CODE, started + reply("") + ended],
-		["owned", "died mid-turn", CONTINUES, 1, started],
+		["daemon", "died mid-turn", STOPS, failed(started)],
+		["daemon", "was killed for silence before its turn began", STOPS, silent("\nIDLE 1800s")],
+		["daemon", "exited before any event, its prompt possibly admitted", STOPS, failed("daemon closed\n")],
+		["daemon", "was killed for silence after its turn ended", CONTINUES, silent(started + reply("") + ended)],
+		["daemon", "could not be started at all", CONTINUES, unstarted],
+		["owned", "died mid-turn", CONTINUES, failed(started)],
 	] as const)(
 		"under %s custody, a writer whose seat client %s %s",
-		async (hosting, _case, outcome, code, output) => {
+		async (hosting, _case, outcome, first) => {
 			const f = setup();
 			const ticket = f.ticket("custody-one");
 			ticket.launcher = {
@@ -506,11 +511,11 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 			const calls: string[][] = [];
 			runner.run = async (argv) => {
 				calls.push(argv);
-				return calls.length === 1 ? { code, output } : { code: 0, output: started + reply("DONE custody-one") + ended };
+				return calls.length === 1 ? first : { code: 0, output: started + reply("DONE custody-one") + ended };
 			};
 			const rounds = runner.writerRounds("write", "start", "continue");
 			if (outcome === STOPS) {
-				await expect(rounds).rejects.toThrow("before its daemon-hosted turn ended; that turn may still be running");
+				await expect(rounds).rejects.toThrow("before its daemon-hosted turn was seen to end; that turn may still be");
 				expect(calls).toHaveLength(1);
 			} else {
 				expect((await rounds).final).toBe("DONE custody-one");

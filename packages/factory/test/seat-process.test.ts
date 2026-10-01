@@ -128,6 +128,11 @@ describe("seat process output", () => {
 		const missing = new FakeChild();
 		const failed = runProcess(["no-such-agent"], options, spawnFake(missing).spawn);
 		missing.emit("error", new Error("spawn no-such-agent ENOENT"));
-		expect(await failed).toEqual({ code: 127, output: "\nspawn no-such-agent ENOENT" });
+		expect(await failed).toEqual({ code: 127, output: "\nspawn no-such-agent ENOENT", spawnFailed: true });
+		// An error from a child that did start is not a spawn failure.
+		const started = Object.assign(new FakeChild(), { pid: 4242 });
+		const errored = runProcess(["agent"], options, spawnFake(started).spawn);
+		started.emit("error", new Error("kill EPERM"));
+		expect(await errored).toEqual({ code: 127, output: "\nkill EPERM" });
 	});
 });

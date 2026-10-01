@@ -11,6 +11,8 @@ const KILL_GRACE_MS = 10_000;
 export interface Exec {
 	code: number;
 	output: string;
+	/** The process never started (the executable could not be spawned), so nothing it would have done happened. */
+	spawnFailed?: true;
 }
 
 export interface ProcessOptions {
@@ -75,7 +77,11 @@ export function runProcess(argv: string[], options: ProcessOptions, spawn: Spawn
 		child.stderr!.on("data", collect);
 		child.on("error", (error) => {
 			clearTimeout(timer);
-			resolve({ code: 127, output: `${output}\n${error.message}` });
+			resolve({
+				code: 127,
+				output: `${output}\n${error.message}`,
+				...(child.pid === undefined ? { spawnFailed: true as const } : {}),
+			});
 		});
 		child.on("close", (code, signal) => {
 			clearTimeout(timer);

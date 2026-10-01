@@ -67,9 +67,10 @@ PRIME_AGENT_FACTORY_AGENT_BIN=/absolute/path/prime-agent-rs \
   turn; the next round continues the same session file with `-c`.
 - `daemon`: seats pass `--daemon-hosted`; the agent daemon holds the session, which stays attachable from another
   terminal. Killing a silent seat only detaches its client, and the resident turn can still be running. So a seat
-  whose stream ends without the turn's `agent_end` (killed for silence, or a client that died mid-turn) stops the
-  ticket with a custody failure instead of prompting that session again: settle the turn (attach and wait for it,
-  or stop it), then resolve the attempt. Use it when attachability matters more than unattended continuation.
+  whose stream does not show its turn's `agent_end` (killed for silence, or a client that died before or during
+  the turn) stops the ticket with a custody failure instead of prompting that session again, unless the client
+  never started at all: settle the turn (attach and wait for it, or stop it), then resolve the attempt. Use it
+  when attachability matters more than unattended continuation.
 
 Every seat's environment drops inherited worker authority (`PRIME_AGENT_INTERNAL_*`) and the runner's routing
 credentials (`TYPESAFE_JEV_API_KEY`, `FACTORY_ADVISOR_API_KEY`). The TS build's legacy owned-worker frontend switch
