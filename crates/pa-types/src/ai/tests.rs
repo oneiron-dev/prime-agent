@@ -187,6 +187,31 @@ fn model_with_compat_roundtrip() {
     );
 }
 
+/// The WebSocket opt-in alone selects the Responses compat view and keeps
+/// its explicit `supportsWebSocket` spelling both ways.
+#[test]
+fn supports_web_socket_selects_the_responses_compat() {
+    let compat: ModelCompat =
+        serde_json::from_str(r#"{"supportsWebSocket":true,"supportsLongCacheRetention":false}"#)
+            .unwrap();
+    assert_eq!(
+        compat.kind().unwrap(),
+        CompatKind::OpenAiResponses(OpenAiResponsesCompat {
+            send_session_id_header: None,
+            supports_long_cache_retention: Some(false),
+            supports_web_socket: Some(true),
+        })
+    );
+    let encoded = ModelCompat::from_kind(CompatKind::OpenAiResponses(OpenAiResponsesCompat {
+        supports_web_socket: Some(false),
+        ..OpenAiResponsesCompat::default()
+    }));
+    assert_eq!(
+        serde_json::to_value(&encoded).unwrap(),
+        serde_json::json!({ "supportsWebSocket": false })
+    );
+}
+
 #[test]
 fn user_content_untagged_text_block_roundtrips_losslessly() {
     // Live session files carry user text blocks without a `type` tag

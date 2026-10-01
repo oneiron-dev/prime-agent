@@ -33,7 +33,8 @@ use pa_telemetry::{
 use serde_json::Value;
 
 use super::auto_retry::AutoRetryEvent;
-use super::error_classify::classify_error_message;
+use super::error_classify::{classify_error_message, classify_transport_failure};
+use super::provider_retry::{provider_stream_failure_details, provider_stream_failure_kind};
 
 // The one-shot daemon/worker event trackers (the `daemon event` and
 // `model refused` one-shot surfaces the supervisor notes/adoption/sessions
@@ -559,6 +560,17 @@ impl SessionTelemetry {
         self.client.track("rlm child usage attributed", properties);
     }
 
+    /// `agent provider transport used`: the session's provider requests
+    /// reached the model over the Responses WebSocket transport (fed once
+    /// per session by the transport adoption seam). The API name only.
+    pub fn note_provider_transport_used(&self, api: &str) {
+        let mut properties = self.session_properties();
+        properties.set("api", Value::from(api));
+        properties.set("transport", Value::from("websocket"));
+        self.client
+            .track("agent provider transport used", properties);
+    }
+
     /// `agent command used`: builtin session commands only, canonical name.
     /// Feed from `session_commands::execute_session_command` (TS
     /// `captureAgentCommandUsed`).
@@ -715,6 +727,16 @@ fn handle_event(
                 resolve_run_started(client, &mut state, RunTrigger::Continuation);
                 let is_error = assistant.stop_reason == StopReason::Error;
                 let error_message = is_error.then(|| assistant.error_message.clone()).flatten();
+                // A structured transport failure classifies by its recorded
+                // cause (`websocket_<cause>`), never by its message text.
+                let transport_failure = (is_error
+                    && provider_stream_failure_kind(&assistant).as_deref() == Some("transport"))
+                .then(|| {
+                    provider_stream_failure_details(&assistant)
+                        .and_then(|details| details.get("providerErrorType"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
                 let cost_total = assistant.usage.cost.total;
                 if let Some(run) = state.active_run.as_mut() {
                     run.usage.add(&assistant.usage);
@@ -737,8 +759,14 @@ fn handle_event(
                     let run_started = state.active_run.as_ref().map_or(now, |run| run.started_at);
                     state.consecutive_failure_count += 1;
                     let error_id = uuid();
-                    let classification =
-                        classify_error_message(error_message.as_deref().unwrap_or_default());
+                    let classification = match &transport_failure {
+                        Some(provider_error_type) => {
+                            classify_transport_failure(provider_error_type.as_deref())
+                        }
+                        None => {
+                            classify_error_message(error_message.as_deref().unwrap_or_default())
+                        }
+                    };
                     let raw_length = error_message
                         .as_deref()
                         .map_or(0, |message| message.chars().count() as u64);

@@ -1,0 +1,1808 @@
+//! Generic Responses WebSocket provider behavior, driven through
+//! `stream_openai_responses` against the scripted loopback server: the
+//! transport selection matrix, handshake headers, socket reuse and delta
+//! continuation, fallback rules, terminal handling, ownership, and the
+//! transport half of the drop/retry/continuation/fallback scenario.
+
+use serde_json::{json, Map, Value};
+use tokio_util::sync::CancellationToken;
+
+use super::mock_server::{self, MockServer, Record, SseReply, Turn, Upgrade};
+use super::resolve_responses_websocket_url;
+use crate::providers::openai_responses::{stream_openai_responses, OpenAIResponsesOptions};
+use crate::types::{
+    AssistantContent, AssistantMessage, CacheRetention, Context, Message, Model, StopReason,
+    StreamOptions, Transport, UserMessage, UserMessageContent,
+};
+
+fn model(base_url: &str, compat: Option<Value>) -> Model {
+    let mut model = json!({
+        "id": "gpt-ws", "name": "gpt-ws", "api": "openai-responses", "provider": "cpa-r",
+        "baseUrl": base_url, "reasoning": false, "input": ["text"],
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 100_000, "maxTokens": 1000,
+    });
+    if let Some(compat) = compat {
+        model["compat"] = compat;
+    }
+    serde_json::from_value(model).expect("test model")
+}
+
+fn ws_model(server: &MockServer) -> Model {
+    model(&server.base_url, Some(json!({ "supportsWebSocket": true })))
+}
+
+fn user(text: &str) -> Message {
+    Message::User(UserMessage {
+        content: UserMessageContent::Text(text.to_string()),
+        timestamp: 1,
+        rest: Map::default(),
+    })
+}
+
+/// No system prompt, so input counts are exactly the conversation items.
+fn context(messages: Vec<Message>) -> Context {
+    Context {
+        system_prompt: None,
+        messages,
+        tools: None,
+    }
+}
+
+fn options(session_id: Option<&str>, transport: Option<Transport>) -> OpenAIResponsesOptions {
+    OpenAIResponsesOptions::from_base(StreamOptions {
+        api_key: Some("test-key".to_string()),
+        session_id: session_id.map(str::to_string),
+        transport,
+        ..StreamOptions::default()
+    })
+}
+
+async fn run(
+    model: &Model,
+    context: &Context,
+    options: &OpenAIResponsesOptions,
+) -> AssistantMessage {
+    stream_openai_responses(model, context, Some(options))
+        .result()
+        .await
+}
+
+/// A complete text response: lifecycle, one message item, terminal.
+fn response(id: &str, text: &str) -> Vec<Value> {
+    let mut events = vec![json!({ "type": "response.created", "response": { "id": id } })];
+    events.extend(text_item(id, text));
+    events.push(completed(id));
+    events
+}
+
+fn text_item(id: &str, text: &str) -> Vec<Value> {
+    let item_id = format!("msg_{id}");
+    vec![
+        json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": { "type": "message", "id": item_id, "role": "assistant", "status": "in_progress", "content": [] },
+        }),
+        json!({
+            "type": "response.content_part.added", "output_index": 0, "content_index": 0,
+            "part": { "type": "output_text", "text": "" },
+        }),
+        json!({
+            "type": "response.output_text.delta", "output_index": 0, "content_index": 0,
+            "delta": text,
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "item": { "type": "message", "id": item_id, "role": "assistant", "status": "completed",
+                      "content": [{ "type": "output_text", "text": text }] },
+        }),
+    ]
+}
+
+fn completed(id: &str) -> Value {
+    json!({
+        "type": "response.completed",
+        "response": { "id": id, "status": "completed",
+                      "usage": { "input_tokens": 5, "output_tokens": 3, "total_tokens": 8 } },
+    })
+}
+
+fn text_of(message: &AssistantMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            AssistantContent::Thinking(_) | AssistantContent::ToolCall(_) => None,
+        })
+        .collect()
+}
+
+/// The compact shape of one observed request: where it went, which
+/// response it continues, and how many input items it carries.
+#[derive(Debug, PartialEq, Eq)]
+enum Seen {
+    Upgrade(usize),
+    Ws {
+        connection: usize,
+        previous: Option<String>,
+        inputs: usize,
+    },
+    Sse {
+        previous: Option<String>,
+        inputs: usize,
+    },
+}
+
+fn seen(records: Vec<Record>) -> Vec<Seen> {
+    let summary = |body: &Value| {
+        (
+            body.get("previous_response_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            body.get("input")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+        )
+    };
+    // Connection ends are timing-dependent (a socket closes after its
+    // request settles): the request shape leaves them out.
+    records
+        .into_iter()
+        .filter_map(|record| match record {
+            Record::Upgrade { connection, .. } => Some(Seen::Upgrade(connection)),
+            Record::WsRequest {
+                connection, body, ..
+            } => {
+                let (previous, inputs) = summary(&body);
+                Some(Seen::Ws {
+                    connection,
+                    previous,
+                    inputs,
+                })
+            }
+            Record::SseRequest { body, .. } => {
+                let (previous, inputs) = summary(&body);
+                Some(Seen::Sse { previous, inputs })
+            }
+            Record::FrameStarted { .. } | Record::Closed { .. } => None,
+        })
+        .collect()
+}
+
+fn diagnostic(message: &AssistantMessage, kind: &str) -> Option<Value> {
+    message
+        .diagnostics
+        .as_deref()?
+        .iter()
+        .find(|diagnostic| diagnostic.type_ == kind)
+        .map(|diagnostic| {
+            let mut value = serde_json::to_value(diagnostic).expect("diagnostic json");
+            value.as_object_mut().expect("object").remove("timestamp");
+            value
+        })
+}
+
+#[test]
+fn websocket_urls_derive_from_the_base_url() {
+    for (base, expected) in [
+        ("", "wss://api.openai.com/v1/responses"),
+        (
+            "  https://api.example.com/v1/  ",
+            "wss://api.example.com/v1/responses",
+        ),
+        (
+            "http://127.0.0.1:8317/v1",
+            "ws://127.0.0.1:8317/v1/responses",
+        ),
+        (
+            "http://127.0.0.1:8317/v1/responses",
+            "ws://127.0.0.1:8317/v1/responses",
+        ),
+        (
+            "https://gw.example.com/v1?team=a",
+            "wss://gw.example.com/v1/responses?team=a",
+        ),
+        ("https://gw.example.com", "wss://gw.example.com/responses"),
+    ] {
+        assert_eq!(
+            resolve_responses_websocket_url(base).as_deref(),
+            Ok(expected),
+            "{base:?}"
+        );
+    }
+}
+
+/// `auto` uses the socket only for an opted-in model; `sse` never does;
+/// the explicit WebSocket transports do regardless of the opt-in.
+#[tokio::test]
+async fn transport_selection_follows_the_opt_in_and_explicit_modes() {
+    let cases: [(Option<Value>, Option<Transport>, bool); 7] = [
+        (None, None, false),
+        (
+            Some(json!({ "supportsWebSocket": false })),
+            Some(Transport::Auto),
+            false,
+        ),
+        (Some(json!({ "supportsWebSocket": true })), None, true),
+        (
+            Some(json!({ "supportsWebSocket": true })),
+            Some(Transport::Sse),
+            false,
+        ),
+        (None, Some(Transport::Websocket), true),
+        (
+            Some(json!({ "supportsWebSocket": false })),
+            Some(Transport::WebsocketCached),
+            true,
+        ),
+        (Some(json!({ "sendSessionIdHeader": true })), None, false),
+    ];
+    for (compat, transport, uses_socket) in cases {
+        let mut server = mock_server::spawn(
+            vec![Upgrade::Accept(vec![Turn::Events(response(
+                "resp_1", "hi",
+            ))])],
+            vec![SseReply::Events(response("resp_1", "hi"))],
+        )
+        .await;
+        let message = run(
+            &model(&server.base_url, compat.clone()),
+            &context(vec![user("hello")]),
+            &options(None, transport),
+        )
+        .await;
+        assert_eq!(text_of(&message), "hi", "{compat:?} {transport:?}");
+        let expected = if uses_socket {
+            vec![
+                Seen::Upgrade(1),
+                Seen::Ws {
+                    connection: 1,
+                    previous: None,
+                    inputs: 1,
+                },
+            ]
+        } else {
+            vec![Seen::Sse {
+                previous: None,
+                inputs: 1,
+            }]
+        };
+        assert_eq!(seen(server.drain()), expected, "{compat:?} {transport:?}");
+    }
+}
+
+/// The affinity-relevant handshake headers of the first upgrade in
+/// `records`, sorted by name (the mock lowercases names).
+fn upgrade_headers(records: &[Record]) -> Vec<(String, String)> {
+    let Some(Record::Upgrade { headers, .. }) = records.first() else {
+        panic!("expected an upgrade first: {records:?}");
+    };
+    let mut ours: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "x-team" | "x-model-only" | "session_id" | "x-client-request-id" | "authorization"
+            )
+        })
+        .cloned()
+        .collect();
+    ours.sort();
+    ours
+}
+
+fn pair(name: &str, value: &str) -> (String, String) {
+    (name.to_string(), value.to_string())
+}
+
+/// A WebSocket model with two model headers, one of which a request
+/// header overrides (case-insensitively) in the tests below.
+fn model_with_headers(server: &MockServer, compat: Value) -> Model {
+    let mut ws = model(&server.base_url, Some(compat));
+    ws.headers = Some(
+        [pair("X-Team", "model"), pair("X-Model-Only", "m")]
+            .into_iter()
+            .collect(),
+    );
+    ws
+}
+
+/// The handshake carries the SSE header set in the TS order: model
+/// headers, the cache/session affinity pair, request overrides (case
+/// insensitive), then the bearer credential; the body is the SSE body
+/// framed as `response.create`, cache key included.
+#[tokio::test]
+async fn handshake_headers_follow_the_sse_precedence() {
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(vec![Turn::Events(response("resp_1", "a"))])],
+        Vec::new(),
+    )
+    .await;
+    let ws = model_with_headers(&server, json!({ "supportsWebSocket": true }));
+    let mut request = options(Some("hdr-session"), None);
+    request.base.headers = Some([pair("x-team", "override")].into_iter().collect());
+    run(&ws, &context(vec![user("one")]), &request).await;
+    let records = server.drain();
+    assert_eq!(
+        upgrade_headers(&records),
+        vec![
+            pair("authorization", "Bearer test-key"),
+            pair("session_id", "hdr-session"),
+            pair("x-client-request-id", "hdr-session"),
+            pair("x-model-only", "m"),
+            pair("x-team", "override"),
+        ]
+    );
+    let Record::WsRequest { body, .. } = &records[1] else {
+        panic!("expected the request: {records:?}");
+    };
+    assert_eq!(body["type"], json!("response.create"));
+    assert_eq!(body["prompt_cache_key"], json!("hdr-session"));
+}
+
+/// `cacheRetention: none` drops the affinity pair and the cache key but
+/// keeps the session's socket ownership (the second request reuses it).
+#[tokio::test]
+async fn no_cache_retention_drops_affinity_but_keeps_the_socket() {
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(vec![
+            Turn::Events(response("resp_1", "a")),
+            Turn::Events(response("resp_2", "b")),
+        ])],
+        Vec::new(),
+    )
+    .await;
+    let ws = model_with_headers(&server, json!({ "supportsWebSocket": true }));
+    let mut no_cache = options(Some("hdr-none"), None);
+    no_cache.base.cache_retention = Some(CacheRetention::None);
+    run(&ws, &context(vec![user("one")]), &no_cache).await;
+    run(&ws, &context(vec![user("two")]), &no_cache).await;
+    let records = server.drain();
+    assert_eq!(
+        upgrade_headers(&records),
+        vec![
+            pair("authorization", "Bearer test-key"),
+            pair("x-model-only", "m"),
+            pair("x-team", "model"),
+        ]
+    );
+    let Record::WsRequest { body, .. } = &records[1] else {
+        panic!("expected the request: {records:?}");
+    };
+    assert_eq!(body.get("prompt_cache_key"), None);
+    assert_eq!(
+        seen(records),
+        vec![
+            Seen::Upgrade(1),
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+        ]
+    );
+}
+
+/// `sendSessionIdHeader: false` drops only `session_id`; the request id
+/// header stays.
+#[tokio::test]
+async fn send_session_id_header_false_drops_only_session_id() {
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(vec![Turn::Events(response("resp_1", "a"))])],
+        Vec::new(),
+    )
+    .await;
+    let quiet = model_with_headers(
+        &server,
+        json!({ "supportsWebSocket": true, "sendSessionIdHeader": false }),
+    );
+    run(
+        &quiet,
+        &context(vec![user("one")]),
+        &options(Some("hdr-quiet"), None),
+    )
+    .await;
+    assert_eq!(
+        upgrade_headers(&server.drain()),
+        vec![
+            pair("authorization", "Bearer test-key"),
+            pair("x-client-request-id", "hdr-quiet"),
+            pair("x-model-only", "m"),
+            pair("x-team", "model"),
+        ]
+    );
+}
+
+/// The response hook sees the synthetic 101 handshake (no headers).
+#[tokio::test]
+async fn the_response_hook_sees_the_synthetic_upgrade() {
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(vec![Turn::Events(response(
+            "resp_1", "ok",
+        ))])],
+        Vec::new(),
+    )
+    .await;
+    let seen_responses = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&seen_responses);
+    let mut request = options(None, None);
+    request.base.on_response = Some(std::sync::Arc::new(move |response, _model| {
+        sink.lock()
+            .unwrap()
+            .push((response.status, response.headers));
+    }));
+    let message = run(&ws_model(&server), &context(vec![user("hi")]), &request).await;
+    assert_eq!(text_of(&message), "ok");
+    assert_eq!(
+        *seen_responses.lock().unwrap(),
+        vec![(101, std::collections::BTreeMap::new())]
+    );
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(1),
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+        ]
+    );
+}
+
+/// `websocket` reuses the session's socket but always sends the full
+/// request; `websocket-cached` (and `auto`) continue the previous response.
+#[tokio::test]
+async fn full_and_cached_modes_share_the_socket_but_not_the_delta() {
+    for (transport, continues) in [
+        (Transport::Websocket, false),
+        (Transport::WebsocketCached, true),
+    ] {
+        let mut server = mock_server::spawn(
+            vec![Upgrade::Accept(vec![
+                Turn::Events(response("resp_1", "first")),
+                Turn::Events(response("resp_2", "second")),
+            ])],
+            Vec::new(),
+        )
+        .await;
+        let ws = model(&server.base_url, None);
+        let session = format!("modes-{transport:?}");
+        let request = options(Some(&session), Some(transport));
+        let first = run(&ws, &context(vec![user("one")]), &request).await;
+        run(
+            &ws,
+            &context(vec![user("one"), Message::Assistant(first), user("two")]),
+            &request,
+        )
+        .await;
+        let second = if continues {
+            Seen::Ws {
+                connection: 1,
+                previous: Some("resp_1".to_string()),
+                inputs: 1,
+            }
+        } else {
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 3,
+            }
+        };
+        assert_eq!(
+            seen(server.drain()),
+            vec![
+                Seen::Upgrade(1),
+                Seen::Ws {
+                    connection: 1,
+                    previous: None,
+                    inputs: 1
+                },
+                second,
+            ],
+            "{transport:?}"
+        );
+    }
+}
+
+/// A body change (here the model) or a rewritten history invalidates the
+/// anchor: the request goes out in full on the same socket.
+#[tokio::test]
+async fn body_and_history_changes_send_the_full_request() {
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(vec![
+            Turn::Events(response("resp_1", "first")),
+            Turn::Events(response("resp_2", "second")),
+            Turn::Events(response("resp_3", "third")),
+        ])],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let request = options(Some("invalidate-session"), None);
+    let first = run(&ws, &context(vec![user("one")]), &request).await;
+    let mut renamed = ws.clone();
+    renamed.id = "gpt-ws-2".to_string();
+    let second = run(
+        &renamed,
+        &context(vec![user("one"), Message::Assistant(first), user("two")]),
+        &request,
+    )
+    .await;
+    // A compaction-like rewrite: the summary replaces the history prefix.
+    run(
+        &renamed,
+        &context(vec![
+            user("summary"),
+            Message::Assistant(second),
+            user("three"),
+        ]),
+        &request,
+    )
+    .await;
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(1),
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 3
+            },
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 3
+            },
+        ]
+    );
+}
+
+/// `response.incomplete` settles the request (stop reason length) without
+/// waiting for a close, and a binary terminal frame ends its request too:
+/// both leave the socket reusable.
+#[tokio::test]
+async fn incomplete_and_binary_terminals_settle_without_a_close() {
+    let mut incomplete =
+        vec![json!({ "type": "response.created", "response": { "id": "resp_1" } })];
+    incomplete.extend(text_item("resp_1", "cut"));
+    incomplete.push(json!({
+        "type": "response.incomplete",
+        "response": { "id": "resp_1", "status": "incomplete",
+                      "incomplete_details": { "reason": "max_output_tokens" } },
+    }));
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(vec![
+            Turn::Events(incomplete),
+            Turn::BinaryEvents(response("resp_2", "binary")),
+            Turn::Events(response("resp_3", "after")),
+        ])],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let request = options(Some("terminal-session"), Some(Transport::Websocket));
+    let first = run(&ws, &context(vec![user("one")]), &request).await;
+    assert_eq!(
+        (first.stop_reason, text_of(&first)),
+        (StopReason::Length, "cut".to_string())
+    );
+    let second = run(&ws, &context(vec![user("two")]), &request).await;
+    assert_eq!(
+        (second.stop_reason, text_of(&second)),
+        (StopReason::Stop, "binary".to_string())
+    );
+    let third = run(&ws, &context(vec![user("three")]), &request).await;
+    assert_eq!(text_of(&third), "after");
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(1),
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+        ]
+    );
+}
+
+/// A provider error event followed by a close keeps the provider verdict
+/// (CPA's nested 503 envelope classifies as a server error), and the
+/// started request never falls back to SSE.
+#[tokio::test]
+async fn a_terminal_error_before_the_close_keeps_the_provider_verdict() {
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(vec![Turn::EventsThenClose(
+            vec![json!({
+                "type": "error", "status": 503,
+                "error": { "type": "server_error", "code": "auth_unavailable", "message": "no healthy credential" },
+            })],
+            1011,
+            "upstream failed",
+        )])],
+        vec![SseReply::Events(response("resp_sse", "never"))],
+    )
+    .await;
+    let message = run(
+        &ws_model(&server),
+        &context(vec![user("hi")]),
+        &options(Some("verdict-session"), None),
+    )
+    .await;
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some("Provider server error (server_error, auth_unavailable, 503): no healthy credential")
+    );
+    assert_eq!(
+        diagnostic(&message, "provider_stream_failure").map(|value| value["details"].clone()),
+        Some(json!({
+            "kind": "server_error",
+            "providerErrorType": "server_error",
+            "providerErrorCode": "auth_unavailable",
+            "status": 503,
+            "raw": r#"{"type":"error","status":503,"providerErrorType":"server_error","providerErrorCode":"auth_unavailable","message":"no healthy credential"}"#,
+        }))
+    );
+    assert!(
+        !server
+            .drain()
+            .iter()
+            .any(|record| matches!(record, Record::SseRequest { .. })),
+        "a started request never replays over SSE"
+    );
+}
+
+/// A malformed frame before any event falls back to SSE once; after the
+/// first event it fails the request without a fallback.
+#[tokio::test]
+async fn malformed_frames_fall_back_only_before_the_first_event() {
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![Turn::RawText(vec!["not json"])]),
+            Upgrade::Accept(vec![Turn::RawText(vec![
+                r#"{"type":"response.created","response":{"id":"resp_2"}}"#,
+                "still not json",
+            ])]),
+        ],
+        vec![SseReply::Events(response("resp_sse", "via sse"))],
+    )
+    .await;
+    let ws = ws_model(&server);
+    let fallback = run(&ws, &context(vec![user("one")]), &options(None, None)).await;
+    assert_eq!(text_of(&fallback), "via sse");
+    assert_eq!(
+        diagnostic(&fallback, "provider_transport_failure").map(|value| value["details"].clone()),
+        Some(json!({
+            "configuredTransport": "auto",
+            "fallbackTransport": "sse",
+            "eventsEmitted": false,
+            "phase": "before_message_stream_start",
+        }))
+    );
+    let failed = run(&ws, &context(vec![user("two")]), &options(None, None)).await;
+    assert_eq!(failed.stop_reason, StopReason::Error);
+    assert_eq!(
+        diagnostic(&failed, "provider_transport_failure").map(|value| value["details"].clone()),
+        Some(json!({
+            "configuredTransport": "auto",
+            "eventsEmitted": true,
+            "phase": "after_message_stream_start",
+        }))
+    );
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(1),
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Sse {
+                previous: None,
+                inputs: 1
+            },
+            Seen::Upgrade(2),
+            Seen::Ws {
+                connection: 2,
+                previous: None,
+                inputs: 1
+            },
+        ]
+    );
+}
+
+/// A credential (or route) change replaces the session's socket: the new
+/// connection starts without a continuation.
+#[tokio::test]
+async fn a_credential_change_replaces_the_socket() {
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![Turn::Events(response("resp_1", "a"))]),
+            Upgrade::Accept(vec![Turn::Events(response("resp_2", "b"))]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let first = run(
+        &ws,
+        &context(vec![user("one")]),
+        &options(Some("rotate"), None),
+    )
+    .await;
+    let mut rotated = options(Some("rotate"), None);
+    rotated.base.api_key = Some("rotated-key".to_string());
+    run(
+        &ws,
+        &context(vec![user("one"), Message::Assistant(first), user("two")]),
+        &rotated,
+    )
+    .await;
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(1),
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Upgrade(2),
+            Seen::Ws {
+                connection: 2,
+                previous: None,
+                inputs: 3
+            },
+        ]
+    );
+}
+
+/// A later claim owns the session slot even when an earlier connection
+/// opens after it: the earlier one serves its request and closes, and the
+/// next request reuses the later connection.
+#[tokio::test]
+async fn a_later_claim_owns_the_slot_when_an_earlier_socket_opens_late() {
+    let (open_first, gate) = tokio::sync::oneshot::channel();
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::AcceptWhen(gate, vec![Turn::Events(response("resp_a", "late"))]),
+            Upgrade::Accept(vec![
+                Turn::Events(response("resp_b", "early")),
+                Turn::Events(response("resp_c", "reuse")),
+            ]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let late = stream_openai_responses(
+        &ws,
+        &context(vec![user("a")]),
+        Some(&options(Some("claims"), None)),
+    );
+    // The first handshake is in flight (observed), then the second claim
+    // connects and finishes first.
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+    let early = run(
+        &ws,
+        &context(vec![user("b")]),
+        &options(Some("claims"), None),
+    )
+    .await;
+    assert_eq!(text_of(&early), "early");
+    open_first.send(()).expect("gate");
+    assert_eq!(text_of(&late.result().await), "late");
+    run(
+        &ws,
+        &context(vec![user("c")]),
+        &options(Some("claims"), None),
+    )
+    .await;
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(2),
+            Seen::Ws {
+                connection: 2,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 2,
+                previous: None,
+                inputs: 1
+            },
+        ]
+    );
+}
+
+/// Session disposal cancels a request stalled on the socket and one still
+/// connecting: both settle as aborted with the disposal text, never as a
+/// transport failure, and neither replays over SSE. The stalled request's
+/// socket closes with `session_cleanup`.
+#[tokio::test]
+async fn session_disposal_cancels_stalled_and_connecting_requests() {
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(vec![Turn::Stall]), Upgrade::Hang],
+        vec![SseReply::Events(response("resp_sse", "never"))],
+    )
+    .await;
+    let ws = ws_model(&server);
+    let stalled = stream_openai_responses(
+        &ws,
+        &context(vec![user("a")]),
+        Some(&options(Some("dispose-stalled"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { .. }
+    ));
+    crate::cleanup_session_resources(Some("dispose-stalled"));
+    let stalled = stalled.result().await;
+
+    let connecting = stream_openai_responses(
+        &ws,
+        &context(vec![user("b")]),
+        Some(&options(Some("dispose-connecting"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { .. }
+    ));
+    crate::cleanup_session_resources(Some("dispose-connecting"));
+    let connecting = connecting.result().await;
+
+    for message in [&stalled, &connecting] {
+        assert_eq!(message.stop_reason, StopReason::Aborted);
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some(super::SESSION_DISPOSED_MESSAGE)
+        );
+        let transport = diagnostic(message, "provider_transport_failure").expect("diagnostic");
+        assert_eq!(
+            transport["error"],
+            json!({
+                "name": "AbortError",
+                "message": super::SESSION_DISPOSED_MESSAGE,
+                "code": "session_disposed",
+            })
+        );
+        assert_eq!(transport["details"].get("fallbackTransport"), None);
+        assert_eq!(diagnostic(message, "provider_stream_failure"), None);
+    }
+    assert_eq!(server.closed(1).await.as_deref(), Some("session_cleanup"));
+    assert!(!server
+        .drain()
+        .iter()
+        .any(|record| matches!(record, Record::SseRequest { .. })));
+    assert_eq!(super::session::owned_request_count("dispose-stalled"), 0);
+    assert_eq!(super::session::owned_request_count("dispose-connecting"), 0);
+}
+
+/// Disposal reaches a busy request whose connection a concurrent request
+/// of the same session displaced from the cache (TS `owner.socket`): both
+/// requests settle as disposed, and both sockets close with
+/// `session_cleanup`, the uncached one included (it used to close with
+/// `done`, and the cached one's reason raced its request's cancellation).
+#[tokio::test]
+async fn disposal_reaches_a_displaced_busy_connection() {
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![Turn::Stall]),
+            Upgrade::Accept(vec![Turn::Stall]),
+        ],
+        vec![SseReply::Events(response("resp_sse", "never"))],
+    )
+    .await;
+    let ws = ws_model(&server);
+    let displaced = stream_openai_responses(
+        &ws,
+        &context(vec![user("a")]),
+        Some(&options(Some("dispose-displaced"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 1, .. }
+    ));
+    let cached_before = super::session::cached_connection_id("dispose-displaced");
+    let newer = stream_openai_responses(
+        &ws,
+        &context(vec![user("b")]),
+        Some(&options(Some("dispose-displaced"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 2, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 2, .. }
+    ));
+    // The newer connection owns the slot; the displaced one serves its
+    // request outside the cache.
+    let cached_after = super::session::cached_connection_id("dispose-displaced");
+    assert!(cached_before.is_some() && cached_after.is_some());
+    assert_ne!(cached_before, cached_after);
+    crate::cleanup_session_resources(Some("dispose-displaced"));
+    for message in [displaced.result().await, newer.result().await] {
+        assert_eq!(message.stop_reason, StopReason::Aborted);
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some(super::SESSION_DISPOSED_MESSAGE)
+        );
+    }
+    assert_eq!(server.closed(1).await.as_deref(), Some("session_cleanup"));
+    assert_eq!(server.closed(2).await.as_deref(), Some("session_cleanup"));
+    assert!(!server
+        .drain()
+        .iter()
+        .any(|record| matches!(record, Record::SseRequest { .. })));
+    assert_eq!(
+        super::session::cached_connection_id("dispose-displaced"),
+        None
+    );
+    assert_eq!(super::session::owned_request_count("dispose-displaced"), 0);
+}
+
+/// Disposal still closes the socket of a displaced request the caller
+/// aborted a moment before (TS closes every owned `request.socket`): the
+/// request keeps its abort verdict, and its uncached socket closes with
+/// `session_cleanup` instead of `done`.
+#[tokio::test]
+async fn disposal_closes_a_caller_aborted_displaced_socket() {
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![Turn::Stall]),
+            Upgrade::Accept(vec![Turn::Stall]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let caller = CancellationToken::new();
+    let mut aborted_options = options(Some("dispose-aborted"), None);
+    aborted_options.base.signal = Some(caller.clone());
+    let aborted = stream_openai_responses(&ws, &context(vec![user("a")]), Some(&aborted_options));
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 1, .. }
+    ));
+    let newer = stream_openai_responses(
+        &ws,
+        &context(vec![user("b")]),
+        Some(&options(Some("dispose-aborted"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 2, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 2, .. }
+    ));
+    // The abort and the disposal land in one step: no worker runs between
+    // them (single-threaded test runtime).
+    caller.cancel();
+    crate::cleanup_session_resources(Some("dispose-aborted"));
+    let aborted = aborted.result().await;
+    assert_eq!(aborted.stop_reason, StopReason::Aborted);
+    assert_ne!(
+        aborted.error_message.as_deref(),
+        Some(super::SESSION_DISPOSED_MESSAGE)
+    );
+    let newer = newer.result().await;
+    assert_eq!(
+        newer.error_message.as_deref(),
+        Some(super::SESSION_DISPOSED_MESSAGE)
+    );
+    assert_eq!(server.closed(1).await.as_deref(), Some("session_cleanup"));
+    assert_eq!(server.closed(2).await.as_deref(), Some("session_cleanup"));
+}
+
+/// A request whose session was disposed before it mapped its socket's end
+/// reports the disposal: a remote close the worker queued just before the
+/// disposal is not a transport failure the caller would replay over SSE
+/// (TS `onAbort` replaces a failure the collector has not thrown). A
+/// handshake failure that already settled the connect stays the failure
+/// (TS rethrows the settled connect rejection).
+#[test]
+fn a_disposal_wins_over_an_unmapped_socket_end() {
+    let owner = super::session::OwnedRequest::begin(Some("dispose-unmapped"), None);
+    let ended = super::socket_end_error(
+        super::connection::SocketEnd::CloseFrame {
+            code: Some(1011),
+            reason: "upstream reset".to_string(),
+        },
+        &owner,
+    );
+    assert!(matches!(ended, super::ResponsesWsError::Transport(_)));
+    crate::cleanup_session_resources(Some("dispose-unmapped"));
+    assert_eq!(
+        super::socket_end_error(
+            super::connection::SocketEnd::CloseFrame {
+                code: Some(1011),
+                reason: "upstream reset".to_string(),
+            },
+            &owner,
+        ),
+        super::ResponsesWsError::SessionDisposed
+    );
+    assert_eq!(
+        super::socket_end_error(super::connection::SocketEnd::Eof, &owner),
+        super::ResponsesWsError::SessionDisposed
+    );
+    assert!(matches!(
+        super::connect_error(
+            super::connection::ConnectFailure::Request("Invalid WebSocket header x".to_string()),
+            &owner,
+        ),
+        super::ResponsesWsError::Transport(_)
+    ));
+    assert_eq!(
+        super::connect_error(super::connection::ConnectFailure::Cancelled, &owner),
+        super::ResponsesWsError::SessionDisposed
+    );
+}
+
+/// A later claim under a new identity (rotated credentials) owns the slot
+/// even when the earlier, old-identity socket opens after it: the late
+/// socket serves its one request and closes with `done`, and the next
+/// new-identity request reuses the later connection.
+#[tokio::test]
+async fn a_new_identity_claim_owns_the_slot_when_the_old_identity_opens_late() {
+    let (open_first, gate) = tokio::sync::oneshot::channel();
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::AcceptWhen(gate, vec![Turn::Events(response("resp_a", "late"))]),
+            Upgrade::Accept(vec![
+                Turn::Events(response("resp_b", "early")),
+                Turn::Events(response("resp_c", "reuse")),
+            ]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let late = stream_openai_responses(
+        &ws,
+        &context(vec![user("a")]),
+        Some(&options(Some("claims-identity"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+    let mut rotated = options(Some("claims-identity"), None);
+    rotated.base.api_key = Some("rotated-key".to_string());
+    let early = run(&ws, &context(vec![user("b")]), &rotated).await;
+    assert_eq!(text_of(&early), "early");
+    open_first.send(()).expect("gate");
+    assert_eq!(text_of(&late.result().await), "late");
+    // The superseded old-identity socket retires after its one request.
+    assert_eq!(server.closed(1).await.as_deref(), Some("done"));
+    let reuse = run(
+        &ws,
+        &context(vec![user("b"), Message::Assistant(early), user("c")]),
+        &rotated,
+    )
+    .await;
+    assert_eq!(text_of(&reuse), "reuse");
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(2),
+            Seen::Ws {
+                connection: 2,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 2,
+                previous: Some("resp_b".to_string()),
+                inputs: 1
+            },
+        ]
+    );
+}
+
+/// The `ws://` URL of the scripted server's Responses endpoint.
+fn ws_url(server: &MockServer) -> String {
+    resolve_responses_websocket_url(&server.base_url).expect("ws url")
+}
+
+/// A busy connection that a newer same-identity claim displaced from the
+/// cache releases without touching the newer entry (TS entry-reference
+/// guards): its anchor write skips the slot, it closes with
+/// `connection_identity_changed`, and the next acquire reuses the newer
+/// connection with the newer connection's (empty) anchor.
+#[tokio::test]
+async fn a_displaced_connection_release_leaves_the_newer_entry() {
+    use super::continuation::ContinuationAnchor;
+    use super::session::{acquire, release, set_continuation, ReleaseDisposition};
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(Vec::new()), Upgrade::Accept(Vec::new())],
+        Vec::new(),
+    )
+    .await;
+    let url = ws_url(&server);
+    let token = CancellationToken::new();
+    let displaced = acquire(&url, &[], Some("release-guard"), &token)
+        .await
+        .expect("first connection");
+    let newer = acquire(&url, &[], Some("release-guard"), &token)
+        .await
+        .expect("second connection");
+    assert_ne!(
+        displaced.worker.connection_id(),
+        newer.worker.connection_id()
+    );
+    release(&newer, ReleaseDisposition::Keep);
+    set_continuation(
+        &displaced,
+        Some(ContinuationAnchor {
+            body: json!({ "input": [] }),
+            response_id: "resp_stale".to_string(),
+            response_items: Vec::new(),
+        }),
+    );
+    release(&displaced, ReleaseDisposition::Keep);
+    assert_eq!(
+        server.closed(1).await.as_deref(),
+        Some("connection_identity_changed")
+    );
+    let reused = acquire(&url, &[], Some("release-guard"), &token)
+        .await
+        .expect("reuse");
+    assert_eq!(reused.worker.connection_id(), newer.worker.connection_id());
+    assert_eq!(reused.continuation, None);
+    release(&reused, ReleaseDisposition::Discard);
+    assert_eq!(server.closed(2).await.as_deref(), Some("done"));
+    assert_eq!(super::session::cached_connection_id("release-guard"), None);
+}
+
+/// An idle timer scheduled before a reuse never evicts the reused
+/// connection (the generation guard): only the timer of the last release
+/// expires it, with an `idle_timeout` close (paused clock; no real wait).
+#[tokio::test]
+async fn a_stale_idle_timer_never_evicts_a_reused_connection() {
+    use super::session::{acquire, release, ReleaseDisposition, CONNECTION_IDLE_TTL};
+    let mut server = mock_server::spawn(vec![Upgrade::Accept(Vec::new())], Vec::new()).await;
+    let url = ws_url(&server);
+    let token = CancellationToken::new();
+    let first = acquire(&url, &[], Some("timer-guard"), &token)
+        .await
+        .expect("open");
+    let connection = first.worker.connection_id();
+    release(&first, ReleaseDisposition::Keep);
+    tokio::time::pause();
+    let reused = acquire(&url, &[], Some("timer-guard"), &token)
+        .await
+        .expect("reuse");
+    assert_eq!(reused.worker.connection_id(), connection);
+    // The first release's timer comes due while the connection is busy
+    // again: it is stale and leaves the entry alone.
+    tokio::time::sleep(CONNECTION_IDLE_TTL + std::time::Duration::from_secs(1)).await;
+    assert_eq!(
+        super::session::cached_connection_id("timer-guard"),
+        Some(connection)
+    );
+    release(&reused, ReleaseDisposition::Keep);
+    tokio::time::sleep(
+        CONNECTION_IDLE_TTL
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the TTL exceeds a second"),
+    )
+    .await;
+    assert_eq!(
+        super::session::cached_connection_id("timer-guard"),
+        Some(connection)
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(super::session::cached_connection_id("timer-guard"), None);
+    tokio::time::resume();
+    assert_eq!(server.closed(1).await.as_deref(), Some("idle_timeout"));
+}
+
+/// An abort from the response hook (fired at the upgrade) stops the
+/// request before its frame is sent.
+#[tokio::test]
+async fn an_abort_from_the_response_hook_stops_before_sending() {
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(vec![Turn::Events(response(
+            "resp_1", "never",
+        ))])],
+        vec![SseReply::Events(response("resp_sse", "never"))],
+    )
+    .await;
+    let signal = CancellationToken::new();
+    let hook_signal = signal.clone();
+    let mut request = options(Some("hook-abort"), None);
+    request.base.signal = Some(signal);
+    request.base.on_response = Some(std::sync::Arc::new(move |_response, _model| {
+        hook_signal.cancel();
+    }));
+    let message = run(&ws_model(&server), &context(vec![user("hi")]), &request).await;
+    assert_eq!(message.stop_reason, StopReason::Aborted);
+    assert_eq!(seen(server.drain()), vec![Seen::Upgrade(1)]);
+}
+
+/// An idle connection expires after the TTL: the next request opens a new
+/// socket (paused clock; no real wait).
+#[tokio::test]
+async fn idle_connections_expire_after_the_ttl() {
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![Turn::Events(response("resp_1", "a"))]),
+            Upgrade::Accept(vec![Turn::Events(response("resp_2", "b"))]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let first = run(
+        &ws,
+        &context(vec![user("one")]),
+        &options(Some("expiry"), None),
+    )
+    .await;
+    let cached = super::session::cached_connection_id("expiry").expect("cached connection");
+    tokio::time::pause();
+    tokio::time::sleep(super::session::CONNECTION_IDLE_TTL + std::time::Duration::from_secs(1))
+        .await;
+    tokio::time::resume();
+    assert_eq!(
+        super::session::cached_connection_id("expiry"),
+        None,
+        "{cached}"
+    );
+    run(
+        &ws,
+        &context(vec![user("one"), Message::Assistant(first), user("two")]),
+        &options(Some("expiry"), None),
+    )
+    .await;
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(1),
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Upgrade(2),
+            Seen::Ws {
+                connection: 2,
+                previous: None,
+                inputs: 3
+            },
+        ]
+    );
+}
+
+/// The transport half of the combined drop/retry/continuation/fallback
+/// scenario (port map §4.1): delta before the failure, a mid-stream drop
+/// that fails with a structured transport failure and no same-attempt SSE
+/// POST, the session's re-issue on a fresh socket with the full body (no
+/// stale `previous_response_id`), delta continuation from the recovered
+/// response, a later pre-first-event upgrade rejection with exactly one
+/// SSE fallback, and the next request trying the socket again (generic
+/// Responses never pins a session to SSE).
+#[tokio::test]
+// One scenario, step by step in the port map's order (each step depends on
+// the connection state the previous one left), so it stays one function.
+#[allow(clippy::too_many_lines)]
+async fn drop_retry_continuation_and_fallback_scenario() {
+    let mut partial =
+        vec![json!({ "type": "response.created", "response": { "id": "resp_drop" } })];
+    partial.extend(text_item("resp_drop", "partial ").into_iter().take(3));
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![
+                Turn::Events(response("resp_1", "one")),
+                Turn::EventsThenFin(partial),
+            ]),
+            Upgrade::Accept(vec![
+                Turn::Events(response("resp_2", "two")),
+                Turn::Events(response("resp_3", "three")),
+            ]),
+            Upgrade::Reject(500),
+            Upgrade::Accept(vec![Turn::Events(response("resp_5", "five"))]),
+        ],
+        vec![SseReply::Events(response("resp_4", "four"))],
+    )
+    .await;
+    let ws = ws_model(&server);
+    let request = options(Some("scenario"), None);
+
+    // 1. A full request anchors resp_1.
+    let first = run(&ws, &context(vec![user("u1")]), &request).await;
+    assert_eq!(first.response_id.as_deref(), Some("resp_1"));
+    // 2-5. The next request continues resp_1 with only the new input, then
+    // the socket drops after a partial delta.
+    let retry_context = context(vec![user("u1"), Message::Assistant(first), user("u2")]);
+    let dropped = run(&ws, &retry_context, &request).await;
+    assert_eq!(dropped.stop_reason, StopReason::Error);
+    assert_eq!(
+        dropped.error_message.as_deref(),
+        Some("WebSocket closed before response.completed")
+    );
+    assert_eq!(
+        diagnostic(&dropped, "provider_stream_failure").map(|value| value["details"].clone()),
+        Some(json!({
+            "kind": "transport",
+            "providerErrorType": "websocket_closed",
+            "transport": { "protocol": "websocket", "cause": "closed", "closeCode": 1006, "wasClean": false },
+        }))
+    );
+    assert_eq!(
+        diagnostic(&dropped, "provider_transport_failure").map(|value| value["details"].clone()),
+        Some(json!({
+            "configuredTransport": "auto",
+            "eventsEmitted": true,
+            "phase": "after_message_stream_start",
+        }))
+    );
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(1),
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 1,
+                previous: Some("resp_1".to_string()),
+                inputs: 1
+            },
+        ],
+        "no same-attempt SSE POST"
+    );
+    // 6-9. The session re-issues the failed request (its context without
+    // the failed assistant): a fresh socket, the full body.
+    let recovered = run(&ws, &retry_context, &request).await;
+    assert_eq!(recovered.response_id.as_deref(), Some("resp_2"));
+    // 10. Delta continuation resumes from the recovered response.
+    let mut next_messages = retry_context.messages.clone();
+    next_messages.push(Message::Assistant(recovered.clone()));
+    next_messages.push(user("u3"));
+    let third = run(&ws, &context(next_messages.clone()), &request).await;
+    assert_eq!(text_of(&third), "three");
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(2),
+            Seen::Ws {
+                connection: 2,
+                previous: None,
+                inputs: 3
+            },
+            Seen::Ws {
+                connection: 2,
+                previous: Some("resp_2".to_string()),
+                inputs: 1
+            },
+        ]
+    );
+    // 11-12. The idle socket expires; the next upgrade is rejected before
+    // any event and the request falls back to exactly one full SSE POST.
+    tokio::time::pause();
+    tokio::time::sleep(super::session::CONNECTION_IDLE_TTL + std::time::Duration::from_secs(1))
+        .await;
+    tokio::time::resume();
+    next_messages.push(Message::Assistant(third));
+    next_messages.push(user("u4"));
+    let fallback = run(&ws, &context(next_messages.clone()), &request).await;
+    assert_eq!(text_of(&fallback), "four");
+    let transport = diagnostic(&fallback, "provider_transport_failure").expect("diagnostic");
+    assert_eq!(
+        transport,
+        json!({
+            "type": "provider_transport_failure",
+            "error": {
+                "name": "WebSocketTransportError",
+                "message": "Received network error or non-101 status code.",
+            },
+            "details": {
+                "configuredTransport": "auto",
+                "fallbackTransport": "sse",
+                "eventsEmitted": false,
+                "phase": "before_message_stream_start",
+            },
+        })
+    );
+    // 13. The next request tries the socket again.
+    next_messages.push(Message::Assistant(fallback));
+    next_messages.push(user("u5"));
+    let again = run(&ws, &context(next_messages), &request).await;
+    assert_eq!(text_of(&again), "five");
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(3),
+            Seen::Sse {
+                previous: None,
+                inputs: 7
+            },
+            Seen::Upgrade(4),
+            Seen::Ws {
+                connection: 4,
+                previous: None,
+                inputs: 9
+            },
+        ]
+    );
+}
+
+/// Session disposal reaches a request whose write is under way: the peer
+/// read the first bytes of the large request frame and stopped reading,
+/// so the write backs up once the socket buffers fill. The request settles
+/// as disposed instead of waiting on the peer forever (the write used to
+/// ignore the request's token).
+#[tokio::test]
+async fn disposal_interrupts_a_request_blocked_on_its_write() {
+    let mut server = mock_server::spawn(vec![Upgrade::AcceptSilent], Vec::new()).await;
+    // Far beyond the loopback socket buffers: the write cannot complete.
+    let huge = "x".repeat(24 * 1024 * 1024);
+    let pending = stream_openai_responses(
+        &ws_model(&server),
+        &context(vec![user(&huge)]),
+        Some(&options(Some("dispose-blocked-write"), None)),
+    );
+    server.frame_started(1).await;
+    crate::cleanup_session_resources(Some("dispose-blocked-write"));
+    let message = tokio::time::timeout(std::time::Duration::from_secs(30), pending.result())
+        .await
+        .expect("the blocked write settles once the session is disposed");
+    assert_eq!(
+        (message.stop_reason, message.error_message.as_deref()),
+        (StopReason::Aborted, Some(super::SESSION_DISPOSED_MESSAGE))
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+}
+
+/// A credential change while the session's socket is busy closes that
+/// socket under its request (TS `close(socket,
+/// "connection_identity_changed")`): the started request fails with the
+/// clean close instead of streaming on a connection the session replaced,
+/// and the new request runs on a fresh socket. The close used to wait for
+/// the busy request to end on its own, which a stalled upstream never does.
+#[tokio::test]
+async fn an_identity_change_closes_the_busy_socket_under_its_request() {
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![Turn::EventsThenStall(vec![json!({
+                "type": "response.created", "response": { "id": "resp_stalled" }
+            })])]),
+            Upgrade::Accept(vec![Turn::Events(response("resp_2", "rotated"))]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let stalled = stream_openai_responses(
+        &ws,
+        &context(vec![user("one")]),
+        Some(&options(Some("rotate-busy"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 1, .. }
+    ));
+    let mut rotated = options(Some("rotate-busy"), None);
+    rotated.base.api_key = Some("rotated-key".to_string());
+    let fresh = run(&ws, &context(vec![user("two")]), &rotated).await;
+    assert_eq!(text_of(&fresh), "rotated");
+    let stalled = tokio::time::timeout(std::time::Duration::from_secs(30), stalled.result())
+        .await
+        .expect("the replaced socket's request settles");
+    assert_eq!(
+        (stalled.stop_reason, stalled.error_message.as_deref()),
+        (
+            StopReason::Error,
+            Some("WebSocket closed before response.completed 1000 connection_identity_changed")
+        )
+    );
+    // The replaced socket's close frame names why (TS
+    // `close(socket, "connection_identity_changed")`).
+    assert_eq!(
+        server.closed(1).await.as_deref(),
+        Some("connection_identity_changed")
+    );
+    assert_eq!(
+        seen(server.drain()),
+        vec![
+            Seen::Upgrade(2),
+            Seen::Ws {
+                connection: 2,
+                previous: None,
+                inputs: 1
+            },
+        ]
+    );
+}
+
+/// A caller abort mid-stream ends the request as aborted and closes its
+/// socket (TS `keep = false`): the server sees the connection end, and the
+/// started request never replays over SSE.
+#[tokio::test]
+async fn a_caller_abort_closes_the_streaming_socket() {
+    let mut server = mock_server::spawn(
+        vec![Upgrade::Accept(vec![Turn::EventsThenStall(vec![json!({
+            "type": "response.created", "response": { "id": "resp_aborted" }
+        })])])],
+        vec![SseReply::Events(response("resp_sse", "never"))],
+    )
+    .await;
+    let signal = CancellationToken::new();
+    let mut request = options(Some("abort-closes"), None);
+    request.base.signal = Some(signal.clone());
+    let pending = stream_openai_responses(
+        &ws_model(&server),
+        &context(vec![user("hi")]),
+        Some(&request),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 1, .. }
+    ));
+    signal.cancel();
+    assert_eq!(pending.result().await.stop_reason, StopReason::Aborted);
+    // The aborted request retires its socket with TS `release(false)`'s
+    // `done` close.
+    assert_eq!(server.closed(1).await.as_deref(), Some("done"));
+    assert!(!server
+        .drain()
+        .iter()
+        .any(|record| matches!(record, Record::SseRequest { .. })));
+}
+
+/// A complete response calling the `probe` tool with `marker`.
+fn probe_call(id: &str, call_id: &str, marker: &str) -> Vec<Value> {
+    let arguments = json!({ "marker": marker }).to_string();
+    vec![
+        json!({ "type": "response.created", "response": { "id": id } }),
+        json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": { "type": "function_call", "id": format!("fc_{id}"), "call_id": call_id,
+                      "name": "probe", "arguments": "" },
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta", "output_index": 0,
+            "delta": arguments,
+        }),
+        json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": { "type": "function_call", "id": format!("fc_{id}"), "call_id": call_id,
+                      "name": "probe", "arguments": arguments, "status": "completed" },
+        }),
+        completed(id),
+    ]
+}
+
+/// The TS parity scenario's four requests on session `parity`: full,
+/// text delta, tool-output delta, full after a system-prompt change.
+async fn parity_scenario(ws: &Model) {
+    let tools = vec![crate::types::Tool {
+        name: "probe".to_string(),
+        description: "record a marker".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": { "marker": { "type": "string" } },
+            "required": ["marker"],
+        }),
+    }];
+    let request = |system: &str, messages: &[Message]| Context {
+        system_prompt: Some(system.to_string()),
+        messages: messages.to_vec(),
+        tools: Some(tools.clone()),
+    };
+    let parity = options(Some("parity"), None);
+    let mut messages = vec![user("one")];
+    let first = run(ws, &request("sys", &messages), &parity).await;
+    messages.extend([Message::Assistant(first), user("two")]);
+    let second = run(ws, &request("sys", &messages), &parity).await;
+    let call_id = second
+        .content
+        .iter()
+        .find_map(|block| match block {
+            AssistantContent::ToolCall(call) => Some(call.id.clone()),
+            AssistantContent::Text(_) | AssistantContent::Thinking(_) => None,
+        })
+        .expect("the probe call");
+    messages.push(Message::Assistant(second));
+    messages.push(
+        serde_json::from_value(json!({
+            "role": "toolResult", "toolCallId": call_id, "toolName": "probe",
+            "content": [{ "type": "text", "text": "probe ran once" }],
+            "isError": false, "timestamp": 1,
+        }))
+        .expect("tool result message"),
+    );
+    let third = run(ws, &request("sys", &messages), &parity).await;
+    messages.extend([Message::Assistant(third), user("three")]);
+    let fourth = run(ws, &request("changed sys", &messages), &parity).await;
+    assert_eq!(text_of(&fourth), "new prompt");
+}
+
+/// The observed requests in the TS harness's shape: every upgrade's path
+/// and chosen handshake headers (the WebSocket protocol's own handshake
+/// headers aside; the TS socket constructor never sees those), sorted by
+/// name, and every request frame's exact text.
+fn parity_record(records: &[Record]) -> (Value, Value) {
+    let mut upgrades = Vec::new();
+    let mut frames = Vec::new();
+    for record in records {
+        match record {
+            Record::Upgrade { path, headers, .. } => {
+                let mut chosen: Vec<(String, String)> = headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        !matches!(
+                            name.as_str(),
+                            "host"
+                                | "connection"
+                                | "upgrade"
+                                | "sec-websocket-key"
+                                | "sec-websocket-version"
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                chosen.sort();
+                upgrades.push(json!({ "path": path, "headers": chosen }));
+            }
+            Record::WsRequest {
+                connection, text, ..
+            } => {
+                frames.push(json!({ "connection": connection, "text": text }));
+            }
+            _ => {}
+        }
+    }
+    (Value::Array(upgrades), Value::Array(frames))
+}
+
+/// A failed message's outcome in the TS harness's shape: the stop reason,
+/// the error text, and the diagnostics without their timestamps.
+fn parity_outcome(message: &AssistantMessage) -> Value {
+    let mut diagnostics = serde_json::to_value(&message.diagnostics).expect("diagnostics");
+    for diagnostic in diagnostics.as_array_mut().into_iter().flatten() {
+        if let Some(fields) = diagnostic.as_object_mut() {
+            fields.remove("timestamp");
+        }
+    }
+    json!({
+        "stopReason": message.stop_reason,
+        "errorMessage": message.error_message,
+        "diagnostics": diagnostics,
+    })
+}
+
+/// TS differential evidence: the TS reference (bf4d2c6ca
+/// `streamOpenAIResponses` over a scripted socket,
+/// `fixtures/ts_parity_harness.ts`) ran these scenarios and recorded
+/// `fixtures/ts_parity.json`. On session `parity`: a full first request, a
+/// text delta, a tool-output delta, a full request after a system-prompt
+/// change, then a disposal. On session `parity-drop`: a socket the peer
+/// closes (1011) after the first events. The Rust transport sends
+/// byte-identical request frames (the received text) with the same
+/// handshake headers on the same path, the same close, and settles the
+/// drop with the same error text and diagnostics (TS stack traces aside).
+#[tokio::test]
+async fn request_frames_match_the_ts_reference() {
+    let reference: Value =
+        serde_json::from_str(include_str!("fixtures/ts_parity.json")).expect("fixture json");
+    let mut cut_off = response("resp_drop", "cut off");
+    cut_off.truncate(4);
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![
+                Turn::Events(response("resp_1", "first")),
+                Turn::Events(probe_call("resp_2", "call_1", "once")),
+                Turn::Events(response("resp_3", "after tool")),
+                Turn::Events(response("resp_4", "new prompt")),
+            ]),
+            Upgrade::Accept(vec![Turn::EventsThenClose(cut_off, 1011, "upstream reset")]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    parity_scenario(&ws).await;
+    crate::cleanup_session_resources(Some("parity"));
+    let (code, reason) = server.close_frame(1).await.expect("a close frame");
+    let dropped = run(
+        &ws,
+        &Context {
+            system_prompt: Some("sys".to_string()),
+            messages: vec![user("drop")],
+            tools: None,
+        },
+        &options(Some("parity-drop"), None),
+    )
+    .await;
+    crate::cleanup_session_resources(Some("parity-drop"));
+
+    let (upgrades, frames) = parity_record(&server.drain());
+    assert_eq!(frames, reference["frames"]);
+    assert_eq!(upgrades, reference["upgrades"]);
+    assert_eq!(
+        reference["closes"],
+        json!([{ "connection": 1, "code": code, "reason": reason }])
+    );
+    let mut expected_drop = reference["drop"].clone();
+    for diagnostic in expected_drop["diagnostics"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        // A TS `Error` carries its stack; the Rust error info has none.
+        if let Some(error) = diagnostic["error"].as_object_mut() {
+            error.remove("stack");
+        }
+    }
+    assert_eq!(parity_outcome(&dropped), expected_drop);
+}

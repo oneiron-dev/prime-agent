@@ -36,7 +36,87 @@ pub enum StreamFailureKind {
     /// mid-block, no stop signal, no error frame (the connection just
     /// ends). Transient by nature — the same request can be re-issued.
     StreamDrop,
+    /// The transport connection itself failed (the WebSocket errored,
+    /// closed, or ended) before the provider delivered a verdict (TS
+    /// `"transport"`). Transient by construction: no provider verdict
+    /// arrived, so the failure carries structured connection detail
+    /// instead of a provider error type inferred from text.
+    Transport,
     Unknown,
+}
+
+/// The transport protocol a [`StreamTransportFailureDetail`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamTransportProtocol {
+    Websocket,
+}
+
+/// How a transport connection to the provider failed (TS
+/// `StreamTransportFailureCause`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamTransportFailureCause {
+    /// The connection could not be established.
+    Connect,
+    /// The socket reported an error.
+    Error,
+    /// The socket closed before the terminal event.
+    Closed,
+    /// The event stream ended without a terminal event or a close.
+    Eof,
+}
+
+impl StreamTransportFailureCause {
+    /// The wire token (`"connect"`, `"error"`, `"closed"`, `"eof"`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Error => "error",
+            Self::Closed => "closed",
+            Self::Eof => "eof",
+        }
+    }
+}
+
+/// Structured detail for a [`StreamFailureKind::Transport`] failure (TS
+/// `StreamTransportFailureDetail`): the connection failed before the
+/// provider delivered a verdict, so no provider error type exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamTransportFailureDetail {
+    pub protocol: StreamTransportProtocol,
+    pub cause: StreamTransportFailureCause,
+    /// Server close code, when the socket closed with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was_clean: Option<bool>,
+}
+
+impl StreamTransportFailureDetail {
+    /// A WebSocket failure detail with no close information.
+    #[must_use]
+    pub fn websocket(cause: StreamTransportFailureCause) -> Self {
+        Self {
+            protocol: StreamTransportProtocol::Websocket,
+            cause,
+            close_code: None,
+            close_reason: None,
+            was_clean: None,
+        }
+    }
+
+    /// The classification's provider error type (`websocket_<cause>`).
+    #[must_use]
+    pub fn provider_error_type(&self) -> String {
+        match self.protocol {
+            StreamTransportProtocol::Websocket => format!("websocket_{}", self.cause.as_str()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -49,6 +129,14 @@ pub struct StreamFailureInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub provider_error_type: Option<String>,
+    /// Provider's more-specific error code, when it supplies one
+    /// separately from its type (CPA's nested `error.code`).
+    #[serde(
+        rename = "providerErrorCode",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provider_error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     #[serde(rename = "requestId", default, skip_serializing_if = "Option::is_none")]
@@ -63,6 +151,9 @@ pub struct StreamFailureInfo {
     /// Truncated raw provider payload for post-mortems.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
+    /// Connection-level detail, present only for kind `transport`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<StreamTransportFailureDetail>,
 }
 
 impl StreamFailureInfo {
@@ -71,10 +162,25 @@ impl StreamFailureInfo {
         Self {
             kind: StreamFailureKind::Unknown,
             provider_error_type: None,
+            provider_error_code: None,
             status: None,
             request_id: None,
             retry_after_ms: None,
             raw: None,
+            transport: None,
+        }
+    }
+
+    /// The classification of a transport failure (TS
+    /// `WebSocketTransportError`'s info): kind `transport`, provider
+    /// error type `websocket_<cause>`, and the structured detail.
+    #[must_use]
+    pub fn transport(detail: StreamTransportFailureDetail) -> Self {
+        Self {
+            kind: StreamFailureKind::Transport,
+            provider_error_type: Some(detail.provider_error_type()),
+            transport: Some(detail),
+            ..Self::unknown()
         }
     }
 }
@@ -391,25 +497,44 @@ impl ProviderConnectionError {
     }
 }
 
-/// A WebSocket transport failure thrown out of a provider stream (the codex
-/// WS path, after events were emitted): `Display` is the raw runtime text
-/// (verbatim, like the TS), and the TS `provider_stream_failure` diagnostic
-/// records the runtime WS error class name — `WebSocketCloseError` for
-/// close events, plain `Error` otherwise — plus the numeric close code.
+/// A WebSocket transport failure thrown out of a provider stream:
+/// `Display` is the raw short text (verbatim, like the TS). The codex WS
+/// path keeps its unclassified runtime surface (`transport: None`): the
+/// diagnostic records the runtime WS error class name —
+/// `WebSocketCloseError` for close events, plain `Error` otherwise — plus
+/// the numeric close code. The generic Responses WS path carries the
+/// structured detail (TS `WebSocketTransportError`): the failure classifies
+/// as kind `transport` with provider error type `websocket_<cause>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderWsTransportError {
     pub message: String,
     pub close_code: Option<u16>,
+    /// The structured transport classification, when the transport
+    /// records one (the generic Responses WebSocket path).
+    pub transport: Option<StreamTransportFailureDetail>,
 }
 
 impl ProviderWsTransportError {
     /// The TS runtime/WS error class name recorded in the diagnostic
-    /// (`error.name`); the close-code presence decides it.
+    /// (`error.name`): the structured class for the generic transport,
+    /// otherwise the close-code presence decides it.
     #[must_use]
     pub fn error_name(&self) -> &'static str {
-        match self.close_code {
-            Some(_) => "WebSocketCloseError",
-            None => "Error",
+        match (&self.transport, self.close_code) {
+            (Some(_), _) => "WebSocketTransportError",
+            (None, Some(_)) => "WebSocketCloseError",
+            (None, None) => "Error",
+        }
+    }
+
+    /// The TS diagnostic's `error.code`: the codex close error carries the
+    /// numeric close code; the structured transport error has no `code`
+    /// property (its close code lives in the classification detail).
+    #[must_use]
+    pub fn diagnostic_code(&self) -> Option<u16> {
+        match self.transport {
+            Some(_) => None,
+            None => self.close_code,
         }
     }
 }
@@ -532,6 +657,10 @@ const KIND_MESSAGES: &[(StreamFailureKind, &str)] = &[
         StreamFailureKind::StreamDrop,
         "Provider dropped the response stream",
     ),
+    (
+        StreamFailureKind::Transport,
+        "Connection to the provider was lost before the response completed",
+    ),
     (StreamFailureKind::Unknown, "Provider stream failed"),
 ];
 
@@ -548,6 +677,11 @@ pub fn stream_failure_message(info: &StreamFailureInfo, detail: Option<&str>) ->
     let mut qualifiers: Vec<String> = Vec::new();
     if let Some(provider_error_type) = &info.provider_error_type {
         qualifiers.push(provider_error_type.clone());
+    }
+    if let Some(provider_error_code) = &info.provider_error_code {
+        if info.provider_error_type.as_ref() != Some(provider_error_code) {
+            qualifiers.push(provider_error_code.clone());
+        }
     }
     if let Some(status) = info.status {
         qualifiers.push(status.to_string());
@@ -651,9 +785,7 @@ pub fn stream_failure_from_stop_reason(
         },
         provider_error_type: raw_stop_reason.map(std::string::ToString::to_string),
         request_id: request_id.map(std::string::ToString::to_string),
-        status: None,
-        retry_after_ms: None,
-        raw: None,
+        ..StreamFailureInfo::unknown()
     };
     if info.kind == StreamFailureKind::Unknown
         && raw_stop_reason.is_some_and(|reason| reason.to_lowercase().contains("malformed"))
@@ -701,10 +833,7 @@ pub(crate) fn stream_drop_failure(open_block: OpenStreamBlock) -> StreamFailureE
     let info = StreamFailureInfo {
         kind: StreamFailureKind::StreamDrop,
         provider_error_type: Some("stream_drop".to_string()),
-        status: None,
-        request_id: None,
-        retry_after_ms: None,
-        raw: None,
+        ..StreamFailureInfo::unknown()
     };
     StreamFailureError {
         message: stream_failure_message(&info, Some(detail)),
@@ -807,7 +936,7 @@ fn extract_parts_from_http(error: &ProviderHttpError) -> ExtractedParts {
             status: error.status,
             request_id,
             retry_after_ms,
-            raw: None,
+            ..StreamFailureInfo::unknown()
         },
         detail: body_message,
     }
@@ -826,7 +955,13 @@ pub fn extract_stream_failure_info(error: &ProviderError) -> StreamFailureInfo {
             provider_error_type: connection.error_code().map(str::to_string),
             ..StreamFailureInfo::unknown()
         },
-        // The TS WS transport errors never classify ("WebSocketCloseError"
+        // The structured transport error carries its own classification
+        // (TS `WebSocketTransportError extends StreamFailureError`).
+        ProviderError::Transport(ProviderWsTransportError {
+            transport: Some(detail),
+            ..
+        }) => StreamFailureInfo::transport(detail.clone()),
+        // The codex WS runtime errors never classify ("WebSocketCloseError"
         // matches no kind pattern); the provider error type is the error's
         // class name, like `err.name !== "Error"` in the TS extraction.
         ProviderError::Transport(transport) => StreamFailureInfo {
@@ -854,8 +989,9 @@ pub fn format_stream_failure_message(error: &ProviderError) -> String {
         ProviderError::StreamFailure(failure) => failure.message.clone(),
         ProviderError::Aborted => "Request was aborted".to_string(),
         ProviderError::Connection(connection) => connection.message(),
-        // The TS WS transport errors classify as "unknown", so the raw
-        // runtime text passes through verbatim.
+        // The codex WS runtime errors classify as "unknown" and the
+        // structured transport error is a `StreamFailureError` whose
+        // message is the short socket text: both pass through verbatim.
         ProviderError::Transport(transport) => transport.message.clone(),
         ProviderError::Http(http) => {
             let parts = extract_parts_from_http(http);
@@ -899,7 +1035,7 @@ pub(crate) fn diagnostic_error_info(error: &ProviderError) -> DiagnosticErrorInf
         ProviderError::Transport(transport) => (
             Some(transport.error_name().to_string()),
             transport.message.clone(),
-            transport.close_code.map(|code| {
+            transport.diagnostic_code().map(|code| {
                 crate::types::DiagnosticCode::Num(crate::types::JsNumber::from(u64::from(code)))
             }),
         ),
@@ -951,6 +1087,7 @@ pub fn record_stream_failure(
             "api": model.2,
             "kind": info.kind,
             "providerErrorType": info.provider_error_type,
+            "providerErrorCode": info.provider_error_code,
             "status": info.status,
             "requestId": info.request_id,
             "message": output.error_message,

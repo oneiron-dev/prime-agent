@@ -837,6 +837,14 @@ impl Agent {
     /// `throw` in a TS listener). `agent_end` is the final emitted event for a
     /// run, but the agent becomes idle only after all awaited listeners for
     /// that event finish.
+    /// The session id every provider request of this agent carries (TS
+    /// `agent.sessionId`): side requests made on the session's behalf (a
+    /// compaction summary) carry the same one.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.inner.session_id.as_deref()
+    }
+
     pub async fn subscribe<F>(&self, listener: F) -> Subscription
     where
         F: Fn(AgentEvent, AbortSignal) -> crate::BoxFut<'static, anyhow::Result<()>>

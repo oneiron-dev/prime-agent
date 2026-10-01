@@ -2,6 +2,10 @@
 //! Port of `packages/ai/src/providers/openai-responses.ts`: session-affinity
 //! headers, prompt-cache retention, reasoning params with encrypted-content
 //! include, service-tier pricing, and the shared Responses stream processor.
+//! A model that opts in (`compat.supportsWebSocket`) or an explicit
+//! `websocket`/`websocket-cached` transport streams over the Responses
+//! WebSocket transport first ([`crate::providers::responses_websocket`]);
+//! SSE takes over only when the socket failed before its first event.
 
 use serde_json::{json, Map, Value};
 
@@ -16,13 +20,20 @@ use crate::providers::openai_responses_shared::{
     ConvertResponsesMessagesOptions, ConvertResponsesToolsOptions, ReasoningSummary,
     ResponsesStreamHooks, OPENAI_TOOL_CALL_PROVIDERS,
 };
+use crate::providers::responses_websocket::{
+    process_generation, resolve_responses_websocket_url, ContinuationMode, GenerationRequest,
+    ResponsesWsError, SESSION_DISPOSED_MESSAGE,
+};
 use crate::providers::simple_options::build_base_options;
 use crate::registry::Provider;
 use crate::types::{
     done_reason, error_reason, AssistantMessage, CacheRetention, Context, Model, ModelExt,
-    ModelThinkingLevel, ServiceTier, SimpleStreamOptions, StopReason, StreamOptions, Usage,
+    ModelThinkingLevel, ServiceTier, SimpleStreamOptions, StopReason, StreamOptions, Transport,
+    Usage,
 };
-use crate::utils_inner::diagnostics::now_ms;
+use crate::utils_inner::diagnostics::{
+    append_assistant_message_diagnostic, create_assistant_message_diagnostic, now_ms,
+};
 use crate::utils_inner::http::{send, HttpResponse, RequestOptions};
 use crate::utils_inner::json_parse::{parse_json_with_repair, parse_streaming_json};
 use crate::utils_inner::sse::SseDecoder;
@@ -47,6 +58,8 @@ fn resolve_cache_retention(cache_retention: Option<CacheRetention>) -> CacheRete
 pub struct ResolvedResponsesCompat {
     pub send_session_id_header: bool,
     pub supports_long_cache_retention: bool,
+    /// The `auto` transport tries the WebSocket transport (default off).
+    pub supports_web_socket: bool,
 }
 
 pub fn get_responses_compat(model: &Model) -> ResolvedResponsesCompat {
@@ -68,6 +81,10 @@ pub fn get_responses_compat(model: &Model) -> ResolvedResponsesCompat {
             .as_ref()
             .and_then(|c| c.supports_long_cache_retention)
             .unwrap_or(true),
+        supports_web_socket: compat
+            .as_ref()
+            .and_then(|c| c.supports_web_socket)
+            .unwrap_or(false),
     }
 }
 
@@ -140,8 +157,27 @@ pub fn stream_openai_responses(
                 });
                 writer.end(None);
             }
-            Err(error) => {
-                output.stop_reason = if error == ProviderError::Aborted {
+            // Disposal of the owning session is a cancellation, not a
+            // provider failure (TS `isOpenAIResponsesWebSocketSessionDisposedError`).
+            Err(ResponsesRunError::SessionDisposed) => {
+                output.stop_reason = StopReason::Aborted;
+                output.error_message = Some(SESSION_DISPOSED_MESSAGE.to_string());
+                writer.push(AssistantMessageEvent::Error {
+                    reason: error_reason(output.stop_reason),
+                    error: output.clone(),
+                });
+                writer.end(Some(output));
+            }
+            Err(ResponsesRunError::Provider(error)) => {
+                // TS `options?.signal?.aborted ? "aborted" : "error"`: a
+                // caller abort makes any failure an abort (a handshake
+                // failure that settled just before the abort keeps its text
+                // but not an error verdict).
+                let caller_aborted = options
+                    .as_ref()
+                    .and_then(|options| options.base.signal.as_ref())
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                output.stop_reason = if error == ProviderError::Aborted || caller_aborted {
                     StopReason::Aborted
                 } else {
                     StopReason::Error
@@ -172,7 +208,18 @@ fn build_headers(
 ) -> Vec<(String, String)> {
     let compat = get_responses_compat(model);
     let mut headers: Vec<(String, String)> = Vec::new();
+    // TS `withOpenCodeHeaders`: OpenCode routes identify the client and
+    // the conversation ahead of the model headers, which still win
+    // (case-insensitively). The SSE request and the WebSocket handshake
+    // share this set.
+    if model.provider == "opencode" || model.provider == "opencode-go" {
+        headers.push(("User-Agent".into(), "prime-agent".into()));
+        if let Some(session_id) = &options.base.session_id {
+            headers.push(("x-opencode-session".into(), session_id.clone()));
+        }
+    }
     for (name, value) in model.headers.iter().flatten() {
+        headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         headers.push((name.clone(), value.clone()));
     }
     if let Some(cache_session_id) = cache_session_id {
@@ -277,6 +324,30 @@ fn build_params(model: &Model, context: &Context, options: &OpenAIResponsesOptio
     Value::Object(params)
 }
 
+/// How one generic Responses stream failed.
+enum ResponsesRunError {
+    Provider(ProviderError),
+    /// The owning session was disposed mid-request (WebSocket transport).
+    SessionDisposed,
+}
+
+impl From<ProviderError> for ResponsesRunError {
+    fn from(error: ProviderError) -> Self {
+        ResponsesRunError::Provider(error)
+    }
+}
+
+/// The TS wire name of a transport (`auto`, `sse`, `websocket`,
+/// `websocket-cached`).
+fn transport_wire_name(transport: Transport) -> &'static str {
+    match transport {
+        Transport::Auto => "auto",
+        Transport::Sse => "sse",
+        Transport::Websocket => "websocket",
+        Transport::WebsocketCached => "websocket-cached",
+    }
+}
+
 // Long by design (a 1:1 port of the upstream provider shape); refactoring is out of scope for the zero-behavior pedantic sweep.
 #[allow(clippy::too_many_lines)]
 async fn run_stream(
@@ -285,7 +356,7 @@ async fn run_stream(
     options: Option<&OpenAIResponsesOptions>,
     output: &mut AssistantMessage,
     writer: &AssistantMessageEventWriter,
-) -> Result<(), ProviderError> {
+) -> Result<(), ResponsesRunError> {
     let options = options.cloned().unwrap_or_default();
     let api_key = options
         .base
@@ -307,8 +378,140 @@ async fn run_stream(
         }
     }
 
-    let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
     let headers = build_headers(model, &api_key, &options, cache_session_id.as_deref());
+    // TS `websocketEnabled`: `sse` never tries the socket, `auto` only for
+    // an opted-in model, and the explicit WebSocket transports always
+    // (they still fall back before the first event). The authenticated
+    // runtime check always holds here: the socket carries the headers.
+    let transport = options.base.transport.unwrap_or(Transport::Auto);
+    let websocket_enabled = match transport {
+        Transport::Sse => false,
+        Transport::Auto => get_responses_compat(model).supports_web_socket,
+        Transport::Websocket | Transport::WebsocketCached => true,
+    };
+    if websocket_enabled {
+        let mut started = false;
+        let model_id = model.id.clone();
+        let hooks = ResponsesStreamHooks {
+            request_service_tier: options.service_tier,
+            resolve_service_tier: None,
+            apply_service_tier_pricing: Some(Box::new(move |usage, service_tier| {
+                apply_service_tier_pricing(usage, service_tier.as_deref(), &model_id);
+            })),
+        };
+        // WebSocket APIs expose no portable upgrade headers: the hook sees
+        // the successful 101 handshake (TS `onOpen`).
+        let on_open = || {
+            if let Some(on_response) = &options.base.on_response {
+                on_response(
+                    crate::types::ProviderResponse {
+                        status: 101,
+                        headers: std::collections::BTreeMap::new(),
+                    },
+                    model,
+                );
+            }
+        };
+        let attempt = match resolve_responses_websocket_url(&model.base_url) {
+            Ok(url) => {
+                process_generation(
+                    GenerationRequest {
+                        model,
+                        url: &url,
+                        headers: &headers,
+                        body: &params,
+                        session_id: options.base.session_id.as_deref(),
+                        continuation: match transport {
+                            Transport::Auto | Transport::WebsocketCached => {
+                                ContinuationMode::Cached
+                            }
+                            Transport::Websocket | Transport::Sse => ContinuationMode::Full,
+                        },
+                        signal: options.base.signal.as_ref(),
+                        hooks,
+                        on_open: &on_open,
+                    },
+                    output,
+                    writer,
+                    &mut started,
+                )
+                .await
+            }
+            Err(message) => Err(ResponsesWsError::Provider(ProviderError::Message(message))),
+        };
+        // The abort and stop-reason checks sit inside the TS WebSocket try
+        // block: their failures record the transport diagnostic too.
+        let attempt = attempt.and_then(|()| {
+            if options
+                .base
+                .signal
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                return Err(ResponsesWsError::Provider(ProviderError::Aborted));
+            }
+            if matches!(output.stop_reason, StopReason::Aborted | StopReason::Error) {
+                return Err(ResponsesWsError::Provider(ProviderError::StreamFailure(
+                    stream_failure_from_stop_reason(output.stop_reason_raw.as_deref(), None),
+                )));
+            }
+            Ok(())
+        });
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // Disposal of the owning session is a cancellation, not a
+                // transport failure: replaying it over SSE would resend a
+                // request the session no longer owns.
+                let caller_aborted = options
+                    .base
+                    .signal
+                    .as_ref()
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                let will_fallback =
+                    !started && error != ResponsesWsError::SessionDisposed && !caller_aborted;
+                let mut details = Map::new();
+                details.insert(
+                    "configuredTransport".into(),
+                    json!(transport_wire_name(transport)),
+                );
+                // TS `fallbackTransport: willFallback ? "sse" : undefined`:
+                // the undefined key never serializes.
+                if will_fallback {
+                    details.insert("fallbackTransport".into(), json!("sse"));
+                }
+                details.insert("eventsEmitted".into(), json!(started));
+                details.insert(
+                    "phase".into(),
+                    json!(if started {
+                        "after_message_stream_start"
+                    } else {
+                        "before_message_stream_start"
+                    }),
+                );
+                append_assistant_message_diagnostic(
+                    output,
+                    create_assistant_message_diagnostic(
+                        "provider_transport_failure",
+                        Some(error.diagnostic_error()),
+                        Some(Value::Object(details)),
+                    ),
+                );
+                if !will_fallback {
+                    return Err(match error {
+                        ResponsesWsError::Transport(transport) => {
+                            ProviderError::Transport(transport).into()
+                        }
+                        ResponsesWsError::Provider(error) => error.into(),
+                        ResponsesWsError::Aborted => ProviderError::Aborted.into(),
+                        ResponsesWsError::SessionDisposed => ResponsesRunError::SessionDisposed,
+                    });
+                }
+            }
+        }
+    }
+
+    let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
     let mut response: HttpResponse = send(RequestOptions {
         method: reqwest::Method::POST,
         url,
@@ -341,7 +544,8 @@ async fn run_stream(
             response.status,
             &body,
             response.headers.clone(),
-        ));
+        )
+        .into());
     }
 
     writer.push(AssistantMessageEvent::Start {
@@ -518,6 +722,53 @@ mod tests {
             "compat": raw,
         }))
         .unwrap()
+    }
+
+    /// `OpenCode` routes carry the TS `withOpenCodeHeaders` identity (the
+    /// client and the conversation) ahead of the model headers, which
+    /// override it case-insensitively; `cacheRetention: none` drops only
+    /// the cache-affinity pair. Other providers carry no identity.
+    #[test]
+    fn opencode_routes_identify_the_client_and_conversation() {
+        let opencode = |provider: &str| -> Model {
+            serde_json::from_value(serde_json::json!({
+                "id": "m", "name": "m", "api": "openai-responses", "provider": provider,
+                "baseUrl": "https://opencode.ai/zen/v1", "reasoning": false, "input": ["text"],
+                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                "contextWindow": 1000, "maxTokens": 100,
+                "headers": { "user-agent": "custom-agent" },
+            }))
+            .unwrap()
+        };
+        let mut options = OpenAIResponsesOptions::from_base(StreamOptions {
+            session_id: Some("conv-1".to_string()),
+            cache_retention: Some(CacheRetention::None),
+            ..StreamOptions::default()
+        });
+        let pairs = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect()
+        };
+        assert_eq!(
+            build_headers(&opencode("opencode-go"), "key", &options, None),
+            pairs(&[
+                ("x-opencode-session", "conv-1"),
+                ("user-agent", "custom-agent"),
+                ("Authorization", "Bearer key"),
+            ])
+        );
+        options.base.cache_retention = None;
+        assert_eq!(
+            build_headers(&opencode("cpa-r"), "key", &options, Some("conv-1")),
+            pairs(&[
+                ("user-agent", "custom-agent"),
+                ("session_id", "conv-1"),
+                ("x-client-request-id", "conv-1"),
+                ("Authorization", "Bearer key"),
+            ])
+        );
     }
 
     #[test]

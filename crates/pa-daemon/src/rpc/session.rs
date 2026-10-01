@@ -431,7 +431,7 @@ impl RpcSession {
         // published — exactly what the exit's abort/dispose targets) and
         // the adopted lease returns with it.
         let disposed = tokio::select! {
-            () = handle.engine.dispose_kernel() => true,
+            () = handle.engine.dispose() => true,
             () = self.signal_shutdown.cancelled() => false,
         };
         if !disposed {
@@ -481,7 +481,7 @@ impl RpcSession {
         if let Some(subscription) = self.subscription.lock().await.take() {
             subscription.unsubscribe().await;
         }
-        engine.dispose_kernel().await;
+        engine.dispose().await;
     }
 }
 

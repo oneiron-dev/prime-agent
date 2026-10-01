@@ -1,6 +1,6 @@
 use super::{
     auxiliary_model, compaction, compaction_exec, image_model_routing, ipython_state,
-    provider_adapter, refine, telemetry, AgentSession, PromptBatchRow,
+    provider_adapter, provider_retry, refine, telemetry, AgentSession, PromptBatchRow,
 };
 
 impl AgentSession {
@@ -100,6 +100,14 @@ impl AgentSession {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         settings.enabled = enabled;
+    }
+
+    /// Install the provider retry policy the compaction summary requests
+    /// run under (TS passes `providerRetryPolicy(settingsManager)` to every
+    /// summary call); the engine wiring calls this with the settings
+    /// policy.
+    pub fn set_summary_retry_policy(&mut self, policy: provider_retry::ProviderRetryPolicy) {
+        self.summary_retry = Some(policy);
     }
 
     /// Install the auxiliary-model routing context (TS #2411's

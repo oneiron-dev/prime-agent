@@ -37,6 +37,9 @@ url = "2"
 # `test-util` (tokio time pause) is test-only: the mutation-drain latch test
 # drives real timeouts through the paused clock.
 tokio = { workspace = true, features = ["test-util"] }
+# The Responses WebSocket retry tests drive a session over the real
+# transport against pa-ai's scripted loopback server (no new crate).
+pa-ai = { path = "../pa-ai", features = ["test-support"] }
 
 [[bin]]
 name = "pa-daemon"

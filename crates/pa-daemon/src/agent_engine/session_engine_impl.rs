@@ -392,6 +392,33 @@ impl SessionEngine for AgentSessionEngine {
         }
     }
 
+    fn configure_transport(&self, transport: pa_types::ai::Transport) {
+        // The switch lands under the provider slot's lock: every target
+        // install reads the transport under the same lock, so an install
+        // built from an older snapshot can never undo the switch.
+        {
+            let mut slot = self.provider_target.write().expect("provider target lock");
+            *self.transport.write().expect("transport lock") = Some(transport);
+            if let Some(target) = slot.as_mut() {
+                target.transport = Some(transport);
+            }
+        }
+        // An armed image route reinstalls its stored targets later in the
+        // episode (a failover switch, the settle's restore): they follow
+        // the switch too, or the old transport would come back.
+        if let Some(route) = self
+            .image_route
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            route.target.transport = Some(transport);
+            if let Some(session_target) = route.session_target.as_mut() {
+                session_target.transport = Some(transport);
+            }
+        }
+    }
+
     fn configure_model(&self, selection: EngineModelSelection) {
         // Merge like the TS runtime config: explicit wire flags replace the
         // current selection; absent fields keep it.
@@ -485,6 +512,7 @@ impl SessionEngine for AgentSessionEngine {
                 api_key,
                 model: model.clone(),
                 headers,
+                transport: *self.transport.read().expect("transport lock"),
             });
         }
         let session = self.session.blocking_lock();

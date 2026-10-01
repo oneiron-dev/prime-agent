@@ -95,6 +95,12 @@ pub struct ProviderTarget {
     /// `set_model` carries them through to the stream the same way the
     /// build-time resolution does.
     pub headers: Option<std::collections::BTreeMap<String, String>>,
+    /// The session's provider transport preference (the `transport`
+    /// setting; TS `agent.transport` from `settingsManager.getTransport()`).
+    /// It is a session property, so every host that swaps the target (a
+    /// model switch, a provider failover, an image route) carries it over.
+    /// `None` leaves the provider default (`auto`).
+    pub transport: Option<pa_types::ai::Transport>,
 }
 
 /// A real pa-ai provider stream adapter for the agent loop, reading its
@@ -109,27 +115,20 @@ pub struct ProviderTarget {
 pub fn switchable_stream_fn(target: Arc<std::sync::RwLock<Option<ProviderTarget>>>) -> StreamFn {
     Arc::new(
         move |_requested: AgentModel, context: LlmContext, options: StreamRequestOptions| {
-            let ProviderTarget {
-                api_key,
-                model,
-                service_tier,
-                headers,
-            } = target
+            let target = target
                 .read()
                 .expect("provider target lock")
                 .clone()
                 .expect("provider target set before the first stream");
-            Box::pin(async move {
-                stream_once(&model, api_key, service_tier, headers, context, options)
-            })
+            Box::pin(async move { stream_once(target, context, options) })
         },
     )
 }
 
-/// Stream one completion against `model` with `api_key` and the
-/// auth-resolved request `headers`.
-/// Stream one completion against `model` (the per-request tail the
-/// switchable seams and the CLI's route-authoritative variant share).
+/// Stream one completion against the target's model with its key,
+/// auth-resolved request headers, service tier, and transport (the
+/// per-request tail the switchable seams and the CLI's route-authoritative
+/// variant share).
 /// `pub`: the CLI headless's route-authoritative stream reads the armed
 /// image target ahead of the shared slot and streams with the same tail.
 ///
@@ -138,13 +137,17 @@ pub fn switchable_stream_fn(target: Arc<std::sync::RwLock<Option<ProviderTarget>
 /// Returns the provider stream's error when the request fails (the
 /// per-attempt failures the retry driver classifies).
 pub fn stream_once(
-    model: &Model,
-    api_key: Option<String>,
-    service_tier: Option<pa_types::ai::ServiceTier>,
-    headers: Option<std::collections::BTreeMap<String, String>>,
+    target: ProviderTarget,
     context: LlmContext,
     options: StreamRequestOptions,
 ) -> anyhow::Result<Box<dyn ModelStream>> {
+    let ProviderTarget {
+        api_key,
+        model,
+        service_tier,
+        headers,
+        transport,
+    } = target;
     let messages: Vec<pa_types::ai::Message> = context
         .messages
         .iter()
@@ -169,7 +172,7 @@ pub fn stream_once(
             max_tokens: options.max_tokens,
             signal: Some(cancel.clone()),
             api_key,
-            transport: None,
+            transport,
             service_tier,
             cache_retention: None,
             session_id: options.session_id.clone(),
@@ -188,7 +191,7 @@ pub fn stream_once(
         reasoning: Some(model_thinking_level(options.reasoning)),
         thinking_budgets: None,
     };
-    let stream = pa_ai::stream_simple(model, &ai_context, Some(stream_options))
+    let stream = pa_ai::stream_simple(&model, &ai_context, Some(stream_options))
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     // Pump pa-ai events into a pa-agent event stream (the loop's
     // ModelStream): each provider event is forwarded verbatim.
@@ -221,6 +224,7 @@ pub fn real_stream_fn(api_key: Option<String>, model: Model) -> StreamFn {
         model,
         service_tier: None,
         headers: None,
+        transport: None,
     }))))
 }
 
@@ -422,6 +426,7 @@ mod tests {
             model: model.clone(),
             service_tier: Some(pa_types::ai::ServiceTier::Priority),
             headers: None,
+            transport: None,
         })));
         let stream_fn = switchable_stream_fn(target.clone());
         for tier in [Some(pa_types::ai::ServiceTier::Priority), None] {
@@ -442,6 +447,57 @@ mod tests {
                 (model.id, None),
             ]
         );
+        registration.unregister();
+    }
+
+    /// The target's transport preference reaches the provider request
+    /// (it used to be dropped: every request ran on the provider default,
+    /// so a `websocket` or `sse` setting never took effect).
+    #[tokio::test]
+    async fn live_target_transport_reaches_provider() {
+        let registration =
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                api: Some("target-transport-test".to_owned()),
+                ..Default::default()
+            });
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = received.clone();
+        let factory = pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |_, options, _, _| {
+            captured
+                .lock()
+                .unwrap()
+                .push(options.and_then(|options| options.transport));
+            Ok(pa_ai::faux::faux_assistant_text_message(
+                "ok",
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ))
+        }));
+        let transports = [
+            Some(pa_types::ai::Transport::WebsocketCached),
+            Some(pa_types::ai::Transport::Sse),
+            None,
+        ];
+        registration.set_responses(vec![factory; transports.len()]);
+        let target = Arc::new(std::sync::RwLock::new(Some(ProviderTarget {
+            api_key: None,
+            model: registration.get_model(),
+            service_tier: None,
+            headers: None,
+            transport: None,
+        })));
+        let stream_fn = switchable_stream_fn(target.clone());
+        for transport in transports {
+            target.write().unwrap().as_mut().unwrap().transport = transport;
+            let mut stream = stream_fn(
+                AgentModel::unknown(),
+                LlmContext::default(),
+                StreamRequestOptions::default(),
+            )
+            .await
+            .unwrap();
+            stream.result().await.unwrap();
+        }
+        assert_eq!(*received.lock().unwrap(), transports.to_vec());
         registration.unregister();
     }
 
@@ -592,6 +648,7 @@ mod tests {
             model: model.clone(),
             service_tier: None,
             headers: None,
+            transport: None,
         })));
         let stream_fn = switchable_stream_fn(target);
         let mut stream = stream_fn(

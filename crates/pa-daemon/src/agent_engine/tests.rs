@@ -17,10 +17,13 @@ mod compaction;
 mod goal;
 mod model_resolution;
 mod quota_park;
+mod retry_episode;
 mod rlm_children;
 mod saved_context;
 mod session;
 mod streaming;
+mod transport;
+mod websocket_retry;
 
 fn bare_engine(dir: &std::path::Path) -> AgentSessionEngine {
     let agent_dir = dir.join("agent");

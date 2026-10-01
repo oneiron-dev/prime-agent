@@ -8,7 +8,8 @@ use super::compaction_exec;
 use super::compaction_exec::{
     build_summarization_request, build_turn_prefix_request, compaction_entry_for,
     complete_summary_call, details_for, file_ops_block, split_summary, summed_usage,
-    CompactionDetails, CompactionResult, SummaryDeltaSink, SummarySlice, NO_PRIOR_HISTORY,
+    CompactionDetails, CompactionResult, SummaryDeltaSink, SummaryProvider, SummaryRequestOptions,
+    SummarySlice, NO_PRIOR_HISTORY,
 };
 use super::compaction_utils;
 use crate::session::manager::SessionManager;
@@ -92,6 +93,9 @@ pub struct CompactOptions<'a> {
     /// one-shot completion — the summarizer call itself is identical
     /// either way; only the stream consumption differs.
     pub summary_delta: Option<SummaryDeltaSink>,
+    /// How the summarizer requests run: the session id they carry and the
+    /// shared provider retry policy (TS `runRollingSummary`).
+    pub summary_requests: SummaryRequestOptions,
 }
 
 /// The model-visible message produced by a session entry (summarizer input).
@@ -338,8 +342,12 @@ pub async fn execute_compaction(
         );
         complete_summary_call(
             &model,
-            api_key.clone(),
-            summary_headers.clone(),
+            SummaryProvider {
+                api_key: api_key.clone(),
+                headers: summary_headers.clone(),
+                requests: &options.summary_requests,
+                abort: options.abort,
+            },
             history_max_tokens,
             request,
             options.summary_delta.clone(),
@@ -354,8 +362,12 @@ pub async fn execute_compaction(
         let request = build_turn_prefix_request(&turn_prefix_messages);
         let slice = complete_summary_call(
             &model,
-            api_key.clone(),
-            summary_headers.clone(),
+            SummaryProvider {
+                api_key: api_key.clone(),
+                headers: summary_headers.clone(),
+                requests: &options.summary_requests,
+                abort: options.abort,
+            },
             turn_prefix_max_tokens,
             request,
             // The turn-prefix call never streams live: the split join

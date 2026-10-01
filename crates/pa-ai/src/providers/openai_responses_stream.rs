@@ -505,6 +505,18 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 }
             }
             "response.output_item.done" => {
+                // TS reads the item's slot at the top of the loop, before
+                // `slots.delete`: removing it first lost every finished
+                // item that carries its `output_index` (as OpenAI sends it),
+                // so the text signature, the reasoning item, and the final
+                // tool call never landed on the message.
+                let (content_index, slot_json) = match self.current_slot(output_index) {
+                    Some(slot) => (
+                        Some(slot.content_index),
+                        slot.partial_json.text().to_string(),
+                    ),
+                    None => (None, String::new()),
+                };
                 if let Some(index) = output_index {
                     self.slots.remove(&index);
                 }
@@ -513,9 +525,6 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     .get("type")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                let content_index = self
-                    .current_slot(output_index)
-                    .map(|slot| slot.content_index);
                 match item_type {
                     "reasoning" => {
                         if let Some(content_index) = content_index {
@@ -626,18 +635,8 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         }
                     }
                     "function_call" => {
-                        let content_index = content_index.or_else(|| {
-                            output_index
-                                .and_then(|index| self.slots.get(&index))
-                                .map(|slot| slot.content_index)
-                        });
                         if let Some(content_index) = content_index {
                             if self.block_kind(content_index) == Some("toolCall") {
-                                let slot_json =
-                                    match self.slots.get(&output_index.unwrap_or_default()) {
-                                        Some(slot) => slot.partial_json.text().to_string(),
-                                        None => String::new(),
-                                    };
                                 let arguments_text = item
                                     .get("arguments")
                                     .and_then(|value| value.as_str())
@@ -853,20 +852,13 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     }
                 }
             }
+            // Flat OpenAI frames and CPA's nested envelope classify alike
+            // (TS fork 75af473b0): the provider verdict, never a socket
+            // failure.
             "error" => {
-                let code = event.get("code").and_then(|value| value.as_str());
-                let message = event
-                    .get("message")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                return Err(ProviderError::StreamFailure(StreamFailureError {
-                    message: format!("Error Code {}: {}", code.unwrap_or_default(), message),
-                    info: StreamFailureInfo {
-                        kind: classify_stream_failure(code, None),
-                        provider_error_type: code.map(std::string::ToString::to_string),
-                        ..StreamFailureInfo::unknown()
-                    },
-                }));
+                return Err(ProviderError::StreamFailure(
+                    crate::providers::openai_responses_errors::responses_error_event_failure(event),
+                ));
             }
             "response.failed" => {
                 let response = event.get("response").cloned().unwrap_or(Value::Null);

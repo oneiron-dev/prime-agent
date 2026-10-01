@@ -79,16 +79,21 @@ async fn apply_model_selection(
         // as one step, so a concurrently admitted turn can never see
         // half of the selection.
         let mut handle = state.session.handle_mut().await;
-        let provider_target = ProviderTarget {
-            api_key: resolved.api_key.clone(),
-            model: model.clone(),
-            service_tier: None,
-            headers: resolved.headers.clone(),
-        };
-        *handle
-            .provider_target
-            .write()
-            .map_err(|error| error.to_string())? = Some(provider_target);
+        {
+            let mut slot = handle
+                .provider_target
+                .write()
+                .map_err(|error| error.to_string())?;
+            // The session's transport preference survives the switch.
+            let transport = slot.as_ref().and_then(|target| target.transport);
+            *slot = Some(ProviderTarget {
+                api_key: resolved.api_key.clone(),
+                model: model.clone(),
+                service_tier: None,
+                headers: resolved.headers.clone(),
+                transport,
+            });
+        }
         let agent = handle.engine.session.agent();
         let agent_model: pa_agent::types::Model =
             json_round_trip(model).ok_or_else(|| "model conversion failed".to_string())?;

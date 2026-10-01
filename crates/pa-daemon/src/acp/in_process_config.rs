@@ -305,6 +305,7 @@ async fn apply_in_process_model_switch(
                     model: model.clone(),
                     service_tier: None,
                     headers: resolved.headers.clone(),
+                    transport: None,
                 });
             }
         }

@@ -310,6 +310,41 @@ pub fn classify_error_message(message: &str) -> ErrorClassification {
     }
 }
 
+/// The structured WebSocket transport codes (the failure's
+/// `providerErrorType`, `websocket_<cause>`).
+const TRANSPORT_CODES: &[&str] = &[
+    "websocket_connect",
+    "websocket_error",
+    "websocket_closed",
+    "websocket_eof",
+];
+
+/// Classify a failed call the provider recorded as a structured transport
+/// failure (kind `transport`): the connection failed before any provider
+/// verdict, so it is a network failure whatever its message says, coded by
+/// its recorded cause (never recovered from the message text).
+#[must_use]
+pub fn classify_transport_failure(provider_error_type: Option<&str>) -> ErrorClassification {
+    let subtype = "network_error";
+    ErrorClassification {
+        diagnostic: ERROR_DIAGNOSTICS
+            .iter()
+            .find(|(known, _)| *known == subtype)
+            .map_or("A network connection failed.", |(_, diagnostic)| {
+                *diagnostic
+            }),
+        safe_message: None,
+        category: subtype_category(subtype),
+        subtype,
+        code: provider_error_type
+            .and_then(|code| TRANSPORT_CODES.iter().find(|known| **known == code))
+            .copied(),
+        http_status: None,
+        classification_source: "typed_error",
+        retryable: subtype_retryable(subtype),
+    }
+}
+
 /// A bounded `[45]dd` HTTP status in the text (digit-bounded, the TS
 /// `\b5\d\d\b` shape generalized to 4xx).
 fn bounded_http_status(message: &str) -> Option<u64> {
@@ -439,6 +474,33 @@ mod tests {
         );
         assert_eq!(empty.subtype, "stream_drop");
         assert!(empty.retryable);
+    }
+
+    /// A structured transport failure classifies by its recorded cause,
+    /// not its text: a bare socket close (no status, no code token) is a
+    /// retryable network failure coded `websocket_closed`. It used to fall
+    /// through to the generic, non-retryable `unknown`.
+    #[test]
+    fn structured_transport_failures_classify_as_network_errors() {
+        assert_eq!(
+            classify("WebSocket closed before response.completed").subtype,
+            "unknown"
+        );
+        assert_eq!(
+            classify_transport_failure(Some("websocket_closed")),
+            ErrorClassification {
+                diagnostic: "A network connection failed.",
+                safe_message: None,
+                category: "network",
+                subtype: "network_error",
+                code: Some("websocket_closed"),
+                http_status: None,
+                classification_source: "typed_error",
+                retryable: true,
+            }
+        );
+        // An unrecognized cause keeps the class without inventing a code.
+        assert_eq!(classify_transport_failure(Some("websocket_x")).code, None);
     }
 
     #[test]

@@ -641,7 +641,7 @@ mod tests {
             serde_json::json!("rate_limit")
         );
         assert_eq!(properties["http_status"], serde_json::json!(429));
-        assert_eq!(properties["classifier_revision"], serde_json::json!(2));
+        assert_eq!(properties["classifier_revision"], serde_json::json!(3));
         assert!(!properties.contains_key("error_message"), "no raw message");
     }
 

@@ -502,13 +502,17 @@ async fn build_headless_engine_with(
 
     // The stream reads the provider target per call (the switchable seam
     // the ACP pickers swap on a model switch; image-model routing swaps it
-    // per dispatched batch).
+    // per dispatched batch). TS `sdk.ts` builds the Agent with
+    // `settingsManager.getTransport()`.
+    let transport =
+        pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir).get_transport();
     let provider_target: ProviderTargetSlot =
         std::sync::Arc::new(std::sync::RwLock::new(Some(ProviderTarget {
             api_key: resolved.api_key.clone(),
             model: model.clone(),
             service_tier: None,
             headers: resolved.headers.clone(),
+            transport: Some(transport),
         })));
     // The armed image route's target, shared with the stream seam: while
     // an episode is armed the stream serves THIS target (TS keeps the
@@ -662,15 +666,7 @@ fn route_authoritative_stream_fn(
                         .clone()
                 })
                 .expect("provider target set before the first stream");
-            let ProviderTarget {
-                api_key,
-                model,
-                service_tier,
-                headers,
-            } = target;
-            Box::pin(async move {
-                stream_once(&model, api_key, service_tier, headers, context, options)
-            })
+            Box::pin(async move { stream_once(target, context, options) })
         },
     )
 }
@@ -803,11 +799,18 @@ fn headless_image_model_router(
                 registry.load_private_authorization_from_cache();
                 let resolved_auth = registry
                     .get_api_key_and_headers(&resolved.model, resolved.model.headers.as_ref());
+                // The routed model serves on the session's transport.
+                let transport = provider_target
+                    .read()
+                    .expect("provider target lock")
+                    .as_ref()
+                    .and_then(|target| target.transport);
                 let target = pa_core::session_engine::provider_adapter::ProviderTarget {
                     api_key: resolved_auth.api_key,
                     headers: resolved_auth.headers,
                     model: resolved.model.clone(),
                     service_tier: resolved.service_tier,
+                    transport,
                 };
                 // The arm records the routed target it writes so the
                 // settle's still-routed guard can tell a slot the route
@@ -1632,6 +1635,7 @@ async fn build_faux_engine_with(
             model: model.clone(),
             service_tier: None,
             headers: None,
+            transport: None,
         })));
     let stream_fn = switchable_stream_fn(std::sync::Arc::clone(&provider_target));
     // The faux path shares the session-manager wiring (persist / --no-session
@@ -1731,6 +1735,7 @@ mod tests {
                 headers: None,
                 model,
                 service_tier: None,
+                transport: None,
             }
         }
         let home = tempfile::TempDir::new().unwrap();
