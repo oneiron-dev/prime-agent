@@ -10,6 +10,7 @@ import pickle
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
@@ -231,6 +232,64 @@ class SnapshotFileHandleGuardTest(unittest.TestCase):
         ns["first"] = "c" * 5_000
         result = self.snap(ns, max_bytes=7_000, max_variable_bytes=6_000)
         self.assertEqual(result["saved"], ["second"])
+
+
+class PackedSidecarSnapshotGuardTest(unittest.TestCase):
+    """The guard as it ships (the d1ee412fe principle): the runtime staged by
+    the release packer's own copy, shipped-content filter included, driven
+    through the REPL protocol across two kernels."""
+
+    def test_the_packed_runtime_never_reopens_a_closed_write_handle(self):
+        from test_repl import ReplProcess, one
+
+        repo = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(repo / "scripts"))
+        self.addCleanup(sys.path.remove, str(repo / "scripts"))
+        import package_release
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        staged = Path(tmp.name) / "prime-agent-runtime"
+        package_release.copy_tree(
+            repo / "prime-agent-runtime",
+            staged,
+            extra_excluded_names=package_release.RUNTIME_EXCLUDED_NAMES,
+            extra_excluded_suffixes=package_release.RUNTIME_EXCLUDED_SUFFIXES,
+        )
+        env = {"PYTHONPATH": str(staged / "src")}
+        target = os.path.join(tmp.name, "durable.txt")
+        snapshot = os.path.join(tmp.name, "kernel-state.dill")
+        manifest = os.path.join(tmp.name, "kernel-state.json")
+
+        first = ReplProcess(env)
+        self.addCleanup(first.close)
+        first.ready()
+        events = first.execute("c1", f"handle = open({target!r}, 'w')\nhandle.close()\nkeep = 7")
+        self.assertEqual(one(events, "done")["status"], "ok")
+        with open(target, "w") as fh:
+            fh.write("SURVIVE")
+        first.send({"type": "snapshot", "id": "s1", "path": snapshot, "manifest_path": manifest})
+        captured = one(first.until_done("s1"), "done")
+
+        second = ReplProcess(env)
+        self.addCleanup(second.close)
+        second.ready()
+        second.send({"type": "restore", "id": "r1", "path": snapshot})
+        restored = one(second.until_done("r1"), "done")
+        revived = one(second.execute("c2", "('handle' in globals(), keep)"), "result")
+        with open(target) as fh:
+            survived = fh.read()
+        self.assertEqual(
+            (
+                captured["saved"],
+                captured["skipped"],
+                captured["purgedFileHandles"],
+                restored["restored"],
+                revived["text"],
+                survived,
+            ),
+            (["keep"], [{"name": "handle", "reason": "unsafe file handle (io.IOBase)"}], ["handle"], ["keep"], "(False, 7)", "SURVIVE"),
+        )
 
 
 
