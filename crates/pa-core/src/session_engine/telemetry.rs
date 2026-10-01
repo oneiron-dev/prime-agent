@@ -61,6 +61,9 @@ mod classify;
 pub use classify::provider_category;
 use classify::{error_category, model_category, opt_value, run_outcome};
 
+// The provider session-affinity adoption seam (`note_provider_affinity`).
+mod provider_affinity;
+
 // The inline unit battery moved to the child module at the same tree
 // position (session_engine::telemetry::tests); its use-super glob keeps
 // resolving through the facade bindings and re-exports above.

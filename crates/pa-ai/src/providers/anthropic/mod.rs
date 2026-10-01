@@ -1,10 +1,11 @@
 //! Anthropic Messages streaming provider.
 //!
 //! Full port of `packages/ai/src/providers/anthropic.ts`, split across
-//! submodules: request headers and options here, message/tool conversion in
-//! [`convert`], params assembly in [`params`], and the SSE streaming core in
-//! [`stream`]. OAuth/Claude-Code header modes, beta headers, and adaptive vs
-//! budget-based thinking selection live here.
+//! submodules: options, compat, and cache retention here, request headers
+//! (OAuth/Claude-Code modes, beta flags, session affinity) in [`headers`],
+//! message/tool conversion in [`convert`], params assembly in [`params`],
+//! and the SSE streaming core in [`stream`]. Adaptive vs budget-based
+//! thinking selection lives here.
 
 use serde_json::{json, Map, Value};
 
@@ -22,22 +23,22 @@ use crate::types::{
 use crate::utils_inner::diagnostics::now_ms;
 
 mod convert;
+mod headers;
 mod params;
 mod stream;
 
 pub use stream::stream_anthropic;
 
 #[cfg(test)]
+mod cache_marker_tests;
+#[cfg(test)]
+mod request_capture;
+#[cfg(test)]
+mod session_affinity_tests;
+#[cfg(test)]
 mod stream_tests;
 
 pub const API_ANTHROPIC_MESSAGES: &str = "anthropic-messages";
-
-/// Claude Code version mimicked in OAuth mode. The API gates newer models
-/// on the claimed client version (e.g. claude-opus-5.5 requires >= 2.280),
-/// so keep this at or above the latest released Claude Code.
-const CLAUDE_CODE_VERSION: &str = "2.1.281";
-const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
-const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
 const CLAUDE_CODE_TOOLS: [&str; 17] = [
     "Read",
@@ -151,16 +152,22 @@ pub struct AnthropicOptions {
 }
 
 /// Resolved anthropic compat (`Required<AnthropicMessagesCompat>`).
+#[derive(Debug, PartialEq, Eq)]
 pub struct ResolvedAnthropicCompat {
     pub supports_eager_tool_input_streaming: bool,
     pub supports_long_cache_retention: bool,
+    pub send_session_affinity_headers: bool,
 }
 
 pub fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
-    let compat = model.compat_kind().and_then(|kind| match kind {
-        crate::types::CompatKind::AnthropicMessages(compat) => Some(compat),
-        _ => None,
-    });
+    // TS reads these fields straight off `model.compat`. The key sniff
+    // files a shared-key-only object (the `cpa-a` provider's
+    // `{"sendSessionAffinityHeaders": true}`) under the completions shape,
+    // so this provider decodes its own view of the raw object instead.
+    let compat = model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.anthropic_messages().ok());
     ResolvedAnthropicCompat {
         supports_eager_tool_input_streaming: compat
             .as_ref()
@@ -170,6 +177,10 @@ pub fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
             .as_ref()
             .and_then(|c| c.supports_long_cache_retention)
             .unwrap_or(true),
+        send_session_affinity_headers: compat
+            .as_ref()
+            .and_then(|c| c.send_session_affinity_headers)
+            .unwrap_or(false),
     }
 }
 
@@ -281,10 +292,6 @@ fn map_thinking_level_to_effort(
     }
 }
 
-pub(crate) fn is_oauth_token(api_key: &str) -> bool {
-    api_key.contains("sk-ant-oat")
-}
-
 pub(crate) fn should_use_fine_grained_tool_streaming_beta(
     model: &Model,
     context: &Context,
@@ -294,143 +301,6 @@ pub(crate) fn should_use_fine_grained_tool_streaming_beta(
         .as_ref()
         .is_some_and(|tools| !tools.is_empty())
         && !get_anthropic_compat(model).supports_eager_tool_input_streaming
-}
-
-pub(crate) fn merge_headers(sources: &[Option<Map<String, Value>>]) -> Map<String, Value> {
-    let mut merged = Map::new();
-    for source in sources.iter().flatten() {
-        for (key, value) in source {
-            merged.insert(key.clone(), value.clone());
-        }
-    }
-    merged
-}
-
-pub(crate) fn headers_to_pairs(headers: &Map<String, Value>) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter_map(|(key, value)| match value {
-            Value::String(text) => Some((key.clone(), text.clone())),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Build the request headers for the messages endpoint, mirroring the SDK
-/// client configurations (OAuth/Claude Code mode, cloudflare gateway,
-/// github-copilot, plain API key).
-pub(crate) fn build_request_headers(
-    model: &Model,
-    api_key: &str,
-    interleaved_thinking: bool,
-    use_fine_grained_tool_streaming_beta: bool,
-    options_headers: Option<&std::collections::HashMap<String, String>>,
-    session_id: Option<&str>,
-) -> (Vec<(String, String)>, bool) {
-    let is_oauth = is_oauth_token(api_key);
-    let needs_interleaved_beta = interleaved_thinking && !supports_adaptive_thinking(&model.id);
-    let mut beta_features: Vec<&str> = Vec::new();
-    if use_fine_grained_tool_streaming_beta {
-        beta_features.push(FINE_GRAINED_TOOL_STREAMING_BETA);
-    }
-    if needs_interleaved_beta {
-        beta_features.push(INTERLEAVED_THINKING_BETA);
-    }
-    let beta_header = if beta_features.is_empty() {
-        None
-    } else {
-        Some(beta_features.join(","))
-    };
-
-    let model_headers: Option<Map<String, Value>> = model.headers.as_ref().map(|headers| {
-        headers
-            .iter()
-            .map(|(key, value)| (key.clone(), json!(value)))
-            .collect()
-    });
-    let options_headers_json: Option<Map<String, Value>> = options_headers.map(|headers| {
-        headers
-            .iter()
-            .map(|(key, value)| (key.clone(), json!(value)))
-            .collect()
-    });
-
-    let mut default_headers = match model.provider.as_str() {
-        "cloudflare-ai-gateway" => {
-            let mut headers = Map::new();
-            headers.insert("accept".into(), json!("application/json"));
-            headers.insert(
-                "anthropic-dangerous-direct-browser-access".into(),
-                json!("true"),
-            );
-            headers.insert(
-                "cf-aig-authorization".into(),
-                json!(format!("Bearer {api_key}")),
-            );
-            headers.insert("x-api-key".into(), Value::Null);
-            headers.insert("Authorization".into(), Value::Null);
-            if let Some(beta) = &beta_header {
-                headers.insert("anthropic-beta".into(), json!(beta));
-            }
-            merge_headers(&[Some(headers), model_headers, options_headers_json])
-        }
-        "github-copilot" => {
-            let mut headers = Map::new();
-            headers.insert("accept".into(), json!("application/json"));
-            headers.insert(
-                "anthropic-dangerous-direct-browser-access".into(),
-                json!("true"),
-            );
-            if let Some(beta) = &beta_header {
-                headers.insert("anthropic-beta".into(), json!(beta));
-            }
-            merge_headers(&[Some(headers), model_headers, options_headers_json])
-        }
-        _ => {
-            let mut headers = Map::new();
-            headers.insert("accept".into(), json!("application/json"));
-            headers.insert(
-                "anthropic-dangerous-direct-browser-access".into(),
-                json!("true"),
-            );
-            if is_oauth {
-                headers.insert(
-                    "anthropic-beta".into(),
-                    json!(["claude-code-20250219", "oauth-2025-04-20"]
-                        .iter()
-                        .chain(beta_features.iter())
-                        .copied()
-                        .collect::<Vec<_>>()
-                        .join(",")),
-                );
-                headers.insert(
-                    "user-agent".into(),
-                    json!(format!("claude-cli/{CLAUDE_CODE_VERSION}")),
-                );
-                headers.insert("x-app".into(), json!("cli"));
-            } else if let Some(beta) = &beta_header {
-                headers.insert("anthropic-beta".into(), json!(beta));
-            }
-            merge_headers(&[Some(headers), model_headers, options_headers_json])
-        }
-    };
-
-    // withOpenCodeHeaders: session header for opencode providers.
-    if model.provider == "opencode" || model.provider == "opencode-go" {
-        if let Some(session_id) = session_id {
-            default_headers.insert("session_id".into(), json!(session_id));
-        }
-    }
-
-    let mut pairs = headers_to_pairs(&default_headers);
-    // The Anthropic SDK always sends the API version; mirror it.
-    pairs.insert(0, ("anthropic-version".into(), "2023-06-01".into()));
-    if model.provider == "cloudflare-ai-gateway" || model.provider == "github-copilot" || is_oauth {
-        pairs.push(("Authorization".into(), format!("Bearer {api_key}")));
-    } else {
-        pairs.push(("x-api-key".into(), api_key.to_string()));
-    }
-    (pairs, is_oauth)
 }
 
 /// Port of `streamSimpleAnthropic`.
@@ -586,52 +456,5 @@ mod always_on_adaptive_thinking_tests {
     fn optional_thinking_models_still_accept_disabled() {
         assert!(!is_always_on_adaptive_thinking_model("claude-opus-5"));
         assert!(!is_always_on_adaptive_thinking_model("claude-sonnet-5"));
-    }
-}
-
-#[cfg(test)]
-mod subscription_identity_tests {
-    use super::build_request_headers;
-    use crate::types::{zero_model_cost, Model, ModelInput};
-
-    // TS #2645's wire-contract assertions (anthropic-thinking-disable.test.ts):
-    // subscription requests claim the Claude Code client identity, and the
-    // claimed version must stay at or above what the API's model gates require
-    // (the opus-5.5 family rejects anything below 2.280).
-    fn test_model() -> Model {
-        Model {
-            id: "claude-opus-5-5".into(),
-            name: "Claude Opus 5.5".into(),
-            api: "anthropic-messages".into(),
-            provider: "anthropic".into(),
-            base_url: "https://api.anthropic.com".into(),
-            reasoning: false,
-            thinking_level_map: None,
-            input: vec![ModelInput::Text],
-            cost: zero_model_cost(),
-            context_window: 200_000,
-            max_tokens: 32_000,
-            featured: None,
-            headers: None,
-            compat: None,
-        }
-    }
-
-    #[test]
-    fn oauth_requests_claim_the_claude_code_identity() {
-        let (headers, is_oauth) =
-            build_request_headers(&test_model(), "sk-ant-oat-test", false, false, None, None);
-        assert!(is_oauth);
-        let header = |name: &str| {
-            headers
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.as_str())
-        };
-        let user_agent = header("user-agent").expect("the OAuth request sends a user-agent");
-        assert!(user_agent.starts_with("claude-cli/"), "got {user_agent}");
-        assert_eq!(header("x-app"), Some("cli"));
-        let beta = header("anthropic-beta").expect("the OAuth request sends the claude-code beta");
-        assert!(beta.contains("claude-code-20250219"));
     }
 }

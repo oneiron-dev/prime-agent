@@ -893,6 +893,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // event: the producer's flush reports through this handle.
         wiring.rlm_usage.set_telemetry(telemetry.clone());
         transport_adoption.set_telemetry(telemetry.clone());
+        // `provider session affinity configured`: the assembly-time model
+        // (only the full registry model carries its compat).
+        if let Some(model) = config.model_info.as_ref() {
+            telemetry.note_provider_affinity(model);
+        }
     }
     let goal_driver = wiring.runtime.goal_driver().clone();
     Ok(SessionEngine {
@@ -917,7 +922,13 @@ impl SessionEngine {
     /// Live model-facts bookkeeping for the turn-boundary surface: after
     /// a model switch the registered `model.info` handler and the context
     /// window the usage estimate reads follow the model the session now
-    /// runs (the TS runtime reads both live, not at assembly time).
+    /// runs (the TS runtime reads both live, not at assembly time). The
+    /// switched-to model's session-affinity configuration reports too: the
+    /// RPC mode's `set_model`/`cycle_model` install the model on the agent
+    /// directly and land here, while the daemon worker and ACP switches
+    /// report through [`AgentSession::set_model`] and
+    /// [`AgentSession::set_model_and_thinking_level`] (a caller of those
+    /// never needs this method for the report).
     pub fn update_model_facts(&self, model: &pa_types::ai::Model) {
         super::turn_boundary::TurnBoundaryRequests::rebind_model_facts(
             &self.turn_boundary,
@@ -928,6 +939,9 @@ impl SessionEngine {
             },
             (model.context_window > 0).then_some(model.context_window),
         );
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.note_provider_affinity(model);
+        }
     }
 
     /// The session's kernel provisioner as a weak reference (TS
@@ -1039,3 +1053,6 @@ impl SessionEngine {
 // glob resolves through this facade's bindings and re-exports.
 #[cfg(test)]
 mod tests;
+// A normal session on the real Anthropic provider, captured on the wire.
+#[cfg(test)]
+mod provider_wire_tests;
