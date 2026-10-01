@@ -1374,13 +1374,13 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
     async def test_memory_notice_rides_only_a_sigkill_ending(self):
         if not bash_module._IS_POSIX:
             self.skipTest("the memory guard kills POSIX process groups")
-        terminated = bash("sleep 20")
+        terminated = bash("tail -f /dev/null")
         self.assertEqual(bash_module.record_memory_notice([terminated.pid], "Memory limit: not this"), (True, False))
         os.killpg(terminated.pid, signal.SIGTERM)
         result = await terminated
         self.assertEqual((result.exit_code, result.output), (-signal.SIGTERM, ""))
 
-        killed = bash("sleep 20")
+        killed = bash("tail -f /dev/null")
         # Any pid in the list may name the handle (the group id and the measured members ride together).
         self.assertEqual(bash_module.record_memory_notice([4_000_000, killed.pid], "Memory limit: stopped"), (True, False))
         os.killpg(killed.pid, signal.SIGKILL)
