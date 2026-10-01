@@ -600,6 +600,120 @@ mod tests {
         );
     }
 
+    /// The `cpa-a` shape (TS 832395413's model-registry pin): a provider's
+    /// Anthropic `sendSessionAffinityHeaders` reaches every model, a
+    /// model's own compat wins key by key, and a model can opt in alone.
+    /// The shared-key-only objects survive the model's wire round trip and
+    /// read back through the Anthropic view the provider resolves.
+    #[test]
+    fn anthropic_affinity_opt_in_merges_provider_then_model() {
+        let result = load_custom_models(
+            r#"{ "providers": {
+                "cpa-a": {
+                    "baseUrl": "http://localhost:8317",
+                    "apiKey": "dummy-key",
+                    "api": "anthropic-messages",
+                    "compat": { "sendSessionAffinityHeaders": true },
+                    "models": [
+                        { "id": "claude-a" },
+                        { "id": "claude-b", "compat": { "sendSessionAffinityHeaders": false } },
+                        { "id": "claude-c", "compat": { "supportsLongCacheRetention": false } }
+                    ]
+                },
+                "solo": {
+                    "baseUrl": "http://localhost:9",
+                    "apiKey": "dummy-key",
+                    "api": "anthropic-messages",
+                    "models": [
+                        { "id": "claude-d", "compat": { "sendSessionAffinityHeaders": true } },
+                        { "id": "claude-e" }
+                    ]
+                }
+            } }"#,
+            &|_| false,
+            &|_| None,
+        );
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let compat_of = |model: &Model| {
+            model
+                .compat
+                .as_ref()
+                .map(|compat| serde_json::Value::Object(compat.raw.clone()))
+        };
+        assert_eq!(
+            result
+                .models
+                .iter()
+                .map(|model| (model.id.as_str(), compat_of(model)))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "claude-a",
+                    Some(serde_json::json!({ "sendSessionAffinityHeaders": true }))
+                ),
+                (
+                    "claude-b",
+                    Some(serde_json::json!({ "sendSessionAffinityHeaders": false }))
+                ),
+                (
+                    "claude-c",
+                    Some(serde_json::json!({
+                        "sendSessionAffinityHeaders": true,
+                        "supportsLongCacheRetention": false
+                    }))
+                ),
+                (
+                    "claude-d",
+                    Some(serde_json::json!({ "sendSessionAffinityHeaders": true }))
+                ),
+                ("claude-e", None),
+            ]
+        );
+        for model in &result.models {
+            let round_trip: Model =
+                serde_json::from_value(serde_json::to_value(model).unwrap()).unwrap();
+            assert_eq!(compat_of(&round_trip), compat_of(model), "{}", model.id);
+        }
+        let claude_c = result.models[2].compat.as_ref().unwrap();
+        assert_eq!(
+            claude_c.anthropic_messages().unwrap(),
+            pa_types::ai::AnthropicMessagesCompat {
+                supports_eager_tool_input_streaming: None,
+                supports_long_cache_retention: Some(false),
+                send_session_affinity_headers: Some(true),
+            }
+        );
+    }
+
+    /// A built-in model's `modelOverrides` compat can opt one model in
+    /// (TS accepts the key on model overrides too).
+    #[test]
+    fn anthropic_affinity_opt_in_rides_a_model_override() {
+        let base: Model = serde_json::from_value(serde_json::json!({
+            "id": "claude-x", "name": "Claude X", "api": "anthropic-messages",
+            "provider": "anthropic", "baseUrl": "https://api.anthropic.com",
+            "reasoning": true, "input": ["text"],
+            "cost": { "input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200_000, "maxTokens": 32_000,
+            "compat": { "supportsEagerToolInputStreaming": false }
+        }))
+        .unwrap();
+        let over = ModelOverride {
+            compat: Some(serde_json::json!({ "sendSessionAffinityHeaders": true })),
+            ..Default::default()
+        };
+        let merged = apply_model_override(&base, &over);
+        assert_eq!(
+            merged
+                .compat
+                .map(|compat| serde_json::Value::Object(compat.raw)),
+            Some(serde_json::json!({
+                "supportsEagerToolInputStreaming": false,
+                "sendSessionAffinityHeaders": true
+            }))
+        );
+    }
+
     #[test]
     fn model_overrides_merge() {
         let base = serde_json::from_value(serde_json::json!({

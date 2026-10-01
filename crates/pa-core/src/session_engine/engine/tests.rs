@@ -6,7 +6,7 @@ use crate::session_engine::tool_bridge::{bridge_tool, ToolDefinitionBridge};
 use crate::tools::tool_definition::{ExecutionMode, ToolDefinition, ToolExecutionResult};
 use pa_agent::scripted::ScriptedProvider;
 
-fn echo_definition() -> ToolDefinition {
+pub(super) fn echo_definition() -> ToolDefinition {
     ToolDefinition {
         name: "echo".to_string(),
         label: "Echo".to_string(),

@@ -945,3 +945,6 @@ impl SessionEngine {
 // glob resolves through this facade's bindings and re-exports.
 #[cfg(test)]
 mod tests;
+// A normal session on the real Anthropic provider, captured on the wire.
+#[cfg(test)]
+mod provider_wire_tests;
