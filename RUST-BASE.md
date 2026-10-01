@@ -36,12 +36,15 @@ when the diff is identical, otherwise drop it by hand.
 | `PRIME_AGENT_DISABLE_SELF_UPDATE` | `crates/pa-core/src/update/installer.rs`, `crates/pa-cli/src/self_update.rs` | Upstream's `update` / `/update` fetch and run the takeover installer (stops every TS daemon, replaces `~/.local/bin/prime-agent`); a side-by-side install must refuse. |
 | `--no-extensions` accepted | `crates/pa-cli/src/args.rs` | Upstream removed extensions (#3189); the `sol` wrapper and factory still pass the flag. |
 | Side-by-side install + probe | `scripts/oneiron/side_by_side.py` | Installs a staged release beside the TS build and writes receipts. |
+| Release feed, rollout, rollback, status | `scripts/oneiron/release_feed.py`, `rollout.py`, `daemon_idle.py` (subcommands of `side_by_side.py`), `docs/oneiron/RELEASE.md`, `docs/oneiron/ROLLBACK.md` | Stamps a `package_release.py` build into a versioned feed release (`feed/releases/v<ver>/`), rolls it out with verified sums, a probe before selection and an idle-only Rust daemon check, and rolls back to the previous install; every step writes a receipt. `crates/pa-core/tests/oneiron_feed_manifest.rs` checks the feed manifest against the native updater's parser. |
 | Test-policy gate | `scripts/check-test-policy.mjs` (from the TS fork), `scripts/oneiron/test_policy_gate.py` | Runs the fork's test policy with `TEST_POLICY_BASE=oneiron/main` and fails only on violations beyond the 4 upstream ones present at the pin (`scripts/oneiron/test-policy-baseline.txt`). |
 
 ## Side-by-side contract (until cutover)
 
 - Install tree `~/.local/share/prime-agent-oneiron-rs/<version>/` (immutable per version) with
-  `current -> <version>`; launcher `~/.local/bin/prime-agent-rs`.
+  `current -> <version>` and `previous -> <the version current left>`; launcher
+  `~/.local/bin/prime-agent-rs`. Releases come from `side_by_side.py package` / `rollout`
+  (`docs/oneiron/RELEASE.md`); `rollback` and the TS fallback are in `docs/oneiron/ROLLBACK.md`.
 - Own agent dir `~/.prime/agent-rs` (`PRIME_AGENT_CODING_AGENT_DIR`). The TS fleet's
   `~/.prime/agent` is shared mutable state, and a Rust daemon would act on it (audit,
   2026-10-01). It would move sessions into `sessions-archive`, delete TS update manifests at
