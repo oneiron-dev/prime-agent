@@ -30,6 +30,8 @@ mod stream;
 pub use stream::stream_anthropic;
 
 #[cfg(test)]
+mod cache_marker_tests;
+#[cfg(test)]
 mod request_capture;
 #[cfg(test)]
 mod session_affinity_tests;
