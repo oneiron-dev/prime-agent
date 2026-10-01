@@ -220,9 +220,9 @@ async fn completion_waits_for_the_events_its_responses_overtook() {
 }
 
 /// A turn longer than the supervisor's route budget answers the prompt
-/// with the route timeout; the client waits for the session to go idle
-/// (re-issuing the idle wait while the budget keeps running out) instead
-/// of failing the prompt.
+/// with the route timeout after its run started; the client waits for the
+/// session to go idle (re-issuing the idle wait while the budget keeps
+/// running out) instead of failing the prompt.
 #[tokio::test]
 async fn a_turn_past_the_route_budget_waits_for_idle() {
     let mut idle_waits = 0;
@@ -231,7 +231,10 @@ async fn a_turn_past_the_route_budget_waits_for_idle() {
             return replies;
         }
         match kind {
-            "prompt_and_wait" => vec![Reply::Fail("Session worker timed out")],
+            "prompt_and_wait" => vec![
+                event(1, &json!({ "type": "agent_start" })),
+                Reply::Fail("Session worker timed out"),
+            ],
             "wait_for_headless_completion" => {
                 idle_waits += 1;
                 if idle_waits == 1 {
@@ -257,6 +260,31 @@ async fn a_turn_past_the_route_budget_waits_for_idle() {
             "wait_for_headless_completion",
         ]
     );
+}
+
+/// The route budget also answers a prompt that never reached the worker:
+/// with no run started after the prompt was sent, the timeout fails the
+/// prompt instead of waiting for an idle session that never ran it.
+#[tokio::test]
+async fn an_unconfirmed_prompt_past_the_route_budget_fails() {
+    let fake = FakeSupervisor::start(Box::new(|kind, _| {
+        if let Some(replies) = opening(kind) {
+            return replies;
+        }
+        match kind {
+            "prompt_and_wait" => vec![Reply::Fail("Session worker timed out")],
+            other => panic!("unexpected command {other}"),
+        }
+    }));
+    let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
+        .await
+        .unwrap();
+    let error = bounded(session.prompt(prompt("lost"))).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Session worker timed out before the prompt was seen to start; it may not have run"
+    );
+    assert_eq!(fake.commands(), ["create", "attach", "prompt_and_wait"]);
 }
 
 /// A prompt the worker rejects fails with the worker's message.
@@ -309,10 +337,11 @@ async fn same_file_resume_attaches_the_live_worker() {
     assert_eq!(fake.commands(), ["list", "attach"]);
 }
 
-/// A session closed under the client ends the completion barrier instead
-/// of waiting for a sequence that will never arrive.
+/// A session closed under the client before the run's last event reached
+/// the sink fails the completion (the stream is truncated) instead of
+/// waiting for a sequence that will never arrive.
 #[tokio::test]
-async fn a_closed_session_ends_the_completion_barrier() {
+async fn a_session_closed_before_its_last_event_fails_the_completion() {
     let fake = FakeSupervisor::start(Box::new(|kind, _| {
         if let Some(replies) = opening(kind) {
             return replies;
@@ -333,8 +362,45 @@ async fn a_closed_session_ends_the_completion_barrier() {
         .unwrap();
     let (sink, events) = recording();
     session.start_stream(sink);
-    bounded(session.wait_for_completion()).await.unwrap();
+    let error = bounded(session.wait_for_completion()).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "the run's event stream ended before its last event: the session was closed (killed)"
+    );
     assert!(events.lock().unwrap().is_empty());
+}
+
+/// A stream that ends after the run's last event reached the sink still
+/// completes: nothing was lost.
+#[tokio::test]
+async fn a_stream_closed_after_its_last_event_completes() {
+    let agent_end = json!({ "type": "agent_end", "messages": [] });
+    let last = agent_end.clone();
+    let fake = FakeSupervisor::start(Box::new(move |kind, _| {
+        if let Some(replies) = opening(kind) {
+            return replies;
+        }
+        match kind {
+            "wait_for_headless_completion" => vec![Reply::Ok(idle_status())],
+            "get_rlm_children" => vec![
+                Reply::Ok(json!({ "children": [], "eventSequence": 2 })),
+                event(1, &json!({ "type": "agent_start" })),
+                event(2, &last),
+                Reply::Close,
+            ],
+            other => panic!("unexpected command {other}"),
+        }
+    }));
+    let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
+        .await
+        .unwrap();
+    let (sink, events) = recording();
+    session.start_stream(sink);
+    bounded(session.wait_for_completion()).await.unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![json!({ "type": "agent_start" }), agent_end]
+    );
 }
 
 /// Leaving detaches and closes the connection; a resident session is never
@@ -387,4 +453,47 @@ async fn a_request_after_the_connection_ended_fails_instead_of_hanging() {
         .unwrap();
     let error = bounded(session.prompt(prompt("two"))).await.unwrap_err();
     assert_eq!(error.to_string(), "the daemon connection is closed");
+}
+
+/// The text-mode read keeps every message the session types model and
+/// skips a row they do not (an in-process run's harness digest with an ISO
+/// timestamp) instead of failing the whole run.
+#[tokio::test]
+async fn messages_skip_rows_the_session_types_do_not_model() {
+    let answer = json!({
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "SAVED" }],
+        "api": "faux", "provider": "faux", "model": "faux-1",
+        "usage": {
+            "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 2,
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
+        },
+        "stopReason": "stop",
+        "timestamp": 1_790_856_422_484_u64,
+    });
+    let digest = json!({
+        "role": "custom",
+        "customType": "harness_digest",
+        "content": "[harness-digest]",
+        "display": false,
+        "timestamp": "2026-10-01T12:07:02.484Z",
+    });
+    let rows = json!({ "messages": [digest, answer.clone()] });
+    let fake = FakeSupervisor::start(Box::new(move |kind, _| {
+        if let Some(replies) = opening(kind) {
+            return replies;
+        }
+        match kind {
+            "get_messages" => vec![Reply::Ok(rows.clone())],
+            other => panic!("unexpected command {other}"),
+        }
+    }));
+    let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
+        .await
+        .unwrap();
+    let messages = bounded(session.messages()).await.unwrap();
+    assert_eq!(
+        messages,
+        vec![serde_json::from_value::<pa_types::session::AgentMessage>(answer).unwrap()]
+    );
 }
