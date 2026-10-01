@@ -862,6 +862,17 @@ class LauncherTests(Fixture):
                             f"agent dir {re.escape(str(self.agent_dir))}")
         self.assertEqual(side_by_side.tree_identity(self.ts_agent), before)
 
+    def test_launcher_refuses_a_link_below_the_python_cache(self) -> None:
+        # Python follows a dir link below the cache root too (bytecode for
+        # /tmp/x.py lands at <cache>/tmp/x.pyc): a planted <cache>/tmp -> TS
+        # state is an agent-dir link like any other.
+        link = self.agent_dir / "python-cache" / "tmp"
+        link.symlink_to(self.ts_agent, target_is_directory=True)
+        before = side_by_side.tree_identity(self.ts_agent)
+        self.assert_refused(f"refusing agent dir {re.escape(str(self.agent_dir))}: only models.json may be a link "
+                            f"in it, found: {re.escape(str(link))}$")
+        self.assertEqual(side_by_side.tree_identity(self.ts_agent), before)
+
     @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 dir")
     def test_launcher_refuses_an_agent_dir_it_cannot_scan(self) -> None:
         locked = self.agent_dir / "locked"

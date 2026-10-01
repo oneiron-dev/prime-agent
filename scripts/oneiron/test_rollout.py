@@ -627,6 +627,22 @@ class RolloutTests(RolloutFixture):
         self.assertEqual((os.readlink(self.prefix / "current"), os.readlink(self.prefix / "previous")), (V2, V1))
         self.assertEqual(os.listdir(sessions), [])
 
+    def test_a_link_below_the_python_cache_never_carries_bytecode_into_ts_state(self) -> None:
+        # The probe imports the bundled skill from <prefix>/<ver>/skills, so
+        # its bytecode goes to <cache>/<that path>. A dir link planted at the
+        # path's first component, into TS state, is refused before the run
+        # writes anything (and the launcher would refuse it again).
+        self.publish(V1)
+        cache = self.root / "agent-rs" / "python-cache"
+        cache.mkdir(parents=True)
+        link = cache / self.prefix.parts[1]
+        link.symlink_to(side_by_side.TS_AGENT_DIR, target_is_directory=True)
+        ts_before = side_by_side.tree_identity(side_by_side.TS_AGENT_DIR)
+        with self.assertRaisesRegex(SystemExit, f"only models.json may be a link in it, found: {link}$"):
+            self.main("rollout", "--version", V1)
+        self.assertEqual(side_by_side.tree_identity(side_by_side.TS_AGENT_DIR), ts_before)
+        self.assertEqual(((self.prefix / V1).exists(), (self.prefix / "current").is_symlink()), (False, False))
+
     def test_rollback_refuses_while_the_rust_daemon_is_busy(self) -> None:
         self.publish(V1)
         self.publish(V2)
