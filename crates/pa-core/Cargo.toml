@@ -47,6 +47,9 @@ proptest = { workspace = true }
 # The traces rate-gate test runs on paused tokio time (the 12s platform
 # interval auto-advances).
 tokio = { workspace = true, features = ["test-util"] }
+# The compaction summary's WebSocket cancellation tests drive the real
+# Responses transport against pa-ai's scripted loopback server.
+pa-ai = { workspace = true, features = ["test-support"] }
 
 [[test]]
 name = "golden_system_prompt"

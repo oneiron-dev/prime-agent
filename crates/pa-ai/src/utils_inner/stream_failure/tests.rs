@@ -82,8 +82,7 @@ fn builds_user_facing_messages() {
         provider_error_type: Some("overloaded_error".into()),
         status: Some(529),
         request_id: Some("req_abc".into()),
-        retry_after_ms: None,
-        raw: None,
+        ..StreamFailureInfo::unknown()
     };
     assert_eq!(
         stream_failure_message(&info, Some("slow down")),
@@ -98,11 +97,8 @@ fn builds_user_facing_messages() {
 fn classified_message_with_parenthesized_status() {
     let status_only = StreamFailureInfo {
         kind: StreamFailureKind::InvalidRequest,
-        provider_error_type: None,
         status: Some(400),
-        request_id: None,
-        retry_after_ms: None,
-        raw: None,
+        ..StreamFailureInfo::unknown()
     };
     assert_eq!(
         stream_failure_message(&status_only, Some("bad request")),
@@ -493,5 +489,78 @@ fn stream_drop_failures_disclose_the_class_and_block() {
     assert_eq!(
         stream_drop_failure(OpenStreamBlock::None).message,
         "Provider dropped the response stream (stream_drop): the stream ended before any response content or stop signal"
+    );
+}
+
+/// A separate provider error code joins the qualifiers only when it
+/// differs from the provider error type (TS `streamFailureMessage`).
+#[test]
+fn provider_error_code_qualifies_when_distinct() {
+    let distinct = StreamFailureInfo {
+        kind: StreamFailureKind::ServerError,
+        provider_error_type: Some("server_error".into()),
+        provider_error_code: Some("upstream_unavailable".into()),
+        status: Some(503),
+        ..StreamFailureInfo::unknown()
+    };
+    assert_eq!(
+        stream_failure_message(&distinct, Some("try later")),
+        "Provider server error (server_error, upstream_unavailable, 503): try later"
+    );
+    let same = StreamFailureInfo {
+        provider_error_code: Some("server_error".into()),
+        ..distinct
+    };
+    assert_eq!(
+        stream_failure_message(&same, None),
+        "Provider server error (server_error, 503)"
+    );
+}
+
+/// The structured WebSocket transport failure (TS
+/// `WebSocketTransportError`): it classifies as `transport` with the
+/// `websocket_<cause>` provider type and the camelCase detail, keeps its
+/// short socket text verbatim, and records the structured class name with
+/// no diagnostic `code` (the close code lives in the detail).
+#[test]
+fn structured_transport_failures_classify_as_transport() {
+    let error = ProviderError::Transport(ProviderWsTransportError {
+        message: "WebSocket closed before response.completed".to_string(),
+        close_code: Some(1006),
+        transport: Some(StreamTransportFailureDetail {
+            close_code: Some(1006),
+            was_clean: Some(false),
+            ..StreamTransportFailureDetail::websocket(StreamTransportFailureCause::Closed)
+        }),
+    });
+    assert_eq!(
+        format_stream_failure_message(&error),
+        "WebSocket closed before response.completed"
+    );
+    assert_eq!(
+        serde_json::to_value(extract_stream_failure_info(&error)).unwrap(),
+        serde_json::json!({
+            "kind": "transport",
+            "providerErrorType": "websocket_closed",
+            "transport": {
+                "protocol": "websocket",
+                "cause": "closed",
+                "closeCode": 1006,
+                "wasClean": false
+            }
+        })
+    );
+    let diagnostic = diagnostic_error_info(&error);
+    assert_eq!(diagnostic.name.as_deref(), Some("WebSocketTransportError"));
+    assert_eq!(diagnostic.code, None);
+    // The kind's own sentence exists for the classified rewrite paths.
+    assert_eq!(
+        stream_failure_message(
+            &StreamFailureInfo::transport(StreamTransportFailureDetail::websocket(
+                StreamTransportFailureCause::Eof
+            )),
+            None
+        ),
+        "Connection to the provider was lost before the response completed (websocket_eof)"
     );
 }

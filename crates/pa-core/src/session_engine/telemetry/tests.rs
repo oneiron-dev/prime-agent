@@ -990,3 +990,105 @@ async fn bot_edges_the_give_up_never_double_counts_the_chain() {
         "the give-up never inflated the chain to 2"
     );
 }
+
+/// `agent provider transport used`: the session's first WebSocket upgrade
+/// (the transport's synthetic 101) reports once, with the API name and the
+/// transport only; plain HTTP responses and later upgrades never report,
+/// and every request's own response hook still runs.
+#[tokio::test]
+async fn provider_transport_used_reports_the_first_upgrade_once() {
+    let fixture = fixture();
+    let adoption =
+        Arc::new(crate::session_engine::transport_adoption::TransportAdoption::default());
+    adoption.set_telemetry(Arc::new(SessionTelemetry::detached(
+        fixture.client.clone(),
+        fixture.state.clone(),
+        "interactive".to_string(),
+    )));
+    let provider: pa_agent::stream::StreamFn = Arc::new(|model, _context, options| {
+        Box::pin(async move {
+            let hook = options.on_response.expect("the request's hook");
+            for status in [200, 101, 101] {
+                hook(
+                    pa_agent::stream::ProviderResponse {
+                        status,
+                        headers: std::collections::BTreeMap::new(),
+                    },
+                    &model,
+                );
+            }
+            Err(anyhow::anyhow!("scripted provider"))
+        })
+    });
+    let stream_fn = adoption.instrument(provider);
+    let statuses = Arc::new(Mutex::new(Vec::new()));
+    for _ in 0..2 {
+        let seen = Arc::clone(&statuses);
+        let options = pa_agent::stream::StreamRequestOptions {
+            on_response: Some(Arc::new(move |response, _model| {
+                seen.lock().unwrap().push(response.status);
+            })),
+            ..Default::default()
+        };
+        let mut model = pa_agent::types::Model::unknown();
+        model.api = "openai-responses".to_string();
+        let outcome = stream_fn(model, pa_agent::stream::LlmContext::default(), options).await;
+        assert!(outcome.is_err());
+    }
+    fixture.client.flush().await.unwrap();
+    let events = event_properties(&fixture.mock, "agent provider transport used").await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["api"], serde_json::json!("openai-responses"));
+    assert_eq!(events[0]["transport"], serde_json::json!("websocket"));
+    assert_eq!(
+        *statuses.lock().unwrap(),
+        vec![200, 101, 101, 200, 101, 101]
+    );
+}
+
+/// `agent error` for a structured WebSocket transport failure: the
+/// occurrence classifies by the recorded cause (a retryable network error
+/// coded `websocket_closed`), not by the bare socket text, which matches
+/// no status, code, or reviewed message and used to read as `unknown`.
+#[tokio::test]
+async fn transport_failures_report_their_recorded_cause() {
+    let fixture = fixture();
+    let mut failed = assistant_with_error("WebSocket closed before response.completed");
+    failed.diagnostics = Some(vec![pa_agent::types::AssistantMessageDiagnostic {
+        kind: "provider_stream_failure".to_string(),
+        timestamp: 0,
+        error: None,
+        details: Some(serde_json::json!({
+            "kind": "transport",
+            "providerErrorType": "websocket_closed",
+            "transport": { "protocol": "websocket", "cause": "closed", "closeCode": 1006 },
+        })),
+    }]);
+    emit(&fixture, AgentEvent::AgentStart);
+    emit(&fixture, AgentEvent::TurnStart);
+    emit(&fixture, message_end_event(failed));
+    emit(
+        &fixture,
+        AgentEvent::AgentEnd {
+            messages: Vec::new(),
+        },
+    );
+    let errors = event_properties(&fixture.mock, "agent error").await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        [
+            &errors[0]["error_subtype"],
+            &errors[0]["error_category"],
+            &errors[0]["error_code"],
+            &errors[0]["classification_source"],
+            &errors[0]["retryable"],
+        ],
+        [
+            &serde_json::json!("network_error"),
+            &serde_json::json!("network"),
+            &serde_json::json!("websocket_closed"),
+            &serde_json::json!("typed_error"),
+            &serde_json::json!(true),
+        ]
+    );
+}

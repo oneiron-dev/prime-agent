@@ -2,32 +2,32 @@
 //! Section of the port of
 //! `packages/ai/src/providers/openai-codex-responses.ts`.
 //!
-//! Each connection owns a worker task that holds the socket; requests talk to
-//! it over a command channel and receive events over a fresh channel per
-//! request. The handshake sends the same beta header the codex-rs client
-//! sends (`OpenAI-Beta: responses_websockets=2026-02-06`) plus custom
-//! headers via an explicit `http::Request` (plain `connect_async` accepts
-//! `http::Request`, which carries headers).
+//! The socket mechanics (handshake with custom headers, the per-connection
+//! worker, per-request event channels, frame decoding) are the shared
+//! Responses WebSocket worker
+//! ([`crate::providers::responses_websocket::connection`]) under the Codex
+//! terminal-event dialect; this module keeps the Codex session cache, the
+//! connection-anchored continuation, and the Codex (bun runtime) error
+//! surface. The handshake sends the same beta header the codex-rs client
+//! sends (`OpenAI-Beta: responses_websockets=2026-02-06`).
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use futures::stream::SplitStream;
-use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::{CapacityError, ProtocolError};
 use tokio_tungstenite::tungstenite::Error as WsError;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use tokio_util::sync::CancellationToken;
 
+pub(crate) use crate::providers::responses_websocket::connection::WorkerEvent;
+use crate::providers::responses_websocket::connection::{
+    connect, CloseReason, ConnectFailure, EventDialect, SocketEnd, WorkerHandle,
+};
+use crate::providers::responses_websocket::continuation::input_delta;
+
 use crate::providers::openai_codex_responses::errors::{
     CodexProtocolError, CodexStreamError, WebSocketTransportError, WEBSOCKET_CLOSE_CODE_ABNORMAL,
-    WEBSOCKET_CLOSE_CODE_PROTOCOL, WEBSOCKET_CLOSE_CODE_STATUS, WEBSOCKET_CLOSE_CODE_TOO_BIG,
-    WEBSOCKET_CONNECTION_ENDED_REASON,
+    WEBSOCKET_CLOSE_CODE_NORMAL, WEBSOCKET_CLOSE_CODE_PROTOCOL, WEBSOCKET_CLOSE_CODE_STATUS,
+    WEBSOCKET_CLOSE_CODE_TOO_BIG, WEBSOCKET_CONNECTION_ENDED_REASON,
 };
 use crate::providers::openai_codex_responses::session::{session_state, CachedConnection};
 
@@ -40,26 +40,6 @@ pub use crate::providers::openai_codex_responses::session::{
     record_request_stats, record_websocket_failure, record_websocket_sse_fallback,
     schedule_session_websocket_expiry, take_continuation_for,
 };
-
-type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-/// Command sent to a connection's worker task.
-pub(crate) enum WorkerCommand {
-    /// Send one `response.create` request; events flow over `events`.
-    Send {
-        body: String,
-        events: mpsc::Sender<WorkerEvent>,
-    },
-    Close,
-}
-
-/// Events a worker forwards to the active request.
-pub enum WorkerEvent {
-    /// A parsed stream event.
-    Event(Value),
-    /// Terminal marker after the completion event (Ok) or an error (Err).
-    Terminal(Result<(), CodexStreamError>),
-}
 
 /// Connection-scoped continuation state
 /// (`CachedWebSocketContinuationState` in the TS).
@@ -89,11 +69,6 @@ pub struct WebSocketDebugStats {
     pub sse_fallbacks: u64,
     pub websocket_fallback_active: Option<bool>,
     pub last_websocket_error: Option<String>,
-}
-
-fn next_connection_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::SeqCst)
 }
 
 /// Port of the TS runtime's (bun) WebSocket connect-failure surface,
@@ -188,214 +163,83 @@ fn bun_read_failure(error: &WsError) -> WebSocketTransportError {
     }
 }
 
-/// Port of `connectWebSocket` + worker spawn: handshake with custom headers,
-/// then run the reader loop until the channel closes.
-/// Port of `connectWebSocket` + worker spawn: handshake with custom headers,
-/// then run the reader loop until the channel closes.
+/// Port of `connectWebSocket` + worker spawn: the shared handshake and
+/// worker under the Codex dialect, with the Codex connect-failure surface.
 async fn spawn_connection_worker(
     url: &str,
     headers: &[(String, String)],
     signal: Option<CancellationToken>,
-) -> Result<(mpsc::Sender<WorkerCommand>, u64), CodexStreamError> {
-    let mut request = url.into_client_request().map_err(|error| {
-        CodexStreamError::Transport(WebSocketTransportError::runtime(format!(
-            "WebSocket connection to '{url}' failed: {error}"
-        )))
-    })?;
-    for (name, value) in headers {
-        let name = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            CodexStreamError::Transport(WebSocketTransportError::runtime(format!(
-                "WebSocket connection to '{url}' failed: Invalid WebSocket header {name}"
-            )))
-        })?;
-        let value = http::HeaderValue::from_str(value).map_err(|_| {
-            CodexStreamError::Transport(WebSocketTransportError::runtime(format!(
-                "WebSocket connection to '{url}' failed: Invalid WebSocket header value"
-            )))
-        })?;
-        request.headers_mut().insert(name, value);
-    }
-
-    if signal
-        .as_ref()
-        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-    {
-        return Err(CodexStreamError::Aborted);
-    }
-
-    let connect = tokio_tungstenite::connect_async(request);
-    let (stream, _response) = match signal.as_ref() {
-        Some(signal) => {
-            tokio::select! {
-                () = signal.cancelled() => return Err(CodexStreamError::Aborted),
-                result = connect => result,
+) -> Result<(WorkerHandle, u64), CodexStreamError> {
+    let worker = connect(url, headers, signal.as_ref(), EventDialect::Codex)
+        .await
+        .map_err(|failure| match failure {
+            ConnectFailure::Cancelled => CodexStreamError::Aborted,
+            ConnectFailure::Request(detail) => {
+                CodexStreamError::Transport(WebSocketTransportError::runtime(format!(
+                    "WebSocket connection to '{url}' failed: {detail}"
+                )))
             }
-        }
-        None => connect.await,
-    }
-    .map_err(|error| CodexStreamError::Transport(bun_connect_failure(url, &error)))?;
-
-    let connection_id = next_connection_id();
-    let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>(4);
-    tokio::spawn(connection_worker(stream, command_rx, signal));
-    Ok((command_tx, connection_id))
+            ConnectFailure::Handshake(error) => {
+                CodexStreamError::Transport(bun_connect_failure(url, &error))
+            }
+        })?;
+    let connection_id = worker.connection_id();
+    Ok((worker, connection_id))
 }
 
-/// Port of `parseWebSocket`: per-request event forwarding with completion
-/// tracking, error extraction, and close-code reporting. The worker parks
-/// between requests so a session can reuse one connection.
-/// Port of `parseWebSocket`: per-request event forwarding with completion
-/// tracking, error extraction, and close-code reporting. The worker parks
-/// between requests so a session can reuse one connection.
-async fn connection_worker(
-    stream: WsStream,
-    mut commands: mpsc::Receiver<WorkerCommand>,
-    signal: Option<CancellationToken>,
-) {
-    let (mut sink, mut stream) = stream.split();
-    loop {
-        let Some(command) = commands.recv().await else {
-            return;
-        };
-        match command {
-            WorkerCommand::Close => {
-                let _ = sink.close().await;
-                return;
-            }
-            WorkerCommand::Send { body, events } => {
-                if sink.send(Message::Text(body.into())).await.is_err() {
-                    // A dead socket surfaces through its close event (the TS
-                    // runtime's send on a closed socket is a silent no-op; the
-                    // close event carries the failure).
-                    let _ = events
-                        .send(WorkerEvent::Terminal(Err(CodexStreamError::Transport(
-                            WebSocketTransportError::close(
-                                WEBSOCKET_CLOSE_CODE_ABNORMAL,
-                                WEBSOCKET_CONNECTION_ENDED_REASON,
-                            ),
-                        ))))
-                        .await;
-                    let _ = sink.close().await;
-                    return;
-                }
-                let terminal = read_request_events(&mut stream, &events, signal.as_ref()).await;
-                if terminal.is_err() {
-                    let _ = events.send(WorkerEvent::Terminal(terminal)).await;
-                    let _ = sink.close().await;
-                    return;
-                }
-                let _ = events.send(WorkerEvent::Terminal(terminal)).await;
-            }
+/// Port of `parseWebSocket`'s failure surface: how the shared worker ended
+/// one request, as the Codex stream error (TS-binary probe-verified
+/// texts). A completed request is `Ok`.
+pub(crate) fn codex_socket_end(end: SocketEnd) -> Result<(), CodexStreamError> {
+    match end {
+        SocketEnd::Completed => Ok(()),
+        SocketEnd::Cancelled => Err(CodexStreamError::Aborted),
+        SocketEnd::CloseFrame {
+            code: Some(code),
+            reason,
+        } => Err(CodexStreamError::Transport(WebSocketTransportError::close(
+            code, &reason,
+        ))),
+        // A close frame without a status code surfaces as the runtime's
+        // 1005 close event (probe-verified).
+        SocketEnd::CloseFrame { code: None, .. } => Err(CodexStreamError::Transport(
+            WebSocketTransportError::close(WEBSOCKET_CLOSE_CODE_STATUS, ""),
+        )),
+        // Peer EOF without a close frame: the runtime fires a close event
+        // with code 1006 ("Connection ended" in the TS runtime). A dead
+        // socket surfaces the same way (the TS runtime's send on a closed
+        // socket is a silent no-op; the close event carries the failure).
+        SocketEnd::Eof | SocketEnd::SendFailed => {
+            Err(CodexStreamError::Transport(WebSocketTransportError::close(
+                WEBSOCKET_CLOSE_CODE_ABNORMAL,
+                WEBSOCKET_CONNECTION_ENDED_REASON,
+            )))
         }
-    }
-}
-
-/// Read one request's events until completion, close, or error.
-async fn read_request_events(
-    stream: &mut SplitStream<WsStream>,
-    events: &mpsc::Sender<WorkerEvent>,
-    signal: Option<&CancellationToken>,
-) -> Result<(), CodexStreamError> {
-    let mut saw_completion = false;
-    loop {
-        if signal.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            return Err(CodexStreamError::Aborted);
+        SocketEnd::Read(error) => Err(CodexStreamError::Transport(bun_read_failure(&error))),
+        // This side closed the socket mid-request (session cleanup): the
+        // runtime's close event carries the code and reason it sent.
+        SocketEnd::LocalClose(reason) => Err(CodexStreamError::Transport(
+            WebSocketTransportError::close(WEBSOCKET_CLOSE_CODE_NORMAL, reason.as_str()),
+        )),
+        // Port of `parseWebSocket`'s JSON failure: a non-transport protocol
+        // error, thrown without SSE fallback.
+        SocketEnd::InvalidJson { error, text } => {
+            Err(CodexStreamError::Protocol(CodexProtocolError {
+                message: format!("Invalid Codex WebSocket JSON: {error}"),
+                payload: Some(Value::String(text)),
+            }))
         }
-        let next = stream.next();
-        let message = match signal {
-            Some(signal) => {
-                tokio::select! {
-                    () = signal.cancelled() => return Err(CodexStreamError::Aborted),
-                    message = next => message,
-                }
-            }
-            None => next.await,
-        };
-        match message {
-            // Peer EOF without a close frame: the runtime fires a close event
-            // with code 1006 ("Connection ended" in the TS runtime).
-            None => {
-                return Err(CodexStreamError::Transport(WebSocketTransportError::close(
-                    WEBSOCKET_CLOSE_CODE_ABNORMAL,
-                    WEBSOCKET_CONNECTION_ENDED_REASON,
-                )));
-            }
-            Some(Ok(Message::Text(text))) => {
-                let text = text.as_str().to_string();
-                match serde_json::from_str::<Value>(&text) {
-                    Ok(event) => {
-                        let event_type = event.get("type").and_then(Value::as_str);
-                        if matches!(
-                            event_type,
-                            Some("response.completed" | "response.done" | "response.incomplete")
-                        ) {
-                            saw_completion = true;
-                        }
-                        if events.send(WorkerEvent::Event(event)).await.is_err() {
-                            // The request consumer is gone (its receiver was
-                            // dropped); nobody observes this text.
-                            return Err(CodexStreamError::Transport(
-                                WebSocketTransportError::runtime("WebSocket request cancelled"),
-                            ));
-                        }
-                        if saw_completion {
-                            return Ok(());
-                        }
-                    }
-                    // Port of `parseWebSocket`'s JSON failure: a non-transport
-                    // protocol error, thrown without SSE fallback.
-                    Err(error) => {
-                        return Err(CodexStreamError::Protocol(CodexProtocolError {
-                            message: format!("Invalid Codex WebSocket JSON: {error}"),
-                            payload: Some(Value::String(text)),
-                        }));
-                    }
-                }
-            }
-            Some(Ok(Message::Binary(bytes))) => {
-                // Codex events are JSON text; binary frames decode as UTF-8.
-                let text = String::from_utf8_lossy(&bytes).to_string();
-                match serde_json::from_str::<Value>(&text) {
-                    Ok(event) => {
-                        if events.send(WorkerEvent::Event(event)).await.is_err() {
-                            return Err(CodexStreamError::Transport(
-                                WebSocketTransportError::runtime("WebSocket request cancelled"),
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        return Err(CodexStreamError::Protocol(CodexProtocolError {
-                            message: format!("Invalid Codex WebSocket JSON: {error}"),
-                            payload: Some(Value::String(text)),
-                        }));
-                    }
-                }
-            }
-            Some(Ok(Message::Close(close))) => {
-                if saw_completion {
-                    return Ok(());
-                }
-                // A close frame without a status code surfaces as the
-                // runtime's 1005 close event (probe-verified).
-                let error = match close {
-                    Some(frame) => {
-                        WebSocketTransportError::close(u16::from(frame.code), frame.reason.as_str())
-                    }
-                    None => WebSocketTransportError::close(WEBSOCKET_CLOSE_CODE_STATUS, ""),
-                };
-                return Err(CodexStreamError::Transport(error));
-            }
-            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
-            Some(Err(error)) => {
-                return Err(CodexStreamError::Transport(bun_read_failure(&error)));
-            }
-        }
+        // The request consumer is gone (its receiver was dropped); nobody
+        // observes this text.
+        SocketEnd::ConsumerGone => Err(CodexStreamError::Transport(
+            WebSocketTransportError::runtime("WebSocket request cancelled"),
+        )),
     }
 }
 
 /// A session-acquired connection handle (`{ socket, entry, reused, release }`).
 pub struct AcquiredConnection {
-    worker: mpsc::Sender<WorkerCommand>,
+    worker: WorkerHandle,
     pub session_id: Option<String>,
     pub reused: bool,
     /// A cache entry backs this connection (continuation is possible).
@@ -418,27 +262,23 @@ impl AcquiredConnection {
         }
         let mut request = body.clone();
         request["type"] = Value::String("response.create".to_string());
-        let (event_tx, event_rx) = mpsc::channel(64);
         self.worker
-            .send(WorkerCommand::Send {
-                body: request.to_string(),
-                events: event_tx,
-            })
+            .send(request.to_string(), signal)
             .await
-            .map_err(|_| {
+            .ok_or_else(|| {
                 // The worker (socket) is gone; in the TS the socket's close
                 // event would surface with the 1006 close text.
                 CodexStreamError::Transport(WebSocketTransportError::close(
                     WEBSOCKET_CLOSE_CODE_ABNORMAL,
                     WEBSOCKET_CONNECTION_ENDED_REASON,
                 ))
-            })?;
-        Ok(event_rx)
+            })
     }
 
-    /// Port of `closeWebSocketSilently`: ask the worker to close the socket.
-    pub async fn close(&self) {
-        let _ = self.worker.send(WorkerCommand::Close).await;
+    /// Port of `closeWebSocketSilently` (code 1000, reason `done`): close
+    /// the socket.
+    pub fn close(&self) {
+        self.worker.close(CloseReason::Done);
     }
 }
 
@@ -543,7 +383,7 @@ pub async fn release_connection(
     let session_id = connection.session_id.clone();
     let Some(session_id) = session_id else {
         // Uncached connections always close after the request.
-        connection.close().await;
+        connection.close();
         return;
     };
     if !keep {
@@ -564,7 +404,7 @@ pub async fn release_connection(
     if matched {
         schedule_session_websocket_expiry(&session_id);
     } else {
-        connection.close().await;
+        connection.close();
     }
 }
 
@@ -577,34 +417,11 @@ pub fn get_cached_websocket_input_delta(
     body: &Value,
     continuation: &ContinuationState,
 ) -> Option<Vec<Value>> {
-    let strip = |value: &Value| -> Value {
-        let mut stripped = value.clone();
-        if let Some(map) = stripped.as_object_mut() {
-            map.remove("input");
-            map.remove("previous_response_id");
-        }
-        stripped
-    };
-    if strip(body) != strip(&continuation.last_request_body) {
-        return None;
-    }
-    let current_input = body.get("input").and_then(Value::as_array).cloned()?;
-    let last_input = continuation
-        .last_request_body
-        .get("input")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut baseline = last_input;
-    baseline.extend(continuation.last_response_items.iter().cloned());
-    if current_input.len() < baseline.len() {
-        return None;
-    }
-    let prefix = &current_input[..baseline.len()];
-    if prefix != baseline.as_slice() {
-        return None;
-    }
-    Some(current_input[baseline.len()..].to_vec())
+    input_delta(
+        body,
+        &continuation.last_request_body,
+        &continuation.last_response_items,
+    )
 }
 
 /// Port of `buildCachedWebSocketRequestBody`.
@@ -861,7 +678,9 @@ mod ws_wire_tests {
         loop {
             match events.recv().await.expect("worker stays alive") {
                 WorkerEvent::Event(_) => {}
-                WorkerEvent::Terminal(result) => return result.expect_err("scripted failure"),
+                WorkerEvent::End(end) => {
+                    return codex_socket_end(end).expect_err("scripted failure")
+                }
             }
         }
     }

@@ -44,6 +44,29 @@ pub mod codex_debug {
         reset_debug_stats as reset_websocket_debug_stats, WebSocketDebugStats,
     };
 }
+/// Release the provider connection state one session owns (TS
+/// `cleanupSessionResources`): every in-flight or still-connecting
+/// Responses WebSocket request the session owns is cancelled as disposed
+/// (never replayed over SSE), and its cached generic and Codex WebSocket
+/// connections close. `None` releases every session's state. This is
+/// provider transport state only; session ownership itself stays with the
+/// session engine, which calls this at its teardown seams.
+pub fn cleanup_session_resources(session_id: Option<&str>) {
+    providers::responses_websocket::close_sessions(session_id);
+    providers::openai_codex_responses::session::close_websocket_sessions(session_id);
+}
+
+/// Test support (feature `test-support`) for crates that drive the
+/// Responses WebSocket transport end to end: the scripted loopback server
+/// answering WebSocket upgrades and SSE POSTs that the transport's own
+/// tests use.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    pub use crate::providers::responses_websocket::mock_server::{
+        spawn, MockServer, Record, SseReply, Turn, Upgrade,
+    };
+}
+
 pub use providers::simple_options::{default_request_max_tokens, effective_request_max_tokens};
 pub use registry::{Provider, ProviderRegistry};
 pub use stream::{complete, complete_simple, stream, stream_simple};

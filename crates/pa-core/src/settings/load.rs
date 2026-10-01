@@ -129,6 +129,27 @@ mod tests {
         );
     }
 
+    /// Every TS transport spelling loads as that transport and writes back
+    /// unchanged (`"websocket"` used to fail the parse and load as unset,
+    /// so a WebSocket preference silently ran as `auto`).
+    #[test]
+    fn transport_settings_round_trip_the_ts_spellings() {
+        use pa_types::ai::Transport;
+        for (wire, transport) in [
+            ("auto", Transport::Auto),
+            ("sse", Transport::Sse),
+            ("websocket", Transport::Websocket),
+            ("websocket-cached", Transport::WebsocketCached),
+        ] {
+            let settings = from_value_lenient(&serde_json::json!({ "transport": wire }));
+            assert_eq!(settings.transport, Some(transport), "{wire}");
+            assert_eq!(
+                serde_json::to_value(&settings).unwrap()["transport"],
+                serde_json::json!(wire)
+            );
+        }
+    }
+
     #[test]
     fn clean_document_strict_parses() {
         let value: Value = serde_json::json!({ "theme": "prime", "rlmMaxDepth": 4 });

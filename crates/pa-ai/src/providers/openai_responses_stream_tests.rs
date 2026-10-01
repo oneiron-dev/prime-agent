@@ -140,3 +140,49 @@ fn incomplete_terminal_records_model_and_stops_for_length() {
         );
     }
 }
+
+/// Finished items arrive with their `output_index` (as `OpenAI` sends every
+/// item event): the reasoning item, the text signature, and the finished
+/// tool call land on the message. The slot used to be dropped before its
+/// lookup, so all three were lost (the next request replayed `msg_N` ids,
+/// no reasoning, and the Responses WebSocket delta never matched).
+#[test]
+fn finished_items_with_an_output_index_land_on_the_message() {
+    let reasoning = json!({
+        "type": "reasoning", "id": "rs_1", "summary": [{ "type": "summary_text", "text": "think" }],
+        "encrypted_content": "opaque",
+    });
+    let arguments = json!({ "code": "1 + 1" }).to_string();
+    let output = replay(&[
+        json!({"type": "response.created", "response": {"id": "resp_wire"}}),
+        json!({"type": "response.output_item.added", "output_index": 0,
+               "item": {"type": "reasoning", "id": "rs_1", "summary": []}}),
+        json!({"type": "response.output_item.done", "output_index": 0, "item": reasoning}),
+        json!({"type": "response.output_item.added", "output_index": 1,
+               "item": {"type": "message", "id": "msg_wire", "role": "assistant", "content": []}}),
+        json!({"type": "response.content_part.added", "output_index": 1, "content_index": 0,
+               "part": {"type": "output_text", "text": ""}}),
+        json!({"type": "response.output_text.delta", "output_index": 1, "content_index": 0,
+               "delta": "hi"}),
+        json!({"type": "response.output_item.done", "output_index": 1,
+               "item": {"type": "message", "id": "msg_wire", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hi"}]}}),
+        json!({"type": "response.output_item.added", "output_index": 2,
+               "item": {"type": "function_call", "id": "fc_wire", "call_id": "call_1",
+                        "name": "ipython", "arguments": ""}}),
+        json!({"type": "response.function_call_arguments.delta", "output_index": 2,
+               "delta": arguments}),
+        json!({"type": "response.output_item.done", "output_index": 2,
+               "item": {"type": "function_call", "id": "fc_wire", "call_id": "call_1",
+                        "name": "ipython", "arguments": arguments}}),
+        json!({"type": "response.completed", "response": {"id": "resp_wire", "status": "completed"}}),
+    ]);
+    assert_eq!(
+        serde_json::to_value(&output.content).unwrap(),
+        json!([
+            {"type": "thinking", "thinking": "think", "thinkingSignature": reasoning.to_string()},
+            {"type": "text", "text": "hi", "textSignature": r#"{"v":1,"id":"msg_wire"}"#},
+            {"type": "toolCall", "id": "call_1|fc_wire", "name": "ipython", "arguments": {"code": "1 + 1"}},
+        ])
+    );
+}

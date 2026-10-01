@@ -75,15 +75,10 @@ pub enum QueueModeSetting {
     OneAtATime,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TransportSetting {
-    Auto,
-    Sse,
-    WebSocket,
-    #[serde(rename = "websocket-cached")]
-    WebSocketCached,
-}
+/// The `transport` setting is the provider transport vocabulary itself (TS
+/// `type TransportSetting = Transport`): `"auto"`, `"sse"`, `"websocket"`,
+/// `"websocket-cached"`.
+pub type TransportSetting = pa_types::ai::Transport;
 
 /// `number | "unlimited"` autonomous limit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

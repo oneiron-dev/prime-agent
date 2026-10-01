@@ -507,7 +507,7 @@ impl Worker {
         // the same tier). The TS connection state reads the settings value,
         // so a restarted session re-seeds its flag from the persisted
         // `compaction.enabled`.
-        let (service_tier, steering_mode, follow_up_mode, auto_compaction_enabled) = {
+        let (service_tier, transport, steering_mode, follow_up_mode, auto_compaction_enabled) = {
             let settings = pa_core::settings::SettingsManager::create(&cwd, &self.config.agent_dir);
             let queue_mode = |mode: pa_core::settings::QueueModeSetting| -> String {
                 match mode {
@@ -517,6 +517,7 @@ impl Worker {
             };
             (
                 settings.get_default_service_tier(),
+                settings.get_transport(),
                 queue_mode(settings.get_steering_mode()),
                 queue_mode(settings.get_follow_up_mode()),
                 settings.get_compaction_enabled(),
@@ -531,6 +532,8 @@ impl Worker {
         let clamped_tier =
             crate::setting_switches::effective_service_tier(configured_tier, self.engine.as_ref());
         self.engine.configure_service_tier(clamped_tier);
+        // TS `sdk.ts` builds the Agent with `settingsManager.getTransport()`.
+        self.engine.configure_transport(transport);
         // The abort supervision's terminal record (the supervisor declared
         // a wedged run aborted and injected it into this create replay):
         // the rebuilt transcript discloses the abort with the same

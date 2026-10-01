@@ -483,9 +483,9 @@ impl Worker {
     }
 
     /// `set_transport { transport }` (TS `settingsManager.setTransport` +
-    /// `agent.transport`): persist the transport setting. The live stream
-    /// resolves transport per request from settings in this port, so the
-    /// persisted default is the whole switch.
+    /// `agent.transport`): persist the transport setting as given (the
+    /// setting is the transport vocabulary itself) and switch the live
+    /// session's provider requests to it.
     pub(crate) fn handle_set_transport(&self, payload: &Value) -> DaemonResponse {
         if let Err(response) = self.require_created("set_transport") {
             return response;
@@ -505,17 +505,11 @@ impl Worker {
         let core = self.core.lock().unwrap();
         let cwd = core.cwd.clone();
         drop(core);
-        let setting = match transport {
-            Transport::Auto => pa_core::settings::TransportSetting::Auto,
-            Transport::Sse => pa_core::settings::TransportSetting::Sse,
-            Transport::Websocket | Transport::WebsocketCached => {
-                pa_core::settings::TransportSetting::WebSocket
-            }
-        };
         let mut settings = pa_core::settings::SettingsManager::create(&cwd, &self.config.agent_dir);
-        if let Err(error) = settings.set_transport(setting) {
+        if let Err(error) = settings.set_transport(transport) {
             return response_failure(None, "set_transport", &error.to_string(), None);
         }
+        self.engine.configure_transport(transport);
         response_success(None, "set_transport", None)
     }
 
@@ -1149,8 +1143,9 @@ mod tests {
         assert_eq!(state.data.expect("data")["serviceTier"], json!("default"));
     }
 
-    /// `set_transport` persists the settings value; an unknown transport
-    /// fails the command.
+    /// `set_transport` persists the settings value exactly as given (the
+    /// cached WebSocket transport used to collapse to plain `websocket`);
+    /// an unknown transport fails the command.
     #[tokio::test]
     async fn set_transport_persists_the_setting() {
         let dir = std::env::temp_dir().join(format!("pa-worker-tr-{}", uuid::Uuid::new_v4()));
@@ -1160,18 +1155,20 @@ mod tests {
             .dispatch("create", &json!({ "noSession": true, "cwd": dir }))
             .await;
         assert!(created.success);
-        let response = worker
-            .dispatch(
-                "set_transport",
-                &json!({ "activeSessionId": "switch-session", "transport": "websocket" }),
-            )
-            .await;
-        assert!(response.success, "failed: {response:?}");
-        let settings = pa_core::settings::SettingsManager::create(&dir, dir.join("agent"));
-        assert!(matches!(
-            settings.get_transport(),
-            pa_core::settings::TransportSetting::WebSocket
-        ));
+        for (wire, transport) in [
+            ("websocket", Transport::Websocket),
+            ("websocket-cached", Transport::WebsocketCached),
+        ] {
+            let response = worker
+                .dispatch(
+                    "set_transport",
+                    &json!({ "activeSessionId": "switch-session", "transport": wire }),
+                )
+                .await;
+            assert!(response.success, "failed: {response:?}");
+            let settings = pa_core::settings::SettingsManager::create(&dir, dir.join("agent"));
+            assert_eq!(settings.get_transport(), transport);
+        }
         let response = worker
             .dispatch(
                 "set_transport",

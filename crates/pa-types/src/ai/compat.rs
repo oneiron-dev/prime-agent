@@ -76,6 +76,16 @@ pub struct OpenAiResponsesCompat {
     pub send_session_id_header: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_long_cache_retention: Option<bool>,
+    /// Opt-in for the Responses WebSocket transport under the default
+    /// `auto` transport (TS `OpenAIResponsesCompat.supportsWebSocket`,
+    /// default false). Spelled explicitly: the wire key keeps the
+    /// capital `S` of `WebSocket`.
+    #[serde(
+        rename = "supportsWebSocket",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub supports_web_socket: Option<bool>,
 }
 
 /// Compatibility settings for Anthropic Messages-compatible APIs.
@@ -102,7 +112,7 @@ pub struct ModelCompat {
 }
 
 const ANTHROPIC_COMPAT_KEYS: &[&str] = &["supportsEagerToolInputStreaming"];
-const RESPONSES_COMPAT_KEYS: &[&str] = &["sendSessionIdHeader"];
+const RESPONSES_COMPAT_KEYS: &[&str] = &["sendSessionIdHeader", "supportsWebSocket"];
 /// Which compat object a `Model.compat` wire value carries.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompatKind {

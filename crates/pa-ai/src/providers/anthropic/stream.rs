@@ -73,10 +73,9 @@ fn anthropic_sse_error(data: &str, request_id: Option<&str>) -> StreamFailureErr
     let info = StreamFailureInfo {
         kind: classify_stream_failure(error_type.as_deref(), None),
         provider_error_type: error_type,
-        status: None,
         request_id,
-        retry_after_ms: None,
         raw: Some(truncate_raw_payload(data)),
+        ..StreamFailureInfo::unknown()
     };
     let message = stream_failure_message(&info, detail.as_deref());
     StreamFailureError { message, info }

@@ -104,6 +104,7 @@ async fn quota_reset_beyond_cap_parks_through_the_seam() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || async { Ok(error_message(Some("rate_limit"), None, Some(4_363_000))) },
         move |event| {
             let events = Arc::clone(&events_for_emit);
@@ -150,6 +151,7 @@ async fn quota_reset_beyond_cap_keeps_the_give_up_when_the_seam_declines() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || async { Ok(error_message(Some("rate_limit"), None, Some(4_363_000))) },
         move |event| {
             let events = Arc::clone(&events_for_emit);
@@ -197,6 +199,7 @@ async fn non_quota_exceeds_cap_never_consults_the_park_seam() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || async { Ok(error_message(Some("server_error"), None, Some(4_363_000))) },
         move |event| {
             let events = Arc::clone(&events_for_emit);
@@ -225,6 +228,7 @@ async fn transient_failure_is_retried_until_success_with_events() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || {
             let attempts = Arc::clone(&attempts);
             async move {
@@ -252,7 +256,7 @@ async fn transient_failure_is_retried_until_success_with_events() {
     assert_eq!(message.stop_reason, StopReason::Stop);
     // Two retry starts (one per retry) and one success end. The delays
     // sit in the jitter band around the 5ms/10ms ladder steps
-    // (jittered: [4, 7] and [8, 14] with the ±20% rounding headroom).
+    // (±25%, rounded: [4, 6] and [8, 13]).
     let events = events.lock().unwrap().clone();
     assert_eq!(events.len(), 3, "two starts + one end: {events:?}");
     let shape_matches = matches!(
@@ -290,8 +294,8 @@ async fn transient_failure_is_retried_until_success_with_events() {
         .collect();
     assert_eq!(delays.len(), 2, "two retry starts: {events:?}");
     assert!(
-        (4..=7).contains(&delays[0]) && (8..=14).contains(&delays[1]),
-        "jittered delays {delays:?} outside the [4,7]/[8,14] bands"
+        (4..=6).contains(&delays[0]) && (8..=13).contains(&delays[1]),
+        "jittered delays {delays:?} outside the [4,6]/[8,13] bands"
     );
 }
 
@@ -304,6 +308,7 @@ async fn exhausted_retries_surface_the_final_error() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || {
             let attempts = Arc::clone(&attempts);
             async move {
@@ -386,6 +391,7 @@ async fn stream_drop_retries_until_the_turn_completes() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || {
             let attempts = Arc::clone(&attempts);
             async move {
@@ -447,6 +453,7 @@ async fn stream_drop_exhausts_retries_surfacing_the_class() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || {
             let attempts = Arc::clone(&attempts);
             async move {
@@ -499,6 +506,7 @@ async fn permanent_failures_never_retry_but_disclose() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || {
             let attempts = Arc::clone(&attempts);
             async move {
@@ -548,6 +556,7 @@ async fn payment_failures_settle_once_with_the_disclosure() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || {
             let attempts = Arc::clone(&attempts);
             async move {
@@ -592,6 +601,7 @@ async fn safety_failures_are_permanent_never_retry_but_disclose() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || {
             let attempts = Arc::clone(&attempts);
             async move {
@@ -641,6 +651,7 @@ async fn context_overflow_never_enters_the_retry_loop() {
         &fast_policy(),
         200_000,
         None,
+        &RetryEpisode::default(),
         || {
             let attempts = Arc::clone(&attempts);
             async move {
@@ -678,6 +689,7 @@ async fn cancelled_wait_aborts_with_retry_cancelled() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || {
             attempts += 1;
             async { Ok(error_message(Some("server_error"), None, None)) }
@@ -716,6 +728,7 @@ async fn aborted_signal_racing_failure_stops_aborted() {
         &fast_policy(),
         0,
         Some(&controller.signal()),
+        &RetryEpisode::default(),
         || async { Ok(error_message(Some("server_error"), None, None)) },
         |_| async { Ok(()) },
         |_| async { true },
@@ -735,6 +748,7 @@ async fn server_retry_after_over_cap_ends_the_loop() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || {
             let attempts = Arc::clone(&attempts);
             async move {
@@ -788,6 +802,7 @@ async fn disabled_policy_never_retries_but_discloses() {
         &policy,
         0,
         None,
+        &RetryEpisode::default(),
         || {
             let attempts = Arc::clone(&attempts);
             async move {
@@ -826,6 +841,7 @@ async fn attempt_errors_propagate() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || async { Err(anyhow::anyhow!("turn crashed")) },
         |_| async { Ok(()) },
         |_| async { true },
@@ -849,6 +865,7 @@ async fn unsupported_tool_failures_surface_with_the_disclosure() {
         &fast_policy(),
         0,
         None,
+        &RetryEpisode::default(),
         || {
             let attempts = Arc::clone(&attempts);
             async move {
@@ -881,6 +898,334 @@ async fn unsupported_tool_failures_surface_with_the_disclosure() {
             success: false,
             attempt: 0,
             final_error: Some("404 No endpoints found that support tool use.".to_string()),
+            restored_model: None,
+        }]
+    );
+}
+
+/// A failed turn carrying the structured WebSocket transport failure (the
+/// socket dropped before a provider verdict): kind `transport`, provider
+/// type `websocket_<cause>`, and the connection detail.
+fn transport_message(text: &str, cause: &str) -> AssistantMessage {
+    let mut message = error_message(Some("transport"), None, None);
+    message.diagnostics = Some(vec![AssistantMessageDiagnostic {
+        kind: "provider_stream_failure".to_string(),
+        timestamp: 0,
+        error: None,
+        details: Some(serde_json::json!({
+            "kind": "transport",
+            "providerErrorType": format!("websocket_{cause}"),
+            "transport": { "protocol": "websocket", "cause": cause, "closeCode": 1006, "wasClean": false },
+        })),
+    }]);
+    message.error_message = Some(text.to_string());
+    message
+}
+
+/// Collect every retry event the driver emits.
+fn recording_emit(
+    events: &Arc<Mutex<Vec<AutoRetryEvent>>>,
+) -> impl FnMut(AutoRetryEvent) -> std::future::Ready<anyhow::Result<()>> {
+    let events = Arc::clone(events);
+    move |event| {
+        events.lock().unwrap().push(event);
+        std::future::ready(Ok(()))
+    }
+}
+
+/// The retry events with the jittered wait zeroed (not under test where
+/// this is used).
+fn without_delays(events: &[AutoRetryEvent]) -> Vec<AutoRetryEvent> {
+    events
+        .iter()
+        .map(|event| match event {
+            AutoRetryEvent::Start {
+                attempt,
+                max_attempts,
+                error_message,
+                reason,
+                ..
+            } => AutoRetryEvent::Start {
+                attempt: *attempt,
+                max_attempts: *max_attempts,
+                delay_ms: 0,
+                error_message: error_message.clone(),
+                reason: reason.clone(),
+            },
+            AutoRetryEvent::End { .. } => event.clone(),
+        })
+        .collect()
+}
+
+fn quick_start(attempt: u32, max_attempts: u32, error_message: &str) -> AutoRetryEvent {
+    AutoRetryEvent::Start {
+        attempt,
+        max_attempts,
+        delay_ms: 0,
+        error_message: error_message.to_string(),
+        reason: RetryStartReason::Quick,
+    }
+}
+
+/// The structured transport class is transient by construction (no
+/// provider verdict arrived): both observed socket wordings retry the
+/// same way until the turn completes. Explicit, not the wildcard's luck.
+#[tokio::test]
+async fn transport_failures_retry_until_the_turn_completes() {
+    let mut script = vec![
+        transport_message("WebSocket closed before response.completed", "closed"),
+        transport_message("WebSocket stream closed before response.completed", "eof"),
+        ok_message(),
+    ]
+    .into_iter();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut attempts = 0;
+    let message = run_turn_with_auto_retry(
+        &fast_policy(),
+        0,
+        None,
+        &RetryEpisode::default(),
+        || {
+            attempts += 1;
+            std::future::ready(Ok(script.next().expect("scripted attempt")))
+        },
+        recording_emit(&events),
+        |_| async { true },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!((attempts, message.stop_reason), (3, StopReason::Stop));
+    assert_eq!(
+        without_delays(&events.lock().unwrap()),
+        vec![
+            quick_start(1, 3, "WebSocket closed before response.completed"),
+            quick_start(2, 3, "WebSocket stream closed before response.completed"),
+            AutoRetryEvent::End {
+                success: true,
+                attempt: 2,
+                final_error: None,
+                restored_model: None,
+            },
+        ]
+    );
+}
+
+/// Socket wording never makes a permanent provider verdict retryable,
+/// and a local lifecycle failure stays terminal even when it carries a
+/// transport diagnostic.
+#[tokio::test]
+async fn transport_wording_never_overrides_a_terminal_classification() {
+    let mut invalid = error_message(Some("invalid_request"), Some(400), None);
+    invalid.error_message = Some("WebSocket closed before response.completed".to_string());
+    let mut lifecycle = transport_message("WebSocket error", "error");
+    lifecycle
+        .diagnostics
+        .as_mut()
+        .expect("diagnostics")
+        .push(AssistantMessageDiagnostic {
+            kind: "agent_lifecycle_failure".to_string(),
+            timestamp: 0,
+            error: None,
+            details: None,
+        });
+    for failure in [invalid, lifecycle] {
+        let mut attempts = 0;
+        let message = run_turn_with_auto_retry(
+            &fast_policy(),
+            0,
+            None,
+            &RetryEpisode::default(),
+            || {
+                attempts += 1;
+                std::future::ready(Ok(failure.clone()))
+            },
+            |_| async { Ok(()) },
+            |_| async { true },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (attempts, message.stop_reason),
+            (1, StopReason::Error),
+            "{:?}",
+            failure.error_message
+        );
+    }
+}
+
+/// TS resets the retry episode at every successful assistant message, not
+/// only when the turn settles: a re-issued turn that completes one tool
+/// call and then fails again starts a fresh budget, and the host closes
+/// the earlier episode right after that successful message. Without the
+/// reset, three failures separated by successful tool calls exhausted a
+/// two-retry budget and the turn died at its third failure.
+#[tokio::test]
+async fn a_successful_message_inside_the_turn_starts_a_fresh_episode() {
+    let policy = ProviderRetryPolicy {
+        max_retries: 2,
+        ..fast_policy()
+    };
+    let episode = RetryEpisode::default();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let host_events = Arc::clone(&events);
+    let mut attempts = 0u32;
+    let message = run_turn_with_auto_retry(
+        &policy,
+        0,
+        None,
+        &episode,
+        || {
+            attempts += 1;
+            // Every re-issue completes one tool call before its next
+            // provider call (the host closes the open episode right after
+            // that message); the fourth attempt finishes the turn.
+            if attempts > 1 {
+                if let Some(end) = episode.settle_success() {
+                    host_events.lock().unwrap().push(end);
+                }
+            }
+            let outcome = if attempts < 4 {
+                transport_message("WebSocket closed before response.completed", "closed")
+            } else {
+                ok_message()
+            };
+            std::future::ready(Ok(outcome))
+        },
+        recording_emit(&events),
+        |_| async { true },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!((attempts, message.stop_reason), (4, StopReason::Stop));
+    let host_end = AutoRetryEvent::End {
+        success: true,
+        attempt: 1,
+        final_error: None,
+        restored_model: None,
+    };
+    let failure = "WebSocket closed before response.completed";
+    // Each failure is the first retry of its own episode; the turn's
+    // final success has no episode left to close.
+    assert_eq!(
+        without_delays(&events.lock().unwrap()),
+        vec![
+            quick_start(1, 2, failure),
+            host_end.clone(),
+            quick_start(1, 2, failure),
+            host_end.clone(),
+            quick_start(1, 2, failure),
+            host_end,
+        ]
+    );
+}
+
+/// A cancel issued from the `auto_retry_start` observer (the client's
+/// abort while the retry countdown shows) stops the episode before a
+/// second provider request: the wait sees the cancel at once.
+#[tokio::test]
+async fn a_cancel_from_the_retry_start_observer_prevents_a_second_request() {
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer_cancel = Arc::clone(&cancelled);
+    let mut attempts = 0;
+    let message = run_turn_with_auto_retry(
+        &fast_policy(),
+        0,
+        None,
+        &RetryEpisode::default(),
+        || {
+            attempts += 1;
+            std::future::ready(Ok(transport_message("WebSocket error", "error")))
+        },
+        move |event| {
+            if matches!(event, AutoRetryEvent::Start { .. }) {
+                observer_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            std::future::ready(Ok(()))
+        },
+        |_| std::future::ready(!cancelled.load(std::sync::atomic::Ordering::SeqCst)),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!((attempts, message.stop_reason), (1, StopReason::Aborted));
+}
+
+/// Transport failures exhaust the quick-retry budget like any transient
+/// failure: the initial attempt plus three retries, then the final error
+/// row carries the socket text.
+#[tokio::test]
+async fn transport_failures_exhaust_with_the_final_error() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut attempts = 0;
+    let message = run_turn_with_auto_retry(
+        &fast_policy(),
+        0,
+        None,
+        &RetryEpisode::default(),
+        || {
+            attempts += 1;
+            std::future::ready(Ok(transport_message("WebSocket error", "error")))
+        },
+        recording_emit(&events),
+        |_| async { true },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!((attempts, message.stop_reason), (4, StopReason::Error));
+    assert_eq!(
+        without_delays(&events.lock().unwrap()),
+        vec![
+            quick_start(1, 3, "WebSocket error"),
+            quick_start(2, 3, "WebSocket error"),
+            quick_start(3, 3, "WebSocket error"),
+            AutoRetryEvent::End {
+                success: false,
+                attempt: 3,
+                final_error: Some("WebSocket error".to_string()),
+                restored_model: None,
+            },
+        ]
+    );
+}
+
+/// With retries disabled a transport failure settles on its first attempt
+/// and still discloses once (the failure-scoped outcome row).
+#[tokio::test]
+async fn disabled_retries_disclose_a_transport_failure_once() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut attempts = 0;
+    let message = run_turn_with_auto_retry(
+        &ProviderRetryPolicy {
+            enabled: false,
+            ..fast_policy()
+        },
+        0,
+        None,
+        &RetryEpisode::default(),
+        || {
+            attempts += 1;
+            std::future::ready(Ok(transport_message(
+                "WebSocket closed before response.completed",
+                "closed",
+            )))
+        },
+        recording_emit(&events),
+        |_| async { true },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!((attempts, message.stop_reason), (1, StopReason::Error));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![AutoRetryEvent::End {
+            success: false,
+            attempt: 0,
+            final_error: Some("WebSocket closed before response.completed".to_string()),
             restored_model: None,
         }]
     );

@@ -493,8 +493,8 @@ async fn run_websocket_attempt(
                             break;
                         }
                     }
-                    websocket::WorkerEvent::Terminal(result) => {
-                        result?;
+                    websocket::WorkerEvent::End(end) => {
+                        websocket::codex_socket_end(end)?;
                         break;
                     }
                 }

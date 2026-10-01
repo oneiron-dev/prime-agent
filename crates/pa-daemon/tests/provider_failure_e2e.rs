@@ -512,9 +512,9 @@ fn provider_failure_is_retried_then_surfaced_to_attached_clients() {
         .expect("error message")
         .contains("mock provider overloaded"));
     assert_eq!(starts[1]["attempt"], 2);
-    // Each retry start's delay sits in the ±20% jitter band around its
-    // ladder step (50ms then 100ms: [40, 70] and [80, 140]).
-    let jitter_band = |base: u64| (base * 4 / 5, base * 7 / 5);
+    // Each retry start's delay sits in the ±25% jitter band around its
+    // ladder step (50ms then 100ms, rounded: [37, 63] and [75, 125]).
+    let jitter_band = |base: u64| (base * 3 / 4, base * 5 / 4 + 1);
     for (start, base) in starts.iter().zip([50u64, 100u64]) {
         let delay = start["delayMs"].as_u64().expect("delayMs");
         let (low, high) = jitter_band(base);

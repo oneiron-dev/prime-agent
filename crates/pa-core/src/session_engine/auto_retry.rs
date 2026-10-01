@@ -14,6 +14,7 @@
 //! shape (`auto_retry_start` / `auto_retry_end`).
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use pa_agent::abort::AbortSignal;
 use pa_agent::types::{AssistantMessage, StopReason};
@@ -62,6 +63,90 @@ pub enum AutoRetryEvent {
     },
 }
 
+/// The retry episode one turn's attempts share with the host running them
+/// (TS `_retryAttempt`). TS resets the episode at every successful
+/// assistant message — inside a tool turn too, not only when the whole
+/// turn settles — so independent provider calls never spend one budget: a
+/// retry that succeeds at one tool call and fails at the next starts a
+/// fresh episode. The host reports each successful assistant message
+/// through [`RetryEpisode::settle_success`] and emits the `auto_retry_end`
+/// it returns right after that message; the drivers count retries here, so
+/// they see the reset. One episode serves one turn.
+#[derive(Debug, Default)]
+pub struct RetryEpisode {
+    /// Retries performed in the open episode.
+    retries: AtomicU32,
+    /// A provider-failover switch is active: the failover driver restores
+    /// the primary (and closes the episode with the restored model) when
+    /// the turn settles, so a successful message inside the turn resets
+    /// the budget without closing the episode.
+    held_for_restore: AtomicBool,
+    /// The retry count the first successful message after the switch
+    /// reset: the restore's closing end reports it.
+    retries_before_restore: AtomicU32,
+}
+
+impl RetryEpisode {
+    /// A successful (non-error) assistant message settled inside the
+    /// running attempt: an open episode ends successfully here (TS
+    /// `message_end` resets `_retryAttempt` and emits `auto_retry_end`).
+    /// Returns that end event for the host to emit right after the
+    /// message, or `None` when no retry is in flight.
+    pub fn settle_success(&self) -> Option<AutoRetryEvent> {
+        let retries = self.retries.swap(0, Ordering::SeqCst);
+        if self.held_for_restore.load(Ordering::SeqCst) {
+            // The budget starts over all the same; the episode's end waits
+            // for the primary's restore when the turn settles.
+            if retries > 0 {
+                let _ = self.retries_before_restore.compare_exchange(
+                    0,
+                    retries,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
+            return None;
+        }
+        (retries > 0).then_some(AutoRetryEvent::End {
+            success: true,
+            attempt: retries,
+            final_error: None,
+            restored_model: None,
+        })
+    }
+
+    /// Retries performed in the open episode (zero after a reset).
+    pub(crate) fn retries(&self) -> u32 {
+        self.retries.load(Ordering::SeqCst)
+    }
+
+    /// Count one more retry; returns the new count.
+    pub(crate) fn bump(&self) -> u32 {
+        self.retries.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Close the episode at the turn's end, returning its retry count.
+    pub(crate) fn take(&self) -> u32 {
+        self.retries.swap(0, Ordering::SeqCst)
+    }
+
+    /// A provider switch is active for the rest of the turn.
+    pub(crate) fn hold_for_restore(&self) {
+        self.held_for_restore.store(true, Ordering::SeqCst);
+    }
+
+    /// Close the held episode at the primary's restore: the count the
+    /// first successful message after the switch reset, else the open
+    /// count.
+    pub(crate) fn take_for_restore(&self) -> u32 {
+        let open = self.take();
+        match self.retries_before_restore.swap(0, Ordering::SeqCst) {
+            0 => open,
+            reset => reset,
+        }
+    }
+}
+
 /// Drive `attempt` under the shared retry policy until it settles.
 ///
 /// `attempt` runs one turn and returns its final assistant message; a turn
@@ -77,6 +162,10 @@ pub enum AutoRetryEvent {
 /// surfaces the parked status as the final `auto_retry_end` instead of
 /// the give-up — and `None` keeps the immediate give-up.
 ///
+/// `episode` counts the retries; the host resets it at each successful
+/// assistant message inside an attempt ([`RetryEpisode::settle_success`]),
+/// so a later failure in the same turn starts a fresh budget.
+///
 /// # Errors
 ///
 /// Returns the `attempt` future's error when a turn attempt fails, or the
@@ -86,6 +175,7 @@ pub async fn run_turn_with_auto_retry<A, AF, E, EF, W, WF>(
     policy: &ProviderRetryPolicy,
     context_window: u64,
     signal: Option<&AbortSignal>,
+    episode: &RetryEpisode,
     mut attempt: A,
     mut emit: E,
     mut wait: W,
@@ -99,10 +189,12 @@ where
     W: FnMut(std::time::Duration) -> WF,
     WF: Future<Output = bool>,
 {
-    let mut retries_performed = 0u32;
     loop {
         let message = attempt().await?;
         if message.stop_reason != StopReason::Error {
+            // An episode the host already closed at a successful message
+            // inside this attempt reads zero: no second end.
+            let retries_performed = episode.take();
             if retries_performed > 0 {
                 emit(AutoRetryEvent::End {
                     success: true,
@@ -117,6 +209,9 @@ where
         if signal.is_some_and(AbortSignal::is_aborted) {
             return Ok(with_stop_reason_aborted(message));
         }
+        // The episode's count after any reset the host made at a
+        // successful message inside this attempt.
+        let retries_performed = episode.retries();
         // Non-retryable failures never enter the TS retry bookkeeping: a
         // permanent failure that follows earlier transient retries only
         // closes the active retry (`_finishActiveRetryWithFailure`).
@@ -158,14 +253,15 @@ where
         }
         // TS `_handleRetryableError` bumps the attempt counter before
         // deciding, so the exhaustion check compares past `max_retries`.
-        retries_performed += 1;
+        let retries_performed = episode.bump();
         let delay = provider_retry_delay(
             retries_performed,
             provider_stream_failure_retry_after_ms(&message),
             policy,
         );
         let delay_ms = match delay {
-            // Jittered (SANCTIONED DIVERGENCE, operator ruling 2026-09-23):
+            // Jittered (operator ruling 2026-09-23; the fork TS
+            // `providerRetryDelay` rule: ±25%, floored at the server wait):
             // the jittered value is both waited and reported, so the
             // interactive countdown stays honest while a fleet of retried
             // sessions spreads off the same exponential-ladder ticks.
@@ -186,7 +282,11 @@ where
                     .await?;
                     return Ok(message);
                 }
-                jittered_delay_ms(delay_ms, retry_jitter_rand01())
+                jittered_delay_ms(
+                    delay_ms,
+                    provider_stream_failure_retry_after_ms(&message),
+                    retry_jitter_rand01(),
+                )
             }
             ProviderRetryDelay::ExceedsCap { retry_after_ms } => {
                 // The give-up sentence of this arm is the park's abort

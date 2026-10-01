@@ -1,0 +1,103 @@
+{
+  "upgrades": [
+    {
+      "path": "/v1/responses",
+      "headers": [
+        [
+          "authorization",
+          "Bearer test-key"
+        ],
+        [
+          "session_id",
+          "parity"
+        ],
+        [
+          "x-client-request-id",
+          "parity"
+        ]
+      ]
+    },
+    {
+      "path": "/v1/responses",
+      "headers": [
+        [
+          "authorization",
+          "Bearer test-key"
+        ],
+        [
+          "session_id",
+          "parity-drop"
+        ],
+        [
+          "x-client-request-id",
+          "parity-drop"
+        ]
+      ]
+    }
+  ],
+  "frames": [
+    {
+      "connection": 1,
+      "text": "{\"type\":\"response.create\",\"model\":\"gpt-ws\",\"input\":[{\"role\":\"system\",\"content\":\"sys\"},{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"one\"}]}],\"stream\":true,\"prompt_cache_key\":\"parity\",\"store\":false,\"tools\":[{\"type\":\"function\",\"name\":\"probe\",\"description\":\"record a marker\",\"parameters\":{\"type\":\"object\",\"properties\":{\"marker\":{\"type\":\"string\"}},\"required\":[\"marker\"]},\"strict\":false}]}"
+    },
+    {
+      "connection": 1,
+      "text": "{\"type\":\"response.create\",\"model\":\"gpt-ws\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"two\"}]}],\"stream\":true,\"prompt_cache_key\":\"parity\",\"store\":false,\"tools\":[{\"type\":\"function\",\"name\":\"probe\",\"description\":\"record a marker\",\"parameters\":{\"type\":\"object\",\"properties\":{\"marker\":{\"type\":\"string\"}},\"required\":[\"marker\"]},\"strict\":false}],\"previous_response_id\":\"resp_1\"}"
+    },
+    {
+      "connection": 1,
+      "text": "{\"type\":\"response.create\",\"model\":\"gpt-ws\",\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"probe ran once\"}],\"stream\":true,\"prompt_cache_key\":\"parity\",\"store\":false,\"tools\":[{\"type\":\"function\",\"name\":\"probe\",\"description\":\"record a marker\",\"parameters\":{\"type\":\"object\",\"properties\":{\"marker\":{\"type\":\"string\"}},\"required\":[\"marker\"]},\"strict\":false}],\"previous_response_id\":\"resp_2\"}"
+    },
+    {
+      "connection": 1,
+      "text": "{\"type\":\"response.create\",\"model\":\"gpt-ws\",\"input\":[{\"role\":\"system\",\"content\":\"changed sys\"},{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"one\"}]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\",\"annotations\":[]}],\"status\":\"completed\",\"id\":\"msg_resp_1\"},{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"two\"}]},{\"type\":\"function_call\",\"id\":\"fc_resp_2\",\"call_id\":\"call_1\",\"name\":\"probe\",\"arguments\":\"{\\\"marker\\\":\\\"once\\\"}\"},{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"probe ran once\"},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"after tool\",\"annotations\":[]}],\"status\":\"completed\",\"id\":\"msg_resp_3\"},{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"three\"}]}],\"stream\":true,\"prompt_cache_key\":\"parity\",\"store\":false,\"tools\":[{\"type\":\"function\",\"name\":\"probe\",\"description\":\"record a marker\",\"parameters\":{\"type\":\"object\",\"properties\":{\"marker\":{\"type\":\"string\"}},\"required\":[\"marker\"]},\"strict\":false}]}"
+    },
+    {
+      "connection": 2,
+      "text": "{\"type\":\"response.create\",\"model\":\"gpt-ws\",\"input\":[{\"role\":\"system\",\"content\":\"sys\"},{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"drop\"}]}],\"stream\":true,\"prompt_cache_key\":\"parity-drop\",\"store\":false}"
+    }
+  ],
+  "closes": [
+    {
+      "connection": 1,
+      "code": 1000,
+      "reason": "session_cleanup"
+    }
+  ],
+  "drop": {
+    "stopReason": "error",
+    "errorMessage": "WebSocket closed before response.completed 1011 upstream reset",
+    "diagnostics": [
+      {
+        "type": "provider_transport_failure",
+        "error": {
+          "name": "WebSocketTransportError",
+          "message": "WebSocket closed before response.completed 1011 upstream reset"
+        },
+        "details": {
+          "configuredTransport": "auto",
+          "eventsEmitted": true,
+          "phase": "after_message_stream_start"
+        }
+      },
+      {
+        "type": "provider_stream_failure",
+        "error": {
+          "name": "WebSocketTransportError",
+          "message": "WebSocket closed before response.completed 1011 upstream reset"
+        },
+        "details": {
+          "kind": "transport",
+          "providerErrorType": "websocket_closed",
+          "transport": {
+            "protocol": "websocket",
+            "cause": "closed",
+            "closeCode": 1011,
+            "closeReason": "upstream reset",
+            "wasClean": true
+          }
+        }
+      }
+    ]
+  }
+}

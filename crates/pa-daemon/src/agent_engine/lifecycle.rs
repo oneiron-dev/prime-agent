@@ -188,6 +188,7 @@ impl AgentSessionEngine {
             initial_selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
             service_tier: std::sync::RwLock::new(None),
+            transport: std::sync::RwLock::new(None),
             session: tokio::sync::Mutex::new(None),
             session_build: tokio::sync::Mutex::new(()),
             pending_branch: std::sync::Mutex::new(None),
@@ -801,14 +802,16 @@ impl AgentSessionEngine {
             if let Some(telemetry) = &engine.telemetry {
                 let _ = telemetry.end().await;
             }
-            engine.dispose_kernel().await;
+            engine.dispose().await;
         }
     }
 
     /// Tear the built session's kernel down (TS `closeSession` ->
     /// `AgentSessionRuntime.dispose` -> `AgentSession.disposeAsync` ->
     /// `IpythonKernelProvisioner.dispose`: one final namespace snapshot,
-    /// drained host requests, then the `python -m rlm.repl` process exits).
+    /// drained host requests, then the `python -m rlm.repl` process exits),
+    /// releasing the session's provider connection state first (TS
+    /// `cleanupSessionResources`).
     ///
     /// The engine object survives the call: the worker process outlives its
     /// session, so the engine-drop teardown (the strong owner of the
@@ -818,7 +821,7 @@ impl AgentSessionEngine {
     pub async fn dispose_kernel(&self) {
         let guard = self.session.lock().await;
         if let Some(engine) = guard.as_deref() {
-            engine.dispose_kernel().await;
+            engine.dispose().await;
         }
     }
 
@@ -1031,6 +1034,7 @@ impl AgentSessionEngine {
                 api_key,
                 model: model.clone(),
                 headers,
+                transport: *self.transport.read().expect("transport lock"),
             });
         }
         if let Some(session_dir) = &self.config.session_dir {

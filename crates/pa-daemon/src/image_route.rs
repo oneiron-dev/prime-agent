@@ -144,6 +144,7 @@ impl AgentSessionEngine {
                         api_key: self.resolve_request_api_key(&resolved.model),
                         model: resolved.model.clone(),
                         headers: self.resolve_request_key_and_headers(&resolved.model).1,
+                        transport: *self.transport.read().expect("transport lock"),
                     },
                     agent_override: pa_agent::agent::AgentModelOverride {
                         thinking_level: map_thinking_level(resolved.thinking_level),
@@ -200,7 +201,13 @@ impl AgentSessionEngine {
         let route = route.clone();
         drop(slot);
         agent.set_model_override(Some(route.agent_override));
-        *self.provider_target.write().expect("provider target lock") = Some(route.target);
+        // The route's snapshot serves on the session's current transport,
+        // read under the slot's lock (a concurrent transport switch lands
+        // under it too).
+        let mut target = self.provider_target.write().expect("provider target lock");
+        let mut routed = route.target;
+        routed.transport = *self.transport.read().expect("transport lock");
+        *target = Some(routed);
     }
 
     /// Clear the armed route and restore the session's serving target (a
@@ -233,12 +240,15 @@ impl AgentSessionEngine {
                     api_key,
                     headers,
                     model,
+                    transport: *self.transport.read().expect("transport lock"),
                 })
             }
             Err(_) => route.session_target,
         };
-        if let Some(target) = target.take() {
-            *self.provider_target.write().expect("provider target lock") = Some(target);
+        if let Some(mut restored) = target.take() {
+            let mut slot = self.provider_target.write().expect("provider target lock");
+            restored.transport = *self.transport.read().expect("transport lock");
+            *slot = Some(restored);
         }
     }
 

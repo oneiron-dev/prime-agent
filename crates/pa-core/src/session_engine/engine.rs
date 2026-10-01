@@ -173,6 +173,9 @@ pub struct SessionEngine {
     /// loops the graph and keeps a dropped session's kernel process alive
     /// until the process exits.
     pub(crate) provisioner: std::sync::Arc<crate::kernel::provisioner::IpythonKernelProvisioner>,
+    /// The session id the loop's provider requests carry (the provider
+    /// connection state pa-ai keeps per session is keyed by it).
+    provider_session_id: String,
 }
 
 /// Resolve the MCP gating the resource loader and prompt need: skill
@@ -267,6 +270,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // snapshot is fixed for the session anyway — while the `PI_REQUEST_TIMING`
     // env half stays live inside the wrappers' per-request check.
     let request_timing_settings = settings.get_request_timing();
+    // TS passes `providerRetryPolicy(settingsManager)` to every compaction
+    // summary call.
+    let summary_retry_policy = settings.get_provider_retry_policy();
     let (mcp_skill_overrides, mcp_generic_servers, built_manager) =
         mcp_gating(&settings, config.agent_dir.clone()).await?;
     let mcp_manager = config
@@ -628,6 +634,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             &config.agent_dir,
         )),
     );
+    // The `agent provider transport used` adoption seam: it observes the
+    // provider's WebSocket upgrade on the stream path and reports through
+    // the session telemetry installed below.
+    let transport_adoption =
+        std::sync::Arc::new(super::transport_adoption::TransportAdoption::default());
     let agent = Agent::new(AgentOptions {
         initial_state: AgentInitialState {
             system_prompt: Some(system_prompt.clone()),
@@ -638,7 +649,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         },
         stream_fn: Some(super::request_timing::instrument_stream_fn(
             std::sync::Arc::clone(&request_timing_wiring),
-            stream_fn,
+            transport_adoption.instrument(stream_fn),
         )),
         // The session conversion rules apply at the loop's LLM boundary
         // (TS `convertToLlm`): bookkeeping custom rows drop, everything
@@ -676,7 +687,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         follow_up_mode: config.follow_up_mode,
         // TS `sdk.ts`: every loop request carries the session id (the
         // summarizer side calls stay without one).
-        session_id: Some(provider_session_id),
+        session_id: Some(provider_session_id.clone()),
         ..Default::default()
     });
 
@@ -713,6 +724,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             agent_dir: config.agent_dir.clone(),
         },
     );
+    session.set_summary_retry_policy(summary_retry_policy);
     // The kernel-state probe behind the post-compaction `ipython_state`
     // notice (TS `AgentSession._ipythonKernelProvisioner`): the engine's
     // provisioner is the session's kernel whether it added the `ipython`
@@ -812,6 +824,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // Same lifetime for the `rlm child usage attributed` adoption
         // event: the producer's flush reports through this handle.
         wiring.rlm_usage.set_telemetry(telemetry.clone());
+        transport_adoption.set_telemetry(telemetry.clone());
     }
     let goal_driver = wiring.runtime.goal_driver().clone();
     Ok(SessionEngine {
@@ -828,6 +841,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         telemetry,
         rlm_usage: wiring.rlm_usage,
         provisioner,
+        provider_session_id,
     })
 }
 
@@ -904,6 +918,18 @@ impl SessionEngine {
     /// session that owns it.
     pub async fn dispose_kernel(&self) {
         self.provisioner.dispose(None).await;
+    }
+
+    /// End the session (TS `AgentSession.dispose`): the provider
+    /// connection state the session owns goes first (TS
+    /// `cleanupSessionResources(sessionId)`: its in-flight Responses
+    /// WebSocket requests, connecting or streaming, settle as disposed and
+    /// its cached sockets close), then the kernel tears down with a final
+    /// namespace snapshot. The seam every host session-end path calls
+    /// (kill, shutdown, replacement, the orphan exit).
+    pub async fn dispose(&self) {
+        pa_ai::cleanup_session_resources(Some(&self.provider_session_id));
+        self.dispose_kernel().await;
     }
 
     /// Release the session's kernel now with a final namespace snapshot,
