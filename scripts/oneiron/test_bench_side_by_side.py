@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import urllib.request
 from pathlib import Path
 
@@ -209,6 +210,50 @@ class FrameAndRoleTests(unittest.TestCase):
         self.assertEqual(bench.classify(9, info("/h/kernel-venv/bin/python -m rlm.repl")), "kernel")
         self.assertEqual(bench.classify(9, info("/home/u/.local/bin/uv pip install x")), "bootstrap")
         self.assertEqual(bench.classify(9, info("fd --version")), "other")
+
+    def test_mac_table_reads_argv_apart_from_the_environment(self) -> None:
+        # `ps -E` puts the environment in the command column. The sandbox env carries
+        # UV_CACHE_DIR=<home>/.cache/uv, which the bootstrap rule must not read as a uv argv.
+        start, later = "Thu Oct  2 02:47:53 2026", "Thu Oct  2 02:49:01 2026"
+        daemon = "/r/prime-agent --mode daemon --daemon-socket /tmp/pb.x/t/prime-agent-user/daemon.sock"
+        env = "HOME=/tmp/pb.x/h TMPDIR=/tmp/pb.x/t UV_CACHE_DIR=/Users/u/.cache/uv"
+        rows = {  # pid: (lstart in the -E call, argv, environment, lstart in the argv call or None)
+            101: (start, daemon, env, start),
+            102: (start, "/r/prime-agent", env + " PRIME_AGENT_INTERNAL_DAEMON_WORKER=1", start),
+            103: (start, "/Users/u/.local/bin/uv pip install x", env, start),
+            104: (start, "/r/prime-agent --mode daemon", env, None),        # gone before the argv call
+            105: (start, "/r/prime-agent --mode daemon", env, later),       # pid reused between the calls
+        }
+        with_env = [f"{pid} 1 2048 S {s} {argv} {e}" for pid, (s, argv, e, _) in rows.items()]
+        with_env.append(f"106 1 0 Z {start} /r/zombie {env}")
+        argv_only = [f"{pid} {a} {argv}" for pid, (_, argv, _, a) in rows.items() if a]
+        # Same pid and start, but the argv is not the -E column's prefix (retitled between the calls).
+        with_env.append(f"107 1 2048 S {start} /r/prime-agent --mode daemon {env}")
+        argv_only.append(f"107 {start} node /x/cli.js")
+        # A retitled process: its padded title replaces argv and hides the environment in both calls.
+        with_env.append(f"108 1 2048 S {start} prime-agent      ")
+        argv_only.append(f"108 {start} prime-agent      ")
+
+        def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess:
+            lines = with_env if "-E" in command else argv_only
+            return subprocess.CompletedProcess(command, 0, "\n".join(lines) + "\n", "")
+
+        with unittest.mock.patch.object(bench.subprocess, "run", fake_run):
+            table = bench._mac_table()
+        self.assertEqual(sorted(table), [101, 102, 103, 104, 105, 107, 108])
+        self.assertEqual(table[101]["cmd"], daemon)
+        self.assertEqual(table[101]["ident"], "Thu Oct 2 02:47:53 2026")
+        self.assertLessEqual({"HOME=/tmp/pb.x/h", "TMPDIR=/tmp/pb.x/t", "UV_CACHE_DIR=/Users/u/.cache/uv"},
+                             table[101]["env"])
+        self.assertEqual(bench.classify(101, table[101]), "daemon")
+        self.assertEqual(bench.classify(102, table[102]), "worker")
+        self.assertEqual(bench.classify(103, table[103]), "bootstrap")
+        # No trustworthy argv: the -E column stays the command, as before.
+        self.assertTrue(table[104]["cmd"].endswith("UV_CACHE_DIR=/Users/u/.cache/uv"))
+        self.assertTrue(table[105]["cmd"].endswith("UV_CACHE_DIR=/Users/u/.cache/uv"))
+        self.assertTrue(table[107]["cmd"].endswith("UV_CACHE_DIR=/Users/u/.cache/uv"))
+        self.assertEqual(table[108]["cmd"], "prime-agent")
+        self.assertEqual(bench.classify(108, table[108]), "cli")
 
     def test_json_events_and_final_assistant(self) -> None:
         stream = "\n".join([

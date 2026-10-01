@@ -593,20 +593,33 @@ def _linux_info(pid: int, env: set[str], matched: bool) -> dict | None:
 
 
 def _mac_table() -> dict[int, dict]:
-    """Every process from one `ps` call (no /proc on macOS). `ps -E` appends
-    the environment to the command column; `lstart` (always five words) is
-    the start time that pins a pid's identity."""
-    out = subprocess.run(["ps", "-E", "-A", "-ww", "-o", "pid=,ppid=,rss=,state=,lstart=,command="],
-                         capture_output=True, text=True).stdout
+    """Every process from `ps` (no /proc on macOS). `ps -E` appends the
+    environment to the command column, so `env` takes its tokens, and `cmd`
+    is argv alone, as on Linux, from a second `ps` without -E: classify reads
+    `cmd`, and an environment value such as UV_CACHE_DIR=~/.cache/uv must not
+    read as argv. A process that started, ended or retitled itself between
+    the two calls keeps the -E column as its `cmd`. `lstart` (always five
+    words) is the start time that pins a pid's identity."""
+    def ps(*flags: str, columns: str) -> list[str]:
+        return subprocess.run(["ps", *flags, "-A", "-ww", "-o", columns],
+                              capture_output=True, text=True).stdout.splitlines()
+
+    argv_of: dict[int, tuple[str, str]] = {}
+    for line in ps(columns="pid=,lstart=,command="):
+        parts = line.split(None, 6)
+        if len(parts) == 7 and parts[0].isdigit():
+            argv_of[int(parts[0])] = (" ".join(parts[1:6]), parts[6])
     table: dict[int, dict] = {}
-    for line in out.splitlines():
+    for line in ps("-E", columns="pid=,ppid=,rss=,state=,lstart=,command="):
         parts = line.split(None, 9)
         if len(parts) < 10 or not parts[0].isdigit() or parts[3].startswith("Z"):
             continue
-        command = parts[9]
-        table[int(parts[0])] = {"ppid": int(parts[1]), "name": os.path.basename(command.split(" ", 1)[0]),
-                                "rssKb": int(parts[2]), "hwmKb": None, "cmd": command,
-                                "env": set(command.split()), "envMatched": False, "ident": " ".join(parts[4:9])}
+        pid, command, ident = int(parts[0]), parts[9], " ".join(parts[4:9])
+        argv_ident, argv = argv_of.get(pid, (None, ""))
+        cmd = argv.rstrip() if argv_ident == ident and argv.strip() and command.startswith(argv) else command
+        table[pid] = {"ppid": int(parts[1]), "name": os.path.basename(command.split(" ", 1)[0]),
+                      "rssKb": int(parts[2]), "hwmKb": None, "cmd": cmd,
+                      "env": set(command.split()), "envMatched": False, "ident": ident}
     return table
 
 
