@@ -56,12 +56,10 @@ prime-agent-rs --version
    entering each phase and right before the swap). An earlier rollback receipt there is kept
    under its timestamp.
 
-Running `rollback` again goes back to the version you left. `--retire-idle-daemon` also stops
-the Rust supervisor when it runs another release (read from its executable path) and is still
-the same idle supervisor that was checked before the swap, so the next `prime-agent-rs` run
-starts the target. It is not an atomic fence: see "Old supervisor" in
-[RELEASE.md](RELEASE.md). Without it, the receipt's `notice` names the release that supervisor
-keeps running.
+Running `rollback` again goes back to the version you left. A running Rust supervisor is never
+stopped: when it runs another release (read from its executable path), the receipt's `notice`
+names it, and new daemon-hosted sessions keep starting on it until it exits (see the end of
+section 2 in [RELEASE.md](RELEASE.md)).
 
 **If the supervisor is busy:** let its sessions finish, or end them one at a time with
 `prime-agent-rs list` and `prime-agent-rs stop <session>`. Then run `rollback` again.
@@ -81,9 +79,7 @@ Nothing to undo. `prime-agent` (the TS launcher at `~/.local/bin/prime-agent`) w
 changed. Keep using it. The Rust trial uses its own agent dir, socket dir and kernel venv, so
 TS state is untouched. To stop the Rust trial, stop using `prime-agent-rs`. Its supervisor keeps
 running on the Rust socket dir until something stops it; it touches only Rust state, so leaving
-it is safe (`--retire-idle-daemon` only retires a supervisor of a release other than the one
-being selected). You can also remove
-the launcher by hand: `rm ~/.local/bin/prime-agent-rs`. The installs and receipts stay; removing
+it is safe. You can also remove the launcher by hand: `rm ~/.local/bin/prime-agent-rs`. The installs and receipts stay; removing
 `~/.local/share/prime-agent-oneiron-rs/` is optional and loses the receipts.
 
 ## 3. Back to the TS build after cutover

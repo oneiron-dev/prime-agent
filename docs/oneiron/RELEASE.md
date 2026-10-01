@@ -109,7 +109,8 @@ started meanwhile is turned away before it writes anything):
    provider call. `--tools` also runs a kernel turn. If the probe fails, the version stays
    installed and unselected. The launcher sets `PYTHONPYCACHEPREFIX` to
    `~/.prime/agent-rs/python-cache`: the kernel imports bundled Python skills in place, and
-   their bytecode must not land inside the immutable install.
+   their bytecode must not land inside the immutable install. The launcher refuses to start
+   when that cache resolves outside the agent dir (a symlink out of it).
 5. **Select.** The idle check runs again. Then, under the lock, one last look: `current`,
    `previous` and the launcher must still be what the run started from, and the install's
    payload digest must still equal the one verified at install time. Only then is the
@@ -130,22 +131,19 @@ names; `status` and the `current` symlink tell what happened. An earlier receipt
 name is kept beside it under its timestamp.
 
 Rolling out the version that is already current runs every phase again (the swap is then a
-no-op). That re-verifies it, and finishes an activation that was interrupted or a retirement
-you now ask for.
+no-op). That re-verifies it, and finishes an activation that was interrupted.
 
-A running Rust supervisor is not restarted by the swap. If it runs another release but the same
-protocol and schema, new `prime-agent-rs` clients still treat it as current, and it starts every
-new session's worker from its own, older binary until it exits. Its release is read from its
-executable path (the hello's `appVersion` is the compiled Cargo version, the same for every
-Oneiron build of one base). The receipt's `notice` says which release it still runs.
-`--retire-idle-daemon` stops it after the swap: on a new connection whose hello must be the same
-supervisor (pid, process start, executable) checked before the swap, it sends `list` and, only on
-an empty answer, `shutdown` (never forced). The next `prime-agent-rs` run then starts the
-selected version. This is not an atomic idle fence: the supervisor accepts `shutdown`
-unconditionally, so a session another client creates in the moment between that `list` answer
-and the `shutdown` is stopped too. That is the same window as the CLI's own stale-daemon
-replacement. Retire only when nothing else is starting Rust sessions. A supervisor that lists
-sessions is never sent `shutdown`.
+A running Rust supervisor is not restarted by the swap, and these scripts never stop one: they
+only ever send it `list`. If it runs another release but the same protocol and schema, new
+`prime-agent-rs` clients still treat it as current, and it starts every new session's worker
+from its own, older binary until it exits. Its release is read from its executable path (the
+hello's `appVersion` is the compiled Cargo version, the same for every Oneiron build of one
+base). The receipt's `notice` says which release it still runs. Making the new release take
+over daemon-hosted sessions needs that supervisor stopped while it is idle. The daemon wire has
+no stop that refuses while sessions are live, decided together with session admission
+(`shutdown` is unconditional), so a `list`-then-`shutdown` from outside can stop a session
+created in between. That stop stays an operator decision outside these scripts until the
+daemon offers an idle-only shutdown.
 
 ## Not in this release
 
