@@ -24,14 +24,19 @@ fn serialized(value: &Value) -> String {
     value.to_string()
 }
 
-/// The body without the fields a continuation rewrites.
+/// The body without the fields a continuation rewrites, the remaining keys
+/// in their order (TS object rest). `Map::remove` under `preserve_order`
+/// swap-removes, which would move the last key into the gap.
 fn without_input(body: &Value) -> Value {
-    let mut stripped = body.clone();
-    if let Some(map) = stripped.as_object_mut() {
-        map.remove("input");
-        map.remove("previous_response_id");
+    match body.as_object() {
+        Some(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| *key != "input" && *key != "previous_response_id")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        None => body.clone(),
     }
-    stripped
 }
 
 /// The input items `body` adds beyond the baseline (`previous_body`'s
@@ -205,6 +210,33 @@ mod tests {
                                  "input": [{ "type": "a", "id": "1" }, { "type": "b" }] });
         assert_eq!(
             input_delta(&same_order, &previous.body, &previous.response_items),
+            Some(vec![json!({ "type": "b" })])
+        );
+    }
+
+    /// Dropping `input` keeps the other keys in their order (TS object
+    /// rest): a body whose other keys moved does not continue, and one
+    /// where only `input` moved does. Swap removal used to get both wrong.
+    #[test]
+    fn dropping_the_input_keeps_the_other_keys_in_order() {
+        let previous = anchor(
+            json!({ "model": "m", "input": [{ "type": "a" }], "stream": true, "store": false }),
+            Vec::new(),
+        );
+        let moved_keys = json!({ "model": "m", "store": false, "stream": true,
+                                 "input": [{ "type": "a" }, { "type": "b" }] });
+        assert_eq!(
+            input_delta(&moved_keys, &previous.body, &previous.response_items),
+            None
+        );
+        let previous = anchor(
+            json!({ "input": [{ "type": "a" }], "model": "m", "stream": true, "store": false }),
+            Vec::new(),
+        );
+        let moved_input = json!({ "model": "m", "stream": true, "store": false,
+                                  "input": [{ "type": "a" }, { "type": "b" }] });
+        assert_eq!(
+            input_delta(&moved_input, &previous.body, &previous.response_items),
             Some(vec![json!({ "type": "b" })])
         );
     }
