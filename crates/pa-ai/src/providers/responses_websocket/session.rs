@@ -150,7 +150,17 @@ impl OwnedRequest {
         if self.disposed.load(Ordering::SeqCst) {
             return Some(Cancellation::SessionDisposed);
         }
-        self.cancel.is_cancelled().then_some(Cancellation::Aborted)
+        if !self.cancel.is_cancelled() {
+            return None;
+        }
+        // The token fired. A disposal marks the request before it fires
+        // the token, so a disposal that landed between the first read and
+        // the token check shows here: never report it as a caller abort.
+        Some(if self.disposed.load(Ordering::SeqCst) {
+            Cancellation::SessionDisposed
+        } else {
+            Cancellation::Aborted
+        })
     }
 }
 
@@ -372,14 +382,23 @@ pub(crate) fn close_sessions(session_id: Option<&str>) {
     for owned in state.owned.values() {
         let owns =
             session_id.is_none_or(|session_id| owned.session_id.as_deref() == Some(session_id));
-        if owns && !owned.cancel.is_cancelled() {
-            // Marked first: whichever signal the socket's worker sees, the
-            // request reads as disposed, and the close reason is set before
-            // the token fires.
+        if !owns {
+            continue;
+        }
+        // A request the caller already aborted keeps that verdict; the
+        // others are marked first: whichever signal the socket's worker
+        // sees, the request reads as disposed.
+        let disposing = !owned.cancel.is_cancelled();
+        if disposing {
             owned.disposed.store(true, Ordering::SeqCst);
-            if let Some(worker) = &owned.worker {
-                worker.close(CloseReason::SessionCleanup);
-            }
+        }
+        // Every owned socket closes with `session_cleanup` (TS closes
+        // `request.socket` unconditionally), an aborted one included, and
+        // the reason is set before the token fires.
+        if let Some(worker) = &owned.worker {
+            worker.close(CloseReason::SessionCleanup);
+        }
+        if disposing {
             owned.cancel.cancel();
         }
     }

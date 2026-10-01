@@ -169,8 +169,14 @@ fn transport_error(
 }
 
 /// A failure before the socket opened (TS `connect`'s error/close events
-/// with cause `connect`).
+/// with cause `connect`). A request already cancelled (its session
+/// disposed, or the caller aborted) reports the cancellation: a disposed
+/// session's request must never read as a transport failure the caller
+/// replays over SSE.
 fn connect_error(failure: ConnectFailure, owner: &OwnedRequest) -> ResponsesWsError {
+    if let Some(cancellation) = owner.cancellation() {
+        return ResponsesWsError::from_cancellation(cancellation);
+    }
     let message = match failure {
         ConnectFailure::Cancelled => {
             return ResponsesWsError::from_cancellation(
@@ -219,8 +225,15 @@ fn eof_error() -> ResponsesWsError {
     )
 }
 
-/// Map how the socket ended one request (anything but completion).
+/// Map how the socket ended one request (anything but completion). A
+/// cancellation that landed before the request mapped its end wins over the
+/// end (TS `onAbort` replaces a failure the collector has not thrown yet):
+/// a remote close the worker queued just before a disposal still reads as
+/// the disposal, never as a transport failure to replay.
 fn socket_end_error(end: SocketEnd, owner: &OwnedRequest) -> ResponsesWsError {
+    if let Some(cancellation) = owner.cancellation() {
+        return ResponsesWsError::from_cancellation(cancellation);
+    }
     match end {
         SocketEnd::Completed => eof_error(),
         SocketEnd::Cancelled | SocketEnd::ConsumerGone => ResponsesWsError::from_cancellation(
@@ -449,7 +462,11 @@ async fn stream_events(
                 }
                 Some(WorkerEvent::End(SocketEnd::Completed)) => break,
                 Some(WorkerEvent::End(end)) => return Err(socket_end_error(end, owner)),
-                None => return Err(eof_error()),
+                None => {
+                    return Err(owner
+                        .cancellation()
+                        .map_or_else(eof_error, ResponsesWsError::from_cancellation))
+                }
             }
         }
         processor.finish().map_err(ResponsesWsError::Provider)

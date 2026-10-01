@@ -982,6 +982,104 @@ async fn disposal_reaches_a_displaced_busy_connection() {
     assert_eq!(super::session::owned_request_count("dispose-displaced"), 0);
 }
 
+/// Disposal still closes the socket of a displaced request the caller
+/// aborted a moment before (TS closes every owned `request.socket`): the
+/// request keeps its abort verdict, and its uncached socket closes with
+/// `session_cleanup` instead of `done`.
+#[tokio::test]
+async fn disposal_closes_a_caller_aborted_displaced_socket() {
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![Turn::Stall]),
+            Upgrade::Accept(vec![Turn::Stall]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let caller = CancellationToken::new();
+    let mut aborted_options = options(Some("dispose-aborted"), None);
+    aborted_options.base.signal = Some(caller.clone());
+    let aborted = stream_openai_responses(&ws, &context(vec![user("a")]), Some(&aborted_options));
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 1, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 1, .. }
+    ));
+    let newer = stream_openai_responses(
+        &ws,
+        &context(vec![user("b")]),
+        Some(&options(Some("dispose-aborted"), None)),
+    );
+    assert!(matches!(
+        server.next_request().await,
+        Record::Upgrade { connection: 2, .. }
+    ));
+    assert!(matches!(
+        server.next_request().await,
+        Record::WsRequest { connection: 2, .. }
+    ));
+    // The abort and the disposal land in one step: no worker runs between
+    // them (single-threaded test runtime).
+    caller.cancel();
+    crate::cleanup_session_resources(Some("dispose-aborted"));
+    let aborted = aborted.result().await;
+    assert_eq!(aborted.stop_reason, StopReason::Aborted);
+    assert_ne!(
+        aborted.error_message.as_deref(),
+        Some(super::SESSION_DISPOSED_MESSAGE)
+    );
+    let newer = newer.result().await;
+    assert_eq!(
+        newer.error_message.as_deref(),
+        Some(super::SESSION_DISPOSED_MESSAGE)
+    );
+    assert_eq!(server.closed(1).await.as_deref(), Some("session_cleanup"));
+    assert_eq!(server.closed(2).await.as_deref(), Some("session_cleanup"));
+}
+
+/// A request whose session was disposed before it mapped its socket's end
+/// or its handshake failure reports the disposal: a remote close the
+/// worker queued just before the disposal is not a transport failure the
+/// caller would replay over SSE.
+#[test]
+fn a_disposal_wins_over_an_unmapped_socket_end() {
+    let owner = super::session::OwnedRequest::begin(Some("dispose-unmapped"), None);
+    let ended = super::socket_end_error(
+        super::connection::SocketEnd::CloseFrame {
+            code: Some(1011),
+            reason: "upstream reset".to_string(),
+        },
+        &owner,
+    );
+    assert!(matches!(ended, super::ResponsesWsError::Transport(_)));
+    crate::cleanup_session_resources(Some("dispose-unmapped"));
+    assert_eq!(
+        super::socket_end_error(
+            super::connection::SocketEnd::CloseFrame {
+                code: Some(1011),
+                reason: "upstream reset".to_string(),
+            },
+            &owner,
+        ),
+        super::ResponsesWsError::SessionDisposed
+    );
+    assert_eq!(
+        super::socket_end_error(super::connection::SocketEnd::Eof, &owner),
+        super::ResponsesWsError::SessionDisposed
+    );
+    assert_eq!(
+        super::connect_error(
+            super::connection::ConnectFailure::Request("Invalid WebSocket header x".to_string()),
+            &owner,
+        ),
+        super::ResponsesWsError::SessionDisposed
+    );
+}
+
 /// A later claim under a new identity (rotated credentials) owns the slot
 /// even when the earlier, old-identity socket opens after it: the late
 /// socket serves its one request and closes with `done`, and the next
