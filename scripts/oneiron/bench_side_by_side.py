@@ -7,11 +7,13 @@ mock provider (no real provider is called unless --live-sol):
   version      `--version` cold start (hyperfine --warmup 2 --runs 20, or a
                timed loop when hyperfine is missing)
   oneshot      headless `-p --mode json --no-session --no-tools ... -- "say hi"`
-               wall time to the agent_end event, the CLI process's max RSS
-               (wait4) and the peak summed RSS of every sandbox process.
-               "steady" leaves sandbox processes alive between runs (the TS
-               CLI keeps a supervisor daemon, as on a workstation);
-               "oneshotCold" reaps every sandbox process before each run
+               wall time to the agent_end event, the CLI's wait4 max RSS and
+               the peak summed RSS of every sandbox process. "steady" leaves
+               sandbox processes alive between runs (the TS CLI keeps a
+               supervisor daemon, as on a workstation); "oneshotCold" reaps
+               every sandbox process before each run. A run counts only when
+               the mock got a request and the final assistant message did
+               not end in an error
   resume       `-p --mode json --resume <session file> --no-tools ... --
                "continue"` on a synthetic v3 transcript (~1,100 message rows
                of realistic sizes; a pristine copy per run), to agent_end
@@ -44,9 +46,11 @@ PRIME_AGENT_DISABLE_SELF_UPDATE=1 plus dead loopback installer/feed URLs. The
 binaries run directly (TS: node + the cli.js behind ~/.local/bin/prime-agent,
 Rust: the physical binary behind prime-agent-oneiron-rs/current). A sandbox's
 processes are the ones whose environment carries HOME=<sb>/h (Linux
-/proc/<pid>/environ, macOS `ps -E`) plus the descendants of PIDs this script
-spawned; only those are ever signalled, by PID. `update`, `shutdown` and
-daemon stop commands are never run. The real uv cache dir is reused (as
+/proc/<pid>/environ; macOS `ps -E`, which also needs TMPDIR=<sb>/t there),
+the descendants of those and of PIDs this script spawned, and earlier-seen
+ones that outlived their parent; only those are ever signalled, by PID, and
+only while the PID still names the same process (its start time).
+`update`, `shutdown` and daemon stop commands are never run. The real uv cache dir is reused (as
 scripts/oneiron/gate.sh does) so a kernel bootstrap needs no download it
 already has; everything uv installs lands in the sandbox.
 
@@ -73,10 +77,17 @@ JSON schema `prime-agent-oneiron.bench/1` (bench-<host>-<utc>.json):
                  {ts|rs: {ok, firstRun: Sample | null, samples[Sample],
                   summary{agentEndS, exitS, maxRssKb, peakSandboxRssKb,
                   requestBytes}, error}}
-                 Sample = {run, ok, exitCode, agentEndS, exitS, maxRssKb,
-                  peakSandboxRssKb, peakProcesses, requestBytes (largest
-                  provider request body), requests[{path, bytes, messages}],
-                  requestMessages (resume), error?, stderrTail?, stdoutTail?}
+                 Sample = {run, ok, exitCode, agentEndS, exitS, stopReason,
+                  maxRssKb, peakSandboxRssKb, peakProcesses, requestBytes
+                  (largest provider request body), requests[{path, bytes,
+                  messages}], requestMessages (resume), error?, stderrTail?,
+                  stdoutTail?}
+                 maxRssKb: wait4 ru_maxrss of the CLI (the largest of it and
+                  any child it waited for; not a sum). peakSandboxRssKb: the
+                  largest sum of RSS over all sandbox processes, sampled every
+                  pollSeconds while the CLI runs (daemons it reuses included),
+                  floored at maxRssKb: a run shorter than one poll is sampled
+                  about once.
                  (oneshotCold.firstRun is null: it shares oneshot's sandbox)
     interactive  {ts|rs: {ok, firstRun: {ok, readyS, firstFrameS,
                   bootstrapS, error, lastFrame?}, samples[{run, ok, readyS,
@@ -158,10 +169,13 @@ UPSTREAM_REFERENCE = {
 READY_PROMPT = re.compile(r"^\s*>\s*$", re.MULTILINE)
 READY_STATUS = re.compile(re.escape(MOCK_MODEL) + r" · \d")
 QUIT_KEYS = ("C-c", "C-c")
-# Worst-case socket path below a sandbox TMPDIR: the daemon's worker socket
-# (`prime-agent-<uid>/worker-<12>-<12>.sock`); macOS sun_path holds 104 bytes.
-SOCKET_TAIL = len("/prime-agent-99999/worker-xxxxxxxxxxxx-xxxxxxxxxxxx.sock")
-SUN_PATH_MAX = 103
+# Worst-case socket path below a sandbox base: `pb.XXXXXXXX/t` then the
+# daemon's worker socket (`prime-agent-<uid>/worker-<12>-<12>.sock`). sun_path
+# holds 104 bytes on macOS and 108 on Linux, the terminating NUL included.
+SOCKET_TAIL = len("/pb.XXXXXXXX/t/prime-agent-99999/worker-xxxxxxxxxxxx-xxxxxxxxxxxx.sock")
+SUN_PATH_MAX = 103 if sys.platform == "darwin" else 107
+# Resolved live keys (--live-sol): scrubbed from every diagnostic kept.
+SECRETS: set[str] = set()
 
 
 def utc_now() -> str:
@@ -554,68 +568,108 @@ def _linux_children(pid: int) -> list[int]:
     return children
 
 
+def _linux_starttime(pid: int) -> str | None:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            stat = handle.read().decode(errors="replace")
+    except OSError:
+        return None
+    # Field 22 (starttime); the comm field may hold spaces and parens.
+    fields = stat[stat.rfind(")") + 2:].split()
+    return fields[19] if len(fields) > 19 else None
+
+
 def _linux_info(pid: int, env: set[str], matched: bool) -> dict | None:
     status = _linux_status(pid)
-    if not status or status.get("State", "").startswith("Z"):
+    ident = _linux_starttime(pid)
+    if not status or ident is None or status.get("State", "").startswith("Z"):
         return None
     return {"ppid": int(status.get("PPid", "0")), "name": status.get("Name", ""),
             "rssKb": int((status.get("VmRSS") or "0 kB").split()[0]),
             "hwmKb": int((status.get("VmHWM") or "0 kB").split()[0]),
-            "cmd": _linux_cmdline(pid), "env": env, "envMatched": matched}
+            "cmd": _linux_cmdline(pid), "env": env, "envMatched": matched, "ident": ident}
 
 
-def sandbox_processes(home: str, roots: set[int] = frozenset()) -> dict[int, dict]:
+def _mac_table() -> dict[int, dict]:
+    """Every process from one `ps` call (no /proc on macOS). `ps -E` appends
+    the environment to the command column; `lstart` (always five words) is
+    the start time that pins a pid's identity."""
+    out = subprocess.run(["ps", "-E", "-A", "-ww", "-o", "pid=,ppid=,rss=,state=,lstart=,command="],
+                         capture_output=True, text=True).stdout
+    table: dict[int, dict] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 9)
+        if len(parts) < 10 or not parts[0].isdigit() or parts[3].startswith("Z"):
+            continue
+        command = parts[9]
+        table[int(parts[0])] = {"ppid": int(parts[1]), "name": os.path.basename(command.split(" ", 1)[0]),
+                                "rssKb": int(parts[2]), "hwmKb": None, "cmd": command,
+                                "env": set(command.split()), "envMatched": False, "ident": " ".join(parts[4:9])}
+    return table
+
+
+def identity(pid: int) -> str | None:
+    """A live pid's start time: (pid, identity) never names a reused pid."""
+    if IS_LINUX:
+        return _linux_starttime(pid)
+    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return " ".join(out.split()) or None
+
+
+def sandbox_processes(home: str, roots: set[int] = frozenset(),
+                      known: dict[int, str] | None = None) -> dict[int, dict]:
     """The sandbox's live processes: every pid whose environment carries
-    HOME=<home> (daemons that left their parent included) plus the live
-    descendants of `roots` (the PIDs this script spawned).
-    pid -> {ppid, rssKb, hwmKb, name, cmd, env (KEY=VALUE tokens), envMatched}."""
-    token = f"HOME={home}"
+    HOME=<home> (macOS: and TMPDIR=<sandbox>/t, as `ps -E` mixes argv and
+    environment in one column), every `known` pid (pid -> identity from an
+    earlier scan) still alive under the same identity, and all live
+    descendants of those and of `roots` (the PIDs this script spawned), so a
+    child that lost its parent or its HOME stays tracked.
+    pid -> {ppid, rssKb, hwmKb, name, cmd, env (KEY=VALUE tokens), envMatched, ident}."""
+    tokens = {f"HOME={home}"}
     found: dict[int, dict] = {}
     if IS_LINUX:
         for entry in os.scandir("/proc"):
             if not entry.name.isdigit():
                 continue
             env = _linux_environ(int(entry.name))
-            if token in env:
+            if tokens <= env:
                 info = _linux_info(int(entry.name), env, True)
                 if info:
                     found[int(entry.name)] = info
-        stack = list(roots)
-        seen = set(stack)
-        while stack:
-            pid = stack.pop()
-            if pid not in found:
-                info = _linux_info(pid, _linux_environ(pid), False)
-                if not info:
-                    continue
+
+        def lookup(pid: int) -> dict | None:
+            return _linux_info(pid, _linux_environ(pid), False)
+
+        children_of = _linux_children
+    else:
+        tokens.add(f"TMPDIR={Path(home).parent / 't'}")
+        table = _mac_table()
+        kids: dict[int, list[int]] = {}
+        for pid, info in table.items():
+            kids.setdefault(info["ppid"], []).append(pid)
+            info["envMatched"] = tokens <= info["env"]
+            if info["envMatched"]:
                 found[pid] = info
-            for child in _linux_children(pid):
-                if child not in seen:
-                    seen.add(child)
-                    stack.append(child)
-        return found
-    # macOS: no /proc; `ps -E` appends the environment to the command column.
-    out = subprocess.run(["ps", "-E", "-A", "-ww", "-o", "pid=,ppid=,rss=,state=,command="],
-                         capture_output=True, text=True).stdout
-    table: dict[int, dict] = {}
-    for line in out.splitlines():
-        parts = line.split(None, 4)
-        if len(parts) < 5 or not parts[0].isdigit() or parts[3].startswith("Z"):
-            continue
-        words = set(parts[4].split())
-        table[int(parts[0])] = {"ppid": int(parts[1]), "name": os.path.basename(parts[4].split(" ", 1)[0]),
-                                "rssKb": int(parts[2]), "hwmKb": None, "cmd": parts[4], "env": words,
-                                "envMatched": token in words}
-    found = {pid: info for pid, info in table.items() if info["envMatched"]}
-    children: dict[int, list[int]] = {}
-    for pid, info in table.items():
-        children.setdefault(info["ppid"], []).append(pid)
-    stack = [pid for pid in roots if pid in table]
+        lookup = table.get
+
+        def children_of(pid: int) -> list[int]:
+            return kids.get(pid, [])
+
+    for pid, ident in (known or {}).items():
+        if pid not in found:
+            info = lookup(pid)
+            if info and info["ident"] == ident:
+                found[pid] = info
+    stack = list(set(roots) | set(found))
     seen = set(stack)
     while stack:
         pid = stack.pop()
-        found.setdefault(pid, table[pid])
-        for child in children.get(pid, []):
+        if pid not in found:
+            info = lookup(pid)
+            if not info:
+                continue
+            found[pid] = info
+        for child in children_of(pid):
             if child not in seen:
                 seen.add(child)
                 stack.append(child)
@@ -656,15 +710,24 @@ def pid_alive(pid: int) -> bool:
 
 
 def reap(home: str, roots: set[int] = frozenset(), exclude: set[int] = frozenset(),
-         grace: float = 5.0, rounds: int = 6) -> list[dict]:
-    """SIGTERM then SIGKILL every sandbox process, by PID, until none is
-    left (a supervisor may respawn a worker once). Returns what was signalled."""
-    signalled: list[dict] = []
+         known: dict[int, str] | None = None, grace: float = 5.0,
+         rounds: int = 6) -> tuple[list[dict], dict[int, dict]]:
+    """SIGTERM then SIGKILL every sandbox process, by PID and identity, until
+    two scans find none (a supervisor may respawn a worker once). Returns
+    what was signalled and what survived (logged: it should be nothing)."""
     me = os.getpid()
+    known = dict(known or {})
+
+    def scan() -> dict[int, dict]:
+        procs = {pid: info for pid, info in sandbox_processes(home, roots, known).items()
+                 if pid not in exclude and pid > 1 and pid != me}
+        known.update({pid: info["ident"] for pid, info in procs.items()})
+        return procs
+
+    signalled: list[dict] = []
     quiet_checks = 0
     for _ in range(rounds):
-        procs = {pid: info for pid, info in sandbox_processes(home, roots).items()
-                 if pid not in exclude and pid > 1 and pid != me}
+        procs = scan()
         if not procs:
             quiet_checks += 1
             if quiet_checks >= 2:
@@ -674,21 +737,28 @@ def reap(home: str, roots: set[int] = frozenset(), exclude: set[int] = frozenset
         quiet_checks = 0
         for pid, info in procs.items():
             signalled.append({"pid": pid, "name": info.get("name") or info.get("cmd", "")[:40]})
-            _signal(pid, signal.SIGTERM, home, info["envMatched"])
+            _signal(pid, signal.SIGTERM, home, info)
         deadline = time.monotonic() + grace
         while time.monotonic() < deadline and any(pid_alive(pid) for pid in procs):
             time.sleep(0.1)
         for pid, info in procs.items():
             if pid_alive(pid):
-                _signal(pid, signal.SIGKILL, home, info["envMatched"])
+                _signal(pid, signal.SIGKILL, home, info)
         time.sleep(0.2)
-    return signalled
+    survivors = scan()
+    if survivors:
+        log(f"warning: sandbox processes survived the reap: "
+            f"{ {pid: info.get('name') for pid, info in survivors.items()} }")
+    return signalled, survivors
 
 
-def _signal(pid: int, sig: int, home: str, env_matched: bool) -> None:
-    # Linux: a pid found by its HOME is re-checked just before the signal,
-    # so a pid reused by an unrelated process in between is never hit.
-    if IS_LINUX and env_matched and f"HOME={home}" not in _linux_environ(pid):
+def _signal(pid: int, sig: int, home: str, info: dict) -> None:
+    # The scan's (pid, start time) must still name the same process, so a
+    # pid reused in between is never hit; a pid found by its HOME is also
+    # re-checked for it (Linux).
+    if identity(pid) != info.get("ident"):
+        return
+    if IS_LINUX and info.get("envMatched") and f"HOME={home}" not in _linux_environ(pid):
         return
     try:
         os.kill(pid, sig)
@@ -726,16 +796,26 @@ def resolve_products(ts_bin: str | None, rs_bin: str | None) -> dict[str, dict]:
     return products
 
 
+def socket_fits(base: Path) -> bool:
+    """The deepest daemon socket below a sandbox in `base` fits sun_path,
+    and the path has no whitespace (macOS matches `ps -E` tokens)."""
+    return not re.search(r"\s", str(base)) and len(str(base).encode()) + SOCKET_TAIL <= SUN_PATH_MAX
+
+
 def sandbox_base(override: str | None) -> tuple[Path, str]:
     """Where sandboxes go. Linux: /tmp. macOS: $TMPDIR when the deepest
-    daemon socket below `<base>/pb.XXXXXXXX/t` still fits sun_path, else
-    /tmp (the per-user $TMPDIR there is ~49 bytes already)."""
+    daemon socket below it still fits sun_path, else /tmp (the per-user
+    $TMPDIR there is ~49 bytes already)."""
     if override:
-        return Path(override), "--sandbox-base"
+        base = Path(os.path.abspath(override))
+        if not socket_fits(base):
+            raise SystemExit(f"error: --sandbox-base {base} has whitespace or is too long for the daemon "
+                             f"socket paths below it ({SUN_PATH_MAX - SOCKET_TAIL} bytes at most)")
+        return base, "--sandbox-base"
     if IS_MAC:
-        tmp = (os.environ.get("TMPDIR") or "").rstrip("/")
-        if tmp and len(tmp) + len("/pb.XXXXXXXX/t") + SOCKET_TAIL <= SUN_PATH_MAX:
-            return Path(tmp), "$TMPDIR"
+        tmp = Path(os.path.abspath(os.environ.get("TMPDIR") or "/tmp"))
+        if socket_fits(tmp):
+            return tmp, "$TMPDIR"
         return Path("/tmp"), "/tmp ($TMPDIR too long for daemon socket paths)"
     return Path("/tmp"), "/tmp"
 
@@ -770,15 +850,25 @@ class Sandbox:
     def __init__(self, product: str, purpose: str, base: Path, mock_url: str, uv_cache: str | None) -> None:
         self.product = product
         self.purpose = purpose
+        self.roots: set[int] = set()
+        self.known: dict[int, str] = {}
+        self.env: dict[str, str] = {}
         base.mkdir(parents=True, exist_ok=True)
-        self.root = Path(tempfile.mkdtemp(prefix="pb.", dir=str(base)))
-        Sandbox.created.append(self)
+        self.root = Path(os.path.abspath(tempfile.mkdtemp(prefix="pb.", dir=str(base))))
         self.home = self.root / "h"
         self.tmp = self.root / "t"
         self.work = self.root / "w"
+        self.agent_dir = self.home / ".prime" / "agent"
+        Sandbox.created.append(self)
+        try:
+            self.setup(mock_url, uv_cache)
+        except BaseException:
+            self.teardown()
+            raise
+
+    def setup(self, mock_url: str, uv_cache: str | None) -> None:
         for sub in ("h", "t", "w", "x/config", "x/data", "x/cache", "x/state"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
-        self.agent_dir = self.home / ".prime" / "agent"
         self.agent_dir.mkdir(parents=True, mode=0o700)
         self.env = base_env(dict(os.environ))
         self.env.update({
@@ -789,11 +879,10 @@ class Sandbox:
         })
         if uv_cache:
             self.env["UV_CACHE_DIR"] = uv_cache
-        if product == "rs":
+        if self.product == "rs":
             self.env.update({"PRIME_AGENT_DISABLE_SELF_UPDATE": "1", "PRIME_AGENT_RUST_INSTALLER_URL": DEAD_URL,
                              "PRIME_AGENT_DOWNLOAD_BASE_URL": DEAD_URL})
         self.write_agent_files(self.agent_dir, mock_url)
-        self.roots: set[int] = set()
 
     def write_agent_files(self, agent_dir: Path, mock_url: str, extra_providers: dict | None = None) -> None:
         """models.json with the mock provider (plus copied real providers in
@@ -809,30 +898,56 @@ class Sandbox:
             {"onboardingShown": True, "telemetry": {"enabled": False, "noticeShown": True}}, indent=2) + "\n")
 
     def processes(self) -> dict[int, dict]:
-        return sandbox_processes(str(self.home), self.roots)
+        found = sandbox_processes(str(self.home), self.roots, self.known)
+        self.known = {pid: info["ident"] for pid, info in found.items()}
+        return found
 
     def reap(self, exclude: set[int] = frozenset()) -> list[dict]:
-        signalled = reap(str(self.home), self.roots, exclude)
-        self.roots.clear()
+        signalled, survivors = reap(str(self.home), self.roots, exclude, self.known)
+        self.roots = {pid for pid in self.roots if pid in survivors}
+        self.known = {pid: info["ident"] for pid, info in survivors.items()}
         return signalled
 
     def teardown(self) -> None:
-        tmux_socket = self.root / "tm"
-        if tmux_socket.exists():
-            subprocess.run(["tmux", "-S", str(tmux_socket), "kill-server"], capture_output=True,
-                           env=self.env, timeout=10)
-        self.reap()
+        """Every step runs even when one before it fails; the models.json
+        copies (a live key under --live-sol) go first."""
+        for models in self.root.glob("h/.prime/*/models.json"):
+            try:
+                models.unlink()
+            except OSError as error:
+                log(f"warning: could not delete {models}: {error}")
+        if (self.root / "tm").exists():
+            try:
+                subprocess.run(["tmux", "-S", str(self.root / "tm"), "kill-server"], capture_output=True,
+                               env=self.env, timeout=10)
+            except (OSError, subprocess.SubprocessError) as error:
+                log(f"warning: tmux kill-server for {self.root} failed: {error}")
+        try:
+            self.reap()
+        except Exception as error:  # noqa: BLE001 - the directory still goes
+            log(f"warning: reaping {self.root} failed: {error}")
         shutil.rmtree(self.root, ignore_errors=True)
+        if self.root.exists():
+            log(f"warning: could not remove sandbox {self.root}")
         if self in Sandbox.created:
             Sandbox.created.remove(self)
 
 
 def teardown_all() -> None:
-    for sandbox in list(Sandbox.created):
-        try:
-            sandbox.teardown()
-        except Exception as error:  # noqa: BLE001 - teardown must reach every sandbox
-            log(f"teardown of {sandbox.root} failed: {error}")
+    """Tear every registered sandbox down; a second Ctrl-C cannot cut it short."""
+    main_thread = threading.current_thread() is threading.main_thread()
+    previous = signal.getsignal(signal.SIGINT) if main_thread else None
+    if main_thread:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        for sandbox in list(Sandbox.created):
+            try:
+                sandbox.teardown()
+            except Exception as error:  # noqa: BLE001 - teardown must reach every sandbox
+                log(f"teardown of {sandbox.root} failed: {error}")
+    finally:
+        if main_thread and previous is not None:
+            signal.signal(signal.SIGINT, previous)
 
 
 # -- headless runs -------------------------------------------------------------------
@@ -869,8 +984,10 @@ def final_assistant(events: list[dict]) -> dict | None:
 def run_headless(sandbox: Sandbox, argv: list[str], mock: MockProvider | None, poll: float,
                  timeout: float, run: int) -> dict:
     """One headless run: wall time to the agent_end line on stdout and to
-    exit, the CLI's own max RSS (wait4) and the peak summed RSS of every
-    sandbox process while it ran."""
+    exit (a blocking wait4 in its own thread), the CLI's wait4 max RSS, and
+    the peak summed RSS of every sandbox process, scanned every `poll` while
+    the CLI runs. Against the mock, a run counts only when the provider got
+    a request and the final assistant message did not end in an error."""
     mark = mock.mark() if mock else 0
     stderr_path = sandbox.root / f"stderr-{run}.log"
     agent_end: list[float] = []
@@ -892,38 +1009,50 @@ def run_headless(sandbox: Sandbox, argv: list[str], mock: MockProvider | None, p
                     except json.JSONDecodeError:
                         pass
 
+        exited: dict = {}
+
+        def wait() -> None:
+            _, status, rusage = os.wait4(proc.pid, 0)
+            exited.update(at=time.monotonic() - started, status=status, rusage=rusage)
+
         reader = threading.Thread(target=read, daemon=True)
+        waiter = threading.Thread(target=wait, daemon=True)
         reader.start()
+        waiter.start()
         peak_rss = 0
         peak_count = 0
-        status = None
-        rusage = None
-        while True:
-            pid, status, rusage = os.wait4(proc.pid, os.WNOHANG)
-            if pid:
-                break
+        while waiter.is_alive():
             if time.monotonic() - started > timeout:
-                reap(str(sandbox.home), {proc.pid})
-                pid, status, rusage = os.wait4(proc.pid, 0)
+                sandbox.reap()
+                waiter.join(timeout=30)
                 break
             procs = sandbox.processes()
             total = sum(info["rssKb"] for info in procs.values())
             if total > peak_rss:
                 peak_rss, peak_count = total, len(procs)
-            time.sleep(poll)
-        exit_s = time.monotonic() - started
-        proc.returncode = os.waitstatus_to_exitcode(status)
+            waiter.join(timeout=poll)
         reader.join(timeout=10)
-    sandbox.roots.discard(proc.pid)
-    max_rss = rusage.ru_maxrss // 1024 if IS_MAC else rusage.ru_maxrss
+        if not reader.is_alive():
+            proc.stdout.close()
+    if "status" in exited:
+        proc.returncode = os.waitstatus_to_exitcode(exited["status"])
+        sandbox.roots.discard(proc.pid)
+    rusage = exited.get("rusage")
+    max_rss = (rusage.ru_maxrss // 1024 if IS_MAC else rusage.ru_maxrss) if rusage else None
     requests = mock.since(mark) if mock else []
     events = json_events("".join(lines))
-    sample = {"run": run, "ok": proc.returncode == 0 and bool(agent_end), "exitCode": proc.returncode,
-              "agentEndS": round(agent_end[0], 4) if agent_end else None, "exitS": round(exit_s, 4),
-              "maxRssKb": max_rss, "peakSandboxRssKb": max(peak_rss, max_rss), "peakProcesses": peak_count,
+    final = final_assistant(events) or {}
+    posted = [r for r in requests if r["path"].endswith(("/chat/completions", "/responses"))]
+    ok = (proc.returncode == 0 and bool(agent_end) and final.get("stopReason") not in ("error", "aborted")
+          and (mock is None or bool(posted)))
+    sample = {"run": run, "ok": ok, "exitCode": proc.returncode,
+              "agentEndS": round(agent_end[0], 4) if agent_end else None,
+              "exitS": round(exited["at"], 4) if "at" in exited else None,
+              "stopReason": final.get("stopReason"), "maxRssKb": max_rss,
+              "peakSandboxRssKb": max(peak_rss, max_rss or 0), "peakProcesses": peak_count,
               "requestBytes": max((r["bytes"] for r in requests), default=None),
               "requests": [{"path": r["path"], "bytes": r["bytes"], "messages": r["messages"]} for r in requests]}
-    if not sample["ok"]:
+    if not ok:
         sample["stderrTail"] = stderr_path.read_text(errors="replace")[-2000:]
         sample["stdoutTail"] = "".join(lines)[-1000:]
     sample["_events"] = events
@@ -1007,7 +1136,7 @@ class Bench:
                         if index >= self.args.version_warmup:
                             entry["samples"].append(round(elapsed, 5))
                 entry["summary"] = {"wallS": summarize(entry["samples"])}
-                entry["ok"] = bool(entry["samples"])
+                entry["ok"] = len(entry["samples"]) == self.args.version_runs
                 result[name] = entry
                 log(f"version {name}: median {entry['summary']['wallS'] and entry['summary']['wallS']['median']}s "
                     f"({entry['method']})")
@@ -1138,12 +1267,17 @@ class Bench:
         return {"readyS": None, "firstFrameS": round(first_frame, 4) if first_frame else None, "frame": frame}
 
     def quit_tui(self, sandbox: Sandbox, session: str, pane_pid: int) -> tuple[float | None, bool]:
-        started = time.monotonic()
-        for key in QUIT_KEYS:
+        """Send the quit keys; seconds from the last key to the TUI's exit."""
+        for index, key in enumerate(QUIT_KEYS):
+            if index:
+                time.sleep(0.2)
             self.tmux(sandbox, "send-keys", "-t", session, key)
-            time.sleep(0.2)
+        started = time.monotonic()
         while time.monotonic() - started < 10:
             if not pid_alive(pane_pid):
+                # tmux reaped it: the pid is free for reuse, so it stops
+                # being a root the reap would signal unchecked.
+                sandbox.roots.discard(pane_pid)
                 return round(time.monotonic() - started, 3), True
             time.sleep(0.05)
         return None, False
@@ -1176,9 +1310,13 @@ class Bench:
                     "idleByRole": {role: summarize([sample["idleByRole"].get(role, 0) for sample in good])
                                    for role in roles},
                 }
-                entry["ok"] = bool(entry["samples"]) and all(sample["ok"] for sample in entry["samples"])
+                # Warm samples mean something only once the bootstrap finished.
+                entry["ok"] = (bool(entry["firstRun"] and entry["firstRun"]["ok"]) and bool(entry["samples"])
+                               and all(sample["ok"] for sample in entry["samples"]))
                 if not entry["ok"]:
-                    entry["error"] = "a launch never reached the ready frame (see samples[].error)"
+                    entry["error"] = ("the first-run bootstrap failed (see firstRun.error)"
+                                      if not entry["firstRun"]["ok"]
+                                      else "a launch never reached the ready frame (see samples[].error)")
         finally:
             for sandbox in sandboxes.values():
                 sandbox.teardown()
@@ -1190,12 +1328,17 @@ class Bench:
         started, server_pid, pane_pid = self.launch_tui(sandbox, name, "first")
         ready = self.wait_ready(sandbox, "first", started, self.args.bootstrap_timeout)
         bootstrap = None
+        first_settled = None
         settled = 0
         while time.monotonic() - started < self.args.bootstrap_timeout:
             roles = [classify(pid, info, pane_pid) for pid, info in sandbox.processes().items() if pid != server_pid]
-            settled = settled + 1 if "kernel" in roles and "bootstrap" not in roles else 0
-            if settled >= 2:
-                bootstrap = round(time.monotonic() - started - 1.0, 2)
+            if "kernel" in roles and "bootstrap" not in roles:
+                first_settled = first_settled or time.monotonic() - started
+                settled += 1
+            else:
+                first_settled, settled = None, 0
+            if settled >= 2:  # seen settled twice, a second apart
+                bootstrap = round(first_settled, 2)
                 break
             time.sleep(1.0)
         self.quit_tui(sandbox, "first", pane_pid)
@@ -1243,7 +1386,8 @@ class Bench:
     def measure_live_sol(self) -> dict:
         args = self.args
         providers = live_provider_copy(LIVE_MODELS_JSON, args.live_provider)
-        expected_model = args.live_model.split("/", 1)[-1]
+        # A login-pinned id (`antevon/gpt-6.1-sol`) is answered by the bare id.
+        accepted = {args.live_model, args.live_model.split("/", 1)[-1]}
         result: dict = {}
         sandboxes = {name: self.sandbox(name, "live") for name in self.names}
         try:
@@ -1277,7 +1421,7 @@ class Bench:
                 # A provider error still ends the agent cleanly: the reply
                 # must also be a real one from the requested model.
                 sample["ok"] = (raw["ok"] and sample["stopReason"] not in ("error", "aborted", None)
-                                and sample["responseModel"] == expected_model)
+                                and sample["responseModel"] in accepted)
                 if message.get("errorMessage"):
                     sample["errorMessage"] = redact(str(message["errorMessage"]))[:500]
                 if not sample["ok"]:
@@ -1345,10 +1489,14 @@ def live_provider_copy(models_json: Path, provider: str) -> dict:
         if out.returncode != 0 or not out.stdout.strip():
             raise SystemExit(f"error: the {provider} apiKey command failed (exit {out.returncode})")
         entry["apiKey"] = out.stdout.strip()
+    if isinstance(entry.get("apiKey"), str) and len(entry["apiKey"]) >= 8:
+        SECRETS.add(entry["apiKey"])
     return {provider: entry}
 
 
 def redact(text: str) -> str:
+    for secret in SECRETS:
+        text = text.replace(secret, "<redacted>")
     return re.sub(r"(sk-|Bearer\s+|eyJ)[A-Za-z0-9._\-]{8,}", r"\1<redacted>", text)
 
 
@@ -1605,21 +1753,19 @@ def main(argv: list[str] | None = None) -> int:
             measurements["interactive"] = bench.measure_interactive()
         if args.live_sol:
             measurements["liveSol"] = bench.measure_live_sol()
+        for name in bench.names:
+            if not bench.products[name]["version"]:
+                sandbox = bench.sandbox(name, "version-probe")
+                try:
+                    bench.products[name]["version"] = probe_version(bench.products[name], sandbox)
+                finally:
+                    sandbox.teardown()
     except KeyboardInterrupt:
         log("interrupted: tearing the sandboxes down")
-        teardown_all()
-        bench.mock.close()
         return 130
     finally:
         teardown_all()
-    bench.mock.close()
-    for name in bench.names:
-        if not bench.products[name]["version"]:
-            sandbox = bench.sandbox(name, "version-probe")
-            try:
-                bench.products[name]["version"] = probe_version(bench.products[name], sandbox)
-            finally:
-                sandbox.teardown()
+        bench.mock.close()
     host["loadAvgAfter"] = load_avg()
     result = {
         "schema": SCHEMA, "startedAt": started_at, "finishedAt": utc_now(),

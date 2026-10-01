@@ -33,6 +33,24 @@ TS_BINDING = """
 """
 
 
+# A stand-in product for run_headless: reads the sandbox models.json the way
+# the real ones do, calls the mock unless told not to, prints JSON events.
+FAKE_PRODUCT = """
+import json, os, sys, urllib.request
+mode = sys.argv[1]
+models = json.load(open(os.path.join(os.environ["HOME"], ".prime/agent/models.json")))
+if mode != "no-call":
+    url = models["providers"]["mock"]["baseUrl"] + "/chat/completions"
+    body = json.dumps({"model": "mock-1", "messages": [{"role": "user", "content": "hi"}]}).encode()
+    urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=10).read()
+stop = "error" if mode == "error" else "stop"
+print(json.dumps({"type": "agent_start"}), flush=True)
+print(json.dumps({"type": "message_end", "message": {"role": "assistant", "stopReason": stop}}), flush=True)
+print(json.dumps({"type": "agent_end", "messages": []}), flush=True)
+sys.exit(3 if mode == "exit" else 0)
+"""
+
+
 def sse_events(frames: list[bytes]) -> list[dict | str]:
     out: list[dict | str] = []
     for frame in frames:
@@ -216,6 +234,8 @@ class FrameAndRoleTests(unittest.TestCase):
                 "other": {"apiKey": "never-copied"}}}))
             copy = bench.live_provider_copy(models, "live")
             self.assertEqual(copy, {"live": {"apiKey": "resolved-key", "models": [{"id": "m"}]}})
+            self.assertIn("resolved-key", bench.SECRETS)
+            bench.SECRETS.discard("resolved-key")
             with self.assertRaises(SystemExit):
                 bench.live_provider_copy(models, "absent")
             models.write_text(json.dumps({"providers": {"live": {"apiKey": "!exit 3"}}}))
@@ -225,6 +245,11 @@ class FrameAndRoleTests(unittest.TestCase):
     def test_redact(self) -> None:
         self.assertEqual(bench.redact("auth Bearer abcdefghijklmnop end"), "auth Bearer <redacted> end")
         self.assertEqual(bench.redact("key sk-abcdefghijkl"), "key sk-<redacted>")
+        bench.SECRETS.add("opaque0key0without0prefix")
+        try:
+            self.assertEqual(bench.redact("got opaque0key0without0prefix back"), "got <redacted> back")
+        finally:
+            bench.SECRETS.discard("opaque0key0without0prefix")
 
 
 class SandboxTests(unittest.TestCase):
@@ -318,6 +343,116 @@ class SandboxTests(unittest.TestCase):
             outsider.kill()
             outsider.wait()
             sandbox.teardown()
+
+    def test_signal_skips_a_pid_whose_identity_changed(self) -> None:
+        sandbox = bench.Sandbox("ts", "t", self.base, "http://127.0.0.1:9/v1", None)
+        child = subprocess.Popen(["sleep", "30"], env=sandbox.env)
+        try:
+            deadline = time.monotonic() + 5
+            while child.pid not in sandbox.processes() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            info = sandbox.processes()[child.pid]
+            self.assertEqual(info["ident"], bench.identity(child.pid))
+            bench._signal(child.pid, 15, str(sandbox.home), {**info, "ident": "someone else"})
+            time.sleep(0.2)
+            self.assertIsNone(child.poll())
+            bench._signal(child.pid, 15, str(sandbox.home), info)
+            self.assertEqual(child.wait(timeout=5), -15)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            sandbox.teardown()
+
+    def test_an_orphan_without_the_sandbox_home_stays_tracked(self) -> None:
+        sandbox = bench.Sandbox("ts", "t", self.base, "http://127.0.0.1:9/v1", None)
+        # The shell (a spawned root) starts a child with a scrubbed env, then
+        # dies: the child keeps neither its parent nor the sandbox HOME.
+        shell = subprocess.Popen(["sh", "-c", "env -i PATH=\"$PATH\" sleep 30 & echo $!; wait"],
+                                 stdout=subprocess.PIPE, text=True, env={"PATH": os.environ["PATH"]})
+        orphan = int(shell.stdout.readline())
+        try:
+            sandbox.roots.add(shell.pid)
+            self.assertIn(orphan, sandbox.processes())
+            shell.kill()
+            shell.wait()
+            sandbox.roots.discard(shell.pid)
+            time.sleep(0.2)
+            procs = sandbox.processes()
+            self.assertIn(orphan, procs)
+            self.assertFalse(procs[orphan]["envMatched"])
+            sandbox.reap()
+            time.sleep(0.2)
+            self.assertFalse(bench.pid_alive(orphan))
+        finally:
+            shell.stdout.close()
+            try:
+                os.kill(orphan, 9)
+            except ProcessLookupError:
+                pass
+            sandbox.teardown()
+
+    def test_run_headless_counts_only_real_replies(self) -> None:
+        mock = bench.MockProvider()
+        sandbox = bench.Sandbox("ts", "t", self.base, mock.base_url, None)
+        script = sandbox.root / "fake.py"
+        script.write_text(FAKE_PRODUCT)
+        try:
+            def run(mode: str) -> dict:
+                return bench.strip_events(bench.run_headless(sandbox, [sys.executable, str(script), mode],
+                                                             mock, 0.02, 30, run=0))
+
+            good = run("ok")
+            self.assertTrue(good["ok"], good)
+            self.assertEqual(good["stopReason"], "stop")
+            self.assertGreater(good["maxRssKb"], 1000)
+            self.assertLessEqual(good["agentEndS"], good["exitS"])
+            self.assertGreaterEqual(good["peakSandboxRssKb"], good["maxRssKb"])
+            self.assertEqual(good["requests"][0]["messages"], 1)
+            self.assertNotIn("stderrTail", good)
+            self.assertFalse(run("error")["ok"])
+            self.assertFalse(run("no-call")["ok"])
+            failed = run("exit")
+            self.assertEqual((failed["ok"], failed["exitCode"]), (False, 3))
+            self.assertIn("stderrTail", failed)
+            self.assertEqual(sandbox.roots, set())
+        finally:
+            sandbox.teardown()
+            mock.close()
+
+    def test_constructor_failure_rolls_the_sandbox_back(self) -> None:
+        def boom(*args: object) -> None:
+            raise OSError("disk full")
+
+        saved = bench.Sandbox.write_agent_files
+        bench.Sandbox.write_agent_files = boom
+        try:
+            with self.assertRaises(OSError):
+                bench.Sandbox("ts", "t", self.base, "http://127.0.0.1:9/v1", None)
+        finally:
+            bench.Sandbox.write_agent_files = saved
+        self.assertEqual(list(self.base.iterdir()), [])
+        self.assertEqual(bench.Sandbox.created, [])
+
+    def test_teardown_deletes_the_key_copies(self) -> None:
+        sandbox = bench.Sandbox("rs", "t", self.base, "http://127.0.0.1:9/v1", None)
+        sandbox.write_agent_files(sandbox.home / ".prime" / "agent-rs", "http://127.0.0.1:9/v1",
+                                  {"live": {"apiKey": "secret"}})
+        sandbox.teardown()
+        self.assertFalse(sandbox.root.exists())
+        self.assertNotIn(sandbox, bench.Sandbox.created)
+
+    def test_sandbox_base_override_must_fit_the_socket_paths(self) -> None:
+        with self.assertRaises(SystemExit):
+            bench.sandbox_base("/tmp/has space")
+        with self.assertRaises(SystemExit):
+            bench.sandbox_base("/" + "x" * 60)
+        cwd = os.getcwd()
+        os.chdir("/")
+        try:
+            self.assertEqual(bench.sandbox_base("tmp")[0], Path("/tmp"))
+        finally:
+            os.chdir(cwd)
 
     def test_mac_sandbox_base_falls_back_when_sockets_would_overflow(self) -> None:
         saved = (bench.IS_MAC, os.environ.get("TMPDIR"))
