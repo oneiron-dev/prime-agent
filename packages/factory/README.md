@@ -102,4 +102,11 @@ and hosts formats are unchanged here. What changes:
 - A new factory gets a version 2 runtime pin (`factoryArgv` instead of `cliArgv`) and a separate agent pin. Existing
   factory state is not migrated; a TS factory keeps running on the TS build.
 
-There is no `prime-agent factory` command in the Rust binary yet.
+## Not in this package yet
+
+- A `prime-agent factory` command in the Rust binary that runs this package; invoke `prime-agent-factory` directly.
+- Adoption telemetry for factory invocations.
+- Seat environment for a warm agent daemon: under `seatHosting: "daemon"` a worker the daemon already runs keeps
+  its own environment, so a seat's `PATH` and `W7_CARGO_*` overlay reaches it only once the daemon honors a
+  client's launch environment.
+- Migration of an existing TypeScript factory's state; such a factory keeps running on the TypeScript build.
