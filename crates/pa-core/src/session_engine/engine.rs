@@ -173,6 +173,9 @@ pub struct SessionEngine {
     /// loops the graph and keeps a dropped session's kernel process alive
     /// until the process exits.
     pub(crate) provisioner: std::sync::Arc<crate::kernel::provisioner::IpythonKernelProvisioner>,
+    /// The session id the loop's provider requests carry (the provider
+    /// connection state pa-ai keeps per session is keyed by it).
+    provider_session_id: String,
 }
 
 /// Resolve the MCP gating the resource loader and prompt need: skill
@@ -676,7 +679,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         follow_up_mode: config.follow_up_mode,
         // TS `sdk.ts`: every loop request carries the session id (the
         // summarizer side calls stay without one).
-        session_id: Some(provider_session_id),
+        session_id: Some(provider_session_id.clone()),
         ..Default::default()
     });
 
@@ -828,6 +831,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         telemetry,
         rlm_usage: wiring.rlm_usage,
         provisioner,
+        provider_session_id,
     })
 }
 
@@ -904,6 +908,18 @@ impl SessionEngine {
     /// session that owns it.
     pub async fn dispose_kernel(&self) {
         self.provisioner.dispose(None).await;
+    }
+
+    /// End the session (TS `AgentSession.dispose`): the provider
+    /// connection state the session owns goes first (TS
+    /// `cleanupSessionResources(sessionId)`: its in-flight Responses
+    /// WebSocket requests, connecting or streaming, settle as disposed and
+    /// its cached sockets close), then the kernel tears down with a final
+    /// namespace snapshot. The seam every host session-end path calls
+    /// (kill, shutdown, replacement, the orphan exit).
+    pub async fn dispose(&self) {
+        pa_ai::cleanup_session_resources(Some(&self.provider_session_id));
+        self.dispose_kernel().await;
     }
 
     /// Release the session's kernel now with a final namespace snapshot,

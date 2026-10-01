@@ -802,14 +802,16 @@ impl AgentSessionEngine {
             if let Some(telemetry) = &engine.telemetry {
                 let _ = telemetry.end().await;
             }
-            engine.dispose_kernel().await;
+            engine.dispose().await;
         }
     }
 
     /// Tear the built session's kernel down (TS `closeSession` ->
     /// `AgentSessionRuntime.dispose` -> `AgentSession.disposeAsync` ->
     /// `IpythonKernelProvisioner.dispose`: one final namespace snapshot,
-    /// drained host requests, then the `python -m rlm.repl` process exits).
+    /// drained host requests, then the `python -m rlm.repl` process exits),
+    /// releasing the session's provider connection state first (TS
+    /// `cleanupSessionResources`).
     ///
     /// The engine object survives the call: the worker process outlives its
     /// session, so the engine-drop teardown (the strong owner of the
@@ -819,7 +821,7 @@ impl AgentSessionEngine {
     pub async fn dispose_kernel(&self) {
         let guard = self.session.lock().await;
         if let Some(engine) = guard.as_deref() {
-            engine.dispose_kernel().await;
+            engine.dispose().await;
         }
     }
 
