@@ -16,7 +16,8 @@ launcher). The launcher gives every Rust process its own agent dir
 (PRIME_AGENT_CODING_AGENT_DIR), socket dir (PRIME_AGENT_SOCKET_DIR, a
 fork-only knob read by pa-daemon's socket_dir()), supervisor socket
 (PRIME_AGENT_DAEMON_SOCKET) and kernel venv (PRIME_AGENT_KERNEL_VENV); the
-installer seeds the agent dir with a Rust-owned snapshot of the TS skills.
+installer seeds the agent dir with its own skills (hub categories rendered for
+it, the rest a snapshot of the TS skills).
 Self-update is shut three ways: the fork-only
 PRIME_AGENT_DISABLE_SELF_UPDATE guard refuses `update` and the TUI `/update`
 (both would otherwise fetch and run upstream's takeover installer), the
@@ -66,6 +67,12 @@ PROTECTED_STATE = (
 SHARED_LINKS = ("models.json",)
 # Build output and caches a skills snapshot leaves behind.
 SKILLS_SNAPSHOT_SKIP = ("__pycache__", "*.egg-info", ".venv", "node_modules", ".pytest_cache")
+# The hub categories' deploy lock (prime-skill-hubs scripts/render-host.py)
+# at the top of a skills dir, and a hub name it may list.
+HUB_LOCK = "LOCK.host.json"
+HUB_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Git env that would point the hubs clone at another repository.
+GIT_LOCATION_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
 LAUNCHER_NAME = "prime-agent-rs"
 TS_LAUNCHER_NAME = "prime-agent"
 RECEIPT_SCHEMA = "prime-agent-oneiron-rs.install/1"
@@ -138,7 +145,7 @@ refuse_ts_state "socket dir" "$sock_dir"
 # Own agent dir: the TS fleet's ~/.prime/agent is shared mutable state the
 # Rust daemon would sweep, migrate and rewrite (session archiving, update
 # manifests, schedules, settings, OAuth refresh). The installer seeds it with
-# a models.json link, a skills snapshot and a one-time settings copy.
+# a models.json link, its own skills and a one-time settings copy.
 agent_dir=$(checked PRIME_AGENT_RS_AGENT_DIR "${{PRIME_AGENT_RS_AGENT_DIR:-$home/.prime/agent-rs}}")
 agent_dir=$(canon "$agent_dir")
 refuse_ts_state "agent dir" "$agent_dir"
@@ -470,15 +477,16 @@ def remove_entry(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def copy_snapshot(source: Path, target: Path, skipped: list[str]) -> None:
+def copy_snapshot(source: Path, target: Path, skipped: list[str], exclude: frozenset[str] = frozenset()) -> None:
     """Copy the `source` tree to a new `target` with files and dirs only:
     every link becomes a copy of what it names, SKILLS_SNAPSHOT_SKIP names
-    are left behind, and dangling links, link cycles and special files are
-    recorded in `skipped`. (shutil.copytree checks relative link targets
-    against the cwd, so it would drop or misjudge them.)"""
+    (and top-level `exclude` names) are left behind, and dangling links,
+    link cycles and special files are recorded in `skipped`.
+    (shutil.copytree checks relative link targets against the cwd, so it
+    would drop or misjudge them.)"""
     active: set[Path] = set()
 
-    def copy_dir(src: Path, dst: Path) -> None:
+    def copy_dir(src: Path, dst: Path, exclude: frozenset[str] = frozenset()) -> None:
         real = src.resolve()
         if real in active:
             skipped.append(f"{src} (link cycle)")
@@ -486,7 +494,7 @@ def copy_snapshot(source: Path, target: Path, skipped: list[str]) -> None:
         active.add(real)
         dst.mkdir()
         for entry in sorted(os.scandir(src), key=lambda entry: entry.name):
-            if any(fnmatch.fnmatch(entry.name, pattern) for pattern in SKILLS_SNAPSHOT_SKIP):
+            if entry.name in exclude or any(fnmatch.fnmatch(entry.name, pattern) for pattern in SKILLS_SNAPSHOT_SKIP):
                 continue
             if entry.is_dir():
                 copy_dir(Path(entry.path), dst / entry.name)
@@ -496,33 +504,116 @@ def copy_snapshot(source: Path, target: Path, skipped: list[str]) -> None:
                 skipped.append(entry.path)
         active.discard(real)
 
-    copy_dir(source, target)
+    copy_dir(source, target, exclude)
 
 
-def snapshot_skills(source: Path, target: Path) -> dict:
-    """Replace `target` with a Rust-owned snapshot of the TS skills dir. The
-    kernel installs Python skills editable and imports them, so bytecode and
-    build metadata land beside the skill source: a link would put those
-    writes in the TS tree."""
+class HubRenderUnavailable(Exception):
+    """Why the hub categories cannot be rendered for the Rust agent dir; the
+    skills are then a plain snapshot of the TS dir, hub files included."""
+
+
+def render_hubs(ts_skills: Path, repo: Path, agent_dir: Path, scratch: Path) -> tuple[dict, Path]:
+    """Render the TS skills dir's hub categories for `agent_dir` the way the
+    TS deploy was made: the hubs checkout's own scripts/render-host.py, at
+    the commit and host profile the TS LOCK.host.json records, rewrites the
+    agent root inside hub files and writes a lock. The checkout is only read
+    (a shared clone in `scratch` checks the commit out), and the render must
+    match the TS lock byte for byte outside the rewritten files. Returns the
+    TS lock and the render output (hubs/<hub>/…, LOCK.host.json)."""
+    try:
+        ts_lock = json.loads((ts_skills / HUB_LOCK).read_text())
+        commit, profile, hubs = ts_lock["source_commit"], ts_lock["host_profile"], ts_lock["hubs"]
+    except FileNotFoundError:
+        raise HubRenderUnavailable(f"the TS skills dir has no {HUB_LOCK}") from None
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise HubRenderUnavailable(f"unreadable TS {HUB_LOCK}: {error!r}") from None
+    if not (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit)
+            and isinstance(profile, str) and re.fullmatch(r"[a-z0-9-]+", profile)
+            and isinstance(hubs, list) and all(isinstance(hub, str) and HUB_NAME.match(hub) for hub in hubs)):
+        raise HubRenderUnavailable(f"the TS {HUB_LOCK} names no plain commit, profile and hub names")
+    if not (repo / ".git").exists():
+        raise HubRenderUnavailable(f"no hubs checkout at {repo}")
+    env = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION_ENV}
+    clone, out = scratch / "hubs", scratch / "rendered"
+
+    def run(step: str, command: list[str]) -> None:
+        result = subprocess.run(command, capture_output=True, text=True, env=env)
+        if result.returncode != 0:
+            raise HubRenderUnavailable(f"{step} failed (exit {result.returncode}): {result.stderr.strip()[-500:]}")
+
+    git = ["git", "-c", "core.hooksPath=/dev/null"]
+    run(f"cloning {repo}", [*git, "clone", "--quiet", "--shared", "--no-checkout", str(repo), str(clone)])
+    run(f"checking out {commit}", [*git, "-C", str(clone), "checkout", "--quiet", "--detach", commit])
+    script = clone / "scripts" / "render-host.py"
+    if not script.is_file():
+        raise HubRenderUnavailable(f"{commit} has no scripts/render-host.py")
+    run("render-host.py", [sys.executable, str(script), "--prime-agent-dir", str(agent_dir),
+                           "--output", str(out), "--profile", profile])
+    try:
+        lock = json.loads((out / HUB_LOCK).read_text())
+    except (OSError, ValueError) as error:
+        raise HubRenderUnavailable(f"render-host.py wrote no readable {HUB_LOCK}: {error!r}") from None
+    expected = {"source_commit": commit, "host_profile": profile, "hubs": hubs, "prime_agent_dir": str(agent_dir)}
+    stamped = {key: lock.get(key) for key in expected}
+    if stamped != expected:
+        raise HubRenderUnavailable(f"the rendered {HUB_LOCK} says {stamped}, not {expected}")
+    rewritten = {change.get("path") for change in lock.get("changes", [])
+                 if change.get("kind") == "prime-agent-root-rewrite"}
+    ts_files = {entry["path"]: entry["sha256"] for entry in ts_lock.get("files", [])}
+    files = {entry["path"]: entry["sha256"] for entry in lock.get("files", [])}
+    differ = sorted(path for path in ts_files.keys() | files.keys()
+                    if path not in rewritten and ts_files.get(path) != files.get(path))
+    if differ:
+        raise HubRenderUnavailable(f"the render differs from the TS deploy at {commit} in {len(differ)} files, "
+                                   f"e.g. {differ[0]}")
+    if any(not (out / "hubs" / hub).is_dir() for hub in hubs) or any(path.is_symlink() for path in out.rglob("*")):
+        raise HubRenderUnavailable("the render lacks a hub dir or holds a link")
+    return ts_lock, out
+
+
+def build_skills(source: Path, target: Path, agent_dir: Path, hubs_repo: Path) -> dict:
+    """Replace `target` with the Rust agent dir's own skills, never a link:
+    the kernel installs Python skills editable and imports them, so bytecode
+    and build metadata land beside the skill source, which a link would put
+    in the TS tree. Hub categories are rendered for the Rust agent dir
+    (render_hubs) and laid out as the TS deploy is, <hub>/ and the lock at
+    the top; every other entry is a snapshot (copy_snapshot). When the hubs
+    cannot be rendered the whole TS dir is a snapshot, and the reason is
+    recorded."""
     temp = target.with_name(f".{target.name}.tmp-{os.getpid()}")
     old = target.with_name(f".{target.name}.old-{os.getpid()}")
     skipped: list[str] = []
     remove_entry(temp)
-    try:
-        copy_snapshot(source, temp, skipped)
-        if target.is_symlink() or target.exists():
-            os.rename(target, old)
-        os.rename(temp, target)
-    finally:
-        remove_entry(temp)
+    with tempfile.TemporaryDirectory(prefix="pa-rs-skills-") as scratch:
+        try:
+            ts_lock, rendered = render_hubs(source, hubs_repo, agent_dir, Path(scratch))
+            record: dict[str, object] = {"skillsSource": "hub-render", "hubsRepo": str(hubs_repo),
+                                         "hubsCommit": ts_lock["source_commit"],
+                                         "hostProfile": ts_lock["host_profile"], "hubs": ts_lock["hubs"]}
+        except HubRenderUnavailable as reason:
+            ts_lock, rendered = {"hubs": []}, None
+            record = {"skillsSource": "snapshot-fallback", "reason": str(reason)}
+        try:
+            exclude = frozenset([*ts_lock["hubs"], HUB_LOCK]) if rendered else frozenset()
+            copy_snapshot(source, temp, skipped, exclude)
+            if rendered:
+                for hub in ts_lock["hubs"]:
+                    shutil.copytree(rendered / "hubs" / hub, temp / hub, symlinks=True)
+                shutil.copy2(rendered / HUB_LOCK, temp / HUB_LOCK)
+                record["lockSha256"] = sha256_file(temp / HUB_LOCK)
+            if target.is_symlink() or target.exists():
+                os.rename(target, old)
+            os.rename(temp, target)
+        finally:
+            remove_entry(temp)
     remove_entry(old)
-    return {"snapshotOf": str(source), "skipped": skipped}
+    return {**record, "snapshotOf": str(source), "skipped": skipped}
 
 
-def seed_agent_dir(agent_dir: Path, ts_agent_dir: Path, *, refresh_skills: bool) -> dict:
-    """Create the Rust agent dir: a link to models.json (no Rust writer), a
-    snapshot of the skills, a one-time copy of settings.json, nothing else
-    (no auth, no sessions). An existing snapshot is kept unless
+def seed_agent_dir(agent_dir: Path, ts_agent_dir: Path, hubs_repo: Path, *, refresh_skills: bool) -> dict:
+    """Create the Rust agent dir: a link to models.json (no Rust writer), its
+    own skills (build_skills), a one-time copy of settings.json, nothing
+    else (no auth, no sessions). Existing skills are kept unless
     `refresh_skills`; an old-layout skills link is always replaced."""
     agent_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     actions: dict[str, object] = {}
@@ -541,7 +632,7 @@ def seed_agent_dir(agent_dir: Path, ts_agent_dir: Path, *, refresh_skills: bool)
         actions["skills"] = "kept (install --refresh-skills replaces it)"
     elif source.is_dir():
         replaced = f"link -> {old_link}" if old_link is not None else "snapshot" if target.exists() else None
-        actions["skills"] = {**snapshot_skills(source, target), "replaced": replaced}
+        actions["skills"] = {**build_skills(source, target, agent_dir, hubs_repo), "replaced": replaced}
     else:
         if old_link is not None:
             target.unlink()
@@ -633,7 +724,8 @@ def install(args: argparse.Namespace) -> int:
     launcher = bin_dir / LAUNCHER_NAME
     agent = None
     if args.activate:
-        agent = seed_agent_dir(agent_dir, TS_AGENT_DIR, refresh_skills=args.refresh_skills)
+        hubs_repo = Path(os.path.expanduser(args.skill_hubs)) if args.skill_hubs else HOME / "code" / "prime-skill-hubs"
+        agent = seed_agent_dir(agent_dir, TS_AGENT_DIR, hubs_repo, refresh_skills=args.refresh_skills)
         current_before = flip_current(prefix, version)
         launcher = write_launcher(bin_dir, prefix)
 
@@ -884,7 +976,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     install_cmd.add_argument("--no-activate", dest="activate", action="store_false",
                              help="copy the release without flipping current or writing the launcher")
     install_cmd.add_argument("--refresh-skills", action="store_true",
-                             help="replace the agent dir's skills snapshot with a fresh one of the TS skills")
+                             help="replace the agent dir's skills with a fresh build from the TS skills")
+    install_cmd.add_argument("--skill-hubs", help="prime-skill-hubs checkout that renders the hub categories "
+                             "(default ~/code/prime-skill-hubs; read only)")
 
     probe_cmd = commands.add_parser("probe", help="probe the installed launcher")
     probe_cmd.add_argument("--provider", default="cpa-r")

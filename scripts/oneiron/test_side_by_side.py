@@ -63,6 +63,43 @@ exit 3
 """
 
 
+NO_LOCK = "the TS skills dir has no LOCK.host.json"
+
+# A stand-in for prime-skill-hubs' scripts/render-host.py with the same
+# contract: hubs/ copied to <output>/hubs, the Mac agent root rewritten to
+# --prime-agent-dir, an arch-linux adapter line appended, LOCK.host.json
+# stamped with the checkout's HEAD.
+FAKE_RENDER = """#!/usr/bin/env python3
+import argparse, hashlib, json, shutil, subprocess
+from pathlib import Path
+REPO = Path(__file__).resolve().parents[1]
+OLD = b"/Users/olety/.prime/agent"
+parser = argparse.ArgumentParser()
+parser.add_argument("--prime-agent-dir", required=True)
+parser.add_argument("--output", required=True)
+parser.add_argument("--profile", default="generic")
+args = parser.parse_args()
+out, new = Path(args.output).resolve(), str(Path(args.prime_agent_dir).resolve()).encode()
+shutil.copytree(REPO / "hubs", out / "hubs")
+changes = []
+for path in sorted((out / "hubs").rglob("*")):
+    if path.is_file() and OLD in path.read_bytes():
+        changes.append({"path": str(path.relative_to(out)), "kind": "prime-agent-root-rewrite"})
+        path.write_bytes(path.read_bytes().replace(OLD, new))
+if args.profile == "arch-linux":
+    adapter = out / "hubs" / "beta" / "SKILL.md"
+    adapter.write_text(adapter.read_text() + "\\n## Arch Linux host gate\\n")
+    changes.append({"path": str(adapter), "kind": "profile-adapter-append"})
+files = [{"path": str(path.relative_to(out)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+         for path in sorted((out / "hubs").rglob("*")) if path.is_file()]
+head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+lock = {"schema_version": "1.0.0", "host_profile": args.profile, "prime_agent_dir": new.decode(),
+        "hubs": sorted(path.name for path in (out / "hubs").iterdir()), "source_commit": head,
+        "changes": changes, "files": files}
+(out / "LOCK.host.json").write_text(json.dumps(lock, sort_keys=True, indent=2) + "\\n")
+"""
+
+
 def make_stage(parent: Path, version: str = VERSION) -> Path:
     stage = parent / f"prime-agent-{version}-{PLATFORM}"
     (stage / "prime-agent-runtime" / "src" / "rlm").mkdir(parents=True)
@@ -190,7 +227,8 @@ class InstallerTests(Fixture):
              "versionCheck": {"stdout": VERSION, "exitCode": 0, "ok": True},
              "agentDir": {"path": str(self.agent_dir), "seeded": {
                  "models.json": f"linked -> {self.ts_agent / 'models.json'}",
-                 "skills": {"snapshotOf": str(self.ts_agent / "skills"), "skipped": [], "replaced": None},
+                 "skills": {"skillsSource": "snapshot-fallback", "reason": NO_LOCK,
+                            "snapshotOf": str(self.ts_agent / "skills"), "skipped": [], "replaced": None},
                  "settings.json": f"copied once from {self.ts_agent / 'settings.json'}"}}})
         self.assertEqual(receipt["tsLauncher"]["before"], {"kind": "symlink", "target": str(self.ts_target)})
         self.assertEqual(receipt["tsLauncher"]["before"], receipt["tsLauncher"]["after"])
@@ -276,7 +314,8 @@ class InstallerTests(Fixture):
                                               "grok/src/grok/__init__.py": "X = 1\n", "linked.md": "# shared\n"})
         self.assertEqual(side_by_side.tree_links(snapshot), [])
         self.assertEqual(self.receipt()["agentDir"]["seeded"]["skills"],
-                         {"snapshotOf": str(skills), "replaced": None,
+                         {"skillsSource": "snapshot-fallback", "reason": NO_LOCK,
+                          "snapshotOf": str(skills), "replaced": None,
                           "skipped": [str(skills / "dangling.md"), f"{skills / 'loop'} (link cycle)"]})
         # The kernel's editable install and imports write beside the skill
         # source: in the snapshot, never in the TS tree.
@@ -484,6 +523,97 @@ class InstallerTests(Fixture):
             json.dumps({"type": "agent_end", "messages": [{"role": "assistant", "responseModel": "gpt-6.1-sol"}]}),
         ])
         self.assertEqual(side_by_side.response_models(stream), ["gpt-6.1-sol", "gpt-6.1-sol"])
+
+
+class SkillHubTests(Fixture):
+    """Hub categories rendered for the Rust agent dir from a fake hubs checkout
+    whose TS deploy (alpha, beta and the lock at the top of skills/) was made
+    at an older commit than its HEAD."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ.update({"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"})
+        self.ts_skills = self.ts_agent / "skills"
+        self.repo = self.root / "hubs-repo"
+        write_executable(self.repo / "scripts" / "render-host.py", FAKE_RENDER)
+        alpha = self.repo / "hubs" / "alpha"
+        alpha.mkdir(parents=True)
+        (alpha / "SKILL.md").write_text("# alpha v1\nsee /Users/olety/.prime/agent/skills/alpha/ROUTES.md\n")
+        (alpha / "ROUTES.md").write_text("routes\n")
+        (self.repo / "hubs" / "beta").mkdir()
+        (self.repo / "hubs" / "beta" / "SKILL.md").write_text("# beta\n")
+        self.git("init", "--quiet")
+        self.commit = self.commit_all("hubs v1")
+        rendered = self.root / "ts-render"
+        subprocess.run([sys.executable, str(self.repo / "scripts" / "render-host.py"), "--prime-agent-dir",
+                        str(self.ts_agent), "--output", str(rendered), "--profile", "arch-linux"], check=True)
+        for hub in ("alpha", "beta"):
+            (rendered / "hubs" / hub).rename(self.ts_skills / hub)
+        (rendered / "LOCK.host.json").rename(self.ts_skills / "LOCK.host.json")
+        (alpha / "SKILL.md").write_text("# alpha v2\n")
+        self.commit_all("hubs v2")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=test", "-c",
+                               "user.email=test@example.invalid", "-c", "commit.gpgsign=false", *args],
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit_all(self, message: str) -> str:
+        self.git("add", "-A")
+        self.git("commit", "--quiet", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def test_hubs_are_rendered_for_the_rust_agent_dir_at_the_ts_lock_commit(self) -> None:
+        repo_before = side_by_side.tree_identity(self.repo)
+        ts_before = side_by_side.tree_identity(self.ts_agent)
+        self.install("--skill-hubs", str(self.repo))
+        skills = self.agent_dir / "skills"
+        files = files_of(skills)
+        lock = json.loads(files.pop("LOCK.host.json"))
+        self.assertEqual(files, {"alpha/SKILL.md": f"# alpha v1\nsee {self.agent_dir}/skills/alpha/ROUTES.md\n",
+                                 "alpha/ROUTES.md": "routes\n", "beta/SKILL.md": "# beta\n\n## Arch Linux host gate\n",
+                                 "grok/SKILL.md": "# grok\n"})
+        self.assertEqual({key: lock[key] for key in ("prime_agent_dir", "source_commit", "host_profile", "hubs")},
+                         {"prime_agent_dir": str(self.agent_dir), "source_commit": self.commit,
+                          "host_profile": "arch-linux", "hubs": ["alpha", "beta"]})
+        self.assertEqual(self.receipt()["agentDir"]["seeded"]["skills"], {
+            "skillsSource": "hub-render", "hubsRepo": str(self.repo), "hubsCommit": self.commit,
+            "hostProfile": "arch-linux", "hubs": ["alpha", "beta"],
+            "lockSha256": side_by_side.sha256_file(skills / "LOCK.host.json"),
+            "snapshotOf": str(self.ts_skills), "skipped": [], "replaced": None})
+        # The checkout (its HEAD, branch and refs included) and the TS tree are only read.
+        self.assertEqual(side_by_side.tree_identity(self.repo), repo_before)
+        self.assertEqual(side_by_side.tree_identity(self.ts_agent), ts_before)
+
+    def test_skills_fall_back_to_a_snapshot_when_the_hubs_cannot_be_rendered(self) -> None:
+        lock_path = self.ts_skills / "LOCK.host.json"
+        lock_text = lock_path.read_text()
+        lock = json.loads(lock_text)
+        missing = "0" * 40
+        tampered = {**lock, "files": [{**entry, "sha256": "0" * 64} if entry["path"] == "hubs/alpha/ROUTES.md"
+                                      else entry for entry in lock["files"]]}
+        absent = self.root / "absent"
+        cases = (
+            ("no checkout", lambda: None, absent, f"^no hubs checkout at {re.escape(str(absent))}$"),
+            ("missing commit", lambda: lock_path.write_text(json.dumps({**lock, "source_commit": missing})),
+             self.repo, f"^checking out {missing} failed"),
+            ("no lock", lock_path.unlink, self.repo, f"^{NO_LOCK}$"),
+            ("render differs", lambda: lock_path.write_text(json.dumps(tampered)), self.repo,
+             f"^the render differs from the TS deploy at {self.commit} in 1 files, e.g. hubs/alpha/ROUTES.md$"),
+        )
+        for index, (name, prepare, repo, reason) in enumerate(cases, start=1):
+            with self.subTest(name):
+                lock_path.write_text(lock_text)
+                prepare()
+                agent_dir = self.root / f"agent-{index}"
+                version = f"0.9.8-oneiron.20261001.{index}"
+                with self.env(PRIME_AGENT_RS_AGENT_DIR=str(agent_dir)):
+                    self.install("--skill-hubs", str(repo), version=version)
+                seeded = self.receipt(version)["agentDir"]["seeded"]["skills"]
+                self.assertRegex(seeded.pop("reason"), reason)
+                self.assertEqual(seeded, {"skillsSource": "snapshot-fallback", "snapshotOf": str(self.ts_skills),
+                                          "skipped": [], "replaced": None})
+                self.assertEqual(files_of(agent_dir / "skills"), files_of(self.ts_skills))
 
 
 class LauncherTests(Fixture):

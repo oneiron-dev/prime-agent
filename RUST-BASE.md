@@ -47,12 +47,19 @@ when the diff is identical, otherwise drop it by hand.
   2026-10-01). It would move sessions into `sessions-archive`, delete TS update manifests at
   every boot, recover and back off TS schedules, rewrite `settings.json` wholesale, race OAuth
   refresh, and write differently-limited kernel snapshots. The installer seeds the Rust agent dir
-  with a link to `models.json` (no Rust writer; it loads unchanged), a Rust-owned snapshot of
-  `skills/` and a one-time copy of `settings.json`. The snapshot holds files only (a link becomes a
-  copy of what it names; `__pycache__`, `*.egg-info`, `.venv`, `node_modules` stay behind): the
+  with a link to `models.json` (no Rust writer; it loads unchanged), its own `skills/` and a
+  one-time copy of `settings.json`. The hub categories the TS `skills/LOCK.host.json` lists are
+  rendered for the Rust agent dir, as the TS deploy was: prime-skill-hubs' `scripts/render-host.py`
+  (from `--skill-hubs`, default `~/code/prime-skill-hubs`, read through a shared clone) at the
+  lock's `source_commit` and `host_profile`, laid out as `<hub>/` plus the lock at the top, and
+  checked byte for byte against the TS lock outside the rewritten agent-root paths. Every other
+  entry is a snapshot. Without the checkout or the commit (the Mac), or on any mismatch, the whole
+  TS dir is a snapshot and the receipt says `skillsSource: snapshot-fallback` with the reason; a
+  render records `hubsCommit` and `lockSha256`. Either way the result is files only (a link becomes
+  a copy of what it names; `__pycache__`, `*.egg-info`, `.venv`, `node_modules` stay behind): the
   kernel installs Python skills editable and imports them, writing beside the source, so a link
-  would write into the TS tree. An existing snapshot is kept, `install --refresh-skills` replaces
-  it, and an old-layout `skills` link is replaced on the next install. It never copies `auth.json`
+  would write into the TS tree. Existing skills are kept, `install --refresh-skills` rebuilds them,
+  and an old-layout `skills` link is replaced on the next install. It never copies `auth.json`
   (cpa providers carry their keys in `models.json`; a copied OAuth refresh token would still race
   TS).
   Consequence: during the trial, Rust and TS sessions are separate stores. Sharing them needs the
