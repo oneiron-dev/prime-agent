@@ -8,6 +8,9 @@
   probe     run the installed launcher: --version, a sol-shaped one-shot on
             cpa-r (the reply's responseModel must match), optionally a tools run
             that bootstraps the separate kernel venv; writes PROBE-RECEIPT.json
+  package   stamp a package_release.py layout into a feed release
+            (release_feed.py): feed/releases/v<version>/ with the tarball,
+            SHA256SUMS and manifest.json, plus feed-level latest.json/stable
 
 The TS product is never touched: the `prime-agent` launcher, its install tree
 (~/.local/share/prime-agent-oneiron/), its daemon socket dir and its kernel
@@ -705,13 +708,42 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
     add_probe_args(commands.add_parser("probe", help="probe the installed launcher"))
 
+    package_cmd = commands.add_parser("package", help="stamp a package_release.py layout into a feed release")
+    package_cmd.add_argument("--package-dir", type=Path, required=True,
+                             help="scripts/package_release.py --out-dir (binaries.json + the staged layout)")
+    package_cmd.add_argument("--version", required=True, help="<base>-oneiron.YYYYMMDD.N, e.g. 0.9.8-oneiron.20261001.1")
+    decoder = package_cmd.add_mutually_exclusive_group()
+    decoder.add_argument("--decoder", type=Path,
+                         help="Linux: the split-debug prime-agent-<base>-linux-x64.debug.gz package_release.py made")
+    decoder.add_argument("--no-decoder", action="store_true",
+                         help="Linux: publish without the split-debug decoder (recorded in the manifest)")
+    package_cmd.add_argument("--feed-dir", type=Path, help="default: <prefix>/feed")
+    package_cmd.add_argument("--source-root", type=Path, default=ROOT,
+                             help="the checkout the binary was built from (provenance; default: this repo)")
+    package_cmd.add_argument("--allow-dirty", action="store_true",
+                             help="package from a checkout with uncommitted changes (recorded as dirty)")
+    package_cmd.add_argument("--allow-fixture-catalog", action="store_true",
+                             help="accept the synthetic bundle_catalog.py --fixture catalogs (tests only)")
+    package_cmd.add_argument("--no-promote", dest="promote", action="store_false",
+                             help="publish the release without moving feed latest.json/stable")
+
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    return install(args) if args.command == "install" else probe(args)
+    if args.command == "install":
+        return install(args)
+    if args.command == "probe":
+        return probe(args)
+    # The release module imports this one for its primitives, so it loads
+    # here, at dispatch time, not at module import.
+    import release_feed
+    return release_feed.package(args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Run through the importable module, so the release module (which
+    # `import side_by_side`) shares this one's state instead of a second copy.
+    import side_by_side
+    sys.exit(side_by_side.main())
