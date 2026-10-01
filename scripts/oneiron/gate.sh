@@ -226,7 +226,10 @@ run_sandboxed_test() {
 
 run_policy() {
   python3 scripts/oneiron/test_policy_gate.py
+  # The side-by-side install, the release feed, and rollout/rollback/status.
   python3 scripts/oneiron/test_side_by_side.py
+  python3 scripts/oneiron/test_release_feed.py
+  python3 scripts/oneiron/test_rollout.py
 }
 
 case "$step" in

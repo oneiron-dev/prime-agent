@@ -49,7 +49,8 @@ if [ "$1" = "env" ]; then
     "RLM_GLOBAL_HARNESS_STATE_DIR=${RLM_GLOBAL_HARNESS_STATE_DIR-unset}" \\
     "PA_COMPACTION_TRACE=${PA_COMPACTION_TRACE-unset}" "PA_MCP_LOGIN_URL_FILE=${PA_MCP_LOGIN_URL_FILE-unset}" \\
     "PA_DAEMON_EVENT_LOG=${PA_DAEMON_EVENT_LOG-unset}" "ROSTER=${PRIME_AGENT_UPDATE_ROSTER-unset}" \\
-    "INTERNAL=$(env | sed -n 's/^\\(PRIME_AGENT_INTERNAL_[A-Za-z0-9_]*\\)=.*/\\1/p' | tr '\\n' ' ')"
+    "INTERNAL=$(env | sed -n 's/^\\(PRIME_AGENT_INTERNAL_[A-Za-z0-9_]*\\)=.*/\\1/p' | tr '\\n' ' ')" \\
+    "PYCACHE=$PYTHONPYCACHEPREFIX"
   exit 0
 fi
 if [ "$1" = "-p" ]; then
@@ -180,6 +181,8 @@ class Fixture(unittest.TestCase):
             "PA_DAEMON_EVENT_LOG": str(self.ts_agent / "events.jsonl"),
             "PRIME_AGENT_UPDATE_ROSTER": str(self.ts_agent / "update-restarts" / "roster.json"),
             "PRIME_AGENT_INTERNAL_DAEMON_WORKER": "1", "PRIME_AGENT_INTERNAL_SESSION_HANDOFF": "/ts/handoff",
+            # A TS-chosen bytecode cache must not survive into the Rust process either.
+            "PYTHONPYCACHEPREFIX": "/ts/pycache",
         })
 
     def tearDown(self) -> None:
@@ -265,7 +268,8 @@ class InstallerTests(Fixture):
         newer = "0.9.8-oneiron.20261001.2"
         self.install(version=newer)
         self.assertEqual(self.receipt(newer)["current"], {"before": VERSION, "after": newer})
-        self.assertEqual(os.readlink(self.prefix / "current"), newer)
+        self.assertEqual((os.readlink(self.prefix / "current"), os.readlink(self.prefix / "previous")),
+                         (newer, VERSION))
 
     def test_no_activate_copies_without_launcher_or_current(self) -> None:
         self.install("--no-activate")
@@ -285,12 +289,43 @@ class InstallerTests(Fixture):
             sorted(str(p.relative_to(self.prefix / VERSION)) for p in (self.prefix / VERSION).rglob("*")),
             sorted(str(p.relative_to(stage)) for p in stage.rglob("*")))
 
+    def test_tarball_members_are_checked_before_anything_is_extracted(self) -> None:
+        stage = make_stage(self.root)
+        outside = self.root / "outside.txt"
+
+        def link(info: tarfile.TarInfo) -> None:
+            info.type, info.linkname = tarfile.SYMTYPE, str(outside)
+
+        def hardlink(info: tarfile.TarInfo) -> None:
+            info.type, info.linkname = tarfile.LNKTYPE, "package.json"
+
+        def fifo(info: tarfile.TarInfo) -> None:
+            info.type = tarfile.FIFOTYPE
+
+        for label, name, shape in (("symlink", "evil", link), ("hardlink", "evil", hardlink),
+                                   ("fifo", "evil", fifo), ("parent", "../evil", None),
+                                   ("absolute", str(outside), None), ("duplicate", "package.json", None)):
+            with self.subTest(label):
+                tarball = self.root / f"{stage.name}.tar.gz"
+                with tarfile.open(tarball, "w:gz") as archive:
+                    for path in sorted(stage.rglob("*")):
+                        archive.add(path, arcname=str(path.relative_to(stage)), recursive=False)
+                    info = tarfile.TarInfo(name)
+                    if shape is not None:
+                        shape(info)
+                    archive.addfile(info, io.BytesIO(b"") if info.isfile() else None)
+                with self.assertRaisesRegex(SystemExit, "unsafe tarball member"):
+                    self.run_main("install", "--tarball", str(tarball))
+                self.assertFalse(outside.exists())
+                self.assertFalse(self.prefix.exists())
+
     def test_install_seeds_an_isolated_agent_dir_once(self) -> None:
         self.install()
         self.assertEqual(os.readlink(self.agent_dir / "models.json"), str(self.ts_agent / "models.json"))
         self.assertEqual(files_of(self.agent_dir / "skills"), {"grok/SKILL.md": "# grok\n"})
         self.assertEqual(json.loads((self.agent_dir / "settings.json").read_text()), {"theme": "dark"})
-        self.assertEqual(sorted(os.listdir(self.agent_dir)), ["models.json", "settings.json", "skills"])
+        # python-cache: the bytecode cache the install's launcher run created.
+        self.assertEqual(sorted(os.listdir(self.agent_dir)), ["models.json", "python-cache", "settings.json", "skills"])
         # A later install keeps the Rust side's own settings edits.
         (self.agent_dir / "settings.json").write_text('{"theme": "light"}')
         self.install(version="0.9.8-oneiron.20261001.2")
@@ -353,7 +388,7 @@ class InstallerTests(Fixture):
         self.install("--refresh-skills", version=third)
         self.assertEqual(files_of(self.agent_dir / "skills"), {"grok/SKILL.md": "# grok\n", "new/SKILL.md": "# new\n"})
         self.assertEqual(self.receipt(third)["agentDir"]["seeded"]["skills"]["replaced"], "snapshot")
-        self.assertEqual(sorted(os.listdir(self.agent_dir)), ["models.json", "settings.json", "skills"])
+        self.assertEqual(sorted(os.listdir(self.agent_dir)), ["models.json", "python-cache", "settings.json", "skills"])
 
     def test_every_destination_role_refuses_every_protected_root(self) -> None:
         roots = side_by_side.protected_roots()
@@ -478,7 +513,8 @@ class InstallerTests(Fixture):
         self.prefix.mkdir(parents=True)
         (self.prefix / "receipts").symlink_to(self.ts_agent)
         ts_before = side_by_side.tree_identity(self.ts_agent)
-        with self.assertRaisesRegex(SystemExit, "only `current` may be a link in it, found: .*/receipts$"):
+        with self.assertRaisesRegex(SystemExit, "only `current` and `previous` may be links in it, "
+                                                "found: .*/receipts$"):
             self.run_main("install", "--stage-dir", str(make_stage(self.root)))
         self.assertEqual(os.listdir(self.prefix), ["receipts"])
         self.assertEqual(side_by_side.tree_identity(self.ts_agent), ts_before)
@@ -715,8 +751,10 @@ class LauncherTests(Fixture):
             "PA_DAEMON_EVENT_LOG": "unset",
             "ROSTER": "unset",
             "INTERNAL": "",
+            "PYCACHE": str(self.agent_dir / "python-cache"),
         })
         self.assertEqual(stat.S_IMODE(self.sock_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.agent_dir / "python-cache").stat().st_mode), 0o700)
 
     def test_launcher_follows_a_safe_alias_and_exports_its_canonical_target(self) -> None:
         # Aliases resolve before the checks (macOS TMPDIR itself sits behind
@@ -812,6 +850,28 @@ class LauncherTests(Fixture):
                             f"in it, found: {re.escape(str(named))}")
         named.unlink()
         self.assertEqual(self.launcher_env()["KERNEL_VENV"], str(venv))
+
+    def test_launcher_refuses_a_python_cache_that_leads_out_of_the_agent_dir(self) -> None:
+        # Bytecode is written wherever the cache resolves: a link out of the
+        # Rust agent dir (into TS state, here) is refused before any run.
+        cache = self.agent_dir / "python-cache"
+        cache.rmdir()  # the install's own launcher run created it, empty
+        cache.symlink_to(self.ts_agent, target_is_directory=True)
+        before = side_by_side.tree_identity(self.ts_agent)
+        self.assert_refused(f"refusing Python cache {re.escape(str(self.ts_agent))}: it resolves outside the "
+                            f"agent dir {re.escape(str(self.agent_dir))}")
+        self.assertEqual(side_by_side.tree_identity(self.ts_agent), before)
+
+    def test_launcher_refuses_a_link_below_the_python_cache(self) -> None:
+        # Python follows a dir link below the cache root too (bytecode for
+        # /tmp/x.py lands at <cache>/tmp/x.pyc): a planted <cache>/tmp -> TS
+        # state is an agent-dir link like any other.
+        link = self.agent_dir / "python-cache" / "tmp"
+        link.symlink_to(self.ts_agent, target_is_directory=True)
+        before = side_by_side.tree_identity(self.ts_agent)
+        self.assert_refused(f"refusing agent dir {re.escape(str(self.agent_dir))}: only models.json may be a link "
+                            f"in it, found: {re.escape(str(link))}$")
+        self.assertEqual(side_by_side.tree_identity(self.ts_agent), before)
 
     @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 dir")
     def test_launcher_refuses_an_agent_dir_it_cannot_scan(self) -> None:
@@ -922,7 +982,8 @@ class ProbeTests(Fixture):
         shutil.rmtree(self.prefix / "receipts")
         (self.prefix / "receipts").symlink_to(self.ts_agent)
         ts_before = side_by_side.tree_identity(self.ts_agent)
-        with self.assertRaisesRegex(SystemExit, "only `current` may be a link in it, found: .*/receipts$"):
+        with self.assertRaisesRegex(SystemExit, "only `current` and `previous` may be links in it, "
+                                                "found: .*/receipts$"):
             self.probe()
         self.assertEqual(side_by_side.tree_identity(self.ts_agent), ts_before)
 

@@ -42,13 +42,16 @@ when the diff is identical, otherwise drop it by hand.
 | Headless selection skips `provider_retry_outcome` | `crates/pa-core/src/session_engine/headless.rs` | Upstream's one-row retry disclosure (a sanctioned TS divergence) is persisted after the episode's last assistant and hid it from text-mode selection; TS, which keeps only the per-attempt rows, prints the recovered answer. |
 | Effective `--no-skills`/`--no-prompt-templates`/`--no-context-files` | `crates/pa-core/src/resources/mod.rs` (`ResourceLoadingPolicy`) | Upstream parses the flags but always discovered every resource; the `sol` wrapper and factory rely on `--no-skills` for prompt size. |
 | Side-by-side install + probe | `scripts/oneiron/side_by_side.py` | Installs a staged release beside the TS build and writes receipts. |
+| Release feed, rollout, rollback, status | `scripts/oneiron/release_feed.py`, `rollout.py`, `daemon_idle.py` (subcommands of `side_by_side.py`), `docs/oneiron/RELEASE.md`, `docs/oneiron/ROLLBACK.md` | Stamps a `package_release.py` build into a versioned feed release (`feed/releases/v<ver>/`), rolls it out with verified sums, a probe before selection and an idle-only Rust daemon check, and rolls back to the previous install; every step writes a receipt. `crates/pa-core/tests/oneiron_feed_manifest.rs` checks the feed manifest against the native updater's parser. |
 | Test-policy gate | `scripts/check-test-policy.mjs` (from the TS fork), `scripts/oneiron/test_policy_gate.py` | Runs the fork's test policy with `TEST_POLICY_BASE=oneiron/main` and fails only on violations beyond the 4 upstream ones present at the pin (`scripts/oneiron/test-policy-baseline.txt`). |
 | Factory package | `packages/factory` (Node, not in the Cargo workspace) | The TS fork's work factory as its own package, `prime-agent-factory`; its seats run the `prime-agent` binary as a subprocess. Gate: `npm ci && npm run check` in that directory. |
 
 ## Side-by-side contract (until cutover)
 
 - Install tree `~/.local/share/prime-agent-oneiron-rs/<version>/` (immutable per version) with
-  `current -> <version>`; launcher `~/.local/bin/prime-agent-rs`.
+  `current -> <version>` and `previous -> <the version current left>`; launcher
+  `~/.local/bin/prime-agent-rs`. Releases come from `side_by_side.py package` / `rollout`
+  (`docs/oneiron/RELEASE.md`); `rollback` and the TS fallback are in `docs/oneiron/ROLLBACK.md`.
 - Own agent dir `~/.prime/agent-rs` (`PRIME_AGENT_CODING_AGENT_DIR`). The TS fleet's
   `~/.prime/agent` is shared mutable state, and a Rust daemon would act on it (audit,
   2026-10-01). It would move sessions into `sessions-archive`, delete TS update manifests at
@@ -73,24 +76,31 @@ when the diff is identical, otherwise drop it by hand.
   fork-only shared-store guard (`PRIME_AGENT_SHARED_STORE`), a follow-up lane.
 - The launcher exports `PRIME_AGENT_CODING_AGENT_DIR=~/.prime/agent-rs`,
   `PRIME_AGENT_SOCKET_DIR=${TMPDIR:-/tmp}/pa-rs-<uid>` (0700, owner-checked),
-  `PRIME_AGENT_DAEMON_SOCKET=<that dir>/daemon.sock` and
-  `PRIME_AGENT_KERNEL_VENV=~/.prime/agent-rs/kernel-venv`. It always overwrites the generic names
+  `PRIME_AGENT_DAEMON_SOCKET=<that dir>/daemon.sock`,
+  `PRIME_AGENT_KERNEL_VENV=~/.prime/agent-rs/kernel-venv` and
+  `PYTHONPYCACHEPREFIX=~/.prime/agent-rs/python-cache` (0700; the kernel imports bundled Python
+  skills in place from the release dir, and their bytecode must stay out of the immutable install;
+  a cache that resolves outside the agent dir is refused). It always overwrites the generic names
   and clears inherited session dirs and harness/debug sinks (`RLM_SESSION_DIR`,
   `RLM_HARNESS_STATE_DIR`, `RLM_GLOBAL_HARNESS_STATE_DIR`, `PA_COMPACTION_TRACE`,
   `PA_MCP_LOGIN_URL_FILE`, `PA_DAEMON_EVENT_LOG`), an inherited restart roster
   (`PRIME_AGENT_UPDATE_ROSTER`) and every `PRIME_AGENT_INTERNAL_*` switch. Override only with
   `PRIME_AGENT_RS_AGENT_DIR` / `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`. The
   short `pa-rs-<uid>` name keeps macOS worker socket paths under the 104-byte `sun_path` limit.
-- One protected set for every path the installer or launcher writes (prefix, receipts, bin dir,
-  agent dir, socket dir, kernel venv): `PROTECTED_STATE` in `side_by_side.py`, which also renders
-  the launcher's list. It is the TS socket dirs `<tmp>/prime-agent-<uid>` and
-  `<tmp>/prime-agent-user` (under `$TMPDIR` and `/tmp`), the TS agent dir `~/.prime/agent` and its
-  XDG location `${XDG_DATA_HOME:-~/.local/share}/prime/agent`, and the TS install tree. No path may
-  equal, sit in or contain one. Paths must be absolute with no empty, `.` or `..` component, are
-  judged by their canonical target (a link to a missing dir is refused), and are all checked before
-  anything is written. The agent dir may hold no link but `models.json` (to a regular file), a
-  linked dir in the kernel venv must stay inside it (uv's `lib64 -> lib`), and the prefix may hold
-  no link but `current`. A tree that cannot be scanned is refused.
+- One protected set for every path the installer, the release scripts or the launcher write
+  (prefix, receipts, feed, bin dir, agent dir, socket dir, kernel venv) and for the Rust socket the
+  rollout idle check connects to: `PROTECTED_STATE` in `side_by_side.py`, which also renders the
+  launcher's list. It is the TS socket dirs `<tmp>/prime-agent-<uid>` and `<tmp>/prime-agent-user`
+  (under `$TMPDIR` and `/tmp`), the TS agent dir `~/.prime/agent` and its XDG location
+  `${XDG_DATA_HOME:-~/.local/share}/prime/agent`, and the TS install tree. No path may equal, sit
+  in or contain one. Paths must be absolute with no empty, `.` or `..` component, are judged by
+  their canonical target (a link to a missing dir is refused), and are all checked before anything
+  is written. The agent dir may hold no link but `models.json` (to a regular file), a linked dir in
+  the kernel venv must stay inside it (uv's `lib64 -> lib`), and the prefix may hold no link but
+  `current` and `previous`; a receipts or feed release dir must be a real directory. A tree that
+  cannot be scanned is refused. Every file the scripts write (launcher, receipts, feed artifacts and
+  pointers) goes through one exclusive temp beside it (`mkstemp`, never an existing name a link
+  could sit at) and is renamed into place.
 - Self-update is shut. Upstream's `prime-agent update` and the TUI `/update` fetch and run the
   takeover installer, so the launcher sets `PRIME_AGENT_DISABLE_SELF_UPDATE=1`. That fork-only guard
   refuses both, plus the staged native updater. It also points `PRIME_AGENT_RUST_INSTALLER_URL` and
@@ -108,7 +118,9 @@ when the diff is identical, otherwise drop it by hand.
 - Known leak: child processes of a Rust session (bash tool, kernel) inherit the launcher's env.
   TS reads `PRIME_AGENT_KERNEL_VENV` and `PRIME_AGENT_CODING_AGENT_DIR`, so a TS `sol` started from
   inside a `prime-agent-rs` session runs against the Rust agent dir and venv. The TS state stays
-  untouched; that TS run just sees Rust's store. This goes away at cutover.
+  untouched; that TS run just sees Rust's store. Any Python run from a Rust session also writes
+  its bytecode under `~/.prime/agent-rs/python-cache` (`PYTHONPYCACHEPREFIX`) instead of beside
+  its sources. This goes away at cutover.
 
 ## Gates (upstream CI only runs on `main`)
 
