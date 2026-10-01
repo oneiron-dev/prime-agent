@@ -451,8 +451,10 @@ async fn loop_requests_carry_the_provider_session_id() {
 
 /// `provider session affinity configured`: a depth-0 session reports its
 /// Anthropic model's opt-in at assembly and again at each live model
-/// switch (other APIs report nothing); a subagent session never reports.
-/// Only the configuration primitives ride the event.
+/// switch, through every switch seam the embeddings use (the daemon
+/// worker's atomic model-and-level switch, ACP's `set_model`, the RPC
+/// mode's model-facts rebind); other APIs report nothing, and a subagent
+/// session never reports. Only the configuration primitives ride the event.
 #[tokio::test]
 async fn affinity_configuration_reports_at_assembly_and_model_switch() {
     fn registry_model(api: &str, compat: Option<serde_json::Value>) -> pa_types::ai::Model {
@@ -473,6 +475,7 @@ async fn affinity_configuration_reports_at_assembly_and_model_switch() {
     );
     let switches = [
         registry_model("anthropic-messages", None),
+        opted_in.clone(),
         registry_model(
             "openai-completions",
             Some(serde_json::json!({ "sendSessionAffinityHeaders": true })),
@@ -507,9 +510,27 @@ async fn affinity_configuration_reports_at_assembly_and_model_switch() {
             })
             .await
             .unwrap();
-            for model in &switches {
-                engine.update_model_facts(model);
+            let [plain, opted, completions] = &switches;
+            // The daemon worker's switch, ACP's, then the RPC mode's.
+            engine
+                .session
+                .set_model_and_thinking_level(
+                    plain,
+                    &plain.provider,
+                    &plain.id,
+                    pa_agent::types::ThinkingLevel::Off,
+                )
+                .await
+                .unwrap();
+            for model in [opted, completions] {
+                engine
+                    .session
+                    .set_model(model, &model.provider, &model.id)
+                    .await
+                    .unwrap();
             }
+            engine.update_model_facts(plain);
+            engine.update_model_facts(completions);
             client.flush().await.unwrap();
             mock.events()
                 .iter()
@@ -525,6 +546,14 @@ async fn affinity_configuration_reports_at_assembly_and_model_switch() {
         properties.set("enabled", serde_json::json!(enabled));
         serde_json::to_value(&properties).unwrap()
     };
-    assert_eq!(reported(None).await, vec![expected(true), expected(false)]);
+    assert_eq!(
+        reported(None).await,
+        vec![
+            expected(true),
+            expected(false),
+            expected(true),
+            expected(false)
+        ]
+    );
     assert_eq!(reported(Some(1)).await, Vec::<serde_json::Value>::new());
 }

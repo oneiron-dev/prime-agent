@@ -841,7 +841,12 @@ impl SessionEngine {
     /// a model switch the registered `model.info` handler and the context
     /// window the usage estimate reads follow the model the session now
     /// runs (the TS runtime reads both live, not at assembly time). The
-    /// switched-to model's session-affinity configuration reports too.
+    /// switched-to model's session-affinity configuration reports too: the
+    /// RPC mode's `set_model`/`cycle_model` install the model on the agent
+    /// directly and land here, while the daemon worker and ACP switches
+    /// report through [`AgentSession::set_model`] and
+    /// [`AgentSession::set_model_and_thinking_level`] (a caller of those
+    /// never needs this method for the report).
     pub fn update_model_facts(&self, model: &pa_types::ai::Model) {
         super::turn_boundary::TurnBoundaryRequests::rebind_model_facts(
             &self.turn_boundary,
