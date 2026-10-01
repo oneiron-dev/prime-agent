@@ -80,6 +80,15 @@ pub fn confirm_nightly_switch(
 /// message a binary the Prime Agent installer does not own produces verbatim
 /// (the actionable, install-method-specific instruction).
 pub fn run(options: &SelfUpdateOptions, persisted_wire: Option<&str>) -> i32 {
+    // Oneiron fork: the side-by-side launcher's guard covers the staged
+    // native updater too, not only the installer funnel.
+    if pa_core::update::installer::self_update_disabled() {
+        eprintln!(
+            "Error: self-update is disabled for this install ({}); install new builds with its own release tooling",
+            pa_core::update::installer::ENV_DISABLE_SELF_UPDATE
+        );
+        return 1;
+    }
     // The effective channel: an explicit flag wins, else the persisted
     // one, else the running version infers it.
     let channel = options

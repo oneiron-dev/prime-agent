@@ -13,11 +13,14 @@ The TS product is never touched: the `prime-agent` launcher, its install tree
 (~/.local/share/prime-agent-oneiron/), its daemon socket dir and its kernel
 venv. The launcher gives every Rust process its own socket dir
 (PRIME_AGENT_SOCKET_DIR, a fork-only knob read by pa-daemon's socket_dir()),
-its own supervisor socket (PRIME_AGENT_DAEMON_SOCKET), its own kernel venv
-(PRIME_AGENT_KERNEL_VENV) and no upstream release checks
-(PI_SKIP_VERSION_CHECK), so it can never reach upstream's update channel.
-Never run upstream install-rust.sh instead: it stops every TS daemon and
-replaces ~/.local/bin/prime-agent.
+its own supervisor socket (PRIME_AGENT_DAEMON_SOCKET) and its own kernel venv
+(PRIME_AGENT_KERNEL_VENV). Self-update is shut three ways: the fork-only
+PRIME_AGENT_DISABLE_SELF_UPDATE guard refuses `update` and the TUI `/update`
+(both would otherwise fetch and run upstream's takeover installer), the
+installer and download URLs point at a dead loopback endpoint, and
+PI_SKIP_VERSION_CHECK silences release notices. Never run upstream
+install-rust.sh instead: it stops every TS daemon and replaces
+~/.local/bin/prime-agent.
 """
 
 from __future__ import annotations
@@ -56,7 +59,7 @@ REQUIRED_STAGE_PATHS = ("prime-agent", "package.json", "prime-agent-runtime/src/
 LAUNCHER_TEMPLATE = """#!/bin/sh
 # prime-agent-rs: the side-by-side Rust prime-agent (Oneiron fork).
 # Written by scripts/oneiron/side_by_side.py install; reinstall instead of editing.
-# Own socket dir + socket, own kernel venv, no upstream release checks. The TS
+# Own socket dir + socket, own kernel venv, self-update shut. The TS
 # `prime-agent` launcher, its daemons and its kernel venv are never touched.
 set -e
 prefix={prefix}
@@ -72,9 +75,13 @@ chmod 700 "$sock_dir"
 PRIME_AGENT_SOCKET_DIR=$sock_dir
 PRIME_AGENT_DAEMON_SOCKET=$sock_dir/daemon.sock
 PRIME_AGENT_KERNEL_VENV=${{PRIME_AGENT_RS_KERNEL_VENV:-$HOME/.prime/agent/kernel-venv-rs}}
+PRIME_AGENT_DISABLE_SELF_UPDATE=1
+PRIME_AGENT_RUST_INSTALLER_URL=http://127.0.0.1:1/oneiron-self-update-disabled
+PRIME_AGENT_DOWNLOAD_BASE_URL=http://127.0.0.1:1/oneiron-feed-disabled
 PI_SKIP_VERSION_CHECK=1
-export PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV PI_SKIP_VERSION_CHECK
-unset PI_PACKAGE_DIR
+export PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV PRIME_AGENT_DISABLE_SELF_UPDATE \\
+  PRIME_AGENT_RUST_INSTALLER_URL PRIME_AGENT_DOWNLOAD_BASE_URL PI_SKIP_VERSION_CHECK
+unset PI_PACKAGE_DIR PRIME_AGENT_KERNEL_PYTHON
 dir=$(cd "$prefix/current" && pwd -P)
 exec "$dir/prime-agent" "$@"
 """

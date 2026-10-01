@@ -33,6 +33,8 @@ when the diff is identical, otherwise drop it by hand.
 | Change | Where | Why |
 |---|---|---|
 | `PRIME_AGENT_SOCKET_DIR` | `crates/pa-daemon/src/platform/paths.rs` | Worker sockets always live in the socket dir, not beside a custom `PRIME_AGENT_DAEMON_SOCKET`; without this a side-by-side install's workers listen inside the TS `prime-agent-<uid>/` dir. Unset keeps TS parity. |
+| `PRIME_AGENT_DISABLE_SELF_UPDATE` | `crates/pa-core/src/update/installer.rs`, `crates/pa-cli/src/self_update.rs` | Upstream's `update` / `/update` fetch and run the takeover installer (stops every TS daemon, replaces `~/.local/bin/prime-agent`); a side-by-side install must refuse. |
+| `--no-extensions` accepted | `crates/pa-cli/src/args.rs` | Upstream removed extensions (#3189); the `sol` wrapper and factory still pass the flag. |
 | Side-by-side install + probe | `scripts/oneiron/side_by_side.py` | Installs a staged release beside the TS build and writes receipts. |
 | Test-policy gate | `scripts/check-test-policy.mjs` (from the TS fork), `scripts/oneiron/test_policy_gate.py` | Runs the fork's test policy with `TEST_POLICY_BASE=oneiron/main` and fails only on violations beyond the 4 upstream ones present at the pin (`scripts/oneiron/test-policy-baseline.txt`). |
 
@@ -41,11 +43,16 @@ when the diff is identical, otherwise drop it by hand.
 - Install tree `~/.local/share/prime-agent-oneiron-rs/<version>/` (immutable per version) with
   `current -> <version>`; launcher `~/.local/bin/prime-agent-rs`.
 - The launcher exports `PRIME_AGENT_SOCKET_DIR=${TMPDIR:-/tmp}/pa-rs-<uid>` (0700, owner-checked),
-  `PRIME_AGENT_DAEMON_SOCKET=<that dir>/daemon.sock`,
-  `PRIME_AGENT_KERNEL_VENV=~/.prime/agent/kernel-venv-rs` and `PI_SKIP_VERSION_CHECK=1` (the build
-  never polls upstream's release channel). It always overwrites those generic names; override only
-  with `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`. The short `pa-rs-<uid>` name
-  keeps macOS worker socket paths under the 104-byte `sun_path` limit.
+  `PRIME_AGENT_DAEMON_SOCKET=<that dir>/daemon.sock` and
+  `PRIME_AGENT_KERNEL_VENV=~/.prime/agent/kernel-venv-rs`. It always overwrites those generic
+  names; override only with `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`. The short
+  `pa-rs-<uid>` name keeps macOS worker socket paths under the 104-byte `sun_path` limit.
+- Self-update is shut. Upstream's `prime-agent update` and the TUI `/update` fetch and run the
+  takeover installer, so the launcher sets `PRIME_AGENT_DISABLE_SELF_UPDATE=1`. That fork-only guard
+  refuses both, plus the staged native updater. It also points `PRIME_AGENT_RUST_INSTALLER_URL` and
+  `PRIME_AGENT_DOWNLOAD_BASE_URL` at a dead loopback endpoint (`http://127.0.0.1:1/…`) so the
+  installer fails closed even without the guard, and sets `PI_SKIP_VERSION_CHECK=1` (notices
+  only). A raw binary run without the launcher has none of this.
 - `~/.local/bin/prime-agent`, the TS install tree, the TS socket dir and the TS kernel venv are
   never written. Never run upstream `install-rust.sh` or any `curl … | sh`: it stops every TS
   daemon and replaces `~/.local/bin/prime-agent`.

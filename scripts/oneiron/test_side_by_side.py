@@ -27,7 +27,9 @@ if [ "$1" = "--version" ]; then
 fi
 if [ "$1" = "env" ]; then
   printf '%s\\n' "SOCKET_DIR=$PRIME_AGENT_SOCKET_DIR" "DAEMON_SOCKET=$PRIME_AGENT_DAEMON_SOCKET" \\
-    "KERNEL_VENV=$PRIME_AGENT_KERNEL_VENV" "SKIP=$PI_SKIP_VERSION_CHECK" "PACKAGE_DIR=${PI_PACKAGE_DIR-unset}"
+    "KERNEL_VENV=$PRIME_AGENT_KERNEL_VENV" "SKIP=$PI_SKIP_VERSION_CHECK" "PACKAGE_DIR=${PI_PACKAGE_DIR-unset}" \\
+    "NO_UPDATE=$PRIME_AGENT_DISABLE_SELF_UPDATE" "INSTALLER=$PRIME_AGENT_RUST_INSTALLER_URL" \\
+    "DOWNLOAD=$PRIME_AGENT_DOWNLOAD_BASE_URL" "KERNEL_PYTHON=${PRIME_AGENT_KERNEL_PYTHON-unset}"
   exit 0
 fi
 exit 3
@@ -58,13 +60,16 @@ class SideBySideTests(unittest.TestCase):
         self.sock_dir = self.root / "sock"
         self.saved_env = {key: os.environ.get(key) for key in
                           ("PRIME_AGENT_RS_SOCKET_DIR", "PRIME_AGENT_RS_KERNEL_VENV",
-                           "PRIME_AGENT_DAEMON_SOCKET", "PRIME_AGENT_KERNEL_VENV", "PI_PACKAGE_DIR")}
+                           "PRIME_AGENT_DAEMON_SOCKET", "PRIME_AGENT_KERNEL_VENV", "PI_PACKAGE_DIR",
+                           "PRIME_AGENT_KERNEL_PYTHON", "PRIME_AGENT_RUST_INSTALLER_URL")}
         os.environ["PRIME_AGENT_RS_SOCKET_DIR"] = str(self.sock_dir)
         os.environ["PRIME_AGENT_RS_KERNEL_VENV"] = str(self.root / "venv-rs")
-        # Inherited TS-side values must never reach the Rust process.
+        # Inherited TS-side or upstream values must never reach the Rust process.
         os.environ["PRIME_AGENT_DAEMON_SOCKET"] = "/tmp/prime-agent-ts/daemon.sock"
         os.environ["PRIME_AGENT_KERNEL_VENV"] = "/ts/kernel-venv"
         os.environ["PI_PACKAGE_DIR"] = "/ts/package"
+        os.environ["PRIME_AGENT_KERNEL_PYTHON"] = "/ts/python"
+        os.environ["PRIME_AGENT_RUST_INSTALLER_URL"] = "https://example.invalid/install.sh"
 
     def tearDown(self) -> None:
         for key, value in self.saved_env.items():
@@ -94,6 +99,10 @@ class SideBySideTests(unittest.TestCase):
             "KERNEL_VENV": str(self.root / "venv-rs"),
             "SKIP": "1",
             "PACKAGE_DIR": "unset",
+            "NO_UPDATE": "1",
+            "INSTALLER": "http://127.0.0.1:1/oneiron-self-update-disabled",
+            "DOWNLOAD": "http://127.0.0.1:1/oneiron-feed-disabled",
+            "KERNEL_PYTHON": "unset",
         })
         self.assertEqual(oct(self.sock_dir.stat().st_mode & 0o777), oct(0o700))
         receipt = json.loads((self.prefix / "receipts" / f"{VERSION}-{PLATFORM}" /

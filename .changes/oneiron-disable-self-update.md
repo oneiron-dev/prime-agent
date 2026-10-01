@@ -1,0 +1,1 @@
+- `PRIME_AGENT_DISABLE_SELF_UPDATE=1` makes `prime-agent update` and the `/update` command refuse instead of downloading and running the installer, for installs managed by other tooling.
