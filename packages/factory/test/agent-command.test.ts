@@ -328,6 +328,14 @@ describe("launch", () => {
 			{ previous: pin(first), agent: pin(second), reason: "launch" },
 			{ previous: pin(second), agent: pin(third), reason: "launch" },
 		]);
+		// A launch replaces config.json through a temporary file of its own; another launch's is never taken over.
+		const foreign = join(f.root, "factory", "config.json.tmp");
+		writeFileSync(foreign, "another launch's config");
+		expect(f.launch(["--prime-agent-bin", "./third-agent"]).agentBinary).toBe(third.binary);
+		expect([readFileSync(foreign, "utf8"), f.persisted()]).toEqual([
+			"another launch's config",
+			{ config: third.binary, ticket: third.binary },
+		]);
 	});
 
 	it("refuses a launch whose native seats have no agent binary, and allows one whose seats are all commands", () => {

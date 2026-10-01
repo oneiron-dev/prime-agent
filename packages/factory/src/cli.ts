@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { CommandAdapter, fingerprintCommand } from "./adapters/command.js";
@@ -165,12 +166,12 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 				const settings = agent ? { ...requested, primeAgentBin: agent.binary } : requested;
 				const result = launchTickets(store, settings, tickets);
 				if (agent) store.pinAgent({ host: settings.host, ...agent }, "launch");
-				// Replaced whole, never rewritten in place: a running serve and the watchdog re-read it.
+				// Replaced whole, never rewritten in place: a running serve and the watchdog re-read it. The temporary
+				// file is this launch's own, so a concurrent launch can neither publish nor lose it.
 				const configPath = join(directory, "config.json");
-				writeFileSync(`${configPath}.tmp`, `${JSON.stringify({ ...config, launcher: settings }, null, 2)}\n`, {
-					mode: 0o600,
-				});
-				renameSync(`${configPath}.tmp`, configPath);
+				const temporary = `${configPath}.${process.pid}.${randomUUID()}.tmp`;
+				writeFileSync(temporary, `${JSON.stringify({ ...config, launcher: settings }, null, 2)}\n`, { mode: 0o600 });
+				renameSync(temporary, configPath);
 				emit({ ...result, skipped, tickets: tickets.length, agentBinary: agent?.binary ?? null });
 				break;
 			}
