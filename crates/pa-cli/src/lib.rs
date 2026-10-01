@@ -40,10 +40,12 @@ pub(crate) mod daemon_session_list;
 pub(crate) mod file_processor;
 pub(crate) mod global_flags;
 pub(crate) mod headless_autonomous;
+pub(crate) mod hosted_print;
 pub(crate) mod incident;
 pub(crate) mod initial_message;
 pub(crate) mod installer_update;
 pub(crate) mod interactive_mode;
+pub(crate) mod json_output;
 pub(crate) mod list_models;
 pub(crate) mod mcp_command;
 pub(crate) mod mcp_login;
@@ -59,15 +61,20 @@ pub(crate) mod sessions_table_format;
 pub(crate) mod subscription_login;
 pub(crate) mod traces_login;
 
+/// The json stream's event selection a [`RunOptions`] carries.
+pub use json_output::JsonEventProfile;
 /// The runtime boundary: everything a mode-runner crate implements to plug
 /// into the `prime-agent` binary, plus the entry point that drives it.
-pub use mode::{AppMode, MissingSubsystem, RunOptions, Runtime, UnavailableRuntime};
+pub use mode::{
+    AppMode, HeadlessHosting, MissingSubsystem, RunOptions, Runtime, UnavailableRuntime,
+};
 pub(crate) mod piped_stdin;
 pub(crate) mod print_autonomous;
 pub(crate) mod print_boundary;
 pub(crate) mod print_goal;
 pub mod print_runtime;
 pub(crate) mod print_session_command;
+pub(crate) mod print_terminal;
 pub mod update_flow;
 pub mod util_time;
 pub use print_runtime::PrintRuntime;
@@ -317,6 +324,12 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
         offline: parsed.offline,
         agents_view_requested: public_command.explicit_agents_view,
         attach_agent: public_command.attach_agent,
+        json_event_profile: parsed.json_event_profile.unwrap_or_default(),
+        headless_hosting: if parsed.daemon_hosted {
+            mode::HeadlessHosting::Daemon
+        } else {
+            mode::HeadlessHosting::InProcess
+        },
     };
 
     match runtime.run(&options) {

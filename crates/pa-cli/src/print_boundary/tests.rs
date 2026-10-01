@@ -138,6 +138,7 @@ async fn faux_engine_with_telemetry(
         conversation_log_path: None,
         additional_skill_paths: Vec::new(),
         additional_prompt_paths: Vec::new(),
+        resource_loading: pa_core::resources::ResourceLoadingPolicy::default(),
         extra_builtin_skill_overrides: Vec::new(),
         rlm_subagent_host: None,
         rlm_depth: None,

@@ -5,6 +5,8 @@
 
 use pa_types::ai::ModelThinkingLevel;
 
+use crate::json_output::JsonEventProfile;
+
 /// Supported reasoning-effort levels (`THINKING_LEVELS` in the TS product).
 pub const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -153,8 +155,14 @@ pub struct Args {
     pub help: bool,
     pub version: bool,
     pub mode: Option<Mode>,
+    /// `--json-event-profile`: the json stream's event selection (explicit
+    /// only; requires `--mode json`).
+    pub json_event_profile: Option<JsonEventProfile>,
     pub daemon_socket: Option<String>,
     pub no_session: bool,
+    /// `--daemon-hosted`: the daemon owns this non-interactive session
+    /// (resident, listed, attachable) instead of the client.
+    pub daemon_hosted: bool,
     pub fork: Option<String>,
     pub session_dir: Option<String>,
     pub models: Option<Vec<String>>,
@@ -284,6 +292,11 @@ pub fn parse_args(args: &[String]) -> Args {
             "--daemon-socket" => {
                 result.daemon_socket = Some(require_value!(arg));
             }
+            "--json-event-profile" => {
+                let profile = require_value!(arg);
+                result.json_event_profile =
+                    parse_json_event_profile(&profile, &mut result.diagnostics);
+            }
             "--continue" | "-c" => result.continue_ = true,
             "--resume" | "-r" => match args.get(i + 1) {
                 Some(next)
@@ -308,6 +321,7 @@ pub fn parse_args(args: &[String]) -> Args {
                 result.append_system_prompt.push(value);
             }
             "--no-session" => result.no_session = true,
+            "--daemon-hosted" => result.daemon_hosted = true,
             "--fork" => result.fork = Some(require_value!(arg)),
             "--session-dir" => result.session_dir = Some(require_value!(arg)),
             "--models" => {
@@ -493,6 +507,11 @@ pub fn parse_args(args: &[String]) -> Args {
                     result.resume = Some(value.to_string());
                 }
             }
+            _ if arg.starts_with("--json-event-profile=") => {
+                let profile = &arg["--json-event-profile=".len()..];
+                result.json_event_profile =
+                    parse_json_event_profile(profile, &mut result.diagnostics);
+            }
             _ if arg.starts_with("--export=") => {
                 result.diagnostics.push(Diagnostic::error(
                     "--export was removed. Use \"prime-agent session export <file> [output]\".",
@@ -521,8 +540,33 @@ pub fn parse_args(args: &[String]) -> Args {
             .diagnostics
             .push(Diagnostic::error("--goal-token-budget requires --goal"));
     }
+    // An explicit profile, `all` included, is a json-stream option only.
+    if result.json_event_profile.is_some() && result.mode != Some(Mode::Json) {
+        result.diagnostics.push(Diagnostic::error(
+            "--json-event-profile requires --mode json",
+        ));
+    }
+    if result.daemon_hosted && result.no_session {
+        result.diagnostics.push(Diagnostic::error(
+            "--daemon-hosted cannot be combined with --no-session",
+        ));
+    }
 
     result
+}
+
+/// A `--json-event-profile` value, or the invalid-value error.
+fn parse_json_event_profile(
+    value: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<JsonEventProfile> {
+    let profile = JsonEventProfile::parse(value);
+    if profile.is_none() {
+        diagnostics.push(Diagnostic::error(format!(
+            "Invalid JSON event profile \"{value}\". Valid values: all, factory-completed"
+        )));
+    }
+    profile
 }
 
 /// `hasRequiredOptionValue` from args.ts: the value flag either consumes the
@@ -576,6 +620,130 @@ mod tests {
         assert_eq!(
             last_error(&parse(&["--extension", "x.ts"])),
             "Unknown option: --extension"
+        );
+    }
+
+    fn error(message: &str) -> Diagnostic {
+        Diagnostic::error(message)
+    }
+
+    /// Both syntaxes select the profile on an explicit json run.
+    #[test]
+    fn json_event_profile_spaced_and_equals_syntax() {
+        let expected = Args {
+            mode: Some(Mode::Json),
+            json_event_profile: Some(JsonEventProfile::FactoryCompleted),
+            print: true,
+            messages: vec!["hi".to_string()],
+            ..Args::default()
+        };
+        for argv in [
+            [
+                "--mode",
+                "json",
+                "--json-event-profile",
+                "factory-completed",
+                "-p",
+                "hi",
+            ]
+            .as_slice(),
+            [
+                "--mode",
+                "json",
+                "--json-event-profile=factory-completed",
+                "-p",
+                "hi",
+            ]
+            .as_slice(),
+            [
+                "--json-event-profile",
+                "factory-completed",
+                "--mode",
+                "json",
+                "-p",
+                "hi",
+            ]
+            .as_slice(),
+        ] {
+            assert_eq!(format!("{:?}", parse(argv)), format!("{expected:?}"));
+        }
+        let explicit_all = Args {
+            json_event_profile: Some(JsonEventProfile::All),
+            ..expected
+        };
+        assert_eq!(
+            format!(
+                "{:?}",
+                parse(&["--mode", "json", "--json-event-profile=all", "-p", "hi"])
+            ),
+            format!("{explicit_all:?}")
+        );
+    }
+
+    /// An explicit profile, `all` included, needs an explicit `--mode json`.
+    #[test]
+    fn json_event_profile_requires_explicit_json_mode() {
+        for argv in [
+            ["--json-event-profile", "all", "-p", "hi"].as_slice(),
+            ["--mode", "text", "--json-event-profile", "all", "-p", "hi"].as_slice(),
+            ["--json-event-profile=factory-completed", "-p", "hi"].as_slice(),
+        ] {
+            assert_eq!(
+                parse(argv).diagnostics,
+                vec![error("--json-event-profile requires --mode json")]
+            );
+        }
+    }
+
+    #[test]
+    fn json_event_profile_rejects_unknown_and_missing_values() {
+        for (argv, value) in [
+            (
+                ["--mode", "json", "--json-event-profile", "factory"].as_slice(),
+                "factory",
+            ),
+            (
+                ["--mode", "json", "--json-event-profile=bogus"].as_slice(),
+                "bogus",
+            ),
+            (["--mode", "json", "--json-event-profile="].as_slice(), ""),
+        ] {
+            let parsed = parse(argv);
+            assert_eq!(parsed.json_event_profile, None);
+            assert_eq!(
+                parsed.diagnostics,
+                vec![error(&format!(
+                    "Invalid JSON event profile \"{value}\". Valid values: all, factory-completed"
+                ))]
+            );
+        }
+        // A missing value leaves the next flag a flag.
+        let parsed = parse(&["--mode", "json", "--json-event-profile", "--daemon-hosted"]);
+        assert_eq!(
+            parsed.diagnostics,
+            vec![error("--json-event-profile requires a value")]
+        );
+        assert!(parsed.daemon_hosted);
+        assert_eq!(parsed.json_event_profile, None);
+    }
+
+    #[test]
+    fn daemon_hosted_parses_and_refuses_no_session() {
+        let expected = Args {
+            daemon_hosted: true,
+            print: true,
+            messages: vec!["hi".to_string()],
+            ..Args::default()
+        };
+        assert_eq!(
+            format!("{:?}", parse(&["--daemon-hosted", "-p", "hi"])),
+            format!("{expected:?}")
+        );
+        assert_eq!(
+            parse(&["--daemon-hosted", "--no-session", "-p", "hi"]).diagnostics,
+            vec![error(
+                "--daemon-hosted cannot be combined with --no-session"
+            )]
         );
     }
 

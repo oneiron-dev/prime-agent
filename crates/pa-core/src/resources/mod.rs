@@ -89,6 +89,29 @@ pub struct LoadedResources {
     pub append_system_prompt: Vec<String>,
 }
 
+/// Whether a session discovers one kind of resource on its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResourceDiscovery {
+    /// Discover from the agent dir, the project, packages and the bundled
+    /// set (the default).
+    #[default]
+    Enabled,
+    /// No discovery (the TS `--no-*` flags). Explicitly passed skill and
+    /// prompt-template paths still load.
+    Disabled,
+}
+
+/// The session's resource-discovery policy (TS `--no-skills`,
+/// `--no-prompt-templates`, `--no-context-files`): what
+/// [`load_resources`] auto-discovers for one session assembly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceLoadingPolicy {
+    pub skills: ResourceDiscovery,
+    pub prompt_templates: ResourceDiscovery,
+    /// `AGENTS.md`/`CLAUDE.md` project context.
+    pub context_files: ResourceDiscovery,
+}
+
 /// Resource loading options (the TS `DefaultResourceLoaderOptions` surface,
 /// minus the theme machinery).
 #[derive(Default)]

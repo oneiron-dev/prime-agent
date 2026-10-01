@@ -16,7 +16,6 @@ use pa_agent::stream::{LlmContext, StreamFn, StreamRequestOptions};
 use pa_core::session_engine::provider_adapter::{
     json_round_trip, map_thinking_level, stream_once, switchable_stream_fn, ProviderTarget,
 };
-use pa_core::session_engine::session_events::agent_event_json;
 
 /// The runtime: implements the print (text) mode against the merged session
 /// engine. Modes not wired here still report their typed missing subsystem.
@@ -36,16 +35,37 @@ impl crate::mode::Runtime for PrintRuntime {
                 }
             };
         }
+        // `--daemon-hosted` hands a print/json session to the daemon; the
+        // rpc and acp transports have no resident-session path here yet, so
+        // the flag fails loudly there instead of being ignored (an
+        // interactive session is daemon-resident already).
+        if options.headless_hosting == crate::mode::HeadlessHosting::Daemon
+            && matches!(options.app_mode, AppMode::Rpc | AppMode::Acp)
+        {
+            eprintln!(
+                "Error: --daemon-hosted is not supported in {} mode yet",
+                options.app_mode.as_str()
+            );
+            return Ok(1);
+        }
         match options.app_mode {
             // Runtime failures print themselves and exit non-zero; the typed
             // MissingSubsystem channel stays reserved for unwired subsystems.
-            AppMode::Print | AppMode::Json => match run_print_mode(options) {
-                Ok(code) => Ok(code),
-                Err(message) => {
-                    eprintln!("Error: {message}");
-                    Ok(1)
+            AppMode::Print | AppMode::Json => {
+                let run = match options.headless_hosting {
+                    crate::mode::HeadlessHosting::InProcess => run_print_mode(options),
+                    crate::mode::HeadlessHosting::Daemon => {
+                        crate::hosted_print::run_hosted_print(options)
+                    }
+                };
+                match run {
+                    Ok(code) => Ok(code),
+                    Err(message) => {
+                        eprintln!("Error: {message}");
+                        Ok(1)
+                    }
                 }
-            },
+            }
             // The interactive TUI attaches through the daemon (spawning a
             // supervisor when none is running); the daemon mode runs the
             // supervisor in-process. Runtime failures print themselves and
@@ -149,40 +169,7 @@ async fn try_daemon_attached_acp(options: &RunOptions) -> Option<i32> {
             .await
             .map_err(|error| format!("{error:#}"))?;
         let config = &options.config;
-        // The session flags the in-process engine honors, under the TS
-        // `runtimeConfigFromArgs` names. `--api-key` stays off: the
-        // in-process path ignores it too, and the create config is persisted.
-        let mut create_config = serde_json::json!({ "cwd": config.cwd.display().to_string() });
-        if let Some(provider) = &config.provider {
-            create_config["provider"] = serde_json::json!(provider);
-        }
-        if let Some(model) = &config.model {
-            create_config["model"] = serde_json::json!(model);
-        }
-        if let Some(thinking) = config.thinking {
-            create_config["thinking"] = serde_json::json!(thinking.wire_name());
-        }
-        if let Some(system_prompt) = &config.system_prompt {
-            create_config["systemPrompt"] = serde_json::json!(system_prompt);
-        }
-        if !config.append_system_prompt.is_empty() {
-            create_config["appendSystemPrompt"] = serde_json::json!(config.append_system_prompt);
-        }
-        for (key, paths) in [
-            ("skills", &config.skills),
-            ("promptTemplates", &config.prompt_templates),
-        ] {
-            if !paths.is_empty() {
-                create_config[key] = paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .into();
-            }
-        }
-        if let Some(autonomous) = &config.autonomous {
-            create_config["autonomous"] = serde_json::json!(autonomous_runtime_config(autonomous));
-        }
+        let create_config = config.daemon_create_config(&config.cwd);
         pa_daemon::acp::daemon::run_daemon_attached_acp_mode(
             pa_daemon::acp::daemon::DaemonAcpOptions {
                 socket_path,
@@ -388,6 +375,7 @@ fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
 }
 
 async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
+    crate::print_terminal::track_headless_invocation(options).await;
     let headless = build_headless_engine(options, "print").await?;
     let engine = std::sync::Arc::new(headless.engine);
     // The CLI `--goal` seed (TS constructor seeding): a fresh root branch
@@ -613,6 +601,7 @@ async fn build_headless_engine_with(
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect(),
+            resource_loading: config.resource_loading(),
             extra_builtin_skill_overrides: vec![],
             rlm_subagent_host: None,
             rlm_depth: None,
@@ -868,7 +857,7 @@ async fn build_headless_engine(
 /// json stream leads with.
 async fn session_header_json(
     engine: &pa_core::session_engine::engine::SessionEngine,
-) -> Option<String> {
+) -> Option<serde_json::Value> {
     let persistence = engine.session.shared_persistence();
     let session = persistence.lock().await;
     let header = session.get_header()?;
@@ -915,7 +904,7 @@ async fn session_header_json(
             .as_ref()
             .map(|git| serde_json::to_value(git).unwrap_or(serde_json::Value::Null)),
     );
-    Some(serde_json::Value::Object(object).to_string())
+    Some(serde_json::Value::Object(object))
 }
 
 fn select_model(
@@ -1015,27 +1004,12 @@ fn build_session_manager_with_lease(
     // over the stored session cwd on resume.
     let explicit_cwd_override = options.session.cwd_from_flag.then_some(cwd.as_path());
     if let Some(selector) = &options.session.resume {
-        let resolved = resolve_session_path(selector, &cwd, &session_dir)
-            .map_err(|error| render_selector_error(&error))?;
-        return match resolved {
-            ResolvedSession::Path(path) | ResolvedSession::Local(path) => {
-                let lease = session_open_guard(options.daemon_socket.as_deref(), &path)?;
-                // A failed open's early return drops the lease (released),
-                // never leaving an orphaned hold behind.
-                let manager = open_session_file(&path, &session_dir, &cwd, explicit_cwd_override)?;
-                Ok((manager, Some(lease)))
-            }
-            ResolvedSession::Global {
-                path: _,
-                cwd: session_cwd,
-            } => {
-                // Print mode has no fork prompt; mirror the TS non-TTY path.
-                Err(format!(
-                    "session {selector} belongs to a different project ({}). Pass --fork {selector} to use it here, or run from that project's directory.",
-                    session_cwd.display()
-                ))
-            }
-        };
+        let path = resolve_resume_selector(selector, &cwd, &session_dir)?;
+        let lease = session_open_guard(options.daemon_socket.as_deref(), &path)?;
+        // A failed open's early return drops the lease (released), never
+        // leaving an orphaned hold behind.
+        let manager = open_session_file(&path, &session_dir, &cwd, explicit_cwd_override)?;
+        return Ok((manager, Some(lease)));
     }
     if options.session.continue_recent {
         let most_recent = find_most_recent_session_for_cwd(&session_dir, &cwd);
@@ -1209,6 +1183,24 @@ fn open_session_file(
     fallback_cwd: &std::path::Path,
     explicit_cwd_override: Option<&std::path::Path>,
 ) -> Result<pa_core::session::manager::SessionManager, String> {
+    let session_cwd = resumed_session_cwd(path, fallback_cwd, explicit_cwd_override)?;
+    Ok(pa_core::session::manager::SessionManager::open(
+        &session_cwd,
+        session_dir,
+        path,
+    ))
+}
+
+/// The working directory a resumed session runs in (TS `SessionManager.open`
+/// cwd semantics): an explicit `--cwd` override wins, else the header's
+/// cwd, falling back to the process cwd for unreadable or new files — with
+/// main.ts's `getMissingSessionCwdIssue` guard: a session stored against a
+/// deleted directory must not silently continue somewhere else.
+pub(crate) fn resumed_session_cwd(
+    path: &std::path::Path,
+    fallback_cwd: &std::path::Path,
+    explicit_cwd_override: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
     let session_cwd = explicit_cwd_override.map_or_else(
         || {
             let header = pa_core::session::manager::read_session_header(path);
@@ -1219,21 +1211,37 @@ fn open_session_file(
         },
         std::path::Path::to_path_buf,
     );
-    let manager = pa_core::session::manager::SessionManager::open(&session_cwd, session_dir, path);
-    // main.ts getMissingSessionCwdIssue: a session stored against a deleted
-    // directory must not silently continue somewhere else.
-    if !manager.get_cwd().exists() {
-        let session_file = manager
-            .get_session_file()
-            .map(|path| format!("\nSession file: {}", path.display()))
-            .unwrap_or_default();
+    if !session_cwd.exists() {
         return Err(format!(
-            "Stored session working directory does not exist: {}{session_file}\nCurrent working directory: {}",
-            manager.get_cwd().display(),
+            "Stored session working directory does not exist: {}\nSession file: {}\nCurrent working directory: {}",
+            session_cwd.display(),
+            path.display(),
             fallback_cwd.display()
         ));
     }
-    Ok(manager)
+    Ok(session_cwd)
+}
+
+/// `--resume <selector>` for a headless run: the selected session file, or
+/// the TS non-TTY refusal for another project's session (print mode has no
+/// fork prompt).
+pub(crate) fn resolve_resume_selector(
+    selector: &str,
+    cwd: &std::path::Path,
+    session_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let resolved = resolve_session_path(selector, cwd, session_dir)
+        .map_err(|error| render_selector_error(&error))?;
+    match resolved {
+        ResolvedSession::Path(path) | ResolvedSession::Local(path) => Ok(path),
+        ResolvedSession::Global {
+            path: _,
+            cwd: session_cwd,
+        } => Err(format!(
+            "session {selector} belongs to a different project ({}). Pass --fork {selector} to use it here, or run from that project's directory.",
+            session_cwd.display()
+        )),
+    }
 }
 
 /// Render a selector failure with the main.ts formatting: the error message
@@ -1274,18 +1282,20 @@ async fn run_prompts_and_emit(
     let json_mode = options.app_mode == AppMode::Json;
     let mut unsubscribe: Option<pa_agent::agent::Subscription> = None;
     if json_mode {
+        // The `--json-event-profile` projection: the header marker and the
+        // typed snapshot filter apply before anything is serialized.
+        let sink = crate::json_output::JsonEventSink::stdout(options.json_event_profile);
         if let Some(header) = session_header_json(engine).await {
-            println!("{header}");
+            sink.header(header);
         }
         unsubscribe = Some(
             engine
                 .session
                 .agent()
-                .subscribe(|event, _signal| {
+                .subscribe(move |event, _signal| {
+                    let sink = sink.clone();
                     Box::pin(async move {
-                        if let Some(json) = agent_event_json(&event) {
-                            println!("{json}");
-                        }
+                        sink.agent_event(&event);
                         Ok(())
                     })
                 })
@@ -1469,37 +1479,16 @@ async fn run_prompts_and_emit(
             .await;
         return Ok(1);
     }
-    let state = engine.session.agent().state().await;
-    let messages: Vec<pa_types::session::AgentMessage> =
-        state.messages.iter().filter_map(json_round_trip).collect();
-    let result = pa_core::session_engine::headless::select_headless_terminal_result(&messages);
     // The TS print-mode exit contract (modes/print-mode.ts): json mode
     // never derives the exit code from the terminal selection — the event
     // stream carries everything, and only the autonomous gates (or a thrown
-    // error) exit non-zero. Text mode prints the primary message (an error
-    // primary to stderr with exit 1, a settled answer to stdout) and the
-    // trailing compaction-outcome disclosures to stderr. A run with no
-    // terminal message — e.g. an overflow turn dropped by the
-    // compact-and-retry recovery whose outcome row is the only surface —
-    // prints nothing and leaves the exit code to the outcome rows.
+    // error) exit non-zero.
     let mut exit_code = 0;
     if !json_mode {
-        if let Some(primary) = result.primary {
-            if let Some(stderr) = primary.stderr_text(&mut exit_code) {
-                eprintln!("{stderr}");
-            }
-            if exit_code == 0 {
-                if let Some(text) = primary.stdout_text() {
-                    println!("{text}");
-                }
-            }
-        }
-        for outcome in result.compaction_outcomes {
-            eprintln!("{}", outcome.content);
-            if outcome.outcome == "failed" {
-                exit_code = 1;
-            }
-        }
+        let state = engine.session.agent().state().await;
+        let messages: Vec<pa_types::session::AgentMessage> =
+            state.messages.iter().filter_map(json_round_trip).collect();
+        exit_code = crate::print_terminal::write_text_terminal_result(&messages);
     }
     // The TS print-mode autonomous contract applies to both output modes.
     if let Some(stderr) = autonomous.exit_stderr().await {
@@ -1661,6 +1650,9 @@ async fn build_faux_engine_with(
             conversation_log_path: None,
             additional_skill_paths: vec![],
             additional_prompt_paths: vec![],
+            // The same discovery policy as the real assembly, so the
+            // binary-level verifiers observe the `--no-*` flags.
+            resource_loading: config.resource_loading(),
             extra_builtin_skill_overrides: vec![],
             rlm_subagent_host: None,
             rlm_depth: None,
