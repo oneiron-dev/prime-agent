@@ -15,7 +15,8 @@ pub(super) struct TurnRunner {
     /// The input-pause table (the admission gate holds queued input).
     pub(super) input_pauses: crate::session_input_pause::InputPauseTable,
     /// The prompt-admission registry: a queued admitted prompt commits
-    /// when its turn starts and clears when the turn settles.
+    /// at its pickup (a cancelled one never runs) and clears when its
+    /// turn settles.
     pub(super) prompt_admissions: crate::prompt_admission::WorkerAdmissions,
     pub(super) work_notify: Arc<Notify>,
     pub(super) idle_notify: Arc<Notify>,
@@ -85,27 +86,54 @@ impl TurnRunner {
                 if self.input_pauses.paused() || core.queued_input_suspended || core.compacting {
                     core.busy = false;
                     None
-                } else if core.steering.front().is_some() {
-                    let items = gather_delivery_batch(&mut core, Lane::Steering);
-                    core.busy = true;
-                    core.abort_requested = false;
-                    core.retry_abort_requested = false;
-                    // The run starts with no tool calls in flight (TS
-                    // resets `pendingToolCalls` at run start).
-                    core.running_tool_calls.clear();
-                    Some(items)
-                } else if core.follow_up.front().is_some() {
-                    let items = gather_delivery_batch(&mut core, Lane::FollowUp);
-                    core.busy = true;
-                    core.abort_requested = false;
-                    core.retry_abort_requested = false;
-                    core.running_tool_calls.clear();
+                } else if core.steering.front().is_some() || core.follow_up.front().is_some() {
+                    let lane = if core.steering.front().is_some() {
+                        Lane::Steering
+                    } else {
+                        Lane::FollowUp
+                    };
+                    let mut items = gather_delivery_batch(&mut core, lane);
+                    // The pickup commits each admitted prompt (TS
+                    // `commitAdmission`) under the registry lock a
+                    // `cancel_prompt_admission` takes, so the cancel either
+                    // answered `owned` or withdrew the prompt: one it
+                    // cancelled first (its drop found no lane row — the
+                    // cancel landed before the enqueue) leaves the batch
+                    // here and never runs; its waiter fails like a dropped
+                    // queue row.
+                    items.retain(|item| {
+                        item.admission_id
+                            .as_deref()
+                            .is_none_or(|admission_id| self.prompt_admissions.commit(admission_id))
+                    });
+                    if !items.is_empty() {
+                        core.busy = true;
+                        core.abort_requested = false;
+                        core.retry_abort_requested = false;
+                        // The run starts with no tool calls in flight (TS
+                        // resets `pendingToolCalls` at run start).
+                        core.running_tool_calls.clear();
+                    }
                     Some(items)
                 } else {
                     core.busy = false;
                     None
                 }
             };
+            if item.as_ref().is_some_and(Vec::is_empty) {
+                // Every picked prompt was withdrawn: nothing runs. The
+                // journal settles (the prompt's own admission checkpoint
+                // may have landed after its cancel's) and the lanes are
+                // read again.
+                checkpoint_queue_recovery(
+                    &self.recovery,
+                    &self.core,
+                    QueueCheckpoint::Settle {
+                        operation: "queue_dropped",
+                    },
+                );
+                continue;
+            }
             if let Some(items) = item {
                 // No pickup checkpoint by design: every path that
                 // admits work into the lanes has already recorded its
@@ -410,11 +438,7 @@ impl TurnRunner {
         let Some((first, batched)) = items.split_first() else {
             return;
         };
-        // An admitted prompt's turn started: its prompt admission commits
-        // (TS `commitAdmission`) — one per batched item, in delivery order.
-        for admission_id in items.iter().filter_map(|item| item.admission_id.as_ref()) {
-            self.prompt_admissions.commit(admission_id);
-        }
+        // The batch's prompt admissions committed at the pickup (`run`).
         self.emit_turn_event(json!({ "type": "agent_start" }));
         self.emit_turn_event(json!({ "type": "turn_start" }));
 

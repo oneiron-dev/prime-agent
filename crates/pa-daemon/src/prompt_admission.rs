@@ -446,12 +446,18 @@ impl Supervisor {
                 admission.status = AdmissionStatus::Cancelled;
             }
         });
-        let Some(status) = connection
-            .prompt_admissions
-            .with(&key, |admission| admission.status)
+        let Some((status, route_timed_out)) =
+            connection.prompt_admissions.with(&key, |admission| {
+                (admission.status, admission.route_timed_out)
+            })
         else {
             return Self::admission_status(command_id, type_name, "unknown");
         };
+        if route_timed_out && status != AdmissionStatus::Waiting {
+            // A settled status answers a timed-out route's one read as
+            // well: no route will clear the record.
+            connection.prompt_admissions.remove(&key);
+        }
         match status {
             AdmissionStatus::Cancelled => {
                 Self::admission_status(command_id, type_name, "cancelled")
@@ -477,6 +483,13 @@ impl Supervisor {
                     return Self::admission_status(command_id, type_name, "cancelled");
                 };
                 let Some(resident) = self.registry.get(&worker_id).await else {
+                    if route_timed_out {
+                        // The worker is gone after the budget ran out: the
+                        // prompt may have run on it, so the read claims
+                        // neither way.
+                        connection.prompt_admissions.remove(&key);
+                        return Self::admission_status(command_id, type_name, "unknown");
+                    }
                     return Self::admission_status(command_id, type_name, "cancelled");
                 };
                 let mut payload = json!({
@@ -510,21 +523,17 @@ impl Supervisor {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                     .to_string();
-                let route_timed_out = connection
+                connection
                     .prompt_admissions
-                    .update(&key, |admission| {
-                        match status.as_str() {
-                            "owned" => admission.status = AdmissionStatus::Owned,
-                            "cancelled" => admission.status = AdmissionStatus::Cancelled,
-                            _ => {
-                                if admission.status != AdmissionStatus::Cancelled {
-                                    admission.status = AdmissionStatus::Waiting;
-                                }
+                    .update(&key, |admission| match status.as_str() {
+                        "owned" => admission.status = AdmissionStatus::Owned,
+                        "cancelled" => admission.status = AdmissionStatus::Cancelled,
+                        _ => {
+                            if admission.status != AdmissionStatus::Cancelled {
+                                admission.status = AdmissionStatus::Waiting;
                             }
                         }
-                        admission.route_timed_out
-                    })
-                    .unwrap_or(false);
+                    });
                 if route_timed_out {
                     // No route settles a timed-out admission: its one read
                     // is done, so the record leaves the table.
@@ -577,22 +586,32 @@ impl WorkerAdmissions {
         Self::default()
     }
 
-    fn register(&self, admission_id: &str) {
+    pub(crate) fn register(&self, admission_id: &str) {
         self.admissions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(admission_id.to_string(), AdmissionStatus::Waiting);
     }
 
-    /// The queued prompt's turn started: a waiting admission commits.
-    pub(crate) fn commit(&self, admission_id: &str) {
+    /// The queued prompt was picked up for its turn: a waiting admission
+    /// commits. Returns whether the prompt may run — `false` for one a
+    /// cancel withdrew first (the same lock orders the two, so a later
+    /// cancel answers `owned`); that admission settles here, since its
+    /// prompt never reaches a turn that would clear it.
+    pub(crate) fn commit(&self, admission_id: &str) -> bool {
         let mut admissions = self
             .admissions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(status) = admissions.get_mut(admission_id) {
-            if *status == AdmissionStatus::Waiting {
-                *status = AdmissionStatus::Owned;
+        match admissions.get(admission_id).copied() {
+            Some(AdmissionStatus::Waiting) => {
+                admissions.insert(admission_id.to_string(), AdmissionStatus::Owned);
+                true
+            }
+            Some(AdmissionStatus::Owned) | None => true,
+            Some(AdmissionStatus::Cancelled) => {
+                admissions.remove(admission_id);
+                false
             }
         }
     }
@@ -637,12 +656,21 @@ impl Worker {
     /// controller aborts before the admission commits, so the prompt never
     /// runs).
     pub(crate) fn drop_queued_admitted_prompt(&self, admission_id: &str) {
-        {
+        let dropped = {
             let mut core = self.core.lock().unwrap();
+            let queued = core.steering.len() + core.follow_up.len();
             core.steering
                 .retain(|item| item.admission_id.as_deref() != Some(admission_id));
             core.follow_up
                 .retain(|item| item.admission_id.as_deref() != Some(admission_id));
+            core.steering.len() + core.follow_up.len() != queued
+        };
+        // A dropped prompt never reaches the turn that would clear its
+        // admission (TS clears it when the cancelled prompt settles). With
+        // no row to drop, the cancel landed before the prompt's enqueue:
+        // the record stays cancelled for the pickup to refuse and settle.
+        if dropped {
+            self.prompt_admissions.clear(admission_id);
         }
         // The cancelled rows leave the lanes: settle the verdict so the
         // drop cannot leave the admission's busy=true (or its snapshot
@@ -873,7 +901,8 @@ mod tests {
             ))]
         );
         let (routed_prompt, forwarded_read) = worker.await.unwrap();
-        assert_eq!(routed_prompt.command_type, "prompt_and_wait");
+        // The prompt reached the worker under the supervisor-scoped
+        // admission id, and the read addressed exactly that admission.
         let worker_admission_id = routed_prompt.payload["admissionId"].clone();
         assert!(
             worker_admission_id
@@ -881,10 +910,25 @@ mod tests {
                 .is_some_and(|id| id.starts_with("supervisor-admission:")),
             "{worker_admission_id}"
         );
-        assert_eq!(forwarded_read.command_type, "cancel_prompt_admission");
         assert_eq!(
-            forwarded_read.payload,
-            json!({ "activeSessionId": "w-adm", "admissionId": worker_admission_id })
+            (routed_prompt.command_type, routed_prompt.payload),
+            (
+                "prompt_and_wait".to_string(),
+                json!({
+                    "type": "prompt_and_wait",
+                    "activeSessionId": "w-adm",
+                    "message": "long turn",
+                    "admissionId": worker_admission_id,
+                    "clientId": "client-1",
+                })
+            )
+        );
+        assert_eq!(
+            (forwarded_read.command_type, forwarded_read.payload),
+            (
+                "cancel_prompt_admission".to_string(),
+                json!({ "activeSessionId": "w-adm", "admissionId": worker_admission_id })
+            )
         );
         // The read consumed the record: nothing answers for it any more.
         let (lines, _) = supervisor
