@@ -196,6 +196,14 @@ def flip_current(prefix: Path, version: str) -> str | None:
     return before
 
 
+def stamp_manifest(package_json: Path, version: str) -> None:
+    """Pin the exe-adjacent manifest version (the binary reports it over the
+    compiled-in one, as upstream's commit-stamped continuous builds do)."""
+    manifest = json.loads(package_json.read_text())
+    manifest["version"] = version
+    package_json.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
 def install(args: argparse.Namespace) -> int:
     prefix = args.prefix.expanduser()
     bin_dir = args.bin_dir.expanduser()
@@ -205,7 +213,11 @@ def install(args: argparse.Namespace) -> int:
 
     with tempfile.TemporaryDirectory(prefix="pa-rs-install-") as scratch:
         stage = extract_tarball(args.tarball, Path(scratch)) if args.tarball else args.stage_dir
-        version, platform = read_stage(stage)
+        staged_version, platform = read_stage(stage)
+        version = args.version or staged_version
+        if version != staged_version and not version.startswith(f"{staged_version}-"):
+            raise SystemExit(f"error: --version {version} must extend the staged version {staged_version} "
+                             f"(e.g. {staged_version}-oneiron.YYYYMMDD.N)")
         target = prefix / version
         if target.exists():
             raise SystemExit(f"error: {target} already exists; installs are immutable, bump the build number")
@@ -214,6 +226,8 @@ def install(args: argparse.Namespace) -> int:
         if temp_target.exists():
             shutil.rmtree(temp_target)
         shutil.copytree(stage, temp_target, symlinks=True)
+        if version != staged_version:
+            stamp_manifest(temp_target / "package.json", version)
         os.rename(temp_target, target)
 
     current_before = None
@@ -237,6 +251,7 @@ def install(args: argparse.Namespace) -> int:
     receipt = {
         "schema": RECEIPT_SCHEMA,
         "version": version,
+        "stagedVersion": staged_version,
         "platform": platform,
         "installedAt": utc_now(),
         "host": socket.gethostname(),
@@ -388,6 +403,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     source = install_cmd.add_mutually_exclusive_group(required=True)
     source.add_argument("--stage-dir", type=Path, help="scripts/package_release.py staged layout dir")
     source.add_argument("--tarball", type=Path, help="prime-agent-<version>-<platform>.tar.gz")
+    install_cmd.add_argument("--version", help="stamp this version into the installed package.json "
+                             "(must extend the staged version, e.g. 0.9.8-oneiron.20261001.1)")
     install_cmd.add_argument("--no-activate", dest="activate", action="store_false",
                              help="copy the release without flipping current or writing the launcher")
 

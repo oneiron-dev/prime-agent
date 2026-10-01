@@ -18,13 +18,16 @@ import side_by_side  # noqa: E402
 VERSION = "0.9.8-oneiron.20261001.1"
 PLATFORM = "linux-x64"
 
-# The fake binary prints the version, or the isolation env it was launched
-# with, so the launcher's exports are asserted on what the process really saw.
+# The fake binary prints the exe-adjacent manifest version (as the real one
+# does), or the isolation env it was launched with, so the launcher's exports
+# are asserted on what the process really saw.
 FAKE_BINARY = """#!/bin/sh
-if [ "$1" = "--version" ]; then echo "{version}"; exit 0; fi
+if [ "$1" = "--version" ]; then
+  sed -n 's/.*"version": *"\\([^"]*\\)".*/\\1/p' "$(dirname "$0")/package.json"; exit 0
+fi
 if [ "$1" = "env" ]; then
   printf '%s\\n' "SOCKET_DIR=$PRIME_AGENT_SOCKET_DIR" "DAEMON_SOCKET=$PRIME_AGENT_DAEMON_SOCKET" \\
-    "KERNEL_VENV=$PRIME_AGENT_KERNEL_VENV" "SKIP=$PI_SKIP_VERSION_CHECK" "PACKAGE_DIR=${{PI_PACKAGE_DIR-unset}}"
+    "KERNEL_VENV=$PRIME_AGENT_KERNEL_VENV" "SKIP=$PI_SKIP_VERSION_CHECK" "PACKAGE_DIR=${PI_PACKAGE_DIR-unset}"
   exit 0
 fi
 exit 3
@@ -37,7 +40,7 @@ def make_stage(parent: Path, version: str = VERSION) -> Path:
     (stage / "skills").mkdir()
     (stage / "package.json").write_text(json.dumps({"version": version}))
     binary = stage / "prime-agent"
-    binary.write_text(FAKE_BINARY.format(version=version))
+    binary.write_text(FAKE_BINARY)
     binary.chmod(0o755)
     return stage
 
@@ -103,6 +106,22 @@ class SideBySideTests(unittest.TestCase):
              "versionCheck": {"stdout": VERSION, "exitCode": 0, "ok": True}})
         self.assertEqual(receipt["tsLauncher"]["before"], {"kind": "symlink", "target": str(self.ts_target)})
         self.assertEqual(receipt["tsLauncher"]["before"], receipt["tsLauncher"]["after"])
+
+    def test_version_stamp_pins_the_installed_manifest(self) -> None:
+        stage = make_stage(self.root, "0.9.8")
+        self.assertEqual(self.run_main("install", "--stage-dir", str(stage), "--version", VERSION), 0)
+        self.assertEqual(json.loads((self.prefix / VERSION / "package.json").read_text()), {"version": VERSION})
+        self.assertEqual(json.loads((stage / "package.json").read_text()), {"version": "0.9.8"})
+        receipt = json.loads((self.prefix / "receipts" / f"{VERSION}-{PLATFORM}" /
+                              "INSTALL-RECEIPT.json").read_text())
+        self.assertEqual((receipt["version"], receipt["stagedVersion"], receipt["versionCheck"]["ok"]),
+                         (VERSION, "0.9.8", True))
+
+    def test_version_stamp_must_extend_the_staged_version(self) -> None:
+        stage = make_stage(self.root, "0.9.8")
+        with self.assertRaisesRegex(SystemExit, "must extend the staged version"):
+            self.run_main("install", "--stage-dir", str(stage), "--version", "0.9.9-oneiron.20261001.1")
+        self.assertFalse(self.prefix.exists())
 
     def test_installs_are_immutable(self) -> None:
         stage = make_stage(self.root)
