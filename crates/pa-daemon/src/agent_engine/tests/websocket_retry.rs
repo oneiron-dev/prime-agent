@@ -260,9 +260,71 @@ fn a_dropped_socket_retries_the_full_request_on_a_fresh_connection() {
     );
 }
 
-/// A completed tool call is dispatched exactly once across a dropped
-/// follow-up request, and a tool call cut off by the drop is never
-/// dispatched: the re-issued request carries the completed call and its
+/// The `probe` tool: a side effect that records every marker it runs
+/// with (what a retry must never repeat).
+struct Probe {
+    runs: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl pa_agent::types::AgentTool for Probe {
+    fn name(&self) -> &'static str {
+        "probe"
+    }
+    fn description(&self) -> &'static str {
+        "record a marker"
+    }
+    fn parameters(&self) -> &Value {
+        static PARAMETERS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        PARAMETERS.get_or_init(|| {
+            json!({
+                "type": "object",
+                "properties": { "marker": { "type": "string" } },
+                "required": ["marker"],
+            })
+        })
+    }
+    fn execute(
+        self: std::sync::Arc<Self>,
+        _tool_call_id: String,
+        params: Value,
+        _signal: pa_agent::abort::AbortSignal,
+        _on_update: pa_agent::types::AgentToolUpdateCallback,
+    ) -> pa_agent::BoxFut<'static, anyhow::Result<pa_agent::types::AgentToolResult>> {
+        Box::pin(async move {
+            let marker = params["marker"].as_str().unwrap_or_default().to_string();
+            self.runs.lock().unwrap().push(marker.clone());
+            Ok(pa_agent::types::AgentToolResult::text(format!(
+                "probe ran {marker}"
+            )))
+        })
+    }
+}
+
+/// Build the engine's session and add the `probe` tool beside its own
+/// tools; returns the probe's run log.
+fn install_probe(engine: &AgentSessionEngine) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    let runs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model = engine.resolve_model().expect("the route resolves");
+    engine
+        .ensure_core_session(&model)
+        .expect("the session builds");
+    let session = engine.session.blocking_lock();
+    let core = session.as_deref().expect("the built session");
+    let probe = std::sync::Arc::new(Probe {
+        runs: std::sync::Arc::clone(&runs),
+    });
+    engine.runtime.block_on(async {
+        let agent = core.session.agent();
+        let mut tools = agent.state().await.tools;
+        tools.push(probe);
+        agent.set_tools(tools).await;
+    });
+    runs
+}
+
+/// A completed side-effectful tool call runs exactly once across a
+/// dropped follow-up request, and a tool call cut off by the drop never
+/// runs: the re-issued request carries the completed call and its real
 /// output, not the partial call.
 #[test]
 fn a_drop_after_a_completed_tool_call_never_repeats_or_runs_a_cut_call() {
@@ -285,8 +347,11 @@ fn a_drop_after_a_completed_tool_call_never_repeats_or_runs_a_cut_call() {
         Vec::new(),
     ));
     let (engine, _dir) = websocket_engine(&server);
+    let runs = install_probe(&engine);
     let mut events = Vec::new();
     admit(&engine, "run the tool".to_string(), &mut events);
+    // The side effect ran once, for the completed call only.
+    assert_eq!(*runs.lock().unwrap(), vec!["once".to_string()]);
     let dispatched: Vec<&str> = events
         .iter()
         .filter_map(|event| match event {
@@ -325,5 +390,6 @@ fn a_drop_after_a_completed_tool_call_never_repeats_or_runs_a_cut_call() {
     let retried = bodies[2].to_string();
     assert!(retried.contains("call_once"), "{retried}");
     assert!(retried.contains("function_call_output"), "{retried}");
+    assert!(retried.contains("probe ran once"), "{retried}");
     assert!(!retried.contains("call_cut"), "{retried}");
 }
