@@ -46,6 +46,16 @@ if [ -f "$offload/env.sh" ]; then
   . "$offload/env.sh"
   unset W7_CARGO_LOCAL
   cargo=(cargo "+$toolchain")
+  # The wrapper forwards only its own short env list: an explicit TS
+  # reference would not reach the remote differential suites, which would
+  # then skip or pick another binary.
+  case "$step" in
+    test|crates|all)
+      if [ -n "${PA_TS_BINARY:-}" ]; then
+        echo "gate: PA_TS_BINARY is set, but an explicit TS reference cannot travel to the build boxes; run that comparison in local mode on the Mac" >&2
+        exit 1
+      fi ;;
+  esac
 else
   mode=local
   echo "gate: local mode"
@@ -88,19 +98,57 @@ require_offload() {
   done
   [ -n "$ok" ] && [ "$top" = "$(pwd -P)" ] ||
     { echo "$refuse $root is not a worktree the wrapper offloads from (one level under: $offload_roots)" >&2; exit 1; }
+  # The hosts the wrapper reads at every call (its hosts file wins over
+  # W7_CARGO_HOSTS): at least one well-formed build box, and no `local`
+  # entry (a local slot runs cargo here).
+  local hosts entries entry host rest slots jobs dir remote=""
+  if [ -f "$offload/hosts" ]; then hosts="$(tr -d '\n' < "$offload/hosts")"; else hosts="${W7_CARGO_HOSTS:-}"; fi
+  IFS=';' read -ra entries <<<"$hosts"
+  for entry in ${entries[@]+"${entries[@]}"}; do
+    host=${entry%%:*}
+    [ -n "$host" ] && [ "$host" != "$entry" ] || continue
+    [ "$host" != local ] || { echo "$refuse the wrapper's hosts list a local entry" >&2; exit 1; }
+    rest=${entry#*:}; slots=${rest%%:*}; rest=${rest#*:}; jobs=${rest%%:*}; dir=${rest#*:}
+    [[ "$slots" =~ ^[0-9]+$ ]] && [[ "$jobs" =~ ^[0-9]+$ ]] && [ "$slots" -gt 0 ] && [ -n "$dir" ] || continue
+    remote=1
+  done
+  [ -n "$remote" ] || { echo "$refuse no build host in $offload/hosts (or W7_CARGO_HOSTS)" >&2; exit 1; }
+}
+
+# Offload mode: cargo through the wrapper, passing only when its stderr
+# names the build box that ran it (`[factory-cargo] <host> slot …`, the
+# last one). A run without one ran on this host: a loud failure, never a
+# pass. The hosts can change between require_offload and the call.
+offloaded() {
+  local log status host
+  log="$(mktemp "${TMPDIR:-/tmp}/gate-offload.XXXXXX")"
+  set +e
+  { "${cargo[@]}" "$@" 2>&1 1>&3 3>&- | tee "$log" >&2; status=${PIPESTATUS[0]}; } 3>&1
+  set -e
+  host="$(sed -n 's/^\[factory-cargo\] \([^ ]*\) slot .*/\1/p' "$log" | tail -n 1)"
+  rm -f "$log"
+  if [ -z "$host" ] || [ "$host" = local ]; then
+    echo "gate: offload mode, but cargo ran on this host, not a build box (exit $status); failing" >&2
+    return 1
+  fi
+  return "$status"
 }
 
 run_fmt() { "${cargo[@]}" fmt --all --check; }
 
 run_clippy() {
-  if [ "$mode" = offload ]; then require_offload; fi
-  "${cargo[@]}" clippy --workspace --all-targets --locked -- -D warnings
+  if [ "$mode" = offload ]; then
+    require_offload
+    offloaded clippy --workspace --all-targets --locked -- -D warnings
+  else
+    "${cargo[@]}" clippy --workspace --all-targets --locked -- -D warnings
+  fi
 }
 
 run_test() {
   if [ "$mode" = offload ]; then
     require_offload
-    "${cargo[@]}" test --locked "${scope[@]}" --no-fail-fast "$@"
+    offloaded test --locked "${scope[@]}" --no-fail-fast "$@"
   else
     run_sandboxed_test "$@"
   fi

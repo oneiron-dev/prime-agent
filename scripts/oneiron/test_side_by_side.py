@@ -996,10 +996,19 @@ class OffloadGateTests(unittest.TestCase):
         self.worktrees = self.root / "worktrees"
         self.repo = self.worktrees / "lane-x"
         self.gate = gate_copy(self.repo, self.kit, self.worktrees)
+        # As the real wrapper: a `[factory-cargo] <host> slot …` line on
+        # stderr for the build box that runs an offloaded call
+        # (STUB_SLOT_HOST="" stands for a local fallback, which prints none).
         write_executable(self.kit / "bin" / "cargo", """#!/bin/sh
 printf '%s|%s|%s|%s\\n' "$*" "$W7_CARGO_WORK" "${W7_CARGO_LOCAL-unset}" "$(pwd -P)" >> "$STUB_OUT/log"
-case "$2" in test|clippy) exit "${STUB_EXIT:-0}" ;; esac
+case "$2" in
+  test|clippy)
+    host=${STUB_SLOT_HOST-box1}
+    [ -z "$host" ] || echo "[factory-cargo] $host slot 1/2; at most 8 Cargo jobs" >&2
+    exit "${STUB_EXIT:-0}" ;;
+esac
 """)
+        (self.kit / "hosts").write_text("box1:2:8:/home/b/w8-build;\nbox2:2:8:/home/b/w8-build\n")
         self.write_env_sh()
         write_executable(self.root / "decoy" / "cargo", '#!/bin/sh\necho "LOCAL $*" >> "$STUB_OUT/log"\nexit 99\n')
         self.env = {"PATH": f"{self.root / 'decoy'}:/usr/bin", "HOME": str(self.root / "home"), "LANG": "C",
@@ -1010,9 +1019,10 @@ case "$2" in test|clippy) exit "${STUB_EXIT:-0}" ;; esac
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def write_env_sh(self, *, path: bool = True, work: bool = True) -> None:
+    def write_env_sh(self, *, path: bool = True, work: bool = True, hosts: str = "") -> None:
         lines = [f"export PATH={self.kit / 'bin'}:$PATH"] if path else []
         lines += [f"export W7_CARGO_WORK={self.kit}"] if work else []
+        lines += [f"export W7_CARGO_HOSTS='{hosts}'"] if hosts else []
         (self.kit / "env.sh").write_text("".join(f"{line}\n" for line in lines))
 
     def run_gate(self, gate: Path | None = None, *args: str, **env: str) -> subprocess.CompletedProcess:
@@ -1070,6 +1080,59 @@ case "$2" in test|clippy) exit "${STUB_EXIT:-0}" ;; esac
                                      (1, "gate: offload mode (build boxes)\n"), result.stderr)
                     self.assertIn(refuse + message, result.stderr)
                     self.assertEqual(self.log(), [])
+
+    def test_offload_refuses_without_a_remote_build_host(self) -> None:
+        refuse = "gate: offload mode, refusing to run cargo on this host: "
+        no_host = f"no build host in {self.kit}/hosts (or W7_CARGO_HOSTS)"
+        hosts = self.kit / "hosts"
+        cases = (
+            ("empty hosts file", "", {}, no_host),
+            ("malformed entries only", "box1;box2:0:8:/w;box3:2:8:", {}, no_host),
+            ("a local entry", "local:1:8:/w;box1:2:8:/w", {}, "the wrapper's hosts list a local entry"),
+            # The file wins over W7_CARGO_HOSTS, as in the wrapper.
+            ("file over env", "local:1:8:/w", {"hosts": "box1:2:8:/w"}, "the wrapper's hosts list a local entry"),
+            ("no file, no env", None, {}, no_host),
+        )
+        for name, text, env_sh, message in cases:
+            for step in ("test", "clippy"):
+                with self.subTest(name, step=step):
+                    if text is None:
+                        hosts.unlink(missing_ok=True)
+                    else:
+                        hosts.write_text(text)
+                    self.write_env_sh(**env_sh)
+                    result = self.run_gate(None, step)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(refuse + message, result.stderr)
+                    self.assertEqual(self.log(), [])
+        self.write_env_sh(hosts="box1:2:8:/w")
+        self.assertEqual(self.run_gate(None, "test").returncode, 0)
+        self.assertEqual(self.log(), [self.remote("test --locked --workspace --no-fail-fast")])
+
+    def test_offload_fails_when_cargo_ran_on_this_host(self) -> None:
+        for slot_host in ("", "local"):
+            for step in ("test", "clippy"):
+                with self.subTest(slot_host=slot_host, step=step):
+                    result = self.run_gate(None, step, STUB_SLOT_HOST=slot_host)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertNotIn("passed", result.stdout)
+                    self.assertIn("gate: offload mode, but cargo ran on this host, not a build box (exit 0); failing",
+                                  result.stderr)
+        result = self.run_gate(None, "test")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[factory-cargo] box1 slot 1/2; at most 8 Cargo jobs\n", result.stderr)
+
+    def test_offload_refuses_an_explicit_ts_reference(self) -> None:
+        message = ("gate: PA_TS_BINARY is set, but an explicit TS reference cannot travel to the build boxes; "
+                   "run that comparison in local mode on the Mac")
+        for args in (("test",), ("crates", "pa-cli"), ("all",)):
+            with self.subTest(args=args):
+                result = self.run_gate(None, *args, PA_TS_BINARY="/ts/bin/prime-agent")
+                self.assertEqual((result.returncode, result.stdout), (1, "gate: offload mode (build boxes)\n"))
+                self.assertIn(message, result.stderr)
+                self.assertEqual(self.log(), [])
+        result = self.run_gate(None, "clippy", PA_TS_BINARY="/ts/bin/prime-agent")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class PolicyGateTests(unittest.TestCase):

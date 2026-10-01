@@ -117,11 +117,15 @@ scripts/oneiron/gate.sh crates pa-core pa-daemon -- <filter>   # focused
   `cargo +1.98.1 …` (the toolchain travels in the command; `RUSTUP_TOOLCHAIN` does not). No local
   build, bootstrap or sandbox: the remote run gets none of this host's env, and the boxes run no TS
   fleet. `fmt` stays local. The wrapper silently runs cargo on this host when it is not first on
-  PATH, `W7_CARGO_WORK` is unset or the worktree is not directly under
-  `…/prime-agent/.claude/worktrees/` (or `/home/lexi/w8-opus/`), so the gate refuses to run cargo
-  at all in those cases. A remote failure that is not the code (sync, ssh, toolchain): say so and
-  rerun once; never fall back to a local run. `cargo build` stays local (`-j 8`, the gate target
-  dir).
+  PATH, `W7_CARGO_WORK` is unset, the worktree is not directly under
+  `…/prime-agent/.claude/worktrees/` (or `/home/lexi/w8-opus/`), or its hosts file
+  (`…/offload/hosts`, else `W7_CARGO_HOSTS`) lists no build box or a `local` one, so the gate
+  refuses to run cargo at all in those cases. Each offloaded call also has to show the wrapper's
+  `[factory-cargo] <box> slot` line on stderr; without one cargo ran here and the gate fails. An
+  explicit `PA_TS_BINARY` cannot travel (the wrapper forwards a fixed env list), so the test steps
+  refuse it: run that comparison in local mode on the Mac. A remote failure that is not the code
+  (sync, ssh, toolchain): say so and rerun once; never fall back to a local run. `cargo build`
+  stays local (`-j 8`, the gate target dir).
 - Local (`gate: local mode`), without the offload kit (the Mac). Never run a bare `cargo test
   --workspace` on a machine with a live TS fleet: the kernel e2e suites bootstrap the ambient kernel
   venv and probe the default daemon socket dir. The gate builds, bootstraps and tests under a
