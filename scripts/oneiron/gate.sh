@@ -2,6 +2,7 @@
 # The local merge gate for rust-oneiron lanes (upstream CI only runs on main).
 #
 #   scripts/oneiron/gate.sh [fmt|clippy|test|policy|all] [-- extra cargo test args]
+#   scripts/oneiron/gate.sh crates <crate>... [-- test filters]   (focused, same sandbox)
 #
 # Same gates as `make check` on the toolchain upstream CI pins, plus the fork
 # gates. Tests run sandboxed: HOME and TMPDIR point at a throwaway dir, so the
@@ -15,6 +16,11 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
 step="${1:-all}"
 [ $# -gt 0 ] && shift
+crates=()
+if [ "$step" = "crates" ]; then
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do crates+=(-p "$1"); shift; done
+  [ ${#crates[@]} -gt 0 ] || { echo "usage: $0 crates <crate>... [-- test filters]" >&2; exit 2; }
+fi
 [ "${1:-}" = "--" ] && shift
 
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.98.1}"
@@ -25,6 +31,10 @@ if command -v sccache >/dev/null 2>&1; then
   export SCCACHE_DIR="${SCCACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sccache}"
 fi
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
+# mold cuts link time and memory when several lanes build at once (Linux x64 only).
+if [ "$(uname -s)-$(uname -m)" = "Linux-x86_64" ] && command -v mold >/dev/null 2>&1; then
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:--C link-arg=-fuse-ld=mold}"
+fi
 # The gate's test build gets its own target dir so it never blocks on (or
 # invalidates) the release build's lock in target/.
 export CARGO_TARGET_DIR="${GATE_TARGET_DIR:-$root/target/gate}"
@@ -33,7 +43,8 @@ run_fmt() { cargo fmt --all --check; }
 run_clippy() { cargo clippy --workspace --all-targets --locked -- -D warnings; }
 
 run_test() {
-  local sandbox
+  local scope=(--workspace) sandbox
+  if [ ${#crates[@]} -gt 0 ]; then scope=("${crates[@]}"); fi
   sandbox="$(mktemp -d "${TMPDIR:-/tmp}/pa-gate.XXXXXX")"
   mkdir -p "$sandbox/home" "$sandbox/tmp"
   echo "gate: sandbox $sandbox"
@@ -48,7 +59,7 @@ run_test() {
       PRIME_AGENT_TELEMETRY PRIME_AGENT_TELEMETRY_API_KEY PRIME_AGENT_TELEMETRY_ENDPOINT PRIME_AGENT_TELEMETRY_ORIGIN
     cargo build --locked --workspace --bins
     "$CARGO_TARGET_DIR/debug/prime-agent" --prime-agent-bootstrap
-    cargo test --locked --workspace --no-fail-fast "$@"
+    cargo test --locked "${scope[@]}" --no-fail-fast "$@"
   )
   rm -rf "$sandbox"
 }
@@ -61,9 +72,9 @@ run_policy() {
 case "$step" in
   fmt) run_fmt ;;
   clippy) run_clippy ;;
-  test) run_test "$@" ;;
+  test|crates) run_test "$@" ;;
   policy) run_policy ;;
   all) run_fmt; run_clippy; run_policy; run_test "$@" ;;
-  *) echo "usage: $0 [fmt|clippy|test|policy|all] [-- cargo test args]" >&2; exit 2 ;;
+  *) echo "usage: $0 [fmt|clippy|test|policy|all|crates <crate>...] [-- cargo test args]" >&2; exit 2 ;;
 esac
 echo "gate: $step passed"
