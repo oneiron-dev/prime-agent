@@ -6,20 +6,19 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-
 use serde_json::Value;
 
 use crate::providers::openai_codex_responses::errors::CodexStreamError;
 use crate::providers::openai_codex_responses::websocket::{
-    ContinuationState, WorkerCommand, SESSION_WEBSOCKET_CACHE_TTL_MS,
+    ContinuationState, SESSION_WEBSOCKET_CACHE_TTL_MS,
 };
+use crate::providers::responses_websocket::connection::WorkerHandle;
 
 pub use crate::providers::openai_codex_responses::websocket::WebSocketDebugStats;
 
 pub struct CachedConnection {
-    /// Command channel to the connection's worker task.
-    pub worker: mpsc::Sender<WorkerCommand>,
+    /// Command handle to the connection's worker task.
+    pub(crate) worker: WorkerHandle,
     pub busy: bool,
     pub continuation: Option<ContinuationState>,
     /// Generation counter for pending idle-expiry tasks.
@@ -112,7 +111,7 @@ pub fn close_websocket_sessions(session_id: Option<&str>) {
     let Ok(mut state) = session_state().lock() else {
         return;
     };
-    let entries: Vec<mpsc::Sender<WorkerCommand>> = match session_id {
+    let entries: Vec<WorkerHandle> = match session_id {
         Some(session_id) => state
             .connections
             .remove(session_id)
@@ -125,7 +124,7 @@ pub fn close_websocket_sessions(session_id: Option<&str>) {
             .collect(),
     };
     for worker in entries {
-        let _ = worker.try_send(WorkerCommand::Close);
+        worker.close();
     }
 }
 
@@ -202,7 +201,7 @@ pub fn schedule_session_websocket_expiry(session_id: &str) {
             return;
         }
         if let Some(entry) = state.connections.remove(&session_id) {
-            let _ = entry.worker.try_send(WorkerCommand::Close);
+            entry.worker.close();
         }
     });
 }

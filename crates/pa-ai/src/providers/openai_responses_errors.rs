@@ -2,7 +2,7 @@
 //! (port of `parseResponsesErrorFrame` / `redactErrorText` in
 //! `packages/ai/src/providers/openai-responses-shared.ts`).
 //!
-//! OpenAI sends a flat frame (`{"type":"error","code","message"}`); the CPA
+//! `OpenAI` sends a flat frame (`{"type":"error","code","message"}`); the CPA
 //! gateway nests its verdict (`{"type":"error","status":503,"error":{"type",
 //! "code","message"}}`). Both classify through the shared stream-failure
 //! vocabulary, keeping the provider type, the separate provider code, and
@@ -65,7 +65,7 @@ fn redact_error_text(value: &str, max_chars: usize) -> String {
     }
 }
 
-/// Port of `parseResponsesErrorFrame`: accepts both the flat OpenAI frame
+/// Port of `parseResponsesErrorFrame`: accepts both the flat `OpenAI` frame
 /// and the CPA nested envelope.
 fn parse_responses_error_frame(event: &Value) -> ResponsesErrorFrame {
     let frame = event.as_object();
@@ -146,7 +146,7 @@ mod tests {
     use crate::utils_inner::stream_failure::StreamFailureKind;
     use serde_json::json;
 
-    /// OpenAI's flat frame: the code is both the provider type and code.
+    /// The flat `OpenAI` frame: the code is both the provider type and code.
     /// The bounded `raw` keeps only what the frame itself nested (TS
     /// `safeRaw` takes the nested type before the code fallback), so a
     /// flat frame's `raw` carries the code alone.

@@ -16,5 +16,6 @@ mod openai_responses_errors;
 pub mod openai_responses_hooks;
 pub mod openai_responses_shared;
 pub mod openai_responses_stream;
+pub(crate) mod responses_websocket;
 pub mod simple_options;
 pub mod transform_messages;
