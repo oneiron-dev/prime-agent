@@ -57,8 +57,10 @@ def main(argv: list[str] | None = None) -> int:
               f"git fetch oneiron)", file=sys.stderr)
         return 1
     base_sha = resolved.stdout.strip()
+    # The checker gets the resolved commit, not the ref: a ref that moves
+    # mid-run must not make the reported sha differ from the one checked.
     result = subprocess.run(["node", str(ROOT / "scripts" / "check-test-policy.mjs")], cwd=ROOT,
-                            env={**os.environ, "TEST_POLICY_BASE": base},
+                            env={**os.environ, "TEST_POLICY_BASE": base_sha},
                             capture_output=True, text=True)
     output = result.stdout + result.stderr
     found = Counter(violation_keys(output))

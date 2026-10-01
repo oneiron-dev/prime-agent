@@ -58,32 +58,46 @@ run_test() {
   sandbox="$(mktemp -d /tmp/pg.XXXXXX)"
   mkdir -p "$sandbox/h" "$sandbox/t" "$sandbox/bin"
   echo "gate: sandbox $sandbox"
-  local ts_reference="${PA_TS_BINARY:-}" shadowed_path="" dir entry status
-  # PATH minus any `prime-agent`: a dir holding one is replaced by a shadow
-  # with links to everything else in it (uv, python, git stay reachable).
+  local ts_reference="${PA_TS_BINARY:-}" shadowed_path="" seen="" dir entry status shadows=0
+  # PATH minus any `prime-agent`: each dir holding one is replaced, at its
+  # own position, by a shadow dir of links (to absolute targets) to
+  # everything else in it, so every other command resolves as before.
+  # Repeats and empty entries (the cwd: here, the worktree) are dropped.
   local IFS=:
   for dir in $PATH; do
-    if [ -n "$dir" ] && [ -e "$dir/prime-agent" ]; then
-      for entry in "$dir"/*; do
-        case "${entry##*/}" in prime-agent|prime-agent-*|sol) ;; *) [ -e "$sandbox/bin/${entry##*/}" ] || ln -s "$entry" "$sandbox/bin/" ;; esac
+    [ -n "$dir" ] || continue
+    case ":$seen:" in *":$dir:"*) continue ;; esac
+    seen="${seen:+$seen:}$dir"
+    if [ -e "$dir/prime-agent" ]; then
+      shadows=$((shadows + 1))
+      mkdir "$sandbox/bin/$shadows"
+      for entry in "$(cd "$dir" && pwd -P)"/*; do
+        case "${entry##*/}" in prime-agent|prime-agent-*|sol) ;; *) ln -s "$entry" "$sandbox/bin/$shadows/" ;; esac
       done
-      dir="$sandbox/bin"
+      dir="$sandbox/bin/$shadows"
     fi
-    case ":$shadowed_path:" in *":$dir:"*) ;; *) shadowed_path="${shadowed_path:+$shadowed_path:}$dir" ;; esac
+    shadowed_path="${shadowed_path:+$shadowed_path:}$dir"
   done
   unset IFS
+  # A subshell left of && or || runs with set -e off, so a failed build or
+  # bootstrap would pass the gate on green tests. It stands alone and sets
+  # -e itself; the outer shell collects its status for the cleanup below.
+  set +e
   (
+    set -e
     export HOME="$sandbox/h" TMPDIR="$sandbox/t" XDG_CONFIG_HOME="$sandbox/h/.config" \
       XDG_DATA_HOME="$sandbox/h/.local/share" XDG_STATE_HOME="$sandbox/h/.local/state" \
       PATH="$shadowed_path" TZ=UTC
     # CI runs with a clean env. Every product switch goes: state roots
-    # (session dirs, agent dir), update roles (the restart roster), sockets,
-    # venvs, telemetry (a developer's DO_NOT_TRACK=1 flips the env-precedence
-    # tests). HOME/TMPDIR alone would not neutralize an inherited override.
-    for name in $(env | sed -n 's/^\(PRIME_AGENT_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(PI_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    # (session dirs, agent dir), harness state and debug sinks (RLM_*,
+    # PA_*: write destinations, not metadata), update roles (the restart
+    # roster), sockets, venvs, telemetry (a developer's DO_NOT_TRACK=1 flips
+    # the env-precedence tests). HOME/TMPDIR alone would not neutralize an
+    # inherited override.
+    for name in $(env | sed -nE 's/^((PRIME_AGENT|PI|RLM|PA)_[A-Za-z0-9_]*)=.*/\1/p'); do
       unset "$name"
     done
-    unset DO_NOT_TRACK PA_TS_REFERENCE PA_TS_BINARY
+    unset DO_NOT_TRACK
     # The TS-differential suites run `PA_TS_BINARY`, else `prime-agent` on
     # PATH. Here that would be the Oneiron TS fork, not upstream's parity
     # ground truth, so by default neither exists (they skip as on a CI
@@ -93,7 +107,9 @@ run_test() {
     cargo build --locked --workspace --bins
     "$CARGO_TARGET_DIR/debug/prime-agent" --prime-agent-bootstrap
     cargo test --locked "${scope[@]}" --no-fail-fast "$@"
-  ) && status=0 || status=$?
+  )
+  status=$?
+  set -e
   # /tmp is RAM-backed here: a failed run's sandbox (kernel venv included)
   # is kept only on request.
   if [ "$status" -ne 0 ] && [ -n "${GATE_KEEP_SANDBOX:-}" ]; then
