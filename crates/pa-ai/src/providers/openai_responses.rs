@@ -169,7 +169,15 @@ pub fn stream_openai_responses(
                 writer.end(Some(output));
             }
             Err(ResponsesRunError::Provider(error)) => {
-                output.stop_reason = if error == ProviderError::Aborted {
+                // TS `options?.signal?.aborted ? "aborted" : "error"`: a
+                // caller abort makes any failure an abort (a handshake
+                // failure that settled just before the abort keeps its text
+                // but not an error verdict).
+                let caller_aborted = options
+                    .as_ref()
+                    .and_then(|options| options.base.signal.as_ref())
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                output.stop_reason = if error == ProviderError::Aborted || caller_aborted {
                     StopReason::Aborted
                 } else {
                     StopReason::Error
