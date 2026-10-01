@@ -42,10 +42,9 @@ ENV_KEYS = ("HOME", "TMPDIR", "XDG_DATA_HOME", "PRIME_AGENT_RS_AGENT_DIR", "PRIM
 
 class FakeRustDaemon:
     """A scripted supervisor on a unix socket: connection N gets hellos[N]
-    (the last one repeats), `list` gets `sessions` (after on_list runs), and
-    `shutdown` removes the socket (as the real supervisor does on exit)
-    before it answers. It serves exactly `connections` connections and
-    records every request it reads."""
+    (the last one repeats) and `list` gets `sessions` (after on_list runs);
+    any other command is answered with a failure. It serves exactly
+    `connections` connections and records every request it reads."""
 
     def __init__(self, path: Path, hellos: list[dict], sessions: list, connections: int,
                  on_list: Callable[[], None] | None = None) -> None:
@@ -66,14 +65,11 @@ class FakeRustDaemon:
                     request = json.loads(line)
                     self.received.append(request)
                     kind = request["command"]["type"]
-                    response = {"type": "response", "id": request["id"], "command": kind, "success": True}
+                    response = {"type": "response", "id": request["id"], "command": kind, "success": kind == "list"}
                     if kind == "list":
                         if self.on_list is not None:
                             self.on_list()
                         response["data"] = {"sessions": self.sessions}
-                    else:
-                        self.server.close()
-                        self.path.unlink()
                     conn.sendall((json.dumps(response) + "\n").encode())
 
     def finish(self) -> None:
@@ -309,7 +305,7 @@ class RolloutTests(RolloutFixture):
                          {"type": "command", "protocol": {"name": "prime-agent.daemon", "version": 7},
                           "command": {"type": "list", "id": request["id"]}})
 
-    def test_an_old_idle_supervisor_is_reported_and_retired_only_on_request(self) -> None:
+    def test_an_old_supervisor_is_reported_and_left_running(self) -> None:
         self.publish(V1)
         self.publish(V2)
         self.assertEqual(self.main("rollout", "--version", V1), 0)
@@ -317,64 +313,31 @@ class RolloutTests(RolloutFixture):
         daemon = self.daemon(sessions=[], connections=2, hellos=[self.rust_hello(V1)])
         self.assertEqual(self.main("rollout", "--version", V2), 0)
         daemon.finish()
+        # Only `list` ever reaches it: nothing here stops a supervisor.
         self.assertEqual([request["command"]["type"] for request in daemon.received], ["list", "list"])
         self.assertEqual(self.receipt(V2)["notice"],
-                         f"the Rust supervisor at {self.socket_path} still runs {V1}; new sessions start on it "
-                         "until it exits (--retire-idle-daemon stops it when idle)")
+                         f"the Rust supervisor at {self.socket_path} still runs {V1}; new sessions start on it, "
+                         f"not on {V2}, until it exits")
         self.assertTrue(self.socket_path.exists())
         self.socket_path.unlink()
 
-        # Rolling back to V1, the release that supervisor runs: nothing to retire.
+        # Rolling back to V1, the release that supervisor runs: nothing to note.
         daemon = self.daemon(sessions=[], connections=1, hellos=[self.rust_hello(V1)])
-        self.assertEqual(self.main("rollback", "--retire-idle-daemon"), 0)
+        self.assertEqual(self.main("rollback"), 0)
         daemon.finish()
         self.assertEqual([request["command"]["type"] for request in daemon.received], ["list"])
-        receipt = self.receipt(V1, "ROLLBACK-RECEIPT.json")
-        self.assertEqual(("retire" in receipt["rustDaemon"], "notice" in receipt), (False, False))
+        self.assertNotIn("notice", self.receipt(V1, "ROLLBACK-RECEIPT.json"))
         self.assertTrue(self.socket_path.exists())
 
-    def test_a_supervisor_already_on_the_selected_release_is_never_retired(self) -> None:
+    def test_a_supervisor_already_on_the_selected_release_gets_no_notice(self) -> None:
         # Every Oneiron build of one base reports the same appVersion; the
         # running release is read from the executable path instead.
         self.publish(V2)
         daemon = self.daemon(sessions=[], connections=2, hellos=[self.rust_hello(V2)])
-        self.assertEqual(self.main("rollout", "--version", V2, "--retire-idle-daemon"), 0)
+        self.assertEqual(self.main("rollout", "--version", V2), 0)
         daemon.finish()
         self.assertEqual([request["command"]["type"] for request in daemon.received], ["list", "list"])
-        receipt = self.receipt(V2)
-        self.assertEqual(("retire" in receipt["rustDaemon"], "notice" in receipt), (False, False))
-        self.assertTrue(self.socket_path.exists())
-
-    def test_retire_idle_daemon_stops_the_old_supervisor_after_the_swap(self) -> None:
-        self.publish(V1)
-        self.publish(V2)
-        self.assertEqual(self.main("rollout", "--version", V1), 0)
-        daemon = self.daemon(sessions=[], connections=3, hellos=[self.rust_hello(V1)])
-        self.assertEqual(self.main("rollout", "--version", V2, "--retire-idle-daemon"), 0)
-        daemon.finish()
-        self.assertEqual([request["command"]["type"] for request in daemon.received],
-                         ["list", "list", "list", "shutdown"])
-        receipt = self.receipt(V2)
-        self.assertEqual((receipt["status"], receipt["rustDaemon"]["retire"]["retire"], "notice" in receipt),
-                         ("activated", {"acknowledged": True, "stopped": True}, False))
-        self.assertFalse(self.socket_path.exists())
-
-    def test_retiring_never_reaches_a_supervisor_other_than_the_one_checked(self) -> None:
-        self.publish(V1)
-        self.publish(V2)
-        self.assertEqual(self.main("rollout", "--version", V1), 0)
-        # Before the swap: supervisor 4242 runs V1. When retiring: 5151 answers.
-        daemon = self.daemon(sessions=[], connections=3,
-                             hellos=[self.rust_hello(V1), self.rust_hello(V1), self.rust_hello(V1, pid=5151)])
-        self.assertEqual(self.main("rollout", "--version", V2, "--retire-idle-daemon"), 0)
-        daemon.finish()
-        self.assertEqual([request["command"]["type"] for request in daemon.received], ["list", "list"])
-        receipt = self.receipt(V2)
-        self.assertEqual((receipt["rustDaemon"]["retire"]["state"], receipt["rustDaemon"]["retire"]["retire"]),
-                         ("replaced", {"acknowledged": False, "stopped": False,
-                                       "detail": "a different supervisor answers than the one checked before the swap"}))
-        self.assertIn(f"still runs {V1}", receipt["notice"])
-        self.assertTrue(self.socket_path.exists())
+        self.assertNotIn("notice", self.receipt(V2))
 
     def test_a_foreign_daemon_is_never_sent_a_command(self) -> None:
         self.publish(V1)
@@ -480,6 +443,28 @@ class RolloutTests(RolloutFixture):
         self.assertEqual((receipt["status"], receipt["phase"], receipt["checks"]["payloadUnchangedAtSelect"],
                           receipt["after"]["current"]), ("failed", "select", False, None))
         self.assertIn("changed after it was verified", receipt["failure"]["message"])
+        self.assertFalse((self.bin_dir / "prime-agent-rs").exists())
+
+    def test_an_install_swapped_for_a_link_after_verification_is_never_selected(self) -> None:
+        # Between the install check and the swap (here: during the idle
+        # recheck), <prefix>/<version> becomes a link to an identical tree
+        # elsewhere. Same bytes, but not the install.
+        self.publish(V1)
+        install, elsewhere = self.prefix / V1, self.root / "elsewhere" / V1
+
+        def swap_for_a_link() -> None:
+            if install.is_dir() and not install.is_symlink():
+                elsewhere.parent.mkdir()
+                install.rename(elsewhere)
+                install.symlink_to(elsewhere, target_is_directory=True)
+
+        daemon = self.daemon(sessions=[], connections=2, hellos=[self.rust_hello(V1)], on_list=swap_for_a_link)
+        self.assertEqual(self.main("rollout", "--version", V1), 1)
+        daemon.finish()
+        receipt = self.receipt(V1)
+        self.assertEqual((receipt["status"], receipt["phase"], receipt["after"]["current"]),
+                         ("failed", "select", None))
+        self.assertIn("is not a plain directory", receipt["failure"]["message"])
         self.assertFalse((self.bin_dir / "prime-agent-rs").exists())
 
     def test_a_concurrent_run_is_turned_away_before_it_records_anything(self) -> None:

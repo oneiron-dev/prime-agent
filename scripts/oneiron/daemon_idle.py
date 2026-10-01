@@ -11,13 +11,11 @@ unless the Rust supervisor is idle, and idle is proven, never assumed:
   idle           a supervisor of THIS install answered `list` with no sessions
   busy           it answered with live sessions
   foreign        something else answered (wrong protocol, a different socket
-                 path in its hello, or an executable outside the prefix); it is
-                 never sent a command
+                 path in its hello, or an executable that is not an install's
+                 prime-agent under the prefix); it is never sent a command
   unknown        no hello, a failed or timed-out `list`, or not a socket
   refused        the path overlaps TS state (under $TMPDIR or /tmp); it is
                  never connected to
-  replaced       (retiring only) a supervisor other than the one checked
-                 before the swap answers; it is sent nothing
 
 Only absent, not-listening and idle permit the swap. The check speaks the
 daemon wire (newline-delimited JSON: the supervisor's `daemon_hello`, then a
@@ -26,20 +24,14 @@ daemon wire (newline-delimited JSON: the supervisor's `daemon_hello`, then a
 pa-cli's `probe_daemon` does. It never scans for daemons and never touches
 the TS socket dir.
 
-It stops nothing unless asked (`inspect(..., retire=<expected identity>)`,
-behind --retire-idle-daemon): a supervisor of another release with the same
-protocol and schema stays `current` to new clients and spawns every worker
-from its own binary, so after a swap it keeps new sessions on the old
-release until it exits. Retiring checks that the hello on the retiring
-connection is the supervisor observed before the swap (pid, process start
-and executable), sends `list` again, and only on an empty answer sends
-`shutdown` (never forced) on that same connection. That is the narrowest
-fence the daemon wire offers, not an atomic one: the supervisor accepts
-`shutdown` unconditionally, so a session another client creates between
-that `list` answer and the `shutdown` would be stopped too (the same
-window as pa-cli's own stale-daemon replacement,
-crates/pa-cli/src/interactive_mode/daemon.rs shutdown_stale_daemon). A
-supervisor with sessions in its `list` answer is never sent `shutdown`.
+It sends nothing but `list`, and so it stops nothing. A supervisor of
+another release with the same protocol and schema stays `current` to new
+clients and spawns every worker from its own binary, so after a swap it
+keeps new sessions on the old release until it exits; rollout records that
+in its receipt. Stopping it safely needs a shutdown the supervisor refuses
+while it hosts sessions, decided atomically with session admission. The
+daemon wire has no such command (`shutdown` is unconditional), so these
+scripts leave the supervisor alone.
 """
 
 from __future__ import annotations
@@ -56,8 +48,6 @@ import side_by_side as sbs
 
 DAEMON_PROTOCOL_NAME = "prime-agent.daemon"
 IDLE_STATES = frozenset({"absent", "not-listening", "idle"})
-# What makes the retiring connection's supervisor the one observed earlier.
-RETIRE_IDENTITY = ("supervisorPid", "supervisorProcessStartId", "executablePath")
 CONNECT_TIMEOUT_SECONDS = 2.0
 # pa-cli's probe_daemon waits 1.5s for the hello and 30s for `list` (a busy
 # supervisor answers list from every worker's state).
@@ -122,8 +112,10 @@ def hello_identity(hello: dict) -> dict:
 
 def install_of(identity: dict, prefix: Path) -> str | None:
     """The install (<prefix>/<version>/) whose executable the supervisor
-    runs, or None when its executable is not in one. Linux reports a
-    replaced binary as "<path> (deleted)"."""
+    runs, or None when its executable is not in one. This, not the hello's
+    appVersion (the compiled Cargo version, the same for every Oneiron build
+    of one base), names the release. Linux reports a replaced binary as
+    "<path> (deleted)"."""
     executable = identity.get("executablePath")
     if not isinstance(executable, str):
         return None
@@ -147,37 +139,8 @@ def foreign_reason(identity: dict, socket_path: Path, prefix: Path) -> str | Non
     return None
 
 
-def command_envelope(hello: dict, command: str) -> tuple[str, bytes]:
-    request_id = f"oneiron-{command}-{uuid.uuid4().hex[:12]}"
-    envelope = {"type": "command", "id": request_id, "protocol": hello["protocol"],
-                "clientId": f"oneiron-rollout:{uuid.uuid4()}", "command": {"type": command, "id": request_id}}
-    return request_id, (json.dumps(envelope) + "\n").encode()
-
-
-def wait_until_gone(socket_path: Path, deadline: float) -> bool:
-    """True once nothing accepts on socket_path (the supervisor removes its
-    socket on exit); False if something still does at the deadline."""
-    while True:
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        with probe:
-            probe.settimeout(CONNECT_TIMEOUT_SECONDS)
-            try:
-                probe.connect(str(socket_path))
-            except OSError:
-                return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.1)
-
-
-def inspect(socket_path: Path, prefix: Path, *, retire: dict | None = None) -> dict:
-    """The Rust supervisor at socket_path, classified (see the module doc).
-
-    retire=<the RETIRE_IDENTITY fields observed before the swap> also stops
-    it, but only when this connection's hello is that same supervisor and
-    its `list` comes back empty: `shutdown` (never forced) on this
-    connection, then a bounded wait until the socket stops accepting.
-    Recorded under "retire"."""
+def inspect(socket_path: Path, prefix: Path) -> dict:
+    """The Rust supervisor at socket_path, classified (see the module doc)."""
     socket_path = Path(os.path.abspath(socket_path))
     report: dict = {"socket": str(socket_path)}
     for root in sbs.protected_roots():
@@ -206,35 +169,19 @@ def inspect(socket_path: Path, prefix: Path, *, retire: dict | None = None) -> d
         problem = foreign_reason(report, socket_path, prefix)
         if problem:
             return {**report, "state": "foreign", "detail": problem}
-        if retire is not None and {key: report[key] for key in RETIRE_IDENTITY} != retire:
-            # Another supervisor answers now: it was never checked, so it is
-            # sent nothing at all.
-            return {**report, "state": "replaced",
-                    "retire": {"acknowledged": False, "stopped": False,
-                               "detail": "a different supervisor answers than the one checked before the swap"}}
-        request_id, request = command_envelope(hello, "list")
+        request_id = f"oneiron-list-{uuid.uuid4().hex[:12]}"
+        envelope = {"type": "command", "id": request_id, "protocol": hello["protocol"],
+                    "clientId": f"oneiron-rollout:{uuid.uuid4()}", "command": {"type": "list", "id": request_id}}
         try:
-            conn.sendall(request)
+            conn.sendall((json.dumps(envelope) + "\n").encode())
         except OSError as error:
             return {**report, "state": "unknown", "detail": f"send list: {error}"}
         response = reader.next_matching({"type": "response", "id": request_id},
                                         time.monotonic() + LIST_TIMEOUT_SECONDS)
-        if response is None:
-            return {**report, "state": "unknown", "detail": "no response to list"}
-        data = response.get("data")
-        sessions = data.get("sessions") if isinstance(data, dict) else None
-        if response.get("success") is not True or not isinstance(sessions, list):
-            return {**report, "state": "unknown", "detail": f"list failed: {response.get('error')!r}"}
-        report.update(state="busy" if sessions else "idle", sessionCount=len(sessions))
-        if retire is None or sessions:
-            return report
-        request_id, request = command_envelope(hello, "shutdown")
-        try:
-            conn.sendall(request)
-        except OSError as error:
-            return {**report, "retire": {"acknowledged": False, "stopped": False, "detail": f"send: {error}"}}
-        response = reader.next_matching({"type": "response", "id": request_id},
-                                        time.monotonic() + HELLO_TIMEOUT_SECONDS)
-    acknowledged = response is not None and response.get("success") is True
-    stopped = acknowledged and wait_until_gone(socket_path, time.monotonic() + LIST_TIMEOUT_SECONDS)
-    return {**report, "retire": {"acknowledged": acknowledged, "stopped": stopped}}
+    if response is None:
+        return {**report, "state": "unknown", "detail": "no response to list"}
+    data = response.get("data")
+    sessions = data.get("sessions") if isinstance(data, dict) else None
+    if response.get("success") is not True or not isinstance(sessions, list):
+        return {**report, "state": "unknown", "detail": f"list failed: {response.get('error')!r}"}
+    return {**report, "state": "busy" if sessions else "idle", "sessionCount": len(sessions)}

@@ -133,6 +133,17 @@ for protected in "$HOME/.prime/agent" "${{XDG_DATA_HOME:-$HOME/.local/share}}/pr
 done
 if [ ! -e "$agent_dir" ]; then (umask 077 && mkdir -p "$agent_dir"); fi
 
+# The kernel imports bundled Python skills in place (editable installs from
+# the release dir): their bytecode goes to this cache, never into the
+# immutable install, whose payload digest rollout and rollback check. It
+# must resolve inside the agent dir (a symlink out of it is refused).
+py_cache=$(canon "$agent_dir/python-cache")
+case "$py_cache/" in
+  "$agent_dir"/?*/) ;;
+  *) die "refusing Python cache $py_cache: it resolves outside the agent dir $agent_dir" ;;
+esac
+if [ ! -e "$py_cache" ]; then (umask 077 && mkdir -p "$py_cache"); fi
+
 kernel_venv=${{PRIME_AGENT_RS_KERNEL_VENV:-$agent_dir/kernel-venv}}
 absolute PRIME_AGENT_RS_KERNEL_VENV "$kernel_venv"
 kernel_venv=$(canon "$kernel_venv")
@@ -149,10 +160,7 @@ PRIME_AGENT_DISABLE_SELF_UPDATE=1
 PRIME_AGENT_RUST_INSTALLER_URL=http://127.0.0.1:1/oneiron-self-update-disabled
 PRIME_AGENT_DOWNLOAD_BASE_URL=http://127.0.0.1:1/oneiron-feed-disabled
 PI_SKIP_VERSION_CHECK=1
-# The kernel imports bundled Python skills in place (editable installs from
-# the release dir): their bytecode goes here, never into the immutable
-# install, whose payload digest rollout and rollback check.
-PYTHONPYCACHEPREFIX=$agent_dir/python-cache
+PYTHONPYCACHEPREFIX=$py_cache
 export PRIME_AGENT_CODING_AGENT_DIR PRIME_AGENT_SOCKET_DIR PRIME_AGENT_DAEMON_SOCKET PRIME_AGENT_KERNEL_VENV \\
   PRIME_AGENT_DISABLE_SELF_UPDATE PRIME_AGENT_RUST_INSTALLER_URL PRIME_AGENT_DOWNLOAD_BASE_URL PI_SKIP_VERSION_CHECK \\
   PYTHONPYCACHEPREFIX
@@ -191,7 +199,11 @@ def payload_digest(directory: Path) -> str:
     """One sha256 over an install's whole payload: every dir and regular
     file by relative path, with each file's executable bit and content hash.
     Equal digests mean equal trees, so a reused or rolled-back install is
-    checked in full, not just by its executable."""
+    checked in full, not just by its executable. The install dir itself
+    must be a real directory: a link to an identical tree elsewhere is not
+    the install."""
+    if directory.is_symlink() or not directory.is_dir():
+        raise SystemExit(f"error: {directory} is not a plain directory; an install is never a link")
     digest = hashlib.sha256()
     for path in sorted(directory.rglob("*")):
         relative = path.relative_to(directory).as_posix()
@@ -769,9 +781,6 @@ def add_idle_args(command: argparse.ArgumentParser) -> None:
     command.add_argument("--force-idle-check-skip", action="store_true",
                          help="proceed even when the Rust daemon has live sessions or cannot be "
                               "checked (they keep running the old binary)")
-    command.add_argument("--retire-idle-daemon", action="store_true",
-                         help="after the swap, stop the Rust supervisor if it is still idle and runs "
-                              "another version, so the next run starts the selected one")
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:

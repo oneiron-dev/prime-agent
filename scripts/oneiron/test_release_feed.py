@@ -310,9 +310,19 @@ class PackageTests(FeedFixture):
         source = json.loads((self.release() / "manifest.json").read_text())["source"]
         self.assertEqual((source["dirty"], source["build"].endswith("-dirty"), source["dirtySha256"]),
                          (True, True, release_feed.dirty_digest(self.source)))
-        # Another uncommitted state is another digest.
+        # Another uncommitted state is another digest: content, an untracked
+        # file's mode, or an untracked symlink's target.
+        digests = [source["dirtySha256"]]
+        (self.source / "untracked.txt").chmod(0o755)
+        digests.append(release_feed.dirty_digest(self.source))
         (self.source / "untracked.txt").write_text("other content")
-        self.assertNotEqual(release_feed.dirty_digest(self.source), source["dirtySha256"])
+        digests.append(release_feed.dirty_digest(self.source))
+        (self.source / "link").symlink_to("marker")
+        digests.append(release_feed.dirty_digest(self.source))
+        (self.source / "link").unlink()
+        (self.source / "link").symlink_to("RUST-BASE.md")
+        digests.append(release_feed.dirty_digest(self.source))
+        self.assertEqual(len(set(digests)), len(digests))
 
     def test_feed_pointers_never_move_back(self) -> None:
         newer = "0.9.8-oneiron.20261001.10"

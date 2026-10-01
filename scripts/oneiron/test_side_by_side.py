@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -282,6 +283,20 @@ class SideBySideTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, override)
             self.assertIn("overlaps TS state", result.stderr)
         self.assertEqual(sorted(os.listdir(ts_sock)), [])
+
+    def test_launcher_refuses_a_python_cache_that_leads_out_of_the_agent_dir(self) -> None:
+        # Bytecode is written wherever the cache resolves: a link out of the
+        # Rust agent dir (into TS state, here) is refused before any run.
+        self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)
+        cache = self.agent_dir / "python-cache"
+        with contextlib.suppress(FileNotFoundError):
+            cache.rmdir()  # the install's own launcher run created it, empty
+        cache.symlink_to(self.ts_agent, target_is_directory=True)
+        before = sorted(os.listdir(self.ts_agent))
+        result = self.run_launcher()
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertIn("resolves outside the agent dir", result.stderr)
+        self.assertEqual(sorted(os.listdir(self.ts_agent)), before)
 
     def test_launcher_refuses_the_ts_kernel_venv(self) -> None:
         self.assertEqual(self.run_main("install", "--stage-dir", str(make_stage(self.root))), 0)

@@ -113,13 +113,20 @@ def git(root: Path, *args: str) -> str:
 
 def dirty_digest(root: Path) -> str:
     """One sha256 over a checkout's uncommitted state: the binary diff
-    against HEAD plus every untracked, unignored file by name and content,
-    so an allowed dirty release names exactly what it carried."""
+    against HEAD (tracked content and mode changes) plus every untracked,
+    unignored entry by name, kind and mode, with a file's content hash or
+    a symlink's target, so an allowed dirty release names exactly what it
+    carried."""
     diff = subprocess.run(["git", "-C", str(root), "diff", "HEAD", "--binary"], capture_output=True, check=True)
     digest = hashlib.sha256(diff.stdout)
     untracked = git(root, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
     for name in sorted(filter(None, untracked)):
-        digest.update(f"\0{name}\0{sbs.sha256_file(root / name)}".encode())
+        path = root / name
+        if path.is_symlink():
+            entry = f"link {os.readlink(path)}"
+        else:
+            entry = f"file {path.stat().st_mode & 0o7777:o} {sbs.sha256_file(path)}"
+        digest.update(f"\0{name}\0{entry}".encode())
     return digest.hexdigest()
 
 

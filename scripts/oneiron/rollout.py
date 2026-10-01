@@ -15,9 +15,8 @@
             the TS launcher, the feed pointers
 
 Both swaps refuse unless the Rust supervisor is idle (daemon_idle.py). They
-stop it only with --retire-idle-daemon, after the swap, when it is still idle
-and runs another version; otherwise the receipt notes that it keeps new
-sessions on its version until it exits. Each run holds the prefix lock from
+never stop it: when it runs another release, the receipt notes that it keeps
+new sessions on that release until it exits. Each run holds the prefix lock from
 its first check to its receipt, so a concurrent run is turned away before it
 records anything. Every refusal or failure after the arguments check out is
 written as a receipt; an earlier receipt of the same name is kept beside it
@@ -141,30 +140,21 @@ def idle_gate(receipt: Receipt, key: str, args: argparse.Namespace, prefix: Path
                   f"{hint}, or pass --force-idle-check-skip")
 
 
-def retire_old_daemon(receipt: Receipt, args: argparse.Namespace, prefix: Path, version: str) -> None:
+def note_old_daemon(receipt: Receipt, prefix: Path, version: str) -> None:
     """The swap does not reach a running supervisor: one of another release
     but the same protocol and schema is still `current` to new clients, and
-    it spawns every worker from its own (old) binary. Its release is told by
-    its executable path (the hello's appVersion is the compiled Cargo
-    version, the same for every Oneiron build of one base). On request, and
-    only when the retiring connection finds that same supervisor (pid,
-    process start, executable) still idle, stop it, so the next
-    prime-agent-rs run starts `version`; otherwise say so."""
+    it spawns every worker from its own (old) binary until it exits. Its
+    release is told by its executable path (the hello's appVersion is the
+    compiled Cargo version, the same for every Oneiron build of one base).
+    Nothing here stops it (see daemon_idle); the receipt says it runs on."""
     observed = receipt.data["rustDaemon"]["idleBeforeSelect"]
     if observed["state"] not in ("idle", "busy"):
         return
     running = daemon_idle.install_of(observed, prefix)
     if running == version:
         return
-    if args.retire_idle_daemon:
-        result = daemon_idle.inspect(rust_socket(args), prefix,
-                                     retire={key: observed.get(key) for key in daemon_idle.RETIRE_IDENTITY})
-        receipt.data["rustDaemon"]["retire"] = result
-        if result.get("retire", {}).get("stopped"):
-            return
     receipt.data["notice"] = (f"the Rust supervisor at {observed['socket']} still runs {running}; new sessions "
-                              "start on it until it exits"
-                              + ("" if args.retire_idle_daemon else " (--retire-idle-daemon stops it when idle)"))
+                              f"start on it, not on {version}, until it exits")
     print(f"note: {receipt.data['notice']}")
 
 
@@ -197,8 +187,8 @@ def rollout(args: argparse.Namespace) -> int:
     # The whole run, receipt included, holds the prefix lock: a concurrent
     # rollout or rollback is turned away before it records anything. A
     # version that is already current runs through every phase again (that
-    # re-verifies it, and finishes an interrupted activation or a requested
-    # retirement); the swap itself is then a no-op.
+    # re-verifies it and finishes an interrupted activation); the swap
+    # itself is then a no-op.
     with sbs.locked(prefix):
         receipt_dir = sbs.plain_dir(prefix, "receipts", f"{version}-{platform}")
         receipt = Receipt(receipt_dir / "ACTIVATION-RECEIPT.json", ACTIVATION_SCHEMA, version=version,
@@ -228,7 +218,7 @@ def rollout(args: argparse.Namespace) -> int:
                 with receipt.phase("post-check"):
                     post_check(receipt, prefix, bin_dir, version)
                 with receipt.phase("old-daemon"):
-                    retire_old_daemon(receipt, args, prefix, version)
+                    note_old_daemon(receipt, prefix, version)
 
         code = receipt.run(steps)
         receipt.data["after"] = pointer_state(prefix, bin_dir)
@@ -439,7 +429,7 @@ def rollback(args: argparse.Namespace) -> int:
             with receipt.phase("post-check"):
                 post_check(receipt, prefix, bin_dir, target)
             with receipt.phase("old-daemon"):
-                retire_old_daemon(receipt, args, prefix, target)
+                note_old_daemon(receipt, prefix, target)
 
         code = receipt.run(steps)
         receipt.data["after"] = pointer_state(prefix, bin_dir)
