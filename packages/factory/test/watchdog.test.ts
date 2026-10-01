@@ -1,6 +1,16 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, inject, it } from "vitest";
@@ -9,6 +19,7 @@ import { FactoryEngine } from "../src/engine.js";
 import { FactoryStore } from "../src/store.js";
 import type { AttemptContext, Inspection } from "../src/types.js";
 import {
+	factoryWatchdog,
 	reduceSignals,
 	runFactoryWatchdogCli,
 	servesFactory,
@@ -104,15 +115,24 @@ it("finds this package's serve by its exact entry and directory, and refuses a b
 	expect([
 		serves(["node", entry, "serve", "factory"]),
 		serves(["node", join(root, "bin", "prime-agent-factory"), "serve", "."], factory),
-		serves(["node", "dist/cli-entry.js", "serve", factory]),
+		serves(["/usr/bin/node", "dist/cli-entry.js", "serve", factory]),
 		serves(["node", "--import", "loader.mjs", entry, "serve", factory, "--interval-ms", "50"]),
+		serves(["node", "--enable-source-maps", "--title=factory", "-r", "x.cjs", entry, "serve", factory]),
+		serves(["node", entry, "serve", "--interval-ms", "50", factory]),
+	]).toEqual([true, true, true, true, true, true]);
+	expect([
 		serves(["node", entry, "serve", "other"]),
 		serves(["node", entry, "serve"], factory),
 		serves(["node", entry, "status", factory]),
 		serves(["node", join(root, "other.js"), "serve", factory]),
 		// The old in-binary form names no entry of this package.
 		serves(["node", "cli.js", "factory", "serve", factory]),
-	]).toEqual([true, true, true, true, false, false, false, false, false]);
+		// The entry as some other program's data: another interpreter, another script, inline code.
+		serves(["python3", "-c", "pass", entry, "serve", factory]),
+		serves(["node", join(root, "other.js"), entry, "serve", factory]),
+		serves(["node", "-e", "setInterval(() => {}, 1000)", entry, "serve", factory]),
+		serves(["node", "--require", entry, join(root, "other.js"), "serve", factory]),
+	]).toEqual([false, false, false, false, false, false, false, false, false]);
 	const usage = console.error;
 	console.error = () => undefined;
 	try {
@@ -125,34 +145,8 @@ it("finds this package's serve by its exact entry and directory, and refuses a b
 	}
 });
 
-/**
- * A REJECTED action in a real factory directory, and a watchdog state past its silent baseline. `launcher` records
- * a launch on that configured host with that agent path.
- */
-async function rejectedFactory(root: string, launcher?: { host: "local" | "remote"; agent: string }): Promise<string> {
-	const factory = join(root, "factory");
-	mkdirSync(factory);
-	mkdirSync(join(root, "work"));
-	writeFileSync(
-		join(factory, "config.json"),
-		JSON.stringify({
-			version: 1,
-			hosts: {
-				local: { type: "local", runnerRoot: join(root, "attempts") },
-				remote: { type: "ssh", sshHost: "factory-host", runnerRoot: "/attempts" },
-			},
-			...(launcher
-				? {
-						launcher: {
-							host: launcher.host,
-							repo: join(root, "repo"),
-							work: join(root, "work"),
-							primeAgentBin: launcher.agent,
-						},
-					}
-				: {}),
-		}),
-	);
+/** Reject action `id` of ticket T in the factory's store, through an adapter whose every attempt exits 1. */
+async function reject(factory: string, id: string): Promise<void> {
 	const store = new FactoryStore(join(factory, "factory.db"));
 	try {
 		const failed = async (context: AttemptContext): Promise<Inspection> => ({
@@ -165,32 +159,73 @@ async function rejectedFactory(root: string, launcher?: { host: "local" | "remot
 			},
 		});
 		const engine = new FactoryEngine(store, { launch: failed, inspect: failed }, { enabled: true });
-		engine.applyPlan({
-			version: 1,
-			tickets: [{ id: "T", owner: "owner" }],
-			slots: [{ id: "slot", host: "local" }],
-			actions: [
-				{
-					id: "a",
-					ticketId: "T",
-					dependencies: [],
-					sourceFingerprint: "opaque:a",
-					command: { argv: ["false"], cwd: root },
-					requirements: {},
-				},
-			],
-		});
+		const action = {
+			id,
+			ticketId: "T",
+			dependencies: [],
+			sourceFingerprint: `opaque:${id}`,
+			command: { argv: ["false"], cwd: factory },
+			requirements: {},
+		};
+		const ticket = { id: "T", owner: "owner" };
+		engine.applyPlan(
+			{ version: 1, tickets: [ticket], slots: [{ id: "slot", host: "local" }], actions: [action] },
+			store.planRevision(),
+		);
 		await engine.tick();
-		expect(store.actions().map((action) => action.state)).toEqual(["REJECTED"]);
+		expect(store.actions().find((candidate) => candidate.id === id)?.state).toBe("REJECTED");
 	} finally {
 		store.close();
 	}
+}
+type Launcher = { host: "local" | "remote"; agent: string };
+/** What a launch on that configured host with that agent path leaves in config.json, replaced whole. */
+function recordLaunch(root: string, launcher?: Launcher): void {
+	const path = join(root, "factory", "config.json");
+	const hosts = {
+		local: { type: "local", runnerRoot: join(root, "attempts") },
+		remote: { type: "ssh", sshHost: "factory-host", runnerRoot: "/attempts" },
+	};
+	const recorded = launcher && {
+		host: launcher.host,
+		repo: join(root, "repo"),
+		work: join(root, "work"),
+		primeAgentBin: launcher.agent,
+	};
+	writeFileSync(`${path}.tmp`, JSON.stringify({ version: 1, hosts, ...(recorded ? { launcher: recorded } : {}) }));
+	renameSync(`${path}.tmp`, path);
+}
+/** A REJECTED action `a` in a real factory directory, and a watchdog state past its silent baseline. */
+async function rejectedFactory(root: string, launcher?: Launcher): Promise<string> {
+	const factory = join(root, "factory");
+	mkdirSync(factory);
+	mkdirSync(join(root, "work"));
+	recordLaunch(root, launcher);
+	await reject(factory, "a");
 	mkdirSync(join(factory, "watchdog"));
 	writeFileSync(
 		join(factory, "watchdog", "state.json"),
 		JSON.stringify({ version: 1, session: "owner", factory, sequence: 0, initialized: true }),
 	);
 	return factory;
+}
+/** An agent binary that records each call and acknowledges every send as queued. */
+function recordingAgent(root: string, name: string): { binary: string; sends: () => string[][] } {
+	const binary = join(root, name);
+	const calls = join(root, `${name}-calls.jsonl`);
+	writeFileSync(
+		binary,
+		`#!${process.execPath}\nrequire("node:fs").appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + "\\n");\nprocess.stdout.write(JSON.stringify({ deliveryStatus: "queued" }));\n`,
+		{ mode: 0o755 },
+	);
+	const sends = () =>
+		existsSync(calls)
+			? readFileSync(calls, "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line) as string[])
+			: [];
+	return { binary, sends };
 }
 
 it.each([
@@ -203,7 +238,7 @@ it.each([
 	async (_name, selection) => {
 		const root = mkdtempSync(join(tmpdir(), "factory-watchdog-"));
 		roots.push(root);
-		const agent = join(root, "agent");
+		const { binary: agent, sends } = recordingAgent(root, "agent");
 		const factory = await rejectedFactory(
 			root,
 			selection === "local"
@@ -211,12 +246,6 @@ it.each([
 				: selection === "remote"
 					? { host: "remote", agent: "/remote/only/prime-agent" }
 					: undefined,
-		);
-		const calls = join(root, "agent-calls.jsonl");
-		writeFileSync(
-			agent,
-			`#!${process.execPath}\nrequire("node:fs").appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + "\\n");\nprocess.stdout.write(JSON.stringify({ deliveryStatus: "queued" }));\n`,
-			{ mode: 0o755 },
 		);
 		const watchdog = spawn(
 			process.execPath,
@@ -238,14 +267,10 @@ it.each([
 		);
 		try {
 			await fileReady(join(factory, "watchdog", "deliveries.jsonl"), holdsLine);
-			const sends = readFileSync(calls, "utf8")
-				.trim()
-				.split("\n")
-				.map((line) => JSON.parse(line) as string[]);
 			// status and events went to the factory entry; the agent saw exactly one send for the new rejection.
-			expect(sends).toHaveLength(1);
-			expect(sends[0]!.slice(0, 4)).toEqual(["send", "--json", "owner", "--message"]);
-			const key = sends[0]![4]!.match(/^\[FACTORY_EXCEPTION (action:a:[^\]]+)\] a: REJECTED;/)?.[1];
+			const [send, ...rest] = sends();
+			expect([send!.slice(0, 4), rest]).toEqual([["send", "--json", "owner", "--message"], []]);
+			const key = send![4]!.match(/^\[FACTORY_EXCEPTION (action:a:[^\]]+)\] a: REJECTED;/)?.[1];
 			const delivered = JSON.parse(readFileSync(join(factory, "watchdog", "deliveries.jsonl"), "utf8"));
 			expect([delivered.key, delivered.receipt]).toEqual([key, { deliveryStatus: "queued" }]);
 		} finally {
@@ -254,3 +279,27 @@ it.each([
 		}
 	},
 );
+
+it("re-reads the agent binary a relaunch recorded on every pass, and refuses an SSH factory without a local route", async () => {
+	const root = mkdtempSync(join(tmpdir(), "factory-watchdog-"));
+	roots.push(root);
+	const [first, second] = [recordingAgent(root, "agent-a"), recordingAgent(root, "agent-b")];
+	const factory = await rejectedFactory(root, { host: "local", agent: first.binary });
+	const env = { ...process.env, [AGENT_BINARY_ENV]: "" };
+	const factoryArgv = [process.execPath, join(inject("factoryDist"), "cli-entry.js")];
+	const watchdog = factoryWatchdog({ factory, session: "owner", factoryArgv, env });
+	await watchdog.pass();
+	// A relaunch switches the binary while the watchdog runs; the next exception goes through the new one.
+	recordLaunch(root, { host: "local", agent: second.binary });
+	await reject(factory, "b");
+	await watchdog.pass();
+	const key = (send: string[]) => send[4]?.match(/^\[FACTORY_EXCEPTION (action:[ab]):/)?.[1];
+	expect([first.sends().map(key), second.sends().map(key)]).toEqual([["action:a"], ["action:b"]]);
+	// The recorded path of an SSH launcher names a binary over there: no local agent stands in for it.
+	recordLaunch(root, { host: "remote", agent: second.binary });
+	expect(() => factoryWatchdog({ factory, session: "owner", factoryArgv, env })).toThrow(
+		`the factory's agent binary ${second.binary} is on SSH host remote; pass --agent-bin or set ${AGENT_BINARY_ENV}`,
+	);
+	const explicit = { ...env, [AGENT_BINARY_ENV]: first.binary };
+	expect(() => factoryWatchdog({ factory, session: "owner", factoryArgv, env: explicit })).not.toThrow();
+});

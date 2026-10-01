@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { CommandAdapter, fingerprintCommand } from "./adapters/command.js";
 import { DEFAULT_SEATS } from "./adapters/oneiron-settings.js";
@@ -165,11 +165,12 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 				const settings = agent ? { ...requested, primeAgentBin: agent.binary } : requested;
 				const result = launchTickets(store, settings, tickets);
 				if (agent) store.pinAgent({ host: settings.host, ...agent }, "launch");
-				writeFileSync(
-					join(directory, "config.json"),
-					`${JSON.stringify({ ...config, launcher: settings }, null, 2)}\n`,
-					{ mode: 0o600 },
-				);
+				// Replaced whole, never rewritten in place: a running serve and the watchdog re-read it.
+				const configPath = join(directory, "config.json");
+				writeFileSync(`${configPath}.tmp`, `${JSON.stringify({ ...config, launcher: settings }, null, 2)}\n`, {
+					mode: 0o600,
+				});
+				renameSync(`${configPath}.tmp`, configPath);
 				emit({ ...result, skipped, tickets: tickets.length, agentBinary: agent?.binary ?? null });
 				break;
 			}
@@ -258,8 +259,12 @@ export async function runFactoryCli(args: readonly string[]): Promise<void> {
 			case "serve":
 			case "run":
 				await serve(engine, integer(options.get("--interval-ms"), 1000, 50), () => {
-					if (!config.launcher || engine.status().paused) return;
-					const imported = importSplits(store, config.launcher);
+					if (engine.status().paused) return;
+					// The launcher as the last launch wrote it: a relaunch that changed the settings or the agent
+					// binary reaches the follow-ups this running server imports.
+					const { launcher } = readFactoryConfig(directory);
+					if (!launcher) return;
+					const imported = importSplits(store, launcher);
 					if (imported.length) emit({ splitsImported: imported });
 				});
 				break;

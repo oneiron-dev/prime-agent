@@ -12,10 +12,10 @@ import {
 	watch,
 	writeFileSync,
 } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { agentSelection } from "./agent-command.js";
-import { readFactoryConfig } from "./config.js";
+import { AGENT_BINARY_ENV, agentSelection } from "./agent-command.js";
+import { type FactoryConfig, readFactoryConfig } from "./config.js";
 import { invokedDirectly, locateFactoryEntrypoint } from "./runtime.js";
 import type { FactoryStatus } from "./types.js";
 
@@ -163,18 +163,73 @@ function canonical(path: string): string {
 		return path;
 	}
 }
+/** Node options whose value is the next argument; the `--name=value` form needs no entry here. */
+const NODE_VALUE_OPTIONS = new Set([
+	"-r",
+	"--require",
+	"--import",
+	"--loader",
+	"--experimental-loader",
+	"-C",
+	"--conditions",
+	"--env-file",
+	"--env-file-if-exists",
+	"--input-type",
+	"--title",
+	"--inspect-port",
+	"--debug-port",
+	"--disable-warning",
+	"--redirect-warnings",
+	"--watch-path",
+	"--diagnostic-dir",
+	"--report-dir",
+	"--report-directory",
+	"--report-filename",
+	"--report-signal",
+	"--cpu-prof-dir",
+	"--cpu-prof-name",
+	"--heap-prof-dir",
+	"--heap-prof-name",
+	"--icu-data-dir",
+	"--openssl-config",
+	"--tls-keylog",
+	"--tls-cipher-list",
+	"--trace-event-categories",
+	"--trace-event-file-pattern",
+	"--unhandled-rejections",
+	"--dns-result-order",
+	"--snapshot-blob",
+	"--localstorage-file",
+	"--experimental-config-file",
+]);
+/** Node options that run code from the command line instead of a script. */
+const NODE_PROGRAM_OPTIONS = new Set(["-e", "--eval", "-p", "--print", "-i", "--interactive", "--test", "--run"]);
 /**
- * Whether a command line is this package's `serve` of this factory: an argument that is exactly the factory entry
- * (`entry`, canonical; a bin symlink or a relative path resolves to it), then `serve`, then the directory. Relative
- * paths are read from the serve's cwd.
+ * Whether a command line is this package's `serve` of this factory: Node running exactly the factory entry as its
+ * script (`entry`, canonical; a bin symlink or a relative path resolves to it), with `serve` and then the directory
+ * as the first command arguments. The entry appearing anywhere else, as some other program's data, is not a serve.
+ * Relative paths are read from the serve's cwd.
  */
 export function servesFactory(argv: string[], cwd: () => string, factory: string, entry: string): boolean {
-	for (let index = 0; index + 2 < argv.length; index++) {
-		const candidate = argv[index]!;
-		if (argv[index + 1] !== "serve" || !candidate) continue;
-		if (canonical(resolve(isAbsolute(candidate) ? "/" : cwd(), candidate)) !== entry) continue;
-		const target = argv[index + 2]!;
-		return resolve(isAbsolute(target) ? "/" : cwd(), target) === factory;
+	if (!/^node(?:js)?[\d.-]*$/.test(basename(argv[0] ?? ""))) return false;
+	let index = 1;
+	for (; index < argv.length; index++) {
+		const option = argv[index]!;
+		if (option === "--") {
+			index++;
+			break;
+		}
+		if (!option.startsWith("-") || option === "-") break;
+		if (NODE_PROGRAM_OPTIONS.has(option.split("=")[0]!)) return false;
+		if (!option.includes("=") && NODE_VALUE_OPTIONS.has(option)) index++;
+	}
+	const at = (path: string) => resolve(isAbsolute(path) ? "/" : cwd(), path);
+	const script = argv[index];
+	if (!script || canonical(at(script)) !== entry || argv[index + 1] !== "serve") return false;
+	// Every factory option takes a value, so the directory is the first argument after serve that is neither.
+	for (let next = index + 2; next < argv.length; next += 2) {
+		const argument = argv[next]!;
+		if (!argument.startsWith("--")) return at(argument) === factory;
 	}
 	return false;
 }
@@ -194,28 +249,67 @@ function servePresent(factory: string, entry: string): boolean | undefined {
 	return false;
 }
 
-export async function runFactoryWatchdog(options: {
+/**
+ * The agent binary that delivers a message: `--agent-bin`, else the factory's recorded `launcher.primeAgentBin`
+ * when its launcher host is this machine, else `PRIME_AGENT_FACTORY_AGENT_BIN`, else `prime-agent` on PATH. An SSH
+ * launcher's recorded path names a binary on that host, so such a factory needs `--agent-bin` or the environment:
+ * an unrelated local `prime-agent` is never substituted for it.
+ */
+export function deliveryAgent(
+	config: FactoryConfig,
+	explicit: string[] | undefined,
+	env: NodeJS.ProcessEnv,
+): string[] {
+	if (explicit) return explicit;
+	const launcher = config.launcher;
+	const host = launcher ? config.hosts[launcher.host] : undefined;
+	if (launcher && host?.type === "ssh" && !env[AGENT_BINARY_ENV])
+		throw new Error(
+			`the factory's agent binary ${launcher.primeAgentBin ?? "(none recorded)"} is on SSH host ${launcher.host}; pass --agent-bin or set ${AGENT_BINARY_ENV} to the agent on this machine that delivers to the owner session`,
+		);
+	return [agentSelection(undefined, host?.type === "local" ? launcher?.primeAgentBin : undefined, env)];
+}
+
+export interface WatchdogOptions {
 	factory: string;
 	session: string;
-	/** The agent binary that delivers a message (`send --json`); defaults to the factory's selected agent. */
+	/** The agent binary that delivers a message (`send --json`); defaults to `deliveryAgent`. */
 	agentArgv?: string[];
+	/** How to run this package's CLI for `status` and `events`; defaults to this installation's entry. */
+	factoryArgv?: string[];
+	env?: NodeJS.ProcessEnv;
 	stateDirectory?: string;
 	diskLowGiB?: number;
-}): Promise<void> {
+}
+/** One factory's watchdog: `pass` snapshots, folds and delivers at most one alert. */
+export interface FactoryWatchdog {
+	pass(): Promise<void>;
+}
+
+/**
+ * Set up the watchdog of one factory and one owner session. Each pass reads the factory's config again, so a
+ * relaunch that switched the agent binary or the launcher settings reaches a watchdog that is already running.
+ * A delivery route that cannot work is refused here, before anything is watched.
+ */
+export function factoryWatchdog(options: WatchdogOptions): FactoryWatchdog {
 	const factory = resolve(options.factory);
-	const config = readFactoryConfig(factory);
-	const launcher = config.launcher;
-	const work = launcher?.work;
-	const host = launcher ? config.hosts[launcher.host] : undefined;
-	const runnerRoot = host && host.type !== "ssh" ? host.runnerRoot : undefined;
-	// The runner's own default floor: below it cargoTest waits, so that is when the owner hears of it.
-	const diskLowGiB = options.diskLowGiB ?? launcher?.diskFloorGiB ?? 100;
+	const env = options.env ?? process.env;
 	const entrypoint = locateFactoryEntrypoint();
-	const factoryArgv = [entrypoint.node, ...entrypoint.execArgv, entrypoint.entry];
-	// The recorded agent path belongs to the runner host; it names a binary here only when that host is this one.
-	const recordedAgent = host?.type === "local" ? launcher?.primeAgentBin : undefined;
-	const agentArgv = options.agentArgv ?? [agentSelection(undefined, recordedAgent, process.env)];
-	const entry = canonical(entrypoint.entry);
+	const factoryArgv = options.factoryArgv ?? [entrypoint.node, ...entrypoint.execArgv, entrypoint.entry];
+	const entry = canonical(factoryArgv.at(-1)!);
+	const route = () => {
+		const config = readFactoryConfig(factory);
+		const launcher = config.launcher;
+		const host = launcher ? config.hosts[launcher.host] : undefined;
+		return {
+			work: launcher?.work,
+			runnerRoot: host && host.type !== "ssh" ? host.runnerRoot : undefined,
+			// The runner's own default floor: below it cargoTest waits, so that is when the owner hears of it.
+			diskLowGiB: options.diskLowGiB ?? launcher?.diskFloorGiB ?? 100,
+			agentArgv: deliveryAgent(config, options.agentArgv, env),
+		};
+	};
+	route();
 	const directory = options.stateDirectory ?? join(factory, "watchdog");
 	const statePath = join(directory, "state.json");
 	const receipts = join(directory, "deliveries.jsonl");
@@ -232,12 +326,13 @@ export async function runFactoryWatchdog(options: {
 	};
 	const run = async (argv: string[], args: string[]): Promise<unknown> => {
 		const { stdout } = await execute(argv[0]!, [...argv.slice(1), ...args], {
+			env,
 			timeout: 30_000,
 			maxBuffer: 32 * 1024 * 1024,
 		});
 		return JSON.parse(stdout);
 	};
-	const snapshot = async (): Promise<WatchdogSnapshot> => {
+	const snapshot = async ({ work, runnerRoot }: ReturnType<typeof route>): Promise<WatchdogSnapshot> => {
 		const status = (await run(factoryArgv, ["status", factory])) as FactoryStatus;
 		let sequence = state.sequence;
 		// The native event ledger is read by its durable sequence; ordinary stages never become messages.
@@ -289,7 +384,7 @@ export async function runFactoryWatchdog(options: {
 		};
 	};
 	// One bounded delivery attempt per pass. A failed delivery never advances or removes the outbox item.
-	const deliver = async () => {
+	const deliver = async (agentArgv: string[]) => {
 		const item = state.outbox?.[0];
 		if (!item || item.deliveryPaused || (item.nextAttemptAt ?? 0) > Date.now()) return;
 		const message = `[FACTORY_EXCEPTION ${item.key}] ${item.message} Factory ${factory}, event cursor ${state.sequence}.`;
@@ -314,6 +409,29 @@ export async function runFactoryWatchdog(options: {
 			);
 		}
 	};
+	return {
+		async pass() {
+			try {
+				const current = route();
+				const baseline = !state.initialized;
+				reduceSignals(state, await snapshot(current), { baseline, diskLowGiB: current.diskLowGiB });
+				state.initialized = true;
+				save();
+				await deliver(current.agentArgv);
+			} catch (error) {
+				appendFileSync(
+					join(directory, "errors.log"),
+					`${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}; the outbox is kept\n`,
+				);
+			}
+		},
+	};
+}
+
+/** Run the watchdog until SIGTERM or SIGINT: a pass now, on every factory database write and every 30 seconds. */
+export async function runFactoryWatchdog(options: WatchdogOptions): Promise<void> {
+	const watchdog = factoryWatchdog(options);
+	const factory = resolve(options.factory);
 	let running = false;
 	let again = false;
 	let debounce: NodeJS.Timeout | undefined;
@@ -324,16 +442,7 @@ export async function runFactoryWatchdog(options: {
 		}
 		running = true;
 		try {
-			const baseline = !state.initialized;
-			reduceSignals(state, await snapshot(), { baseline, diskLowGiB });
-			state.initialized = true;
-			save();
-			await deliver();
-		} catch (error) {
-			appendFileSync(
-				join(directory, "errors.log"),
-				`${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}; the outbox is kept\n`,
-			);
+			await watchdog.pass();
 		} finally {
 			running = false;
 			if (again) {
@@ -365,7 +474,7 @@ export async function runFactoryWatchdog(options: {
 
 const USAGE = `Usage: node <package>/dist/watchdog.js --factory <absolute-dir> --session <owner-session-id> [--agent-bin <executable>] [--state-dir <absolute-dir>] [--disk-low-gib <n>]
 Messages the session only for new factory exceptions; state lives in <factory>/watchdog unless --state-dir is set.
-Messages go through the agent binary: --agent-bin, else the factory's launcher.primeAgentBin when its launcher host is local, else PRIME_AGENT_FACTORY_AGENT_BIN, else prime-agent on PATH.`;
+Messages go through the agent binary: --agent-bin, else the factory's launcher.primeAgentBin when its launcher host is local, else PRIME_AGENT_FACTORY_AGENT_BIN, else prime-agent on PATH. A factory whose launcher host is an SSH host needs --agent-bin or PRIME_AGENT_FACTORY_AGENT_BIN.`;
 
 export async function runFactoryWatchdogCli(args: string[]): Promise<number> {
 	const values = new Map<string, string>();
@@ -394,7 +503,12 @@ export async function runFactoryWatchdogCli(args: string[]): Promise<number> {
 		return 2;
 	}
 	const agent = values.get("--agent-bin");
-	await runFactoryWatchdog({ factory, session, agentArgv: agent ? [agent] : undefined, stateDirectory, diskLowGiB });
+	try {
+		await runFactoryWatchdog({ factory, session, agentArgv: agent ? [agent] : undefined, stateDirectory, diskLowGiB });
+	} catch (error) {
+		console.error(`factory watchdog: ${error instanceof Error ? error.message : String(error)}`);
+		return 1;
+	}
 	return 0;
 }
 

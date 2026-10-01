@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -138,6 +138,83 @@ describe("prime-agent-factory CLI", () => {
 		expect(recovered.attempts[0]?.receipt?.exitCode).toBe(0);
 		expect(readFileSync(f.marker, "utf8")).toBe("x");
 		expect(recovered.roles?.writer?.effort).toBe("xhigh");
+	});
+
+	it("imports a SPLIT follow-up in a running serve with the launcher the latest launch recorded", async () => {
+		const f = setup();
+		invoke(["init", f.directory, f.planPath, "--hosts", f.hostsPath]);
+		// The relaunch also moves the work directory, and the leftover exists only under the new one: this serve can
+		// import it only through the launcher the relaunch wrote, never through the one it started with.
+		const launcher = (agent: string, work: string) => ({
+			host: "local",
+			repo: join(f.root, "repo"),
+			work: join(f.root, work),
+			primeAgentBin: agent,
+		});
+		const configPath = join(f.directory, "config.json");
+		// What `launch` leaves in config.json, replaced whole the way launch replaces it.
+		const relaunch = (recorded: ReturnType<typeof launcher>) => {
+			const config = { ...JSON.parse(readFileSync(configPath, "utf8")), launcher: recorded };
+			writeFileSync(`${configPath}.tmp`, JSON.stringify(config));
+			renameSync(`${configPath}.tmp`, configPath);
+		};
+		relaunch(launcher("/opt/agent-a", "work-a"));
+		// The parent's submit and merge wait on the held job, so this serve never starts them.
+		const store = new FactoryStore(join(f.directory, "factory.db"));
+		try {
+			const plan = JSON.parse(readFileSync(f.planPath, "utf8")) as FactoryPlan;
+			const parent = (stage: string, dependencies: string[]) => ({
+				id: `parent:${stage}`,
+				ticketId: "parent",
+				dependencies,
+				sourceFingerprint: `ticket:parent:${stage}`,
+				command: { argv: ["false"], cwd: f.root },
+				requirements: {},
+			});
+			const actions = [...plan.actions, parent("submit", ["a"]), parent("merge", ["parent:submit"])];
+			const tickets = [...plan.tickets, { id: "parent", owner: "launcher" }];
+			store.applyPlan({ ...plan, tickets, actions }, store.planRevision());
+			store.resume();
+		} finally {
+			store.close();
+		}
+		const server = spawn(process.execPath, [entry(), "serve", f.directory, "--interval-ms", "50"], {
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		children.push(server);
+		const lines = createInterface({ input: server.stdout! });
+		const output = (key: "launched" | "splitsImported") =>
+			new Promise<string[]>((resolveLine) =>
+				lines.on("line", (line) => {
+					const value = (JSON.parse(line) as Record<string, string[] | undefined>)[key];
+					if (value?.length) resolveLine(value);
+				}),
+			);
+		const [attemptId] = await output("launched");
+		try {
+			// The writer's leftover, then a relaunch with another agent binary, while this serve runs.
+			const relaunched = launcher("/opt/agent-b", "work-b");
+			const parentDirectory = join(relaunched.work, "tickets", "parent");
+			mkdirSync(parentDirectory, { recursive: true });
+			const parentRun = { version: 1, key: "parent", title: "P", contract: "Do p.", acceptance: "p", row: "OF-1" };
+			writeFileSync(
+				join(parentDirectory, "ticket.json"),
+				JSON.stringify({ ...parentRun, blockedBy: [], launcher: relaunched }),
+			);
+			writeFileSync(join(parentDirectory, "split.json"), JSON.stringify({ key: "parent", remains: "the rest" }));
+			const imported = output("splitsImported");
+			relaunch(relaunched);
+			expect(await imported).toEqual(["parent-split"]);
+			const followUp = JSON.parse(readFileSync(join(relaunched.work, "tickets", "parent-split", "ticket.json"), "utf8"));
+			expect(followUp.launcher).toEqual(relaunched);
+		} finally {
+			lines.close();
+			server.kill("SIGKILL");
+			await once(server, "exit");
+			await fileReady(f.pidFile);
+			f.release();
+			await fileReady(join(f.runnerRoot, attemptId!, "terminal.json"));
+		}
 	});
 
 	it("keeps serve alive through a SQLite write lock and reconciles after the lock clears", async () => {

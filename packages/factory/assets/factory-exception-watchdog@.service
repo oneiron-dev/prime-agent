@@ -1,7 +1,8 @@
 # Exception-only factory watchdog, one instance per factory. The instance name picks an environment file with
 # WATCHDOG_SCRIPT (<package>/dist/watchdog.js of the installed prime-agent-factory), FACTORY_DIR (absolute),
 # OWNER_SESSION (the session that receives the messages) and PATH, and optionally PRIME_AGENT_FACTORY_AGENT_BIN (the
-# agent binary that delivers them when the factory's launcher.primeAgentBin names none). The user manager's own PATH
+# agent binary that delivers them when the factory's launcher.primeAgentBin names none on this machine; required when
+# the factory's launcher host is an SSH host, whose recorded path names a binary over there). The user manager's own PATH
 # is minimal, so the file's PATH must name the directory of the node that runs the factory (systemd refuses a
 # variable as the program) and, without PRIME_AGENT_FACTORY_AGENT_BIN, the directory of the agent binary.
 # Install as a user unit:
