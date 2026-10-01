@@ -362,6 +362,8 @@ class PackageTests(FeedFixture):
                     self.package(make_package_dir(self.root / f"pkg-{len(parts)}"))
                 self.assertEqual(os.listdir(self.ts_install), [])
                 link.unlink()
+                # Refused before the feed lock file was created, too.
+                self.assertFalse((self.feed / ".lock").exists())
 
 
 @unittest.skipUnless(host.system() == "Linux" and shutil.which("gcc") and shutil.which("readelf"),

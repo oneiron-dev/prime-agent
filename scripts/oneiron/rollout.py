@@ -192,7 +192,9 @@ def rollout(args: argparse.Namespace) -> int:
     # rollout or rollback is turned away before it records anything. A
     # version that is already current runs through every phase again (that
     # re-verifies it and finishes an interrupted activation); the swap
-    # itself is then a no-op.
+    # itself is then a no-op. The receipt dir is refused before the lock
+    # file is created, and checked again under the lock.
+    sbs.receipt_dir(prefix, version, platform)
     with sbs.locked(prefix):
         receipt_dir = sbs.receipt_dir(prefix, version, platform)
         receipt = Receipt(receipt_dir / "ACTIVATION-RECEIPT.json", ACTIVATION_SCHEMA, version=version,
@@ -408,6 +410,7 @@ def rollback(args: argparse.Namespace) -> int:
         raise SystemExit(f"error: {target} is not installed in {prefix}")
     platform = receipt_platform(prefix, target) or release_feed.host_platform()
 
+    sbs.receipt_dir(prefix, target, platform)  # refused before the lock file exists; again under it
     with sbs.locked(prefix):
         receipt_dir = sbs.receipt_dir(prefix, target, platform)
         receipt = Receipt(receipt_dir / "ROLLBACK-RECEIPT.json", ROLLBACK_SCHEMA, fromVersion=current,

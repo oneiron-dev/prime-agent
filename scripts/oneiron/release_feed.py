@@ -217,7 +217,10 @@ def publish(feed_dir: Path, version: str, base: str, source: dict, row: dict, ta
     """Add one platform to releases/v<version>/ and move the feed pointers;
     under the feed lock, artifacts first, then SHA256SUMS, manifest.json and
     the pointers (each replaced atomically). A re-run of an already published
-    platform with the same bytes changes nothing but may still promote."""
+    platform with the same bytes changes nothing but may still promote. A
+    linked release dir is refused before the lock file is created, and
+    again under the lock."""
+    sbs.plain_dir(feed_dir, "releases", f"v{version}")
     with sbs.locked(feed_dir):
         release_dir = sbs.plain_dir(feed_dir, "releases", f"v{version}")
         manifest_path = release_dir / "manifest.json"

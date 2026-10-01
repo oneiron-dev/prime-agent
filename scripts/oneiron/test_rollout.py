@@ -15,6 +15,7 @@ import fcntl
 import io
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -516,6 +517,25 @@ class RolloutTests(RolloutFixture):
                                                 "found: .*/receipts$"):
             self.main("rollout", "--version", V1)
         self.assertEqual((os.listdir(elsewhere), (self.prefix / V1).exists()), ([], False))
+
+    def test_a_receipts_dir_that_is_not_a_dir_is_refused_before_the_lock_file_exists(self) -> None:
+        self.publish(V1)
+        self.publish(V2)
+        self.assertEqual(self.main("rollout", "--version", V1), 0)
+        self.assertEqual(self.main("rollout", "--version", V2), 0)
+        (self.prefix / ".lock").unlink()
+        receipts = self.prefix / "receipts"
+        # rollback's target receipt dir is a plain file; then all of receipts/ is.
+        shutil.rmtree(receipts / f"{V1}-{PLATFORM}")
+        (receipts / f"{V1}-{PLATFORM}").write_text("not a dir\n")
+        with self.assertRaisesRegex(SystemExit, f"{V1}-{PLATFORM} is not a plain directory"):
+            self.main("rollback")
+        self.assertFalse((self.prefix / ".lock").exists())
+        shutil.rmtree(receipts)
+        receipts.write_text("not a dir\n")
+        with self.assertRaisesRegex(SystemExit, "receipts is not a plain directory"):
+            self.main("rollout", "--version", V1)
+        self.assertEqual(((self.prefix / ".lock").exists(), os.readlink(self.prefix / "current")), (False, V2))
 
     def test_rollback_refuses_what_it_cannot_vouch_for(self) -> None:
         self.publish(V1)
