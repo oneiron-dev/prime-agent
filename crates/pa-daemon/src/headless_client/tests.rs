@@ -171,6 +171,9 @@ fn recording() -> (super::HostedEventSink, Arc<Mutex<Vec<Value>>>) {
     )
 }
 
+/// The detach bound the scripted runs leave with (their fake answers it).
+const DETACH_WITHIN: Duration = Duration::from_secs(5);
+
 /// Failure bound for one awaited step (never a readiness wait).
 async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(30), future)
@@ -231,7 +234,7 @@ async fn completion_waits_for_the_events_its_responses_overtook() {
         *events.lock().unwrap(),
         vec![agent_start, message_end, agent_end, compaction_end]
     );
-    bounded(session.close()).await;
+    bounded(session.close(DETACH_WITHIN)).await;
     assert_eq!(
         fake.commands(),
         [
@@ -572,6 +575,120 @@ async fn same_file_resume_attaches_the_live_worker() {
     assert_eq!(fake.commands(), ["list", "attach"]);
 }
 
+/// The launch tool selection: an older daemon (no
+/// `session_tool_selection`) gets nothing, not even a create it would run
+/// with every tool; a current daemon receives the keys on the create.
+#[tokio::test]
+async fn a_tool_selection_needs_the_daemon_capability() {
+    let restricted = |fake: &FakeSupervisor| HostedSessionOptions {
+        create_config: json!({ "cwd": "/work", "noTools": true }),
+        ..fake.options()
+    };
+    let old = FakeSupervisor::start(Box::new(|kind, _| panic!("unexpected command {kind}")));
+    let error = bounded(HostedHeadlessSession::open(restricted(&old)))
+        .await
+        .err()
+        .expect("an older daemon is refused");
+    assert_eq!(
+        error.to_string(),
+        "the running daemon does not support --tools, --no-tools or --no-builtin-tools (it does not advertise `session_tool_selection`); restart it with this build, or drop the flags"
+    );
+    assert_eq!(old.commands(), Vec::<String>::new());
+
+    let current = FakeSupervisor::advertising(
+        &["prompt_admission_cancellation", "session_tool_selection"],
+        Box::new(|kind, _| opening(kind).unwrap_or_else(|| panic!("unexpected command {kind}"))),
+    );
+    bounded(HostedHeadlessSession::open(restricted(&current)))
+        .await
+        .unwrap();
+    assert_eq!(
+        current.sent("create")["config"],
+        json!({ "cwd": "/work", "noTools": true })
+    );
+}
+
+/// Reusing a live session never changes its tools: a run whose selection
+/// differs from the one the live worker publishes is refused before any
+/// attach; an equivalent selection (the same resolved policy) reuses it.
+#[tokio::test]
+async fn a_live_session_with_other_tools_is_not_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("session.jsonl");
+    std::fs::write(&file, "{}\n").unwrap();
+    let rows = json!({ "sessions": [
+        { "id": "live-1", "activeSessionId": "live-1", "sessionFile": file, "workerState": "ready",
+          "model": { "id": "faux-1" }, "toolSelection": { "noTools": true } },
+    ]});
+    let script = move || -> Script {
+        let rows = rows.clone();
+        Box::new(move |kind, _| match kind {
+            "list" => vec![Reply::Ok(rows.clone())],
+            "attach" => vec![Reply::Ok(json!({ "lastEventSequence": 3 }))],
+            other => panic!("unexpected command {other}"),
+        })
+    };
+    let capabilities = ["prompt_admission_cancellation", "session_tool_selection"];
+    let open = |fake: &FakeSupervisor, create_config: Value| HostedSessionOptions {
+        session_path: Some(file.clone()),
+        create_config,
+        ..fake.options()
+    };
+
+    let default_run = FakeSupervisor::advertising(&capabilities, script());
+    let error = bounded(HostedHeadlessSession::open(open(
+        &default_run,
+        json!({ "cwd": "/work" }),
+    )))
+    .await
+    .err()
+    .expect("a default run must not reuse a no-tools session");
+    assert_eq!(
+        error.to_string(),
+        "the session is already running in the daemon with --no-tools, and this run asks for no tool flags; a live session keeps the tools it was launched with. Run with the same tool flags, or resume it after it stops"
+    );
+    assert_eq!(default_run.commands(), ["list"]);
+
+    let same_policy = FakeSupervisor::advertising(&capabilities, script());
+    let (_session, opened) = bounded(HostedHeadlessSession::open(open(
+        &same_policy,
+        json!({ "cwd": "/work", "noTools": true, "noBuiltinTools": true }),
+    )))
+    .await
+    .unwrap();
+    assert_eq!(opened.active_session_id, "live-1");
+    assert_eq!(same_policy.commands(), ["list", "attach"]);
+}
+
+/// Equivalent allowlists (a name repeated) resolve to the same policy, so
+/// the live session is reused rather than refused.
+#[tokio::test]
+async fn an_equivalent_allowlist_reuses_the_live_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("session.jsonl");
+    std::fs::write(&file, "{}\n").unwrap();
+    let rows = json!({ "sessions": [
+        { "id": "live-1", "activeSessionId": "live-1", "sessionFile": file, "workerState": "ready",
+          "model": { "id": "faux-1" }, "toolSelection": { "tools": ["ipython", "ipython"] } },
+    ]});
+    let fake = FakeSupervisor::advertising(
+        &["prompt_admission_cancellation", "session_tool_selection"],
+        Box::new(move |kind, _| match kind {
+            "list" => vec![Reply::Ok(rows.clone())],
+            "attach" => vec![Reply::Ok(json!({ "lastEventSequence": 1 }))],
+            other => panic!("unexpected command {other}"),
+        }),
+    );
+    let options = HostedSessionOptions {
+        session_path: Some(file.clone()),
+        create_config: json!({ "cwd": "/work", "tools": ["ipython"] }),
+        ..fake.options()
+    };
+    let (_session, opened) = bounded(HostedHeadlessSession::open(options)).await.unwrap();
+    assert_eq!(opened.active_session_id, "live-1");
+    assert_eq!(fake.commands(), ["list", "attach"]);
+}
+
 /// A session closed under the client before the run's last event reached
 /// the sink fails the completion (the stream is truncated) instead of
 /// waiting for a sequence that will never arrive.
@@ -695,7 +812,43 @@ async fn close_detaches_and_never_stops_the_session() {
     let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
         .await
         .unwrap();
-    bounded(session.close()).await;
+    bounded(session.close(DETACH_WITHIN)).await;
+    assert_eq!(fake.commands(), ["create", "attach", "detach"]);
+}
+
+/// A daemon that never answers the detach costs the leaving client its
+/// exit budget and no more: the detach went out, the wait ended at the
+/// bound (the paused clock advances only to the timer that fired, rounded
+/// up to the timer wheel's millisecond), and the connection closed.
+#[tokio::test]
+async fn an_unanswered_detach_ends_at_the_exit_budget() {
+    let (detach_tx, mut detach_rx) = tokio::sync::mpsc::unbounded_channel();
+    let fake = FakeSupervisor::start(Box::new(move |kind, command| {
+        if let Some(replies) = opening(kind) {
+            return replies;
+        }
+        match kind {
+            // Never answered: the daemon stopped responding.
+            "detach" => {
+                let _ = detach_tx.send(command["activeSessionId"].clone());
+                Vec::new()
+            }
+            other => panic!("unexpected command {other}"),
+        }
+    }));
+    let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
+        .await
+        .unwrap();
+    let exit_budget = Duration::from_millis(300);
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    session.close(exit_budget).await;
+    let waited = started.elapsed();
+    assert!(
+        waited >= exit_budget && waited < exit_budget + Duration::from_millis(2),
+        "the detach wait ended at the exit budget: {waited:?}"
+    );
+    assert_eq!(bounded(detach_rx.recv()).await, Some(json!("s1")));
     assert_eq!(fake.commands(), ["create", "attach", "detach"]);
 }
 

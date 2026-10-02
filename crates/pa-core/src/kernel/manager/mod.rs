@@ -54,6 +54,7 @@ pub type KernelBootstrapProgressHandler = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Default)]
 pub struct KernelStartOptions {
+    /// Abandons the caller's wait; the startup keeps running for others.
     pub signal: Option<AbortSignal>,
     pub on_bootstrap_progress: Option<KernelBootstrapProgressHandler>,
 }

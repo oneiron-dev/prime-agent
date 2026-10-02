@@ -232,13 +232,16 @@ impl Supervisor {
         self.declare_compaction_terminal(resident, || resident.compaction.observe_worker_gone())
             .await;
         let deadline = worker_connect_deadline();
-        let child = self.spawn_worker_process(resident, deadline).await?;
-        if let Err(error) = self.connect_worker(resident, deadline).await {
-            // Never leave a spawned-but-unwired worker process behind.
-            let mut child = child;
-            let _ = child.kill().await;
-            return Err(error);
-        }
+        let mut child = self.spawn_worker_process(resident, deadline).await?;
+        // A failed connect never leaves a spawned-but-unwired worker
+        // process behind (the watch kills or reaps it), and a worker that
+        // dies mid-handshake reports its own exit.
+        self.watch_launch_stage(
+            &resident.worker_id,
+            &mut child,
+            self.connect_worker(resident, deadline),
+        )
+        .await?;
         let (payload, injected_compaction_abort) = {
             let descriptor = resident.descriptor.lock().await;
             let mut payload = create_command_payload(&descriptor.create_command);
@@ -283,27 +286,24 @@ impl Supervisor {
                 (payload, None)
             }
         };
-        let response = match self
-            .route_command_typed(
-                resident,
-                "create",
-                payload,
-                LONG_ROUTE_TIMEOUT_MS,
-                RouteAdmission::SupervisorInternal,
+        // The replay never answered (or the worker died first): the freshly
+        // spawned worker is not supervised by the monitor path that
+        // produced it, so it dies with the relaunch attempt instead of
+        // orphaning (and holding its socket path against the next one) -
+        // the watch kills or reaps it.
+        let response = self
+            .watch_launch_stage(
+                &resident.worker_id,
+                &mut child,
+                self.route_command_typed(
+                    resident,
+                    "create",
+                    payload,
+                    LONG_ROUTE_TIMEOUT_MS,
+                    RouteAdmission::SupervisorInternal,
+                ),
             )
-            .await
-        {
-            Ok(response) => response,
-            // The replay never answered: the freshly spawned worker is not
-            // supervised by the monitor path that produced it, so it must
-            // die with the relaunch attempt instead of orphaning (and
-            // holding its socket path against the next one).
-            Err(error) => {
-                let mut child = child;
-                let _ = child.kill().await;
-                return Err(error);
-            }
-        };
+            .await?;
         if self.is_stopping(resident) {
             // A shutdown raced the relaunch: stop the freshly spawned worker
             // instead of leaving it running with nobody supervising it.
@@ -316,7 +316,6 @@ impl Supervisor {
                     RouteAdmission::SupervisorInternal,
                 )
                 .await;
-            let mut child = child;
             let _ = child.kill().await;
             return Err(anyhow!("supervisor is shutting down"));
         }
@@ -324,7 +323,6 @@ impl Supervisor {
             // Same rule as the route error above: a worker whose create
             // replay failed must not be left running. A typed rejection
             // relays verbatim and logs the conflict like the launch path.
-            let mut child = child;
             let _ = child.kill().await;
             return Err(match response.error_info {
                 Some(error_info) => {
@@ -459,7 +457,7 @@ impl Supervisor {
         // (`spawnHidden(..., { detached: true })`): the worker leaves the
         // supervisor's console group and shows no fresh console.
         pa_core::platform::process::set_new_process_group(command.as_std_mut());
-        let child = command
+        let mut child = command
             .spawn()
             .with_context(|| format!("spawn session worker {}", resident.worker_id))?;
         let now_ms = std::time::SystemTime::now()
@@ -482,21 +480,20 @@ impl Supervisor {
             let _ = persist_worker(&resident.descriptor_path, &descriptor);
         }
 
-        // Probe the worker socket until it accepts connections. A worker that
-        // never comes up inside the connect budget is killed here so a stuck
-        // child never outlives its failed launch (TS `connectWorker` throws
-        // `DaemonWorkerProbeTimeoutError` and the launch failure path stops
-        // the worker).
-        if let Err(error) =
-            probe_worker_socket(&resident.worker_id, &worker_socket, connect_deadline).await
-        {
-            let mut child = child;
-            let _ = child.kill().await;
-            return Err(crate::worker_stderr::not_ready_with_tail(
-                error,
-                &stderr_log_path,
-            ));
-        }
+        // Probe the worker socket until it accepts connections, watching the
+        // child: a worker that exits first (its socket would not bind, a
+        // crash at boot) fails the launch at once with its exit status and
+        // stderr, and one that never comes up inside the connect budget is
+        // killed so a stuck child never outlives its failed launch (TS
+        // `connectWorker` throws `DaemonWorkerProbeTimeoutError` and the
+        // launch failure path stops the worker).
+        let probe = async {
+            probe_worker_socket(&resident.worker_id, &worker_socket, connect_deadline)
+                .await
+                .map_err(|error| crate::worker_stderr::not_ready_with_tail(error, &stderr_log_path))
+        };
+        self.watch_launch_stage(&resident.worker_id, &mut child, probe)
+            .await?;
         Ok(child)
     }
 

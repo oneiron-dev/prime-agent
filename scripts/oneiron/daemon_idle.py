@@ -57,8 +57,9 @@ LIST_TIMEOUT_SECONDS = 30.0
 
 def default_socket_path() -> Path:
     """The supervisor socket prime-agent-rs exports: the launcher's socket
-    dir (PRIME_AGENT_RS_SOCKET_DIR, else ${TMPDIR:-/tmp}/pa-rs-<uid>), with
-    the launcher's checks (side_by_side.runtime_dirs)."""
+    dir (PRIME_AGENT_RS_SOCKET_DIR, else /tmp/pa-rs-<uid> on macOS and
+    ${TMPDIR:-/tmp}/pa-rs-<uid> elsewhere), with the launcher's checks
+    (side_by_side.runtime_dirs)."""
     return sbs.runtime_dirs()["socket dir"] / "daemon.sock"
 
 

@@ -102,6 +102,7 @@ fn flush_rows_write_crlf_and_keep_zone_markers() {
 fn options(selection: ModelSelection) -> InteractiveOptions {
     InteractiveOptions {
         models: None,
+        tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         socket_path: PathBuf::from("/tmp/unused.sock"),
         cwd: PathBuf::from("/tmp"),
         session_dir: None,
@@ -151,6 +152,109 @@ fn create_config_carries_the_requested_thinking_level() {
 fn create_config_omits_thinking_when_no_flag_was_given() {
     let config = options(ModelSelection::default()).create_config();
     assert!(config.get("thinking").is_none());
+}
+
+/// The launch tool selection rides the create config under the TS
+/// runtime-config names (an explicit empty list stays explicit), and a
+/// default launch adds no key.
+#[test]
+fn create_config_carries_the_tool_selection() {
+    let with = |tool_selection: pa_types::daemon::ToolSelectionFlags| {
+        let mut opts = options(ModelSelection::default());
+        opts.tool_selection = tool_selection;
+        opts.create_config()
+    };
+    assert_eq!(
+        [
+            with(pa_types::daemon::ToolSelectionFlags::default()),
+            with(pa_types::daemon::ToolSelectionFlags {
+                no_tools: true,
+                ..Default::default()
+            }),
+            with(pa_types::daemon::ToolSelectionFlags {
+                tools: Some(Vec::new()),
+                no_builtin_tools: true,
+                ..Default::default()
+            }),
+        ],
+        [
+            json!({ "cwd": "/tmp" }),
+            json!({ "cwd": "/tmp", "noTools": true }),
+            json!({ "cwd": "/tmp", "tools": [], "noBuiltinTools": true }),
+        ]
+    );
+}
+
+/// A daemon whose hello lacks `session_tool_selection` would ignore the
+/// keys and run every tool: a restricted launch fails before any create
+/// reaches it.
+#[tokio::test]
+async fn a_restricted_launch_refuses_a_daemon_without_tool_selection() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let recorded = std::sync::Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.into_split();
+                let hello = json!({
+                    "type": "daemon_hello",
+                    "protocol": { "name": "prime-agent.daemon", "version": 7 },
+                    "serverCapabilities": ["attach_snapshot", "event_sequence"],
+                });
+                let _ = writer.write_all(format!("{hello}\n").as_bytes()).await;
+                let mut lines = tokio::io::BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let envelope: Value = serde_json::from_str(&line).unwrap();
+                    let kind = envelope["command"]["type"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    recorded.lock().unwrap().push(kind.clone());
+                    let response = json!({
+                        "type": "response", "id": envelope["id"], "command": kind,
+                        "success": true, "data": {},
+                    });
+                    if writer
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let mut opts = options(ModelSelection::default());
+    opts.socket_path = socket;
+    opts.tool_selection = pa_types::daemon::ToolSelectionFlags {
+        no_tools: true,
+        ..Default::default()
+    };
+    let result = run_interactive(
+        opts,
+        UiMode::Headless(HeadlessPlan {
+            steps: Vec::new(),
+            width: 80,
+            height: 24,
+        }),
+    )
+    .await;
+    let error = result.expect_err("the restricted launch must not open a session");
+    assert!(
+        format!("{error:#}").contains("does not advertise `session_tool_selection`"),
+        "{error:#}"
+    );
+    assert!(
+        !seen.lock().unwrap().iter().any(|kind| kind == "create"),
+        "no create reached the older daemon: {:?}",
+        seen.lock().unwrap()
+    );
 }
 
 #[test]

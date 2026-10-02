@@ -14,6 +14,8 @@ struct PromptCommandArgs {
     model: Option<String>,
     cwd: Option<String>,
     json: bool,
+    /// The session flags `--tools`/`--no-tools`/`--no-builtin-tools`.
+    tool_selection: pa_types::daemon::ToolSelectionFlags,
 }
 
 fn parse_args(args: &[String]) -> Result<PromptCommandArgs, String> {
@@ -22,6 +24,21 @@ fn parse_args(args: &[String]) -> Result<PromptCommandArgs, String> {
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--json" => parsed.json = true,
+            "--no-tools" | "-nt" => parsed.tool_selection.no_tools = true,
+            "--no-builtin-tools" | "-nbt" => parsed.tool_selection.no_builtin_tools = true,
+            "--tools" | "-t" => {
+                let Some(value) = rest.next() else {
+                    return Err(format!("{arg} requires a value"));
+                };
+                parsed.tool_selection.tools = Some(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                );
+            }
             "--model" => {
                 let Some(value) = rest.next() else {
                     return Err("--model requires a value".to_string());
@@ -59,7 +76,9 @@ pub fn run_prompt_command(args: &[String]) -> i32 {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    match assemble_breakdown(&cwd, parsed.model.as_deref()) {
+    let tool_selection =
+        pa_core::session_engine::tool_selection::ToolSelection::from_flags(&parsed.tool_selection);
+    match assemble_breakdown(&cwd, parsed.model.as_deref(), &tool_selection) {
         Ok(breakdown) => {
             if parsed.json {
                 print_json(&breakdown);
@@ -78,6 +97,7 @@ pub fn run_prompt_command(args: &[String]) -> i32 {
 fn assemble_breakdown(
     cwd: &std::path::Path,
     model: Option<&str>,
+    tool_selection: &pa_core::session_engine::tool_selection::ToolSelection,
 ) -> anyhow::Result<pa_core::prompts::SystemPromptBreakdown> {
     let agent_dir = get_agent_dir();
     let settings = SettingsManager::create(cwd, &agent_dir);
@@ -102,6 +122,14 @@ fn assemble_breakdown(
         system_prompt: None,
         ..ResourceLoaderOptions::new(cwd.to_path_buf(), agent_dir)
     })?;
+    // The shipped model-tool surface is the built-in `ipython` alone
+    // (bash/edit are kernel-resident programmatic tools); the session's
+    // tool flags select from it exactly as the engine does.
+    let selected_tools = tool_selection.select(Vec::new(), vec!["ipython"], |name| name);
+    // A no-REPL session appends its append text (here: a discovered
+    // `APPEND_SYSTEM.md`) the way the engine does.
+    let append_system_prompt =
+        (!selected_tools.contains(&"ipython")).then(|| resources.append_system_prompt.join("\n\n"));
     Ok(pa_core::prompts::system_prompt::system_prompt_breakdown(
         &pa_core::prompts::BuildSystemPromptOptions {
             cwd: cwd.display().to_string(),
@@ -115,9 +143,8 @@ fn assemble_breakdown(
                 .map(|file| (file.path.display().to_string(), file.content.clone()))
                 .collect(),
             skills: resources.skills.clone(),
-            // The shipped model-tool surface: `ipython` only; bash/edit
-            // are kernel-resident programmatic tools.
-            selected_tools: Some(vec!["ipython"]),
+            selected_tools: Some(selected_tools),
+            append_system_prompt,
             allow_recursion: Some(true),
             generic_mcp_servers: generic_servers,
             rlm_depth: Some(0),
@@ -196,11 +223,24 @@ mod tests {
             "--json".to_string(),
             "--cwd".to_string(),
             "/w".to_string(),
+            "-nt".to_string(),
+            "--tools".to_string(),
+            "ipython, ,ipython".to_string(),
         ])
         .unwrap();
-        assert_eq!(parsed.model.as_deref(), Some("mock/mock-1"));
-        assert_eq!(parsed.cwd.as_deref(), Some("/w"));
-        assert!(parsed.json);
+        assert_eq!(
+            parsed,
+            PromptCommandArgs {
+                model: Some("mock/mock-1".to_string()),
+                cwd: Some("/w".to_string()),
+                json: true,
+                tool_selection: pa_types::daemon::ToolSelectionFlags {
+                    tools: Some(vec!["ipython".to_string(), "ipython".to_string()]),
+                    no_tools: true,
+                    no_builtin_tools: false,
+                },
+            }
+        );
         assert_eq!(
             parse_args(&["--bogus".to_string()]),
             Err("unknown option \"--bogus\"".to_string())
@@ -219,7 +259,12 @@ mod tests {
     #[test]
     fn assembles_the_layered_prompt_for_a_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let breakdown = assemble_breakdown(dir.path(), Some("mock/mock-1")).unwrap();
+        let breakdown = assemble_breakdown(
+            dir.path(),
+            Some("mock/mock-1"),
+            &pa_core::session_engine::tool_selection::ToolSelection::Defaults,
+        )
+        .unwrap();
         assert!(breakdown.assembled.starts_with("# prime-agent harness"));
         assert!(breakdown
             .assembled
@@ -240,5 +285,29 @@ mod tests {
                 segment.name
             );
         }
+    }
+
+    /// `prompt --no-tools` dumps the prompt a no-tools session sends: the
+    /// TS no-tools prompt, not the layered harness.
+    #[test]
+    fn assembles_the_no_tools_prompt_for_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let breakdown = assemble_breakdown(
+            dir.path(),
+            Some("mock/mock-1"),
+            &pa_core::session_engine::tool_selection::ToolSelection::NoTools,
+        )
+        .unwrap();
+        assert!(breakdown
+            .assembled
+            .starts_with("You are a general purpose agent that uses code to solve tasks.\n"));
+        assert!(!breakdown.assembled.contains("# prime-agent harness"));
+        assert!(breakdown
+            .assembled
+            .contains("\nConversation log: not persisted\nRecursive agent depth: 0\n"));
+        assert_eq!(
+            breakdown.segments[0].text,
+            breakdown.assembled[..breakdown.cached_prefix_len]
+        );
     }
 }

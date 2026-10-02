@@ -29,6 +29,9 @@ PLATFORM = "linux-x64"
 # A fixture mtime far in the past: any later write moves it, even one that
 # lands in the same clock tick as the fixture's creation.
 OLD_NS = 1_000_000_000 * 10**9
+# Fixture roots stay short so their socket dirs fit sun_path natively on
+# macOS too: its $TMPDIR (/var/folders/…/T/) alone is 57 bytes canonical.
+SHORT_TMP = "/tmp" if sys.platform == "darwin" else None
 
 # The fake binary prints the exe-adjacent manifest version (as the real one
 # does), the isolation env it was launched with, or (for `-p`) one JSON event
@@ -131,10 +134,11 @@ class Fixture(unittest.TestCase):
     TS agent dir; the module's HOME-derived roots point into it."""
 
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=SHORT_TMP)
         self.root = Path(self.tmp.name).resolve()
         self.saved_env = dict(os.environ)
-        self.saved_module = {name: getattr(side_by_side, name) for name in ("HOME", "TS_AGENT_DIR", "SYSTEM_TMP")}
+        self.saved_module = {name: getattr(side_by_side, name)
+                             for name in ("HOME", "TS_AGENT_DIR", "SYSTEM_TMP", "SOCKET_PLATFORM")}
         self.saved_cwd = os.getcwd()
         self.home = self.root / "home"
         self.ts_agent = self.home / ".prime" / "agent"
@@ -184,6 +188,9 @@ class Fixture(unittest.TestCase):
             # A TS-chosen bytecode cache must not survive into the Rust process either.
             "PYTHONPYCACHEPREFIX": "/ts/pycache",
         })
+        # tempfile caches the first TMPDIR it reads; drop the cache so the code under
+        # test uses this test's TMPDIR, not an earlier test's deleted one.
+        tempfile.tempdir = None
 
     def tearDown(self) -> None:
         os.chdir(self.saved_cwd)
@@ -191,6 +198,7 @@ class Fixture(unittest.TestCase):
             setattr(side_by_side, name, value)
         os.environ.clear()
         os.environ.update(self.saved_env)
+        tempfile.tempdir = None
         self.tmp.cleanup()
 
     @contextlib.contextmanager
@@ -223,6 +231,11 @@ class Fixture(unittest.TestCase):
 
 
 class InstallerTests(Fixture):
+    def test_temporary_files_follow_this_tests_tmpdir(self) -> None:
+        # install() makes its scratch dirs with tempfile's default dir; a value
+        # cached by an earlier test points into that test's deleted sandbox.
+        self.assertEqual(Path(tempfile.gettempdir()), self.fake_tmp)
+
     def test_install_activates_an_isolated_launcher_and_leaves_ts_alone(self) -> None:
         self.install()
         self.assertEqual(os.readlink(self.prefix / "current"), VERSION)
@@ -902,6 +915,68 @@ class LauncherTests(Fixture):
         self.assertEqual(os.listdir(ts_site), [])
 
 
+    def render_for(self, platform: str) -> None:
+        """Rewrite the launcher as the installer renders it on `platform`."""
+        side_by_side.SOCKET_PLATFORM = platform
+        side_by_side.write_launcher(self.bin_dir, self.prefix)
+
+    def test_launcher_default_socket_dir_is_short_on_darwin_and_tmpdir_on_linux(self) -> None:
+        # A macOS-deep TMPDIR: under it the longest socket path would not fit.
+        deep_tmp = self.fake_tmp / ("T" * 60)
+        deep_tmp.mkdir()
+        uid = os.getuid()
+        for platform, expected in (("darwin", self.system_tmp / f"pa-rs-{uid}"),
+                                   ("linux", self.fake_tmp / f"pa-rs-{uid}")):
+            with self.subTest(platform=platform):
+                self.render_for(platform)
+                tmpdir = str(deep_tmp) if platform == "darwin" else str(self.fake_tmp)
+                env = self.launcher_env(PRIME_AGENT_RS_SOCKET_DIR="", TMPDIR=tmpdir)
+                self.assertEqual((env["SOCKET_DIR"], env["DAEMON_SOCKET"]),
+                                 (str(expected), str(expected / "daemon.sock")))
+                self.assertEqual(stat.S_IMODE(expected.stat().st_mode), 0o700)
+
+    def test_launcher_socket_budget_is_bytes_with_the_nul_per_platform(self) -> None:
+        name = side_by_side.LONGEST_SOCKET_NAME
+        for platform, limit in (("darwin", 104), ("linux", 108)):
+            self.render_for(platform)
+            at_limit = dir_of_bytes(self.root, limit - 1 - len(name) - 1, "a")
+            over = dir_of_bytes(self.root, limit - len(name) - 1, "b")
+            # Two-byte characters: under the limit in characters, over it in bytes.
+            wide = dir_of_bytes(self.root, limit - len(name) - 1, "\u00e9")
+            self.assertLess(len(str(wide / name)) + 1, limit)
+            with self.subTest(platform=platform, case="at the limit"):
+                self.assertEqual(self.launcher_env(PRIME_AGENT_RS_SOCKET_DIR=str(at_limit))["SOCKET_DIR"],
+                                 str(at_limit))
+            for case, path in (("one byte over", over), ("multi-byte", wide)):
+                with self.subTest(platform=platform, case=case):
+                    result = self.run_launcher("env", PRIME_AGENT_RS_SOCKET_DIR=str(path))
+                    size = len(os.fsencode(path / name))
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", (
+                        f"prime-agent-rs: refusing socket dir {path}: its longest socket path ({path}/{name}) is "
+                        f"{size} bytes plus the NUL, over the {limit}-byte {platform} sun_path limit; set "
+                        f"PRIME_AGENT_RS_SOCKET_DIR to a shorter directory (at most {limit - 2 - len(name)} bytes, "
+                        f"e.g. /tmp/pa-rs-{os.getuid()})\n")))
+                    self.assertFalse(path.exists(), "nothing is created for a refused socket dir")
+
+    def test_launcher_counts_the_canonical_socket_dir(self) -> None:
+        # A short alias of an over-budget dir: the exported (canonical)
+        # spelling is what binds, so that is what is counted.
+        self.render_for("linux")
+        deep = dir_of_bytes(self.root, 108 - len(side_by_side.LONGEST_SOCKET_NAME) - 1, "c")
+        deep.mkdir()
+        alias = self.root / "s"
+        alias.symlink_to(deep)
+        self.assert_refused(f"refusing socket dir {re.escape(str(deep))}: its longest socket path",
+                            PRIME_AGENT_RS_SOCKET_DIR=str(alias))
+
+    def test_launcher_refuses_ts_socket_dirs_on_darwin_too(self) -> None:
+        self.render_for("darwin")
+        for base in (self.fake_tmp, self.system_tmp):
+            with self.subTest(base=str(base)):
+                self.assert_refused("refusing socket dir .*: it overlaps TS state at",
+                                    PRIME_AGENT_RS_SOCKET_DIR=str(base / f"prime-agent-{os.getuid()}"))
+
+
 class LauncherUnderPosixBashTests(LauncherTests):
     shell = ("bash", "--posix")
 
@@ -909,6 +984,75 @@ class LauncherUnderPosixBashTests(LauncherTests):
 @unittest.skipUnless(shutil.which("dash"), "dash is not installed")
 class LauncherUnderDashTests(LauncherTests):
     shell = ("dash",)
+
+
+def dir_of_bytes(root: Path, size: int, char: str) -> Path:
+    """A path under `root` exactly `size` bytes long (UTF-8), padded with
+    `char` (a multi-byte `char` is evened out with leading `x`s)."""
+    pad = size - len(os.fsencode(root)) - 1
+    width = len(char.encode())
+    if pad < width:
+        raise AssertionError(f"{root} leaves no room for a {size}-byte dir of {char!r}")
+    path = root / ("x" * (pad % width) + char * (pad // width))
+    assert len(os.fsencode(path)) == size, path
+    return path
+
+
+class SocketBudgetTests(Fixture):
+    """The installer's twin of the launcher's socket dir rules
+    (runtime_dirs: install, rollout, rollback and the idle check)."""
+
+    def dirs(self, platform: str, **env: str) -> dict[str, Path]:
+        side_by_side.SOCKET_PLATFORM = platform
+        with self.env(**env):
+            return side_by_side.runtime_dirs()
+
+    def test_default_socket_dir_is_short_on_darwin_and_tmpdir_on_linux(self) -> None:
+        deep_tmp = self.fake_tmp / ("T" * 60)
+        deep_tmp.mkdir()
+        uid = os.getuid()
+        self.assertEqual(
+            [self.dirs("darwin", PRIME_AGENT_RS_SOCKET_DIR="", TMPDIR=str(deep_tmp))["socket dir"],
+             self.dirs("linux", PRIME_AGENT_RS_SOCKET_DIR="")["socket dir"],
+             self.dirs("darwin")["socket dir"], self.dirs("linux")["socket dir"]],
+            [self.system_tmp / f"pa-rs-{uid}", self.fake_tmp / f"pa-rs-{uid}", self.sock_dir, self.sock_dir])
+
+    def test_socket_budget_is_bytes_with_the_nul_per_platform(self) -> None:
+        name = side_by_side.LONGEST_SOCKET_NAME
+        self.assertEqual(len(name), 32)
+        for platform, limit in (("darwin", 104), ("linux", 108)):
+            at_limit = dir_of_bytes(self.root, limit - 1 - len(name) - 1, "a")
+            over = dir_of_bytes(self.root, limit - len(name) - 1, "b")
+            wide = dir_of_bytes(self.root, limit - len(name) - 1, "\u00e9")
+            with self.subTest(platform=platform, case="at the limit"):
+                self.assertEqual(self.dirs(platform, PRIME_AGENT_RS_SOCKET_DIR=str(at_limit))["socket dir"],
+                                 at_limit)
+            for case, path in (("one byte over", over), ("multi-byte", wide)):
+                with self.subTest(platform=platform, case=case):
+                    size = len(os.fsencode(path / name))
+                    with self.assertRaises(SystemExit) as refused:
+                        self.dirs(platform, PRIME_AGENT_RS_SOCKET_DIR=str(path))
+                    self.assertEqual(str(refused.exception), (
+                        f"error: refusing socket dir {path}: its longest socket path ({path}/{name}) is {size} "
+                        f"bytes plus the NUL, over the {limit}-byte {platform} sun_path limit; set "
+                        f"PRIME_AGENT_RS_SOCKET_DIR to a shorter directory (at most {limit - 2 - len(name)} bytes, "
+                        f"e.g. /tmp/pa-rs-{os.getuid()})"))
+
+    def test_an_over_budget_socket_dir_refuses_the_install_before_any_write(self) -> None:
+        stage = make_stage(self.root)
+        before = side_by_side.tree_identity(self.root)
+        over = dir_of_bytes(self.root, 104 - len(side_by_side.LONGEST_SOCKET_NAME) - 1, "b")
+        side_by_side.SOCKET_PLATFORM = "darwin"
+        with self.env(PRIME_AGENT_RS_SOCKET_DIR=str(over)):
+            with self.assertRaisesRegex(SystemExit, "over the 104-byte darwin sun_path limit"):
+                self.run_main("install", "--stage-dir", str(stage))
+        self.assertEqual(side_by_side.tree_identity(self.root), before)
+
+    def test_ts_socket_dirs_stay_refused_on_darwin(self) -> None:
+        for base in (self.fake_tmp, self.system_tmp):
+            with self.subTest(base=str(base)):
+                with self.assertRaisesRegex(SystemExit, "refusing socket dir .*: it overlaps TS state at"):
+                    self.dirs("darwin", PRIME_AGENT_RS_SOCKET_DIR=str(base / f"prime-agent-{os.getuid()}"))
 
 
 class ProbeTests(Fixture):

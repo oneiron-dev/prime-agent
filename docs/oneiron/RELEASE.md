@@ -97,7 +97,11 @@ the prefix may hold no link but `current` and `previous`, and the agent dir no l
    `SHA256SUMS` and the tarball's sha256 must all agree. The hash is taken on a private copy,
    and that copy is what gets installed.
 2. **Idle check.** The rollout connects only to the Rust supervisor socket
-   (`${PRIME_AGENT_RS_SOCKET_DIR:-$TMPDIR/pa-rs-<uid>}/daemon.sock`, or `--rust-socket`). It
+   (`${PRIME_AGENT_RS_SOCKET_DIR:-<tmp>/pa-rs-<uid>}/daemon.sock`, `<tmp>` being `/tmp` on
+   macOS and `$TMPDIR` (else `/tmp`) elsewhere, or `--rust-socket`). A socket dir whose longest
+   socket path (`<dir>/w-<12 hex>-<12 hex>.sock`, plus the NUL) would not fit the platform's
+   `sun_path` (104 bytes on macOS, 108 on Linux) is refused before anything is written, as the
+   launcher refuses it. It
    checks the hello identity: the protocol, the socket path, and an executable that is an
    install's `prime-agent` under the prefix. Then it sends one `list` and refuses while there
    are live sessions. Anything that is not this install's supervisor is never sent a command.
@@ -156,8 +160,11 @@ daemon offers an idle-only shutdown.
 A release that changes the schema is different: the first `prime-agent-rs` client that ensures
 the daemon (the TUI or a `--daemon-hosted` run, not these scripts) treats the older supervisor
 as stale, replaces it when no session is active, and refuses to start while one is (it prints
-the `shutdown --force` hint). Schema revision 31 (the session policy that `--daemon-hosted`
-carries for `--offline` and `--no-skills`) is such a change.
+the `shutdown --force` hint). Schema revision 31 (the typed worker-startup failure, the
+`--tools`/`--no-tools`/`--no-builtin-tools` selection, and the session policy that
+`--daemon-hosted` carries for `--offline` and `--no-skills`) is such a change. All three share
+one schema id: a daemon from a revision-31 build that lacks one of them stays current for a newer
+client, which refuses the flags that daemon does not advertise until it is stopped.
 
 ## Not in this release
 

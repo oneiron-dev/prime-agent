@@ -202,7 +202,7 @@ async fn prewarmed_kernel_lands_compaction_notice_without_tool_use() {
             execution_mode: Some("test".to_string()),
             now: None,
         }),
-        prewarm_ipython_kernel: Some(true),
+        prewarm_ipython_kernel: Some(pa_core::session_engine::engine::KernelPrewarm::Background),
         ..Default::default()
     })
     .await
@@ -296,7 +296,7 @@ async fn subagent_sessions_stay_lazy_despite_the_prewarm_flag() {
             now: None,
         }),
         rlm_depth: Some(1),
-        prewarm_ipython_kernel: Some(true),
+        prewarm_ipython_kernel: Some(pa_core::session_engine::engine::KernelPrewarm::Background),
         ..Default::default()
     })
     .await

@@ -142,6 +142,10 @@ pub struct SessionSummary {
     pub runtime_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unfinished_action_count: Option<u32>,
+    /// Oneiron fork (schema revision 31): the session's launch tool
+    /// selection, present only when it is not the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_selection: Option<pa_types::daemon::ToolSelectionFlags>,
 }
 
 /// Port of `SessionActionSnapshot` (core/session-action-store.ts).

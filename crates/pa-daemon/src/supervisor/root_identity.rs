@@ -296,6 +296,13 @@ impl Supervisor {
         // relaunch never replays that contradiction).
         descriptor.create_command.session_path = Some(session_file.clone());
         descriptor.create_command.no_session = None;
+        // A discarded launch's descriptor is gone for good (the create
+        // failed and the client was told so): nothing routes to the
+        // resident any more, and no record is written back for a restart
+        // to adopt.
+        if resident.launch_discarded() {
+            return true;
+        }
         // The moved-to session runs under the worker's policy: its record
         // follows the move now; a failed write stays pending for the next
         // roster write (and the stop) to repair.

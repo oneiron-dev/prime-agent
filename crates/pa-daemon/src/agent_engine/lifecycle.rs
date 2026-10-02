@@ -1021,6 +1021,10 @@ impl AgentSessionEngine {
             .read()
             .expect("create resources lock")
             .clone();
+        // Every build (the create's, a replacement's, a respawned worker's)
+        // reads the create command's selection: the session never falls
+        // back to the default tools.
+        let tool_selection = create_resources.tool_selection();
 
         // The session's stream reads its target from the engine's live slot:
         // `set_model` swaps the slot so the built session follows without a
@@ -1140,7 +1144,9 @@ impl AgentSessionEngine {
             // the engine adds the kernel-backed `ipython` tool itself.
             tools: vec![],
             custom_system_prompt: create_resources.system_prompt,
-            prompt_guidelines: create_resources.append_system_prompt,
+            prompt_guidelines: Vec::new(),
+            append_system_prompt: create_resources.append_system_prompt,
+            tool_selection,
             generic_mcp_servers: vec![],
             allow_recursion: None,
             session_manager: Some(session_manager),
@@ -1172,7 +1178,9 @@ impl AgentSessionEngine {
             // engine's depth gate keeps subagent workers (rlmDepth > 0) on
             // the lazy first-call start, exactly like the TS session's
             // `rlmDepth === 0` check.
-            prewarm_ipython_kernel: Some(true),
+            prewarm_ipython_kernel: Some(
+                pa_core::session_engine::engine::KernelPrewarm::Background,
+            ),
             on_background_work_settled,
             // TS `_clearQueuedGoalContexts` (the session-command sites and
             // the kernel's `goal.complete`): the worker-installed queue

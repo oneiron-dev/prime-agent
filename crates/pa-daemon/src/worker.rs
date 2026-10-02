@@ -334,6 +334,7 @@ impl Worker {
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
             active_action: None,
+            tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
             running_tool_calls: std::collections::HashSet::new(),
         };
         let active_session_id = config.active_session_id.clone();

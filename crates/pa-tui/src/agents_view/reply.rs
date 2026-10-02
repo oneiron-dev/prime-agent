@@ -881,7 +881,7 @@ pub(super) fn spawn_reply_dispatch(
     })
 }
 
-async fn send_reply(
+pub(super) async fn send_reply(
     client: DaemonClient,
     ui_tx: &mpsc::UnboundedSender<UiInput>,
     request: ReplyRequest,
@@ -909,6 +909,17 @@ async fn send_reply(
         else {
             return Err("Cannot resume a session without a saved session file".to_string());
         };
+        // The resume carries the launch tool selection: an older daemon
+        // (no `session_tool_selection`) would ignore it and run every
+        // tool, so the reply fails before the create.
+        let tool_selection =
+            pa_types::daemon::ToolSelectionFlags::from_create_config(&request.resume_config)
+                .map_err(|error| format!("Invalid create config: {error}"))?;
+        if let Some(refusal) = tool_selection.unsupported_by_daemon(
+            client.supports_server_capability(pa_types::daemon::SESSION_TOOL_SELECTION_CAPABILITY),
+        ) {
+            return Err(refusal);
+        }
         let telemetry_disabled = request
             .resume_config
             .get("telemetryDisabled")
