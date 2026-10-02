@@ -340,11 +340,29 @@ fn session_role_section(options: &BuildSystemPromptOptions) -> String {
 
 pub(super) fn today() -> String {
     // UTC date in YYYY-MM-DD form; the prompt is date context only.
-    let days = std::time::SystemTime::now()
+    date_at(now_unix_secs(), 0)
+}
+
+/// The local calendar day (TS `new Date()`'s `getFullYear`/`getMonth`/
+/// `getDate`): the no-REPL custom-prompt date line.
+pub(super) fn local_today() -> String {
+    let now = now_unix_secs();
+    date_at(now, crate::platform::clock::local_utc_offset_secs(now))
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() / 86_400);
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// The `YYYY-MM-DD` day of `unix_secs` in a zone `offset_secs` east of UTC.
+pub(super) fn date_at(unix_secs: i64, offset_secs: i64) -> String {
+    let days = unix_secs.saturating_add(offset_secs).div_euclid(86_400);
     // Civil-from-days algorithm (Howard Hinnant).
-    let z = days as i64 + 719_468;
+    let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;

@@ -96,7 +96,7 @@ pub(super) fn no_repl_breakdown(
                 "",
                 &format!(
                     "\nCurrent date: {}\nCurrent working directory: {cwd}",
-                    super::system_prompt::today()
+                    super::system_prompt::local_today()
                 ),
             );
             if let Some(doctrine) = &child_doctrine {
@@ -341,6 +341,34 @@ mod tests {
             ],
             ..Default::default()
         })
+    }
+
+    /// The custom-prompt date line is TS's LOCAL calendar day: the day of
+    /// an instant moves with the zone offset across midnight.
+    #[test]
+    fn the_date_line_follows_the_local_offset() {
+        use crate::prompts::system_prompt::date_at;
+        // 2026-10-02T00:30:00Z.
+        let instant = 1_790_901_000;
+        assert_eq!(
+            [
+                date_at(instant, 0),
+                date_at(instant, -3_600),
+                date_at(instant, 14 * 3_600),
+                date_at(0, -1),
+            ],
+            ["2026-10-02", "2026-10-01", "2026-10-02", "1969-12-31"]
+        );
+        let custom = build_system_prompt(&BuildSystemPromptOptions {
+            cwd: "/w".to_string(),
+            custom_prompt: Some("Be terse.".to_string()),
+            selected_tools: Some(Vec::new()),
+            ..Default::default()
+        });
+        assert!(custom.contains(&format!(
+            "\nCurrent date: {}\n",
+            crate::prompts::system_prompt::local_today()
+        )));
     }
 
     /// TS without a REPL: the family restrictions follow the environment

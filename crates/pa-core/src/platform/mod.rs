@@ -5,6 +5,7 @@
 //! Call sites in the session engine never branch on `cfg` themselves.
 
 pub mod browser;
+pub(crate) mod clock;
 pub(crate) mod kernel_memory;
 pub mod lock_dir;
 pub mod perms;
