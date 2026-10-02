@@ -183,6 +183,12 @@ pub(crate) struct ResidentWorker {
     /// fork leak's boot form), so the fence refuses — the conservative
     /// miss, never a mis-delivery.
     identity_quarantined: AtomicBool,
+    /// The create's launch failed and was discarded: its descriptor is gone
+    /// for good, so a late writer that looked the resident up before the
+    /// discard (a roster follow of a reply already in flight) must never
+    /// persist it again for a restart to adopt. Set and read under the
+    /// descriptor lock.
+    launch_discarded: AtomicBool,
     /// Monotonic connection epoch: only the pumps of the current
     /// connection may flip `connected` false, so a superseded socket's
     /// late EOF cannot retire a live replacement.
@@ -243,6 +249,7 @@ impl ResidentWorker {
             route_state_tx,
             identity_persist_pending: AtomicBool::new(false),
             identity_quarantined: AtomicBool::new(false),
+            launch_discarded: AtomicBool::new(false),
             connection_epoch: AtomicU64::new(0),
             compaction: crate::compaction_supervision::CompactionSupervision::default(),
         })
@@ -354,6 +361,19 @@ impl ResidentWorker {
 
     /// Whether the root-identity transition's durable record write is
     /// still unresolved (the live descriptor moved; the persist failed).
+    /// Mark the create's failed launch discarded (see `launch_discarded`).
+    pub(crate) fn note_launch_discarded(&self) {
+        self.launch_discarded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the create's failed launch was discarded: its descriptor
+    /// must not be persisted again.
+    pub(crate) fn launch_discarded(&self) -> bool {
+        self.launch_discarded
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub(crate) fn identity_persist_pending(&self) -> bool {
         self.identity_persist_pending
             .load(std::sync::atomic::Ordering::SeqCst)

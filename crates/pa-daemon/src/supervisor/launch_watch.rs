@@ -63,14 +63,25 @@ impl Supervisor {
     /// through its `Ready` persist). A self-registration in flight either
     /// finished first, and its descriptor is deleted here, or runs after
     /// and finds neither resident nor descriptor (the unknown-worker
-    /// refusal): a restart never adopts a create the client was told
-    /// failed. A worker that dies during startup can register (it does so
-    /// before it binds) moments before its exit is observed.
+    /// refusal). The resident is fenced too, under its descriptor lock: a
+    /// roster follow that already held it (a reply in flight before the
+    /// worker died) never persists it again. A restart never adopts a
+    /// create the client was told failed. A worker that dies during startup
+    /// can register (it does so before it binds) moments before its exit
+    /// is observed.
     pub(super) async fn discard_failed_launch(&self, worker_id: &str, descriptor_path: &Path) {
         {
             let _registration_gate = self.registry.adoption_guard(worker_id).await;
-            self.registry.remove(worker_id).await;
-            let _ = std::fs::remove_file(descriptor_path);
+            match self.registry.remove(worker_id).await {
+                Some(resident) => {
+                    let _descriptor = resident.descriptor.lock().await;
+                    resident.note_launch_discarded();
+                    let _ = std::fs::remove_file(descriptor_path);
+                }
+                None => {
+                    let _ = std::fs::remove_file(descriptor_path);
+                }
+            }
         }
         self.registry.forget(worker_id).await;
     }
@@ -318,6 +329,59 @@ mod tests {
         assert!(
             !descriptor_path.exists(),
             "the registration's descriptor went with the failed launch"
+        );
+    }
+
+    /// A roster follow that held the resident from before the discard (a
+    /// worker reply already in flight) lands after it: the moved identity
+    /// is never written back for a restart to adopt.
+    #[tokio::test]
+    async fn a_discarded_launch_is_not_persisted_by_a_late_roster_follow() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let supervisor = supervisor(dir.path());
+        let descriptor_path = dir.path().join("ffffffffffff.json");
+        let descriptor: pa_types::daemon::DaemonWorkerDescriptor =
+            serde_json::from_value(serde_json::json!({
+                "version": 2,
+                "workerId": "ffffffffffff",
+                "pid": 0,
+                "socketPath": "/tmp/none.sock",
+                "recoveryJournalPath": "/tmp/none.jsonl",
+                "supervisorSocketPath": "/tmp/none.sock",
+                "authenticationToken": "token",
+                "rootActiveSessionId": "ffffffffffff",
+                "createdAt": "t",
+                "updatedAt": "t",
+                "lifecycle": "starting",
+                "createCommand": {},
+                "consecutiveFailures": 0,
+            }))
+            .expect("descriptor");
+        let resident = crate::registry::ResidentWorker::new(
+            "ffffffffffff".to_string(),
+            descriptor,
+            descriptor_path.clone(),
+        );
+        supervisor.registry.insert(Arc::clone(&resident)).await;
+        supervisor
+            .discard_failed_launch("ffffffffffff", &descriptor_path)
+            .await;
+        supervisor.roster.lock().unwrap().write_summary(
+            serde_json::json!({
+                "sessionId": "s-1",
+                "activeSessionId": "ffffffffffff",
+                "sessionFile": "/sessions/s-1.jsonl",
+                "activity": "idle",
+            }),
+            Some("ffffffffffff"),
+            None,
+        );
+        let mut descriptor = resident.descriptor.lock().await;
+        assert!(supervisor.sync_root_identity_from_roster(&resident, &mut descriptor));
+        drop(descriptor);
+        assert!(
+            !descriptor_path.exists(),
+            "the discarded launch's descriptor stays gone"
         );
     }
 
