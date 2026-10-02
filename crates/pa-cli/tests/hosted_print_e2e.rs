@@ -228,8 +228,8 @@ impl Sandbox {
     }
 
     /// Create an RLM child of a listed session the way a parent's spawn
-    /// does (its file as `parentSessionPath`, no policy keys); returns the
-    /// child worker's pid.
+    /// does (its file as `parentSessionPath`, no policy or tool keys);
+    /// returns the child's listed row.
     #[track_caller]
     fn create_child(&self, parent: &Value) -> Value {
         std::fs::create_dir_all(self.home().join("children")).unwrap();
@@ -252,7 +252,7 @@ impl Sandbox {
             .unwrap()
             .iter()
             .find(|row| row["activeSessionId"] == created["data"]["activeSessionId"])
-            .expect("the child is listed")["workerPid"]
+            .expect("the child is listed")
             .clone()
     }
 
@@ -341,10 +341,14 @@ impl Sandbox {
 
     /// What a listed session's live worker runs with: its published
     /// `toolSelection` (null for the defaults), its `ipython` definition
-    /// answer (`{}` when the tool is inactive) and its system prompt.
+    /// answer (`{}` when the tool is inactive) and its system prompt. The
+    /// prompt is read first: that read builds the worker's session (built
+    /// lazily, and rebuilt after a switch), so the definition answer comes
+    /// from the session's own tools, never from a session not built yet.
     #[track_caller]
     fn tool_state(&self, row: &Value) -> (Value, Value, String) {
         let row = self.session_row(&row["sessionId"]);
+        let system_prompt = self.system_prompt(&row["sessionId"]);
         let ipython = self.wire().request(&json!({
             "type": "get_tool_definition",
             "activeSessionId": row["activeSessionId"],
@@ -353,7 +357,7 @@ impl Sandbox {
         (
             row["toolSelection"].clone(),
             ipython["data"].clone(),
-            self.system_prompt(&row["sessionId"]),
+            system_prompt,
         )
     }
 
@@ -1140,8 +1144,8 @@ fn an_offline_session_runs_its_own_worker_offline_on_an_online_daemon() {
             offline_env(&supervisor),
             offline_env(&online_row["workerPid"]),
             offline_env(&offline_row["workerPid"]),
-            offline_env(&sandbox.create_child(&online_row)),
-            offline_env(&sandbox.create_child(&offline_row)),
+            offline_env(&sandbox.create_child(&online_row)["workerPid"]),
+            offline_env(&sandbox.create_child(&offline_row)["workerPid"]),
         ],
         [
             None,
@@ -1448,7 +1452,7 @@ fn an_online_session_runs_its_own_worker_online_on_an_offline_daemon() {
         .find(|row| user_texts(row["sessionFile"].as_str().unwrap()) == ["online"])
         .unwrap();
     let woken = sandbox.passivate_and_wake(&online_row);
-    let child = sandbox.create_child(&woken);
+    let child = sandbox.create_child(&woken)["workerPid"].clone();
     assert_eq!(
         [offline_env(&woken["workerPid"]), offline_env(&child)],
         [None, None]
@@ -1542,6 +1546,13 @@ fn a_passivated_no_tools_session_wakes_without_tools() {
         (&after.0, &after.1, &after),
         (&json!({ "noTools": true }), &json!({}), &before),
         "the woken worker runs the session without tools, as before the passivation"
+    );
+    // An RLM child's first create (no tool keys) inherits the selection.
+    let child = sandbox.create_child(&woken);
+    assert_eq!(
+        child["toolSelection"],
+        json!({ "noTools": true }),
+        "{child}"
     );
 
     // A record without the selection keys reads as the default selection
