@@ -331,6 +331,10 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "abort_and_send_queued",
                 "agent_roster",
                 "direct_peer_transport",
+                // Oneiron fork (schema 31): a create whose worker died
+                // during startup fails with `errorInfo.code:
+                // "worker_startup_failed"` (exit status, stderr line, log).
+                "worker_startup_failure",
             ]
             .iter()
             .map(std::string::ToString::to_string),

@@ -33,11 +33,28 @@ mod tests;
 use errors::{command_type_debug, response_data_or_error, DirectRequestError};
 pub use errors::{
     is_daemon_rejection, is_daemon_timeout, is_daemon_unreachable, is_update_restarting_rejection,
-    rejected_provider_unauthenticated, RequestRejected,
+    is_worker_startup_failure, rejected_provider_unauthenticated, RequestRejected,
 };
 
 /// Default response timeout (TS `DEFAULT_DAEMON_REQUEST_TIMEOUT_MS`).
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+/// A `create`'s response timeout. Oneiron fork (TS waits the default 30s):
+/// the daemon's launch budget for a worker that never comes up (the socket
+/// probe, connect and auth) is its default connect deadline (30s Unix, 90s
+/// Windows) plus up to the 10s auth floor, so an equal client deadline
+/// expired first and the daemon's diagnostic (the exit status, the stderr
+/// line, the log path) never reached the user. The client outlasts that
+/// default budget instead, so a worker that never comes up, or dies while
+/// starting, is reported by the daemon. The create itself (the session
+/// load inside the worker) stays bounded by this wait as it was by the old
+/// one: a worker that dies past it is still reported by the daemon at once,
+/// but to a client that already gave up on a create that slow. The launch
+/// budget's test override (`PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS`) is not
+/// tracked.
+#[cfg(unix)]
+const CREATE_REQUEST_TIMEOUT_MS: u64 = 60_000;
+#[cfg(not(unix))]
+const CREATE_REQUEST_TIMEOUT_MS: u64 = 120_000;
 /// Requests whose completion is bounded by the turn itself
 /// (`prompt_and_wait`, `wait_for_idle`) use the supervisor's long route
 /// timeout so a long turn cannot expire the request.
@@ -582,6 +599,7 @@ impl DaemonClient {
             DaemonCommand::PromptAndWait { .. } | DaemonCommand::WaitForIdle { .. } => {
                 LONG_RUNNING_REQUEST_TIMEOUT_MS
             }
+            DaemonCommand::Create { .. } => CREATE_REQUEST_TIMEOUT_MS,
             _ => DEFAULT_REQUEST_TIMEOUT_MS,
         };
         self.request_with_timeout(command, timeout_ms).await

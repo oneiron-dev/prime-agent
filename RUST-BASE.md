@@ -33,6 +33,8 @@ when the diff is identical, otherwise drop it by hand.
 | Change | Where | Why |
 |---|---|---|
 | `PRIME_AGENT_SOCKET_DIR` | `crates/pa-daemon/src/platform/paths.rs` | Worker sockets always live in the socket dir, not beside a custom `PRIME_AGENT_DAEMON_SOCKET`; without this a side-by-side install's workers listen inside the TS `prime-agent-<uid>/` dir. Unset keeps TS parity. |
+| Short Unix worker socket names | `crates/pa-daemon/src/platform/paths.rs`, `boot_reap.rs`, `crates/pa-cli/src/daemon_discovery/mod.rs`, `crates/pa-types/src/incident/` | `w-<12 hex supervisor key>-<12 hex worker id>.sock` (32 bytes) instead of TS's `worker-…` (37): any socket dir up to 70 bytes fits macOS `sun_path`. The boot reap, discovery and incident attribution recognize both names. `pa-types` transport refuses a Unix path past the platform's own limit (103 usable bytes on macOS, 107 on Linux, where a longer one is still re-anchored). Windows pipe names unchanged. |
+| A worker that dies during startup fails its create | `crates/pa-daemon/src/supervisor/launch_watch.rs`, `crates/pa-tui/src/interactive/run.rs`, `crates/pa-tui/src/daemon_client.rs` | The supervisor races every launch stage (probe, connect + auth, create) against the child's exit and answers the create at once with the typed `worker_startup_failed` (`errorInfo`: worker id, exit code or signal, log path; the message adds the last line of its stderr), instead of after the 30 s connect budget or the 10-minute create route. Schema revision 31 and the `worker_startup_failure` capability (TS has neither; an older client reads the code as `Unknown`). The TUI restores the terminal and exits 1 with that error instead of handing off to the agents view, and waits 60 s for a `create` (120 s on Windows; TS 30 s), past the daemon's default launch budget, so a worker that never comes up or dies while starting is reported by the daemon. A failed launch is discarded under the worker's registration gate. |
 | `PRIME_AGENT_DISABLE_SELF_UPDATE` | `crates/pa-core/src/update/installer.rs`, `crates/pa-cli/src/self_update.rs` | Upstream's `update` / `/update` fetch and run the takeover installer (stops every TS daemon, replaces `~/.local/bin/prime-agent`); a side-by-side install must refuse. |
 | `--no-extensions` accepted | `crates/pa-cli/src/args.rs` | Upstream removed extensions (#3189); the `sol` wrapper and factory still pass the flag. |
 | `--json-event-profile all\|factory-completed` | `crates/pa-cli/src/json_output.rs` | The TS fork's factory stream: the reduced profile drops the progressive `message_update`/`tool_execution_update` snapshots before serialization. |
@@ -75,7 +77,8 @@ when the diff is identical, otherwise drop it by hand.
   Consequence: during the trial, Rust and TS sessions are separate stores. Sharing them needs the
   fork-only shared-store guard (`PRIME_AGENT_SHARED_STORE`), a follow-up lane.
 - The launcher exports `PRIME_AGENT_CODING_AGENT_DIR=~/.prime/agent-rs`,
-  `PRIME_AGENT_SOCKET_DIR=${TMPDIR:-/tmp}/pa-rs-<uid>` (0700, owner-checked),
+  `PRIME_AGENT_SOCKET_DIR=/tmp/pa-rs-<uid>` on macOS (canonical `/private/tmp/pa-rs-<uid>`) and
+  `${TMPDIR:-/tmp}/pa-rs-<uid>` elsewhere (0700, owner-checked),
   `PRIME_AGENT_DAEMON_SOCKET=<that dir>/daemon.sock`,
   `PRIME_AGENT_KERNEL_VENV=~/.prime/agent-rs/kernel-venv` and
   `PYTHONPYCACHEPREFIX=~/.prime/agent-rs/python-cache` (0700; the kernel imports bundled Python
@@ -85,8 +88,13 @@ when the diff is identical, otherwise drop it by hand.
   `RLM_HARNESS_STATE_DIR`, `RLM_GLOBAL_HARNESS_STATE_DIR`, `PA_COMPACTION_TRACE`,
   `PA_MCP_LOGIN_URL_FILE`, `PA_DAEMON_EVENT_LOG`), an inherited restart roster
   (`PRIME_AGENT_UPDATE_ROSTER`) and every `PRIME_AGENT_INTERNAL_*` switch. Override only with
-  `PRIME_AGENT_RS_AGENT_DIR` / `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`. The
-  short `pa-rs-<uid>` name keeps macOS worker socket paths under the 104-byte `sun_path` limit.
+  `PRIME_AGENT_RS_AGENT_DIR` / `PRIME_AGENT_RS_SOCKET_DIR` / `PRIME_AGENT_RS_KERNEL_VENV`. Every
+  socket the daemon binds in the socket dir must fit `sun_path` (104 bytes on macOS, 108 on Linux,
+  the NUL included): the launcher and the installer refuse a socket dir whose longest socket path,
+  `<canonical dir>/w-<12 hex>-<12 hex>.sock` counted in bytes, would not (at most 70 bytes of dir on
+  macOS, 74 on Linux), naming `PRIME_AGENT_RS_SOCKET_DIR`. macOS's `$TMPDIR` (57 bytes canonical)
+  left the old `$TMPDIR/pa-rs-<uid>/worker-…` path one byte over, and every interactive worker died
+  at bind.
 - One protected set for every path the installer, the release scripts or the launcher write
   (prefix, receipts, feed, bin dir, agent dir, socket dir, kernel venv) and for the Rust socket the
   rollout idle check connects to: `PROTECTED_STATE` in `side_by_side.py`, which also renders the

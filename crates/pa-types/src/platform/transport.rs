@@ -62,20 +62,27 @@ impl TransportListener for tokio::net::UnixListener {
     }
 }
 
-/// `AF_UNIX` `sun_path` capacity: 108 bytes including the terminating NUL.
-#[cfg(unix)]
+/// Usable `AF_UNIX` `sun_path` bytes, the terminating NUL excluded: Linux's
+/// `sockaddr_un` holds 108 bytes.
+#[cfg(target_os = "linux")]
 const MAX_SUN_PATH: usize = 107;
+/// Usable `AF_UNIX` `sun_path` bytes, the terminating NUL excluded: Darwin's
+/// (and the BSDs') `sockaddr_un` holds 104 bytes, so a 104-byte path fails
+/// at bind with "path must be shorter than `SUN_LEN`".
+#[cfg(all(unix, not(target_os = "linux")))]
+const MAX_SUN_PATH: usize = 103;
 
 /// A kernel-valid `AF_UNIX` address for `bind`/`connect`.
 ///
-/// Paths within the limit pass through unchanged. A longer path is re-anchored
-/// through an `O_PATH` descriptor on its parent directory
-/// (`/proc/self/fd/<fd>/<file name>`): the socket file still lands at the
-/// original (deep) location while the address handed to the kernel stays
-/// short. The TS runtime's socket layer performs this rewrite transparently
-/// (the installed product survives deep `TMPDIR` socket paths), so daemon
-/// and worker endpoints on long paths behave identically here. Linux only;
-/// other platforms surface the natural path-length error.
+/// Paths within the platform limit ([`MAX_SUN_PATH`]) pass through
+/// unchanged. A longer path is re-anchored through an `O_PATH` descriptor
+/// on its parent directory (`/proc/self/fd/<fd>/<file name>`): the socket
+/// file still lands at the original (deep) location while the address
+/// handed to the kernel stays short. The TS runtime's socket layer performs
+/// this rewrite transparently (the installed product survives deep `TMPDIR`
+/// socket paths), so daemon and worker endpoints on long paths behave
+/// identically here. Linux only; other platforms refuse an over-limit path
+/// here, naming the limit, before the kernel would.
 #[cfg(unix)]
 pub struct UnixSocketAddress {
     address: std::path::PathBuf,
@@ -352,41 +359,50 @@ pub fn connect_blocking(path: &Path) -> std::io::Result<Box<dyn BlockingTranspor
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    // The socket-file checks run in the Linux re-anchoring tests only.
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::FileTypeExt;
 
-    /// A directory whose full path length is exactly `target` bytes.
-    ///
-    /// The ambient `TMPDIR` can already be deep (this very harness keeps long
-    /// temp paths), so the base falls back to `/tmp` when needed to stay short.
-    fn dir_of_exact_len(tag: &str, target: usize) -> std::path::PathBuf {
-        let tag = format!("pa-transport-sun-path-{tag}");
-        let base = std::env::temp_dir().join(&tag);
-        let base = if base.as_os_str().len() + 21 <= target {
-            base
+    /// A fresh directory whose full path is exactly `target` bytes, under
+    /// its own uniquely named root (removed with the returned guard): runs
+    /// sharing one box's temp dir never meet, nor delete each other's
+    /// paths. The ambient `TMPDIR` can already be deep (this very harness
+    /// keeps long temp paths; macOS's is 57 bytes), so the root falls back
+    /// to `/tmp` when needed to stay short.
+    fn dir_of_exact_len(target: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let ambient = std::env::temp_dir();
+        let base = if ambient.as_os_str().len() + 60 <= target {
+            ambient
         } else {
-            std::path::Path::new("/tmp").join(&tag)
+            std::path::PathBuf::from("/tmp")
         };
-        let mut dir = base;
-        // Keep at least one byte of room for a file name after the separator.
-        while dir.as_os_str().len() + 22 <= target {
+        let root = tempfile::Builder::new()
+            .prefix("pa-tsp-")
+            .tempdir_in(&base)
+            .expect("unique temp root");
+        let mut dir = root.path().to_path_buf();
+        // Leave 21-40 bytes for the final padding component.
+        while dir.as_os_str().len() + 42 <= target {
             dir = dir.join("d".repeat(20));
         }
         // Pad one final component: appending adds a separator plus the name.
         let pad = target
             .checked_sub(dir.as_os_str().len() + 1)
-            .expect("base must leave room for a file name");
+            .expect("the root must leave room for a padding component");
         dir = dir.join("d".repeat(pad));
         assert_eq!(dir.as_os_str().len(), target);
         std::fs::create_dir_all(&dir).expect("create deep dir");
-        dir
+        (root, dir)
     }
 
+    /// Linux re-anchors an over-limit path (the platform split: Darwin
+    /// refuses it, `darwin_boundary_is_103_bytes`).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn over_limit_paths_bind_connect_and_land_in_place() {
         use tokio::io::AsyncReadExt;
-        let dir = dir_of_exact_len("roundtrip", 120);
+        let (_root, dir) = dir_of_exact_len(120);
         let socket = dir.join("worker-test.sock");
-        let _ = std::fs::remove_file(&socket);
         assert!(socket.as_os_str().len() > MAX_SUN_PATH);
 
         bind_transport(&socket)
@@ -419,24 +435,72 @@ mod tests {
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).await.expect("client read");
         assert_eq!(&buf, b"ping");
-        let _ = std::fs::remove_file(&socket);
     }
 
     #[tokio::test]
     async fn paths_at_the_limit_bind_directly() {
-        let dir = dir_of_exact_len("boundary", 96);
+        let (_root, dir) = dir_of_exact_len(96);
         let name = "x".repeat(MAX_SUN_PATH - dir.as_os_str().len() - 1);
         let socket = dir.join(name);
         assert_eq!(socket.as_os_str().len(), MAX_SUN_PATH);
         bind_transport(&socket)
             .await
             .expect("bind at exactly the limit");
-        let _ = std::fs::remove_file(&socket);
+    }
+
+    /// Linux: 107 bytes is the last direct address; 108 re-anchors through
+    /// the directory descriptor and still binds at the original path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_boundary_is_107_direct_and_108_re_anchored() {
+        let (_root, dir) = dir_of_exact_len(96);
+        let at = dir.join("a".repeat(107 - 96 - 1));
+        let over = dir.join("b".repeat(108 - 96 - 1));
+        assert_eq!((at.as_os_str().len(), over.as_os_str().len()), (107, 108));
+        assert_eq!(
+            UnixSocketAddress::new(&at).expect("direct").effective(),
+            at.as_path()
+        );
+        let address = UnixSocketAddress::new(&over).expect("re-anchored");
+        assert!(
+            address.effective().starts_with("/proc/self/fd/"),
+            "{}",
+            address.effective().display()
+        );
+        bind_transport(&over).await.expect("bind a 108-byte path");
+        assert!(std::fs::symlink_metadata(&over)
+            .expect("socket file at the original path")
+            .file_type()
+            .is_socket());
+    }
+
+    /// Darwin: `sun_path` holds 104 bytes with the NUL, so 103 binds and
+    /// 104 is refused here, naming the limit, instead of failing at the
+    /// kernel's bind (the macOS worker-socket regression).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn darwin_boundary_is_103_bytes() {
+        let (_root, dir) = dir_of_exact_len(90);
+        let at = dir.join("a".repeat(103 - 90 - 1));
+        let over = dir.join("b".repeat(104 - 90 - 1));
+        assert_eq!((at.as_os_str().len(), over.as_os_str().len()), (103, 104));
+        bind_transport(&at).await.expect("bind a 103-byte path");
+        let error = bind_transport(&over)
+            .await
+            .err()
+            .expect("a 104-byte path is refused");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "AF_UNIX socket path exceeds the 103-byte limit: {}",
+                over.display()
+            )
+        );
     }
 
     #[tokio::test]
     async fn over_limit_paths_without_a_short_name_error_clearly() {
-        let dir = dir_of_exact_len("toolong", 120);
+        let (_root, dir) = dir_of_exact_len(120);
         let socket = dir.join("n".repeat(120));
         assert!(socket.as_os_str().len() > MAX_SUN_PATH);
         let error = bind_transport(&socket)
@@ -444,7 +508,6 @@ mod tests {
             .err()
             .expect("no short address exists");
         assert!(error.to_string().contains("exceeds"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

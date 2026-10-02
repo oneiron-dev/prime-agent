@@ -93,14 +93,31 @@ TS_LAUNCHER_NAME = "prime-agent"
 RECEIPT_SCHEMA = "prime-agent-oneiron-rs.install/1"
 PROBE_SCHEMA = "prime-agent-oneiron-rs.probe/1"
 REQUIRED_STAGE_PATHS = ("prime-agent", "package.json", "prime-agent-runtime/src/rlm", "skills")
+# The socket dir's budget: every path the Rust daemon binds there must fit
+# the kernel's AF_UNIX sun_path, NUL included. The longest is a worker
+# endpoint, `w-<12 hex supervisor key>-<12 hex worker id>.sock` (32 bytes,
+# crates/pa-daemon/src/platform/paths.rs); the supervisor's `daemon.sock` is
+# shorter. sun_path holds 104 bytes on macOS (and the BSDs), 108 on Linux.
+# Python's install/rollout checks and the launcher's (rendered from these)
+# refuse a socket dir past the budget before anything is created.
+LONGEST_SOCKET_NAME = "w-" + "f" * 12 + "-" + "f" * 12 + ".sock"
+SUN_PATH_BYTES = {"darwin": 104, "linux": 108}
+# The platform the launcher is rendered for (the installer runs on the
+# machine it installs): it picks the socket dir default and the sun_path
+# limit. A module global so the tests can render the other platform.
+SOCKET_PLATFORM = sys.platform
 
 # POSIX sh, so the same launcher runs under dash (Arch) and bash 3.2 (macOS).
-# The socket dir name stays short: macOS sun_path holds 104 bytes and $TMPDIR
-# there is ~49, so `prime-agent-rs-<uid>/worker-<12>-<12>.sock` would overflow
-# where `pa-rs-<uid>/…` fits. RS-specific overrides only; the generic names
-# are always rewritten so an inherited TS value can never leak in. The
-# checks mirror the installer's (checked_path, canonical, refuse_ts_state,
-# check_agent_tree) and all run BEFORE anything is created.
+# The socket dir must leave room for the longest socket path in sun_path:
+# macOS's $TMPDIR (/var/folders/…/T/, ~49 bytes, 57 canonical) left the old
+# `$TMPDIR/pa-rs-<uid>/worker-<12>-<12>.sock` one byte past the 104-byte
+# limit, so the macOS default is /tmp/pa-rs-<uid> (canonical
+# /private/tmp/pa-rs-<uid>) and the launcher refuses a dir past the budget
+# (SUN_PATH_BYTES, LONGEST_SOCKET_NAME). RS-specific overrides only; the
+# generic names are always rewritten so an inherited TS value can never leak
+# in. The checks mirror the installer's (checked_path, canonical,
+# refuse_ts_state, check_socket_budget, check_agent_tree) and all run BEFORE
+# anything is created.
 LAUNCHER_TEMPLATE = """#!/bin/sh
 # prime-agent-rs: the side-by-side Rust prime-agent (Oneiron fork).
 # Written by scripts/oneiron/side_by_side.py install; reinstall instead of editing.
@@ -109,6 +126,10 @@ LAUNCHER_TEMPLATE = """#!/bin/sh
 set -e
 prefix={prefix}
 system_tmp={system_tmp}
+# The socket dir budget (side_by_side.SUN_PATH_BYTES, LONGEST_SOCKET_NAME),
+# rendered for {socket_platform}.
+sun_path_bytes={sun_path_bytes}
+longest_socket={longest_socket}
 uid=$(id -u)
 die() {{ echo "prime-agent-rs: $*" >&2; exit 1; }}
 # checked NAME P: P without trailing slashes. It must be absolute with no
@@ -154,9 +175,15 @@ case "${{XDG_DATA_HOME:-}}" in
   /*) data=$(checked XDG_DATA_HOME "$XDG_DATA_HOME") ;;
   *) data=$home/.local/share ;;
 esac
-sock_dir=$(checked PRIME_AGENT_RS_SOCKET_DIR "${{PRIME_AGENT_RS_SOCKET_DIR:-$tmp/pa-rs-$uid}}")
+sock_dir=$(checked PRIME_AGENT_RS_SOCKET_DIR "${{PRIME_AGENT_RS_SOCKET_DIR:-{socket_base}/pa-rs-$uid}}")
 sock_dir=$(canon "$sock_dir")
 refuse_ts_state "socket dir" "$sock_dir"
+# Every socket the daemon binds here must fit sun_path, counted in bytes
+# on the canonical (exported) spelling: refused before anything is created.
+sock_bytes=$(printf '%s' "$sock_dir/$longest_socket" | LC_ALL=C wc -c | tr -d ' \\t')
+if [ $((sock_bytes + 1)) -gt "$sun_path_bytes" ]; then
+  die "refusing socket dir $sock_dir: its longest socket path ($sock_dir/$longest_socket) is $sock_bytes bytes plus the NUL, over the $sun_path_bytes-byte {socket_platform} sun_path limit; set PRIME_AGENT_RS_SOCKET_DIR to a shorter directory (at most {socket_dir_max} bytes, e.g. /tmp/pa-rs-$uid)"
+fi
 # Own agent dir: the TS fleet's ~/.prime/agent is shared mutable state the
 # Rust daemon would sweep, migrate and rewrite (session archiving, update
 # manifests, schedules, settings, OAuth refresh). The installer seeds it with
@@ -475,14 +502,53 @@ def cli_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
     return prefix, bin_dir
 
 
+def sun_path_bytes() -> int:
+    """sun_path capacity (NUL included) on SOCKET_PLATFORM: Linux's, or the
+    104 bytes of macOS and the BSDs."""
+    return SUN_PATH_BYTES["linux" if SOCKET_PLATFORM.startswith("linux") else "darwin"]
+
+
+def socket_dir_max() -> int:
+    """The longest socket dir (bytes) whose longest socket path still fits."""
+    return sun_path_bytes() - 1 - len("/" + LONGEST_SOCKET_NAME)
+
+
+def default_socket_base() -> Path:
+    """Where the default socket dir lives: /tmp on macOS (its $TMPDIR is too
+    deep for sun_path), $TMPDIR (else /tmp) elsewhere."""
+    return SYSTEM_TMP if SOCKET_PLATFORM == "darwin" else tmp_dir()
+
+
+def shell_socket_base() -> str:
+    """default_socket_base() as the launcher's own variable."""
+    return "$system_tmp" if SOCKET_PLATFORM == "darwin" else "$tmp"
+
+
+def check_socket_budget(socket_dir: Path) -> Path:
+    """`socket_dir` (canonical), unless its longest socket path would not fit
+    sun_path: bytes of `<dir>/LONGEST_SOCKET_NAME` plus the NUL, counted on
+    the canonical spelling the launcher exports (the launcher's check is
+    the same rule from the same constants)."""
+    limit = sun_path_bytes()
+    longest = socket_dir / LONGEST_SOCKET_NAME
+    size = len(os.fsencode(longest))
+    if size + 1 > limit:
+        raise SystemExit(
+            f"error: refusing socket dir {socket_dir}: its longest socket path ({longest}) is {size} bytes plus "
+            f"the NUL, over the {limit}-byte {SOCKET_PLATFORM} sun_path limit; set PRIME_AGENT_RS_SOCKET_DIR to a "
+            f"shorter directory (at most {socket_dir_max()} bytes, e.g. /tmp/pa-rs-{os.getuid()})")
+    return socket_dir
+
+
 def runtime_dirs() -> dict[str, Path]:
     """The agent dir, socket dir and kernel venv the launcher will hand the
     binary (same overrides, same defaults), canonical and checked."""
     env = os.environ.get
     agent_dir = refuse_ts_state("agent dir", checked_path(
         "PRIME_AGENT_RS_AGENT_DIR", env("PRIME_AGENT_RS_AGENT_DIR") or f"{HOME}/.prime/agent-rs"))
-    socket_dir = refuse_ts_state("socket dir", checked_path(
-        "PRIME_AGENT_RS_SOCKET_DIR", env("PRIME_AGENT_RS_SOCKET_DIR") or f"{tmp_dir()}/pa-rs-{os.getuid()}"))
+    socket_dir = check_socket_budget(refuse_ts_state("socket dir", checked_path(
+        "PRIME_AGENT_RS_SOCKET_DIR",
+        env("PRIME_AGENT_RS_SOCKET_DIR") or f"{default_socket_base()}/pa-rs-{os.getuid()}")))
     kernel_venv = refuse_ts_state("kernel venv", checked_path(
         "PRIME_AGENT_RS_KERNEL_VENV", env("PRIME_AGENT_RS_KERNEL_VENV") or f"{agent_dir}/kernel-venv"))
     if agent_dir == kernel_venv or is_within(agent_dir, kernel_venv):
@@ -824,7 +890,9 @@ def seed_agent_dir(agent_dir: Path, ts_agent_dir: Path, hubs_repo: Path, *, refr
 
 def launcher_text(prefix: Path) -> str:
     return LAUNCHER_TEMPLATE.format(prefix=shlex.quote(str(prefix)), system_tmp=shlex.quote(str(SYSTEM_TMP)),
-                                    protected_roots=shell_protected_roots())
+                                    protected_roots=shell_protected_roots(), socket_base=shell_socket_base(),
+                                    socket_platform=SOCKET_PLATFORM, sun_path_bytes=sun_path_bytes(),
+                                    longest_socket=LONGEST_SOCKET_NAME, socket_dir_max=socket_dir_max())
 
 
 def write_launcher(bin_dir: Path, prefix: Path) -> Path:
@@ -1212,7 +1280,8 @@ def add_probe_args(command: argparse.ArgumentParser) -> None:
 def add_idle_args(command: argparse.ArgumentParser) -> None:
     command.add_argument("--rust-socket", type=Path,
                          help="the Rust supervisor socket to check (default: the launcher's "
-                              "${PRIME_AGENT_RS_SOCKET_DIR:-$TMPDIR/pa-rs-<uid>}/daemon.sock)")
+                              "${PRIME_AGENT_RS_SOCKET_DIR:-<tmp>/pa-rs-<uid>}/daemon.sock, <tmp> being /tmp "
+                              "on macOS, $TMPDIR (else /tmp) elsewhere)")
     command.add_argument("--force-idle-check-skip", action="store_true",
                          help="proceed even when the Rust daemon has live sessions or cannot be "
                               "checked (they keep running the old binary)")

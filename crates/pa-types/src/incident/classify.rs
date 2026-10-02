@@ -4,9 +4,10 @@
 use super::patterns::{
     ADOPT_FAILED, AUTH_FAILED, CATCH_UP, CRASH_LINE, CRASH_PREFIX, DAEMON_COMMAND, EVICTED_EMPTY,
     EVICTED_IDLE, FAILED_AFTER_RETRIES, HEARTBEATS_LIST, MIGRATED, PASSIVATED, RECLAIMED,
-    RECOVERED, RECOVERED_PLAIN, RECOVER_FAILED, REPLACEMENT, SHUTDOWN_EXIT, SIGNAL_SHUTDOWN,
-    STACK_FRAME, STARTUP_FAILED, STDERR_FORWARD, STOP_REQUESTED, SUPERVISOR_COMMAND,
-    SUPERVISOR_LISTENING, UNKNOWN_SESSION, UNRESPONSIVE, WOKE, WORKER_LISTENING, WORKER_SOCKET,
+    RECOVERED, RECOVERED_PLAIN, RECOVER_FAILED, REPLACEMENT, SHORT_WORKER_SOCKET, SHUTDOWN_EXIT,
+    SIGNAL_SHUTDOWN, STACK_FRAME, STARTUP_FAILED, STDERR_FORWARD, STOP_REQUESTED,
+    SUPERVISOR_COMMAND, SUPERVISOR_LISTENING, UNKNOWN_SESSION, UNRESPONSIVE, WOKE,
+    WORKER_LISTENING, WORKER_SOCKET,
 };
 use super::{
     error_message, first_line, lifecycle_classes, truncate_text, IncidentCategory, IncidentEvent,
@@ -15,7 +16,7 @@ use super::{
 use std::collections::HashMap;
 
 /// The worker id a socket path names, if any (TS
-/// `workerIdFromSocketPath`).
+/// `workerIdFromSocketPath`, plus the fork's short `w-` Unix name).
 ///
 /// Splitting on both separators so Windows named-pipe paths
 /// (`\\.\pipe\...`) resolve to their last segment on any platform, not
@@ -28,6 +29,7 @@ pub fn worker_id_from_socket_path(socket_path: Option<&str>) -> Option<&str> {
         .unwrap_or(socket_path);
     WORKER_SOCKET
         .captures(name)
+        .or_else(|| SHORT_WORKER_SOCKET.captures(name))
         .and_then(|captures| captures.get(1))
         .map(|group| group.as_str())
 }

@@ -315,58 +315,64 @@ impl Supervisor {
         // A failed launch never leaves its half-registered resident behind:
         // a later stale-id rebind (or resolve) must not select a worker
         // that cannot route.
-        let child = match self.spawn_worker_process(&resident, deadline).await {
+        let mut child = match self.spawn_worker_process(&resident, deadline).await {
             Ok(child) => child,
             Err(error) => {
-                self.registry.remove(&worker_id).await;
+                self.note_startup_exit(&error);
                 // The half-launched worker's descriptor dies with the
                 // launch: a restart must not adopt it and replay its
                 // durable create after the client was told the create
                 // failed.
-                let _ = std::fs::remove_file(&descriptor_path);
+                self.discard_failed_launch(&worker_id, &descriptor_path)
+                    .await;
                 return Err(error);
             }
         };
-        if let Err(error) = self.connect_worker(&resident, deadline).await {
-            // Never leave a spawned-but-unwired worker process behind.
-            let mut child = child;
-            let _ = child.kill().await;
-            self.registry.remove(&worker_id).await;
-            // The half-launched worker's descriptor dies with the launch.
-            let _ = std::fs::remove_file(&descriptor_path);
-            return Err(error);
-        }
-        let create_payload = {
-            let descriptor = resident.descriptor.lock().await;
-            create_command_payload(&descriptor.create_command)
-        };
-        let mut child = child;
-        let response = match self
-            .route_command_typed(
-                &resident,
-                "create",
-                create_payload,
-                LONG_ROUTE_TIMEOUT_MS,
-                RouteAdmission::SupervisorInternal,
+        // Connect + auth, then the create, each watched against the
+        // worker's exit: a worker that dies after its bind (mid-handshake,
+        // mid-create) fails the create with its own exit status and stderr
+        // at once, never after the route budget. A failed stage never
+        // leaves the spawned worker behind (the watch kills or reaps it):
+        // an unmanaged survivor would keep the session file while a retry
+        // mints a second worker over it.
+        let launched = async {
+            self.watch_launch_stage(
+                &worker_id,
+                &mut child,
+                self.connect_worker(&resident, deadline),
+            )
+            .await?;
+            let create_payload = {
+                let descriptor = resident.descriptor.lock().await;
+                create_command_payload(&descriptor.create_command)
+            };
+            self.watch_launch_stage(
+                &worker_id,
+                &mut child,
+                self.route_command_typed(
+                    &resident,
+                    "create",
+                    create_payload,
+                    LONG_ROUTE_TIMEOUT_MS,
+                    RouteAdmission::SupervisorInternal,
+                ),
             )
             .await
-        {
+        };
+        let response = match launched.await {
             Ok(response) => response,
             Err(error) => {
-                // The connected child dies with the failed create: an
-                // unmanaged survivor would keep the session file while a
-                // retry mints a second worker over it.
-                let _ = child.kill().await;
-                self.registry.remove(&worker_id).await;
+                self.note_startup_exit(&error);
                 // The half-launched worker's descriptor dies with the launch.
-                let _ = std::fs::remove_file(&descriptor_path);
+                self.discard_failed_launch(&worker_id, &descriptor_path)
+                    .await;
                 return Err(error);
             }
         };
         if !response.success {
             let _ = child.kill().await;
-            let _ = std::fs::remove_file(&descriptor_path);
-            self.registry.remove(&worker_id).await;
+            self.discard_failed_launch(&worker_id, &descriptor_path)
+                .await;
             // A typed worker rejection relays verbatim - the typed text is
             // the user-facing refusal (the session-hold rejection the
             // lease raises against a live foreign holder) - and the daemon
