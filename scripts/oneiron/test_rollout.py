@@ -104,6 +104,9 @@ class RolloutFixture(unittest.TestCase):
             "PRIME_AGENT_RS_SOCKET_DIR": str(self.root / "s"),
             "PRIME_AGENT_RS_KERNEL_VENV": str(self.root / "venv-rs"),
         })
+        # tempfile caches the first TMPDIR it reads; drop the cache so this test's
+        # code under test uses this test's TMPDIR, not an earlier test's deleted one.
+        tempfile.tempdir = None
         self.saved = (side_by_side.HOME, side_by_side.TS_AGENT_DIR, side_by_side.SYSTEM_TMP,
                       side_by_side.SOCKET_PLATFORM, release_feed.host_platform)
         side_by_side.HOME = self.home
@@ -130,6 +133,7 @@ class RolloutFixture(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        tempfile.tempdir = None
         self.tmp.cleanup()
 
     def main(self, *argv: str) -> int:
@@ -409,6 +413,12 @@ class RolloutTests(RolloutFixture):
             self.main("rollout", "--version", V1)
         self.assertEqual([(self.prefix / V1).exists(), (self.prefix / "receipts" / f"{V1}-{PLATFORM}").exists(),
                           over.exists()], [False, False, False])
+
+    def test_temporary_files_follow_this_tests_tmpdir(self) -> None:
+        # package() and rollout() make their scratch dirs with tempfile's
+        # default dir; a value cached by an earlier test points into that
+        # test's deleted sandbox (on macOS every later test then fails).
+        self.assertEqual(Path(tempfile.gettempdir()), self.fake_tmp)
 
     def test_a_socket_nobody_listens_on_counts_as_no_daemon(self) -> None:
         self.publish(V1)
