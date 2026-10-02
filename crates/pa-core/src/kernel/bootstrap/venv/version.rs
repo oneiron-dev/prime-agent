@@ -103,6 +103,20 @@ pub(crate) fn write_bootstrap_version(
     Ok(())
 }
 
+/// Drop the venv's `.bootstrap-version` record (a missing one is fine):
+/// until it is written again no readiness check accepts the venv.
+///
+/// # Errors
+///
+/// Returns the removal failure other than a missing record.
+pub(crate) fn clear_bootstrap_version(venv: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(venv.join(BOOTSTRAP_VERSION_FILE)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// The parsed `.bootstrap-version` plus its raw text (the probe-memo key
 /// input), in one read.
 pub(super) fn read_bootstrap_version_raw(venv: &Path) -> (Option<BootstrapVersion>, String) {

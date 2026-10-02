@@ -216,32 +216,45 @@ pub async fn prepare_kernel_environment(options: EnsureKernelPythonOptions) -> a
     }
     let started = Instant::now();
     trace(|| "kernel environment preparation start".to_string());
-    let ensured = ensure_kernel_python_joined(&options).await?;
-    if ensured.prepared {
-        let python_skills = normalize_python_skills(&options.python_skills);
-        let venv = resolve_writable_kernel_venv_dir()?;
-        kernel_ready(
-            &ensured.python.to_string_lossy(),
-            &venv,
-            &resolve_runtime_identity(),
-            &python_skills,
-            options.child_cancel(),
-        )
-        .await;
-        options.check_cancelled()?;
+    let prepared = async {
+        let ensured = ensure_kernel_python_joined(&options).await?;
+        if ensured.prepared {
+            let python_skills = normalize_python_skills(&options.python_skills);
+            let venv = resolve_writable_kernel_venv_dir()?;
+            let ready = kernel_ready(
+                &ensured.python.to_string_lossy(),
+                &venv,
+                &resolve_runtime_identity(),
+                &python_skills,
+                options.child_cancel(),
+            )
+            .await;
+            options.check_cancelled()?;
+            // Setup that still leaves the venv unready (a failed probe, a
+            // skill that would not install) is a failed preparation: the
+            // boot would only repeat it, after the answer.
+            if !ready {
+                return Err(anyhow!("the kernel environment is not ready after setup"));
+            }
+        }
+        anyhow::Ok(ensured.prepared)
     }
-    trace(|| {
-        format!(
-            "kernel environment preparation end ({}, {:.1} ms)",
-            if ensured.prepared {
-                "set up"
-            } else {
-                "already ready"
-            },
-            started.elapsed().as_secs_f64() * 1000.0
-        )
-    });
-    Ok(())
+    .await;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match &prepared {
+        Ok(set_up) => trace(|| {
+            format!(
+                "kernel environment preparation end ({}, {elapsed_ms:.1} ms)",
+                if *set_up { "set up" } else { "already ready" }
+            )
+        }),
+        Err(error) => trace(|| {
+            let first_line = format!("{error:#}");
+            let first_line = first_line.lines().next().unwrap_or_default().to_string();
+            format!("kernel environment preparation failed ({elapsed_ms:.1} ms): {first_line}")
+        }),
+    }
+    prepared.map(|_| ())
 }
 
 /// [`ensure_kernel_python`] with the setup outcome, joining a concurrent
