@@ -16,6 +16,7 @@ use super::{
 };
 use crate::lease::is_process_alive;
 use crate::protocol::{response_failure, response_success, DaemonResponse};
+use crate::session_policy::SessionPolicy;
 
 impl Supervisor {
     /// Complete a tombstoned stop for a worker encountered at adoption —
@@ -186,26 +187,31 @@ impl Supervisor {
             thinking: requested_thinking,
         };
         // The session policy (fork revision 31), validated before anything
-        // launches; `None` is a pre-policy client (no keys, no policy). An
-        // RLM child's create carries none: it inherits its live parent's
-        // (the TS child runtime inherits the parent's session config), so
-        // an offline seat's subagents stay offline and skill-free.
-        let session_policy = match crate::session_policy::SessionPolicy::requested(config_object)? {
-            Some(policy) => Some(policy),
-            None => match config_object
-                .and_then(|config| config.get("parentSessionPath"))
-                .and_then(Value::as_str)
-            {
-                Some(parent_file) => match self.registry.find_by_session_file(parent_file).await {
-                    Some(parent) => Some(crate::session_policy::SessionPolicy::durable(
-                        &parent.descriptor.lock().await.create_command.rest,
-                    ))
-                    .filter(|policy| !policy.is_default()),
-                    None => None,
-                },
-                None => None,
-            },
-        };
+        // launches. A create without the keys (a wake, a revival, a
+        // pre-policy open) runs under the policy its session file was
+        // created with, and an RLM child's first create inherits its
+        // parent session's (the TS child runtime inherits the parent's
+        // session config): an offline seat's sessions and subagents stay
+        // offline and skill-free. `None`: no policy at all (the old
+        // behavior).
+        let mut session_policy = SessionPolicy::requested(config_object)?;
+        if session_policy.is_none() {
+            session_policy = session_path
+                .as_deref()
+                .and_then(|file| SessionPolicy::recalled(&self.descriptor_dir, file));
+        }
+        let parent_file = config_object
+            .and_then(|config| config.get("parentSessionPath"))
+            .and_then(Value::as_str);
+        if let (None, Some(parent_file)) = (session_policy, parent_file) {
+            session_policy = match self.registry.find_by_session_file(parent_file).await {
+                Some(parent) => Some(SessionPolicy::durable(
+                    &parent.descriptor.lock().await.create_command.rest,
+                )),
+                None => SessionPolicy::recalled(&self.descriptor_dir, parent_file),
+            }
+            .filter(|policy| !policy.is_default());
+        }
         if *no_session == Some(true) && session_path.is_some() {
             return Err(anyhow!(
                 "Session cannot be both no-session and session-pathed"
@@ -497,6 +503,18 @@ impl Supervisor {
                 descriptor.session_file.as_deref(),
             );
             persist_worker(&descriptor_path, &descriptor)?;
+            // The policy outlives this worker: the descriptor goes with it
+            // (idle passivation, a per-session stop), and the session's
+            // next worker recalls the policy from this record.
+            if let (Some(policy), Some(session_file)) =
+                (session_policy, descriptor.session_file.as_deref())
+            {
+                if let Err(error) = policy.remember(&self.descriptor_dir, session_file) {
+                    self.log_line(&format!(
+                        "session worker {worker_id}: could not keep the session policy for {session_file}: {error:#}"
+                    ));
+                }
+            }
         }
         // The create completed with a validated session identity: client
         // commands may now be routed to this worker (the replacement-aware

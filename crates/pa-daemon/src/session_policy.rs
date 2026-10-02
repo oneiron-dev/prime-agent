@@ -6,18 +6,22 @@
 //! (no policy, no reuse check).
 //!
 //! The supervisor validates the keys, persists them in the worker's durable
-//! create command (so a respawn or a relaunch rebuilds the same session),
-//! and launches an offline session's worker with `PI_OFFLINE=1` in THAT
-//! worker's environment; its own environment and every other worker stay
-//! as they are. A create that reuses a live worker must ask for the
-//! policy the worker runs under: a mismatch is refused, never applied to
-//! (or silently ignored by) another client's session.
+//! create command (so a respawn or a relaunch rebuilds the same session)
+//! and in a per-session record that outlives the worker (so a passivated
+//! session wakes under it), and launches the session's worker with
+//! `PI_OFFLINE=1` (offline) or without any inherited `PI_OFFLINE` (online)
+//! in THAT worker's environment; its own environment and every other
+//! worker stay as they are. A create that reuses a live worker must ask
+//! for the policy the worker runs under: a mismatch is refused, never
+//! applied to (or silently ignored by) another client's session.
 //!
 //! The offline boundary is the TS one: the worker's startup network
 //! operations (catalog and private-model refreshes, package installs and
 //! update checks, version checks, telemetry) stay off. Provider inference,
 //! the kernel's own environment provisioning, explicit MCP handshakes and
 //! whatever the model's tools run are not blocked; it is not a firewall.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
@@ -113,6 +117,63 @@ impl SessionPolicy {
             no_skills: flag(NO_SKILLS_KEY),
         }
     }
+
+    /// Keep this policy for `session_file` beside the worker descriptors in
+    /// `descriptor_dir`: a worker's descriptor dies with the worker (idle
+    /// passivation, a per-session stop), and the session's next worker (a
+    /// wake, a revival, an open that carries no policy) starts under the
+    /// recalled one. The default policy keeps no record.
+    ///
+    /// # Errors
+    ///
+    /// Returns the write failure.
+    pub(crate) fn remember(self, descriptor_dir: &Path, session_file: &str) -> Result<()> {
+        let path = record_path(descriptor_dir, session_file);
+        if self.is_default() {
+            return match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+                Ok(()) | Err(_) => Ok(()),
+            };
+        }
+        let mut record = Map::from_iter([("sessionFile".to_string(), Value::from(session_file))]);
+        self.write_into(&mut record);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::descriptor::write_file_atomic(&path, &Value::Object(record).to_string())
+    }
+
+    /// The policy [`SessionPolicy::remember`] kept for `session_file`.
+    #[must_use]
+    pub(crate) fn recalled(descriptor_dir: &Path, session_file: &str) -> Option<Self> {
+        let text = std::fs::read_to_string(record_path(descriptor_dir, session_file)).ok()?;
+        let record: Value = serde_json::from_str(&text).ok()?;
+        Self::requested(record.as_object()).ok().flatten()
+    }
+}
+
+/// The directory beside the worker descriptors that keeps session policies.
+const POLICY_RECORDS_DIR: &str = "session-policies";
+
+/// One session file's policy record: named by a digest of its canonical
+/// path (the registry's comparison rule), so any spelling finds it.
+fn record_path(descriptor_dir: &Path, session_file: &str) -> PathBuf {
+    use sha2::Digest as _;
+    let canonical = Path::new(session_file).canonicalize().map_or_else(
+        |_| session_file.to_string(),
+        |path| path.to_string_lossy().to_string(),
+    );
+    let digest = sha2::Sha256::digest(canonical.as_bytes());
+    let name = digest[..16]
+        .iter()
+        .fold(String::with_capacity(32), |mut name, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(name, "{byte:02x}");
+            name
+        });
+    descriptor_dir
+        .join(POLICY_RECORDS_DIR)
+        .join(format!("{name}.json"))
 }
 
 #[cfg(test)]
@@ -174,6 +235,45 @@ mod tests {
             let error = requested(&config).unwrap_err().to_string();
             assert!(error.starts_with("Invalid create config: "), "{error}");
         }
+    }
+
+    /// A remembered policy is recalled for any spelling of the session file
+    /// and survives until the default policy replaces it.
+    #[test]
+    fn a_remembered_policy_outlives_its_worker_until_the_default_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptors = dir.path().join("daemon-workers").join("key");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let file = sessions.join("s.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        let spelled = sessions.join("..").join("sessions").join("s.jsonl");
+        let factory = SessionPolicy {
+            offline: true,
+            no_skills: true,
+        };
+        assert_eq!(
+            SessionPolicy::recalled(&descriptors, file.to_str().unwrap()),
+            None
+        );
+        factory
+            .remember(&descriptors, file.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            SessionPolicy::recalled(&descriptors, spelled.to_str().unwrap()),
+            Some(factory)
+        );
+        SessionPolicy::default()
+            .remember(&descriptors, spelled.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            SessionPolicy::recalled(&descriptors, file.to_str().unwrap()),
+            None
+        );
+        // Forgetting what was never kept is not an error.
+        SessionPolicy::default()
+            .remember(&descriptors, file.to_str().unwrap())
+            .unwrap();
     }
 
     #[test]

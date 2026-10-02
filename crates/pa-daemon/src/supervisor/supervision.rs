@@ -410,7 +410,7 @@ impl Supervisor {
         // One env definition for spawn and for the update roster's
         // `launch_env` row (spec §8: "env snapshot to respawn the worker
         // identically").
-        let (worker_socket, cwd, launch_env) = {
+        let (worker_socket, cwd, launch_env, online_policy) = {
             let descriptor = resident.descriptor.lock().await;
             (
                 PathBuf::from(&descriptor.socket_path),
@@ -426,6 +426,15 @@ impl Supervisor {
                     &self.options.socket_path.to_string_lossy(),
                     &uuid::Uuid::new_v4().to_string(),
                     &descriptor,
+                ),
+                // A session whose policy is online never inherits the
+                // offline mode of a supervisor an `--offline` client
+                // started (a pre-policy session keeps inheriting it).
+                matches!(
+                    crate::session_policy::SessionPolicy::requested(Some(
+                        &descriptor.create_command.rest
+                    )),
+                    Ok(Some(policy)) if !policy.offline
                 ),
             )
         };
@@ -444,6 +453,9 @@ impl Supervisor {
             // supervisor's inherited stderr, which a detached supervisor
             // never had): the launch failure errors below tail this file.
             .stderr(std::process::Stdio::from(stderr_log));
+        if online_policy {
+            command.env_remove(crate::session_policy::OFFLINE_ENV);
+        }
         if std::path::Path::new(&cwd).is_dir() {
             command.current_dir(&cwd);
         }

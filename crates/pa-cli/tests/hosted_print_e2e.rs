@@ -114,6 +114,37 @@ impl Sandbox {
         output_of(&mut self.command(args))
     }
 
+    /// [`Sandbox::command`] ONLINE (no `PI_OFFLINE`), with no way out:
+    /// every HTTP client goes through a dead loopback proxy, and telemetry
+    /// is off.
+    fn online_command(&self, args: &[&str]) -> Command {
+        let mut command = self.command(args);
+        command.env_remove("PI_OFFLINE").env("DO_NOT_TRACK", "1");
+        for proxy in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            command.env(proxy, "http://127.0.0.1:9");
+        }
+        command.env_remove("NO_PROXY").env_remove("no_proxy");
+        command
+    }
+
+    /// The probe skill a session discovers from the agent dir by default.
+    fn add_discoverable_skill(&self) {
+        let dir = self.home().join(".prime/agent/skills/lane-probe-skill");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: lane-probe-skill\ndescription: Probe skill for the hosted no-skills verifier\n---\nBody",
+        )
+        .unwrap();
+    }
+
     /// A factory seat's launch: its exact native argv (`nativeSeatArgv` in
     /// `packages/factory/src/agent-command.ts`, daemon custody) plus
     /// `extra`, with the prompt on stdin.
@@ -860,24 +891,7 @@ fn the_factory_seat_argv_runs_a_hosted_session() {
 #[test]
 fn an_offline_session_runs_its_own_worker_offline_on_an_online_daemon() {
     let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
-    // Online, but with no way out: every HTTP client in the daemon goes
-    // through a dead loopback proxy, and telemetry is off.
-    let online = |args: &[&str]| {
-        let mut command = sandbox.command(args);
-        command.env_remove("PI_OFFLINE").env("DO_NOT_TRACK", "1");
-        for proxy in [
-            "HTTPS_PROXY",
-            "https_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-        ] {
-            command.env(proxy, "http://127.0.0.1:9");
-        }
-        command.env_remove("NO_PROXY").env_remove("no_proxy");
-        output_of(&mut command)
-    };
+    let online = |args: &[&str]| output_of(&mut sandbox.online_command(args));
     let (stdout, stderr, code) = online(&["--daemon-hosted", "-p", "online"]);
     assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
     let (stdout, stderr, code) = online(&[
@@ -958,10 +972,7 @@ fn no_skills_empties_the_hosted_inventory_and_keeps_explicit_skills() {
         .unwrap();
         dir.join(name).display().to_string()
     };
-    skill(
-        &sandbox.home().join(".prime/agent/skills"),
-        "lane-probe-skill",
-    );
+    sandbox.add_discoverable_skill();
     let explicit = skill(&sandbox.home().join("explicit"), "explicit-probe-skill");
     let inventory_of = |flags: &[&str]| {
         let args: Vec<&str> = ["--mode", "json", "--daemon-hosted"]
@@ -1034,39 +1045,88 @@ fn a_live_session_is_reused_only_under_its_own_policy() {
     assert_eq!(user_texts(&file), ["one", "two", "three"]);
 }
 
-/// A daemon of this schema that does not advertise `session_policy` is
-/// never sent a policy it would drop: the seat fails with the reason.
-#[test]
-fn a_daemon_without_the_policy_capability_refuses_the_seat_flags() {
-    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": [] }));
-    let listener = std::os::unix::net::UnixListener::bind(sandbox.socket()).unwrap();
-    let hello = json!({
-        "type": "daemon_hello",
-        "protocol": { "name": "prime-agent.daemon", "version": 7 },
-        "schemaId": pa_types::daemon::DAEMON_SCHEMA_ID,
-        "schemaRevision": pa_types::daemon::DAEMON_SCHEMA_REVISION,
-        "serverCapabilities": ["prompt_admission_cancellation"],
-    });
-    // Every connection gets the hello; the sandbox's shutdown closes its
-    // own (the fake has no supervisor to stop).
+/// What a fake daemon saw on one connection.
+#[derive(Debug, PartialEq)]
+enum FakeDaemonEvent {
+    /// A command envelope's command type.
+    Command(String),
+    /// The client closed the connection (or the fake did, after a
+    /// `shutdown`).
+    Closed,
+}
+
+/// A fake daemon on the sandbox socket: every connection gets `hello`, a
+/// `list` gets `sessions`, every other command no answer, and a `shutdown`
+/// closes the connection. Reports what each connection sent, in order.
+fn fake_daemon(socket: &Path, hello: Value, sessions: Value) -> mpsc::Receiver<FakeDaemonEvent> {
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let (events, received) = mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else {
                 return;
             };
-            let hello = hello.clone();
+            let (hello, sessions, events) = (hello.clone(), sessions.clone(), events.clone());
             std::thread::spawn(move || {
                 if writeln!(stream, "{hello}").is_err() {
                     return;
                 }
+                let mut writer = stream.try_clone().unwrap();
                 for line in BufReader::new(stream).lines() {
-                    if line.map_or(true, |line| line.contains("\"shutdown\"")) {
-                        return;
+                    let Ok(line) = line else { break };
+                    // Clients may send blank keep-alive lines.
+                    let Ok(envelope) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    let kind = envelope["command"]["type"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let _ = events.send(FakeDaemonEvent::Command(kind.clone()));
+                    match kind.as_str() {
+                        "list" => {
+                            let response = json!({
+                                "type": "response", "id": envelope["id"], "command": "list",
+                                "success": true, "data": { "sessions": sessions },
+                            });
+                            if writeln!(writer, "{response}").is_err() {
+                                break;
+                            }
+                        }
+                        "shutdown" => break,
+                        _ => {}
                     }
                 }
+                let _ = events.send(FakeDaemonEvent::Closed);
             });
         }
     });
+    received
+}
+
+fn fake_hello(schema_id: &str, capabilities: &[&str]) -> Value {
+    json!({
+        "type": "daemon_hello",
+        "protocol": { "name": "prime-agent.daemon", "version": 7 },
+        "schemaId": schema_id,
+        "serverCapabilities": capabilities,
+    })
+}
+
+/// A daemon of this schema that does not advertise `session_policy` is
+/// never sent a policy it would drop: the seat fails with the reason,
+/// before any command.
+#[test]
+fn a_daemon_without_the_policy_capability_refuses_the_seat_flags() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": [] }));
+    let seen = fake_daemon(
+        &sandbox.socket(),
+        fake_hello(
+            pa_types::daemon::DAEMON_SCHEMA_ID,
+            &["prompt_admission_cancellation"],
+        ),
+        json!([]),
+    );
     let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::FactoryJson, &[], "seat");
     assert_eq!(
         (stdout.as_str(), stderr.as_str(), code),
@@ -1075,5 +1135,152 @@ fn a_daemon_without_the_policy_capability_refuses_the_seat_flags() {
             "Error: The running daemon cannot apply --offline --no-skills to a hosted session (it does not advertise session_policy); stop it so a current one starts, or run without --daemon-hosted\n",
             1
         )
+    );
+    // The probe's connection and the hosted client's: neither sent a
+    // command.
+    let events: Vec<FakeDaemonEvent> = (0..2)
+        .map(|_| seen.recv_timeout(STEP_BOUND).unwrap())
+        .collect();
+    assert_eq!(events, [FakeDaemonEvent::Closed, FakeDaemonEvent::Closed]);
+}
+
+/// An OLD daemon (schema revision 30, before the session policy) with a
+/// live session is never replaced or stopped by a seat: the seat fails
+/// with the stale-daemon refusal after one `list`, and nothing reaches the
+/// old daemon's sessions.
+#[test]
+fn a_busy_old_daemon_is_never_stopped_by_a_seat() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": [] }));
+    let seen = fake_daemon(
+        &sandbox.socket(),
+        fake_hello(
+            "protocol-7-schema-30-8e4b17c2a9f5",
+            &["prompt_admission_cancellation"],
+        ),
+        json!([{ "activeSessionId": "busy-1", "isSessionActive": true }]),
+    );
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::FactoryJson, &[], "seat");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (
+            "",
+            format!(
+                "Error: An incompatible Prime Agent daemon is running on {}.\n\nRun:\n  prime-agent shutdown --force\n\nThen retry the original command (the running daemon has active work).\n",
+                sandbox.socket().display()
+            )
+            .as_str(),
+            1
+        )
+    );
+    assert_eq!(
+        [
+            seen.recv_timeout(STEP_BOUND).unwrap(),
+            seen.recv_timeout(STEP_BOUND).unwrap(),
+        ],
+        [
+            FakeDaemonEvent::Command("list".to_string()),
+            FakeDaemonEvent::Closed,
+        ]
+    );
+}
+
+/// The inverse isolation: on a daemon an `--offline` run started (its
+/// supervisor runs with `PI_OFFLINE=1`), an online session's worker runs
+/// without it.
+#[test]
+fn an_online_session_runs_its_own_worker_online_on_an_offline_daemon() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    let (stdout, stderr, code) = sandbox.run(&["--daemon-hosted", "--offline", "-p", "offline"]);
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let (stdout, stderr, code) =
+        output_of(&mut sandbox.online_command(&["--daemon-hosted", "-p", "online"]));
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let worker_of = |prompt: &str| {
+        sandbox
+            .sessions()
+            .into_iter()
+            .find(|row| user_texts(row["sessionFile"].as_str().unwrap()) == [prompt])
+            .unwrap_or_else(|| panic!("the {prompt} session stays resident"))["workerPid"]
+            .clone()
+    };
+    let supervisor = sandbox.wire().hello["supervisorPid"].clone();
+    let offline_env = |pid: &Value| environ(pid).get("PI_OFFLINE").cloned();
+    assert_eq!(
+        [
+            offline_env(&supervisor),
+            offline_env(&worker_of("offline")),
+            offline_env(&worker_of("online")),
+        ],
+        [Some("1".to_string()), Some("1".to_string()), None]
+    );
+}
+
+/// A passivated policy session wakes under its own policy: after the idle
+/// passivation retired its worker (the worker descriptor goes with it), a
+/// wake on an ONLINE daemon (an attach by its saved id) starts the next worker
+/// offline and without skill discovery.
+#[test]
+fn a_passivated_session_wakes_under_its_own_policy() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    sandbox.add_discoverable_skill();
+    // An online run starts the daemon: the supervisor runs online.
+    let (stdout, stderr, code) =
+        output_of(&mut sandbox.online_command(&["--daemon-hosted", "-p", "warm"]));
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let (stdout, stderr, code) = output_of(&mut sandbox.online_command(&[
+        "--mode",
+        "json",
+        "--daemon-hosted",
+        "--offline",
+        "--no-skills",
+        "-p",
+        "seat",
+    ]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let session_id = json_lines(&stdout)[0]["id"].clone();
+    let row_of = || {
+        sandbox
+            .sessions()
+            .into_iter()
+            .find(|row| row["sessionId"] == session_id)
+            .expect("the session is listed")
+    };
+    let before = row_of();
+    let active_session_id = before["activeSessionId"].as_str().unwrap().to_string();
+    // The worker's own idle passivation ask carries its token.
+    let descriptor: Value = std::fs::read_dir(sandbox.home().join(".prime/agent/daemon-workers"))
+        .unwrap()
+        .flatten()
+        .map(|dir| dir.path().join(format!("{active_session_id}.json")))
+        .find(|path| path.exists())
+        .map(|path| serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap())
+        .expect("the worker descriptor");
+    let worker =
+        pa_core::platform::process::open_pidfd(before["workerPid"].as_u64().unwrap() as u32)
+            .expect("the live worker");
+    let mut wire = sandbox.wire();
+    wire.request(&json!({
+        "type": "worker_idle_passivation",
+        "workerToken": descriptor["authenticationToken"],
+    }));
+    // The passivated worker's process exits (a pidfd turns readable).
+    let mut exited = libc::pollfd {
+        fd: worker,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&raw mut exited, 1, STEP_BOUND.as_millis() as i32) };
+    unsafe { libc::close(worker) };
+    assert_eq!(ready, 1, "the passivated worker exited");
+    // The wake: an attach to the passivated session by its saved id.
+    wire.request(&json!({ "type": "attach", "activeSessionId": session_id }));
+    let after = row_of();
+    assert_ne!(after["workerPid"], before["workerPid"]);
+    assert_eq!(
+        (
+            environ(&after["workerPid"]).get("PI_OFFLINE").cloned(),
+            inventory(&sandbox.system_prompt(&session_id)),
+        ),
+        (Some("1".to_string()), Vec::<String>::new())
     );
 }
