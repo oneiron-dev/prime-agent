@@ -323,6 +323,26 @@ class SandboxTests(unittest.TestCase):
         env = bench.base_env({"PATH": "/bin", "PRIME_AGENT_X": "1", "PI_Y": "2", "HOME": "/real", "LANG": "C"})
         self.assertEqual(env, {"PATH": "/bin", "LANG": "C"})
 
+    def test_the_live_launcher_env_names_a_socket_dir_inside_the_sandbox(self) -> None:
+        # The macOS launcher defaults its socket dir to /tmp/pa-rs-<uid> whatever TMPDIR says, so
+        # the live leg must name a sandbox dir or its isolation check refuses the run.
+        fake = self.base / "prime-agent-rs"
+        fake.write_text('#!/bin/sh\necho "PRIME_AGENT_CODING_AGENT_DIR=$HOME/.prime/agent-rs"\n'
+                        'echo "PRIME_AGENT_SOCKET_DIR=${PRIME_AGENT_RS_SOCKET_DIR:-/tmp/pa-rs-$(id -u)}"\n')
+        fake.chmod(0o755)
+        sandbox = bench.Sandbox("rs", "t", self.base, "http://127.0.0.1:9/v1", None)
+        saved = bench.RS_LAUNCHER
+        bench.RS_LAUNCHER = fake
+        try:
+            bench.apply_rs_launcher_env(sandbox, "http://127.0.0.1:9/v1", {})
+            self.assertEqual(
+                {key: sandbox.env[key] for key in ("PRIME_AGENT_CODING_AGENT_DIR", "PRIME_AGENT_SOCKET_DIR")},
+                {"PRIME_AGENT_CODING_AGENT_DIR": str(sandbox.home / ".prime" / "agent-rs"),
+                 "PRIME_AGENT_SOCKET_DIR": str(sandbox.tmp / f"pa-rs-{os.getuid()}")})
+        finally:
+            bench.RS_LAUNCHER = saved
+            sandbox.teardown()
+
     def test_sandbox_env_points_inside_and_scrubs_the_fleet(self) -> None:
         for product in ("ts", "rs"):
             sandbox = bench.Sandbox(product, "t", self.base, "http://127.0.0.1:9/v1", "/real/uv-cache")
