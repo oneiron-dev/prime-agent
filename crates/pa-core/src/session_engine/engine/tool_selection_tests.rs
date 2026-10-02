@@ -235,9 +235,10 @@ async fn an_unsolicited_ipython_call_cannot_reach_the_kernel() {
     assert_eq!(engine.provisioner.start_requests(), 0);
 }
 
-/// `--no-tools` with the prewarm requested (the print and daemon builds
-/// ask for it) and a resume snapshot on disk: neither arm asks for the
-/// kernel, so no Python process starts and nothing revives.
+/// `--no-tools` with the prewarm requested in either mode (one-shot print
+/// prepares before the first turn, resident sessions boot in the
+/// background) and a resume snapshot on disk: no arm asks for the kernel,
+/// so no Python process starts and nothing revives.
 #[tokio::test]
 async fn no_tools_never_asks_for_a_kernel_even_with_prewarm_and_a_snapshot() {
     let fixture = fixture();
@@ -249,23 +250,26 @@ async fn no_tools_never_asks_for_a_kernel_even_with_prewarm_and_a_snapshot() {
         b"snapshot",
     )
     .unwrap();
-    for selection in [
-        ToolSelection::NoTools,
-        ToolSelection::SuppliedOnly,
-        ToolSelection::Allowlist(vec!["echo".to_string()]),
-    ] {
-        let provider = Arc::new(ScriptedProvider::new(model()));
-        let engine = create_session(SessionEngineConfig {
-            prewarm_ipython_kernel: Some(true),
-            ..fixture.config(&provider, selection.clone())
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            engine.provisioner.start_requests(),
-            0,
-            "selection {selection:?}"
-        );
+    for prewarm in [KernelPrewarm::BeforeFirstTurn, KernelPrewarm::Background] {
+        for selection in [
+            ToolSelection::NoTools,
+            ToolSelection::SuppliedOnly,
+            ToolSelection::Allowlist(vec!["echo".to_string()]),
+            ToolSelection::Allowlist(Vec::new()),
+        ] {
+            let provider = Arc::new(ScriptedProvider::new(model()));
+            let engine = create_session(SessionEngineConfig {
+                prewarm_ipython_kernel: Some(prewarm),
+                ..fixture.config(&provider, selection.clone())
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                engine.provisioner.start_requests(),
+                0,
+                "prewarm {prewarm:?}, selection {selection:?}"
+            );
+        }
     }
 }
 

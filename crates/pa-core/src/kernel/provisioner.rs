@@ -468,6 +468,49 @@ impl IpythonKernelProvisioner {
             manager.kill();
         }
     }
+
+    /// Prepare the kernel's Python environment now, without starting the
+    /// kernel: a fresh home's venv build, missing skill installs, and the
+    /// readiness probe, so a later boot only spawns its process (a one-shot
+    /// run's foreground preparation; see
+    /// [`crate::kernel::bootstrap::prepare_kernel_environment`]). An
+    /// explicit interpreter has nothing to prepare. The venv is shared by
+    /// every session on the machine, so no dispose cancels its setup;
+    /// dropping the call (a process exit) kills the running step.
+    ///
+    /// # Errors
+    ///
+    /// Returns the setup failure (with its remediation hints).
+    pub async fn prepare_environment(&self) -> anyhow::Result<()> {
+        if self.inner.options.python.is_some() {
+            return Ok(());
+        }
+        crate::kernel::bootstrap::prepare_kernel_environment(
+            crate::kernel::bootstrap::EnsureKernelPythonOptions {
+                python_skills: self.inner.options.python_skills.clone(),
+                on_progress: None,
+                cancel: None,
+            },
+        )
+        .await
+    }
+
+    /// Give the kernel up at once, without a final snapshot: a one-shot
+    /// host's last step after its output. No new boot starts, an in-flight
+    /// boot is abandoned (no `kernel bootstrap` outcome is reported for it;
+    /// the host's runtime shutdown drops it, which kills any setup child it
+    /// still runs), and a running kernel is killed now - what dropping the
+    /// last handle does, made explicit so nothing the kernel started
+    /// outlives the answer.
+    pub fn abandon(&self) {
+        {
+            let mut state = self.lock_state();
+            state.disposed = true;
+            state.dispose_snapshot = false;
+        }
+        self.inner.dispose_signal.abort();
+        self.kill();
+    }
 }
 
 fn emit_startup_progress(
@@ -654,7 +697,15 @@ async fn start_kernel(
         .as_ref()
         .is_some_and(|dir| snapshot_path_in(dir).exists());
     let result = start_kernel_impl(inner, on_progress).await;
-    if let Some(report) = &inner.options.on_bootstrap_result {
+    // A boot the owner disposed or abandoned under it has no outcome to
+    // report: its failure is the cancellation, not the bootstrap.
+    let abandoned = result.is_err() && inner.dispose_signal.is_aborted();
+    if let Some(report) = inner
+        .options
+        .on_bootstrap_result
+        .as_ref()
+        .filter(|_| !abandoned)
+    {
         report(KernelBootstrapStats {
             cold,
             duration_ms: started.elapsed().as_millis() as u64,

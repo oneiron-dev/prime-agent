@@ -263,7 +263,9 @@ async fn session_engine_drop_kills_the_prewarmed_kernel_process() {
             model: Some(agent_model),
             stream_fn: Some(stream_fn),
             tools: Vec::new(),
-            prewarm_ipython_kernel: Some(true),
+            prewarm_ipython_kernel: Some(
+                pa_core::session_engine::engine::KernelPrewarm::Background,
+            ),
             ..Default::default()
         },
     )
@@ -340,7 +342,9 @@ async fn engine_dispose_kernel_kills_the_prewarmed_kernel_process() {
             model: Some(agent_model),
             stream_fn: Some(stream_fn),
             tools: Vec::new(),
-            prewarm_ipython_kernel: Some(true),
+            prewarm_ipython_kernel: Some(
+                pa_core::session_engine::engine::KernelPrewarm::Background,
+            ),
             ..Default::default()
         },
     )
