@@ -365,8 +365,6 @@ impl ResidentWorker {
         self.publish_route_state(|state| state.retired = true);
     }
 
-    /// Whether the root-identity transition's durable record write is
-    /// still unresolved (the live descriptor moved; the persist failed).
     /// Mark the create's failed launch discarded (see `launch_discarded`).
     pub(crate) fn note_launch_discarded(&self) {
         self.launch_discarded
@@ -380,6 +378,8 @@ impl ResidentWorker {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Whether the root-identity transition's durable record write is
+    /// still unresolved (the live descriptor moved; the persist failed).
     pub(crate) fn identity_persist_pending(&self) -> bool {
         self.identity_persist_pending
             .load(std::sync::atomic::Ordering::SeqCst)
