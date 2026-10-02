@@ -1546,14 +1546,17 @@ def apply_rs_launcher_env(sandbox: Sandbox, mock_url: str, providers: dict) -> N
     HOME/TMPDIR, so every dir it names sits in the sandbox), and seed that
     agent dir."""
     effective = None
+    # Named explicitly: on macOS the launcher's default socket dir is /tmp/pa-rs-<uid> whatever TMPDIR says.
+    socket_dir = sandbox.tmp / f"pa-rs-{os.getuid()}"
     if RS_LAUNCHER.is_file():
-        proc = subprocess.run([str(RS_LAUNCHER)], env={**sandbox.env, "PRIME_AGENT_RS_PRINT_ENV": "1"},
+        proc = subprocess.run([str(RS_LAUNCHER)],
+                              env={**sandbox.env, "PRIME_AGENT_RS_PRINT_ENV": "1",
+                                   "PRIME_AGENT_RS_SOCKET_DIR": str(socket_dir)},
                               capture_output=True, text=True, timeout=30)
         if proc.returncode == 0:
             effective = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
             effective.pop("binary", None)
     if effective is None:
-        socket_dir = sandbox.tmp / f"pa-rs-{os.getuid()}"
         socket_dir.mkdir(mode=0o700, exist_ok=True)
         agent_dir = sandbox.home / ".prime" / "agent-rs"
         effective = {"PRIME_AGENT_CODING_AGENT_DIR": str(agent_dir), "PRIME_AGENT_SOCKET_DIR": str(socket_dir),
