@@ -120,6 +120,7 @@ impl Inner {
             crate::kernel::bootstrap::EnsureKernelPythonOptions {
                 python_skills: skills,
                 on_progress: progress,
+                cancel: options.setup_cancel.clone(),
             },
         )
         .await?;

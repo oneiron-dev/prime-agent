@@ -4,10 +4,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Mutex;
 
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use sha2::Digest;
 
 use super::{
@@ -21,6 +20,7 @@ mod layout;
 mod probe;
 mod runtime_source;
 mod skills;
+pub(crate) mod subprocess;
 mod uv;
 mod version;
 
@@ -45,6 +45,7 @@ use skills::{
     file_content_hash, read_python_skill_dependency_names, read_python_skill_project_name,
 };
 pub(crate) use skills::{normalize_python_skills, BootstrapPythonSkill};
+use subprocess::ChildCancel;
 pub(crate) use uv::ensure_uv;
 #[cfg(test)]
 use uv::windows_executable_candidates;
@@ -74,40 +75,45 @@ pub(crate) struct BootstrapVersion {
     python_skills: Option<Vec<BootstrapPythonSkill>>,
 }
 
-async fn run_async(command: &str, args: &[String]) -> anyhow::Result<()> {
-    // Run on a blocking thread: the bootstrap is an IO-bound child process.
-    let command = command.to_string();
-    let args = args.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let mut child = std::process::Command::new(&command);
-        child.args(&args).stdin(Stdio::null());
-        // Hidden window on Windows (TS `spawnHidden`).
-        crate::platform::process::set_no_window(&mut child);
-        let status = child
-            .status()
-            .with_context(|| format!("failed to spawn {command}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "{} {} failed with exit code {}",
-                command,
-                args.join(" "),
-                status.code().unwrap_or(-1)
-            ))
-        }
-    })
-    .await
-    .map_err(|e| anyhow!("bootstrap task join failed: {e}"))?
+/// One `uv` step as an owned child (see [`subprocess`]): a non-zero exit
+/// fails the step, a fired cancellation kills and reaps it.
+async fn run_async(
+    command: &str,
+    args: &[String],
+    options: &EnsureKernelPythonOptions,
+) -> anyhow::Result<()> {
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let status = subprocess::run_owned(
+        command,
+        &arg_refs,
+        subprocess::ChildOutput::Inherit,
+        options.child_cancel(),
+    )
+    .await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} {} failed with exit code {}",
+            command,
+            args.join(" "),
+            status.code().unwrap_or(-1)
+        ))
+    }
 }
 
+/// Build the kernel venv from scratch with `uv`: the interpreter, the venv,
+/// the runtime with the default packages, then the Python skills. The
+/// `.bootstrap-version` record that makes a later run treat the venv as
+/// ready is written last, by the skill sync, so a step that fails or is
+/// cancelled leaves a venv the next readiness check rebuilds.
 pub(crate) async fn bootstrap_venv(
+    uv: &str,
     venv: &Path,
     python_skills: &[BootstrapPythonSkill],
     options: &EnsureKernelPythonOptions,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(venv.parent().unwrap_or(Path::new("/")))?;
-    let uv = ensure_uv()?;
     let python = kernel_venv_python(venv);
     let source_dir = resolve_runtime_source_dir();
     let runtime_requirement = source_dir.as_ref().map_or_else(
@@ -131,16 +137,17 @@ pub(crate) async fn bootstrap_venv(
     }
 
     run_async(
-        &uv,
+        uv,
         &[
             "python".to_string(),
             "install".to_string(),
             PYTHON_VERSION.to_string(),
         ],
+        options,
     )
     .await?;
     run_async(
-        &uv,
+        uv,
         &[
             "venv".to_string(),
             venv_str,
@@ -148,18 +155,11 @@ pub(crate) async fn bootstrap_venv(
             PYTHON_VERSION.to_string(),
             "--seed".to_string(),
         ],
-    )
-    .await?;
-    run_async(&uv, &install_args).await?;
-    sync_python_skills(
-        &uv,
-        venv,
-        &python,
-        &runtime_identity,
-        python_skills,
         options,
     )
-    .await
+    .await?;
+    run_async(uv, &install_args, options).await?;
+    sync_python_skills(uv, venv, &python, &runtime_identity, python_skills, options).await
 }
 
 /// Install/refresh the editable Python skills recorded in the version file.
@@ -219,7 +219,11 @@ pub(crate) async fn sync_python_skills(
             install_args.push("--editable".to_string());
             install_args.push(skill.package_path.clone());
         }
-        if run_async(uv, &install_args).await.is_ok() {
+        let batch = run_async(uv, &install_args, options).await;
+        // A cancelled sync stops here: no per-skill retries, no warnings,
+        // and no version record for a sync that never finished.
+        options.check_cancelled()?;
+        if batch.is_ok() {
             // A changed pyproject (hash moved) replaces the stale record.
             for skill in &missing {
                 installed.insert(bootstrap_skill_key(skill), (*skill).clone());
@@ -236,8 +240,10 @@ pub(crate) async fn sync_python_skills(
                         "--editable".to_string(),
                         skill.package_path.clone(),
                     ],
+                    options,
                 )
                 .await;
+                options.check_cancelled()?;
                 match result {
                     Ok(()) => {
                         installed.insert(bootstrap_skill_key(skill), (*skill).clone());
@@ -259,7 +265,12 @@ pub(crate) async fn sync_python_skills(
     write_bootstrap_version(venv, runtime_identity, &merged)
 }
 
-pub(crate) fn kernel_base_ready(python: &str, venv: &Path, runtime_identity: &str) -> bool {
+pub(crate) async fn kernel_base_ready(
+    python: &str,
+    venv: &Path,
+    runtime_identity: &str,
+    cancel: ChildCancel<'_>,
+) -> bool {
     let (version, raw) = read_bootstrap_version_raw(venv);
     bootstrap_base_version_current(version, runtime_identity)
         && has_prime_agent_runtime_memoized(
@@ -268,14 +279,21 @@ pub(crate) fn kernel_base_ready(python: &str, venv: &Path, runtime_identity: &st
             &raw,
             &installed_runtime_identity(Path::new(python), venv),
             venv,
+            cancel,
         )
+        .await
 }
 
-pub(crate) fn kernel_ready(
+/// Whether the managed venv is ready for a kernel: its version record is
+/// current for this runtime and these skills, and the runtime-ready probe
+/// passes (memoized). A cancelled probe reads as not ready; callers check
+/// the cancellation before acting on that verdict.
+pub(crate) async fn kernel_ready(
     python: &str,
     venv: &Path,
     runtime_identity: &str,
     python_skills: &[BootstrapPythonSkill],
+    cancel: ChildCancel<'_>,
 ) -> bool {
     let (version, raw) = read_bootstrap_version_raw(venv);
     bootstrap_version_current(version.as_ref(), runtime_identity, python_skills)
@@ -285,7 +303,9 @@ pub(crate) fn kernel_ready(
             &raw,
             &installed_runtime_identity(Path::new(python), venv),
             venv,
+            cancel,
         )
+        .await
 }
 
 #[cfg(test)]

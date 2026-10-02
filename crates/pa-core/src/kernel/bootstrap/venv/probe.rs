@@ -3,25 +3,23 @@
 //! two-layer memo (in-process map + the cross-process on-disk verdict)
 //! that skips re-probing a venv nobody damaged.
 
+use super::subprocess::{run_owned, ChildCancel, ChildOutput};
 use super::{
-    collect_python_files, Digest, HashMap, KernelPythonSkill, Mutex, Path, PathBuf, Stdio,
+    collect_python_files, Digest, HashMap, KernelPythonSkill, Mutex, Path, PathBuf,
     DEFAULT_RLM_EXTRA_PACKAGES,
 };
 
-fn python_imports(python: &str, module_name: &str) -> bool {
-    run_quiet(python, &["-c", &format!("import {module_name}")])
+async fn python_imports(python: &str, module_name: &str, cancel: ChildCancel<'_>) -> bool {
+    run_quiet(python, &["-c", &format!("import {module_name}")], cancel).await
 }
 
-fn run_quiet(command: &str, args: &[&str]) -> bool {
-    let mut child = std::process::Command::new(command);
-    child
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // Hidden window on Windows (TS `spawnHidden`).
-    crate::platform::process::set_no_window(&mut child);
-    matches!(child.status(), Ok(status) if status.success())
+/// One quiet interpreter check as an owned child: true only for a clean
+/// exit (a failed spawn or a cancellation reads as false).
+async fn run_quiet(command: &str, args: &[&str], cancel: ChildCancel<'_>) -> bool {
+    matches!(
+        run_owned(command, args, ChildOutput::Discard, cancel).await,
+        Ok(status) if status.success()
+    )
 }
 
 /// The runtime-ready assertion from the TS product: a current
@@ -34,27 +32,35 @@ fn run_quiet(command: &str, args: &[&str]) -> bool {
 /// truncate a durable file.
 const RUNTIME_READY_CHECK: &str = "import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ['create_memory', 'update_memory', 'delete_memory', 'create_skill', 'update_skill', 'delete_skill', 'create_subagent', 'update_subagent', 'delete_subagent', 'create_prompt_note', 'update_prompt_note', 'delete_prompt_note', 'record_refinement']; _mcp_discovery_methods = ['list_plugins', 'search_plugins', 'list_connections', 'search_tools', 'describe_tool']; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert all(callable(getattr(mcp, _m, None)) for _m in _mcp_discovery_methods), \"rlm.mcp is missing MCP discovery methods (list_plugins, search_plugins, list_connections, search_tools, describe_tool); the kernel venv needs a current prime-agent-runtime\"; assert callable(rlm.spawn); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm.spawn); assert inspect.signature(rlm.spawn).parameters['name'].default is inspect.Parameter.empty; assert not hasattr(rlm, 'run'); assert not hasattr(rlm.rlm, 'run'); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert callable(rlm.create_session); assert callable(rlm.rlm.create_session); assert callable(rlm.progress_note); assert callable(rlm.rlm.progress_note); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert _repl._has_filehandle_reducer(b'\\x80\\x02cdill._dill\\n_create_filehandle\\n)R.'), \"rlm.repl lacks the file-handle snapshot guard; the kernel venv needs a current prime-agent-runtime\"; assert all('_has_filehandle_reducer(' in inspect.getsource(_fn) for _fn in (_repl._snapshot_state, _repl._restore_state)), \"rlm.repl snapshots or restores without the file-handle guard; the kernel venv needs a current prime-agent-runtime\"; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')";
 
-pub(crate) fn has_prime_agent_runtime(python: &str) -> bool {
-    run_quiet(python, &["-c", RUNTIME_READY_CHECK])
+pub(crate) async fn has_prime_agent_runtime(python: &str, cancel: ChildCancel<'_>) -> bool {
+    run_quiet(python, &["-c", RUNTIME_READY_CHECK], cancel).await
 }
 
-pub(crate) fn missing_rlm_extra_import_labels(python: &str) -> Vec<&'static str> {
-    DEFAULT_RLM_EXTRA_PACKAGES
-        .iter()
-        .filter(|(_, import, _)| !python_imports(python, import))
-        .map(|(_, _, label)| *label)
-        .collect()
+pub(crate) async fn missing_rlm_extra_import_labels(
+    python: &str,
+    cancel: ChildCancel<'_>,
+) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    for (_, import, label) in DEFAULT_RLM_EXTRA_PACKAGES {
+        if !python_imports(python, import, cancel).await {
+            missing.push(label);
+        }
+    }
+    missing
 }
 
-pub(crate) fn missing_python_skill_import_labels(
+pub(crate) async fn missing_python_skill_import_labels(
     python: &str,
     python_skills: &[KernelPythonSkill],
+    cancel: ChildCancel<'_>,
 ) -> Vec<String> {
-    python_skills
-        .iter()
-        .filter(|skill| !python_imports(python, &skill.import_name))
-        .map(|skill| format!("{} ({})", skill.name, skill.import_name))
-        .collect()
+    let mut missing = Vec::new();
+    for skill in python_skills {
+        if !python_imports(python, &skill.import_name, cancel).await {
+            missing.push(format!("{} ({})", skill.name, skill.import_name));
+        }
+    }
+    missing
 }
 
 /// Process-global memo of a successful runtime-ready probe, tiered above
@@ -186,12 +192,13 @@ pub(super) fn runtime_probe_key(
 /// Managed-venv path only: a caller-owned `PRIME_AGENT_KERNEL_PYTHON`
 /// override never reaches this (it uses the direct probe, the d14
 /// ruling), and no memo file is read or written for it.
-pub(super) fn has_prime_agent_runtime_memoized(
+pub(super) async fn has_prime_agent_runtime_memoized(
     python: &str,
     runtime_identity: &str,
     version_raw: &str,
     installed_identity: &str,
     venv: &Path,
+    cancel: ChildCancel<'_>,
 ) -> bool {
     let key = runtime_probe_key(python, runtime_identity, version_raw, installed_identity);
     let memo_path = super::super::disk_memo::disk_memo_path(venv);
@@ -210,7 +217,9 @@ pub(super) fn has_prime_agent_runtime_memoized(
         entries.insert(key, memo_path);
         return true;
     }
-    if !has_prime_agent_runtime(python) || !python_imports(python, "dill") {
+    if !has_prime_agent_runtime(python, cancel).await
+        || !python_imports(python, "dill", cancel).await
+    {
         return false;
     }
     let mut memo = lock_probe_memo();

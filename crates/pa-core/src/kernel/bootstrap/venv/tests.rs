@@ -50,6 +50,38 @@ fn windows_executable_candidates_skips_suffix_and_duplicates() {
 
 use super::*;
 
+/// The readiness check as the sync oracles drive it (the probes are owned
+/// async children now): one private current-thread runtime per call, so
+/// the memo-lock holders stay synchronous.
+fn kernel_ready(
+    python: &str,
+    venv: &Path,
+    runtime_identity: &str,
+    python_skills: &[BootstrapPythonSkill],
+) -> bool {
+    block_on(super::kernel_ready(
+        python,
+        venv,
+        runtime_identity,
+        python_skills,
+        ChildCancel::Never,
+    ))
+}
+
+/// The runtime-ready probe, driven like [`kernel_ready`].
+#[cfg(unix)]
+fn has_prime_agent_runtime(python: &str) -> bool {
+    block_on(super::has_prime_agent_runtime(python, ChildCancel::Never))
+}
+
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a test runtime")
+        .block_on(future)
+}
+
 #[test]
 fn venv_dir_honors_override() {
     // The default path lives under $HOME.
