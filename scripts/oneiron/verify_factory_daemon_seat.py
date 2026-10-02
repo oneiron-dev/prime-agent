@@ -24,8 +24,10 @@ seat session is still resident in the sandbox daemon (ready, idle), and (Linux) 
 PI_OFFLINE=1. Teardown stops serve and the sandbox daemon by their own pids and removes the sandbox (--keep keeps it).
 Exit 0 when every check passed; the report is printed as JSON either way. Waits are on the events themselves (serve's
 output lines, process exits through a pidfd or kqueue); the bounds only fail a stuck run. A teardown that leaves a
-sandbox process behind (Linux: any process whose environment or command line names the sandbox) fails the run and
-keeps the sandbox.
+sandbox process behind (any process whose environment or command line names the sandbox) fails the run and keeps the
+sandbox. Every process is signalled only through the identity held since it was found (a Linux pidfd, a macOS start
+time), never by a bare pid. The sandbox root never resolves into the canonical shared temp dir (/tmp; /private/tmp on
+macOS).
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 
 TICKET_KEY = "seat-one"
 # What the writer's tool call prints once its edit landed.
@@ -250,13 +253,17 @@ os.execve(CONFIG["binary"], [CONFIG["binary"], *argv], env)
 """
 
 
-def daemon_request(sock_path: Path, command: dict) -> tuple[dict, dict | None]:
-    """One command over the sandbox daemon socket: its hello and the response (None when it closed first)."""
+def daemon_request(sock_path: Path, command: dict,
+                   on_hello: Callable[[dict], None] | None = None) -> tuple[dict, dict | None]:
+    """One command over the sandbox daemon socket: its hello and the response (None when it closed first).
+    `on_hello` sees the hello before the command goes out (the daemon is provably up and answering then)."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(REQUEST_BOUND_S)
         client.connect(str(sock_path))
         reader = client.makefile("r", encoding="utf-8")
         hello = json.loads(reader.readline())
+        if on_hello is not None:
+            on_hello(hello)
         envelope = {"type": "command", "id": "verify-1", "protocol": PROTOCOL, "command": command}
         client.sendall((json.dumps(envelope) + "\n").encode())
         for line in reader:
@@ -266,80 +273,165 @@ def daemon_request(sock_path: Path, command: dict) -> tuple[dict, dict | None]:
         return hello, None
 
 
-def wait_pid_gone(pid: int, bound_s: float, *, kill: bool = False) -> bool:
-    """Wait for one process to exit, on the exit itself (a Linux pidfd, a macOS kqueue), never a poll loop. True when
-    it exited within the bound; with `kill`, a process that outlived it gets SIGKILL through the same pidfd, so a
-    recycled pid is never signalled (macOS has no such handle and signals the pid)."""
-    if hasattr(os, "pidfd_open"):
+# `ps` renders `lstart` in its locale and timezone: pin both so one process always reads the same.
+PS_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C", "TZ": "UTC"}
+
+
+def parse_ps_line(line: str) -> tuple[int, str, str] | None:
+    """One `ps -o pid=,lstart=,command=` line: (pid, start time, command line), None for anything else. `lstart` is
+    five fields (`Thu Oct  3 12:00:00 2026`)."""
+    fields = line.split(None, 6)
+    if len(fields) < 7 or not fields[0].isdigit():
+        return None
+    return int(fields[0]), " ".join(fields[1:6]), fields[6]
+
+
+def ps_start_time(pid: int) -> str | None:
+    """A process's start time as `ps` reports it (the macOS identity); None when it is gone."""
+    listed = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, env=PS_ENV)
+    start = " ".join(listed.stdout.split())
+    return start if listed.returncode == 0 and start else None
+
+
+class ProcessHandle:
+    """One process of this sandbox, its identity acquired when it was found and kept through teardown, so no signal
+    ever reaches a recycled pid. Linux holds a pidfd opened BEFORE ownership is confirmed through /proc (a pidfd that
+    has not turned readable since is the process /proc described); macOS holds the start time `ps` reported, checked
+    again right before any signal."""
+
+    def __init__(self, pid: int, pidfd: int | None, start: str | None):
+        self.pid, self.pidfd, self.start = pid, pidfd, start
+
+    @classmethod
+    def acquire(cls, pid: int, marker: str) -> ProcessHandle | None:
+        """The handle of `pid` when its environment or command line names `marker`; None when it does not, or it is
+        gone."""
+        if hasattr(os, "pidfd_open"):
+            try:
+                fd = os.pidfd_open(pid)
+            except OSError:
+                return None
+            handle = cls(pid, fd, None)
+            try:
+                proc = Path(f"/proc/{pid}")
+                owned = marker.encode() in (proc / "environ").read_bytes() + (proc / "cmdline").read_bytes()
+            except OSError:
+                owned = False
+            if owned and not handle.exited(0):
+                return handle
+            handle.close()
+            return None
+        listed = subprocess.run(["ps", "-ww", "-E", "-o", "pid=,lstart=,command=", "-p", str(pid)],
+                                capture_output=True, text=True, env=PS_ENV)
+        for line in listed.stdout.splitlines():
+            parsed = parse_ps_line(line)
+            if parsed and parsed[0] == pid and marker in parsed[2]:
+                return cls(pid, None, parsed[1])
+        return None
+
+    def exited(self, bound_s: float) -> bool:
+        """Whether the process exits within the bound, awaited on the exit itself (the pidfd; a macOS kqueue)."""
+        if self.pidfd is not None:
+            poller = select.poll()
+            poller.register(self.pidfd, select.POLLIN)
+            return bool(poller.poll(int(bound_s * 1000)))
+        if ps_start_time(self.pid) != self.start:
+            return True
+        queue = select.kqueue()
         try:
-            fd = os.pidfd_open(pid)
+            watch = select.kevent(self.pid, filter=select.KQ_FILTER_PROC,
+                                  flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT, fflags=select.KQ_NOTE_EXIT)
+            return bool(queue.control([watch], 1, bound_s))
         except ProcessLookupError:
             return True
-        try:
-            poller = select.poll()
-            poller.register(fd, select.POLLIN)
-            if poller.poll(int(bound_s * 1000)):
-                return True
-            if kill:
-                signal.pidfd_send_signal(fd, signal.SIGKILL)
-            return False
         finally:
-            os.close(fd)
-    queue = select.kqueue()
-    try:
-        watch = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-                              fflags=select.KQ_NOTE_EXIT)
-        if queue.control([watch], 1, bound_s):
+            queue.close()
+
+    def kill(self) -> None:
+        """SIGKILL, identity-gated: through the pidfd, or (macOS) only while `ps` still reports the start time
+        recorded when the process was found."""
+        try:
+            if self.pidfd is not None:
+                signal.pidfd_send_signal(self.pidfd, signal.SIGKILL)
+            elif ps_start_time(self.pid) == self.start:
+                os.kill(self.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def stop(self, bound_s: float) -> bool:
+        """Wait for the exit; past the bound, SIGKILL it and await that exit too. True when it exited on its own
+        within the bound."""
+        if self.exited(bound_s):
             return True
-        if kill:
-            os.kill(pid, signal.SIGKILL)
+        self.kill()
+        self.exited(bound_s)
         return False
-    except ProcessLookupError:
-        return True
-    finally:
-        queue.close()
+
+    def close(self) -> None:
+        if self.pidfd is not None:
+            os.close(self.pidfd)
+            self.pidfd = None
 
 
-def stop_sandbox_daemon(sock_path: Path) -> tuple[str, bool]:
+def stop_sandbox_daemon(sock_path: Path, root: Path) -> tuple[str, bool]:
     """Force-stop the sandbox daemon over its own socket and wait for its supervisor to exit; SIGKILL it if it
-    outlives the bound. Returns what happened and whether the stop was clean."""
+    outlives the bound. The supervisor's identity is acquired from its hello, before the shutdown goes out (it is
+    alive and answering then), so the kill can never reach a recycled pid. Returns what happened and whether the
+    stop was clean."""
     if not sock_path.exists():
         return "no daemon", True
+    held: list[ProcessHandle] = []
+
+    def hold_supervisor(hello: dict) -> None:
+        pid = hello.get("supervisorPid")
+        handle = ProcessHandle.acquire(pid, str(root)) if isinstance(pid, int) else None
+        if handle is not None:
+            held.append(handle)
+
     try:
-        hello, _ = daemon_request(sock_path, {"type": "shutdown", "force": True})
+        hello, _ = daemon_request(sock_path, {"type": "shutdown", "force": True}, on_hello=hold_supervisor)
     except (OSError, ValueError) as error:
+        for handle in held:
+            handle.close()
         return f"unreachable: {error}", False
     pid = hello.get("supervisorPid")
-    if not isinstance(pid, int):
-        return "no supervisor pid", False
-    if wait_pid_gone(pid, REQUEST_BOUND_S, kill=True):
-        return f"stopped supervisor {pid}", True
-    return f"killed supervisor {pid}", False
+    if not held:
+        return f"the supervisor {pid} cannot be identified as this sandbox's", False
+    supervisor = held[0]
+    try:
+        if supervisor.stop(REQUEST_BOUND_S):
+            return f"stopped supervisor {pid}", True
+        return f"killed supervisor {pid}", False
+    finally:
+        supervisor.close()
 
 
-def sandbox_processes(root: Path) -> list[int]:
-    """Live processes started for this sandbox: their environment or command line names the sandbox root (Linux
-    /proc; elsewhere `ps -E`, which appends a process's environment to its command line).
+def sandbox_processes(root: Path) -> list[ProcessHandle]:
+    """Live processes started for this sandbox, each with its identity held (see ProcessHandle): their environment
+    or command line names the sandbox root (Linux /proc; elsewhere `ps -E`, which appends a process's environment
+    to its command line). The caller closes them.
 
     Raises RuntimeError when the processes cannot be listed: a teardown must not pass without that proof."""
     marker = str(root)
-    found: list[int] = []
-    if Path("/proc").is_dir():
+    found: list[ProcessHandle] = []
+    if hasattr(os, "pidfd_open") and Path("/proc").is_dir():
         for entry in Path("/proc").glob("[0-9]*"):
-            try:
-                if marker.encode() in (entry / "environ").read_bytes() + (entry / "cmdline").read_bytes():
-                    found.append(int(entry.name))
-            except OSError:
+            pid = int(entry.name)
+            if pid == os.getpid():
                 continue
+            handle = ProcessHandle.acquire(pid, marker)
+            if handle is not None:
+                found.append(handle)
     else:
-        listed = subprocess.run(["ps", "-axww", "-E", "-o", "pid=,command="], capture_output=True, text=True)
+        listed = subprocess.run(["ps", "-axww", "-E", "-o", "pid=,lstart=,command="], capture_output=True,
+                                text=True, env=PS_ENV)
         if listed.returncode != 0:
             raise RuntimeError(f"cannot list processes: {listed.stderr.strip()}")
         for line in listed.stdout.splitlines():
-            pid, _, command = line.strip().partition(" ")
-            if marker in command and pid.isdigit():
-                found.append(int(pid))
-    return sorted(pid for pid in found if pid != os.getpid())
+            parsed = parse_ps_line(line)
+            if parsed and parsed[0] != os.getpid() and marker in parsed[2]:
+                found.append(ProcessHandle(parsed[0], None, parsed[1]))
+    return sorted(found, key=lambda handle: handle.pid)
 
 
 REAP_ROUNDS = 5
@@ -347,20 +439,23 @@ REAP_ROUNDS = 5
 
 def reap_sandbox(root: Path) -> list[str]:
     """Wait for every process still running for the sandbox to exit, SIGKILL the ones that outlive the bound (they
-    are this run's own), and scan again (a process may have started another while it was awaited) until a scan is
-    empty. Reports each process that had to be killed, a sandbox still busy after the last round, or a scan that
-    could not run."""
+    are this run's own: each is signalled through the identity held since it was found), and scan again (a process
+    may have started another while it was awaited) until a scan is empty. Reports each process that had to be
+    killed, a sandbox still busy after the last round, or a scan that could not run."""
     left: list[str] = []
     for _ in range(REAP_ROUNDS):
         try:
-            pids = sandbox_processes(root)
+            handles = sandbox_processes(root)
         except RuntimeError as error:
             return [*left, f"the sandbox teardown cannot be proven: {error}"]
-        if not pids:
+        if not handles:
             return left
-        for pid in pids:
-            if not wait_pid_gone(pid, REQUEST_BOUND_S, kill=True):
-                left.append(f"process {pid} outlived the teardown and was killed")
+        for handle in handles:
+            try:
+                if not handle.stop(REQUEST_BOUND_S):
+                    left.append(f"process {handle.pid} outlived the teardown and was killed")
+            finally:
+                handle.close()
     return [*left, f"sandbox processes still running after {REAP_ROUNDS} rounds"]
 
 
@@ -376,11 +471,16 @@ def worker_offline_env(pid: int) -> str | None:
     return None
 
 
+# The canonical shared temp dir (Linux /tmp; macOS /tmp is a link to /private/tmp).
+SHARED_TMP = Path(os.path.realpath("/tmp"))
+
+
 def refuse_shared_tmp(root: Path) -> None:
-    """Sandboxes never go under the shared /tmp (a quota-limited tmpfs other jobs need)."""
-    resolved = root.expanduser().resolve()
-    if resolved == Path("/tmp") or Path("/tmp") in resolved.parents:
-        raise SystemExit(f"refusing a sandbox root under the shared /tmp: {resolved}")
+    """Sandboxes never go under the shared temp dir (a quota-limited tmpfs other jobs need): the root, every link in
+    it resolved, is compared with the canonical shared temp."""
+    resolved = Path(os.path.realpath(root.expanduser()))
+    if resolved == SHARED_TMP or SHARED_TMP in resolved.parents:
+        raise SystemExit(f"refusing a sandbox root under the shared temp dir {SHARED_TMP}: {resolved}")
 
 
 class Sandbox:
@@ -573,7 +673,7 @@ def main() -> int:
         if not retired and not report["problems"]:
             report["problems"].append("the ticket never retired")
     finally:
-        report["daemon_teardown"], clean = stop_sandbox_daemon(sandbox.socket)
+        report["daemon_teardown"], clean = stop_sandbox_daemon(sandbox.socket, root)
         teardown = ([] if clean else [f"the sandbox daemon did not stop cleanly: {report['daemon_teardown']}"])
         teardown += reap_sandbox(root)
         report.setdefault("problems", []).extend(teardown)

@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -150,44 +152,82 @@ class EvaluateTests(unittest.TestCase):
 
 
 class TeardownTests(unittest.TestCase):
+    def setUp(self):
+        # The probe processes carry a sandbox-like marker in their environment, off the shared temp dir.
+        cache = Path.home() / ".cache" / "pa-sb"
+        cache.mkdir(parents=True, exist_ok=True)
+        self.marker = tempfile.mkdtemp(prefix="vfds-test-", dir=cache)
+        self.addCleanup(shutil.rmtree, self.marker, True)
+
+    def spawn(self, *argv: str) -> subprocess.Popen:
+        child = subprocess.Popen(list(argv), env={"PATH": "/usr/bin:/bin", "HOME": self.marker})
+        self.addCleanup(self.reap, child)
+        return child
+
+    @staticmethod
+    def reap(child: subprocess.Popen) -> None:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+    def held(self, child: subprocess.Popen) -> verifier.ProcessHandle:
+        handle = verifier.ProcessHandle.acquire(child.pid, self.marker)
+        self.assertIsNotNone(handle, "the sandbox process is found with its identity")
+        self.addCleanup(handle.close)
+        return handle
+
     def test_an_exit_is_awaited_and_a_live_process_only_bounds_out(self):
-        done = subprocess.Popen(["true"])
-        try:
-            self.assertTrue(verifier.wait_pid_gone(done.pid, 30))
-        finally:
-            done.wait()
-        live = subprocess.Popen(["sleep", "30"])
-        try:
-            self.assertFalse(verifier.wait_pid_gone(live.pid, 0.2))
-        finally:
-            live.kill()
-            live.wait()
-        # With kill, a process that outlived the bound is killed through its own handle.
-        stuck = subprocess.Popen(["sleep", "30"])
-        try:
-            self.assertFalse(verifier.wait_pid_gone(stuck.pid, 0.2, kill=True))
-            self.assertEqual(stuck.wait(timeout=30), -9)
-        finally:
-            if stuck.poll() is None:
-                stuck.kill()
-                stuck.wait()
+        live = self.spawn("sleep", "30")
+        handle = self.held(live)
+        self.assertFalse(handle.exited(0.2))
+        live.kill()
+        self.assertTrue(handle.exited(30))
+        # A process that outlives the bound is killed through the identity held since it was found.
+        stuck = self.spawn("sleep", "30")
+        self.assertFalse(self.held(stuck).stop(0.2))
+        self.assertEqual(stuck.wait(timeout=30), -9)
+
+    def test_a_process_of_another_sandbox_is_not_acquired(self):
+        child = self.spawn("sleep", "30")
+        self.assertIsNone(verifier.ProcessHandle.acquire(child.pid, self.marker + "-other"))
+
+    def test_a_stale_identity_is_never_signalled(self):
+        # The pid now belongs to a process that did not start when the recorded one did (a recycled pid): the kill
+        # sends nothing, so the SIGTERM sent after it is what ends the process.
+        child = self.spawn("sleep", "30")
+        stale = verifier.ProcessHandle(child.pid, None, "Thu Jan  1 00:00:00 1970")
+        stale.kill()
+        self.assertTrue(stale.exited(0), "the recorded process is gone")
+        child.terminate()
+        self.assertEqual(child.wait(timeout=30), -15)
+
+    def test_a_ps_line_reads_as_pid_start_and_command(self):
+        self.assertEqual(verifier.parse_ps_line("  4242 Thu Oct  3 12:00:00 2026 /bin/sleep 30 HOME=/h"),
+                         (4242, "Thu Oct 3 12:00:00 2026", "/bin/sleep 30 HOME=/h"))
+        self.assertIsNone(verifier.parse_ps_line("PID STARTED COMMAND"))
+        self.assertIsNone(verifier.parse_ps_line(""))
 
     def test_a_sandbox_root_under_the_shared_tmp_is_refused(self):
-        for root in (Path("/tmp"), Path("/tmp/pa-sb")):
-            with self.assertRaises(SystemExit):
+        shared = Path(os.path.realpath("/tmp"))
+        link = Path(self.marker) / "into-tmp"
+        link.symlink_to("/tmp")
+        for root in (Path("/tmp"), Path("/tmp/pa-sb"), shared / "pa-sb", link, link / "pa-sb"):
+            with self.assertRaises(SystemExit, msg=str(root)):
                 verifier.refuse_shared_tmp(root)
         verifier.refuse_shared_tmp(Path.home() / ".cache" / "pa-sb")
 
-    def test_a_process_started_for_the_sandbox_is_found(self):
-        with tempfile.TemporaryDirectory() as root:
-            child = subprocess.Popen(["sleep", "30"], env={"PATH": "/usr/bin:/bin", "HOME": root})
-            try:
-                # Linux finds it through /proc; without /proc the scan finds nothing.
-                expected = [child.pid] if Path("/proc").is_dir() else []
-                self.assertEqual(verifier.sandbox_processes(Path(root)), expected)
-            finally:
-                child.kill()
-                child.wait()
+    def test_a_process_started_for_the_sandbox_is_found_and_reaped(self):
+        child = self.spawn("sleep", "30")
+        handles = verifier.sandbox_processes(Path(self.marker))
+        try:
+            self.assertEqual([handle.pid for handle in handles], [child.pid])
+        finally:
+            for handle in handles:
+                handle.close()
+        # Once it is gone, the reap proves the sandbox empty with its scan.
+        child.kill()
+        child.wait()
+        self.assertEqual(verifier.reap_sandbox(Path(self.marker)), [])
 
 
 if __name__ == "__main__":

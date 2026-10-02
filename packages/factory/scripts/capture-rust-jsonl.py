@@ -9,8 +9,9 @@ PRIME_AGENT_HOSTED_DAEMON_SCRIPT for daemon seats), so no provider is called.
 
 Sandboxed: HOME, TMPDIR, the daemon socket and its worker socket dir live in a fresh directory under --sandbox-root,
 the environment is rebuilt from scratch (no PRIME_AGENT_* or PI_* variable leaks in), and the sandbox daemon is shut
-down over its own socket (then killed by pid if it outlives the bound) before the directory is removed. Nothing
-touches a real agent dir, socket or daemon.
+down over its own socket (then killed through the identity held since its hello if it outlives the bound) before
+the directory is removed. Nothing touches a real agent dir, socket or daemon. The sandbox root never resolves into
+the canonical shared temp dir (/tmp; /private/tmp on macOS).
 
     python3 scripts/capture-rust-jsonl.py <prime-agent binary> test/fixtures/rust-jsonl [--sandbox-root DIR]
 
@@ -27,7 +28,9 @@ import select
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
+import typing
 
 # One scripted turn per case; the same script drives the owned and the daemon seat.
 CASES = {
@@ -80,13 +83,17 @@ def tool_results(stdout: str) -> list[tuple[bool, str]]:
     return results
 
 
-def daemon_request(sock_path: pathlib.Path, command: dict) -> tuple[dict, list[dict]]:
-    """Send one command envelope; return the hello and every line until the response (or the close)."""
+def daemon_request(sock_path: pathlib.Path, command: dict,
+                   on_hello: typing.Callable[[dict], None] | None = None) -> tuple[dict, list[dict]]:
+    """Send one command envelope; return the hello and every line until the response (or the close). `on_hello`
+    sees the hello before the command goes out (the daemon is provably up and answering then)."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(SHUTDOWN_BOUND_S)
         client.connect(str(sock_path))
         reader = client.makefile("r", encoding="utf-8")
         hello = json.loads(reader.readline())
+        if on_hello is not None:
+            on_hello(hello)
         envelope = {"type": "command", "id": "capture-1", "protocol": {"name": "prime-agent.daemon", "version": 7},
                     "command": command}
         client.sendall((json.dumps(envelope) + "\n").encode())
@@ -99,46 +106,110 @@ def daemon_request(sock_path: pathlib.Path, command: dict) -> tuple[dict, list[d
         return hello, lines
 
 
-def stop_when_gone(pid: int, bound_s: float) -> None:
-    """Wait for one process to exit, on the exit itself (a Linux pidfd, a macOS kqueue); past the bound, SIGKILL it
-    through the same pidfd (a recycled pid is never signalled; macOS signals the pid)."""
-    if hasattr(os, "pidfd_open"):
-        try:
-            fd = os.pidfd_open(pid)
-        except ProcessLookupError:
-            return
-        try:
+# `ps` renders `lstart` in its locale and timezone: pin both so one process always reads the same.
+PS_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C", "TZ": "UTC"}
+
+
+def ps_start_time(pid: int) -> str | None:
+    """A process's start time as `ps` reports it (the macOS identity); None when it is gone."""
+    listed = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, env=PS_ENV)
+    start = " ".join(listed.stdout.split())
+    return start if listed.returncode == 0 and start else None
+
+
+class Supervisor:
+    """The sandbox daemon's supervisor, its identity acquired from its hello and kept until it is gone: Linux a
+    pidfd opened before /proc confirms the process runs for this sandbox, macOS the start time `ps` reported,
+    checked again right before any signal. A recycled pid is never signalled."""
+
+    def __init__(self, pid: int, marker: str):
+        self.pid, self.pidfd, self.start = pid, None, None
+        if hasattr(os, "pidfd_open"):
+            self.pidfd = os.pidfd_open(pid)
+            proc = pathlib.Path(f"/proc/{pid}")
+            owned = marker.encode() in (proc / "environ").read_bytes() + (proc / "cmdline").read_bytes()
+            if not owned or self.exited(0):
+                self.close()
+                raise ProcessLookupError(f"pid {pid} is not this sandbox's supervisor")
+        else:
+            listed = subprocess.run(["ps", "-ww", "-E", "-o", "command=", "-p", str(pid)], capture_output=True,
+                                    text=True, env=PS_ENV)
+            self.start = ps_start_time(pid)
+            if marker not in listed.stdout or self.start is None:
+                raise ProcessLookupError(f"pid {pid} is not this sandbox's supervisor")
+
+    def exited(self, bound_s: float) -> bool:
+        """Whether the supervisor exits within the bound, awaited on the exit itself (the pidfd; a macOS kqueue)."""
+        if self.pidfd is not None:
             poller = select.poll()
-            poller.register(fd, select.POLLIN)
-            if not poller.poll(int(bound_s * 1000)):
-                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            poller.register(self.pidfd, select.POLLIN)
+            return bool(poller.poll(int(bound_s * 1000)))
+        if ps_start_time(self.pid) != self.start:
+            return True
+        queue = select.kqueue()
+        try:
+            watch = select.kevent(self.pid, filter=select.KQ_FILTER_PROC,
+                                  flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT, fflags=select.KQ_NOTE_EXIT)
+            return bool(queue.control([watch], 1, bound_s))
+        except ProcessLookupError:
+            return True
         finally:
-            os.close(fd)
-        return
-    queue = select.kqueue()
-    try:
-        watch = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-                              fflags=select.KQ_NOTE_EXIT)
-        if not queue.control([watch], 1, bound_s):
-            os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    finally:
-        queue.close()
+            queue.close()
+
+    def kill(self) -> None:
+        """SIGKILL, identity-gated (the pidfd; on macOS only while the recorded start time still holds)."""
+        try:
+            if self.pidfd is not None:
+                signal.pidfd_send_signal(self.pidfd, signal.SIGKILL)
+            elif ps_start_time(self.pid) == self.start:
+                os.kill(self.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def close(self) -> None:
+        if self.pidfd is not None:
+            os.close(self.pidfd)
+            self.pidfd = None
 
 
-def stop_sandbox_daemon(sock_path: pathlib.Path) -> None:
-    """Force-shut the sandbox daemon over its own socket; kill it by pid if it outlives the bound."""
+def stop_sandbox_daemon(sock_path: pathlib.Path, root: pathlib.Path) -> None:
+    """Force-shut the sandbox daemon over its own socket and wait for its supervisor to exit; SIGKILL it (through
+    the identity acquired from its hello, before the shutdown went out) if it outlives the bound."""
     if not sock_path.exists():
         return
+    held: list[Supervisor] = []
+
+    def hold(hello: dict) -> None:
+        pid = hello.get("supervisorPid")
+        if isinstance(pid, int):
+            try:
+                held.append(Supervisor(pid, str(root)))
+            except OSError as error:
+                print(f"the sandbox daemon's supervisor cannot be held: {error}", file=sys.stderr)
+
     try:
-        hello, _ = daemon_request(sock_path, {"type": "shutdown", "force": True})
+        daemon_request(sock_path, {"type": "shutdown", "force": True}, on_hello=hold)
     except (OSError, ValueError):
-        return
-    pid = hello.get("supervisorPid")
-    if not isinstance(pid, int):
-        return
-    stop_when_gone(pid, SHUTDOWN_BOUND_S)
+        pass
+    for supervisor in held:
+        try:
+            if not supervisor.exited(SHUTDOWN_BOUND_S):
+                supervisor.kill()
+                supervisor.exited(SHUTDOWN_BOUND_S)
+        finally:
+            supervisor.close()
+
+
+# The canonical shared temp dir (Linux /tmp; macOS /tmp is a link to /private/tmp).
+SHARED_TMP = pathlib.Path(os.path.realpath("/tmp"))
+
+
+def refuse_shared_tmp(root: pathlib.Path) -> None:
+    """Sandboxes never go under the shared temp dir (a quota-limited tmpfs other jobs need): the root, every link in
+    it resolved, is compared with the canonical shared temp."""
+    resolved = pathlib.Path(os.path.realpath(root.expanduser()))
+    if resolved == SHARED_TMP or SHARED_TMP in resolved.parents:
+        raise SystemExit(f"refusing a sandbox root under the shared temp dir {SHARED_TMP}: {resolved}")
 
 
 def main() -> None:
@@ -152,9 +223,7 @@ def main() -> None:
     binary = os.path.abspath(args.binary) if os.sep in args.binary else args.binary
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    resolved = args.sandbox_root.expanduser().resolve()
-    if resolved == pathlib.Path("/tmp") or pathlib.Path("/tmp") in resolved.parents:
-        raise SystemExit(f"refusing a sandbox root under the shared /tmp: {resolved}")
+    refuse_shared_tmp(args.sandbox_root)
     args.sandbox_root.mkdir(parents=True, exist_ok=True)
     root = pathlib.Path(tempfile.mkdtemp(prefix="fcap-", dir=args.sandbox_root))
     home, tmp, work, scripts = root / "h", root / "t", root / "w", root / "scripts"
@@ -198,7 +267,7 @@ def main() -> None:
                 if name == "review-tool-then-verdict" and tool_results(result.stdout) != [(False, TOOL_OUTPUT)]:
                     raise SystemExit(f"{stem}: the tool call did not succeed: {tool_results(result.stdout)}")
     finally:
-        stop_sandbox_daemon(sock_path)
+        stop_sandbox_daemon(sock_path, root)
         shutil.rmtree(root, ignore_errors=True)
 
 
