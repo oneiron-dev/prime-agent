@@ -414,6 +414,21 @@ fn keeps_a_same_component_worker_restart_within_two_seconds() {
     assert!(text.contains("worker 5b1d3aeb91ee started (x2, until 09-10 20:00:01)"));
 }
 
+/// The fork's short Unix worker socket name attributes the worker exactly
+/// like the TS `worker-` name above.
+#[test]
+fn attributes_workers_by_the_short_socket_name() {
+    let socket_path = "/private/tmp/pa-rs-501/w-98ed5cb228d2-5b1d3aeb91ee.sock";
+    let text = report_for(&[
+        worker_start_line("2026-09-10T20:00:00.000Z", socket_path, 100),
+        worker_start_line("2026-09-10T20:00:01.000Z", socket_path, 200),
+    ]);
+    assert!(
+        text.contains("worker 5b1d3aeb91ee started (x2, until 09-10 20:00:01)"),
+        "{text}"
+    );
+}
+
 #[test]
 fn the_report_layout_matches_the_ts_shape() {
     // One supervisor-start event in a 30-minute window: the exact TS

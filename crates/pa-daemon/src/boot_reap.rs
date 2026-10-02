@@ -498,18 +498,24 @@ pub(crate) fn is_worker_argv(argv: &[String]) -> bool {
 
 /// Whether a path is one of THIS supervisor's worker endpoints: under the
 /// shared socket dir, named with this socket's own key
-/// (`worker-<hash12(supervisor socket)>-*.sock`) - the deterministic name
-/// `worker_socket_path` mints, so a foreign or forged value never matches
-/// and the reap's endpoint unlink stays inside the product's namespace.
+/// (`w-<hash12(supervisor socket)>-*.sock`, the deterministic name
+/// `worker_socket_path` mints, or `worker-<hash12>-*.sock`, the name
+/// earlier builds minted, so an upgraded supervisor still reaps a
+/// leftover of its own from before the rename), so a foreign or forged
+/// value never matches and the reap's endpoint unlink stays inside the
+/// product's namespace.
 #[cfg(target_os = "linux")]
 pub(crate) fn is_our_worker_socket(path: &str, supervisor_socket: &Path) -> bool {
+    use crate::platform::{LEGACY_WORKER_SOCKET_PREFIX, WORKER_SOCKET_PREFIX};
     let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) else {
         return false;
     };
     let key = crate::paths::hash_key(&supervisor_socket.to_string_lossy(), 12);
     normalize_socket_spelling(Path::new(path).parent().unwrap_or(Path::new(path)))
         == normalize_socket_spelling(&crate::platform::socket_dir())
-        && name.starts_with(&format!("worker-{key}-"))
+        && [WORKER_SOCKET_PREFIX, LEGACY_WORKER_SOCKET_PREFIX]
+            .iter()
+            .any(|prefix| name.starts_with(&format!("{prefix}{key}-")))
         && Path::new(name).extension().is_some_and(|ext| ext == "sock")
 }
 
@@ -1188,15 +1194,28 @@ mod tests {
         let supervisor = Path::new("/tmp/prime-agent-1000/daemon.sock");
         let key = crate::paths::hash_key(&supervisor.to_string_lossy(), 12);
         let dir = crate::platform::socket_dir().to_string_lossy().to_string();
-        let ours = format!("{dir}/worker-{key}-abcdef123456.sock");
+        let ours = crate::platform::worker_socket_path(supervisor, "abcdef123456");
+        assert_eq!(ours, Path::new(&format!("{dir}/w-{key}-abcdef123456.sock")));
         assert!(
-            is_our_worker_socket(&ours, supervisor),
+            is_our_worker_socket(&ours.to_string_lossy(), supervisor),
             "the deterministic name matches"
         );
         assert!(
-            !is_our_worker_socket(&format!("{dir}/worker-OTHERKEY00-abcdef.sock"), supervisor),
-            "another socket's key never matches"
+            is_our_worker_socket(&format!("{dir}/worker-{key}-abcdef123456.sock"), supervisor),
+            "this supervisor's legacy name still matches"
         );
+        for foreign in [
+            format!("{dir}/w-OTHERKEY00-abcdef.sock"),
+            format!("{dir}/worker-OTHERKEY00-abcdef.sock"),
+            format!("{dir}/w-{key}-abcdef123456.sock.lock"),
+            format!("{dir}/x-{key}-abcdef123456.sock"),
+            format!("{dir}/daemon.sock"),
+        ] {
+            assert!(
+                !is_our_worker_socket(&foreign, supervisor),
+                "never matches {foreign}"
+            );
+        }
         assert!(
             !is_our_worker_socket("/etc/passwd", supervisor),
             "an arbitrary path never matches"
@@ -1207,6 +1226,13 @@ mod tests {
                 supervisor
             ),
             "a matching name outside the socket dir never matches"
+        );
+        assert!(
+            !is_our_worker_socket(
+                &format!("/tmp/elsewhere/w-{key}-abcdef123456.sock"),
+                supervisor
+            ),
+            "a matching short name outside the socket dir never matches"
         );
     }
 

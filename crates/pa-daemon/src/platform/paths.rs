@@ -92,14 +92,29 @@ pub fn default_daemon_socket_path() -> PathBuf {
     PathBuf::from(r"\\.\pipe\prime-agent-daemon")
 }
 
+/// The Unix worker socket name's prefix: `w-<hash12(supervisor socket)>-<worker
+/// id prefix 12>.sock`, 32 bytes. Oneiron fork: TS names it
+/// `worker-<hash>-<id>.sock` (37 bytes), which overflows macOS's 104-byte
+/// `sun_path` under a 66-byte socket dir (the `$TMPDIR/pa-rs-<uid>` dir of
+/// a side-by-side install); the short name keeps both 12-hex keys and fits
+/// any socket dir up to 70 bytes on Darwin (74 on Linux).
+#[cfg(unix)]
+pub(crate) const WORKER_SOCKET_PREFIX: &str = "w-";
+/// The TS-parity worker socket prefix earlier builds minted: a supervisor
+/// that outlived an upgrade (or the reap of one) still finds those. Linux
+/// only: the boot reap that reads it is the Linux process census.
+#[cfg(target_os = "linux")]
+pub(crate) const LEGACY_WORKER_SOCKET_PREFIX: &str = "worker-";
+
 /// Worker endpoint next to the supervisor's: hashed supervisor key plus the
-/// worker id prefix (TS `workerSocketPath`).
+/// worker id prefix (TS `workerSocketPath`, with the fork's short prefix,
+/// [`WORKER_SOCKET_PREFIX`]).
 #[cfg(unix)]
 #[must_use]
 pub fn worker_socket_path(supervisor_socket_path: &Path, worker_id: &str) -> PathBuf {
     let key = hash_key(&supervisor_socket_path.to_string_lossy(), 12);
     socket_dir().join(format!(
-        "worker-{key}-{}.sock",
+        "{WORKER_SOCKET_PREFIX}{key}-{}.sock",
         &worker_id[..12.min(worker_id.len())]
     ))
 }
@@ -134,6 +149,44 @@ mod tests {
         assert_eq!(a, worker_socket_path(supervisor, "0123456789abffff"));
         #[cfg(unix)]
         assert!(a.starts_with(socket_dir()));
+    }
+
+    /// The short Unix name: `w-`, the supervisor's 12-hex key, the worker
+    /// id's first 12 characters, 32 bytes in all, distinct per supervisor.
+    #[cfg(unix)]
+    #[test]
+    fn worker_socket_names_are_short_and_keyed_by_supervisor() {
+        let supervisor = Path::new("/tmp/prime-agent-1/daemon.sock");
+        let key = hash_key(&supervisor.to_string_lossy(), 12);
+        let name = |supervisor: &Path| {
+            worker_socket_path(supervisor, "0123456789abcdef")
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .to_string()
+        };
+        assert_eq!(name(supervisor), format!("w-{key}-0123456789ab.sock"));
+        assert_eq!(name(supervisor).len(), 32);
+        assert_ne!(
+            name(supervisor),
+            name(Path::new("/tmp/prime-agent-2/daemon.sock"))
+        );
+    }
+
+    /// Any socket dir up to 70 bytes fits a worker socket on both
+    /// platforms: dir + `/` + the 32-byte name + NUL within Darwin's
+    /// 104-byte `sun_path` (Linux's holds 108). The 66-byte macOS
+    /// `$TMPDIR/pa-rs-501` dir the old 37-byte name overflowed is inside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_seventy_byte_socket_dir_fits_on_darwin_and_linux() {
+        let dir = format!("/{}", "d".repeat(69));
+        assert_eq!(dir.len(), 70);
+        let name = worker_socket_path(Path::new("/tmp/x/daemon.sock"), "0123456789abcdef");
+        let socket = Path::new(&dir).join(name.file_name().expect("file name"));
+        // Exactly Darwin's capacity at 70 bytes, so Linux's larger one
+        // holds it too; the legacy name needed 109 here, over both.
+        assert_eq!(socket.as_os_str().len() + 1, 104);
     }
 
     /// The side-by-side override relocates the endpoint namespace only when
