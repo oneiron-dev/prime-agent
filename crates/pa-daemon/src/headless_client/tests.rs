@@ -655,6 +655,35 @@ async fn a_live_session_with_other_tools_is_not_reused() {
     assert_eq!(same_policy.commands(), ["list", "attach"]);
 }
 
+/// Equivalent allowlists (a name repeated) resolve to the same policy, so
+/// the live session is reused rather than refused.
+#[tokio::test]
+async fn an_equivalent_allowlist_reuses_the_live_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("session.jsonl");
+    std::fs::write(&file, "{}\n").unwrap();
+    let rows = json!({ "sessions": [
+        { "id": "live-1", "activeSessionId": "live-1", "sessionFile": file, "workerState": "ready",
+          "model": { "id": "faux-1" }, "toolSelection": { "tools": ["ipython", "ipython"] } },
+    ]});
+    let fake = FakeSupervisor::advertising(
+        &["prompt_admission_cancellation", "session_tool_selection"],
+        Box::new(move |kind, _| match kind {
+            "list" => vec![Reply::Ok(rows.clone())],
+            "attach" => vec![Reply::Ok(json!({ "lastEventSequence": 1 }))],
+            other => panic!("unexpected command {other}"),
+        }),
+    );
+    let options = HostedSessionOptions {
+        session_path: Some(file.clone()),
+        create_config: json!({ "cwd": "/work", "tools": ["ipython"] }),
+        ..fake.options()
+    };
+    let (_session, opened) = bounded(HostedHeadlessSession::open(options)).await.unwrap();
+    assert_eq!(opened.active_session_id, "live-1");
+    assert_eq!(fake.commands(), ["list", "attach"]);
+}
+
 /// A session closed under the client before the run's last event reached
 /// the sink fails the completion (the stream is truncated) instead of
 /// waiting for a sequence that will never arrive.

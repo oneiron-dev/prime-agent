@@ -29,11 +29,19 @@ pub enum ToolSelection {
 }
 
 impl ToolSelection {
-    /// Resolve the launch flags (the precedence in the module docs).
+    /// Resolve the launch flags (the precedence in the module docs). The
+    /// allowlist is canonical: a name listed twice keeps its first place,
+    /// so equivalent lists compare equal.
     #[must_use]
     pub fn from_flags(flags: &ToolSelectionFlags) -> Self {
         if let Some(tools) = &flags.tools {
-            return Self::Allowlist(tools.clone());
+            let mut allowed: Vec<String> = Vec::new();
+            for name in tools {
+                if !allowed.contains(name) {
+                    allowed.push(name.clone());
+                }
+            }
+            return Self::Allowlist(allowed);
         }
         if flags.no_tools {
             return Self::NoTools;
@@ -118,6 +126,7 @@ mod tests {
             flags(Some(&["ipython"]), false, true),
             flags(Some(&["ipython"]), true, true),
             flags(Some(&[]), false, false),
+            flags(Some(&["echo", "ipython", "echo"]), false, false),
         ]
         .iter()
         .map(ToolSelection::from_flags)
@@ -133,6 +142,7 @@ mod tests {
                 ToolSelection::Allowlist(vec!["ipython".to_string()]),
                 ToolSelection::Allowlist(vec!["ipython".to_string()]),
                 ToolSelection::Allowlist(Vec::new()),
+                ToolSelection::Allowlist(vec!["echo".to_string(), "ipython".to_string()]),
             ]
         );
     }

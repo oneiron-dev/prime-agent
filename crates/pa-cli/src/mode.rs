@@ -552,7 +552,7 @@ mod tests {
             ),
             (
                 &["--tools", " echo, ,echo "],
-                ToolSelection::Allowlist(vec!["echo".to_string(), "echo".to_string()]),
+                ToolSelection::Allowlist(vec!["echo".to_string()]),
                 serde_json::json!({ "cwd": "/w", "tools": ["echo", "echo"] }),
             ),
         ];
