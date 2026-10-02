@@ -514,6 +514,13 @@ mod tests {
         let parsed: DaemonErrorInfo =
             serde_json::from_str(r#"{"code":"some_future_code"}"#).expect("parse");
         assert_eq!(parsed, DaemonErrorInfo::Unknown);
+        // A code that carries fields (what a pre-schema-31 client meets in
+        // `worker_startup_failed`) degrades the same way.
+        let with_fields: DaemonErrorInfo = serde_json::from_str(
+            r#"{"code":"some_future_code","workerId":"e37f5391bbb4","exitCode":1,"logPath":"/l"}"#,
+        )
+        .expect("parse");
+        assert_eq!(with_fields, DaemonErrorInfo::Unknown);
         // The known codes keep their typed shape.
         let typed: DaemonErrorInfo =
             serde_json::from_str(r#"{"code":"update_restarting"}"#).expect("parse");

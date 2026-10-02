@@ -170,26 +170,22 @@ fn read_tail(path: &Path) -> Result<Option<String>> {
     Ok(Some(contents))
 }
 
-/// The line of the worker's stderr tail a startup failure names: the last
-/// `Error: …` line (what the worker's `main` prints as it exits on an
-/// error, `Error: bind worker socket …`), else the last non-empty line
-/// that is not the Rust runtime's `note: …` hint (a panic's message line).
-/// `Ok(None)` for a missing or silent log.
+/// The last non-empty line of the worker's stderr tail: what a worker that
+/// dies during startup printed last (the product worker exits on one
+/// `Error: bind worker socket …: <cause>` line), the line its startup
+/// failure names. The Rust runtime's `note: run with RUST_BACKTRACE…` hint
+/// is skipped, so a panic names its message instead. `Ok(None)` for a
+/// missing or silent log.
 ///
 /// # Errors
 ///
 /// Returns an error when the log exists but cannot be read.
-pub(crate) fn error_line(log_path: &Path) -> Result<Option<String>> {
+pub(crate) fn last_line(log_path: &Path) -> Result<Option<String>> {
     Ok(read_tail(log_path)?.and_then(|tail| {
-        let lines = || {
-            tail.lines()
-                .rev()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-        };
-        lines()
-            .find(|line| line.starts_with("Error:"))
-            .or_else(|| lines().find(|line| !line.starts_with("note: ")))
+        tail.lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("note: "))
             .map(str::to_string)
     }))
 }
@@ -325,14 +321,14 @@ mod tests {
     }
 
     #[test]
-    fn error_line_prefers_the_exit_error_then_the_last_meaningful_line() {
+    fn last_line_is_the_final_non_empty_line_past_the_runtime_hint() {
         let dir = tempfile::tempdir().expect("temp dir");
         let exit_error = write_log(
             dir.path(),
             "worker-a.stderr.log",
             "booting\nError: bind worker socket /s/w.sock: path must be shorter than SUN_LEN  \n\n \n",
         );
-        // anyhow's `Debug` exit: the context line, not the cause below it.
+        // anyhow's `Debug` exit: the chain's last cause is the last line.
         let with_causes = write_log(
             dir.path(),
             "worker-b.stderr.log",
@@ -352,13 +348,13 @@ mod tests {
                 &silent,
                 &dir.path().join("absent.stderr.log")
             ]
-            .map(|path| error_line(path).expect("read")),
+            .map(|path| last_line(path).expect("read")),
             [
                 Some(
                     "Error: bind worker socket /s/w.sock: path must be shorter than SUN_LEN"
                         .to_string()
                 ),
-                Some("Error: bind worker socket /s/w.sock".to_string()),
+                Some("Not a directory (os error 20)".to_string()),
                 Some("boom".to_string()),
                 None,
                 None,

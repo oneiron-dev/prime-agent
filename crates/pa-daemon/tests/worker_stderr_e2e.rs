@@ -296,12 +296,16 @@ fn a_worker_dying_at_startup_fails_the_create_with_its_exit_and_stderr() {
         .expect("worker id in the log name")
         .to_string();
     let contents = std::fs::read_to_string(&log_path).expect("read worker stderr log");
+    assert!(
+        contents.contains("Error:"),
+        "the worker's dying error is in its log: {contents}"
+    );
     let error_line = contents
         .lines()
         .rev()
         .map(str::trim)
-        .find(|line| line.starts_with("Error:"))
-        .unwrap_or_else(|| panic!("the worker's dying error is in its log: {contents}"))
+        .find(|line| !line.is_empty())
+        .expect("a last stderr line")
         .to_string();
     assert_eq!(
         failed,

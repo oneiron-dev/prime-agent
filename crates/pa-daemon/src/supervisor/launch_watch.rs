@@ -57,6 +57,24 @@ impl Supervisor {
         Err(stage_error)
     }
 
+    /// Discard a create's launch that failed: the resident, its descriptor
+    /// and its registration bookkeeping go under the worker's adoption gate
+    /// (the lock the registration handler holds from its resident lookup
+    /// through its `Ready` persist). A self-registration in flight either
+    /// finished first, and its descriptor is deleted here, or runs after
+    /// and finds neither resident nor descriptor (the unknown-worker
+    /// refusal): a restart never adopts a create the client was told
+    /// failed. A worker that dies during startup can register (it does so
+    /// before it binds) moments before its exit is observed.
+    pub(super) async fn discard_failed_launch(&self, worker_id: &str, descriptor_path: &Path) {
+        {
+            let _registration_gate = self.registry.adoption_guard(worker_id).await;
+            self.registry.remove(worker_id).await;
+            let _ = std::fs::remove_file(descriptor_path);
+        }
+        self.registry.forget(worker_id).await;
+    }
+
     /// The first create's `worker_exited` telemetry for a worker that died
     /// during startup: the seam (and the `crash` reason) the monitor uses
     /// for a crash, never the stderr. A relaunch's startup death is not
@@ -106,7 +124,7 @@ fn startup_failure(
 ) -> TypedCreateRejection {
     let status_text = status.map_or_else(|| "exit status unknown".to_string(), |s| s.to_string());
     let headline = format!("session worker {worker_id} exited during startup ({status_text})");
-    let message = match crate::worker_stderr::error_line(log_path) {
+    let message = match crate::worker_stderr::last_line(log_path) {
         Ok(Some(line)) => format!("{headline}: {line}"),
         Ok(None) => format!("{headline} without writing to stderr"),
         Err(error) => format!("{headline}; its stderr log could not be read: {error:#}"),
@@ -268,6 +286,38 @@ mod tests {
         assert_eq!(
             rejection(&error),
             expected(&supervisor, "cccccccccccc", ": Error: worker auth", 2)
+        );
+    }
+
+    /// A registration that holds the worker's gate (it looked the resident
+    /// up and is about to persist it `Ready`) finishes before a failed
+    /// launch is discarded, so its persisted descriptor is deleted too and
+    /// nothing is left for a restart to adopt.
+    #[tokio::test]
+    async fn a_failed_launch_waits_out_a_registration_in_flight() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let supervisor = supervisor(dir.path());
+        let descriptor_path = dir.path().join("eeeeeeeeeeee.json");
+        let registration = supervisor.registry.adoption_guard("eeeeeeeeeeee").await;
+        let discard = tokio::spawn({
+            let supervisor = Arc::clone(&supervisor);
+            let descriptor_path = descriptor_path.clone();
+            async move {
+                supervisor
+                    .discard_failed_launch("eeeeeeeeeeee", &descriptor_path)
+                    .await;
+            }
+        });
+        // Let the discard run up to the gate (single-threaded runtime: it
+        // either finishes or parks on the gate before this resumes).
+        tokio::task::yield_now().await;
+        // The registration's `Ready` persist, still under its gate.
+        std::fs::write(&descriptor_path, "{}").expect("persist");
+        drop(registration);
+        discard.await.expect("discard task");
+        assert!(
+            !descriptor_path.exists(),
+            "the registration's descriptor went with the failed launch"
         );
     }
 

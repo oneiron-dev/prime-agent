@@ -319,12 +319,12 @@ impl Supervisor {
             Ok(child) => child,
             Err(error) => {
                 self.note_startup_exit(&error);
-                self.registry.remove(&worker_id).await;
                 // The half-launched worker's descriptor dies with the
                 // launch: a restart must not adopt it and replay its
                 // durable create after the client was told the create
                 // failed.
-                let _ = std::fs::remove_file(&descriptor_path);
+                self.discard_failed_launch(&worker_id, &descriptor_path)
+                    .await;
                 return Err(error);
             }
         };
@@ -363,16 +363,16 @@ impl Supervisor {
             Ok(response) => response,
             Err(error) => {
                 self.note_startup_exit(&error);
-                self.registry.remove(&worker_id).await;
                 // The half-launched worker's descriptor dies with the launch.
-                let _ = std::fs::remove_file(&descriptor_path);
+                self.discard_failed_launch(&worker_id, &descriptor_path)
+                    .await;
                 return Err(error);
             }
         };
         if !response.success {
             let _ = child.kill().await;
-            let _ = std::fs::remove_file(&descriptor_path);
-            self.registry.remove(&worker_id).await;
+            self.discard_failed_launch(&worker_id, &descriptor_path)
+                .await;
             // A typed worker rejection relays verbatim - the typed text is
             // the user-facing refusal (the session-hold rejection the
             // lease raises against a live foreign holder) - and the daemon
