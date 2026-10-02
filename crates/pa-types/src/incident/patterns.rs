@@ -11,6 +11,14 @@ pub(super) static WORKER_SOCKET: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid worker socket pattern")
 });
 
+/// `^w-[0-9a-f]{12}-([0-9a-f]{12})\.sock$`: the Oneiron fork's short Unix
+/// worker socket name (`w-<supervisor hash>-<worker id>.sock`, sized for
+/// macOS `sun_path`), the same capture as [`WORKER_SOCKET`]. Rust-only:
+/// the TS daemon never mints it.
+pub(super) static SHORT_WORKER_SOCKET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^w-[0-9a-f]{12}-([0-9a-f]{12})\.sock$").expect("valid short worker socket pattern")
+});
+
 /// `^Session worker ([0-9a-f]{12}) stderr: ?([\s\S]*)$` — the supervisor's
 /// stderr forward.
 pub(super) static STDERR_FORWARD: LazyLock<Regex> = LazyLock::new(|| {

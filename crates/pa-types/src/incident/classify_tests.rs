@@ -146,6 +146,21 @@ fn worker_ids_parse_from_unix_and_named_pipe_socket_paths() {
     assert_eq!(worker_id_from_socket_path(None), None);
 }
 
+/// The fork's short Unix worker name (`w-<12 hex supervisor hash>-<12 hex
+/// worker id>.sock`) attributes like the TS name; near misses do not.
+#[test]
+fn worker_ids_parse_from_short_unix_socket_names() {
+    let cases = [
+        "/private/tmp/pa-rs-501/w-98ed5cb228d2-5b1d3aeb91ee.sock",
+        "/private/tmp/pa-rs-501/w-98ed5cb228d2-5b1d3aeb91ee",
+        "/private/tmp/pa-rs-501/w-98ed5cb2-5b1d3aeb91ee.sock",
+        "/private/tmp/pa-rs-501/w-98ed5cb228d2-5b1d3aeb91ee.sock.lock",
+        "/private/tmp/pa-rs-501/xw-98ed5cb228d2-5b1d3aeb91ee.sock",
+    ]
+    .map(|path| worker_id_from_socket_path(Some(path)));
+    assert_eq!(cases, [Some("5b1d3aeb91ee"), None, None, None, None]);
+}
+
 #[test]
 fn classifies_worker_events_for_windows_named_pipe_sockets() {
     let socket_path = r"\\.\pipe\prime-agent-worker-98ed5cb228d2-5b1d3aeb91ee";

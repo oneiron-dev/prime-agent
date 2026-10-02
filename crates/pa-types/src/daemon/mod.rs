@@ -20,12 +20,18 @@ pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
 /// (TS #2506's field, landing ahead of TS main: the Rust deletion lifecycle
 /// captures the tombstoned child's usage durably before any unlink, so the
 /// field is populated where TS's open PR reads a removed path).
-/// Revision 31 (Oneiron fork only) adds the capability-gated `create` keys
-/// `tools`/`noTools`/`noBuiltinTools` (`session_tool_selection`) and the
-/// worker summary's `toolSelection`. Its id differs from the TS fork's
-/// revision-31 id: the two revisions are unrelated.
+/// Revision 31 is one Oneiron fork-only revision (ahead of TS; its id is
+/// unrelated to the TS fork's revision-31 id) covering every fork change of
+/// the follow-up release:
+/// - the create failure of a worker that died during startup is typed
+///   (`errorInfo.code: "worker_startup_failed"`, server capability
+///   `worker_startup_failure`); older clients read the code as `Unknown` and
+///   keep the plain message;
+/// - the capability-gated `create` keys `tools`/`noTools`/`noBuiltinTools`
+///   (server capability `session_tool_selection`) and the worker summary's
+///   `toolSelection`.
 pub const DAEMON_SCHEMA_REVISION: u64 = 31;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-31-0f2c7a41b9d6";
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-31-a926532e8319";
 
 pub type DaemonClientId = String;
 pub type DaemonCommandId = String;
@@ -192,7 +198,7 @@ mod tests {
         assert_eq!(DAEMON_PROTOCOL_NAME, "prime-agent.daemon");
         assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
         assert_eq!(DAEMON_SCHEMA_REVISION, 31);
-        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-31-0f2c7a41b9d6");
+        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-31-a926532e8319");
         assert_eq!(DAEMON_UPDATE_RESTART_FORMAT_VERSION, 1);
     }
 }

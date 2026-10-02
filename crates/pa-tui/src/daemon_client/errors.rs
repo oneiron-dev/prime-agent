@@ -67,6 +67,25 @@ pub fn is_update_restarting_rejection(error: &anyhow::Error) -> bool {
     })
 }
 
+/// True when an open failed because the session's worker died during
+/// startup (the daemon's typed `worker_startup_failed` create refusal: its
+/// socket would not bind, it crashed at boot). Not a refusal the agents
+/// view can recover from: the interactive startup restores the terminal,
+/// prints the worker's error and exits non-zero.
+#[must_use]
+pub fn is_worker_startup_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<RequestRejected>()
+            .is_some_and(|rejected| {
+                matches!(
+                    &rejected.error_info,
+                    Some(DaemonErrorInfo::WorkerStartupFailed { .. })
+                )
+            })
+    })
+}
+
 /// Whether an error is a response/handshake timeout ("Timed out after
 /// Nms waiting for the Prime Agent daemon (response|handshake)"): a
 /// transient under-load failure, not a protocol error — the caller

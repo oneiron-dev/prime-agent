@@ -190,10 +190,11 @@ fn inside(directory: Option<&Path>, parent: &Path) -> bool {
     }
 }
 
-/// Worker sockets: `worker-*.sock` in the given socket dir (TS
-/// `isWorkerSocketPath`) — the supervisor's own socket is never a worker
-/// socket. The socket dir comes from the state root, never the ambient
-/// environment.
+/// Worker sockets in the given socket dir: `worker-*.sock` (TS
+/// `isWorkerSocketPath`, and what earlier Rust builds minted) or the
+/// fork's short `w-<12 hex supervisor key>-*.sock` — the supervisor's own
+/// socket is never a worker socket. The socket dir comes from the state
+/// root, never the ambient environment.
 pub(crate) fn is_worker_socket_path(socket_path: &Path, socket_dir: &Path) -> bool {
     if socket_path.parent() != Some(socket_dir) {
         return false;
@@ -201,7 +202,12 @@ pub(crate) fn is_worker_socket_path(socket_path: &Path, socket_dir: &Path) -> bo
     let Some(name) = socket_path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    name.starts_with("worker-")
+    let short_name = name.strip_prefix("w-").is_some_and(|rest| {
+        rest.split_once('-').is_some_and(|(key, _)| {
+            key.len() == 12 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    });
+    (name.starts_with("worker-") || short_name)
         && std::path::Path::new(name)
             .extension()
             .is_some_and(|ext| ext == "sock")
@@ -577,7 +583,21 @@ mod tests {
     fn worker_socket_paths_are_scoped_to_the_given_socket_dir() {
         let dir = Path::new("/fixture/agent/sockets");
         assert!(is_worker_socket_path(&dir.join("worker-abc-123.sock"), dir));
+        assert!(is_worker_socket_path(
+            &dir.join("w-98ed5cb228d2-5b1d3aeb91ee.sock"),
+            dir
+        ));
         assert!(!is_worker_socket_path(&dir.join("daemon.sock"), dir));
+        // A supervisor socket that merely starts with `w-` is not a worker.
+        assert!(!is_worker_socket_path(&dir.join("w-daemon.sock"), dir));
+        assert!(!is_worker_socket_path(
+            &dir.join("w-98ed5cb228d2-5b1d3aeb91ee.sock.lock"),
+            dir
+        ));
+        assert!(!is_worker_socket_path(
+            &dir.join("w-98ed5cb228d2-5b1d3aeb91ee.sock"),
+            Path::new("/fixture/other-sockets")
+        ));
         assert!(!is_worker_socket_path(
             &dir.join("nested/worker-a.sock"),
             dir
