@@ -2,24 +2,30 @@
 """End-to-end verifier: one factory ticket closes on DAEMON seats against a built prime-agent binary.
 
     python3 scripts/oneiron/verify_factory_daemon_seat.py --prime-agent-bin <binary> \\
-        --factory-dir packages/factory [--sandbox-root DIR] [--timeout-s 900] [--keep]
+        --factory-dir packages/factory [--sandbox-root DIR (default $PA_SANDBOX_ROOT or ~/.cache/pa-sb)]
+        [--timeout-s 900] [--keep]
 
 Everything runs in a throwaway sandbox under --sandbox-root: a fresh HOME and TMPDIR, a bare origin and its checkout
 (one crate), fake `gh` and `cargo` (the oneiron-ticket.test.ts fakes), the factory package built from --factory-dir
 into the sandbox, and a launcher on host `local` with `seatHosting: "daemon"` and `buildHosts: []`. Every seat is a
 native seat, so it runs the factory's exact argv (`--daemon-hosted --offline ... --no-skills`) through a seat wrapper
 that execs the given binary with only sandbox paths (its own daemon socket and worker socket dir). The model is the
-faux provider (PRIME_AGENT_HOSTED_DAEMON_SCRIPT): the wrapper hands each seat call a script with that stage's reply
-(the pack, the writer's `DONE <key>`, the reviewers' `VERDICT: LANDABLE`). The faux model has no tools here, so the
-writer's edit is made by the wrapper before the seat runs; the factory commits it as the writer's leftovers. No
-provider, network service, real agent dir or running daemon is touched.
+faux provider (PRIME_AGENT_HOSTED_DAEMON_SCRIPT): the wrapper hands each seat call a script with that stage's turn
+(the pack, the reviewers' `VERDICT: LANDABLE`, and the writer's ipython tool call that edits the worktree in the
+seat's own kernel before its `DONE <key>`; the factory commits the edit as the writer's leftovers). The first tool
+call provisions the sandbox's kernel environment with uv (a package download, once per sandbox). No provider, real
+agent dir or running daemon is touched.
 
 The run: `init` (paused) -> `launch --prime-agent-bin` -> `status` -> `resume` -> `serve`, until the ticket is RETIRED
 with `merged: true` (read on every line serve prints; --timeout-s only turns a stuck run into a failure). Then the
-checks: both actions ACCEPTED, every seat call carried the daemon flags, every seat log reached `agent_end`, every
+checks: both actions ACCEPTED, every seat call carried the daemon flags, every seat log reached `agent_end`, the
+writer's ipython call succeeded and its edit is on the published branch, every
 seat session is still resident in the sandbox daemon (ready, idle), and (Linux) every seat worker runs with
 PI_OFFLINE=1. Teardown stops serve and the sandbox daemon by their own pids and removes the sandbox (--keep keeps it).
-Exit 0 when every check passed; the report is printed as JSON either way.
+Exit 0 when every check passed; the report is printed as JSON either way. Waits are on the events themselves (serve's
+output lines, process exits through a pidfd or kqueue); the bounds only fail a stuck run. A teardown that leaves a
+sandbox process behind (Linux: any process whose environment or command line names the sandbox) fails the run and
+keeps the sandbox.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ import argparse
 import json
 import os
 import re
+import select
 import selectors
 import shutil
 import signal
@@ -39,10 +46,14 @@ import time
 from pathlib import Path
 
 TICKET_KEY = "seat-one"
+# What the writer's tool call prints once its edit landed.
+WRITER_TOOL_OUTPUT = "edited alpha"
 SEATS = ("writer", "pack", "grok", "opus")
 DAEMON_FLAGS = ("--daemon-hosted", "--offline", "--no-skills")
 PROTOCOL = {"name": "prime-agent.daemon", "version": 7}
 REQUEST_BOUND_S = 60
+# Off the shared /tmp: sandboxes, sockets and logs stay under the user's cache.
+DEFAULT_SANDBOX_ROOT = Path(os.environ.get("PA_SANDBOX_ROOT") or Path.home() / ".cache" / "pa-sb")
 
 # The oneiron-ticket.test.ts fakes, reduced to what one non-stacked ticket calls.
 FAKE_GH = r"""#!/usr/bin/env node
@@ -92,7 +103,7 @@ def stage_of(prompt: str) -> str | None:
 
 
 def stage_reply(stage: str, key: str) -> str:
-    """The faux model's whole reply for one stage: terminal on the first round."""
+    """The faux model's final reply for one stage: terminal on the first round."""
     replies = {
         "pack": "PACK: crates/alpha/src/lib.rs:1 add_one is the function to extend.",
         "writer": f"Implemented the function.\nPR BODY:\nAdds {function_name(key)} to alpha.\n"
@@ -103,6 +114,23 @@ def stage_reply(stage: str, key: str) -> str:
     return replies[stage]
 
 
+def stage_script(stage: str, key: str, worktree: str) -> dict:
+    """The faux script one seat call's worker runs. The writer first edits the worktree through the seat's own
+    kernel (an ipython tool call), then answers; every other stage only answers."""
+    responses: list = [stage_reply(stage, key)]
+    if stage == "writer":
+        source = str(Path(worktree) / "crates" / "alpha" / "src" / "lib.rs")
+        line = f"pub fn {function_name(key)}() -> u8 {{ 1 }}\n"
+        code = f"open({source!r}, 'a').write({line!r})\nprint({WRITER_TOOL_OUTPUT!r})"
+        call = {"type": "toolCall", "id": "writer-edit", "name": "ipython", "arguments": {"code": code}}
+        responses.insert(0, {"content": [call]})
+    return {"engine": "faux", "responses": responses}
+
+
+def writer_edit_line(key: str) -> str:
+    return f"pub fn {function_name(key)}() -> u8 {{ 1 }}"
+
+
 def function_name(key: str) -> str:
     return re.sub(r"[^a-z0-9]", "_", key.lower())
 
@@ -110,6 +138,23 @@ def function_name(key: str) -> str:
 def seat_flags_missing(argv: list[str]) -> list[str]:
     """The daemon-seat flags a seat call's argv lacks."""
     return [flag for flag in DAEMON_FLAGS if flag not in argv]
+
+
+def ipython_succeeded(log: str) -> bool:
+    """Whether a seat log carries a successful ipython tool result (the toolResult message the agent persisted)."""
+    for line in log.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        message = event.get("message") if isinstance(event, dict) else None
+        if (event.get("type") == "message_end" and isinstance(message, dict) and message.get("role") == "toolResult"
+                and message.get("toolName") == "ipython" and not message.get("isError")):
+            return True
+    return False
 
 
 def stream_reached_agent_end(log: str) -> bool:
@@ -128,8 +173,10 @@ def stream_reached_agent_end(log: str) -> bool:
 
 
 def evaluate(status: dict, ticket_state: dict, calls: list[dict], seat_logs: dict[str, str],
-             daemon_rows: list[dict], worker_offline: dict[str, str | None] | None, key: str = TICKET_KEY) -> list[str]:
-    """Every check the run must pass; the empty list is a pass."""
+             daemon_rows: list[dict], worker_offline: dict[str, str | None] | None, merged_source: str,
+             key: str = TICKET_KEY) -> list[str]:
+    """Every check the run must pass; the empty list is a pass. `merged_source` is the ticket branch's lib.rs as the
+    origin holds it."""
     problems: list[str] = []
     tickets = {ticket.get("id"): ticket for ticket in status.get("tickets", [])}
     if tickets.get(key, {}).get("state") != "RETIRED":
@@ -150,6 +197,11 @@ def evaluate(status: dict, ticket_state: dict, calls: list[dict], seat_logs: dic
             problems.append(f"a seat call had an unexpected prompt: {call.get('prompt_head')!r}")
     if not seat_logs:
         problems.append("no seat log was written")
+    writer_logs = [log for name, log in seat_logs.items() if name.startswith("write")]
+    if not any(ipython_succeeded(log) for log in writer_logs):
+        problems.append("the writer's seat log shows no successful ipython call")
+    if writer_edit_line(key) not in merged_source:
+        problems.append("the published branch does not carry the writer's edit")
     for name, log in sorted(seat_logs.items()):
         if not stream_reached_agent_end(log):
             problems.append(f"seat log {name} never reached agent_end")
@@ -168,12 +220,12 @@ def evaluate(status: dict, ticket_state: dict, calls: list[dict], seat_logs: dic
 
 
 def seat_wrapper_source(python: str, verifier: Path, config: dict) -> str:
-    """The seat binary the launcher records: logs the call, prepares the stage (the writer's edit, the stage's faux
-    script), then execs the real binary with the prompt on stdin and only sandbox paths in its environment."""
+    """The seat binary the launcher records: logs the call, writes the stage's faux script, then execs the real
+    binary with the prompt on stdin and only sandbox paths in its environment."""
     return f"""#!{python}
 import json, os, sys
 sys.path.insert(0, {str(verifier.parent)!r})
-from verify_factory_daemon_seat import function_name, stage_of, stage_reply
+from verify_factory_daemon_seat import stage_of, stage_script
 CONFIG = json.loads({json.dumps(config)!r})
 argv = sys.argv[1:]
 prompt = sys.stdin.read()
@@ -186,12 +238,9 @@ if stage is None:
     sys.exit(2)
 count = sum(1 for _ in open(calls))
 cwd = argv[argv.index("--cwd") + 1]
-if stage == "writer":
-    with open(os.path.join(cwd, "crates", "alpha", "src", "lib.rs"), "a") as source:
-        source.write("pub fn " + function_name(CONFIG["key"]) + "() -> u8 {{ 1 }}\\n")
 script = os.path.join(CONFIG["root"], "scripts", f"{{count}}-{{stage}}.json")
 with open(script, "w") as handle:
-    json.dump({{"engine": "faux", "responses": [stage_reply(stage, CONFIG["key"])]}}, handle)
+    json.dump(stage_script(stage, CONFIG["key"], cwd), handle)
 prompt_file = script + ".prompt"
 with open(prompt_file, "w") as handle:
     handle.write(prompt)
@@ -217,40 +266,75 @@ def daemon_request(sock_path: Path, command: dict) -> tuple[dict, dict | None]:
         return hello, None
 
 
-def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def wait_pid_gone(pid: int, bound_s: float) -> bool:
-    deadline = time.monotonic() + bound_s
-    while pid_alive(pid):
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.1)
-    return True
+    """Wait for one process to exit, on the exit itself (a Linux pidfd, a macOS kqueue), never a poll loop; the bound
+    only turns a process that never exits into False."""
+    if hasattr(os, "pidfd_open"):
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return True
+        try:
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            return bool(poller.poll(int(bound_s * 1000)))
+        finally:
+            os.close(fd)
+    queue = select.kqueue()
+    try:
+        watch = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                              fflags=select.KQ_NOTE_EXIT)
+        return bool(queue.control([watch], 1, bound_s))
+    except ProcessLookupError:
+        return True
+    finally:
+        queue.close()
 
 
-def stop_sandbox_daemon(sock_path: Path) -> str:
-    """Force-stop the sandbox daemon over its own socket; SIGKILL its supervisor pid if it outlives the bound."""
+def stop_sandbox_daemon(sock_path: Path) -> tuple[str, bool]:
+    """Force-stop the sandbox daemon over its own socket and wait for its supervisor to exit; SIGKILL that pid if it
+    outlives the bound. Returns what happened and whether the stop was clean."""
     if not sock_path.exists():
-        return "no daemon"
+        return "no daemon", True
     try:
         hello, _ = daemon_request(sock_path, {"type": "shutdown", "force": True})
     except (OSError, ValueError) as error:
-        return f"unreachable: {error}"
+        return f"unreachable: {error}", False
     pid = hello.get("supervisorPid")
     if not isinstance(pid, int):
-        return "no supervisor pid"
+        return "no supervisor pid", False
     if wait_pid_gone(pid, REQUEST_BOUND_S):
-        return f"stopped supervisor {pid}"
+        return f"stopped supervisor {pid}", True
     os.kill(pid, signal.SIGKILL)
-    return f"killed supervisor {pid}"
+    return f"killed supervisor {pid}", False
+
+
+def sandbox_processes(root: Path) -> list[int]:
+    """Live processes started for this sandbox (Linux: their environment or command line names the sandbox root);
+    empty where /proc is absent."""
+    marker = str(root).encode()
+    found = []
+    for entry in Path("/proc").glob("[0-9]*") if Path("/proc").is_dir() else []:
+        try:
+            if marker in (entry / "environ").read_bytes() or marker in (entry / "cmdline").read_bytes():
+                found.append(int(entry.name))
+        except OSError:
+            continue
+    return sorted(pid for pid in found if pid != os.getpid())
+
+
+def reap_sandbox(root: Path) -> list[str]:
+    """Wait for every process still running for the sandbox to exit, SIGKILL the ones that outlive the bound (they
+    are this run's own), and report each one that had to be killed."""
+    left = []
+    for pid in sandbox_processes(root):
+        if not wait_pid_gone(pid, REQUEST_BOUND_S):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+            left.append(f"process {pid} outlived the teardown and was killed")
+    return left
 
 
 def worker_offline_env(pid: int) -> str | None:
@@ -313,7 +397,11 @@ class Sandbox:
         self.run(["git", "commit", "-qm", "initial"], cwd=self.repo)
         self.run(["git", "push", "-q", "-u", "origin", "main"], cwd=self.repo)
         self.run([self.node, str(self.factory_dir / "scripts" / "build.mjs"), str(self.dist)], cwd=self.factory_dir)
-        seat_env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "TMPDIR": str(self.tmp), "LANG": "C.UTF-8",
+        # The seat's kernel provisions its environment with uv (once per sandbox); nothing else from this
+        # host's PATH reaches a seat.
+        uv = shutil.which("uv")
+        seat_path = os.pathsep.join([*([str(Path(uv).parent)] if uv else []), "/usr/bin", "/bin"])
+        seat_env = {"PATH": seat_path, "HOME": str(self.home), "TMPDIR": str(self.tmp), "LANG": "C.UTF-8",
                     "TZ": "UTC", "PRIME_AGENT_DAEMON_SOCKET": str(self.socket),
                     "PRIME_AGENT_SOCKET_DIR": str(self.socket_dir)}
         wrapper = self.root / "prime-agent-seat"
@@ -389,12 +477,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--prime-agent-bin", required=True)
     parser.add_argument("--factory-dir", required=True, type=Path)
-    parser.add_argument("--sandbox-root", default=None, help="parent of the throwaway sandbox (default: $TMPDIR)")
+    parser.add_argument("--sandbox-root", type=Path, default=DEFAULT_SANDBOX_ROOT,
+                        help=f"parent of the throwaway sandbox (default: {DEFAULT_SANDBOX_ROOT})")
     parser.add_argument("--timeout-s", type=float, default=900.0)
     parser.add_argument("--keep", action="store_true", help="keep the sandbox for inspection")
     args = parser.parse_args()
     binary = os.path.abspath(args.prime_agent_bin)
     factory_dir = args.factory_dir.resolve()
+    args.sandbox_root.mkdir(parents=True, exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix="vfds-", dir=args.sandbox_root))
     report: dict = {"sandbox": str(root), "binary": binary}
     sandbox = Sandbox(root, binary, factory_dir)
@@ -439,12 +529,21 @@ def main() -> int:
                                 for row in rows],
             "worker_pi_offline": offline,
         })
-        report["problems"] = evaluate(status, sandbox.ticket_state(), calls, seat_logs, rows, offline)
+        branch = sandbox.run(["git", "--git-dir", str(sandbox.origin), "show",
+                              f"w7/{TICKET_KEY}:crates/alpha/src/lib.rs"], check=False)
+        merged_source = branch.stdout if branch.returncode == 0 else ""
+        report["published_lib_rs"] = merged_source.splitlines()
+        report["problems"] = evaluate(status, sandbox.ticket_state(), calls, seat_logs, rows, offline,
+                                      merged_source)
         if not retired and not report["problems"]:
             report["problems"].append("the ticket never retired")
     finally:
-        report["daemon_teardown"] = stop_sandbox_daemon(sandbox.socket)
-        if args.keep:
+        report["daemon_teardown"], clean = stop_sandbox_daemon(sandbox.socket)
+        teardown = ([] if clean else [f"the sandbox daemon did not stop cleanly: {report['daemon_teardown']}"])
+        teardown += reap_sandbox(root)
+        report.setdefault("problems", []).extend(teardown)
+        # A teardown that could not prove every process gone keeps the sandbox for diagnosis.
+        if args.keep or teardown:
             report["kept"] = str(root)
         else:
             shutil.rmtree(root, ignore_errors=True)
