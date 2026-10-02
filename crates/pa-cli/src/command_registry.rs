@@ -236,7 +236,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec::new(&["config"], "config", "Configure package resources"),
     CommandSpec::new(
         &["prompt"],
-        "prompt [--model <selector>] [--cwd <dir>] [--json]",
+        "prompt [--model <selector>] [--cwd <dir>] [--tools <list>] [--no-tools] [--no-builtin-tools] [--json]",
         "Print the assembled system prompt with its layer breakdown",
     )
     .description(
@@ -246,6 +246,9 @@ and prints the per-layer breakdown (cached static layers, then the dynamic tail)
     .options(&[
         "--model <selector>  Preview per-model instructions for a provider/id selector",
         "--cwd <dir>         Assemble for this working directory (default: current)",
+        "-t, --tools <list>  Assemble for this tool allowlist (wins over the flags below)",
+        "-nt, --no-tools     Assemble for a session with no tools",
+        "-nbt, --no-builtin-tools  Assemble for a session without built-in tools",
         "--json              Print segments and prompt as JSON",
     ]),
 ];
@@ -334,7 +337,10 @@ const TOP_LEVEL_OPTION_GROUPS: &[OptionGroup] = &[
     OptionGroup {
         heading: "Tool and resource options",
         options: &[
-            ("-t, --tools <list>", "Allowlist comma-separated tool names"),
+            (
+                "-t, --tools <list>",
+                "Allowlist comma-separated tool names (wins over -nt/-nbt)",
+            ),
             ("-nt, --no-tools", "Disable all tools by default"),
             (
                 "-nbt, --no-builtin-tools",

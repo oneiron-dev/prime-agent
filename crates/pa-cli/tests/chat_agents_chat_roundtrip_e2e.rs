@@ -159,6 +159,7 @@ fn write_faux_script(dir: &Path, replies: &[&str]) -> PathBuf {
 
 fn chat_options(socket: PathBuf, cwd: PathBuf) -> InteractiveOptions {
     InteractiveOptions {
+        tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         models: None,
         socket_path: socket,
         cwd,

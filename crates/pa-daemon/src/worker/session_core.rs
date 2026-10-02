@@ -125,6 +125,11 @@ pub(crate) struct SessionCore {
     /// the snapshot (TS #2063 `compactRlmText(queuedAgentMessagePreview(
     /// active))`: the delivery's labeled preview, else the message text).
     pub(crate) active_action: Option<crate::types::SessionActionActive>,
+    /// The create command's tool selection (`tools`/`noTools`/
+    /// `noBuiltinTools`): the summary publishes a non-default one, so a
+    /// client about to reuse this live session can tell it was launched
+    /// with other tools.
+    pub(crate) tool_selection: pa_types::daemon::ToolSelectionFlags,
 }
 
 impl SessionCore {
@@ -177,6 +182,7 @@ impl SessionCore {
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
             active_action: None,
+            tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         }
     }
 }

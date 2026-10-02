@@ -28,7 +28,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pa_types::daemon::{DaemonCommand, DaemonResponse, DaemonSessionLifecycle, PromptInput};
+use pa_core::session_engine::tool_selection::ToolSelection;
+use pa_types::daemon::{
+    DaemonCommand, DaemonResponse, DaemonSessionLifecycle, PromptInput, ToolSelectionFlags,
+    SESSION_TOOL_SELECTION_CAPABILITY,
+};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, watch};
 
@@ -165,10 +169,37 @@ impl HostedHeadlessSession {
         mut self,
         options: HostedSessionOptions,
     ) -> anyhow::Result<(Self, HostedSessionOpened)> {
+        // A daemon without `session_tool_selection` ignores the keys and
+        // would run every tool: refuse instead of falling back.
+        let requested = ToolSelectionFlags::from_create_config(&options.create_config)?;
+        if let Some(refusal) = requested.unsupported_by_daemon(
+            self.link
+                .server_capabilities
+                .iter()
+                .any(|capability| capability == SESSION_TOOL_SELECTION_CAPABILITY),
+        ) {
+            anyhow::bail!("{refusal}");
+        }
         let live = match &options.session_path {
             Some(path) => self.live_session_for_file(path).await?,
             None => None,
         };
+        // Reusing a live session never changes its tools: it belongs to
+        // the client that launched it, so a different selection is refused.
+        if let Some(summary) = &live {
+            let running = summary
+                .get("toolSelection")
+                .map(|value| serde_json::from_value::<ToolSelectionFlags>(value.clone()))
+                .transpose()?
+                .unwrap_or_default();
+            if ToolSelection::from_flags(&running) != ToolSelection::from_flags(&requested) {
+                anyhow::bail!(
+                    "the session is already running in the daemon with {}, and this run asks for {}; a live session keeps the tools it was launched with. Run with the same tool flags, or resume it after it stops",
+                    running.describe(),
+                    requested.describe()
+                );
+            }
+        }
         let summary = if let Some(summary) = live {
             summary
         } else {

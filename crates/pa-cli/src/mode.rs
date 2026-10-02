@@ -119,6 +119,23 @@ impl RuntimeConfig {
         }
     }
 
+    /// The launch tool-selection flags under their create-config names.
+    pub(crate) fn tool_selection_flags(&self) -> pa_types::daemon::ToolSelectionFlags {
+        pa_types::daemon::ToolSelectionFlags {
+            tools: self.tools.clone(),
+            no_tools: self.no_tools,
+            no_builtin_tools: self.no_builtin_tools,
+        }
+    }
+
+    /// The session's tool-selection policy from `--tools`, `--no-tools` and
+    /// `--no-builtin-tools` (an explicit list wins over both disable flags).
+    pub(crate) fn tool_selection(&self) -> pa_core::session_engine::tool_selection::ToolSelection {
+        pa_core::session_engine::tool_selection::ToolSelection::from_flags(
+            &self.tool_selection_flags(),
+        )
+    }
+
     /// The daemon `create` config for a session run in `cwd`: the session
     /// flags the in-process engine honors, under the TS
     /// `runtimeConfigFromArgs` names the Rust create contract carries.
@@ -158,6 +175,10 @@ impl RuntimeConfig {
                 crate::headless_autonomous::autonomous_runtime_config(autonomous)
             );
         }
+        // Capability-gated (`session_tool_selection`): the daemon clients
+        // refuse a non-default selection a daemon cannot honor.
+        self.tool_selection_flags()
+            .write_into_create_config(&mut create_config);
         create_config
     }
 }
@@ -450,5 +471,102 @@ mod tests {
             let settings = pa_core::settings::SettingsManager::create(dir.path(), agent_dir);
             assert!(!telemetry_disabled(&settings));
         });
+    }
+
+    /// The tool flags as the CLI parses them, every alias and both argument
+    /// orders: an explicit `--tools` list (empty included) wins over both
+    /// disable flags, then `--no-tools`, then `--no-builtin-tools`; the
+    /// removed built-in names keep their diagnostic.
+    #[test]
+    fn tool_flags_resolve_by_precedence_in_any_order() {
+        use pa_core::session_engine::tool_selection::ToolSelection;
+        let resolve = |argv: &[&str]| {
+            let args: Vec<String> = argv.iter().map(ToString::to_string).collect();
+            let parsed = crate::args::parse_args(&args);
+            let config = runtime_config_from_args(
+                &parsed,
+                PathBuf::from("/w"),
+                PathBuf::from("/agent"),
+                None,
+                AppMode::Print,
+                true,
+            );
+            (
+                config.tool_selection(),
+                config.daemon_create_config(std::path::Path::new("/w")),
+            )
+        };
+        let ipython = || ToolSelection::Allowlist(vec!["ipython".to_string()]);
+        let cases: Vec<(&[&str], ToolSelection, serde_json::Value)> = vec![
+            (
+                &[],
+                ToolSelection::Defaults,
+                serde_json::json!({ "cwd": "/w" }),
+            ),
+            (
+                &["--no-tools"],
+                ToolSelection::NoTools,
+                serde_json::json!({ "cwd": "/w", "noTools": true }),
+            ),
+            (
+                &["-nt"],
+                ToolSelection::NoTools,
+                serde_json::json!({ "cwd": "/w", "noTools": true }),
+            ),
+            (
+                &["--no-builtin-tools"],
+                ToolSelection::SuppliedOnly,
+                serde_json::json!({ "cwd": "/w", "noBuiltinTools": true }),
+            ),
+            (
+                &["-nbt"],
+                ToolSelection::SuppliedOnly,
+                serde_json::json!({ "cwd": "/w", "noBuiltinTools": true }),
+            ),
+            (
+                &["--tools", "ipython"],
+                ipython(),
+                serde_json::json!({ "cwd": "/w", "tools": ["ipython"] }),
+            ),
+            (
+                &["-t", ""],
+                ToolSelection::Allowlist(Vec::new()),
+                serde_json::json!({ "cwd": "/w", "tools": [] }),
+            ),
+            (
+                &["--no-tools", "--tools", "ipython"],
+                ipython(),
+                serde_json::json!({ "cwd": "/w", "tools": ["ipython"], "noTools": true }),
+            ),
+            (
+                &["--tools", "ipython", "--no-tools"],
+                ipython(),
+                serde_json::json!({ "cwd": "/w", "tools": ["ipython"], "noTools": true }),
+            ),
+            (
+                &["-nbt", "--tools", "ipython", "-nt"],
+                ipython(),
+                serde_json::json!({
+                    "cwd": "/w", "tools": ["ipython"], "noTools": true, "noBuiltinTools": true
+                }),
+            ),
+            (
+                &["--tools", " echo, ,echo "],
+                ToolSelection::Allowlist(vec!["echo".to_string()]),
+                serde_json::json!({ "cwd": "/w", "tools": ["echo", "echo"] }),
+            ),
+        ];
+        for (argv, selection, create_config) in cases {
+            assert_eq!(resolve(argv), (selection, create_config), "argv {argv:?}");
+        }
+        let removed = crate::args::parse_args(&["--tools".to_string(), "read,ipython".to_string()]);
+        assert_eq!(
+            removed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>(),
+            vec!["Unknown built-in tool(s): read. Available built-in tools: ipython".to_string()]
+        );
     }
 }

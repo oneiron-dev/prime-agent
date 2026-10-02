@@ -20,7 +20,8 @@ const MAX_VERSION_LENGTH: usize = 64;
 /// 3: the additive `agent provider transport used`, `kernel memory action`,
 /// `kernel snapshot guard`, `agent headless invoked` and
 /// `provider session affinity configured` rules.
-pub const SCHEMA_REVISION: u64 = 3;
+/// 4: the additive `agent headless invoked` `tool_selection` property.
+pub const SCHEMA_REVISION: u64 = 4;
 
 /// The `cpu_baseline` values.
 const CPU_AVX2: &str = "avx2";

@@ -538,3 +538,73 @@ fn a_click_off_the_target_disarms_like_a_key_move() {
     );
     crate::mouse_tracking::disable(&mut std::io::stdout()).expect("disable");
 }
+
+/// A saved-session reply resumes with the view's create config: on a
+/// daemon whose hello lacks `session_tool_selection`, a restricted launch
+/// selection fails the reply before any create or prompt reaches it (the
+/// older daemon would run the resumed session with every tool).
+#[tokio::test]
+async fn a_restricted_saved_reply_refuses_a_daemon_without_tool_selection() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let (reader, mut writer) = stream.into_split();
+        let hello = serde_json::json!({
+            "type": "daemon_hello",
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "serverCapabilities": ["attach_snapshot", "event_sequence"],
+        });
+        let _ = writer.write_all(format!("{hello}\n").as_bytes()).await;
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let envelope: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let kind = envelope["command"]["type"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            recorded.lock().unwrap().push(kind.clone());
+            let response = serde_json::json!({
+                "type": "response", "id": envelope["id"], "command": kind,
+                "success": true, "data": { "activeSessionId": "resumed-1" },
+            });
+            if writer
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    let (client, _events) = crate::daemon_client::DaemonClient::connect(&socket)
+        .await
+        .unwrap();
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = crate::agents_view::reply::send_reply(
+        client,
+        &ui_tx,
+        ReplyRequest {
+            key: "saved-1".to_string(),
+            summary: serde_json::json!({ "sessionFile": "/x/saved.jsonl" }),
+            text: "hello".to_string(),
+            behavior: None,
+            resume_config: serde_json::json!({ "noTools": true }),
+            cwd_notice: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        outcome.err().as_deref(),
+        Some(
+            "the running daemon does not support --tools, --no-tools or --no-builtin-tools (it does not advertise `session_tool_selection`); restart it with this build, or drop the flags"
+        )
+    );
+    assert_eq!(*seen.lock().unwrap(), Vec::<String>::new());
+}

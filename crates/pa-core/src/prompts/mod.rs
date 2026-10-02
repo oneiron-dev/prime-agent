@@ -8,11 +8,18 @@
 //!   project context, skills inventory, MCP servers, environment, role) and
 //!   is appended after the static prefix, in that order.
 //!
+//! A session whose active tools hold no Python REPL (`--no-tools`,
+//! `--no-builtin-tools`, a `--tools` list without `ipython`) gets the TS
+//! no-tools prompt instead (`no_repl`): the layered harness documents a
+//! kernel API the model cannot reach there.
+//!
 //! `system_prompt_breakdown` exposes the per-layer segments so the CLI can
 //! dump exactly what the model sees; the cache-safety and tool-surface guard
 //! tests pin the boundary and the documented API surface.
 
 pub mod layers;
+
+mod no_repl;
 
 pub mod system_prompt;
 

@@ -57,7 +57,8 @@ pub use event::TelemetryEvent;
 pub use events::{
     AgentError, AgentFeatureOutcome, AgentHeadlessInvoked, AgentInputStage, AgentInstallationStage,
     AgentRunStarted, AgentStartupStage, AgentTiming, AgentToolSummary, ErrorEventKind,
-    HeadlessJsonEventProfile, HeadlessMode, OnboardingStage, RunTrigger, TimingStage, ToolCategory,
+    HeadlessJsonEventProfile, HeadlessMode, HeadlessToolSelection, OnboardingStage, RunTrigger,
+    TimingStage, ToolCategory,
 };
 pub use flags::{FlagsClient, FLAG_CACHE_TTL};
 pub use install_id::install_id;

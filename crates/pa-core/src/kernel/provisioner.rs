@@ -188,6 +188,10 @@ struct ProvisionerState {
     /// sender errs and unblocks the same way); each stop supersedes the
     /// previous.
     pending_stop: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Every request to start the kernel (`prewarm` or `ensure`), counted
+    /// synchronously at the call: the receipt that proves a session never
+    /// asked for Python, without waiting for a boot that should not come.
+    start_requests: u64,
 }
 
 /// Owns one kernel for one session: lazily starts it, memoizes the startup so
@@ -223,6 +227,7 @@ impl IpythonKernelProvisioner {
                     disposed: false,
                     dispose_snapshot: true,
                     pending_stop: None,
+                    start_requests: 0,
                 }),
                 dispose_signal: AbortSignal::new(),
             }),
@@ -254,9 +259,17 @@ impl IpythonKernelProvisioner {
         self.manager().is_some_and(|m| m.is_running())
     }
 
+    /// How many times this provisioner was asked to start its kernel
+    /// (`prewarm` plus `ensure` calls), whether or not a boot followed.
+    #[must_use]
+    pub fn start_requests(&self) -> u64 {
+        self.lock_state().start_requests
+    }
+
     /// Start the kernel in the background. Failures are swallowed here and
     /// surface on the next `ensure()`.
     pub fn prewarm(&self) {
+        self.lock_state().start_requests += 1;
         let provisioner = self.clone();
         tokio::spawn(async move {
             let _ = provisioner.ensure(None, None).await;
@@ -287,6 +300,7 @@ impl IpythonKernelProvisioner {
         // non-Send.
         let decision = {
             let mut state = self.lock_state();
+            state.start_requests += 1;
             if state.disposed {
                 return Err(anyhow!("Kernel provisioner disposed"));
             }
@@ -1111,6 +1125,23 @@ mod tests {
         let clone = provisioner.clone();
         provisioner.dispose(None).await;
         assert!(clone.ensure(None, None).await.is_err());
+    }
+
+    /// The start receipt counts a request at the call itself: a prewarm is
+    /// on the record before its background task runs, and an `ensure()`
+    /// counts even when it fails at once (a disposed provisioner boots
+    /// nothing).
+    #[tokio::test]
+    async fn start_requests_count_each_request_at_the_call() {
+        let provisioner =
+            IpythonKernelProvisioner::new("/tmp", IpythonKernelProvisionerOptions::default());
+        provisioner.dispose(None).await;
+        let before = provisioner.start_requests();
+        provisioner.prewarm();
+        let after_prewarm = provisioner.start_requests();
+        assert!(provisioner.ensure(None, None).await.is_err());
+        assert_eq!((before, after_prewarm), (0, 1));
+        assert!(provisioner.start_requests() >= 2);
     }
 
     /// The prewarm contract (TS `prewarm(): void this.ensure().catch(() =>

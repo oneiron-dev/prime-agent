@@ -1449,9 +1449,14 @@ pub const HEADLESS_MODES: &[&str] = &["text", "json"];
 /// The `--json-event-profile` values (`agent headless invoked`).
 pub const JSON_EVENT_PROFILES: &[&str] = &["all", "factory-completed"];
 
+/// The tool selections (`agent headless invoked`, schema revision 4).
+pub const HEADLESS_TOOL_SELECTIONS: &[&str] =
+    &["default", "no_tools", "no_builtin_tools", "allowlist"];
+
 /// `agent headless invoked` (v2, schema revision 3): one per print/json run, the
 /// headless flags it used (`--mode`, `--daemon-hosted`,
-/// `--json-event-profile`).
+/// `--json-event-profile`; revision 4 adds the `--tools`/`--no-tools`/
+/// `--no-builtin-tools` selection).
 const AGENT_HEADLESS_INVOKED: EventRule = EventRule {
     name: "agent headless invoked",
     since: 2,
@@ -1461,6 +1466,10 @@ const AGENT_HEADLESS_INVOKED: EventRule = EventRule {
         (
             "json_event_profile",
             required(enum_rule(JSON_EVENT_PROFILES, "all")),
+        ),
+        (
+            "tool_selection",
+            optional(enum_rule(HEADLESS_TOOL_SELECTIONS, "default")),
         ),
     ],
 };

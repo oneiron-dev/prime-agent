@@ -233,6 +233,7 @@ fn attach_data(id: &str) -> Value {
 
 fn options(socket: PathBuf) -> InteractiveOptions {
     InteractiveOptions {
+        tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         models: None,
         socket_path: socket,
         cwd: PathBuf::from("/tmp"),

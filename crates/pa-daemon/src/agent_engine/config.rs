@@ -95,6 +95,30 @@ pub(crate) struct CreateSessionResources {
     pub(crate) skills: Vec<String>,
     pub(crate) prompt_templates: Vec<String>,
     pub(crate) autonomous: Option<pa_core::autonomous::AgentAutonomousConfig>,
+    /// The launch tool selection (`session_tool_selection`): `None` and
+    /// `Some([])` stay distinct (no list versus an explicit empty one).
+    pub(crate) tools: Option<Vec<String>>,
+    pub(crate) no_tools: bool,
+    pub(crate) no_builtin_tools: bool,
+}
+
+impl CreateSessionResources {
+    /// The create command's tool-selection flags.
+    pub(crate) fn tool_selection_flags(&self) -> pa_types::daemon::ToolSelectionFlags {
+        pa_types::daemon::ToolSelectionFlags {
+            tools: self.tools.clone(),
+            no_tools: self.no_tools,
+            no_builtin_tools: self.no_builtin_tools,
+        }
+    }
+
+    /// The session's tool-selection policy (an explicit list wins over both
+    /// disable flags).
+    pub(crate) fn tool_selection(&self) -> pa_core::session_engine::tool_selection::ToolSelection {
+        pa_core::session_engine::tool_selection::ToolSelection::from_flags(
+            &self.tool_selection_flags(),
+        )
+    }
 }
 
 /// The create command's `--models` scope inputs (TS main.ts:548-568 +
@@ -138,5 +162,73 @@ impl pa_core::session_engine::rlm_usage::RlmChildUsageSink for ProducerUsageSink
         Box::pin(async move {
             producer.forget_child(&rlm_child_id).await;
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CreateSessionResources;
+    use pa_core::session_engine::tool_selection::ToolSelection;
+    use serde::Deserialize as _;
+
+    /// What a respawned worker rebuilds from: the supervisor replays the
+    /// durable create (its rest keys flattened into the worker `create`),
+    /// and the worker reads the same selection the first create carried.
+    #[test]
+    fn a_replayed_durable_create_keeps_the_tool_selection() {
+        let resolve = |rest: serde_json::Value| {
+            let durable = pa_types::daemon::DurableDaemonCreateCommand {
+                session_path: Some("/s/session.jsonl".to_string()),
+                no_session: None,
+                rest: rest.as_object().unwrap().clone(),
+            };
+            let payload = crate::descriptor::create_command_payload(&durable);
+            let resources = CreateSessionResources::deserialize(&payload).unwrap();
+            (resources.tool_selection_flags(), resources.tool_selection())
+        };
+        assert_eq!(
+            [
+                resolve(serde_json::json!({ "cwd": "/w" })),
+                resolve(serde_json::json!({ "cwd": "/w", "noTools": true })),
+                resolve(serde_json::json!({ "cwd": "/w", "noBuiltinTools": true })),
+                resolve(serde_json::json!({ "cwd": "/w", "tools": [], "noTools": true })),
+            ],
+            [
+                (
+                    pa_types::daemon::ToolSelectionFlags::default(),
+                    ToolSelection::Defaults,
+                ),
+                (
+                    pa_types::daemon::ToolSelectionFlags {
+                        no_tools: true,
+                        ..Default::default()
+                    },
+                    ToolSelection::NoTools,
+                ),
+                (
+                    pa_types::daemon::ToolSelectionFlags {
+                        no_builtin_tools: true,
+                        ..Default::default()
+                    },
+                    ToolSelection::SuppliedOnly,
+                ),
+                (
+                    pa_types::daemon::ToolSelectionFlags {
+                        tools: Some(Vec::new()),
+                        no_tools: true,
+                        ..Default::default()
+                    },
+                    ToolSelection::Allowlist(Vec::new()),
+                ),
+            ]
+        );
+    }
+
+    /// A wrongly typed key fails the create instead of silently running
+    /// every tool.
+    #[test]
+    fn a_wrongly_typed_tool_key_fails_the_create() {
+        let payload = serde_json::json!({ "type": "create", "cwd": "/w", "noTools": "yes" });
+        assert!(CreateSessionResources::deserialize(&payload).is_err());
     }
 }

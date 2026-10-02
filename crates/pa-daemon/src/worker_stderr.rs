@@ -170,6 +170,31 @@ fn read_tail(path: &Path) -> Result<Option<String>> {
     Ok(Some(contents))
 }
 
+/// The start of the Rust runtime's hint after a panic message (the line
+/// that tells how to set `RUST_BACKTRACE`): never the diagnostic itself.
+const RUST_BACKTRACE_HINT: &str = "note: run with `RUST_BACKTRACE=";
+
+/// The last non-empty line of the worker's stderr tail: what a worker that
+/// dies during startup printed last (the product worker exits on one
+/// `Error: bind worker socket …: <cause>` line), the line its startup
+/// failure names. Only the runtime's backtrace hint
+/// ([`RUST_BACKTRACE_HINT`]) is skipped, so a panic names its message
+/// instead; any other `note:` line counts. `Ok(None)` for a missing or
+/// silent log.
+///
+/// # Errors
+///
+/// Returns an error when the log exists but cannot be read.
+pub(crate) fn last_line(log_path: &Path) -> Result<Option<String>> {
+    Ok(read_tail(log_path)?.and_then(|tail| {
+        tail.lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with(RUST_BACKTRACE_HINT))
+            .map(str::to_string)
+    }))
+}
+
 /// Attach the worker's captured stderr tail to a not-ready launch failure
 /// so the error names the panic the supervisor only saw as silence (the
 /// Codex `append_stderr_log_tail_context` + `PidLogTail::append_to_context`
@@ -298,6 +323,56 @@ mod tests {
             "indents the worker's stderr lines: {message}"
         );
         assert!(message.contains("  thread 'main' panicked"));
+    }
+
+    #[test]
+    fn last_line_is_the_final_non_empty_line_past_the_runtime_hint() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exit_error = write_log(
+            dir.path(),
+            "worker-a.stderr.log",
+            "booting\nError: bind worker socket /s/w.sock: path must be shorter than SUN_LEN  \n\n \n",
+        );
+        // anyhow's `Debug` exit: the chain's last cause is the last line.
+        let with_causes = write_log(
+            dir.path(),
+            "worker-b.stderr.log",
+            "Error: bind worker socket /s/w.sock\n\nCaused by:\n    Not a directory (os error 20)\n",
+        );
+        let panic = write_log(
+            dir.path(),
+            "worker-c.stderr.log",
+            "thread 'main' panicked at src/worker.rs:9:5:\nboom\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+        );
+        let silent = write_log(dir.path(), "worker-d.stderr.log", "\n\n");
+        // Any other `note:` line is the worker's own word and counts.
+        let own_note = write_log(
+            dir.path(),
+            "worker-e.stderr.log",
+            "Error: bind failed\nnote: the socket dir sits under a file\n",
+        );
+        assert_eq!(
+            [
+                &exit_error,
+                &with_causes,
+                &panic,
+                &silent,
+                &dir.path().join("absent.stderr.log"),
+                &own_note,
+            ]
+            .map(|path| last_line(path).expect("read")),
+            [
+                Some(
+                    "Error: bind worker socket /s/w.sock: path must be shorter than SUN_LEN"
+                        .to_string()
+                ),
+                Some("Not a directory (os error 20)".to_string()),
+                Some("boom".to_string()),
+                None,
+                None,
+                Some("note: the socket dir sits under a file".to_string()),
+            ]
+        );
     }
 
     #[test]

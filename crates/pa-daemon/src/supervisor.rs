@@ -11,6 +11,7 @@ mod accept_loop;
 mod adoption;
 mod clients;
 mod launch_budget;
+mod launch_watch;
 mod notes;
 mod options;
 mod root_identity;

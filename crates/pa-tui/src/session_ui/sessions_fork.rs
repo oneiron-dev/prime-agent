@@ -339,6 +339,7 @@ impl SessionUi {
             script_path: self.script_path.clone(),
             model_selection: self.model_selection.clone(),
             models: self.models.clone(),
+            tool_selection: self.tool_selection.clone(),
             model_catalog: self.model_catalog.clone(),
             model_configured_providers: self.model_configured_providers.clone(),
             model_recent_models: self.model_recent_models.clone(),
@@ -522,6 +523,13 @@ pub(super) async fn create_session(
         Some(SessionSelection::Resume(path)) => Some(path.to_string_lossy().to_string()),
         _ => None,
     };
+    // An older daemon ignores the tool-selection keys and would run every
+    // tool: refuse instead of opening a session the flags do not govern.
+    if let Some(refusal) = options.tool_selection.unsupported_by_daemon(
+        client.supports_server_capability(pa_types::daemon::SESSION_TOOL_SELECTION_CAPABILITY),
+    ) {
+        return Err(anyhow!("{refusal}"));
+    }
     // The create consumes the path; a refusal needs it again for the
     // descriptive error.
     let refused_path = session_path.clone();
