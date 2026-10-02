@@ -150,6 +150,13 @@ impl Sandbox {
     #[track_caller]
     fn passivate_and_wake(&self, row: &Value) -> Value {
         self.passivate(row);
+        self.wake(row)
+    }
+
+    /// Wake a passivated session with an attach by its saved id. Returns
+    /// the woken session's row.
+    #[track_caller]
+    fn wake(&self, row: &Value) -> Value {
         self.wire()
             .request(&json!({ "type": "attach", "activeSessionId": row["sessionId"] }));
         self.session_row(&row["sessionId"])
@@ -330,6 +337,42 @@ impl Sandbox {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    /// What a listed session's live worker runs with: its published
+    /// `toolSelection` (null for the defaults), its `ipython` definition
+    /// answer (`{}` when the tool is inactive) and its system prompt.
+    #[track_caller]
+    fn tool_state(&self, row: &Value) -> (Value, Value, String) {
+        let row = self.session_row(&row["sessionId"]);
+        let ipython = self.wire().request(&json!({
+            "type": "get_tool_definition",
+            "activeSessionId": row["activeSessionId"],
+            "name": "ipython",
+        }));
+        (
+            row["toolSelection"].clone(),
+            ipython["data"].clone(),
+            self.system_prompt(&row["sessionId"]),
+        )
+    }
+
+    /// The session policy record the daemon keeps for `session_file`: its
+    /// path and its JSON.
+    #[track_caller]
+    fn policy_record(&self, session_file: &Value) -> (PathBuf, Value) {
+        let records: Vec<(PathBuf, Value)> =
+            std::fs::read_dir(self.descriptor_dir().join("session-policies"))
+                .unwrap()
+                .flatten()
+                .map(|entry| {
+                    let record = std::fs::read_to_string(entry.path()).unwrap();
+                    (entry.path(), serde_json::from_str(&record).unwrap())
+                })
+                .filter(|(_, record): &(PathBuf, Value)| record["sessionFile"] == *session_file)
+                .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        records.into_iter().next().unwrap()
     }
 
     /// A raw protocol client (the daemon is up: a hosted run started it).
@@ -556,6 +599,30 @@ fn environ(pid: &Value) -> std::collections::BTreeMap<String, String> {
             Some((name.to_string(), value.to_string()))
         })
         .collect()
+}
+
+/// The TS no-tools prompt (`rlm.js` with `ipython` inactive) for a root
+/// session at `cwd` logging to `log`; pa-core's golden corpus pins its
+/// bytes against the TS capture.
+fn ts_no_tools_prompt(cwd: &str, log: &str) -> String {
+    include_str!("../../pa-core/tests/golden/corpus/no-tools-prompt-ts.txt")
+        .replace(
+            "Working directory: /tmp/pb.ysn9o0q3/w",
+            &format!("Working directory: {cwd}"),
+        )
+        .replace(
+            "Conversation log: not persisted",
+            &format!("Conversation log: {log}"),
+        )
+}
+
+/// The value of a system prompt's `<label>: ` line.
+#[track_caller]
+fn prompt_line<'a>(prompt: &'a str, label: &str) -> &'a str {
+    prompt
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{label}: ")))
+        .unwrap_or_else(|| panic!("no {label} line in {prompt}"))
 }
 
 /// The skill names a system prompt's inventory lists (empty: no
@@ -1126,10 +1193,12 @@ fn no_skills_empties_the_hosted_inventory_and_keeps_explicit_skills() {
     );
 }
 
-/// A live session is reused only under the policy it runs with: the same
-/// seat flags continue it on its worker, a run without `--no-skills` is
-/// refused (never applied to the live worker, which keeps running), and a
-/// pre-policy client's create (no policy keys) reuses it as before.
+/// A live session is reused only under the policy and the tools it runs
+/// with: the same seat flags continue it on its worker; a run without
+/// `--no-skills`, one with other tool flags, and one with both are refused,
+/// each naming what differs (never applied to the live worker, which keeps
+/// running); and a pre-policy client's create (no policy or tool keys)
+/// reuses it as before.
 #[test]
 fn a_live_session_is_reused_only_under_its_own_policy() {
     let sandbox = Sandbox::new(&json!({
@@ -1144,19 +1213,47 @@ fn a_live_session_is_reused_only_under_its_own_policy() {
     assert_eq!(sessions.len(), 1, "{sessions:?}");
     let live = sessions[0].clone();
     let file = live["sessionFile"].as_str().unwrap().to_string();
-    // The sandbox keeps `PI_OFFLINE`, so this run is `--offline` only.
-    let (stdout, stderr, code) =
-        sandbox.run(&["--daemon-hosted", "--resume", &file, "-p", "three"]);
-    assert_eq!(
-        (stdout.as_str(), stderr.as_str(), code),
-        (
-            "",
-            format!(
-                "Error: Session \"{file}\" is live with --offline --no-skills, but this run asked for --offline: a live session keeps its policy, so rerun with the same flags or stop the session first\n"
-            )
-            .as_str(),
-            1
+    // The sandbox keeps `PI_OFFLINE`, so this run is `--offline` only. The
+    // refusal names what differs: the policy, the tools, or both.
+    let refusal_of = |args: &[&str]| {
+        let (stdout, stderr, code) = sandbox.run(args);
+        assert_eq!((stdout.as_str(), code), ("", 1), "stderr: {stderr}");
+        stderr
+    };
+    let refusal = |differences: &str| {
+        format!(
+            "Error: Session \"{file}\" is live with {differences}: a live session keeps its policy and its tools, so rerun with the same flags or stop the session first\n"
         )
+    };
+    assert_eq!(
+        [
+            refusal_of(&["--daemon-hosted", "--resume", &file, "-p", "three"]),
+            refusal_of(&[
+                "--daemon-hosted",
+                "--no-skills",
+                "--no-tools",
+                "--resume",
+                &file,
+                "-p",
+                "three",
+            ]),
+            refusal_of(&[
+                "--daemon-hosted",
+                "--tools",
+                "",
+                "--resume",
+                &file,
+                "-p",
+                "three",
+            ]),
+        ],
+        [
+            refusal("policy --offline --no-skills (this run asked for --offline)"),
+            refusal("tools from no tool flags (this run asked for --no-tools)"),
+            refusal(
+                "policy --offline --no-skills (this run asked for --offline) and tools from no tool flags (this run asked for --tools \"\")"
+            ),
+        ]
     );
     // A pre-policy client's open reuses the live worker, as before.
     let reused = sandbox.wire().request(&json!({
@@ -1402,6 +1499,84 @@ fn a_passivated_session_wakes_under_its_own_policy() {
             inventory(&sandbox.system_prompt(&moved["sessionId"])),
         ),
         (Some("1".to_string()), Vec::<String>::new())
+    );
+}
+
+/// The launch tool selection outlives its worker like the session policy:
+/// a `--no-tools` hosted session whose worker moved onto a new session and
+/// was then retired by the idle passivation (the worker descriptor goes
+/// with it) wakes on the daemon's own create (an attach by its saved id)
+/// without `ipython` and with the TS no-tools prompt, the selection still
+/// published. A record kept before it carried the selection (the policy
+/// alone) wakes the session with the default tools.
+#[test]
+fn a_passivated_no_tools_session_wakes_without_tools() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    let (stdout, stderr, code) = sandbox.run(&["--daemon-hosted", "--no-tools", "-p", "one"]);
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let launched = sandbox.sessions()[0].clone();
+    sandbox.wire().request(&json!({
+        "type": "new_session",
+        "activeSessionId": launched["activeSessionId"],
+    }));
+    let moved = sandbox
+        .sessions()
+        .into_iter()
+        .find(|row| row["activeSessionId"] == launched["activeSessionId"])
+        .expect("the worker still serves a session");
+    assert_ne!(moved["sessionId"], launched["sessionId"]);
+    let before = sandbox.tool_state(&moved);
+    let woken = sandbox.passivate_and_wake(&moved);
+    assert_ne!(woken["workerPid"], moved["workerPid"]);
+    let after = sandbox.tool_state(&woken);
+    let (cwd, log) = (
+        prompt_line(&after.2, "Working directory"),
+        prompt_line(&after.2, "Conversation log"),
+    );
+    assert!(
+        after.2.starts_with(&ts_no_tools_prompt(cwd, log)),
+        "the woken worker sends the TS no-tools prompt: {}",
+        after.2
+    );
+    assert_eq!(
+        (&after.0, &after.1, &after),
+        (&json!({ "noTools": true }), &json!({}), &before),
+        "the woken worker runs the session without tools, as before the passivation"
+    );
+
+    // A record without the selection keys reads as the default selection
+    // (rewritten once the worker is gone: its stop writes the record).
+    sandbox.passivate(&woken);
+    let (path, mut record) = sandbox.policy_record(&woken["sessionFile"]);
+    assert_eq!(
+        record,
+        json!({
+            "sessionFile": woken["sessionFile"],
+            "offline": true,
+            "noSkills": false,
+            "noTools": true,
+            "noBuiltinTools": false,
+        })
+    );
+    for key in ["tools", "noTools", "noBuiltinTools"] {
+        record.as_object_mut().unwrap().remove(key);
+    }
+    std::fs::write(&path, record.to_string()).unwrap();
+    let rewoken = sandbox.wake(&woken);
+    assert_ne!(rewoken["workerPid"], woken["workerPid"]);
+    let (selection, ipython, _) = sandbox.tool_state(&rewoken);
+    assert_eq!(
+        (
+            selection,
+            ipython
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+        (Value::Null, vec!["toolDefinition".to_string()]),
+        "the woken worker runs the default tools"
     );
 }
 

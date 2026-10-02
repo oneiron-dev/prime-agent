@@ -520,7 +520,7 @@ fn hosted_no_tools_reaches_the_worker_and_guards_reuse() {
     let (stdout, stderr, code) = sandbox.run(&["--daemon-hosted", "-c", "-p", "two"]);
     assert_eq!((stdout.as_str(), code), ("", 1));
     assert!(
-        stderr.contains("the session is already running in the daemon with --no-tools, and this run asks for no tool flags"),
+        stderr.contains("is live with tools from --no-tools (this run asked for no tool flags)"),
         "{stderr}"
     );
     assert_eq!(

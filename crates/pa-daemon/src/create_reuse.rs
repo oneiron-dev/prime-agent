@@ -23,8 +23,11 @@
 //!
 //! A create that carries the session policy (`offline`/`noSkills`, fork
 //! revision 31) reuses a live worker only when it runs under the same
-//! policy; a mismatch is refused, never applied to the running worker. A
-//! create without the keys (a pre-policy client) reuses as before.
+//! policy, and one that carries a tool selection (`tools`/`noTools`/
+//! `noBuiltinTools`; the policy keys imply the default one) only when the
+//! worker's selection resolves to the same tools; a mismatch is refused,
+//! naming what differs, never applied to the running worker. A create
+//! without the keys (a pre-policy client) reuses as before.
 //!
 //! A stale binding (the file's previous worker is gone) keeps the launch
 //! path: `record_session_binding` supersedes the old ids at create success
@@ -41,7 +44,7 @@ use serde_json::{json, Value};
 
 use crate::backpressure::RouteAdmission;
 use crate::registry::ResidentWorker;
-use crate::session_policy::SessionPolicy;
+use crate::session_policy::{SessionLaunch, SessionPolicy};
 use crate::supervisor::{Supervisor, ROUTE_TIMEOUT_MS, WORKER_NOT_CONNECTED};
 
 /// How many settled teardown waits one open re-checks before it answers
@@ -250,10 +253,10 @@ impl Supervisor {
             return Ok(None);
         };
         let path_text = path.to_string_lossy().to_string();
-        // The session policy the open asks for (`None`: a pre-policy
-        // client, which reuses whatever runs).
-        let requested_policy =
-            SessionPolicy::requested(config.as_ref().and_then(Value::as_object))?;
+        // The session policy and tool selection the open asks for (a part
+        // left `None`: a client that did not send it, which reuses
+        // whatever runs).
+        let requested = SessionLaunch::requested(config.as_ref().and_then(Value::as_object))?;
 
         // A settled teardown can hand the file straight to a concurrent
         // opener's successor: each wait re-checks the file's residents
@@ -290,21 +293,19 @@ impl Supervisor {
                 {
                     return Err(anyhow!(rejection));
                 }
-                // A live session keeps the policy it was created under:
-                // an open asking for another one is refused, never applied
-                // to (or silently dropped by) the worker another client
-                // may be driving.
-                if let Some(requested) = requested_policy {
-                    let running = SessionPolicy::durable(
-                        &resident.descriptor.lock().await.create_command.rest,
+                // A live session keeps the policy and the tools it was
+                // created under: an open asking for others is refused,
+                // never applied to (or silently dropped by) the worker
+                // another client may be driving.
+                let differences = launch_differences(
+                    &requested,
+                    &resident.descriptor.lock().await.create_command.rest,
+                );
+                if !differences.is_empty() {
+                    bail!(
+                        "Session \"{path_text}\" is live with {}: a live session keeps its policy and its tools, so rerun with the same flags or stop the session first",
+                        differences.join(" and ")
                     );
-                    if running != requested {
-                        bail!(
-                            "Session \"{path_text}\" is live with {}, but this run asked for {}: a live session keeps its policy, so rerun with the same flags or stop the session first",
-                            running.flags(),
-                            requested.flags()
-                        );
-                    }
                 }
                 match self.reuse_summary_or_holder(resident, &path_text).await? {
                     ReuseAnswer::Summary(summary) => return Ok(Some(summary)),
@@ -470,6 +471,43 @@ async fn client_owned_conflict(
     }
 }
 
+/// What keeps an open from reusing a live worker whose durable create
+/// command is `running`: each part the open asks for that the worker does
+/// not run under, worded for the refusal (`policy ... (this run asked for
+/// ...)`, `tools from ... (this run asked for ...)`). Tool selections
+/// compare by the tools they resolve to (`--tools ipython,ipython` is
+/// `--tools ipython`). Empty: the open may reuse it.
+fn launch_differences(
+    requested: &SessionLaunch,
+    running: &serde_json::Map<String, Value>,
+) -> Vec<String> {
+    use pa_core::session_engine::tool_selection::ToolSelection;
+    let mut differences = Vec::new();
+    if let Some(requested) = requested.policy {
+        let live = SessionPolicy::durable(running);
+        if live != requested {
+            differences.push(format!(
+                "policy {} (this run asked for {})",
+                live.flags(),
+                requested.flags()
+            ));
+        }
+    }
+    if let Some(requested) = &requested.tool_selection {
+        let live = SessionLaunch::carried(running)
+            .tool_selection
+            .unwrap_or_default();
+        if ToolSelection::from_flags(&live) != ToolSelection::from_flags(requested) {
+            differences.push(format!(
+                "tools from {} (this run asked for {})",
+                live.describe(),
+                requested.describe()
+            ));
+        }
+    }
+    differences
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,5 +665,44 @@ mod tests {
         let pid = std::process::id();
         let resident = resident_with_identity(u64::from(pid), None);
         assert!(resident_process_alive(&resident).await);
+    }
+
+    /// An open reuses a live worker only under the parts it asks for: a
+    /// policy compares as given, a tool selection by the tools it resolves
+    /// to, and a part the open does not carry never blocks the reuse.
+    #[test]
+    fn an_open_reuses_only_a_worker_under_the_launch_it_asks_for() {
+        let running =
+            json!({ "cwd": "/w", "offline": true, "noSkills": true, "tools": ["ipython"] });
+        let running = running.as_object().unwrap();
+        let differences = |config: Value| {
+            launch_differences(
+                &SessionLaunch::requested(config.as_object()).unwrap(),
+                running,
+            )
+        };
+        assert_eq!(
+            [
+                differences(json!({ "cwd": "/w" })),
+                differences(json!({ "tools": ["ipython", "ipython"], "noTools": true })),
+                differences(json!({ "offline": true, "noSkills": true, "tools": ["ipython"] })),
+                differences(json!({ "offline": true, "noSkills": false, "tools": ["ipython"] })),
+                differences(json!({ "offline": true, "noSkills": true })),
+                differences(json!({ "offline": false, "noSkills": true, "noTools": true })),
+            ],
+            [
+                Vec::<String>::new(),
+                Vec::new(),
+                Vec::new(),
+                vec!["policy --offline --no-skills (this run asked for --offline)".to_string()],
+                vec![
+                    "tools from --tools \"ipython\" (this run asked for no tool flags)".to_string()
+                ],
+                vec![
+                    "policy --offline --no-skills (this run asked for --no-skills)".to_string(),
+                    "tools from --tools \"ipython\" (this run asked for --no-tools)".to_string(),
+                ],
+            ]
+        );
     }
 }

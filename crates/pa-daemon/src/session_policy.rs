@@ -8,7 +8,8 @@
 //! The supervisor validates the keys, persists them in the worker's durable
 //! create command (so a respawn or a relaunch rebuilds the same session)
 //! and in a per-session record that outlives the worker (so a passivated
-//! session wakes under it), and launches the session's worker with
+//! session wakes under it; [`SessionLaunch`] keeps the session's tool
+//! selection there too), and launches the session's worker with
 //! `PI_OFFLINE=1` (offline) or without any inherited `PI_OFFLINE` (online)
 //! in THAT worker's environment; its own environment and every other
 //! worker stay as they are. A create that reuses a live worker must ask
@@ -24,6 +25,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
+use pa_types::daemon::ToolSelectionFlags;
 use serde_json::{Map, Value};
 
 /// The server capability a client checks before it sends the policy keys.
@@ -33,6 +35,10 @@ pub const SESSION_POLICY_CAPABILITY: &str = "session_policy";
 const OFFLINE_KEY: &str = "offline";
 /// The create-config key of [`SessionPolicy::no_skills`].
 const NO_SKILLS_KEY: &str = "noSkills";
+
+/// The create-config keys of the launch tool selection
+/// (`session_tool_selection`, [`ToolSelectionFlags`]).
+const TOOL_SELECTION_KEYS: [&str; 3] = ["tools", "noTools", "noBuiltinTools"];
 
 /// The offline switch every offline-aware subsystem reads (TS `PI_OFFLINE`).
 pub(crate) const OFFLINE_ENV: &str = "PI_OFFLINE";
@@ -118,17 +124,113 @@ impl SessionPolicy {
         }
     }
 
-    /// Keep this policy for `session_file` beside the worker descriptors in
-    /// `descriptor_dir`: a worker's descriptor dies with the worker (idle
-    /// passivation, a per-session stop), and the session's next worker (a
-    /// wake, a revival, an open that carries no policy) starts under the
-    /// recalled one. The explicit default policy is kept too: an online
-    /// session stays online on a supervisor an `--offline` client started.
+    /// The policy a durable create command carries; `None` for a worker
+    /// created without one (a pre-policy client).
+    #[must_use]
+    pub(crate) fn carried(rest: &Map<String, Value>) -> Option<Self> {
+        Self::requested(Some(rest)).ok().flatten()
+    }
+}
+
+/// What a session's next worker starts under, beyond the worker that runs
+/// it now: the session policy and the launch tool selection
+/// (`session_tool_selection`). Each part is `None` when the create (or the
+/// durable create command) carried none of its keys: a pre-policy or
+/// pre-selection client, a daemon-initiated wake or revival, an RLM
+/// child's first create.
+///
+/// A worker's descriptor dies with the worker (idle passivation, a
+/// per-session stop), so the supervisor keeps both parts in one
+/// per-session record wherever the session file changes (the create, every
+/// identity move), and a create that carries neither part's keys starts
+/// under the recalled one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SessionLaunch {
+    pub(crate) policy: Option<SessionPolicy>,
+    pub(crate) tool_selection: Option<ToolSelectionFlags>,
+}
+
+impl SessionLaunch {
+    /// The launch a create config asks for. A client that sends the policy
+    /// keys (the hosted client, against a daemon that advertises
+    /// [`SESSION_POLICY_CAPABILITY`]) sends its whole launch: its tool
+    /// selection is the one it sent, the defaults when it sent no tool key.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal for a policy or tool key of the wrong type.
+    pub(crate) fn requested(config: Option<&Map<String, Value>>) -> Result<Self> {
+        let policy = SessionPolicy::requested(config)?;
+        let tool_selection = match config.map(tool_selection_in).transpose()?.flatten() {
+            Some(selection) => Some(selection),
+            None => policy.map(|_| ToolSelectionFlags::default()),
+        };
+        Ok(Self {
+            policy,
+            tool_selection,
+        })
+    }
+
+    /// The launch a durable create command carries; a key of the wrong
+    /// type counts as absent (the create validated it).
+    #[must_use]
+    pub(crate) fn carried(rest: &Map<String, Value>) -> Self {
+        Self {
+            policy: SessionPolicy::carried(rest),
+            tool_selection: tool_selection_in(rest).ok().flatten(),
+        }
+    }
+
+    /// Nothing to keep: neither part was given.
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.policy.is_none() && self.tool_selection.is_none()
+    }
+
+    /// Fill each part this launch lacks from `kept` (a recalled record, a
+    /// parent's launch).
+    #[must_use]
+    pub(crate) fn or_from(self, kept: &Self) -> Self {
+        Self {
+            policy: self.policy.or(kept.policy),
+            tool_selection: self.tool_selection.or_else(|| kept.tool_selection.clone()),
+        }
+    }
+
+    /// Write the given parts into a durable create command (or a record):
+    /// the policy's two booleans, and the selection's keys with both
+    /// disable flags spelled out, so a kept default selection reads back as
+    /// given rather than as absent.
+    pub(crate) fn write_into(&self, rest: &mut Map<String, Value>) {
+        if let Some(policy) = self.policy {
+            policy.write_into(rest);
+        }
+        if let Some(selection) = &self.tool_selection {
+            for key in TOOL_SELECTION_KEYS {
+                rest.remove(key);
+            }
+            if let Some(tools) = &selection.tools {
+                rest.insert("tools".to_string(), Value::from(tools.clone()));
+            }
+            rest.insert("noTools".to_string(), Value::Bool(selection.no_tools));
+            rest.insert(
+                "noBuiltinTools".to_string(),
+                Value::Bool(selection.no_builtin_tools),
+            );
+        }
+    }
+
+    /// Keep this launch for `session_file` beside the worker descriptors in
+    /// `descriptor_dir`: the session's next worker (a wake, a revival, an
+    /// open that carries neither part) starts under the recalled one. The
+    /// explicit defaults are kept too: an online session stays online on a
+    /// supervisor an `--offline` client started, and a session reopened
+    /// with every tool keeps them.
     ///
     /// # Errors
     ///
     /// Returns the write failure.
-    pub(crate) fn remember(self, descriptor_dir: &Path, session_file: &str) -> Result<()> {
+    pub(crate) fn remember(&self, descriptor_dir: &Path, session_file: &str) -> Result<()> {
         let path = record_path(descriptor_dir, session_file);
         let mut record = Map::from_iter([("sessionFile".to_string(), Value::from(session_file))]);
         self.write_into(&mut record);
@@ -138,13 +240,15 @@ impl SessionPolicy {
         crate::descriptor::write_file_atomic(&path, &Value::Object(record).to_string())
     }
 
-    /// The policy [`SessionPolicy::remember`] kept for `session_file`;
-    /// `Ok(None)` when it kept none.
+    /// The launch [`SessionLaunch::remember`] kept for `session_file`;
+    /// `Ok(None)` when it kept none. A kept record answers for both parts:
+    /// one without selection keys (written before the record carried them)
+    /// reads as the default selection.
     ///
     /// # Errors
     ///
     /// Returns the failure for a record that exists but cannot be read
-    /// (the session's next worker must not start without its policy).
+    /// (the session's next worker must not start without its launch).
     pub(crate) fn recalled(descriptor_dir: &Path, session_file: &str) -> Result<Option<Self>> {
         let path = record_path(descriptor_dir, session_file);
         let text = match std::fs::read_to_string(&path) {
@@ -162,18 +266,36 @@ impl SessionPolicy {
             )
         };
         let record: Value = serde_json::from_str(&text).map_err(|_| unreadable())?;
-        Self::requested(record.as_object())
-            .map_err(|_| unreadable())?
-            .map(Some)
-            .ok_or_else(unreadable)
+        let record = record.as_object().ok_or_else(unreadable)?;
+        let policy = SessionPolicy::requested(Some(record)).map_err(|_| unreadable())?;
+        let tool_selection = tool_selection_in(record).map_err(|_| unreadable())?;
+        if policy.is_none() && tool_selection.is_none() {
+            return Err(unreadable());
+        }
+        Ok(Some(Self {
+            policy,
+            tool_selection: Some(tool_selection.unwrap_or_default()),
+        }))
     }
+}
 
-    /// The policy a durable create command carries; `None` for a worker
-    /// created without one (a pre-policy client).
-    #[must_use]
-    pub(crate) fn carried(rest: &Map<String, Value>) -> Option<Self> {
-        Self::requested(Some(rest)).ok().flatten()
+/// The tool selection a create config (or a durable create command)
+/// carries; `Ok(None)` when it has none of the three keys.
+fn tool_selection_in(config: &Map<String, Value>) -> Result<Option<ToolSelectionFlags>> {
+    let keys: Map<String, Value> = TOOL_SELECTION_KEYS
+        .iter()
+        .filter_map(|key| {
+            config
+                .get(*key)
+                .map(|value| ((*key).to_string(), value.clone()))
+        })
+        .collect();
+    if keys.is_empty() {
+        return Ok(None);
     }
+    ToolSelectionFlags::from_create_config(&Value::Object(keys))
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("Invalid create config: {error}"))
 }
 
 /// The directory beside the worker descriptors that keeps session policies.
@@ -277,28 +399,161 @@ mod tests {
             sessions.join("..").join("sessions").join("s.jsonl"),
         );
         let spelled = spelled.to_str().unwrap();
-        let factory = SessionPolicy {
-            offline: true,
-            no_skills: true,
+        let factory = SessionLaunch {
+            policy: Some(SessionPolicy {
+                offline: true,
+                no_skills: true,
+            }),
+            tool_selection: Some(ToolSelectionFlags {
+                tools: Some(Vec::new()),
+                no_tools: true,
+                no_builtin_tools: false,
+            }),
         };
-        assert_eq!(SessionPolicy::recalled(&descriptors, &file).unwrap(), None);
+        assert_eq!(SessionLaunch::recalled(&descriptors, &file).unwrap(), None);
         factory.remember(&descriptors, &file).unwrap();
         assert_eq!(
-            SessionPolicy::recalled(&descriptors, spelled).unwrap(),
+            SessionLaunch::recalled(&descriptors, spelled).unwrap(),
             Some(factory)
         );
-        SessionPolicy::default()
-            .remember(&descriptors, spelled)
-            .unwrap();
+        let defaults = SessionLaunch {
+            policy: Some(SessionPolicy::default()),
+            tool_selection: Some(ToolSelectionFlags::default()),
+        };
+        defaults.remember(&descriptors, spelled).unwrap();
         assert_eq!(
-            SessionPolicy::recalled(&descriptors, &file).unwrap(),
-            Some(SessionPolicy::default())
+            SessionLaunch::recalled(&descriptors, &file).unwrap(),
+            Some(defaults)
         );
         std::fs::write(record_path(&descriptors, &file), "{\"sessionFile\": \"x\"}").unwrap();
-        let error = SessionPolicy::recalled(&descriptors, &file)
+        let error = SessionLaunch::recalled(&descriptors, &file)
             .unwrap_err()
             .to_string();
         assert!(error.ends_with("is not a policy"), "{error}");
+    }
+
+    /// A record written before it carried the tool selection (a policy
+    /// alone) reads as the default selection, never as "no record": the
+    /// session's next worker starts with every tool, as it was created.
+    #[test]
+    fn a_record_without_selection_keys_reads_as_the_default_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptors = dir.path().join("daemon-workers").join("key");
+        let file = dir.path().join("s.jsonl").to_str().unwrap().to_string();
+        let path = record_path(&descriptors, &file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            json!({ "sessionFile": file, "offline": true, "noSkills": false }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            SessionLaunch::recalled(&descriptors, &file).unwrap(),
+            Some(SessionLaunch {
+                policy: Some(SessionPolicy {
+                    offline: true,
+                    no_skills: false,
+                }),
+                tool_selection: Some(ToolSelectionFlags::default()),
+            })
+        );
+    }
+
+    /// The policy keys make a create's launch whole (the hosted client's
+    /// default selection sends no tool key); tool keys alone are a
+    /// selection without a policy; neither is an empty launch the record
+    /// fills.
+    #[test]
+    fn a_create_asks_for_each_part_it_carries() {
+        let launch = |config: Value| SessionLaunch::requested(config.as_object()).unwrap();
+        assert_eq!(
+            [
+                launch(json!({ "cwd": "/w" })),
+                launch(json!({ "cwd": "/w", "offline": true, "noSkills": true })),
+                launch(json!({ "cwd": "/w", "noTools": true })),
+                launch(json!({ "cwd": "/w", "noSkills": true, "tools": ["ipython"] })),
+            ],
+            [
+                SessionLaunch::default(),
+                SessionLaunch {
+                    policy: Some(SessionPolicy {
+                        offline: true,
+                        no_skills: true,
+                    }),
+                    tool_selection: Some(ToolSelectionFlags::default()),
+                },
+                SessionLaunch {
+                    policy: None,
+                    tool_selection: Some(ToolSelectionFlags {
+                        no_tools: true,
+                        ..ToolSelectionFlags::default()
+                    }),
+                },
+                SessionLaunch {
+                    policy: Some(SessionPolicy {
+                        offline: false,
+                        no_skills: true,
+                    }),
+                    tool_selection: Some(ToolSelectionFlags {
+                        tools: Some(vec!["ipython".to_string()]),
+                        ..ToolSelectionFlags::default()
+                    }),
+                },
+            ]
+        );
+        let error = SessionLaunch::requested(json!({ "noTools": "yes" }).as_object())
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("Invalid create config: "), "{error}");
+    }
+
+    /// A launch written into a durable create command reads back whole,
+    /// the explicit default selection included; a missing part is filled
+    /// from the kept one and a given part never is.
+    #[test]
+    fn a_durable_launch_reads_back_and_fills_only_its_missing_parts() {
+        let no_tools = ToolSelectionFlags {
+            no_tools: true,
+            ..ToolSelectionFlags::default()
+        };
+        for launch in [
+            SessionLaunch {
+                policy: None,
+                tool_selection: Some(no_tools.clone()),
+            },
+            SessionLaunch {
+                policy: Some(SessionPolicy::default()),
+                tool_selection: Some(ToolSelectionFlags::default()),
+            },
+        ] {
+            let mut rest = Map::from_iter([("noTools".to_string(), json!("stale"))]);
+            launch.write_into(&mut rest);
+            assert_eq!(SessionLaunch::carried(&rest), launch);
+        }
+        let kept = SessionLaunch {
+            policy: Some(SessionPolicy {
+                offline: true,
+                no_skills: true,
+            }),
+            tool_selection: Some(no_tools),
+        };
+        assert_eq!(
+            [
+                SessionLaunch::default().or_from(&kept),
+                SessionLaunch {
+                    policy: None,
+                    tool_selection: Some(ToolSelectionFlags::default()),
+                }
+                .or_from(&kept),
+            ],
+            [
+                kept.clone(),
+                SessionLaunch {
+                    policy: kept.policy,
+                    tool_selection: Some(ToolSelectionFlags::default()),
+                },
+            ]
+        );
     }
 
     #[test]

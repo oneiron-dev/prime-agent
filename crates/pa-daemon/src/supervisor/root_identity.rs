@@ -117,7 +117,8 @@ impl Supervisor {
 
     /// Keep the session policy record for the file the worker serves NOW
     /// (fork revision 31): the record outlives the worker, so a wake or a
-    /// revival of that session starts under the worker's policy. A failed
+    /// revival of that session starts under the worker's policy and tool
+    /// selection. A failed
     /// write marks the resident policy-repair-pending; every later roster
     /// write retries it, and the stop tries once more
     /// ([`Self::settle_session_policy_at_stop`]). Never fails the caller.
@@ -144,28 +145,32 @@ impl Supervisor {
         let descriptor = resident.descriptor.lock().await;
         if let Err(error) = self.write_session_policy(resident, &descriptor) {
             self.log_line(&format!(
-                "session worker {}: {error:#}; the stop goes on without it. SESSION POLICY LOST: the session's next worker (a wake, a revival) starts under the record an earlier write kept, or without its --offline/--no-skills",
+                "session worker {}: {error:#}; the stop goes on without it. SESSION POLICY LOST: the session's next worker (a wake, a revival) starts under the record an earlier write kept, or without its --offline/--no-skills and tool flags",
                 resident.worker_id
             ));
         }
     }
 
-    /// Write the policy record for the worker's current session file and
-    /// set the resident's repair marker from the outcome (nothing to keep
-    /// - a pre-policy worker, an in-memory session - clears it).
+    /// Write the policy record (the session policy and the launch tool
+    /// selection) for the worker's current session file and set the
+    /// resident's repair marker from the outcome (nothing to keep - a
+    /// worker created with neither, an in-memory session - clears it).
     fn write_session_policy(
         &self,
         resident: &ResidentWorker,
         descriptor: &DaemonWorkerDescriptor,
     ) -> anyhow::Result<()> {
         let carried =
-            crate::session_policy::SessionPolicy::carried(&descriptor.create_command.rest);
-        let (Some(policy), Some(session_file)) = (carried, descriptor.session_file.as_deref())
+            crate::session_policy::SessionLaunch::carried(&descriptor.create_command.rest);
+        let Some(session_file) = descriptor
+            .session_file
+            .as_deref()
+            .filter(|_| !carried.is_empty())
         else {
             resident.clear_policy_repair_pending();
             return Ok(());
         };
-        match policy.remember(&self.descriptor_dir, session_file) {
+        match carried.remember(&self.descriptor_dir, session_file) {
             Ok(()) => {
                 resident.clear_policy_repair_pending();
                 Ok(())
@@ -673,10 +678,11 @@ mod tests {
     /// The policy record follows an identity move (fork revision 31): a
     /// moved-to write the policy store refuses stays pending, and the next
     /// roster write - even a NO-CHANGE row - repairs it, so a wake of the
-    /// moved-to session starts under the worker's policy.
+    /// moved-to session starts under the worker's policy and tool
+    /// selection.
     #[tokio::test]
     async fn a_failed_policy_write_after_a_move_is_repaired_by_the_next_roster_write() {
-        use crate::session_policy::SessionPolicy;
+        use crate::session_policy::{SessionLaunch, SessionPolicy};
         let dir = std::env::temp_dir().join(format!("pa-root-id-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let supervisor = supervisor_with_movable_worker(&dir).await;
@@ -685,7 +691,14 @@ mod tests {
             offline: true,
             no_skills: true,
         };
-        seat.write_into(&mut resident.descriptor.lock().await.create_command.rest);
+        let launch = SessionLaunch {
+            policy: Some(seat),
+            tool_selection: Some(pa_types::daemon::ToolSelectionFlags {
+                no_tools: true,
+                ..Default::default()
+            }),
+        };
+        launch.write_into(&mut resident.descriptor.lock().await.create_command.rest);
         let moved_to = dir.join("a.jsonl").to_string_lossy().to_string();
 
         // The policy store refuses writes: its directory is a file.
@@ -700,18 +713,18 @@ mod tests {
             (expect_state(&dir, "sA", "a.jsonl"), true),
             "the identity moved; the refused policy write stays pending"
         );
-        assert!(SessionPolicy::recalled(&supervisor.descriptor_dir, &moved_to).is_err());
+        assert!(SessionLaunch::recalled(&supervisor.descriptor_dir, &moved_to).is_err());
 
         // The store accepts writes again: the same row repairs the record.
         std::fs::remove_file(&store).unwrap();
         drive_delta(&supervisor, swap_summary(&dir, "sA", "a.jsonl"), 2).await;
         assert_eq!(
             (
-                SessionPolicy::recalled(&supervisor.descriptor_dir, &moved_to).unwrap(),
+                SessionLaunch::recalled(&supervisor.descriptor_dir, &moved_to).unwrap(),
                 resident.policy_repair_pending(),
             ),
-            (Some(seat), false),
-            "the next roster write kept the moved-to session's policy"
+            (Some(launch), false),
+            "the next roster write kept the moved-to session's policy and tool selection"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

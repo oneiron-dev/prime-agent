@@ -28,9 +28,11 @@
 //! the create config as `offline`/`noSkills` when the daemon advertises
 //! `session_policy`, and every open then goes through the supervisor's
 //! create (a live worker for the same file is reused there, but only when
-//! it runs under the same policy). A daemon without the capability gets
-//! neither key and the list-and-attach reuse; asking it for either flag
-//! fails instead of running the session without it.
+//! it runs under the same policy and its tool selection resolves the same;
+//! the refusal names which differs). A daemon without the capability gets
+//! neither key and the list-and-attach reuse (which compares the live
+//! row's published `toolSelection`); asking it for either flag fails
+//! instead of running the session without it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -209,7 +211,8 @@ impl HostedHeadlessSession {
         }
         // With the policy capability every open is a create: the
         // supervisor reuses a live worker for the same file only when its
-        // policy matches. Without it, the live row is attached directly.
+        // policy matches and its tool selection resolves the same. Without
+        // it, the live row is attached directly (the tool check below).
         let live = match &options.session_path {
             Some(path) if !policy_supported => self.live_session_for_file(path).await?,
             Some(_) | None => None,

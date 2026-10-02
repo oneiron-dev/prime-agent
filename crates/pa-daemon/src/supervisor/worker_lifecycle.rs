@@ -16,7 +16,7 @@ use super::{
 };
 use crate::lease::is_process_alive;
 use crate::protocol::{response_failure, response_success, DaemonResponse};
-use crate::session_policy::SessionPolicy;
+use crate::session_policy::SessionLaunch;
 
 impl Supervisor {
     /// Complete a tombstoned stop for a worker encountered at adoption —
@@ -193,22 +193,36 @@ impl Supervisor {
         // parent session's (the TS child runtime inherits the parent's
         // session config): an offline seat's sessions and subagents stay
         // offline and skill-free. `None`: no policy at all (the old
-        // behavior).
-        let mut session_policy = SessionPolicy::requested(config_object)?;
-        if let (None, Some(file)) = (session_policy, session_path.as_deref()) {
-            session_policy = SessionPolicy::recalled(&self.descriptor_dir, file)?;
-        }
+        // behavior). The launch tool selection follows the same rules
+        // (a create without the tool keys or the policy keys runs under
+        // the kept selection, a child under its parent's), so a
+        // passivated `--no-tools` session wakes without tools.
+        let mut launch = SessionLaunch::requested(config_object)?;
         let parent_file = config_object
             .and_then(|config| config.get("parentSessionPath"))
             .and_then(Value::as_str);
-        if let (None, Some(parent_file)) = (session_policy, parent_file) {
-            session_policy = match self.registry.find_by_session_file(parent_file).await {
-                Some(parent) => {
-                    SessionPolicy::carried(&parent.descriptor.lock().await.create_command.rest)
+        if launch.policy.is_none() || launch.tool_selection.is_none() {
+            if let Some(file) = session_path.as_deref() {
+                if let Some(kept) = SessionLaunch::recalled(&self.descriptor_dir, file)? {
+                    launch = launch.or_from(&kept);
                 }
-                None => SessionPolicy::recalled(&self.descriptor_dir, parent_file)?,
-            };
+            }
         }
+        if let (true, Some(parent_file)) = (
+            launch.policy.is_none() || launch.tool_selection.is_none(),
+            parent_file,
+        ) {
+            let parents = match self.registry.find_by_session_file(parent_file).await {
+                Some(parent) => Some(SessionLaunch::carried(
+                    &parent.descriptor.lock().await.create_command.rest,
+                )),
+                None => SessionLaunch::recalled(&self.descriptor_dir, parent_file)?,
+            };
+            if let Some(parents) = parents {
+                launch = launch.or_from(&parents);
+            }
+        }
+        let session_policy = launch.policy;
         if *no_session == Some(true) && session_path.is_some() {
             return Err(anyhow!(
                 "Session cannot be both no-session and session-pathed"
@@ -271,11 +285,6 @@ impl Supervisor {
             "skills",
             "promptTemplates",
             "autonomous",
-            // The launch tool selection: a respawned worker must rebuild
-            // the session with the same tools, never the defaults.
-            "tools",
-            "noTools",
-            "noBuiltinTools",
         ] {
             if let Some(value) = config_object.and_then(|config| config.get(key)) {
                 durable_rest.insert(key.to_string(), value.clone());
@@ -284,9 +293,10 @@ impl Supervisor {
         // The policy rides the durable create command (both keys, validated
         // booleans) so a respawned or relaunched worker starts under it:
         // the launch env reads `offline`, the worker's create `noSkills`.
-        if let Some(policy) = session_policy {
-            policy.write_into(&mut durable_rest);
-        }
+        // The launch tool selection rides it the same way (validated, as
+        // given or as kept): a respawned worker rebuilds the session with
+        // the same tools, never the defaults.
+        launch.write_into(&mut durable_rest);
         // A child's RLM identity rides the durable create command too, so a
         // respawned or adopted child stays identifiable for ledger appends.
         if let Some(metadata) = &runtime_metadata {
@@ -508,12 +518,13 @@ impl Supervisor {
                 descriptor.root_session_id.as_deref(),
                 descriptor.session_file.as_deref(),
             );
-            // The policy outlives this worker: the descriptor goes with it
-            // (idle passivation, a per-session stop), and the session's
-            // next worker recalls the policy from this record.
+            // The policy and the tool selection outlive this worker: the
+            // descriptor goes with it (idle passivation, a per-session
+            // stop), and the session's next worker recalls them from this
+            // record.
             persist_worker(&descriptor_path, &descriptor).and_then(|()| {
-                match (session_policy, descriptor.session_file.as_deref()) {
-                    (Some(policy), Some(session_file)) => policy
+                match descriptor.session_file.as_deref() {
+                    Some(session_file) if !launch.is_empty() => launch
                         .remember(&self.descriptor_dir, session_file)
                         .context("keep the session policy"),
                     _ => Ok(()),
