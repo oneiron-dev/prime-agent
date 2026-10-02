@@ -170,12 +170,17 @@ fn read_tail(path: &Path) -> Result<Option<String>> {
     Ok(Some(contents))
 }
 
+/// The start of the Rust runtime's hint after a panic message (the line
+/// that tells how to set `RUST_BACKTRACE`): never the diagnostic itself.
+const RUST_BACKTRACE_HINT: &str = "note: run with `RUST_BACKTRACE=";
+
 /// The last non-empty line of the worker's stderr tail: what a worker that
 /// dies during startup printed last (the product worker exits on one
 /// `Error: bind worker socket …: <cause>` line), the line its startup
-/// failure names. The Rust runtime's `note: run with RUST_BACKTRACE…` hint
-/// is skipped, so a panic names its message instead. `Ok(None)` for a
-/// missing or silent log.
+/// failure names. Only the runtime's backtrace hint
+/// ([`RUST_BACKTRACE_HINT`]) is skipped, so a panic names its message
+/// instead; any other `note:` line counts. `Ok(None)` for a missing or
+/// silent log.
 ///
 /// # Errors
 ///
@@ -185,7 +190,7 @@ pub(crate) fn last_line(log_path: &Path) -> Result<Option<String>> {
         tail.lines()
             .rev()
             .map(str::trim)
-            .find(|line| !line.is_empty() && !line.starts_with("note: "))
+            .find(|line| !line.is_empty() && !line.starts_with(RUST_BACKTRACE_HINT))
             .map(str::to_string)
     }))
 }
@@ -340,13 +345,20 @@ mod tests {
             "thread 'main' panicked at src/worker.rs:9:5:\nboom\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
         );
         let silent = write_log(dir.path(), "worker-d.stderr.log", "\n\n");
+        // Any other `note:` line is the worker's own word and counts.
+        let own_note = write_log(
+            dir.path(),
+            "worker-e.stderr.log",
+            "Error: bind failed\nnote: the socket dir sits under a file\n",
+        );
         assert_eq!(
             [
                 &exit_error,
                 &with_causes,
                 &panic,
                 &silent,
-                &dir.path().join("absent.stderr.log")
+                &dir.path().join("absent.stderr.log"),
+                &own_note,
             ]
             .map(|path| last_line(path).expect("read")),
             [
@@ -358,6 +370,7 @@ mod tests {
                 Some("boom".to_string()),
                 None,
                 None,
+                Some("note: the socket dir sits under a file".to_string()),
             ]
         );
     }
