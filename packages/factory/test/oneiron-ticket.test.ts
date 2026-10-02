@@ -1,5 +1,6 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, inject, it, vi } from "vitest";
@@ -167,7 +168,64 @@ function setup() {
 	});
 	return { root, env, git, repo, work, launcher, ticket };
 }
-afterEach(() => {
+/** The built Rust binary the custody verifier runs (e.g. `target/debug/prime-agent`); unset skips it. */
+const BUILT_AGENT = process.env.PRIME_AGENT_TEST_BINARY;
+/** Sandbox daemon sockets the built-binary verifier may have started; each test's daemon stops before its root goes. */
+const daemonSockets: string[] = [];
+const envelope = (id: string, command: object) =>
+	`${JSON.stringify({ type: "command", id, protocol: { name: "prime-agent.daemon", version: 7 }, command })}\n`;
+
+/** One command over a sandbox daemon's socket: the daemon's hello and the command's response. */
+function daemonRequest(
+	socket: string,
+	command: object,
+): Promise<{ hello: Record<string, unknown>; response: { success: boolean; data: Record<string, unknown> } }> {
+	return new Promise((resolve, reject) => {
+		const client = createConnection(socket);
+		let buffer = "";
+		let hello: Record<string, unknown> | undefined;
+		client.on("error", reject);
+		client.on("close", () => reject(new Error(`the daemon closed before answering ${JSON.stringify(command)}`)));
+		client.on("data", (chunk) => {
+			buffer += chunk.toString();
+			for (let newline = buffer.indexOf("\n"); newline >= 0; newline = buffer.indexOf("\n")) {
+				const frame = JSON.parse(buffer.slice(0, newline));
+				buffer = buffer.slice(newline + 1);
+				if (!hello) {
+					hello = frame;
+					client.write(envelope("verify-1", command));
+				} else if (frame.type === "response" && frame.id === "verify-1") {
+					client.end();
+					resolve({ hello, response: frame });
+				}
+			}
+		});
+	});
+}
+
+/** Force-stop a sandbox daemon over its own socket, then wait for its supervisor process to exit. */
+async function stopSandboxDaemon(socket: string): Promise<void> {
+	if (!existsSync(socket)) return;
+	const pid = await new Promise<number | undefined>((resolve) => {
+		const client = createConnection(socket);
+		let buffer = "";
+		let pid: number | undefined;
+		client.on("error", () => resolve(pid));
+		// The supervisor closes the connection once its stop pass starts.
+		client.on("close", () => resolve(pid));
+		client.on("data", (chunk) => {
+			buffer += chunk.toString();
+			if (pid === undefined && buffer.includes("\n")) {
+				pid = Number(JSON.parse(buffer.slice(0, buffer.indexOf("\n"))).supervisorPid);
+				client.write(envelope("stop", { type: "shutdown", force: true }));
+			}
+		});
+	});
+	if (pid !== undefined) spawnSync("tail", [`--pid=${pid}`, "-f", "/dev/null"], { timeout: 60_000 });
+}
+
+afterEach(async () => {
+	for (const socket of daemonSockets.splice(0)) await stopSandboxDaemon(socket);
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -524,6 +582,119 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 			expect(calls[0]!.includes("--daemon-hosted")).toBe(hosting === "daemon");
 		},
 	);
+
+	/**
+	 * The matrix's custody contract against the BUILT Rust binary (`PRIME_AGENT_TEST_BINARY`): real seat processes run
+	 * the factory's exact argv (`--offline` and `--no-skills` included), owned seats run the faux provider in-process,
+	 * daemon seats a sandbox daemon whose workers run it. A wrapper pins the sandbox (HOME, TMPDIR, the daemon socket
+	 * and its worker sockets) with nothing else inherited, logs each call's argv and hands call N its own script.
+	 * Linux only: the teardown waits for the sandbox daemon's exit through `tail --pid`.
+	 */
+	// test-policy: allow conditional-or-disabled-test -- runs only with a built Rust binary (PRIME_AGENT_TEST_BINARY) on Linux; the package suite builds no Rust
+	describe.skipIf(!BUILT_AGENT || process.platform !== "linux")("against the built prime-agent binary", () => {
+		function builtAgent(f: ReturnType<typeof setup>, scripts: object[]) {
+			const sandbox = join(f.root, "pa");
+			for (const dir of ["home", "tmp", "s"]) mkdirSync(join(sandbox, dir), { recursive: true });
+			scripts.forEach((script, index) => {
+				writeFileSync(join(sandbox, `faux-${index + 1}.json`), JSON.stringify(script));
+				writeFileSync(join(sandbox, `daemon-${index + 1}.json`), JSON.stringify({ engine: "faux", ...script }));
+			});
+			const socket = join(sandbox, "d.sock");
+			const wrapper = join(sandbox, "prime-agent");
+			writeFileSync(
+				wrapper,
+				`#!/bin/sh
+dir=${JSON.stringify(sandbox)}
+n=$(( $(cat "$dir/count" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$dir/count"
+[ -f "$dir/faux-$n.json" ] || n=${scripts.length}
+printf '%s\\n' "$*" >> "$dir/calls.log"
+exec env -i PATH=/usr/bin:/bin HOME="$dir/home" TMPDIR="$dir/tmp" PRIME_AGENT_DAEMON_SOCKET=${JSON.stringify(socket)} \\
+  PRIME_AGENT_SOCKET_DIR="$dir/s" PRIME_AGENT_FAUX_SCRIPT="$(cat "$dir/faux-$n.json")" \\
+  PRIME_AGENT_HOSTED_DAEMON_SCRIPT="$dir/daemon-$n.json" ${JSON.stringify(BUILT_AGENT)} "$@"
+`,
+				{ mode: 0o755 },
+			);
+			daemonSockets.push(socket);
+			const calls = () => readFileSync(join(sandbox, "calls.log"), "utf8").trim().split("\n");
+			return { wrapper, socket, calls };
+		}
+		function runner(f: ReturnType<typeof setup>, hosting: "owned" | "daemon", wrapper: string) {
+			const ticket = f.ticket("custody-one");
+			ticket.launcher = {
+				...f.launcher,
+				seatHosting: hosting,
+				// Silence ends a held turn quickly; a streaming seat is never cut.
+				idleMs: 3_000,
+				seats: { writer: { provider: "faux", model: "faux-1", thinking: "low" } },
+			};
+			const r = new OneironTicketRunner(ticket, {
+				env: f.env,
+				routing: {},
+				agentArgv: [wrapper],
+				sleep: async () => undefined,
+			});
+			mkdirSync(r.worktree, { recursive: true });
+			return r;
+		}
+		const held = { responses: [{ text: "held", holdUntilAborted: true }] };
+		const seatFlags = ["--offline", "--no-skills"];
+
+		it("daemon custody: an unfinished writer continues its resident session with -c", async () => {
+			const f = setup();
+			const agent = builtAgent(f, [{ responses: ["Working on it.", "DONE custody-one"] }]);
+			const writer = runner(f, "daemon", agent.wrapper);
+			expect((await writer.writerRounds("write", "start", "continue")).final).toBe("DONE custody-one");
+			const calls = agent.calls().map((argv) => argv.split(" "));
+			expect(calls.map((argv) => [argv.includes("--daemon-hosted"), argv.includes("-c")])).toEqual([
+				[true, false],
+				[true, true],
+			]);
+			for (const argv of calls) expect(seatFlags.filter((flag) => argv.includes(flag))).toEqual(seatFlags);
+			// One resident session, idle, carrying both rounds.
+			const rows = (await daemonRequest(agent.socket, { type: "list" })).response.data.sessions as Record<
+				string,
+				unknown
+			>[];
+			expect(rows.map((row) => [row.workerState, row.isStreaming])).toEqual([["ready", false]]);
+			const users = readFileSync(String(rows[0]!.sessionFile), "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line))
+				.filter((entry) => entry.type === "message" && entry.message?.role === "user");
+			expect(users).toHaveLength(2);
+		});
+
+		it("daemon custody: a writer killed for silence mid-turn stops the ticket, and the turn runs on", async () => {
+			const f = setup();
+			const agent = builtAgent(f, [held]);
+			const writer = runner(f, "daemon", agent.wrapper);
+			await expect(writer.writerRounds("write", "start", "continue")).rejects.toThrow(
+				"before its daemon-hosted turn was seen to end; that turn may still be",
+			);
+			expect(agent.calls()).toHaveLength(1);
+			const rows = (await daemonRequest(agent.socket, { type: "list" })).response.data.sessions as Record<
+				string,
+				unknown
+			>[];
+			expect(rows.map((row) => [row.workerState, row.isStreaming])).toEqual([["ready", true]]);
+		});
+
+		it("owned custody: a writer killed for silence mid-turn continues the same session", async () => {
+			const f = setup();
+			const agent = builtAgent(f, [held, { responses: ["DONE custody-one"] }]);
+			const writer = runner(f, "owned", agent.wrapper);
+			expect((await writer.writerRounds("write", "start", "continue")).final).toBe("DONE custody-one");
+			const calls = agent.calls().map((argv) => argv.split(" "));
+			expect(calls.map((argv) => [argv.includes("--daemon-hosted"), argv.includes("-c")])).toEqual([
+				[false, false],
+				[false, true],
+			]);
+			const sessions = join(writer.directory, "sessions", "write");
+			expect(readdirSync(sessions).filter((name) => name.endsWith(".jsonl"))).toHaveLength(1);
+			expect(existsSync(agent.socket)).toBe(false);
+		});
+	});
 
 	it("continues a writer's existing session on round 1 and delivers the owner's note once", async () => {
 		const f = setup();

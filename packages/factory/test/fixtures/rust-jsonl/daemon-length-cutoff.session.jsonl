@@ -1,0 +1,6 @@
+{"type":"session","version":3,"id":"01a0fd0c-1841-73f3-aced-7c94c6267399","timestamp":"2026-10-02T14:37:03.425Z","cwd":"/home/lexi/.cache/pa-sb/fcap-zannxm_b/w","rlmDepth":0}
+{"type":"thinking_level_change","id":"1aaa4231","parentId":null,"timestamp":"2026-10-02T14:37:03.432Z","thinkingLevel":"off"}
+{"type":"service_tier_change","id":"b3930ca7","parentId":"1aaa4231","timestamp":"2026-10-02T14:37:03.433Z","serviceTier":"default"}
+{"type":"session_state","id":"d784b551","parentId":"b3930ca7","timestamp":"2026-10-02T14:37:03.433Z","state":{"status":"active"}}
+{"type":"message","id":"e8f8f691","parentId":"d784b551","timestamp":"2026-10-02T14:37:03.469Z","message":{"role":"user","content":[{"type":"text","text":"Review this diff for ticket capture-one."}],"timestamp":1790951823469}}
+{"type":"message","id":"91dec372","parentId":"e8f8f691","timestamp":"2026-10-02T14:37:03.479Z","message":{"role":"assistant","content":[{"type":"text","text":"DONE capture-one"}],"api":"faux","provider":"faux","model":"faux-1","diagnostics":[],"usage":{"input":6843,"output":4,"cacheRead":0,"cacheWrite":6843,"totalTokens":13690,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"length","timestamp":1790951823477}}

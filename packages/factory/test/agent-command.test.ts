@@ -156,7 +156,7 @@ function fakeAgent(root: string, name = "prime-agent-rs"): { binary: string; rec
 	const binary = join(root, name);
 	const record = join(root, `${name}.record.json`);
 	const recorder = join(root, "recorder.cjs");
-	const capture = fileURLToPath(new URL("./fixtures/rust-jsonl/writer-done.stdout.jsonl", import.meta.url));
+	const capture = fileURLToPath(new URL("./fixtures/rust-jsonl/owned-writer-done.stdout.jsonl", import.meta.url));
 	writeFileSync(
 		recorder,
 		`const fs = require("node:fs");

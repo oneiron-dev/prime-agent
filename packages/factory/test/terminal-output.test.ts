@@ -12,73 +12,96 @@ import {
 } from "../src/adapters/terminal-output.js";
 
 /**
- * Streams and session files captured from the Rust prime-agent (`scripts/capture-rust-jsonl.py`, faux provider,
- * `-p --mode json`). They carry the `all` profile; `factoryCompleted` derives what `--json-event-profile
- * factory-completed` emits: the same stream without the two progressive snapshot events.
+ * Streams and session files captured from the Rust prime-agent (`scripts/capture-rust-jsonl.py`): the factory's exact
+ * native seat argv (`-p --mode json --json-event-profile factory-completed ... --offline ... --no-skills`, the prompt on
+ * stdin) under the faux provider, once per custody: an owned seat runs the session itself, a daemon seat
+ * (`--daemon-hosted`) streams a session the sandbox daemon holds. The parser reads them as captured.
  */
 const fixture = (name: string) => readFileSync(new URL(`./fixtures/rust-jsonl/${name}`, import.meta.url), "utf8");
 const lines = (jsonl: string) => jsonl.split("\n").filter((line) => line.trim());
-function factoryCompleted(jsonl: string): string {
-	return lines(jsonl)
-		.filter((line) => !["message_update", "tool_execution_update"].includes(JSON.parse(line).type))
-		.join("\n");
-}
-const captured = {
-	done: fixture("writer-done.stdout.jsonl"),
-	review: fixture("review-tool-then-verdict.stdout.jsonl"),
-	error: fixture("provider-error.stdout.jsonl"),
-	length: fixture("length-cutoff.stdout.jsonl"),
-};
+const CUSTODIES = ["owned", "daemon"] as const;
+type Custody = (typeof CUSTODIES)[number];
+const captured = (custody: Custody) => ({
+	done: fixture(`${custody}-writer-done.stdout.jsonl`),
+	review: fixture(`${custody}-review-tool-then-verdict.stdout.jsonl`),
+	error: fixture(`${custody}-provider-error.stdout.jsonl`),
+	length: fixture(`${custody}-length-cutoff.stdout.jsonl`),
+});
+const types = (jsonl: string) => lines(jsonl).map((line) => JSON.parse(line).type as string);
 
-describe("Rust JSON streams through the factory's terminal parsing", () => {
-	it.each([
-		["the all profile", (jsonl: string) => jsonl],
-		["the factory-completed profile", factoryCompleted],
-	])("reads exact terminals from %s", (_profile, project) => {
-		const done = finalAssistantText(project(captured.done));
+describe.each(CUSTODIES)("Rust factory-completed streams from a %s seat", (custody) => {
+	const streams = captured(custody);
+
+	it("carry the profile marker, no progressive snapshots and every completed event", () => {
+		for (const stream of Object.values(streams)) {
+			const [header] = lines(stream);
+			expect(JSON.parse(header!)).toMatchObject({ type: "session", jsonEventProfile: "factory-completed" });
+			expect(types(stream).filter((type) => type === "message_update" || type === "tool_execution_update")).toEqual(
+				[],
+			);
+		}
+		// The tool turn keeps its completed events, in order, through the verdict's turn.
+		const review = types(streams.review).filter((type) => type !== "message_start");
+		expect(review.slice(review.indexOf("tool_execution_start"))).toEqual([
+			"tool_execution_start",
+			"tool_execution_end",
+			"message_end",
+			"turn_end",
+			"turn_start",
+			"message_end",
+			"turn_end",
+			"agent_end",
+		]);
+	});
+
+	it("reads exact terminals", () => {
+		const done = finalAssistantText(streams.done);
 		expect([done, writerTerminal(done, "capture-one"), writerTerminal(done, "capture-two")]).toEqual([
 			"Implemented the change.\nPR BODY:\nAdded the function.\nDONE capture-one",
 			{ kind: "done", line: "DONE capture-one" },
 			undefined,
 		]);
 		// Thinking and the tool-call turn are not the reply; the verdict is the last text after the tool ran.
-		const review = finalAssistantText(project(captured.review));
+		const review = finalAssistantText(streams.review);
 		expect([review, reviewVerdict(review)]).toEqual(["Checked every hunk.\nVERDICT: LANDABLE", "LANDABLE"]);
-		// A provider error and a length cut-off leave no final, though the process exited 0 and DONE was written.
-		expect([finalAssistantText(project(captured.error)), finalAssistantText(project(captured.length))]).toEqual([
-			"",
-			"",
-		]);
-		expect([fixture("provider-error.exit"), fixture("length-cutoff.exit")]).toEqual(["0\n", "0\n"]);
+		// A provider error and a length cut-off leave no final, though DONE was written and the length run exited 0.
+		expect([finalAssistantText(streams.error), finalAssistantText(streams.length)]).toEqual(["", ""]);
+		expect(lines(streams.length).some((line) => line.includes("DONE capture-one"))).toBe(true);
+		// The owned seat exits 0 after a provider error; the daemon seat's retries give up and it exits 1.
+		expect([fixture(`${custody}-provider-error.exit`), fixture(`${custody}-length-cutoff.exit`)]).toEqual(
+			custody === "owned" ? ["0\n", "0\n"] : ["1\n", "0\n"],
+		);
 	});
 
 	it("tells a turn that never began, one still open and one that ended, whatever the run's outcome", () => {
-		const done = lines(captured.done);
-		const toolEnd = lines(captured.review).findIndex((line) => JSON.parse(line).type === "tool_execution_end");
+		const done = lines(streams.done);
+		const review = lines(streams.review);
+		const toolEnd = review.findIndex((line) => JSON.parse(line).type === "tool_execution_end");
 		expect([
 			turnState(""),
 			turnState("spawn failed\nIDLE 1800s"),
-			turnState(lines(captured.review).slice(0, toolEnd + 1).join("\n")),
-			turnState(factoryCompleted(done.slice(0, -1).join("\n"))),
-			turnState(captured.done),
-			turnState(factoryCompleted(captured.error)),
-			turnState(`${captured.done}\n${done.slice(0, 2).join("\n")}`),
+			turnState(review.slice(0, toolEnd + 1).join("\n")),
+			turnState(done.slice(0, -1).join("\n")),
+			turnState(streams.done),
+			turnState(streams.error),
+			turnState(`${streams.done}\n${done.slice(0, 2).join("\n")}`),
 		]).toEqual(["none", "none", "open", "open", "closed", "closed", "open"]);
 	});
 
 	it("drops a stream without agent_end, a later failed run and a turn stopped at its tool call", () => {
-		const done = lines(captured.done);
+		const done = lines(streams.done);
 		expect(finalAssistantText(done.slice(0, -1).join("\n"))).toBe("");
 		// Two runs in one log: the later run's failed reply supersedes the earlier final.
-		expect(finalAssistantText(`${captured.done}\n${captured.error}`)).toBe("");
-		const review = lines(captured.review);
+		expect(finalAssistantText(`${streams.done}\n${streams.error}`)).toBe("");
+		const review = lines(streams.review);
 		const toolEnd = review.findIndex((line) => JSON.parse(line).type === "tool_execution_end");
 		expect(finalAssistantText([...review.slice(0, toolEnd + 1), '{"type":"agent_end"}'].join("\n"))).toBe("");
 	});
 
 	it("ignores malformed lines and custom metadata after the turn ended", () => {
-		const done = lines(captured.done);
-		const custom = done.find((line) => {
+		const done = lines(streams.done);
+		// The owned stream carries the harness digest, the daemon's failed run its retry outcome.
+		const custom = [...done, ...lines(streams.error)].find((line) => {
 			const event = JSON.parse(line);
 			return event.type === "message_end" && event.message?.role === "custom";
 		});
@@ -158,7 +181,7 @@ describe("terminal lines", () => {
 	});
 });
 
-describe("completed-review recovery against a Rust session file", () => {
+describe.each(CUSTODIES)("completed-review recovery against a %s seat's Rust session file", (custody) => {
 	const roots: string[] = [];
 	afterEach(() => {
 		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -173,7 +196,7 @@ describe("completed-review recovery against a Rust session file", () => {
 		const sessionDir = join(directory, "sessions", "review-grok");
 		mkdirSync(sessionDir, { recursive: true });
 		mkdirSync(join(directory, "logs"));
-		const [header, ...entries] = lines(fixture("review-tool-then-verdict.session.jsonl"));
+		const [header, ...entries] = lines(fixture(`${custody}-review-tool-then-verdict.session.jsonl`));
 		const session = JSON.parse(header!) as SessionEntry;
 		const sessionPath = join(sessionDir, "session.jsonl");
 		writeFileSync(
@@ -213,7 +236,7 @@ describe("completed-review recovery against a Rust session file", () => {
 	}
 
 	it("reconsumes the persisted terminal message its seat stream carried to agent_end", async () => {
-		const r = recovery({ stream: factoryCompleted(captured.review), receiptLine: true });
+		const r = recovery({ stream: captured(custody).review, receiptLine: true });
 		expect(await r.run()).toBe("LANDABLE");
 		expect(r.reconsumed()).toMatchObject({
 			name: "grok",
@@ -225,10 +248,10 @@ describe("completed-review recovery against a Rust session file", () => {
 	});
 
 	it("refuses the message without its run.log receipt or without a stream that reached agent_end", async () => {
-		await expect(recovery({ stream: captured.review, receiptLine: false }).run()).rejects.toThrow(
+		await expect(recovery({ stream: captured(custody).review, receiptLine: false }).run()).rejects.toThrow(
 			"no successful seat receipt for this terminal message",
 		);
-		const cut = lines(captured.review).slice(0, -1).join("\n");
+		const cut = lines(captured(custody).review).slice(0, -1).join("\n");
 		await expect(recovery({ stream: cut, receiptLine: true }).run()).rejects.toThrow(
 			"matching native message lacks terminal stream completion",
 		);
