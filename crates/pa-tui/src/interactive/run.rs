@@ -346,6 +346,19 @@ async fn run_interactive_surface(
     let ((mut events, mut session), waited_for_update_restart) = match open_outcome {
         Ok(opened) => opened,
         Err(error) => {
+            // The session's worker died during startup (the daemon's typed
+            // `worker_startup_failed`: its socket would not bind, it
+            // crashed at boot): no session exists for any fallback to
+            // serve, and the agents view would only bury the worker's
+            // error. Hand the terminal back and fail, so the CLI prints the
+            // exit status, the stderr line and the log path and exits 1.
+            if crate::daemon_client::is_worker_startup_failure(&error) {
+                if renderer.is_terminal() {
+                    exit_guard.arm_for_exit();
+                }
+                renderer.finish(&mut view, false);
+                return Err(error);
+            }
             // A daemon refusal for the startup create/attach/resume (the
             // daemon is alive and refused THIS request — a remembered id
             // whose worker is gone, or a saved-session create the daemon

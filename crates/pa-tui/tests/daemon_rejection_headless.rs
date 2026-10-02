@@ -549,6 +549,31 @@ fn run_plan(
     agents_view_open: bool,
     configure: impl FnOnce(&mut MockSupervisor),
 ) -> anyhow::Result<RunOutcome> {
+    let run = run_plan_settled(steps, selection, agents_view_open, configure);
+    let outcome = run.outcome?;
+    Ok(RunOutcome {
+        frames: outcome.frames,
+        prompt_requests: run.prompt_requests,
+        create_requests: run.create_requests,
+        return_to_agents_view: outcome.return_to_agents_view,
+        agents_view_notice: outcome.agents_view_notice,
+    })
+}
+
+/// A run's raw result with the mock's request logs, collected whether the
+/// run returned or failed (a failed run still answers what it sent).
+struct SettledRun {
+    outcome: anyhow::Result<pa_tui::interactive::InteractiveOutcome>,
+    prompt_requests: Vec<Value>,
+    create_requests: Vec<Value>,
+}
+
+fn run_plan_settled(
+    steps: Vec<HeadlessStep>,
+    selection: SessionSelection,
+    agents_view_open: bool,
+    configure: impl FnOnce(&mut MockSupervisor),
+) -> SettledRun {
     // The ambient TMUX variable adds a startup notice to the transcript;
     // scrub it so the run is the same inside tmux and out.
     std::env::remove_var("TMUX");
@@ -577,10 +602,10 @@ fn run_plan(
         } else {
             run_interactive(options, UiMode::Headless(plan)).await
         }
-    })?;
+    });
     let _ = handle.join();
-    Ok(RunOutcome {
-        frames: outcome.frames,
+    SettledRun {
+        outcome,
         prompt_requests: Arc::try_unwrap(prompt_requests).map_or_else(
             |locked| locked.lock().unwrap().clone(),
             |locked| locked.into_inner().unwrap(),
@@ -589,9 +614,7 @@ fn run_plan(
             |locked| locked.lock().unwrap().clone(),
             |locked| locked.into_inner().unwrap(),
         ),
-        return_to_agents_view: outcome.return_to_agents_view,
-        agents_view_notice: outcome.agents_view_notice,
-    })
+    }
 }
 
 /// An empty follow-up submission (alt+enter on the empty editor) is TS
@@ -922,5 +945,81 @@ fn a_permanent_create_failure_after_the_window_surfaces_unmasked() {
     assert!(
         !notice.contains("Waited for the Prime Agent daemon update restart"),
         "no wait notice for an open that never completed: {notice}"
+    );
+}
+
+/// The daemon's typed startup failure: the create of a session whose worker
+/// died before it was ready (macOS: its socket path overflowed `sun_path`).
+const WORKER_STARTUP_FAILURE: &str = "session worker e37f5391bbb4 exited during startup (exit status: 1): Error: bind worker socket /private/var/folders/kh/T/pa-rs-501/w-7070123c2ae3-e37f5391bbb4.sock: path must be shorter than SUN_LEN\nworker log: /Users/u/.prime/agent-rs/logs/worker-e37f5391bbb4.stderr.log";
+
+fn worker_startup_failure_answer() -> CreateAnswer {
+    Some((
+        WORKER_STARTUP_FAILURE.to_string(),
+        Some(json!({
+            "code": "worker_startup_failed",
+            "workerId": "e37f5391bbb4",
+            "exitCode": 1,
+            "logPath": "/Users/u/.prime/agent-rs/logs/worker-e37f5391bbb4.stderr.log",
+        })),
+    ))
+}
+
+/// A worker that died during startup ends the run with the worker's error
+/// (exit status, stderr line, log path) for the CLI to print and exit 1
+/// on: no agents-view handoff for a session that never existed, and the
+/// typed-ahead prompt never dispatched. On both open routes.
+#[test]
+fn a_worker_startup_failure_ends_the_run_with_the_worker_error() {
+    let routes = [
+        (false, SessionSelection::New),
+        (
+            true,
+            SessionSelection::Resume(PathBuf::from("/tmp/sess-1.jsonl")),
+        ),
+    ];
+    for (agents_view_open, selection) in routes {
+        let run = run_plan_settled(
+            vec![
+                HeadlessStep::Type("never sent".to_string()),
+                HeadlessStep::Key(enter()),
+                HeadlessStep::WaitMs(100),
+            ],
+            selection,
+            agents_view_open,
+            |supervisor| {
+                supervisor.create_answers = vec![worker_startup_failure_answer()];
+            },
+        );
+        let error = run
+            .outcome
+            .expect_err("a dead worker ends the run instead of handing off");
+        assert_eq!(
+            (
+                format!("{error:#}"),
+                run.create_requests.len(),
+                run.prompt_requests.len()
+            ),
+            (
+                format!("the daemon rejected the create request: {WORKER_STARTUP_FAILURE}"),
+                1,
+                0
+            ),
+            "agents-view route: {agents_view_open}"
+        );
+    }
+}
+
+/// The same failure without the typed info (an older daemon, or any
+/// untyped refusal) keeps the agents-view fallback: only the typed code
+/// ends the run.
+#[test]
+fn an_untyped_create_refusal_still_falls_back_to_the_agents_view() {
+    let run = run_plan_with(vec![HeadlessStep::WaitMs(100)], |supervisor| {
+        supervisor.create_answers = vec![Some((WORKER_STARTUP_FAILURE.to_string(), None))];
+    })
+    .expect("an untyped refusal hands off instead of exiting");
+    assert_eq!(
+        (run.return_to_agents_view, run.prompt_requests.len()),
+        (true, 0)
     );
 }
