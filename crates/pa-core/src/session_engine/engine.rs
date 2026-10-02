@@ -144,7 +144,6 @@ pub struct SessionEngineConfig {
     pub image_model_router: Option<super::image_model_routing::ImageModelRouter>,
 }
 
-/// An assembled, running session.
 /// How a session prepares its kernel at creation
 /// ([`SessionEngineConfig::prewarm_ipython_kernel`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +162,7 @@ pub enum KernelPrewarm {
     BeforeFirstTurn,
 }
 
+/// An assembled, running session.
 pub struct SessionEngine {
     pub session: AgentSession,
     pub skills: Vec<crate::skills::Skill>,
