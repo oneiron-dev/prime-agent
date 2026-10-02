@@ -282,3 +282,30 @@ fn display_ids_are_twelve_hex() {
     assert_eq!(id.len(), 12);
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
 }
+
+/// The summary publishes the create's tool selection only when it is not
+/// the default, so a default session's wire summary keeps its TS shape
+/// and a client about to reuse a restricted session can see it.
+#[test]
+fn summary_publishes_a_non_default_tool_selection() {
+    let summary_json = |core: &SessionCore| {
+        serde_json::to_value(session_summary(
+            core, "default", None, None, /*bash_running=*/ false, /*quota_parked=*/ false,
+        ))
+        .unwrap()
+    };
+    let default = SessionCore::test_core(None, "/tmp".to_string());
+    let mut restricted = SessionCore::test_core(None, "/tmp".to_string());
+    restricted.tool_selection = pa_types::daemon::ToolSelectionFlags {
+        tools: Some(vec!["ipython".to_string()]),
+        no_tools: true,
+        no_builtin_tools: false,
+    };
+    assert_eq!(
+        [
+            summary_json(&default).get("toolSelection").cloned(),
+            summary_json(&restricted).get("toolSelection").cloned(),
+        ],
+        [None, Some(json!({ "tools": ["ipython"], "noTools": true }))]
+    );
+}

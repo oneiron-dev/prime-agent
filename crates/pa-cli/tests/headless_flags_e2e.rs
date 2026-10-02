@@ -303,6 +303,7 @@ fn headless_run_tracks_its_flags() {
                 "mode": properties["mode"],
                 "daemon_hosted": properties["daemon_hosted"],
                 "json_event_profile": properties["json_event_profile"],
+                "tool_selection": properties["tool_selection"],
             })
         })
         .collect();
@@ -312,6 +313,7 @@ fn headless_run_tracks_its_flags() {
             "mode": "json",
             "daemon_hosted": false,
             "json_event_profile": "factory-completed",
+            "tool_selection": "default",
         })]
     );
 }

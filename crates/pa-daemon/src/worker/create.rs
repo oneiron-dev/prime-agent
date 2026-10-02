@@ -115,6 +115,10 @@ impl Worker {
                 );
             }
         };
+        // The summary publishes the selection for every engine (the
+        // scripted harness included): a hosted client refuses to reuse a
+        // live session launched with other tools.
+        let tool_selection = resources.tool_selection_flags();
         if let Some(agent_engine) = &self.agent_engine {
             if let Some(autonomous) = &resources.autonomous {
                 *agent_engine.autonomous.lock().await =
@@ -626,6 +630,7 @@ impl Worker {
             core.parent_active_session_id = parent_active_session_id;
             core.parent_session_id = parent_session_id;
             core.child_script.clone_from(&child_script);
+            core.tool_selection = tool_selection;
             (self.summary_locked(&core), rlm_depth)
         };
         // TS `sdk.ts` seeds the Agent's queue modes from the settings

@@ -352,6 +352,7 @@ fn enter() -> KeyEvent {
 
 fn options_with_session(socket: PathBuf, session: SessionSelection) -> InteractiveOptions {
     InteractiveOptions {
+        tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         models: None,
         socket_path: socket,
         cwd: PathBuf::from("/tmp"),

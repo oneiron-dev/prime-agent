@@ -223,6 +223,7 @@ fn session_options(
     has_children: bool,
 ) -> pa_tui::interactive::InteractiveOptions {
     pa_tui::interactive::InteractiveOptions {
+        tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         models: None,
         socket_path: socket.to_path_buf(),
         cwd: PathBuf::from("/tmp"),

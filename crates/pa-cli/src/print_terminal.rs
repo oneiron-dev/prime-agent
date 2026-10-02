@@ -64,6 +64,15 @@ pub(crate) async fn track_headless_invocation(options: &RunOptions) {
                 pa_telemetry::HeadlessJsonEventProfile::FactoryCompleted
             }
         },
+        tool_selection: {
+            use pa_core::session_engine::tool_selection::ToolSelection;
+            match options.config.tool_selection() {
+                ToolSelection::Defaults => pa_telemetry::HeadlessToolSelection::Default,
+                ToolSelection::NoTools => pa_telemetry::HeadlessToolSelection::NoTools,
+                ToolSelection::SuppliedOnly => pa_telemetry::HeadlessToolSelection::NoBuiltinTools,
+                ToolSelection::Allowlist(_) => pa_telemetry::HeadlessToolSelection::Allowlist,
+            }
+        },
     }
     .track(&client);
     let _ = client.shutdown().await;

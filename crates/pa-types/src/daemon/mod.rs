@@ -20,8 +20,12 @@ pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
 /// (TS #2506's field, landing ahead of TS main: the Rust deletion lifecycle
 /// captures the tombstoned child's usage durably before any unlink, so the
 /// field is populated where TS's open PR reads a removed path).
-pub const DAEMON_SCHEMA_REVISION: u64 = 30;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-30-8e4b17c2a9f5";
+/// Revision 31 (Oneiron fork only) adds the capability-gated `create` keys
+/// `tools`/`noTools`/`noBuiltinTools` (`session_tool_selection`) and the
+/// worker summary's `toolSelection`. Its id differs from the TS fork's
+/// revision-31 id: the two revisions are unrelated.
+pub const DAEMON_SCHEMA_REVISION: u64 = 31;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-31-0f2c7a41b9d6";
 
 pub type DaemonClientId = String;
 pub type DaemonCommandId = String;
@@ -112,6 +116,7 @@ mod command;
 pub mod framing;
 mod outbound;
 mod plane;
+mod tool_selection;
 pub mod update_flow;
 mod worker;
 
@@ -129,6 +134,7 @@ pub use plane::{
     command_plane, is_daemon_mutating_command, is_session_plane_daemon_command,
     is_update_drain_command, DaemonCommandPlane,
 };
+pub use tool_selection::{ToolSelectionFlags, SESSION_TOOL_SELECTION_CAPABILITY};
 pub use update_flow::{
     legacy_update_restart_status, legacy_update_restarts_dir, prepared_marker_expiry,
     socket_update_dir, update_intent_path, update_marker_path, update_prepared_dir,
@@ -185,8 +191,8 @@ mod tests {
     fn protocol_constants_match_ts() {
         assert_eq!(DAEMON_PROTOCOL_NAME, "prime-agent.daemon");
         assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
-        assert_eq!(DAEMON_SCHEMA_REVISION, 30);
-        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-30-8e4b17c2a9f5");
+        assert_eq!(DAEMON_SCHEMA_REVISION, 31);
+        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-31-0f2c7a41b9d6");
         assert_eq!(DAEMON_UPDATE_RESTART_FORMAT_VERSION, 1);
     }
 }

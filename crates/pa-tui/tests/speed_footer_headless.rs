@@ -263,6 +263,7 @@ fn stream_turn(writer: &mut UnixStream) {
 
 fn options(socket: PathBuf) -> InteractiveOptions {
     InteractiveOptions {
+        tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         models: None,
         socket_path: socket,
         cwd: PathBuf::from("/tmp"),

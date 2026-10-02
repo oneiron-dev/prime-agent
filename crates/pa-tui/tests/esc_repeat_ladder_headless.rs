@@ -374,6 +374,7 @@ impl pa_tui::client_settings::ClientSettings for StubSettings {
 
 fn options(socket: PathBuf) -> InteractiveOptions {
     InteractiveOptions {
+        tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         socket_path: socket,
         cwd: PathBuf::from("/tmp"),
         session_dir: None,

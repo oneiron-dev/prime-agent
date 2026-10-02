@@ -188,6 +188,7 @@ use pa_tui::interactive::{
 
 fn child_options(socket: PathBuf) -> InteractiveOptions {
     InteractiveOptions {
+        tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         models: None,
         socket_path: socket,
         cwd: PathBuf::from("/tmp"),

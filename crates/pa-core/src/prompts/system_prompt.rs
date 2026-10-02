@@ -30,7 +30,7 @@ pub struct PromptSegment {
 }
 
 impl PromptSegment {
-    fn static_segment(name: &'static str, source: &'static str, text: String) -> Self {
+    pub(super) fn static_segment(name: &'static str, source: &'static str, text: String) -> Self {
         Self {
             name,
             kind: SegmentKind::Static,
@@ -39,7 +39,7 @@ impl PromptSegment {
         }
     }
 
-    fn dynamic_segment(name: &'static str, source: &'static str, text: String) -> Self {
+    pub(super) fn dynamic_segment(name: &'static str, source: &'static str, text: String) -> Self {
         Self {
             name,
             kind: SegmentKind::Dynamic,
@@ -75,7 +75,8 @@ pub struct BuildSystemPromptOptions<'a> {
     pub selected_tools: Option<Vec<&'a str>>,
     /// Additional guideline bullets appended to the dynamic tail.
     pub prompt_guidelines: Option<Vec<String>>,
-    /// Text appended to the end of the prompt.
+    /// Text appended to the end of the prompt (the no-REPL prompt joins
+    /// it as TS does; the layered prompt appends it as its last segment).
     pub append_system_prompt: Option<String>,
     /// Working directory.
     pub cwd: String,
@@ -104,8 +105,17 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
     system_prompt_breakdown(options).assembled
 }
 
-/// Build the system prompt with its per-layer breakdown.
+/// Build the system prompt with its per-layer breakdown. A session whose
+/// active tools hold no Python REPL (`ipython`) gets the TS no-tools prompt
+/// instead of the layered harness (see `no_repl`).
 pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemPromptBreakdown {
+    let tools: Vec<&str> = options
+        .selected_tools
+        .clone()
+        .unwrap_or_else(|| vec!["ipython"]);
+    if !tools.contains(&"ipython") {
+        return super::no_repl::no_repl_breakdown(options, &tools);
+    }
     let mut segments: Vec<PromptSegment> = Vec::new();
 
     // The static prefix: the user's replacement prompt, or the layered files.
@@ -151,30 +161,21 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
 
     // The dynamic tail, in fixed order: packages -> project context ->
     // skills inventory -> MCP servers -> environment -> session role ->
-    // additional guidance -> appended prompt.
-    let tools: Vec<&str> = options
-        .selected_tools
-        .clone()
-        .unwrap_or_else(|| vec!["ipython"]);
-    let has_ipython = tools.contains(&"ipython");
-    let has_file_access = has_ipython || tools.contains(&"bash");
-
+    // additional guidance -> appended prompt. `ipython` is active here.
     segments.push(PromptSegment::dynamic_segment(
         "packages",
         "kernel bootstrap defaults",
         packages_section(),
     ));
 
-    if has_ipython {
-        if let Some(line) = crate::kernel::memory_guard::kernel_memory_prompt_line(
-            options.kernel_memory_limit_gb.unwrap_or(0.0),
-        ) {
-            segments.push(PromptSegment::dynamic_segment(
-                "kernel-memory",
-                "kernel memory limit",
-                line,
-            ));
-        }
+    if let Some(line) = crate::kernel::memory_guard::kernel_memory_prompt_line(
+        options.kernel_memory_limit_gb.unwrap_or(0.0),
+    ) {
+        segments.push(PromptSegment::dynamic_segment(
+            "kernel-memory",
+            "kernel memory limit",
+            line,
+        ));
     }
 
     let context = context_files_section(&options.context_files);
@@ -191,7 +192,7 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
         .iter()
         .filter(|skill| !skill.disable_model_invocation)
         .collect();
-    if has_file_access && !visible_skills.is_empty() {
+    if !visible_skills.is_empty() {
         let inventory = format_skills_for_prompt(&options.skills).trim().to_string();
         segments.push(PromptSegment::dynamic_segment(
             "skills-inventory",
@@ -200,15 +201,13 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
         ));
     }
 
-    if has_ipython {
-        let mcp = format_generic_mcp_guidance(&options.generic_mcp_servers);
-        if !mcp.is_empty() {
-            segments.push(PromptSegment::dynamic_segment(
-                "mcp-servers",
-                "generic MCP settings",
-                mcp,
-            ));
-        }
+    let mcp = format_generic_mcp_guidance(&options.generic_mcp_servers);
+    if !mcp.is_empty() {
+        segments.push(PromptSegment::dynamic_segment(
+            "mcp-servers",
+            "generic MCP settings",
+            mcp,
+        ));
     }
 
     segments.push(PromptSegment::dynamic_segment(
@@ -217,7 +216,7 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
         environment_section(options),
     ));
 
-    let role = session_role_section(options, has_ipython);
+    let role = session_role_section(options);
     if !role.is_empty() {
         segments.push(PromptSegment::dynamic_segment(
             "session-role",
@@ -261,7 +260,7 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
     }
 }
 
-fn packages_section() -> String {
+pub(super) fn packages_section() -> String {
     use crate::kernel::bootstrap::default_rlm_extra_import_labels;
     let mut lines = vec![format!(
         "Pre-installed Python packages: {}.",
@@ -315,18 +314,12 @@ fn environment_section(options: &BuildSystemPromptOptions) -> String {
     lines.join("\n")
 }
 
-fn session_role_section(options: &BuildSystemPromptOptions, has_ipython: bool) -> String {
+fn session_role_section(options: &BuildSystemPromptOptions) -> String {
     let depth = options.rlm_depth.unwrap_or(0);
     let mut lines = vec![format!(
         "Recursive agent depth: {depth}{}",
         if depth == 0 { " (root)" } else { " (not root)" }
     )];
-    if !has_ipython {
-        lines.push(
-            "This session has no Python REPL (`ipython` tool): the programmatic tools described above are unavailable here."
-                .to_string(),
-        );
-    }
     if options.allow_recursion == Some(false) {
         lines.push("Subagent spawning is disabled in this session.".to_string());
     }
@@ -335,19 +328,17 @@ fn session_role_section(options: &BuildSystemPromptOptions, has_ipython: bool) -
             "You are a child agent spawned by {}. Task prompts are labeled `[task from parent]`.",
             options.rlm_parent_agent.unwrap_or("your parent agent")
         ));
-        if has_ipython {
-            lines.push(
-                "When a task calls for an answer, reply explicitly with `await agent_message.send(message, receiver_role=\"parent\")`. Not every message or task needs a reply; continue cleanup after sending and go idle normally.".to_string(),
-            );
-            lines.push(
-                "For long-running work, report brief progress with `await rlm.progress_note('...')` (at most 512 characters, throttled to about one note per 10 seconds); the parent sees notes without needing a reply.".to_string(),
-            );
-        }
+        lines.push(
+            "When a task calls for an answer, reply explicitly with `await agent_message.send(message, receiver_role=\"parent\")`. Not every message or task needs a reply; continue cleanup after sending and go idle normally.".to_string(),
+        );
+        lines.push(
+            "For long-running work, report brief progress with `await rlm.progress_note('...')` (at most 512 characters, throttled to about one note per 10 seconds); the parent sees notes without needing a reply.".to_string(),
+        );
     }
     lines.join("\n")
 }
 
-fn today() -> String {
+pub(super) fn today() -> String {
     // UTC date in YYYY-MM-DD form; the prompt is date context only.
     let days = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -366,7 +357,7 @@ fn today() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn format_prompt_guidelines(guidelines: &[String]) -> String {
+pub(super) fn format_prompt_guidelines(guidelines: &[String]) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut list = Vec::new();
     for guideline in guidelines {

@@ -387,6 +387,23 @@ async fn handle_session_new(
         return;
     }
 
+    // A daemon without `session_tool_selection` would ignore the launch
+    // tool flags and run every tool: refuse the session instead.
+    let refusal = pa_types::daemon::ToolSelectionFlags::from_create_config(&options.create_config)
+        .map_err(|error| format!("Invalid create config: {error}"))
+        .and_then(|flags| {
+            flags
+                .unsupported_by_daemon(link.server_capabilities.iter().any(|capability| {
+                    capability == pa_types::daemon::SESSION_TOOL_SELECTION_CAPABILITY
+                }))
+                .map_or(Ok(()), Err)
+        });
+    if let Err(refusal) = refusal {
+        *state.lock().await = DaemonAcpState::default();
+        let _ = tx.send(super::internal_error(&id, &refusal));
+        return;
+    }
+
     // The client-owned daemon session: `--no-session` semantics.
     let mut config = options.create_config.clone();
     // Verification seam: a scripted daemon session (the same `{"engine":

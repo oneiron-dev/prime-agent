@@ -326,6 +326,10 @@ pub struct InteractiveOptions {
     /// registry into the session's scoped list (Alt+M cycling, the
     /// picker's scoped view). `None` leaves the scope unset.
     pub models: Option<Vec<String>>,
+    /// The launch tool selection (`--tools`/`--no-tools`/
+    /// `--no-builtin-tools`): rides every create (`/new` included), gated
+    /// on the daemon's `session_tool_selection` capability.
+    pub tool_selection: pa_types::daemon::ToolSelectionFlags,
     /// Create without a session file (`--no-session`).
     pub no_session: bool,
     pub session: SessionSelection,
@@ -420,6 +424,7 @@ impl std::fmt::Debug for InteractiveOptions {
             .field("script_path", &self.script_path)
             .field("model_selection", &self.model_selection)
             .field("models", &self.models)
+            .field("tool_selection", &self.tool_selection)
             .field("model_catalog", &self.model_catalog)
             .field("no_session", &self.no_session)
             .field("session", &self.session)
@@ -471,6 +476,7 @@ impl InteractiveOptions {
         if self.telemetry_disabled == Some(true) {
             config["telemetryDisabled"] = json!(true);
         }
+        self.tool_selection.write_into_create_config(&mut config);
         config
     }
 }

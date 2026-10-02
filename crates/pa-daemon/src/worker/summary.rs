@@ -452,6 +452,7 @@ pub(crate) fn session_summary(
         model_fallback_message,
         runtime_kind: Some(core.runtime_kind.clone()),
         unfinished_action_count: Some(0),
+        tool_selection: (!core.tool_selection.is_default()).then(|| core.tool_selection.clone()),
     }
 }
 

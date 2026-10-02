@@ -34,10 +34,21 @@ pub struct SessionEngineConfig {
     pub stream_fn: Option<StreamFn>,
     /// Pre-bridged loop tools (bash/edit/ipython).
     pub tools: Vec<Arc<dyn pa_agent::types::AgentTool>>,
+    /// The launch tool selection (`--tools`/`--no-tools`/
+    /// `--no-builtin-tools`), applied over `tools` and the built-in
+    /// `ipython`: it decides both the request's tool definitions and the
+    /// executable tools. The default keeps every tool.
+    pub tool_selection: super::tool_selection::ToolSelection,
     /// Override the default system prompt.
     pub custom_system_prompt: Option<String>,
     /// Prompt guideline bullets.
     pub prompt_guidelines: Vec<String>,
+    /// `--append-system-prompt` sources (text, or a file path whose content
+    /// is read); empty discovers `APPEND_SYSTEM.md`. The no-REPL prompt
+    /// appends the resolved text as TS does; the layered prompt keeps its
+    /// shipped behavior and adds the raw sources as guideline bullets
+    /// (a discovered `APPEND_SYSTEM.md` stays out of it).
+    pub append_system_prompt: Vec<String>,
     /// Enabled generic MCP server names.
     pub generic_mcp_servers: Vec<String>,
     /// Suppress the rlm recursion guidance.
@@ -310,7 +321,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         no_prompt_templates: discovery_disabled(config.resource_loading.prompt_templates),
         no_context_files: discovery_disabled(config.resource_loading.context_files),
         system_prompt: config.custom_system_prompt.clone(),
-        append_system_prompt: Vec::new(),
+        append_system_prompt: config.append_system_prompt.clone(),
         ..Default::default()
     })?;
 
@@ -552,20 +563,29 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             on_memory_action,
             on_snapshot_guard,
         });
-    let mut tools = config.tools.clone();
-    if !tools.iter().any(|tool| tool.name() == "ipython") {
-        let definition = crate::tools::ipython::create_ipython_tool_definition(
-            &cwd.to_string_lossy(),
-            super::runtime_wiring::ipython_tool_options(
-                provisioner.clone(),
-                kernel_memory_limit_gb,
+    // The registry: the supplied tools plus the kernel-backed built-in
+    // `ipython` (a supplied `ipython` shadows it). The launch selection
+    // picks the active tools from it; an inactive `ipython` is dropped
+    // here, so the model never sees it and no tool call can reach the
+    // kernel through it.
+    let builtin_ipython: Arc<dyn pa_agent::types::AgentTool> = Arc::new(
+        crate::session_engine::tool_bridge::ToolDefinitionBridge::new(
+            crate::tools::ipython::create_ipython_tool_definition(
+                &cwd.to_string_lossy(),
+                super::runtime_wiring::ipython_tool_options(
+                    provisioner.clone(),
+                    kernel_memory_limit_gb,
+                ),
             ),
-        );
-        tools.push(Arc::new(
-            crate::session_engine::tool_bridge::ToolDefinitionBridge::new(definition),
-        ));
-    }
+        ),
+    );
+    let tools = config
+        .tool_selection
+        .select(config.tools.clone(), vec![builtin_ipython], |tool| {
+            tool.name()
+        });
     let active_tool_names: Vec<String> = tools.iter().map(|tool| tool.name().to_string()).collect();
+    let has_repl = active_tool_names.iter().any(|name| name == "ipython");
 
     // The TS prewarm (agent-session.ts `_buildRuntime`, behind
     // `createDefaultRuntimeFactory`'s `prewarmIpythonKernel: true`): a main
@@ -579,16 +599,28 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // turn and the `ipython_state_restored` notice lands ahead of it.
     // Failures are swallowed there and surface on the next `ensure()`, and
     // an already-started kernel short-circuits it, so the lazy first-call
-    // start stays the fallback.
+    // start stays the fallback. Without an active `ipython` (TS gates on
+    // `getActiveToolNames().includes("ipython")`) neither arm boots
+    // anything: no prewarm, no snapshot revival, no Python process.
     let prewarm_configured =
         config.prewarm_ipython_kernel.unwrap_or(false) && config.rlm_depth.unwrap_or(0) == 0;
-    if (prewarm_configured || has_snapshot)
-        && active_tool_names.iter().any(|name| name == "ipython")
-    {
+    if (prewarm_configured || has_snapshot) && has_repl {
         provisioner.prewarm();
     }
 
-    let prompt_guidelines = config.prompt_guidelines.clone();
+    // The layered prompt keeps its shipped bytes: append sources ride as
+    // guideline bullets there. The no-REPL prompt appends the resolved
+    // append text (explicit sources or `APPEND_SYSTEM.md`) as TS does.
+    let (prompt_guidelines, append_system_prompt) = if has_repl {
+        let mut guidelines = config.prompt_guidelines.clone();
+        guidelines.extend(config.append_system_prompt.iter().cloned());
+        (guidelines, None)
+    } else {
+        (
+            config.prompt_guidelines.clone(),
+            Some(resources.append_system_prompt.join("\n\n")),
+        )
+    };
 
     // The per-model prompt layer keys on the resolved `provider/id`
     // selector; vision capability gates the image-input line. Both are
@@ -622,6 +654,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             rlm_depth: config.rlm_depth,
             generic_mcp_servers,
             prompt_guidelines: Some(prompt_guidelines),
+            append_system_prompt,
             kernel_memory_limit_gb: Some(kernel_memory_limit_gb),
             ..Default::default()
         },
@@ -1056,3 +1089,6 @@ mod tests;
 // A normal session on the real Anthropic provider, captured on the wire.
 #[cfg(test)]
 mod provider_wire_tests;
+// The launch tool selection: request capture per flag and the kernel gate.
+#[cfg(test)]
+mod tool_selection_tests;
