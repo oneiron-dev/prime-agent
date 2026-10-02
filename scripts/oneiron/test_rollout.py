@@ -83,7 +83,8 @@ class FakeRustDaemon:
 
 class RolloutFixture(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
+        # Short on macOS, whose $TMPDIR is too deep for socket paths.
+        self.tmp = tempfile.TemporaryDirectory(dir="/tmp" if sys.platform == "darwin" else None)
         self.root = Path(self.tmp.name).resolve()
         self.home = self.root / "home"
         self.home.mkdir()
@@ -104,7 +105,7 @@ class RolloutFixture(unittest.TestCase):
             "PRIME_AGENT_RS_KERNEL_VENV": str(self.root / "venv-rs"),
         })
         self.saved = (side_by_side.HOME, side_by_side.TS_AGENT_DIR, side_by_side.SYSTEM_TMP,
-                      release_feed.host_platform)
+                      side_by_side.SOCKET_PLATFORM, release_feed.host_platform)
         side_by_side.HOME = self.home
         side_by_side.TS_AGENT_DIR = self.home / ".prime" / "agent"
         side_by_side.SYSTEM_TMP = self.system_tmp
@@ -123,7 +124,7 @@ class RolloutFixture(unittest.TestCase):
 
     def tearDown(self) -> None:
         (side_by_side.HOME, side_by_side.TS_AGENT_DIR, side_by_side.SYSTEM_TMP,
-         release_feed.host_platform) = self.saved
+         side_by_side.SOCKET_PLATFORM, release_feed.host_platform) = self.saved
         for key, value in self.saved_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -375,6 +376,39 @@ class RolloutTests(RolloutFixture):
                 with self.assertRaises(BlockingIOError):
                     server.accept()  # no connection was ever queued
         self.assertFalse((self.prefix / V1).exists())
+
+    def test_the_idle_check_resolves_the_launchers_default_socket_per_platform(self) -> None:
+        # No override: the rollout checks the socket the launcher would
+        # export. On macOS that is /tmp/pa-rs-<uid> even under a deep
+        # $TMPDIR; elsewhere $TMPDIR/pa-rs-<uid>.
+        self.publish(V1)
+        os.environ.pop("PRIME_AGENT_RS_SOCKET_DIR")
+        deep_tmp = self.fake_tmp / ("T" * 60)
+        deep_tmp.mkdir()
+        uid = os.getuid()
+        for platform, tmpdir, expected in (
+                ("darwin", deep_tmp, self.system_tmp / f"pa-rs-{uid}" / "daemon.sock"),
+                ("linux", self.fake_tmp, self.fake_tmp / f"pa-rs-{uid}" / "daemon.sock")):
+            with self.subTest(platform=platform):
+                side_by_side.SOCKET_PLATFORM = platform
+                os.environ["TMPDIR"] = str(tmpdir)
+                self.assertEqual(daemon_idle.default_socket_path(), expected)
+                self.assertEqual(self.main("rollout", "--version", V1), 0)
+                self.assertEqual(self.receipt(V1)["rustDaemon"]["idleBeforeInstall"],
+                                 {"socket": str(expected), "state": "absent"})
+
+    def test_an_over_budget_socket_dir_refuses_the_rollout_before_anything_is_written(self) -> None:
+        self.publish(V1)
+        side_by_side.SOCKET_PLATFORM = "darwin"
+        name = side_by_side.LONGEST_SOCKET_NAME
+        over = self.root / ("o" * (104 - len(name) - 1 - len(os.fsencode(self.root)) - 1))
+        self.assertEqual(len(os.fsencode(over / name)) + 1, 105)
+        os.environ["PRIME_AGENT_RS_SOCKET_DIR"] = str(over)
+        with self.assertRaisesRegex(SystemExit, f"refusing socket dir {over}: .* over the 104-byte darwin sun_path "
+                                                "limit; set PRIME_AGENT_RS_SOCKET_DIR to a shorter directory"):
+            self.main("rollout", "--version", V1)
+        self.assertEqual([(self.prefix / V1).exists(), (self.prefix / "receipts" / f"{V1}-{PLATFORM}").exists(),
+                          over.exists()], [False, False, False])
 
     def test_a_socket_nobody_listens_on_counts_as_no_daemon(self) -> None:
         self.publish(V1)
