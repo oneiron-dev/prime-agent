@@ -103,6 +103,12 @@ fn tool_result_entries_persisted_and_streamed() {
     );
     assert_eq!(tool_result_message["isError"], true);
 
+    // The first `turn_end` closes the tool turn only; the scripted "done"
+    // answer is a second turn. Stats are a read-plane command served while
+    // a run is in flight, so wait for the run's `agent_end` (emitted after
+    // the last message is persisted) before counting.
+    client.take_session_event(&mut lines, "agent_end");
+
     // The stats command counts the persisted entry.
     client.send_command(
         "s1",
