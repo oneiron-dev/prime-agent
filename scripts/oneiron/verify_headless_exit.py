@@ -143,6 +143,9 @@ def mode_verdict(result: dict, threshold: float) -> list[str]:
         if telemetry is not None and telemetry.get(HEADLESS_INVOKED, 0) != 1:
             problems.append(f"{label} recorded {telemetry.get(HEADLESS_INVOKED, 0)} "
                             f"'{HEADLESS_INVOKED}' events, not 1")
+    if result.get("teardownSurvivors"):
+        names = ", ".join(f"{entry['pid']} {entry['role']}" for entry in result["teardownSurvivors"])
+        problems.append(f"the final sweep found processes alive: {names}")
     summary = result["summary"]
     if summary is None:
         problems.append("no warm run produced a lag")
@@ -213,16 +216,24 @@ def reap_child(pid: int) -> None:
 def survivors(sandbox: bench.Sandbox, adopted: bool) -> list[dict]:
     """Processes a finished run left behind (each given the grace to finish
     exiting first): orphans this script adopted as subreaper, and anything
-    still carrying the sandbox HOME. They are killed and reaped."""
+    still carrying the sandbox HOME. They are killed and reaped. Children
+    are re-listed until none is new: an adopted parent that exits during its
+    grace hands its own live children to this script after the first list."""
     lingering: dict[int, dict] = {}
-    for pid in own_children() if adopted else []:
-        if not wait_gone(pid, SURVIVOR_GRACE_S):
-            info = bench._linux_info(pid, bench._linux_environ(pid), False) or {}
-            lingering[pid] = {"pid": pid, "role": bench.classify(pid, info),
-                              "cmd": info.get("cmd", "")[:120], "adopted": True}
-            os.kill(pid, signal.SIGKILL)
-            wait_gone(pid, SURVIVOR_GRACE_S)
-        reap_child(pid)
+    seen: set[int] = set()
+    while adopted:
+        fresh = [pid for pid in own_children() if pid not in seen]
+        if not fresh:
+            break
+        for pid in fresh:
+            seen.add(pid)
+            if not wait_gone(pid, SURVIVOR_GRACE_S):
+                info = bench._linux_info(pid, bench._linux_environ(pid), False) or {}
+                lingering[pid] = {"pid": pid, "role": bench.classify(pid, info),
+                                  "cmd": info.get("cmd", "")[:120], "adopted": True}
+                os.kill(pid, signal.SIGKILL)
+                wait_gone(pid, SURVIVOR_GRACE_S)
+            reap_child(pid)
     for pid, info in sorted(bench.sandbox_processes(str(sandbox.home)).items()):
         if pid in lingering or wait_gone(pid, SURVIVOR_GRACE_S):
             continue
@@ -233,9 +244,10 @@ def survivors(sandbox: bench.Sandbox, adopted: bool) -> list[dict]:
     return list(lingering.values())
 
 
-def teardown(sandbox: bench.Sandbox, adopted: bool) -> None:
+def teardown(sandbox: bench.Sandbox, adopted: bool) -> list[dict]:
     """Remove a sandbox without the bench's polling reaper: the models.json
-    copies first, a last survivor sweep, then the tree."""
+    copies first, a last survivor sweep, then the tree. Returns what the
+    sweep found (it fails the flag set)."""
     for models in sandbox.root.glob("h/.prime/*/models.json"):
         models.unlink(missing_ok=True)
     left = survivors(sandbox, adopted)
@@ -244,6 +256,17 @@ def teardown(sandbox: bench.Sandbox, adopted: bool) -> None:
     shutil.rmtree(sandbox.root, ignore_errors=True)
     if sandbox in bench.Sandbox.created:
         bench.Sandbox.created.remove(sandbox)
+    return left
+
+
+class VerifySandbox(bench.Sandbox):
+    """The bench sandbox whose teardown (its own setup-failure path
+    included) is this script's event-driven one."""
+
+    adopted = False
+
+    def teardown(self) -> None:
+        teardown(self, VerifySandbox.adopted)
 
 
 def enable_telemetry(sandbox: bench.Sandbox, mock: bench.MockProvider) -> None:
@@ -324,7 +347,7 @@ def run_once(sandbox: bench.Sandbox, argv: list[str], mock: bench.MockProvider, 
 
 def measure_mode(mode: str, args: argparse.Namespace, mock: bench.MockProvider,
                  base: Path, uv_cache: str | None, adopted: bool) -> dict:
-    sandbox = bench.Sandbox("rs", f"exit-{mode}", base, mock.base_url, uv_cache)
+    sandbox = VerifySandbox("rs", f"exit-{mode}", base, mock.base_url, uv_cache)
     if args.telemetry:
         enable_telemetry(sandbox, mock)
     argv = run_argv(args.binary, mode)
@@ -337,10 +360,11 @@ def measure_mode(mode: str, args: argparse.Namespace, mock: bench.MockProvider,
             report_run(mode, f"run {run:2d}", sample)
             samples.append(sample)
     finally:
-        teardown(sandbox, adopted)
+        left = teardown(sandbox, adopted)
     lags = [sample["lagS"] for sample in samples if sample["ok"] and sample["lagS"] is not None]
     return {"mode": mode, "flags": list(MODES[mode]), "telemetry": args.telemetry,
-            "firstRun": first, "samples": samples, "summary": lag_summary(lags)}
+            "firstRun": first, "samples": samples, "summary": lag_summary(lags),
+            "teardownSurvivors": left}
 
 
 def report_run(mode: str, label: str, sample: dict) -> None:
@@ -391,6 +415,7 @@ def main(argv: list[str] | None = None) -> int:
     base = Path(os.path.abspath(args.sandbox_base))
     base.mkdir(parents=True, exist_ok=True)
     adopted = become_subreaper()
+    VerifySandbox.adopted = adopted
     mock = bench.MockProvider()
     uv_cache = bench.uv_cache_dir()
     results = []

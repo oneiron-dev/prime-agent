@@ -64,12 +64,14 @@ class PureParts(unittest.TestCase):
         samples.append(sample(5, 0.1, 0.2, stdout_eof=False))
         samples.append(sample(6, 0.1, 0.2, telemetry={"kernel bootstrap": 1}))
         result = {"firstRun": sample(-1, 0.5, 44.0), "samples": samples,
-                  "summary": verify.lag_summary([1.0, 1.0, 1.0, 0.1, 0.1, 0.1])}
+                  "summary": verify.lag_summary([1.0, 1.0, 1.0, 0.1, 0.1, 0.1]),
+                  "teardownSurvivors": [{"pid": 43, "role": "kernel", "cmd": "python -m rlm.repl"}]}
         self.assertEqual(verify.mode_verdict(result, 0.5), [
             "run 3 did not answer cleanly (exit 1)",
             "run 4 left processes alive: 42 bootstrap",
             "run 5 left stdout open after the CLI exited",
             "run 6 recorded 0 'agent headless invoked' events, not 1",
+            "the final sweep found processes alive: 43 kernel",
             "warm p90 lag 1.000s is not under 0.5s",
             "fresh-home first run lag 43.500s is not under 0.5s",
         ])
