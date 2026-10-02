@@ -87,6 +87,25 @@ pub enum DaemonErrorInfo {
     /// supervisor's answer to a saturated route (the Codex
     /// `-32001 "Server overloaded; retry later."` analog on our wire).
     WorkerOverloaded,
+    /// The session worker a create launched exited before the create
+    /// completed (its socket would not bind, it crashed at boot, it died
+    /// mid-handshake). Not a transient: the response's message carries the
+    /// exit status, the worker's last stderr line and its log path, and an
+    /// interactive client reports it and exits instead of falling back to
+    /// the agents view. Advertised as the `worker_startup_failure` server
+    /// capability (schema 31, fork-only).
+    WorkerStartupFailed {
+        worker_id: String,
+        /// The exit code, when the worker exited normally.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// The terminating signal, when a signal ended it (Unix).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
+        /// The worker's captured stderr log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        log_path: Option<String>,
+    },
     /// A `code` this build does not know (a newer daemon's typed
     /// refusal): forwards-compatibility — the unknown code must degrade
     /// to the plain refusal message that rides the same response instead
@@ -499,5 +518,32 @@ mod tests {
         let typed: DaemonErrorInfo =
             serde_json::from_str(r#"{"code":"update_restarting"}"#).expect("parse");
         assert_eq!(typed, DaemonErrorInfo::UpdateRestarting);
+    }
+
+    /// The worker startup failure's wire shape: `camelCase` fields under the
+    /// `snake_case` code, absent optionals omitted (a pre-schema-31 client
+    /// reads the code as `Unknown`, the test above).
+    #[test]
+    fn worker_startup_failed_wire_shape() {
+        let info = DaemonErrorInfo::WorkerStartupFailed {
+            worker_id: "e37f5391bbb4".to_string(),
+            exit_code: Some(1),
+            signal: None,
+            log_path: Some("/agent/logs/worker-e37f5391bbb4.stderr.log".to_string()),
+        };
+        let wire = serde_json::to_value(&info).expect("serialize");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "code": "worker_startup_failed",
+                "workerId": "e37f5391bbb4",
+                "exitCode": 1,
+                "logPath": "/agent/logs/worker-e37f5391bbb4.stderr.log",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<DaemonErrorInfo>(wire).expect("parse"),
+            info
+        );
     }
 }

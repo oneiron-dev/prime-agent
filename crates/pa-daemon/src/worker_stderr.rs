@@ -170,6 +170,30 @@ fn read_tail(path: &Path) -> Result<Option<String>> {
     Ok(Some(contents))
 }
 
+/// The line of the worker's stderr tail a startup failure names: the last
+/// `Error: …` line (what the worker's `main` prints as it exits on an
+/// error, `Error: bind worker socket …`), else the last non-empty line
+/// that is not the Rust runtime's `note: …` hint (a panic's message line).
+/// `Ok(None)` for a missing or silent log.
+///
+/// # Errors
+///
+/// Returns an error when the log exists but cannot be read.
+pub(crate) fn error_line(log_path: &Path) -> Result<Option<String>> {
+    Ok(read_tail(log_path)?.and_then(|tail| {
+        let lines = || {
+            tail.lines()
+                .rev()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+        };
+        lines()
+            .find(|line| line.starts_with("Error:"))
+            .or_else(|| lines().find(|line| !line.starts_with("note: ")))
+            .map(str::to_string)
+    }))
+}
+
 /// Attach the worker's captured stderr tail to a not-ready launch failure
 /// so the error names the panic the supervisor only saw as silence (the
 /// Codex `append_stderr_log_tail_context` + `PidLogTail::append_to_context`
@@ -298,6 +322,48 @@ mod tests {
             "indents the worker's stderr lines: {message}"
         );
         assert!(message.contains("  thread 'main' panicked"));
+    }
+
+    #[test]
+    fn error_line_prefers_the_exit_error_then_the_last_meaningful_line() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exit_error = write_log(
+            dir.path(),
+            "worker-a.stderr.log",
+            "booting\nError: bind worker socket /s/w.sock: path must be shorter than SUN_LEN  \n\n \n",
+        );
+        // anyhow's `Debug` exit: the context line, not the cause below it.
+        let with_causes = write_log(
+            dir.path(),
+            "worker-b.stderr.log",
+            "Error: bind worker socket /s/w.sock\n\nCaused by:\n    Not a directory (os error 20)\n",
+        );
+        let panic = write_log(
+            dir.path(),
+            "worker-c.stderr.log",
+            "thread 'main' panicked at src/worker.rs:9:5:\nboom\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+        );
+        let silent = write_log(dir.path(), "worker-d.stderr.log", "\n\n");
+        assert_eq!(
+            [
+                &exit_error,
+                &with_causes,
+                &panic,
+                &silent,
+                &dir.path().join("absent.stderr.log")
+            ]
+            .map(|path| error_line(path).expect("read")),
+            [
+                Some(
+                    "Error: bind worker socket /s/w.sock: path must be shorter than SUN_LEN"
+                        .to_string()
+                ),
+                Some("Error: bind worker socket /s/w.sock".to_string()),
+                Some("boom".to_string()),
+                None,
+                None,
+            ]
+        );
     }
 
     #[test]
