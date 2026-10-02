@@ -160,6 +160,8 @@ pub(crate) struct SessionUi {
     /// create into the session's scoped list, so a `/new` session keeps
     /// the scope.
     models: Option<Vec<String>>,
+    /// The launch tool selection every `/new` create carries.
+    tool_selection: pa_types::daemon::ToolSelectionFlags,
     /// The model catalog for the `/model` picker: a startup snapshot from
     /// the composition root (the bundled fallback), replaced by the
     /// daemon's `get_model_catalog` response once it lands.

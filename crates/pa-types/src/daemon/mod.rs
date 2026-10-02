@@ -20,11 +20,16 @@ pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
 /// (TS #2506's field, landing ahead of TS main: the Rust deletion lifecycle
 /// captures the tombstoned child's usage durably before any unlink, so the
 /// field is populated where TS's open PR reads a removed path).
-/// Revision 31 (Oneiron fork, ahead of TS) types the create failure of a
-/// worker that died during startup (`errorInfo.code:
-/// "worker_startup_failed"`, the `worker_startup_failure` server
-/// capability); older clients read the code as `Unknown` and keep the
-/// plain message.
+/// Revision 31 is one Oneiron fork-only revision (ahead of TS; its id is
+/// unrelated to the TS fork's revision-31 id) covering every fork change of
+/// the follow-up release:
+/// - the create failure of a worker that died during startup is typed
+///   (`errorInfo.code: "worker_startup_failed"`, server capability
+///   `worker_startup_failure`); older clients read the code as `Unknown` and
+///   keep the plain message;
+/// - the capability-gated `create` keys `tools`/`noTools`/`noBuiltinTools`
+///   (server capability `session_tool_selection`) and the worker summary's
+///   `toolSelection`.
 pub const DAEMON_SCHEMA_REVISION: u64 = 31;
 pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-31-a926532e8319";
 
@@ -117,6 +122,7 @@ mod command;
 pub mod framing;
 mod outbound;
 mod plane;
+mod tool_selection;
 pub mod update_flow;
 mod worker;
 
@@ -134,6 +140,7 @@ pub use plane::{
     command_plane, is_daemon_mutating_command, is_session_plane_daemon_command,
     is_update_drain_command, DaemonCommandPlane,
 };
+pub use tool_selection::{ToolSelectionFlags, SESSION_TOOL_SELECTION_CAPABILITY};
 pub use update_flow::{
     legacy_update_restart_status, legacy_update_restarts_dir, prepared_marker_expiry,
     socket_update_dir, update_intent_path, update_marker_path, update_prepared_dir,

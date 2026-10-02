@@ -200,6 +200,8 @@ async fn abort_during_a_kernel_cell_settles_the_turn_immediately() {
         tools: Vec::new(),
         custom_system_prompt: None,
         prompt_guidelines: Vec::new(),
+        append_system_prompt: Vec::new(),
+        tool_selection: pa_core::session_engine::tool_selection::ToolSelection::Defaults,
         generic_mcp_servers: Vec::new(),
         allow_recursion: None,
         session_manager: Some(session),

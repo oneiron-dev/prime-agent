@@ -155,6 +155,7 @@ async fn the_refused_open_renders_both_ways_out_as_the_notice_panel() {
     // The refused open: the interactive run on the held file answers with
     // the refusal and hands back to the agents view.
     let options = pa_tui::interactive::InteractiveOptions {
+        tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         models: None,
         socket_path: daemon.socket.clone(),
         cwd: PathBuf::from("/tmp"),

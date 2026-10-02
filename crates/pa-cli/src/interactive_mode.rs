@@ -519,6 +519,7 @@ fn build_tui_options(
     let (onboarding, pending_onboarding_stages) =
         onboarding_task(options, Some(provider_auth.clone()));
     let tui_options_value = InteractiveOptions {
+        tool_selection: config.tool_selection_flags(),
         code_block_indent,
         tree_filter_mode,
         branch_summary_skip_prompt,

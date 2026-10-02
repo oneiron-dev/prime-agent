@@ -247,6 +247,11 @@ impl Supervisor {
             "skills",
             "promptTemplates",
             "autonomous",
+            // The launch tool selection: a respawned worker must rebuild
+            // the session with the same tools, never the defaults.
+            "tools",
+            "noTools",
+            "noBuiltinTools",
         ] {
             if let Some(value) = config_object.and_then(|config| config.get(key)) {
                 durable_rest.insert(key.to_string(), value.clone());

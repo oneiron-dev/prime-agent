@@ -46,6 +46,7 @@ pub mod slash_commands;
 pub mod state_restore_notice;
 pub mod telemetry;
 pub mod tool_bridge;
+pub mod tool_selection;
 pub(crate) mod transport_adoption;
 pub mod turn_boundary;
 

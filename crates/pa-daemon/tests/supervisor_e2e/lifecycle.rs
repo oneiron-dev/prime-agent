@@ -64,6 +64,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
             "agent_roster",
             "direct_peer_transport",
             "worker_startup_failure",
+            "session_tool_selection",
         ])
     );
 

@@ -145,6 +145,7 @@ async fn a_worker_dying_at_startup_ends_the_interactive_open_with_its_error() {
     )
     .expect("write script");
     let options = pa_tui::interactive::InteractiveOptions {
+        tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         models: None,
         socket_path: socket.clone(),
         cwd: dir.path().to_path_buf(),

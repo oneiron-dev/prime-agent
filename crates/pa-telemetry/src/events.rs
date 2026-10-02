@@ -531,6 +531,27 @@ impl HeadlessJsonEventProfile {
     }
 }
 
+/// The tool selection of a headless run (`--tools`/`--no-tools`/
+/// `--no-builtin-tools`, resolved by precedence). Never the tool names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadlessToolSelection {
+    Default,
+    NoTools,
+    NoBuiltinTools,
+    Allowlist,
+}
+
+impl HeadlessToolSelection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::NoTools => "no_tools",
+            Self::NoBuiltinTools => "no_builtin_tools",
+            Self::Allowlist => "allowlist",
+        }
+    }
+}
+
 /// `agent headless invoked`: one per print/json run, the headless flags it
 /// used. Primitives only: no prompt, path, or session identity.
 #[derive(Debug, Clone)]
@@ -538,6 +559,7 @@ pub struct AgentHeadlessInvoked {
     pub mode: HeadlessMode,
     pub daemon_hosted: bool,
     pub json_event_profile: HeadlessJsonEventProfile,
+    pub tool_selection: HeadlessToolSelection,
 }
 
 impl AgentHeadlessInvoked {
@@ -549,6 +571,7 @@ impl AgentHeadlessInvoked {
             "json_event_profile",
             Value::from(self.json_event_profile.as_str()),
         );
+        properties.set("tool_selection", Value::from(self.tool_selection.as_str()));
         client.track("agent headless invoked", properties);
     }
 }
@@ -699,7 +722,7 @@ mod tests {
         assert!(!properties.contains_key("error_message"), "no raw message");
     }
 
-    /// The headless adoption event carries exactly its three primitives,
+    /// The headless adoption event carries exactly its four primitives,
     /// inside the catalog vocabularies (waits on the flush, not a sleep).
     #[tokio::test]
     async fn headless_invoked_carries_the_headless_flags() {
@@ -709,6 +732,7 @@ mod tests {
             mode: HeadlessMode::Json,
             daemon_hosted: true,
             json_event_profile: HeadlessJsonEventProfile::FactoryCompleted,
+            tool_selection: HeadlessToolSelection::NoTools,
         }
         .track(&client);
         client.flush().await.unwrap();
@@ -720,7 +744,13 @@ mod tests {
                 let mut properties: serde_json::Map<String, serde_json::Value> =
                     event.properties.into();
                 properties.retain(|key, _| {
-                    ["mode", "daemon_hosted", "json_event_profile"].contains(&key.as_str())
+                    [
+                        "mode",
+                        "daemon_hosted",
+                        "json_event_profile",
+                        "tool_selection",
+                    ]
+                    .contains(&key.as_str())
                 });
                 properties
             })
@@ -729,6 +759,7 @@ mod tests {
             "mode": "json",
             "daemon_hosted": true,
             "json_event_profile": "factory-completed",
+            "tool_selection": "no_tools",
         });
         assert_eq!(tracked, vec![expected.as_object().unwrap().clone()]);
         for mode in [HeadlessMode::Text, HeadlessMode::Json] {
@@ -739,6 +770,14 @@ mod tests {
             HeadlessJsonEventProfile::FactoryCompleted,
         ] {
             assert!(crate::catalog::JSON_EVENT_PROFILES.contains(&profile.as_str()));
+        }
+        for selection in [
+            HeadlessToolSelection::Default,
+            HeadlessToolSelection::NoTools,
+            HeadlessToolSelection::NoBuiltinTools,
+            HeadlessToolSelection::Allowlist,
+        ] {
+            assert!(crate::catalog::HEADLESS_TOOL_SELECTIONS.contains(&selection.as_str()));
         }
     }
 
