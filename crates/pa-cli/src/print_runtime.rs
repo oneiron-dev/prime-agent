@@ -367,29 +367,46 @@ impl From<HeadlessEngine> for pa_daemon::rpc::session::RpcEngineHandle {
 }
 
 fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
+    if options.verbose {
+        crate::headless_exit::enable_trace();
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    rt.block_on(print_mode_main(options))
+    let result = rt.block_on(print_mode_main(options));
+    // The exit follows the answer: a bounded runtime shutdown, never the
+    // implicit drop's unbounded wait for blocking work still running.
+    crate::headless_exit::shut_down(rt);
+    result
 }
 
 async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
     crate::print_terminal::track_headless_invocation(options).await;
     let headless = build_headless_engine(options, "print").await?;
     let engine = std::sync::Arc::new(headless.engine);
-    // The CLI `--goal` seed (TS constructor seeding): a fresh root branch
-    // starts the goal and queues its continuation context as the first
-    // turn's leading row; a resumed or already-seeded branch keeps its
-    // persisted goal. Depth 0 only — the print session is a root session
-    // (TS main.ts gates `initialGoal` on `rlmDepth === 0` the same way).
-    if let Some(goal) = &options.config.initial_goal {
-        engine
-            .seed_initial_goal(&goal.objective, goal.token_budget.map(u64::from))
-            .await
-            .map_err(|error| format!("{error:#}"))?;
+    let result = async {
+        // The CLI `--goal` seed (TS constructor seeding): a fresh root
+        // branch starts the goal and queues its continuation context as
+        // the first turn's leading row; a resumed or already-seeded branch
+        // keeps its persisted goal. Depth 0 only — the print session is a
+        // root session (TS main.ts gates `initialGoal` on `rlmDepth === 0`
+        // the same way).
+        if let Some(goal) = &options.config.initial_goal {
+            engine
+                .seed_initial_goal(&goal.objective, goal.token_budget.map(u64::from))
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+        }
+        run_prompts_and_emit(&engine, &headless.model, headless.api_key.clone(), options).await
     }
-    run_prompts_and_emit(&engine, &headless.model, headless.api_key.clone(), options).await
+    .await;
+    // Every output and every semantic drain is done: the kernel's
+    // background boot (and any setup step it runs) is abandoned now, its
+    // children killed, instead of finishing after the answer.
+    crate::headless_exit::phase("kernel abandon");
+    engine.abandon_kernel();
+    result
 }
 
 /// Assemble the in-process session engine for a headless run: model
@@ -612,9 +629,10 @@ async fn build_headless_engine_with(
             model_info: Some(model.clone()),
             // TS print/headless sessions build through the same
             // `createDefaultRuntimeFactory` runtime (prewarmIpythonKernel:
-            // true), so the kernel boots in the background at creation;
-            // the engine's depth-0 gate matches the TS session's.
-            prewarm_ipython_kernel: Some(true),
+            // true), so the kernel prewarms at creation; the engine's
+            // depth-0 gate matches the TS session's. A one-shot print/json
+            // run finishes the environment setup before its first turn.
+            prewarm_ipython_kernel: Some(kernel_prewarm(options.app_mode)),
             on_background_work_settled: None,
             queued_goal_context_purge: None,
             queued_steering_probe: None,
@@ -629,6 +647,20 @@ async fn build_headless_engine_with(
         api_key: resolved.api_key,
         provider_target,
     })
+}
+
+/// How an in-process engine prepares its kernel: a one-shot print/json run
+/// finishes the environment setup before its first turn (its exit abandons
+/// the background boot), a long-lived transport boots in the background.
+fn kernel_prewarm(app_mode: AppMode) -> pa_core::session_engine::engine::KernelPrewarm {
+    match app_mode {
+        AppMode::Print | AppMode::Json => {
+            pa_core::session_engine::engine::KernelPrewarm::BeforeFirstTurn
+        }
+        AppMode::Interactive | AppMode::Rpc | AppMode::Acp | AppMode::Daemon => {
+            pa_core::session_engine::engine::KernelPrewarm::Background
+        }
+    }
 }
 
 /// The headless stream seam over the shared provider-target slot with the
@@ -1498,6 +1530,7 @@ async fn run_prompts_and_emit(
         eprintln!("{stderr}");
         exit_code = 1;
     }
+    crate::headless_exit::phase("answer written");
     // The TS disposal order: print mode returns its exit code first, then
     // the connection teardown disposes the session — which drains a
     // compact-trigger auto-refine that no later boundary consumed (TS
@@ -1505,9 +1538,11 @@ async fn run_prompts_and_emit(
     // turn"). The event subscription is already gone at this point, so the
     // round's surface stays off the stream; the durable rows and the
     // harness state persist.
+    crate::headless_exit::phase("semantic drain start");
     boundary
         .drain_compact_auto_refine_at_disposal(engine, model, api_key, global_harness_dir)
         .await;
+    crate::headless_exit::phase("semantic drain end");
     Ok(exit_code)
 }
 

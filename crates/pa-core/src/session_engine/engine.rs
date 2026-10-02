@@ -99,14 +99,14 @@ pub struct SessionEngineConfig {
     /// ("one-at-a-time").
     pub steering_mode: Option<pa_agent::agent::QueueMode>,
     pub follow_up_mode: Option<pa_agent::agent::QueueMode>,
-    /// Boot the session's kernel in the background at creation (TS
-    /// `prewarmIpythonKernel` from `createDefaultRuntimeFactory`): a main
-    /// session (depth 0, the engine's gate like the TS `rlmDepth === 0`
-    /// check) whose `ipython` tool is active starts its kernel without
-    /// waiting for the first tool call. Boot failures are swallowed (they
+    /// Prepare the session's kernel at creation (TS `prewarmIpythonKernel`
+    /// from `createDefaultRuntimeFactory`): a main session (depth 0, the
+    /// engine's gate like the TS `rlmDepth === 0` check) whose `ipython`
+    /// tool is active starts its kernel without waiting for the first tool
+    /// call, as [`KernelPrewarm`] says. Boot failures are swallowed (they
     /// surface on the next `ensure()`), and the lazy first-call start
-    /// stays intact.
-    pub prewarm_ipython_kernel: Option<bool>,
+    /// stays intact. `None` prewarms only a resumed session's snapshot.
+    pub prewarm_ipython_kernel: Option<KernelPrewarm>,
     /// Fires when the session kernel's last live background `bash()`
     /// handle settles (its activity track empties or the kernel tears
     /// down): TS `AgentSession` wires its owed-continuation resume pair
@@ -134,6 +134,24 @@ pub struct SessionEngineConfig {
 }
 
 /// An assembled, running session.
+/// How a session prepares its kernel at creation
+/// ([`SessionEngineConfig::prewarm_ipython_kernel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelPrewarm {
+    /// Boot the whole kernel - environment setup included - in the
+    /// background: a resident session (the daemon worker, RPC, ACP) has
+    /// the time, and its first turn need not wait for it.
+    Background,
+    /// Finish the kernel's environment setup (a fresh home's venv build,
+    /// missing skill installs, the readiness probe) before
+    /// [`create_session`] returns, then boot the kernel process in the
+    /// background: a one-shot run (print/json) never runs setup after its
+    /// answer, and its exit abandons the boot
+    /// ([`SessionEngine::abandon_kernel`]). A failed setup starts no
+    /// background boot; the first `ipython` call retries it.
+    BeforeFirstTurn,
+}
+
 pub struct SessionEngine {
     pub session: AgentSession,
     pub skills: Vec<crate::skills::Skill>,
@@ -580,12 +598,25 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // Failures are swallowed there and surface on the next `ensure()`, and
     // an already-started kernel short-circuits it, so the lazy first-call
     // start stays the fallback.
-    let prewarm_configured =
-        config.prewarm_ipython_kernel.unwrap_or(false) && config.rlm_depth.unwrap_or(0) == 0;
-    if (prewarm_configured || has_snapshot)
-        && active_tool_names.iter().any(|name| name == "ipython")
-    {
-        provisioner.prewarm();
+    // `BeforeFirstTurn` (a one-shot run) awaits the environment setup
+    // here, so a fresh home's venv build lands before the first turn and
+    // never after the answer; only the process boot stays in the
+    // background, abandoned at exit.
+    let prewarm_configured = config
+        .prewarm_ipython_kernel
+        .filter(|_| config.rlm_depth.unwrap_or(0) == 0);
+    if active_tool_names.iter().any(|name| name == "ipython") {
+        match (prewarm_configured, has_snapshot) {
+            (Some(KernelPrewarm::BeforeFirstTurn), _) => {
+                // A failed setup boots nothing in the background: the
+                // boot would only repeat it after the answer.
+                if provisioner.prepare_environment().await.is_ok() {
+                    provisioner.prewarm();
+                }
+            }
+            (Some(KernelPrewarm::Background), _) | (None, true) => provisioner.prewarm(),
+            (None, false) => {}
+        }
     }
 
     let prompt_guidelines = config.prompt_guidelines.clone();
@@ -1000,6 +1031,16 @@ impl SessionEngine {
     /// session that owns it.
     pub async fn dispose_kernel(&self) {
         self.provisioner.dispose(None).await;
+    }
+
+    /// Give the session's kernel up at once, without a final snapshot: a
+    /// one-shot host's last step after its output. An in-flight
+    /// environment setup or boot is cancelled (its subprocesses killed and
+    /// reaped) and a running kernel is killed - what dropping the engine
+    /// does, made explicit and immediate so nothing the kernel started
+    /// outlives the answer.
+    pub fn abandon_kernel(&self) {
+        self.provisioner.abandon();
     }
 
     /// End the session (TS `AgentSession.dispose`): the provider

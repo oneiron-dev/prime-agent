@@ -1165,7 +1165,9 @@ impl AgentSessionEngine {
             // engine's depth gate keeps subagent workers (rlmDepth > 0) on
             // the lazy first-call start, exactly like the TS session's
             // `rlmDepth === 0` check.
-            prewarm_ipython_kernel: Some(true),
+            prewarm_ipython_kernel: Some(
+                pa_core::session_engine::engine::KernelPrewarm::Background,
+            ),
             on_background_work_settled,
             // TS `_clearQueuedGoalContexts` (the session-command sites and
             // the kernel's `goal.complete`): the worker-installed queue

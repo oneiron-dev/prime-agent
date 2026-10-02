@@ -40,9 +40,6 @@ use crate::supervisor::SESSION_WORKER_TIMED_OUT;
 /// on the client: the supervisor bounds each route and the client waits
 /// again while the worker is still running.
 const REQUEST_BOUND: ResponseWait = ResponseWait::Within(Duration::from_secs(120));
-/// Bound for the detach on the way out: an exit must not hang on a daemon
-/// that stopped answering (closing the socket detaches anyway).
-const DETACH_BOUND: ResponseWait = ResponseWait::Within(Duration::from_secs(5));
 /// The server capability an admitted prompt and its
 /// `cancel_prompt_admission` read require (TS
 /// `PROMPT_ADMISSION_CANCELLATION_COMMAND`).
@@ -514,15 +511,20 @@ impl HostedHeadlessSession {
             .collect()
     }
 
-    /// Leave the session running: detach (bounded), then close the
-    /// connection. Never kills or completes the resident session.
-    pub async fn close(&self) {
+    /// Leave the session running: detach, waiting at most `detach_bound`
+    /// for the answer (the caller's exit budget: an exit must not hang on
+    /// a daemon that stopped answering), then close the connection, which
+    /// detaches anyway. Never kills or completes the resident session.
+    pub async fn close(&self, detach_bound: Duration) {
         let detach = DaemonCommand::Detach {
             id: None,
             active_session_id: Some(self.active_session_id.clone()),
             rest: Map::default(),
         };
-        let _ = self.link.request(detach, DETACH_BOUND).await;
+        let _ = self
+            .link
+            .request(detach, ResponseWait::Within(detach_bound))
+            .await;
         self.link.close();
     }
 }

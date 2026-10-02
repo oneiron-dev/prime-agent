@@ -169,6 +169,9 @@ fn recording() -> (super::HostedEventSink, Arc<Mutex<Vec<Value>>>) {
     )
 }
 
+/// The detach bound the scripted runs leave with (their fake answers it).
+const DETACH_WITHIN: Duration = Duration::from_secs(5);
+
 /// Failure bound for one awaited step (never a readiness wait).
 async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(30), future)
@@ -229,7 +232,7 @@ async fn completion_waits_for_the_events_its_responses_overtook() {
         *events.lock().unwrap(),
         vec![agent_start, message_end, agent_end, compaction_end]
     );
-    bounded(session.close()).await;
+    bounded(session.close(DETACH_WITHIN)).await;
     assert_eq!(
         fake.commands(),
         [
@@ -693,7 +696,43 @@ async fn close_detaches_and_never_stops_the_session() {
     let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
         .await
         .unwrap();
-    bounded(session.close()).await;
+    bounded(session.close(DETACH_WITHIN)).await;
+    assert_eq!(fake.commands(), ["create", "attach", "detach"]);
+}
+
+/// A daemon that never answers the detach costs the leaving client its
+/// exit budget and no more: the detach went out, the wait ended at the
+/// bound (the paused clock advances only to the timer that fired, rounded
+/// up to the timer wheel's millisecond), and the connection closed.
+#[tokio::test]
+async fn an_unanswered_detach_ends_at_the_exit_budget() {
+    let (detach_tx, mut detach_rx) = tokio::sync::mpsc::unbounded_channel();
+    let fake = FakeSupervisor::start(Box::new(move |kind, command| {
+        if let Some(replies) = opening(kind) {
+            return replies;
+        }
+        match kind {
+            // Never answered: the daemon stopped responding.
+            "detach" => {
+                let _ = detach_tx.send(command["activeSessionId"].clone());
+                Vec::new()
+            }
+            other => panic!("unexpected command {other}"),
+        }
+    }));
+    let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
+        .await
+        .unwrap();
+    let exit_budget = Duration::from_millis(300);
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    session.close(exit_budget).await;
+    let waited = started.elapsed();
+    assert!(
+        waited >= exit_budget && waited < exit_budget + Duration::from_millis(2),
+        "the detach wait ended at the exit budget: {waited:?}"
+    );
+    assert_eq!(bounded(detach_rx.recv()).await, Some(json!("s1")));
     assert_eq!(fake.commands(), ["create", "attach", "detach"]);
 }
 

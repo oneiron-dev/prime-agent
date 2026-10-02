@@ -40,6 +40,7 @@ pub(crate) mod daemon_session_list;
 pub(crate) mod file_processor;
 pub(crate) mod global_flags;
 pub(crate) mod headless_autonomous;
+pub(crate) mod headless_exit;
 pub(crate) mod hosted_print;
 pub(crate) mod incident;
 pub(crate) mod initial_message;

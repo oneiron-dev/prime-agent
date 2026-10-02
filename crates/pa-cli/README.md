@@ -88,6 +88,20 @@ withdrawn and the run fails, and a prompt nothing holds fails the run
 rather than report one that may never have run. Each print/json run reports `agent headless invoked` (mode,
 daemon_hosted, json_event_profile). Verifiers: `headless_flags_e2e`,
 `hosted_print_e2e`.
+The exit follows the answer (`headless_exit.rs`): an in-process print/json
+engine prepares its kernel with pa-core's `KernelPrewarm::BeforeFirstTurn`
+(a fresh home's kernel environment is set up before the first turn; only
+the kernel process boots in the background), every semantic drain runs as
+before, then the run abandons the kernel (`SessionEngine::abandon_kernel`),
+flushes stdout/stderr and shuts its runtime down within `EXIT_BUDGET`
+(300 ms) instead of the runtime drop's unbounded wait. RPC and ACP keep
+`KernelPrewarm::Background`. The hosted client's detach waits the same
+budget (closing the connection detaches anyway) and its runtime shuts down
+the same way. `--verbose` prints the timestamped exit phases (answer
+written, semantic drain, kernel abandon, output flush, runtime shutdown;
+hosted: detach) and the kernel environment trace (readiness check, each
+bootstrap subprocess's start and end) to stderr. Verifiers:
+`headless_exit_e2e`, `scripts/oneiron/verify_headless_exit.py`.
 
 ## Daemon client
 The daemon-backed public commands (`list`, `stop`, `rename`, `send`, `schedule`) talk to the

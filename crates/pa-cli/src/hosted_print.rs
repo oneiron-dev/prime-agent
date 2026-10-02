@@ -71,11 +71,16 @@ pub(crate) fn run_hosted_print(options: &RunOptions) -> Result<i32, String> {
             if unsupported.len() == 1 { "it" } else { "them" }
         ));
     }
+    if options.verbose {
+        crate::headless_exit::enable_trace();
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    runtime.block_on(hosted_print_main(options))
+    let result = runtime.block_on(hosted_print_main(options));
+    crate::headless_exit::shut_down(runtime);
+    result
 }
 
 async fn hosted_print_main(options: &RunOptions) -> Result<i32, String> {
@@ -152,7 +157,7 @@ async fn hosted_print_main(options: &RunOptions) -> Result<i32, String> {
                 "No models available. Check your installation or add models to models.json."
             )
         );
-        session.close().await;
+        session.close(crate::headless_exit::EXIT_BUDGET).await;
         return Ok(1);
     }
 
@@ -161,8 +166,12 @@ async fn hosted_print_main(options: &RunOptions) -> Result<i32, String> {
         exit_code = run => exit_code,
         exit_code = termination_signal() => exit_code,
     };
-    // Detach + close (TS `dispose`): the resident session keeps running.
-    session.close().await;
+    // Detach + close (TS `dispose`): the resident session keeps running;
+    // the detach waits at most the exit budget (closing detaches anyway).
+    crate::headless_exit::phase("answer written");
+    crate::headless_exit::phase("detach start");
+    session.close(crate::headless_exit::EXIT_BUDGET).await;
+    crate::headless_exit::phase("detach end");
     Ok(exit_code)
 }
 
