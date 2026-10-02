@@ -317,3 +317,34 @@ fn headless_run_tracks_its_flags() {
         })]
     );
 }
+
+/// The faux print builder honours the tool flags like the real one: a
+/// `--no-tools` run's request carries the TS no-tools prompt (echoed back
+/// by the `{"systemPrompt": true}` step), not the layered harness.
+#[test]
+fn faux_print_no_tools_sends_the_ts_no_tools_prompt() {
+    let home = tempfile::TempDir::new().unwrap();
+    let script = json!({ "responses": [{ "systemPrompt": true }] });
+    let (stdout, stderr, code) = run_in_home(
+        home.path(),
+        &[
+            "-p",
+            "--no-session",
+            "--no-skills",
+            "--no-context-files",
+            "--no-tools",
+            "hi",
+        ],
+        &script,
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.starts_with("You are a general purpose agent that uses code to solve tasks.\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\nConversation log: not persisted\nRecursive agent depth: 0\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("# prime-agent harness"), "{stdout}");
+}

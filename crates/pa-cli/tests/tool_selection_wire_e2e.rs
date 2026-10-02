@@ -359,6 +359,46 @@ fn system_and_tools(body: &Value) -> (String, Option<Value>) {
     (system, body.get("tools").cloned())
 }
 
+/// One daemon command on a fresh connection to the sandbox socket; the
+/// response with the command's id (the read timeout is a failure bound).
+fn daemon_request(socket: &std::path::Path, command: &Value) -> Value {
+    let stream = UnixStream::connect(socket).expect("the hosted run started the daemon");
+    stream.set_read_timeout(Some(STEP_BOUND)).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let envelope = json!({
+        "type": "command",
+        "id": "probe",
+        "protocol": { "name": "prime-agent.daemon", "version": 7 },
+        "command": command,
+    });
+    writeln!(writer, "{envelope}").unwrap();
+    BufReader::new(stream)
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(&line.expect("a daemon line")).unwrap())
+        .find(|frame| frame["type"] == "response" && frame["id"] == "probe")
+        .expect("the daemon answered")
+}
+
+/// SIGKILL one sandbox worker (a process this test's hosted run caused)
+/// and wait for its exit through a pidfd.
+fn kill_worker(pid: u32) {
+    let pidfd = pa_core::platform::process::open_pidfd(pid).expect("the worker is alive");
+    unsafe {
+        assert_eq!(libc::kill(pid as libc::pid_t, libc::SIGKILL), 0);
+        let mut exited = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            libc::poll(&raw mut exited, 1, STEP_BOUND.as_millis() as i32),
+            1,
+            "the killed worker exits inside the step bound"
+        );
+        libc::close(pidfd);
+    }
+}
+
 /// The value of the `<label>: ` line of a prompt.
 fn prompt_line<'a>(prompt: &'a str, label: &str) -> &'a str {
     prompt
@@ -368,7 +408,8 @@ fn prompt_line<'a>(prompt: &'a str, label: &str) -> &'a str {
 }
 
 /// Standalone print: every no-tools flag form sends no tool definitions
-/// and exactly the TS no-tools prompt (TS size for the same cwd).
+/// and exactly the TS no-tools prompt (TS size for the same cwd), in text
+/// and json mode alike.
 #[test]
 fn standalone_no_tools_forms_send_the_ts_prompt_and_no_tools() {
     for flags in [
@@ -377,10 +418,16 @@ fn standalone_no_tools_forms_send_the_ts_prompt_and_no_tools() {
         &["--no-builtin-tools"],
         &["--tools", ""],
         &["--tools", "read-me-not"],
+        // Both disable flags with an explicit list, in both orders: the
+        // list (empty here) wins.
+        &["--no-tools", "--no-builtin-tools", "--tools", ""],
+        &["--tools", "", "-nbt", "-nt"],
     ] {
         let sandbox = Sandbox::new();
         let mut args = vec![
             "-p",
+            "--mode",
+            if flags.len() % 2 == 0 { "json" } else { "text" },
             "--no-session",
             "--no-skills",
             "--no-context-files",
@@ -389,11 +436,12 @@ fn standalone_no_tools_forms_send_the_ts_prompt_and_no_tools() {
         args.extend_from_slice(flags);
         args.extend(["--", "Reply with exactly the words: probe ok."]);
         let (stdout, stderr, code) = sandbox.run(&args);
-        assert_eq!(
-            (stdout.as_str(), code),
-            ("probe ok\n", 0),
-            "{flags:?}: {stderr}"
-        );
+        assert_eq!(code, 0, "{flags:?}: {stderr}");
+        if flags.len() % 2 == 0 {
+            assert!(stdout.contains("\"probe ok\""), "{flags:?}: {stdout}");
+        } else {
+            assert_eq!(stdout, "probe ok\n", "{flags:?}");
+        }
         let bodies = sandbox.mock.bodies();
         assert_eq!(bodies.len(), 1, "{flags:?}: one request");
         let (system, tools) = system_and_tools(&bodies[0]);
@@ -406,9 +454,9 @@ fn standalone_no_tools_forms_send_the_ts_prompt_and_no_tools() {
 }
 
 /// Daemon-hosted print: the worker sends no tools and the TS no-tools
-/// prompt, the durable create carries the selection a respawned worker
-/// replays, a run with other tool flags never reuses the live session, and
-/// one with the same flags does.
+/// prompt, the durable create carries the selection and a respawned worker
+/// (after a crash) serves it again, a run with other tool flags never
+/// reuses the live session, and one with the same flags does.
 #[test]
 fn hosted_no_tools_reaches_the_worker_and_guards_reuse() {
     let sandbox = Sandbox::new();
@@ -434,6 +482,40 @@ fn hosted_no_tools_reaches_the_worker_and_guards_reuse() {
     let creates = sandbox.durable_creates();
     assert_eq!(creates.len(), 1, "{creates:?}");
     assert_eq!(creates[0]["noTools"], json!(true), "{}", creates[0]);
+
+    // A crashed worker's respawn replays that durable create: the
+    // supervisor parks a client route until the replacement answers, and
+    // the replacement serves the same no-tools session.
+    let list = daemon_request(&sandbox.socket(), &json!({ "type": "list" }));
+    let row = list["data"]["sessions"][0].clone();
+    let first_pid = row["workerPid"].as_u64().expect("a live worker pid") as u32;
+    let active_session_id = row["activeSessionId"].clone();
+    assert_eq!(row["toolSelection"], json!({ "noTools": true }), "{row}");
+    kill_worker(first_pid);
+    let respawned_prompt = daemon_request(
+        &sandbox.socket(),
+        &json!({ "type": "get_system_prompt", "activeSessionId": active_session_id }),
+    );
+    assert_eq!(
+        respawned_prompt["data"]["systemPrompt"].as_str(),
+        Some(system.as_str()),
+        "{respawned_prompt}"
+    );
+    let ipython = daemon_request(
+        &sandbox.socket(),
+        &json!({
+            "type": "get_tool_definition", "activeSessionId": active_session_id, "name": "ipython",
+        }),
+    );
+    assert_eq!(ipython["data"], json!({}), "{ipython}");
+    let list = daemon_request(&sandbox.socket(), &json!({ "type": "list" }));
+    let row = &list["data"]["sessions"][0];
+    assert_ne!(
+        row["workerPid"],
+        json!(first_pid),
+        "a new worker serves the session"
+    );
+    assert_eq!(row["toolSelection"], json!({ "noTools": true }), "{row}");
 
     let (stdout, stderr, code) = sandbox.run(&["--daemon-hosted", "-c", "-p", "two"]);
     assert_eq!((stdout.as_str(), code), ("", 1));

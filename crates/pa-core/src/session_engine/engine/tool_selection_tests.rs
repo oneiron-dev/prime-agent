@@ -157,7 +157,7 @@ async fn each_selection_reaches_the_provider_request() {
         ),
     ];
     for (selection, tools, layered) in cases {
-        let (request, _, _) = first_request(selection.clone()).await;
+        let (request, system_prompt, fixture) = first_request(selection.clone()).await;
         assert_eq!(
             request,
             Request {
@@ -166,6 +166,17 @@ async fn each_selection_reaches_the_provider_request() {
             },
             "selection {selection:?}"
         );
+        if !layered {
+            // Content and size: exactly the TS no-tools prompt.
+            assert_eq!(
+                system_prompt,
+                ts_no_tools_prompt(
+                    &fixture.cwd.display().to_string(),
+                    &fixture.log.display().to_string(),
+                ),
+                "selection {selection:?}"
+            );
+        }
     }
 }
 
