@@ -188,6 +188,9 @@ class Fixture(unittest.TestCase):
             # A TS-chosen bytecode cache must not survive into the Rust process either.
             "PYTHONPYCACHEPREFIX": "/ts/pycache",
         })
+        # tempfile caches the first TMPDIR it reads; drop the cache so the code under
+        # test uses this test's TMPDIR, not an earlier test's deleted one.
+        tempfile.tempdir = None
 
     def tearDown(self) -> None:
         os.chdir(self.saved_cwd)
@@ -195,6 +198,7 @@ class Fixture(unittest.TestCase):
             setattr(side_by_side, name, value)
         os.environ.clear()
         os.environ.update(self.saved_env)
+        tempfile.tempdir = None
         self.tmp.cleanup()
 
     @contextlib.contextmanager
@@ -227,6 +231,11 @@ class Fixture(unittest.TestCase):
 
 
 class InstallerTests(Fixture):
+    def test_temporary_files_follow_this_tests_tmpdir(self) -> None:
+        # install() makes its scratch dirs with tempfile's default dir; a value
+        # cached by an earlier test points into that test's deleted sandbox.
+        self.assertEqual(Path(tempfile.gettempdir()), self.fake_tmp)
+
     def test_install_activates_an_isolated_launcher_and_leaves_ts_alone(self) -> None:
         self.install()
         self.assertEqual(os.readlink(self.prefix / "current"), VERSION)

@@ -396,6 +396,7 @@ class RolloutTests(RolloutFixture):
             with self.subTest(platform=platform):
                 side_by_side.SOCKET_PLATFORM = platform
                 os.environ["TMPDIR"] = str(tmpdir)
+                tempfile.tempdir = None
                 self.assertEqual(daemon_idle.default_socket_path(), expected)
                 self.assertEqual(self.main("rollout", "--version", V1), 0)
                 self.assertEqual(self.receipt(V1)["rustDaemon"]["idleBeforeInstall"],
