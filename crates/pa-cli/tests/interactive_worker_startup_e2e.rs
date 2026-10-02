@@ -14,11 +14,11 @@
 // The Tier-C/D ruling (fleet-uniform, 2026-09-28), as in the suite's other
 // interactive e2es: the interactive run's future is stack-resident by
 // design, and the test is one linear scenario (the options literal alone
-// is 35 lines); the pid narrows at the kill(2) boundary.
+// is 35 lines); the u32 pid converts to pid_t at the kill(2) boundary.
 #![allow(
     clippy::large_futures,
     clippy::too_many_lines,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_wrap
 )]
 
 use std::io::{BufRead, BufReader, Write};
@@ -28,8 +28,10 @@ use std::time::Duration;
 
 /// Shuts the spawned supervisor down on scope exit (a failing test's
 /// unwind included); the shutdown response is the sync point. A supervisor
-/// that does not answer it is killed by the pid its own hello reported
-/// (the one process this test started, through the CLI's launch path).
+/// that does not answer it is killed by the pid its own hello reported,
+/// and only while that pid still carries the process start identity the
+/// hello reported (the one process this test started, through the CLI's
+/// launch path; a reaped supervisor's recycled pid is never signalled).
 struct SpawnedDaemon {
     socket: PathBuf,
 }
@@ -45,9 +47,14 @@ impl Drop for SpawnedDaemon {
         let mut reader = BufReader::new(stream);
         let mut hello = String::new();
         let _ = reader.read_line(&mut hello);
-        let supervisor_pid = serde_json::from_str::<serde_json::Value>(hello.trim())
+        let identity = serde_json::from_str::<serde_json::Value>(hello.trim())
             .ok()
-            .and_then(|hello| hello["supervisorPid"].as_i64());
+            .and_then(|hello| {
+                Some((
+                    u32::try_from(hello["supervisorPid"].as_u64()?).ok()?,
+                    hello["supervisorProcessStartId"].as_str()?.to_string(),
+                ))
+            });
         let command = serde_json::json!({
             "type": "command",
             "id": "test-shutdown",
@@ -60,10 +67,13 @@ impl Drop for SpawnedDaemon {
             .set_read_timeout(Some(Duration::from_secs(5)));
         let mut response = String::new();
         let answered = reader.read_line(&mut response).is_ok_and(|read| read > 0);
-        if let (false, Some(pid)) = (answered, supervisor_pid) {
-            // SAFETY: kill(2) on the supervisor this test started.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        if let (false, Some((pid, start_id))) = (answered, identity) {
+            if pa_daemon::protocol::process_start_id(pid).as_deref() == Some(start_id.as_str()) {
+                // SAFETY: kill(2) on the supervisor this test started, its
+                // identity re-checked just above.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
             }
         }
     }
