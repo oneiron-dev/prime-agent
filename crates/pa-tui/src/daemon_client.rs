@@ -39,14 +39,22 @@ pub use errors::{
 /// Default response timeout (TS `DEFAULT_DAEMON_REQUEST_TIMEOUT_MS`).
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// A `create`'s response timeout. Oneiron fork (TS waits the default 30s):
-/// the daemon's own launch budget for a worker that never comes up is the
-/// same 30s connect deadline plus up to the 10s auth floor, so an equal
-/// client deadline expired first and the daemon's diagnostic (the worker's
-/// exit status, its stderr line, its log path) never reached the user. The
-/// client waits past that budget instead, so the daemon always answers
-/// first: a dead worker within moments of its exit, a never-ready one at
-/// its deadline.
+/// the daemon's launch budget for a worker that never comes up (the socket
+/// probe, connect and auth) is its default connect deadline (30s Unix, 90s
+/// Windows) plus up to the 10s auth floor, so an equal client deadline
+/// expired first and the daemon's diagnostic (the exit status, the stderr
+/// line, the log path) never reached the user. The client outlasts that
+/// default budget instead, so a worker that never comes up, or dies while
+/// starting, is reported by the daemon. The create itself (the session
+/// load inside the worker) stays bounded by this wait as it was by the old
+/// one: a worker that dies past it is still reported by the daemon at once,
+/// but to a client that already gave up on a create that slow. The launch
+/// budget's test override (`PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS`) is not
+/// tracked.
+#[cfg(unix)]
 const CREATE_REQUEST_TIMEOUT_MS: u64 = 60_000;
+#[cfg(not(unix))]
+const CREATE_REQUEST_TIMEOUT_MS: u64 = 120_000;
 /// Requests whose completion is bounded by the turn itself
 /// (`prompt_and_wait`, `wait_for_idle`) use the supervisor's long route
 /// timeout so a long turn cannot expire the request.

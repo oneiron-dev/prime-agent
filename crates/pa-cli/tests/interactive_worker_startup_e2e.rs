@@ -14,8 +14,12 @@
 // The Tier-C/D ruling (fleet-uniform, 2026-09-28), as in the suite's other
 // interactive e2es: the interactive run's future is stack-resident by
 // design, and the test is one linear scenario (the options literal alone
-// is 35 lines).
-#![allow(clippy::large_futures, clippy::too_many_lines)]
+// is 35 lines); the pid narrows at the kill(2) boundary.
+#![allow(
+    clippy::large_futures,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -23,7 +27,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Shuts the spawned supervisor down on scope exit (a failing test's
-/// unwind included); the shutdown response is the sync point.
+/// unwind included); the shutdown response is the sync point. A supervisor
+/// that does not answer it is killed by the pid its own hello reported
+/// (the one process this test started, through the CLI's launch path).
 struct SpawnedDaemon {
     socket: PathBuf,
 }
@@ -39,6 +45,9 @@ impl Drop for SpawnedDaemon {
         let mut reader = BufReader::new(stream);
         let mut hello = String::new();
         let _ = reader.read_line(&mut hello);
+        let supervisor_pid = serde_json::from_str::<serde_json::Value>(hello.trim())
+            .ok()
+            .and_then(|hello| hello["supervisorPid"].as_i64());
         let command = serde_json::json!({
             "type": "command",
             "id": "test-shutdown",
@@ -50,7 +59,13 @@ impl Drop for SpawnedDaemon {
             .get_ref()
             .set_read_timeout(Some(Duration::from_secs(5)));
         let mut response = String::new();
-        let _ = reader.read_line(&mut response);
+        let answered = reader.read_line(&mut response).is_ok_and(|read| read > 0);
+        if let (false, Some(pid)) = (answered, supervisor_pid) {
+            // SAFETY: kill(2) on the supervisor this test started.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
     }
 }
 
@@ -61,6 +76,29 @@ const OPEN_BOUND: Duration = Duration::from_secs(120);
 #[tokio::test]
 async fn a_worker_dying_at_startup_ends_the_interactive_open_with_its_error() {
     let dir = tempfile::TempDir::new().expect("temp dir");
+    // This binary's only test owns the process env the spawned supervisor
+    // (and its workers) inherit: no product or harness variable from the
+    // host survives (an inherited restart roster, session dir, daemon
+    // socket or internal switch would point the daemon at another
+    // install's state), and HOME and TMPDIR are fresh dirs of this sandbox.
+    let scrubbed: Vec<std::ffi::OsString> = std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            let name = name.to_string_lossy();
+            ["PRIME_AGENT_", "PI_", "RLM_", "PA_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .collect();
+    for name in scrubbed {
+        std::env::remove_var(name);
+    }
+    for (name, sub_dir) in [("HOME", "home"), ("TMPDIR", "tmp")] {
+        let path = dir.path().join(sub_dir);
+        std::fs::create_dir_all(&path).expect("sandbox dir");
+        std::env::set_var(name, path);
+    }
+    std::env::set_var("PRIME_AGENT_DISABLE_SELF_UPDATE", "1");
     let agent_dir = dir.path().join("agent");
     let session_dir = agent_dir.join("sessions");
     std::fs::create_dir_all(&session_dir).expect("session dir");
