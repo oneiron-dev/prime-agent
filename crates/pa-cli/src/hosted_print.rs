@@ -11,12 +11,18 @@
 //! session for this cwd and session dir, `--resume` resolves its selector,
 //! and the daemon is asked for that file by path (the supervisor refuses
 //! `continueRecent`).
+//!
+//! `--offline` (the flag or a truthy `PI_OFFLINE`) and `--no-skills` ride
+//! the create as the session policy: the daemon starts that session's
+//! worker with `PI_OFFLINE=1` and without skill discovery, and a live
+//! session is reused only under the same policy.
 
 use std::sync::Arc;
 
 use pa_daemon::headless_client::{
     HostedEventSink, HostedHeadlessSession, HostedPrompt, HostedSessionOptions,
 };
+use pa_daemon::session_policy::SessionPolicy;
 
 use crate::headless_autonomous::autonomous_exit_stderr;
 use crate::json_output::JsonEventSink;
@@ -30,8 +36,10 @@ const HOSTED_DAEMON_SCRIPT_ENV: &str = "PRIME_AGENT_HOSTED_DAEMON_SCRIPT";
 /// The per-launch overlay a factory seat sets for the agent's own tool
 /// processes (its cargo routing: `W7_CARGO_WORK`, `W7_CARGO_HOSTS`, ...).
 /// A daemon worker runs with the daemon's environment, and the create
-/// contract carries no launch environment yet, so a hosted run refuses it
-/// instead of silently routing the seat's builds elsewhere.
+/// contract carries no launch environment for it: the routing also needs
+/// the factory's cargo wrapper first on the seat's `PATH`, which a worker
+/// shared with other clients does not take from one of them. A hosted run
+/// refuses it instead of silently building on the wrong host.
 const LAUNCH_OVERLAY_ENV_PREFIX: &str = "W7_CARGO_";
 
 /// Run a print/json invocation as a daemon-hosted session.
@@ -46,11 +54,9 @@ pub(crate) fn run_hosted_print(options: &RunOptions) -> Result<i32, String> {
     let config = &options.config;
     let mut unsupported: Vec<String> = [
         (options.session.fork.is_some(), "--fork"),
-        (config.no_skills, "--no-skills"),
         (config.no_prompt_templates, "--no-prompt-templates"),
         (config.no_context_files, "--no-context-files"),
         (config.initial_goal.is_some(), "--goal"),
-        (options.offline, "--offline"),
     ]
     .into_iter()
     .filter(|(present, _)| *present)
@@ -144,6 +150,10 @@ async fn hosted_print_main(options: &RunOptions) -> Result<i32, String> {
         create_config,
         session_path,
         telemetry_disabled: config.telemetry_disabled,
+        session_policy: SessionPolicy {
+            offline: options.offline,
+            no_skills: config.no_skills,
+        },
     })
     .await
     .map_err(|error| format!("{error:#}"))?;

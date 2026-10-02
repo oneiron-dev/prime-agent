@@ -115,6 +115,18 @@ impl Worker {
                 );
             }
         };
+        // An offline session's worker is launched offline (its launch env
+        // carries `PI_OFFLINE`); this process's environment is never
+        // switched after its tasks started, so a worker that came up
+        // without it refuses the session instead of running it online.
+        if resources.offline && !crate::session_policy::process_is_offline() {
+            return response_failure(
+                None,
+                "create",
+                "Invalid create config: the session is offline, but this worker was not launched with PI_OFFLINE",
+                None,
+            );
+        }
         // The summary publishes the selection for every engine (the
         // scripted harness included): a hosted client refuses to reuse a
         // live session launched with other tools.
@@ -819,3 +831,6 @@ fn append_creation_prefix(
 #[cfg(test)]
 #[path = "create_collapse_tests.rs"]
 mod create_collapse_tests;
+#[cfg(test)]
+#[path = "create_policy_tests.rs"]
+mod create_policy_tests;

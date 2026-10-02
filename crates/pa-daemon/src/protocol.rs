@@ -338,6 +338,9 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 // Oneiron fork (schema 31): `create` honors `tools`/`noTools`/
                 // `noBuiltinTools`.
                 pa_types::daemon::SESSION_TOOL_SELECTION_CAPABILITY,
+                // Fork-only (revision 31): the create config's
+                // `offline`/`noSkills` session policy.
+                crate::session_policy::SESSION_POLICY_CAPABILITY,
             ]
             .iter()
             .map(std::string::ToString::to_string),

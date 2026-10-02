@@ -111,12 +111,272 @@ impl Sandbox {
     }
 
     fn run(&self, args: &[&str]) -> (String, String, i32) {
-        let output = self.command(args).output().expect("binary present");
+        output_of(&mut self.command(args))
+    }
+
+    /// [`Sandbox::command`] ONLINE (no `PI_OFFLINE`), with no way out:
+    /// every HTTP client goes through a dead loopback proxy, and telemetry
+    /// is off.
+    fn online_command(&self, args: &[&str]) -> Command {
+        let mut command = self.command(args);
+        command.env_remove("PI_OFFLINE").env("DO_NOT_TRACK", "1");
+        for proxy in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            command.env(proxy, "http://127.0.0.1:9");
+        }
+        command.env_remove("NO_PROXY").env_remove("no_proxy");
+        command
+    }
+
+    /// The listed row of the session `session_id` names.
+    #[track_caller]
+    fn session_row(&self, session_id: &Value) -> Value {
+        self.sessions()
+            .into_iter()
+            .find(|row| row["sessionId"] == *session_id)
+            .expect("the session is listed")
+    }
+
+    /// Passivate a listed session's worker through its own idle-passivation
+    /// ask (the worker descriptor goes with it), wait for the worker's exit
+    /// (a pidfd turns readable), then wake the session with an attach by its
+    /// saved id. Returns the woken session's row.
+    #[track_caller]
+    fn passivate_and_wake(&self, row: &Value) -> Value {
+        self.passivate(row);
+        self.wake(row)
+    }
+
+    /// Wake a passivated session with an attach by its saved id. Returns
+    /// the woken session's row.
+    #[track_caller]
+    fn wake(&self, row: &Value) -> Value {
+        self.wire()
+            .request(&json!({ "type": "attach", "activeSessionId": row["sessionId"] }));
+        self.session_row(&row["sessionId"])
+    }
+
+    /// Passivate a listed session's worker through its own idle-passivation
+    /// ask and wait for the worker's exit.
+    #[track_caller]
+    fn passivate(&self, row: &Value) {
+        let descriptor: Value =
+            serde_json::from_str(&std::fs::read_to_string(self.descriptor_path(row)).unwrap())
+                .unwrap();
+        let worker = Pidfd::open(&row["workerPid"]);
+        self.wire().request(&json!({
+            "type": "worker_idle_passivation",
+            "workerToken": descriptor["authenticationToken"],
+        }));
+        assert!(worker.exited(), "the passivated worker exited");
+    }
+
+    /// The sandbox daemon's worker descriptor directory (one daemon, one
+    /// directory under `daemon-workers`).
+    #[track_caller]
+    fn descriptor_dir(&self) -> PathBuf {
+        let dirs: Vec<PathBuf> = std::fs::read_dir(self.home().join(".prime/agent/daemon-workers"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        dirs[0].clone()
+    }
+
+    /// A listed session's worker descriptor file.
+    #[track_caller]
+    fn descriptor_path(&self, row: &Value) -> PathBuf {
+        let active_session_id = row["activeSessionId"].as_str().unwrap();
+        self.descriptor_dir()
+            .join(format!("{active_session_id}.json"))
+    }
+
+    /// Make the daemon's session policy store refuse every write (its
+    /// directory becomes a file), or accept them again, records intact.
+    #[track_caller]
+    fn set_policy_store(&self, state: PolicyStore) {
+        let store = self.descriptor_dir().join("session-policies");
+        let held = self.descriptor_dir().join("session-policies.held");
+        match state {
+            PolicyStore::Refusing => {
+                std::fs::rename(&store, &held).unwrap();
+                std::fs::write(&store, "refusing").unwrap();
+            }
+            PolicyStore::Writable => {
+                std::fs::remove_file(&store).unwrap();
+                std::fs::rename(&held, &store).unwrap();
+            }
+        }
+    }
+
+    /// Everything the sandbox daemon and its workers logged.
+    fn logs(&self) -> String {
+        std::fs::read_dir(self.home().join(".prime/agent/logs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect()
+    }
+
+    /// Create an RLM child of a listed session the way a parent's spawn
+    /// does (its file as `parentSessionPath`, no policy or tool keys);
+    /// returns the child's listed row.
+    #[track_caller]
+    fn create_child(&self, parent: &Value) -> Value {
+        std::fs::create_dir_all(self.home().join("children")).unwrap();
+        let mut wire = self.wire();
+        let created = wire.request(&json!({
+            "type": "create",
+            "name": format!("child-of-{}", parent["activeSessionId"].as_str().unwrap()),
+            "lifecycle": "resident",
+            "config": {
+                "cwd": self.home(),
+                "sessionDir": self.home().join("children"),
+                "rlmDepth": 1,
+                "parentSessionPath": parent["sessionFile"],
+                "script": self.dir.path().join("script.json"),
+            },
+        }));
+        let listed = wire.request(&json!({ "type": "list", "all": true }));
+        listed["data"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["activeSessionId"] == created["data"]["activeSessionId"])
+            .expect("the child is listed")
+            .clone()
+    }
+
+    /// The probe skill a session discovers from the agent dir by default.
+    fn add_discoverable_skill(&self) {
+        let dir = self.home().join(".prime/agent/skills/lane-probe-skill");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: lane-probe-skill\ndescription: Probe skill for the hosted no-skills verifier\n---\nBody",
+        )
+        .unwrap();
+    }
+
+    /// A factory seat's launch: its exact native argv (`nativeSeatArgv` in
+    /// `packages/factory/src/agent-command.ts`, daemon custody) plus
+    /// `extra`, with the prompt on stdin.
+    fn run_seat(&self, profile: SeatOutput, extra: &[&str], prompt: &str) -> (String, String, i32) {
+        let cwd = self.home().display().to_string();
+        let sessions = self.home().join("seat-sessions").display().to_string();
+        let mut args = vec!["-p"];
+        if profile == SeatOutput::FactoryJson {
+            args.extend([
+                "--mode",
+                "json",
+                "--json-event-profile",
+                "factory-completed",
+            ]);
+        }
+        args.extend([
+            "--daemon-hosted",
+            "--offline",
+            "--provider",
+            "faux",
+            "--model",
+            "faux-1",
+            "--thinking",
+            "low",
+            "--cwd",
+            &cwd,
+            "--no-extensions",
+            "--no-skills",
+            "--session-dir",
+            &sessions,
+        ]);
+        args.extend_from_slice(extra);
+        let mut child = self
+            .command(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("binary present");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(prompt.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
         (
             String::from_utf8_lossy(&output.stdout).to_string(),
             String::from_utf8_lossy(&output.stderr).to_string(),
             output.status.code().unwrap_or(-1),
         )
+    }
+
+    /// A hosted session's assembled system prompt, read from its live
+    /// worker (`get_system_prompt`).
+    #[track_caller]
+    fn system_prompt(&self, session_id: &Value) -> String {
+        let row = self
+            .sessions()
+            .into_iter()
+            .find(|row| row["sessionId"] == *session_id)
+            .expect("the session stays resident");
+        let response = self.wire().request(&json!({
+            "type": "get_system_prompt",
+            "activeSessionId": row["activeSessionId"],
+        }));
+        response["data"]["systemPrompt"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// What a listed session's live worker runs with: its published
+    /// `toolSelection` (null for the defaults), its `ipython` definition
+    /// answer (`{}` when the tool is inactive) and its system prompt. The
+    /// prompt is read first: that read builds the worker's session (built
+    /// lazily, and rebuilt after a switch), so the definition answer comes
+    /// from the session's own tools, never from a session not built yet.
+    #[track_caller]
+    fn tool_state(&self, row: &Value) -> (Value, Value, String) {
+        let row = self.session_row(&row["sessionId"]);
+        let system_prompt = self.system_prompt(&row["sessionId"]);
+        let ipython = self.wire().request(&json!({
+            "type": "get_tool_definition",
+            "activeSessionId": row["activeSessionId"],
+            "name": "ipython",
+        }));
+        (
+            row["toolSelection"].clone(),
+            ipython["data"].clone(),
+            system_prompt,
+        )
+    }
+
+    /// The session policy record the daemon keeps for `session_file`: its
+    /// path and its JSON.
+    #[track_caller]
+    fn policy_record(&self, session_file: &Value) -> (PathBuf, Value) {
+        let records: Vec<(PathBuf, Value)> =
+            std::fs::read_dir(self.descriptor_dir().join("session-policies"))
+                .unwrap()
+                .flatten()
+                .map(|entry| {
+                    let record = std::fs::read_to_string(entry.path()).unwrap();
+                    (entry.path(), serde_json::from_str(&record).unwrap())
+                })
+                .filter(|(_, record): &(PathBuf, Value)| record["sessionFile"] == *session_file)
+                .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        records.into_iter().next().unwrap()
     }
 
     /// A raw protocol client (the daemon is up: a hosted run started it).
@@ -203,6 +463,8 @@ struct Wire {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     next_id: u64,
+    /// The daemon's `daemon_hello`.
+    hello: Value,
 }
 
 impl Wire {
@@ -219,9 +481,10 @@ impl Wire {
             reader: BufReader::new(stream),
             writer,
             next_id: 0,
+            hello: Value::Null,
         };
-        let hello = wire.read_line();
-        assert_eq!(hello["type"], "daemon_hello");
+        wire.hello = wire.read_line();
+        assert_eq!(wire.hello["type"], "daemon_hello");
         wire
     }
 
@@ -266,6 +529,122 @@ impl Wire {
         assert_eq!(response["success"], true, "{response}");
         response
     }
+}
+
+/// Whether the sandbox daemon's session policy store takes writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyStore {
+    /// Every policy write fails (the store's directory is a file).
+    Refusing,
+    /// The store is back, with every record it held.
+    Writable,
+}
+
+/// A live process's pidfd, closed on drop.
+struct Pidfd(i32);
+
+impl Pidfd {
+    #[track_caller]
+    fn open(pid: &Value) -> Self {
+        Self(
+            pa_core::platform::process::open_pidfd(pid.as_u64().expect("a pid") as u32)
+                .expect("a live process"),
+        )
+    }
+
+    /// Whether the process exits inside the step bound (a pidfd turns
+    /// readable when its process exits).
+    fn exited(&self) -> bool {
+        let mut exited = libc::pollfd {
+            fd: self.0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&raw mut exited, 1, STEP_BOUND.as_millis() as i32) == 1 }
+    }
+}
+
+impl Drop for Pidfd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// A factory seat's output mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeatOutput {
+    /// Plain print mode (the final text on stdout).
+    Text,
+    /// `--mode json --json-event-profile factory-completed`, as every
+    /// native seat runs.
+    FactoryJson,
+}
+
+#[track_caller]
+fn output_of(command: &mut Command) -> (String, String, i32) {
+    let output = command.output().expect("binary present");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+/// A live process's environment (`/proc/<pid>/environ`).
+#[track_caller]
+fn environ(pid: &Value) -> std::collections::BTreeMap<String, String> {
+    let pid = pid.as_u64().expect("a live pid");
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .unwrap()
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            let entry = String::from_utf8_lossy(entry);
+            let (name, value) = entry.split_once('=')?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// The TS no-tools prompt (`rlm.js` with `ipython` inactive) for a root
+/// session at `cwd` logging to `log`; pa-core's golden corpus pins its
+/// bytes against the TS capture.
+fn ts_no_tools_prompt(cwd: &str, log: &str) -> String {
+    include_str!("../../pa-core/tests/golden/corpus/no-tools-prompt-ts.txt")
+        .replace(
+            "Working directory: /tmp/pb.ysn9o0q3/w",
+            &format!("Working directory: {cwd}"),
+        )
+        .replace(
+            "Conversation log: not persisted",
+            &format!("Conversation log: {log}"),
+        )
+}
+
+/// The value of a system prompt's `<label>: ` line.
+#[track_caller]
+fn prompt_line<'a>(prompt: &'a str, label: &str) -> &'a str {
+    prompt
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{label}: ")))
+        .unwrap_or_else(|| panic!("no {label} line in {prompt}"))
+}
+
+/// The skill names a system prompt's inventory lists (empty: no
+/// `skills-inventory` segment at all).
+fn inventory(system_prompt: &str) -> Vec<String> {
+    let Some((_, listed)) = system_prompt.split_once("<available_skills>") else {
+        return Vec::new();
+    };
+    let listed = listed.split("</available_skills>").next().unwrap();
+    listed
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("<name>")?
+                .strip_suffix("</name>")
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 fn json_lines(stdout: &str) -> Vec<Value> {
@@ -370,7 +749,8 @@ fn continue_and_resume_reuse_the_live_worker() {
 /// While a hosted run streams, another client can attach to the same
 /// resident session; a signal ends the print client (143) by detaching —
 /// the turn keeps running for the daemon — and the reduced profile streams
-/// no progressive snapshots.
+/// no progressive snapshots. The run carries the factory's `--offline`
+/// and `--no-skills`, as every daemon seat does.
 #[test]
 fn second_client_attaches_and_a_signal_only_detaches() {
     // The turn holds in flight until aborted (no timer releases it), so the
@@ -386,6 +766,8 @@ fn second_client_attaches_and_a_signal_only_detaches() {
             "--json-event-profile",
             "factory-completed",
             "--daemon-hosted",
+            "--offline",
+            "--no-skills",
             "-p",
             "slow turn",
         ])
@@ -453,12 +835,12 @@ fn hosted_refuses_what_it_cannot_honor() {
     let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": [] }));
     for (args, expected) in [
         (
-            ["--daemon-hosted", "--no-skills", "-p", "x"].as_slice(),
-            "Error: --daemon-hosted cannot be combined with --no-skills yet: the daemon session does not receive it\n",
+            ["--daemon-hosted", "--no-context-files", "-p", "x"].as_slice(),
+            "Error: --daemon-hosted cannot be combined with --no-context-files yet: the daemon session does not receive it\n",
         ),
         (
-            ["--daemon-hosted", "--offline", "--goal", "g", "-p", "x"].as_slice(),
-            "Error: --daemon-hosted cannot be combined with --goal, --offline yet: the daemon session does not receive them\n",
+            ["--daemon-hosted", "--offline", "--no-skills", "--goal", "g", "--no-prompt-templates", "-p", "x"].as_slice(),
+            "Error: --daemon-hosted cannot be combined with --no-prompt-templates, --goal yet: the daemon session does not receive them\n",
         ),
         (
             ["--daemon-hosted", "--no-session", "-p", "x"].as_slice(),
@@ -677,4 +1059,640 @@ fn a_relative_resume_path_reaches_the_saved_session() {
     ]);
     assert_eq!((stdout.as_str(), code), ("HOSTED\n", 0), "stderr: {stderr}");
     assert_eq!(user_texts(saved[0].to_str().unwrap()), ["one", "two"]);
+}
+
+/// A factory daemon seat's exact argv (`--offline` and `--no-skills`
+/// included, the prompt on stdin) runs a resident session in text and in
+/// the factory's json profile.
+#[test]
+fn the_factory_seat_argv_runs_a_hosted_session() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["SEAT-ANSWER"] }));
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &[], "text seat");
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("SEAT-ANSWER\n", 0),
+        "stderr: {stderr}"
+    );
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::FactoryJson, &[], "json seat");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let lines = json_lines(&stdout);
+    assert_eq!(lines[0]["jsonEventProfile"], "factory-completed");
+    let types = types(&lines);
+    assert!(
+        !types
+            .iter()
+            .any(|kind| matches!(*kind, "message_update" | "tool_execution_update")),
+        "{types:?}"
+    );
+    assert_eq!(types.last(), Some(&"agent_end"));
+    let answer = lines
+        .iter()
+        .rev()
+        .find(|line| line["type"] == "message_end" && line["message"]["role"] == "assistant")
+        .expect("the assistant answer streamed");
+    assert_eq!(answer["message"]["content"][0]["text"], "SEAT-ANSWER");
+    // Both seats' sessions stay resident, each in the seat's session dir.
+    let mut seats: Vec<Vec<String>> = sandbox
+        .sessions()
+        .iter()
+        .map(|row| {
+            let file = row["sessionFile"].as_str().unwrap();
+            assert!(
+                Path::new(file).starts_with(sandbox.home().join("seat-sessions")),
+                "{file}"
+            );
+            assert_eq!(row["workerState"], "ready");
+            user_texts(file)
+        })
+        .collect();
+    seats.sort();
+    assert_eq!(seats, [["json seat"], ["text seat"]]);
+}
+
+/// On a warm daemon that runs ONLINE (started without `PI_OFFLINE`), an
+/// `--offline` session gets `PI_OFFLINE=1` in its own worker's environment
+/// only: the supervisor and the online session's worker stay online, and
+/// an RLM child inherits its parent session's policy.
+#[test]
+fn an_offline_session_runs_its_own_worker_offline_on_an_online_daemon() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    let online = |args: &[&str]| output_of(&mut sandbox.online_command(args));
+    let (stdout, stderr, code) = online(&["--daemon-hosted", "-p", "online"]);
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let (stdout, stderr, code) = online(&[
+        "--daemon-hosted",
+        "--offline",
+        "--no-skills",
+        "-p",
+        "offline",
+    ]);
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let row_of = |prompt: &str| {
+        sandbox
+            .sessions()
+            .into_iter()
+            .find(|row| user_texts(row["sessionFile"].as_str().unwrap()) == [prompt])
+            .unwrap_or_else(|| panic!("the {prompt} session stays resident"))
+    };
+    let (online_row, offline_row) = (row_of("online"), row_of("offline"));
+    // An RLM child's create names its parent's file and no policy: it
+    // inherits the parent session's.
+    let supervisor = sandbox.wire().hello["supervisorPid"].clone();
+    let offline_env = |pid: &Value| environ(pid).get("PI_OFFLINE").cloned();
+    assert_eq!(
+        [
+            offline_env(&supervisor),
+            offline_env(&online_row["workerPid"]),
+            offline_env(&offline_row["workerPid"]),
+            offline_env(&sandbox.create_child(&online_row)["workerPid"]),
+            offline_env(&sandbox.create_child(&offline_row)["workerPid"]),
+        ],
+        [
+            None,
+            None,
+            Some("1".to_string()),
+            None,
+            Some("1".to_string())
+        ]
+    );
+}
+
+/// `--no-skills` reaches the worker's session assembly: the discovered
+/// skill is in a hosted session's inventory by default, the inventory is
+/// gone under `--no-skills`, and an explicit `--skill` still loads (TS
+/// `noSkills` disables discovery only).
+#[test]
+fn no_skills_empties_the_hosted_inventory_and_keeps_explicit_skills() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ok"] }));
+    let skill = |dir: &Path, name: &str| {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(
+            dir.join(name).join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Probe skill for the hosted no-skills verifier\n---\nBody"),
+        )
+        .unwrap();
+        dir.join(name).display().to_string()
+    };
+    sandbox.add_discoverable_skill();
+    let explicit = skill(&sandbox.home().join("explicit"), "explicit-probe-skill");
+    let inventory_of = |flags: &[&str]| {
+        let args: Vec<&str> = ["--mode", "json", "--daemon-hosted"]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .chain(["-p", "hi"])
+            .collect();
+        let (stdout, stderr, code) = sandbox.run(&args);
+        assert_eq!(code, 0, "stderr: {stderr}");
+        inventory(&sandbox.system_prompt(&json_lines(&stdout)[0]["id"]))
+    };
+    let discovered = inventory_of(&[]);
+    assert!(
+        discovered.contains(&"lane-probe-skill".to_string()),
+        "{discovered:?}"
+    );
+    assert_eq!(inventory_of(&["--no-skills"]), Vec::<String>::new());
+    assert_eq!(
+        inventory_of(&["--no-skills", "--skill", &explicit]),
+        ["explicit-probe-skill"]
+    );
+}
+
+/// A live session is reused only under the policy and the tools it runs
+/// with: the same seat flags continue it on its worker; a run without
+/// `--no-skills`, one with other tool flags, and one with both are refused,
+/// each naming what differs (never applied to the live worker, which keeps
+/// running); and a pre-policy client's create (no policy or tool keys)
+/// reuses it as before.
+#[test]
+fn a_live_session_is_reused_only_under_its_own_policy() {
+    let sandbox = Sandbox::new(&json!({
+        "engine": "faux",
+        "responses": ["FIRST", "SECOND", "THIRD"],
+    }));
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &[], "one");
+    assert_eq!((stdout.as_str(), code), ("FIRST\n", 0), "stderr: {stderr}");
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &["-c"], "two");
+    assert_eq!((stdout.as_str(), code), ("SECOND\n", 0), "stderr: {stderr}");
+    let sessions = sandbox.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let live = sessions[0].clone();
+    let file = live["sessionFile"].as_str().unwrap().to_string();
+    // The sandbox keeps `PI_OFFLINE`, so this run is `--offline` only. The
+    // refusal names what differs: the policy, the tools, or both.
+    let refusal_of = |args: &[&str]| {
+        let (stdout, stderr, code) = sandbox.run(args);
+        assert_eq!((stdout.as_str(), code), ("", 1), "stderr: {stderr}");
+        stderr
+    };
+    let refusal = |differences: &str| {
+        format!(
+            "Error: Session \"{file}\" is live with {differences}: a live session keeps its policy and its tools, so rerun with the same flags or stop the session first\n"
+        )
+    };
+    assert_eq!(
+        [
+            refusal_of(&["--daemon-hosted", "--resume", &file, "-p", "three"]),
+            refusal_of(&[
+                "--daemon-hosted",
+                "--no-skills",
+                "--no-tools",
+                "--resume",
+                &file,
+                "-p",
+                "three",
+            ]),
+            refusal_of(&[
+                "--daemon-hosted",
+                "--tools",
+                "",
+                "--resume",
+                &file,
+                "-p",
+                "three",
+            ]),
+        ],
+        [
+            refusal("policy --offline --no-skills (this run asked for --offline)"),
+            refusal("tools from no tool flags (this run asked for --no-tools)"),
+            refusal(
+                "policy --offline --no-skills (this run asked for --offline) and tools from no tool flags (this run asked for --tools \"\")"
+            ),
+        ]
+    );
+    // A pre-policy client's open reuses the live worker, as before.
+    let reused = sandbox.wire().request(&json!({
+        "type": "create",
+        "sessionPath": file,
+        "config": { "cwd": sandbox.home() },
+    }));
+    assert_eq!(reused["data"]["activeSessionId"], live["activeSessionId"]);
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &["--resume", &file], "three");
+    assert_eq!((stdout.as_str(), code), ("THIRD\n", 0), "stderr: {stderr}");
+    let sessions = sandbox.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    for key in ["activeSessionId", "workerPid", "sessionFile"] {
+        assert_eq!(sessions[0][key], live[key], "{key}");
+    }
+    assert_eq!(user_texts(&file), ["one", "two", "three"]);
+}
+
+/// What a fake daemon saw on one connection.
+#[derive(Debug, PartialEq)]
+enum FakeDaemonEvent {
+    /// A command envelope's command type.
+    Command(String),
+    /// The client closed the connection (or the fake did, after a
+    /// `shutdown`).
+    Closed,
+}
+
+/// A fake daemon on the sandbox socket: every connection gets `hello`, a
+/// `list` gets `sessions`, every other command no answer, and a `shutdown`
+/// closes the connection. Reports what each connection sent, in order.
+fn fake_daemon(socket: &Path, hello: Value, sessions: Value) -> mpsc::Receiver<FakeDaemonEvent> {
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let (events, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                return;
+            };
+            let (hello, sessions, events) = (hello.clone(), sessions.clone(), events.clone());
+            std::thread::spawn(move || {
+                if writeln!(stream, "{hello}").is_err() {
+                    return;
+                }
+                let mut writer = stream.try_clone().unwrap();
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    // Clients may send blank keep-alive lines.
+                    let Ok(envelope) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    let kind = envelope["command"]["type"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let _ = events.send(FakeDaemonEvent::Command(kind.clone()));
+                    match kind.as_str() {
+                        "list" => {
+                            let response = json!({
+                                "type": "response", "id": envelope["id"], "command": "list",
+                                "success": true, "data": { "sessions": sessions },
+                            });
+                            if writeln!(writer, "{response}").is_err() {
+                                break;
+                            }
+                        }
+                        "shutdown" => break,
+                        _ => {}
+                    }
+                }
+                let _ = events.send(FakeDaemonEvent::Closed);
+            });
+        }
+    });
+    received
+}
+
+fn fake_hello(schema_id: &str, capabilities: &[&str]) -> Value {
+    json!({
+        "type": "daemon_hello",
+        "protocol": { "name": "prime-agent.daemon", "version": 7 },
+        "schemaId": schema_id,
+        "serverCapabilities": capabilities,
+    })
+}
+
+/// A daemon of this schema that does not advertise `session_policy` is
+/// never sent a policy it would drop: the seat fails with the reason,
+/// before any command.
+#[test]
+fn a_daemon_without_the_policy_capability_refuses_the_seat_flags() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": [] }));
+    let seen = fake_daemon(
+        &sandbox.socket(),
+        fake_hello(
+            pa_types::daemon::DAEMON_SCHEMA_ID,
+            &["prompt_admission_cancellation"],
+        ),
+        json!([]),
+    );
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::FactoryJson, &[], "seat");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (
+            "",
+            "Error: The running daemon cannot apply --offline --no-skills to a hosted session (it does not advertise session_policy); stop it so a current one starts, or run without --daemon-hosted\n",
+            1
+        )
+    );
+    // The probe's connection and the hosted client's: neither sent a
+    // command.
+    let events: Vec<FakeDaemonEvent> = (0..2)
+        .map(|_| seen.recv_timeout(STEP_BOUND).unwrap())
+        .collect();
+    assert_eq!(events, [FakeDaemonEvent::Closed, FakeDaemonEvent::Closed]);
+}
+
+/// An OLD daemon (schema revision 30, before the session policy) with a
+/// live session is never replaced or stopped by a seat: the seat fails
+/// with the stale-daemon refusal after one `list`, and nothing reaches the
+/// old daemon's sessions.
+#[test]
+fn a_busy_old_daemon_is_never_stopped_by_a_seat() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": [] }));
+    let seen = fake_daemon(
+        &sandbox.socket(),
+        fake_hello(
+            "protocol-7-schema-30-8e4b17c2a9f5",
+            &["prompt_admission_cancellation"],
+        ),
+        json!([{ "activeSessionId": "busy-1", "isSessionActive": true }]),
+    );
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::FactoryJson, &[], "seat");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (
+            "",
+            format!(
+                "Error: An incompatible Prime Agent daemon is running on {}.\n\nRun:\n  prime-agent shutdown --force\n\nThen retry the original command (the running daemon has active work).\n",
+                sandbox.socket().display()
+            )
+            .as_str(),
+            1
+        )
+    );
+    assert_eq!(
+        [
+            seen.recv_timeout(STEP_BOUND).unwrap(),
+            seen.recv_timeout(STEP_BOUND).unwrap(),
+        ],
+        [
+            FakeDaemonEvent::Command("list".to_string()),
+            FakeDaemonEvent::Closed,
+        ]
+    );
+}
+
+/// The inverse isolation: on a daemon an `--offline` run started (its
+/// supervisor runs with `PI_OFFLINE=1`), an online session's worker runs
+/// without it, after a passivation and wake too, and so does its RLM child.
+#[test]
+fn an_online_session_runs_its_own_worker_online_on_an_offline_daemon() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    let (stdout, stderr, code) = sandbox.run(&["--daemon-hosted", "--offline", "-p", "offline"]);
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let (stdout, stderr, code) =
+        output_of(&mut sandbox.online_command(&["--daemon-hosted", "-p", "online"]));
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let worker_of = |prompt: &str| {
+        sandbox
+            .sessions()
+            .into_iter()
+            .find(|row| user_texts(row["sessionFile"].as_str().unwrap()) == [prompt])
+            .unwrap_or_else(|| panic!("the {prompt} session stays resident"))["workerPid"]
+            .clone()
+    };
+    let supervisor = sandbox.wire().hello["supervisorPid"].clone();
+    let offline_env = |pid: &Value| environ(pid).get("PI_OFFLINE").cloned();
+    assert_eq!(
+        [
+            offline_env(&supervisor),
+            offline_env(&worker_of("offline")),
+            offline_env(&worker_of("online")),
+        ],
+        [Some("1".to_string()), Some("1".to_string()), None]
+    );
+    // It stays online across a passivation and wake, and an RLM child it
+    // spawns inherits its online policy, not the supervisor's offline mode.
+    let online_row = sandbox
+        .sessions()
+        .into_iter()
+        .find(|row| user_texts(row["sessionFile"].as_str().unwrap()) == ["online"])
+        .unwrap();
+    let woken = sandbox.passivate_and_wake(&online_row);
+    let child = sandbox.create_child(&woken)["workerPid"].clone();
+    assert_eq!(
+        [offline_env(&woken["workerPid"]), offline_env(&child)],
+        [None, None]
+    );
+}
+
+/// A passivated policy session wakes under its own policy: after a new
+/// session moved its worker onto another file and the idle passivation
+/// retired the worker (the worker descriptor goes with it), a wake on an
+/// ONLINE daemon (an attach by its saved id) starts the next worker offline
+/// and without skill discovery.
+#[test]
+fn a_passivated_session_wakes_under_its_own_policy() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    sandbox.add_discoverable_skill();
+    // An online run starts the daemon: the supervisor runs online.
+    let (stdout, stderr, code) =
+        output_of(&mut sandbox.online_command(&["--daemon-hosted", "-p", "warm"]));
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let (stdout, stderr, code) = output_of(&mut sandbox.online_command(&[
+        "--mode",
+        "json",
+        "--daemon-hosted",
+        "--offline",
+        "--no-skills",
+        "-p",
+        "seat",
+    ]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let seat_id = json_lines(&stdout)[0]["id"].clone();
+    let seat = sandbox.session_row(&seat_id);
+    // A new session moves the worker onto another file; its policy follows.
+    sandbox.wire().request(&json!({
+        "type": "new_session",
+        "activeSessionId": seat["activeSessionId"],
+    }));
+    let moved = sandbox
+        .sessions()
+        .into_iter()
+        .find(|row| row["activeSessionId"] == seat["activeSessionId"])
+        .expect("the worker still serves a session");
+    assert_ne!(moved["sessionId"], seat_id);
+    let woken = sandbox.passivate_and_wake(&moved);
+    assert_ne!(woken["workerPid"], moved["workerPid"]);
+    assert_eq!(
+        (
+            environ(&woken["workerPid"]).get("PI_OFFLINE").cloned(),
+            inventory(&sandbox.system_prompt(&moved["sessionId"])),
+        ),
+        (Some("1".to_string()), Vec::<String>::new())
+    );
+}
+
+/// The launch tool selection outlives its worker like the session policy:
+/// a `--no-tools` hosted session whose worker moved onto a new session and
+/// was then retired by the idle passivation (the worker descriptor goes
+/// with it) wakes on the daemon's own create (an attach by its saved id)
+/// without `ipython` and with the TS no-tools prompt, the selection still
+/// published. A record kept before it carried the selection (the policy
+/// alone) wakes the session with the default tools.
+#[test]
+fn a_passivated_no_tools_session_wakes_without_tools() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    let (stdout, stderr, code) = sandbox.run(&["--daemon-hosted", "--no-tools", "-p", "one"]);
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let launched = sandbox.sessions()[0].clone();
+    sandbox.wire().request(&json!({
+        "type": "new_session",
+        "activeSessionId": launched["activeSessionId"],
+    }));
+    let moved = sandbox
+        .sessions()
+        .into_iter()
+        .find(|row| row["activeSessionId"] == launched["activeSessionId"])
+        .expect("the worker still serves a session");
+    assert_ne!(moved["sessionId"], launched["sessionId"]);
+    let before = sandbox.tool_state(&moved);
+    let woken = sandbox.passivate_and_wake(&moved);
+    assert_ne!(woken["workerPid"], moved["workerPid"]);
+    let after = sandbox.tool_state(&woken);
+    let (cwd, log) = (
+        prompt_line(&after.2, "Working directory"),
+        prompt_line(&after.2, "Conversation log"),
+    );
+    assert!(
+        after.2.starts_with(&ts_no_tools_prompt(cwd, log)),
+        "the woken worker sends the TS no-tools prompt: {}",
+        after.2
+    );
+    assert_eq!(
+        (&after.0, &after.1, &after),
+        (&json!({ "noTools": true }), &json!({}), &before),
+        "the woken worker runs the session without tools, as before the passivation"
+    );
+    // An RLM child's first create (no tool keys) inherits the selection.
+    let child = sandbox.create_child(&woken);
+    assert_eq!(
+        child["toolSelection"],
+        json!({ "noTools": true }),
+        "{child}"
+    );
+
+    // A record without the selection keys reads as the default selection
+    // (rewritten once the worker is gone: its stop writes the record).
+    sandbox.passivate(&woken);
+    let (path, mut record) = sandbox.policy_record(&woken["sessionFile"]);
+    assert_eq!(
+        record,
+        json!({
+            "sessionFile": woken["sessionFile"],
+            "offline": true,
+            "noSkills": false,
+            "noTools": true,
+            "noBuiltinTools": false,
+        })
+    );
+    for key in ["tools", "noTools", "noBuiltinTools"] {
+        record.as_object_mut().unwrap().remove(key);
+    }
+    std::fs::write(&path, record.to_string()).unwrap();
+    let rewoken = sandbox.wake(&woken);
+    assert_ne!(rewoken["workerPid"], woken["workerPid"]);
+    let (selection, ipython, _) = sandbox.tool_state(&rewoken);
+    assert_eq!(
+        (
+            selection,
+            ipython
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+        (Value::Null, vec!["toolDefinition".to_string()]),
+        "the woken worker runs the default tools"
+    );
+}
+
+/// The record follows the tools a session runs with now: a worker created
+/// without tool keys (the default selection) that switches onto a session
+/// saved with `--no-tools` serves it with every tool, and after the idle
+/// passivation the daemon's wake keeps them instead of reviving the saved
+/// `--no-tools`.
+#[test]
+fn a_default_worker_that_switched_onto_a_no_tools_session_wakes_with_its_tools() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    let (stdout, stderr, code) = sandbox.run(&["--daemon-hosted", "--no-tools", "-p", "one"]);
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let saved = sandbox.sessions()[0].clone();
+    sandbox.passivate(&saved);
+    let mut wire = sandbox.wire();
+    let created = wire.request(&json!({
+        "type": "create",
+        "lifecycle": "resident",
+        "config": {
+            "cwd": sandbox.home(),
+            "script": sandbox.dir.path().join("script.json"),
+        },
+    }));
+    let worker = created["data"]["activeSessionId"].clone();
+    wire.request(&json!({
+        "type": "switch_session",
+        "activeSessionId": worker,
+        "sessionPath": saved["sessionFile"],
+    }));
+    let switched = sandbox
+        .sessions()
+        .into_iter()
+        .find(|row| row["activeSessionId"] == worker)
+        .expect("the default worker serves the saved session");
+    assert_eq!(switched["sessionId"], saved["sessionId"]);
+    let before = sandbox.tool_state(&switched);
+    let woken = sandbox.passivate_and_wake(&switched);
+    assert_ne!(woken["workerPid"], switched["workerPid"]);
+    let after = sandbox.tool_state(&woken);
+    assert_eq!(
+        (
+            &after.0,
+            after
+                .1
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            &after,
+        ),
+        (&Value::Null, vec!["toolDefinition".to_string()], &before),
+        "the woken worker runs the default tools the session ran with"
+    );
+}
+
+/// A kill retires its worker whatever the policy store does: with every
+/// policy write refused, the stop's last policy write fails (and says so
+/// in the daemon log), and the worker still gets its shutdown, exits, and
+/// leaves no descriptor behind.
+#[test]
+fn a_kill_retires_its_worker_whatever_the_policy_store_does() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &[], "one");
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let sessions = sandbox.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let row = sessions[0].clone();
+    let descriptor = sandbox.descriptor_path(&row);
+    assert!(descriptor.exists(), "the live worker's descriptor");
+    let worker = Pidfd::open(&row["workerPid"]);
+    sandbox.set_policy_store(PolicyStore::Refusing);
+    sandbox
+        .wire()
+        .request(&json!({ "type": "kill", "activeSessionId": row["activeSessionId"] }));
+    assert!(worker.exited(), "the killed worker exited");
+    assert!(!descriptor.exists(), "the retired worker's descriptor went");
+    assert!(
+        sandbox.logs().contains("SESSION POLICY LOST"),
+        "the refused policy write was logged"
+    );
+}
+
+/// A create whose session policy cannot be kept is refused and leaves no
+/// resident behind: the next open of the same session (the store writable
+/// again) launches its own worker at once instead of finding, or waiting
+/// on, the refused one.
+#[test]
+fn a_refused_admission_leaves_no_resident_behind() {
+    let sandbox = Sandbox::new(&json!({
+        "engine": "faux",
+        "responses": ["ANSWER", "ANSWER"],
+    }));
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &[], "one");
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let row = sandbox.sessions()[0].clone();
+    let file = row["sessionFile"].as_str().unwrap().to_string();
+    sandbox.passivate(&row);
+    sandbox.set_policy_store(PolicyStore::Refusing);
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &["--resume", &file], "two");
+    assert_eq!((stdout.as_str(), code), ("", 1), "stderr: {stderr}");
+    assert!(stderr.contains("keep the session policy"), "{stderr}");
+    sandbox.set_policy_store(PolicyStore::Writable);
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &["--resume", &file], "three");
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    assert_eq!(user_texts(&file), ["one", "three"]);
 }

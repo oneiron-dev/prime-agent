@@ -157,6 +157,15 @@ no stop that refuses while sessions are live, decided together with session admi
 created in between. That stop stays an operator decision outside these scripts until the
 daemon offers an idle-only shutdown.
 
+A release that changes the schema is different: the first `prime-agent-rs` client that ensures
+the daemon (the TUI or a `--daemon-hosted` run, not these scripts) treats the older supervisor
+as stale, replaces it when no session is active, and refuses to start while one is (it prints
+the `shutdown --force` hint). Schema revision 31 (the typed worker-startup failure, the
+`--tools`/`--no-tools`/`--no-builtin-tools` selection, and the session policy that
+`--daemon-hosted` carries for `--offline` and `--no-skills`) is such a change. All three share
+one schema id: a daemon from a revision-31 build that lacks one of them stays current for a newer
+client, which refuses the flags that daemon does not advertise until it is stopped.
+
 ## Not in this release
 
 - Native self-update (`prime-agent update` against this feed) stays disabled. The launcher

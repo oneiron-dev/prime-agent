@@ -173,6 +173,11 @@ pub(crate) struct ResidentWorker {
     /// roster write re-runs the transition's persist from the live state
     /// before a restart can replay the superseded session.
     identity_persist_pending: AtomicBool,
+    /// The session policy record for the file this worker serves now did
+    /// not land (fork revision 31: a write after a new-session/fork move
+    /// failed): every later roster write retries it, and the stop tries it
+    /// once more without ever waiting on it.
+    policy_repair_pending: AtomicBool,
     /// The boot-reconciliation quarantine: a resident adopted from a
     /// persisted record whose live reconciliation pull FAILED is fenced
     /// from every identity-based route (the selector resolution, the
@@ -248,6 +253,7 @@ impl ResidentWorker {
             heartbeat_snapshot_generation: AtomicU64::new(0),
             route_state_tx,
             identity_persist_pending: AtomicBool::new(false),
+            policy_repair_pending: AtomicBool::new(false),
             identity_quarantined: AtomicBool::new(false),
             launch_discarded: AtomicBool::new(false),
             connection_epoch: AtomicU64::new(0),
@@ -359,8 +365,6 @@ impl ResidentWorker {
         self.publish_route_state(|state| state.retired = true);
     }
 
-    /// Whether the root-identity transition's durable record write is
-    /// still unresolved (the live descriptor moved; the persist failed).
     /// Mark the create's failed launch discarded (see `launch_discarded`).
     pub(crate) fn note_launch_discarded(&self) {
         self.launch_discarded
@@ -374,6 +378,8 @@ impl ResidentWorker {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Whether the root-identity transition's durable record write is
+    /// still unresolved (the live descriptor moved; the persist failed).
     pub(crate) fn identity_persist_pending(&self) -> bool {
         self.identity_persist_pending
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -390,6 +396,27 @@ impl ResidentWorker {
     /// identity again).
     pub(crate) fn clear_identity_persist_pending(&self) {
         self.identity_persist_pending
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the session policy record for the file this worker serves
+    /// now is still unwritten.
+    pub(crate) fn policy_repair_pending(&self) -> bool {
+        self.policy_repair_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Mark the session policy record unwritten: the next roster write
+    /// (and the stop) retries it.
+    pub(crate) fn mark_policy_repair_pending(&self) {
+        self.policy_repair_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Clear the marker (the record for the file this worker serves now
+    /// landed, or it has no policy to keep).
+    pub(crate) fn clear_policy_repair_pending(&self) {
+        self.policy_repair_pending
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 

@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use super::{HostedHeadlessSession, HostedPrompt, HostedSessionOpened, HostedSessionOptions};
+use crate::session_policy::SessionPolicy;
 
 /// One scripted line the fake supervisor writes for a command.
 enum Reply {
@@ -102,6 +103,7 @@ impl FakeSupervisor {
             create_config: json!({ "cwd": "/work" }),
             session_path: None,
             telemetry_disabled: false,
+            session_policy: SessionPolicy::default(),
         }
     }
 
@@ -947,4 +949,77 @@ async fn messages_refuse_an_unreadable_row() {
             .starts_with("unreadable session message: "),
         "{error}"
     );
+}
+
+const FACTORY_POLICY: SessionPolicy = SessionPolicy {
+    offline: true,
+    no_skills: true,
+};
+
+/// A daemon that advertises `session_policy` receives both policy keys on
+/// the create (the flags it runs the session under), and a same-file
+/// resume goes through that create (the supervisor's reuse checks the
+/// live worker's policy) instead of attaching a listed row.
+#[tokio::test]
+async fn the_policy_rides_every_open_as_a_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("session.jsonl");
+    std::fs::write(&file, "{}\n").unwrap();
+    let fake = FakeSupervisor::advertising(
+        &["prompt_admission_cancellation", "session_policy"],
+        Box::new(|kind, _| opening(kind).unwrap_or_else(|| panic!("unexpected command {kind}"))),
+    );
+    let options = HostedSessionOptions {
+        session_path: Some(file.clone()),
+        session_policy: FACTORY_POLICY,
+        ..fake.options()
+    };
+    let (_session, opened) = bounded(HostedHeadlessSession::open(options)).await.unwrap();
+    assert_eq!(opened.active_session_id, "s1");
+    assert_eq!(fake.commands(), ["create", "attach"]);
+    let create = fake.sent("create");
+    assert_eq!(
+        (&create["sessionPath"], &create["config"]),
+        (
+            &json!(file),
+            &json!({ "cwd": "/work", "offline": true, "noSkills": true })
+        )
+    );
+}
+
+/// Without either flag the capability still sends the default policy, so
+/// the supervisor can refuse a live session created under another one.
+#[tokio::test]
+async fn the_default_policy_is_sent_explicitly() {
+    let fake = FakeSupervisor::advertising(
+        &["session_policy"],
+        Box::new(|kind, _| opening(kind).unwrap_or_else(|| panic!("unexpected command {kind}"))),
+    );
+    bounded(HostedHeadlessSession::open(fake.options()))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.sent("create")["config"],
+        json!({ "cwd": "/work", "offline": false, "noSkills": false })
+    );
+}
+
+/// A daemon without `session_policy` never receives a flag it would drop:
+/// the open fails before any command, naming the flags.
+#[tokio::test]
+async fn a_daemon_without_the_policy_capability_refuses_the_flags() {
+    let fake = FakeSupervisor::start(Box::new(|kind, _| panic!("unexpected command {kind}")));
+    let options = HostedSessionOptions {
+        session_policy: FACTORY_POLICY,
+        ..fake.options()
+    };
+    let error = match bounded(HostedHeadlessSession::open(options)).await {
+        Ok(_) => panic!("the open must fail"),
+        Err(error) => error.to_string(),
+    };
+    assert_eq!(
+        error,
+        "The running daemon cannot apply --offline --no-skills to a hosted session (it does not advertise session_policy); stop it so a current one starts, or run without --daemon-hosted"
+    );
+    assert_eq!(fake.commands(), Vec::<String>::new());
 }

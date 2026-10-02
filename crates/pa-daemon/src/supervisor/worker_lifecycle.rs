@@ -16,6 +16,7 @@ use super::{
 };
 use crate::lease::is_process_alive;
 use crate::protocol::{response_failure, response_success, DaemonResponse};
+use crate::session_policy::SessionLaunch;
 
 impl Supervisor {
     /// Complete a tombstoned stop for a worker encountered at adoption —
@@ -185,6 +186,43 @@ impl Supervisor {
                 .map(str::to_string),
             thinking: requested_thinking,
         };
+        // The session policy (fork revision 31), validated before anything
+        // launches. A create without the keys (a wake, a revival, a
+        // pre-policy open) runs under the policy its session file was
+        // created with, and an RLM child's first create inherits its
+        // parent session's (the TS child runtime inherits the parent's
+        // session config): an offline seat's sessions and subagents stay
+        // offline and skill-free. `None`: no policy at all (the old
+        // behavior). The launch tool selection follows the same rules
+        // (a create without the tool keys or the policy keys runs under
+        // the kept selection, a child under its parent's), so a
+        // passivated `--no-tools` session wakes without tools.
+        let mut launch = SessionLaunch::requested(config_object)?;
+        let parent_file = config_object
+            .and_then(|config| config.get("parentSessionPath"))
+            .and_then(Value::as_str);
+        if launch.policy.is_none() || launch.tool_selection.is_none() {
+            if let Some(file) = session_path.as_deref() {
+                if let Some(kept) = SessionLaunch::recalled(&self.descriptor_dir, file)? {
+                    launch = launch.or_from(&kept);
+                }
+            }
+        }
+        if let (true, Some(parent_file)) = (
+            launch.policy.is_none() || launch.tool_selection.is_none(),
+            parent_file,
+        ) {
+            let parents = match self.registry.find_by_session_file(parent_file).await {
+                Some(parent) => Some(SessionLaunch::carried(
+                    &parent.descriptor.lock().await.create_command.rest,
+                )),
+                None => SessionLaunch::recalled(&self.descriptor_dir, parent_file)?,
+            };
+            if let Some(parents) = parents {
+                launch = launch.or_from(&parents);
+            }
+        }
+        let session_policy = launch.policy;
         if *no_session == Some(true) && session_path.is_some() {
             return Err(anyhow!(
                 "Session cannot be both no-session and session-pathed"
@@ -247,16 +285,18 @@ impl Supervisor {
             "skills",
             "promptTemplates",
             "autonomous",
-            // The launch tool selection: a respawned worker must rebuild
-            // the session with the same tools, never the defaults.
-            "tools",
-            "noTools",
-            "noBuiltinTools",
         ] {
             if let Some(value) = config_object.and_then(|config| config.get(key)) {
                 durable_rest.insert(key.to_string(), value.clone());
             }
         }
+        // The policy rides the durable create command (both keys, validated
+        // booleans) so a respawned or relaunched worker starts under it:
+        // the launch env reads `offline`, the worker's create `noSkills`.
+        // The launch tool selection rides it the same way (validated, as
+        // given or as kept): a respawned worker rebuilds the session with
+        // the same tools, never the defaults.
+        launch.write_into(&mut durable_rest);
         // A child's RLM identity rides the durable create command too, so a
         // respawned or adopted child stays identifiable for ledger appends.
         if let Some(metadata) = &runtime_metadata {
@@ -293,8 +333,11 @@ impl Supervisor {
             session_file: session_path.clone(),
             session_dir: session_dir.clone(),
             // TS main.ts `telemetryDisabled`: only ever `Some(true)`
-            // (the enabled case stays absent on the wire).
-            telemetry_disabled: telemetry_disabled.and(Some(true)),
+            // (the enabled case stays absent on the wire). An offline
+            // session is never telemetered, whatever the client sent.
+            telemetry_disabled: telemetry_disabled.and(Some(true)).or(session_policy
+                .is_some_and(|policy| policy.offline)
+                .then_some(true)),
             created_at: now.clone(),
             updated_at: now,
             lifecycle: DaemonWorkerLifecycle::Starting,
@@ -438,13 +481,11 @@ impl Supervisor {
                 // Never leave the spawned worker behind a degraded create:
                 // the shutdown is graceful, and the awaited kill reaps the
                 // child (the monitor that would own it is not spawned yet).
-                let _ = self.stop_worker(&resident).await;
-                let _ = child.kill().await;
-                let _ = std::fs::remove_file(&descriptor_path);
+                self.discard_unadmitted_worker(&resident, child).await;
                 return Err(anyhow!("session worker create returned no session file"));
             }
         }
-        {
+        let admitted = {
             let mut descriptor = resident.descriptor.lock().await;
             descriptor.lifecycle = DaemonWorkerLifecycle::Ready;
             descriptor.root_session_id = create_summary
@@ -477,7 +518,26 @@ impl Supervisor {
                 descriptor.root_session_id.as_deref(),
                 descriptor.session_file.as_deref(),
             );
-            persist_worker(&descriptor_path, &descriptor)?;
+            // The policy and the tool selection outlive this worker: the
+            // descriptor goes with it (idle passivation, a per-session
+            // stop), and the session's next worker recalls them from this
+            // record.
+            persist_worker(&descriptor_path, &descriptor).and_then(|()| {
+                match descriptor.session_file.as_deref() {
+                    Some(session_file) if !launch.is_empty() => launch
+                        .remember(&self.descriptor_dir, session_file)
+                        .context("keep the session policy"),
+                    _ => Ok(()),
+                }
+            })
+        };
+        if let Err(error) = admitted {
+            // A worker whose descriptor or session policy cannot be kept
+            // is not admitted (a restart could not adopt it; its next
+            // worker would start without the policy). The launch always
+            // retires it, whatever the descriptor or policy store does.
+            self.discard_unadmitted_worker(&resident, child).await;
+            return Err(error);
         }
         // The create completed with a validated session identity: client
         // commands may now be routed to this worker (the replacement-aware
@@ -749,6 +809,10 @@ impl Supervisor {
         // stop before the shutdown is forwarded, exactly like TS throws
         // for non-direct-child stops, so the worker's crash-recovery
         // contract stays intact.
+        // The session's policy record (kept at the create and at every
+        // identity move) gets one more best-effort write for the file the
+        // worker serves NOW; the stop never waits on the policy store.
+        self.settle_session_policy_at_stop(resident).await;
         self.persist_stop_tombstone_stop(resident).await?;
         resident.intentional_stop.store(true, Ordering::SeqCst);
         // The stop is intentional: routes waiting out a replacement must
@@ -789,6 +853,13 @@ impl Supervisor {
         // that missed the routed shutdown stays adoptable (or is
         // escalated away) instead of becoming an invisible lease holder.
         self.retire_worker_after_stop(resident).await;
+        self.release_stopped_worker(resident).await;
+        Ok(())
+    }
+
+    /// The stop's tail past the retire: the registry, the scheduled-jobs
+    /// invalidation and the roster forget the stopped worker.
+    async fn release_stopped_worker(self: &Arc<Self>, resident: &Arc<ResidentWorker>) {
         // TS `stopWorkerUntracked`: a client-owned (ephemeral) worker's
         // scheduled jobs die with the registration
         // (`cancelEphemeralWorkerScheduledJobs`) — every remove-descriptor
@@ -814,7 +885,35 @@ impl Supervisor {
         // transcript read.
         self.passivate_roster_worker(&resident.worker_id, ephemeral)
             .await;
-        Ok(())
+    }
+
+    /// Retire a launched worker whose create cannot be admitted (a
+    /// degraded create, a session policy that cannot be kept): the
+    /// graceful stop, then the awaited kill of the child this launch owns
+    /// (its exit is confirmed: the kill reaps it), its descriptor gone,
+    /// and its resident out of the registry and the roster whatever the
+    /// stop managed. A later open never finds (or waits on) it.
+    async fn discard_unadmitted_worker(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+        mut child: tokio::process::Child,
+    ) {
+        let stopped = self.stop_worker(resident).await;
+        resident.intentional_stop.store(true, Ordering::SeqCst);
+        resident.note_retired();
+        let _ = child.kill().await;
+        let _ = std::fs::remove_file(&resident.descriptor_path);
+        let _ = crate::descriptor::clear_identity_pending(&resident.descriptor_path);
+        if let Err(error) = stopped {
+            // The graceful stop never started (its tombstone did not
+            // persist), so its tail never ran: the child is gone now, and
+            // the registry and the roster forget it here.
+            self.log_line(&format!(
+                "session worker {} was not admitted and its stop did not start ({error:#}); the launch retired it",
+                resident.worker_id
+            ));
+            self.release_stopped_worker(resident).await;
+        }
     }
 
     /// Delete one stopped worker's descriptor only after its process is

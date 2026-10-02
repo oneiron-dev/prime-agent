@@ -322,7 +322,12 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
         daemon_socket: parsed.daemon_socket.clone(),
         list_models: parsed.list_models,
         verbose: parsed.verbose,
-        offline: parsed.offline,
+        // The effective offline mode: the flag or a truthy `PI_OFFLINE`
+        // (normalized above), which a daemon-hosted session carries.
+        offline: parsed.offline
+            || crate::config::is_truthy_env_flag(
+                std::env::var(crate::config::ENV_OFFLINE).ok().as_deref(),
+            ),
         agents_view_requested: public_command.explicit_agents_view,
         attach_agent: public_command.attach_agent,
         json_event_profile: parsed.json_event_profile.unwrap_or_default(),

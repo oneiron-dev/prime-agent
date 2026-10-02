@@ -33,6 +33,10 @@ impl Supervisor {
         for resident in self.registry.list().await {
             resident.intentional_stop.store(true, Ordering::SeqCst);
             resident.note_retired();
+            // The session policy record gets its last best-effort write
+            // (a repair a failed identity-move write left pending); the
+            // shutdown never waits on the policy store.
+            self.settle_session_policy_at_stop(&resident).await;
             // The stop tombstone persists before the worker is even told (TS
             // `stopWorkerUntracked` persists before its request): a
             // supervisor that dies between here and the worker's exit

@@ -116,6 +116,15 @@ pub fn worker_launch_env(
             "1".to_string(),
         );
     }
+    // An offline session (its durable `offline` policy) starts its worker
+    // offline, at every launch and relaunch; the supervisor's own
+    // environment and every other worker's stay as they are.
+    if crate::session_policy::SessionPolicy::durable(&descriptor.create_command.rest).offline {
+        env.insert(
+            crate::session_policy::OFFLINE_ENV.to_string(),
+            "1".to_string(),
+        );
+    }
     env
 }
 
@@ -417,9 +426,41 @@ mod tests {
         assert_eq!(rebuilt["script"], "/script.json");
     }
 
+    /// The durable `offline` policy adds exactly `PI_OFFLINE=1` to that
+    /// worker's launch env; `noSkills` alone and a pre-policy descriptor
+    /// launch with the env they always had.
     #[test]
-    fn descriptor_validates_against_socket() {
-        let descriptor = WorkerDescriptor {
+    fn an_offline_session_launches_its_worker_offline() {
+        let launch_env = |rest: Value| {
+            worker_launch_env(
+                Path::new("/agent"),
+                "/tmp/daemon.sock",
+                "instance",
+                &WorkerDescriptor {
+                    create_command: DurableDaemonCreateCommand {
+                        session_path: Some("/a.jsonl".to_string()),
+                        no_session: None,
+                        rest: rest.as_object().cloned().unwrap(),
+                    },
+                    ..ready_descriptor()
+                },
+            )
+        };
+        let online = launch_env(json!({ "cwd": "/w" }));
+        let mut expected = online.clone();
+        expected.insert("PI_OFFLINE".to_string(), "1".to_string());
+        assert_eq!(
+            launch_env(json!({ "cwd": "/w", "offline": true, "noSkills": true })),
+            expected
+        );
+        assert_eq!(
+            launch_env(json!({ "cwd": "/w", "offline": false, "noSkills": true })),
+            online
+        );
+    }
+
+    fn ready_descriptor() -> WorkerDescriptor {
+        WorkerDescriptor {
             version: 2,
             worker_id: "abc123def456".to_string(),
             pid: 42,
@@ -450,7 +491,12 @@ mod tests {
             last_failure_at: None,
             last_error: None,
             rest: Map::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn descriptor_validates_against_socket() {
+        let descriptor = ready_descriptor();
         let json = serde_json::to_value(&descriptor).unwrap();
         assert_eq!(json["lifecycle"], "ready");
         assert_eq!(json["workerId"], "abc123def456");

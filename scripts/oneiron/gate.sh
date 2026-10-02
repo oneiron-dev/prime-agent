@@ -230,6 +230,8 @@ run_policy() {
   python3 scripts/oneiron/test_side_by_side.py
   python3 scripts/oneiron/test_release_feed.py
   python3 scripts/oneiron/test_rollout.py
+  # The factory daemon-seat verifier's pure parts.
+  python3 scripts/oneiron/test_verify_factory_daemon_seat.py
 }
 
 case "$step" in

@@ -29,8 +29,16 @@ The package has no runtime npm dependency. `npm run check` runs the typecheck, t
 policy gate (`TEST_POLICY_BASE=oneiron/main`). The suite builds the package into a temporary directory first and
 runs its CLI tests against that build. From source, `node --import tsx src/cli-entry.ts <command>` works too.
 
-`scripts/capture-rust-jsonl.py <prime-agent> test/fixtures/rust-jsonl` regenerates the captured Rust streams the
-parser tests read (sandboxed HOME and TMPDIR, scripted faux provider, no network).
+`scripts/capture-rust-jsonl.py <prime-agent> test/fixtures/rust-jsonl [--sandbox-root <dir>]` regenerates the
+captured Rust streams the parser tests read: the native seat argv with `--json-event-profile factory-completed`,
+once owned and once daemon-hosted (a sandbox daemon it stops again), for a finished writer, a reviewer's tool turn,
+a provider error and a length cut-off (sandboxed HOME, TMPDIR and sockets, scripted faux provider, no network).
+
+`PRIME_AGENT_TEST_BINARY=<built prime-agent> npm test` also runs the custody verifier against that binary
+(`test/oneiron-ticket.test.ts`, Linux): real owned and daemon seats under the faux provider, a sandbox daemon per
+test. `scripts/oneiron/verify_factory_daemon_seat.py --prime-agent-bin <binary> --factory-dir packages/factory`
+(from the repository root) closes one sandbox ticket end to end on daemon seats: init, launch, status, resume and
+serve until the ticket is RETIRED and merged.
 
 ## Which agent binary the seats run
 
@@ -111,5 +119,6 @@ and hosts formats are unchanged here. What changes:
 - Adoption telemetry for factory invocations.
 - Seat environment for a warm agent daemon: under `seatHosting: "daemon"` a worker the daemon already runs keeps
   its own environment, so a seat's `PATH` and `W7_CARGO_*` overlay reaches it only once the daemon honors a
-  client's launch environment.
+  client's launch environment; until then the Rust binary refuses `--daemon-hosted` with a `W7_CARGO_*` overlay,
+  so daemon seats need `buildHosts: []`. The seats' `--offline` and `--no-skills` do reach the daemon session.
 - Migration of an existing TypeScript factory's state; such a factory keeps running on the TypeScript build.

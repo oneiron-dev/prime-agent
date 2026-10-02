@@ -29,7 +29,10 @@ pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
 ///   keep the plain message;
 /// - the capability-gated `create` keys `tools`/`noTools`/`noBuiltinTools`
 ///   (server capability `session_tool_selection`) and the worker summary's
-///   `toolSelection`.
+///   `toolSelection`;
+/// - the capability-gated `create` keys `offline`/`noSkills` (server
+///   capability `session_policy`): a hosted session's `--offline` and
+///   `--no-skills`.
 pub const DAEMON_SCHEMA_REVISION: u64 = 31;
 pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-31-a926532e8319";
 
