@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -190,6 +192,18 @@ class TeardownTests(unittest.TestCase):
     def test_a_process_of_another_sandbox_is_not_acquired(self):
         child = self.spawn("sleep", "30")
         self.assertIsNone(verifier.ProcessHandle.acquire(child.pid, self.marker + "-other"))
+
+    def test_only_a_vanished_process_reads_as_absent(self):
+        # A pidfd failure that is not the process's disappearance (EMFILE here) leaves the teardown unproven, never
+        # an empty sandbox; a vanished process is simply absent.
+        vanished = OSError(errno.ESRCH, "No such process")
+        exhausted = OSError(errno.EMFILE, "Too many open files")
+        with mock.patch.object(verifier.os, "pidfd_open", side_effect=ProcessLookupError(*vanished.args),
+                               create=True):
+            self.assertIsNone(verifier.ProcessHandle.acquire(4242, self.marker))
+        with mock.patch.object(verifier.os, "pidfd_open", side_effect=exhausted, create=True):
+            with self.assertRaisesRegex(RuntimeError, "cannot hold process 4242"):
+                verifier.ProcessHandle.acquire(4242, self.marker)
 
     def test_a_stale_identity_is_never_signalled(self):
         # The pid now belongs to a process that did not start when the recorded one did (a recycled pid): the kill

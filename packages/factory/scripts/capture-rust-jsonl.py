@@ -126,16 +126,23 @@ class Supervisor:
         self.pid, self.pidfd, self.start = pid, None, None
         if hasattr(os, "pidfd_open"):
             self.pidfd = os.pidfd_open(pid)
-            proc = pathlib.Path(f"/proc/{pid}")
-            owned = marker.encode() in (proc / "environ").read_bytes() + (proc / "cmdline").read_bytes()
-            if not owned or self.exited(0):
+            try:
+                proc = pathlib.Path(f"/proc/{pid}")
+                owned = marker.encode() in (proc / "environ").read_bytes() + (proc / "cmdline").read_bytes()
+                if not owned or self.exited(0):
+                    raise ProcessLookupError(f"pid {pid} is not this sandbox's supervisor")
+            except BaseException:
                 self.close()
-                raise ProcessLookupError(f"pid {pid} is not this sandbox's supervisor")
+                raise
         else:
-            listed = subprocess.run(["ps", "-ww", "-E", "-o", "command=", "-p", str(pid)], capture_output=True,
-                                    text=True, env=PS_ENV)
-            self.start = ps_start_time(pid)
-            if marker not in listed.stdout or self.start is None:
+            # One listing gives the ownership and the identity together, so both describe the same process.
+            listed = subprocess.run(["ps", "-ww", "-E", "-o", "pid=,lstart=,command=", "-p", str(pid)],
+                                    capture_output=True, text=True, env=PS_ENV)
+            for line in listed.stdout.splitlines():
+                fields = line.split(None, 6)
+                if len(fields) == 7 and fields[0] == str(pid) and marker in fields[6]:
+                    self.start = " ".join(fields[1:6])
+            if self.start is None:
                 raise ProcessLookupError(f"pid {pid} is not this sandbox's supervisor")
 
     def exited(self, bound_s: float) -> bool:

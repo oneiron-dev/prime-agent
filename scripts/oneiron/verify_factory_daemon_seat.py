@@ -304,19 +304,27 @@ class ProcessHandle:
 
     @classmethod
     def acquire(cls, pid: int, marker: str) -> ProcessHandle | None:
-        """The handle of `pid` when its environment or command line names `marker`; None when it does not, or it is
-        gone."""
+        """The handle of `pid` when its environment or command line names `marker`; None when it does not (another
+        user's process, whose environment is unreadable, is not this sandbox's), or it is gone.
+
+        Raises RuntimeError when the process can be neither held nor proven gone (a pidfd or /proc failure such as
+        EMFILE): a teardown must not read that as an empty sandbox."""
         if hasattr(os, "pidfd_open"):
             try:
                 fd = os.pidfd_open(pid)
-            except OSError:
+            except ProcessLookupError:
                 return None
+            except OSError as error:
+                raise RuntimeError(f"cannot hold process {pid}: {error}") from error
             handle = cls(pid, fd, None)
             try:
                 proc = Path(f"/proc/{pid}")
                 owned = marker.encode() in (proc / "environ").read_bytes() + (proc / "cmdline").read_bytes()
-            except OSError:
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
                 owned = False
+            except OSError as error:
+                handle.close()
+                raise RuntimeError(f"cannot read process {pid}: {error}") from error
             if owned and not handle.exited(0):
                 return handle
             handle.close()
@@ -381,10 +389,15 @@ def stop_sandbox_daemon(sock_path: Path, root: Path) -> tuple[str, bool]:
     if not sock_path.exists():
         return "no daemon", True
     held: list[ProcessHandle] = []
+    unheld: list[str] = []
 
     def hold_supervisor(hello: dict) -> None:
         pid = hello.get("supervisorPid")
-        handle = ProcessHandle.acquire(pid, str(root)) if isinstance(pid, int) else None
+        try:
+            handle = ProcessHandle.acquire(pid, str(root)) if isinstance(pid, int) else None
+        except RuntimeError as error:
+            unheld.append(str(error))
+            return
         if handle is not None:
             held.append(handle)
 
@@ -396,7 +409,8 @@ def stop_sandbox_daemon(sock_path: Path, root: Path) -> tuple[str, bool]:
         return f"unreachable: {error}", False
     pid = hello.get("supervisorPid")
     if not held:
-        return f"the supervisor {pid} cannot be identified as this sandbox's", False
+        reason = f": {unheld[0]}" if unheld else ""
+        return f"the supervisor {pid} cannot be identified as this sandbox's{reason}", False
     supervisor = held[0]
     try:
         if supervisor.stop(REQUEST_BOUND_S):
@@ -411,17 +425,23 @@ def sandbox_processes(root: Path) -> list[ProcessHandle]:
     or command line names the sandbox root (Linux /proc; elsewhere `ps -E`, which appends a process's environment
     to its command line). The caller closes them.
 
-    Raises RuntimeError when the processes cannot be listed: a teardown must not pass without that proof."""
+    Raises RuntimeError when the processes cannot be listed, or one can be neither held nor proven gone: a teardown
+    must not pass without that proof."""
     marker = str(root)
     found: list[ProcessHandle] = []
     if hasattr(os, "pidfd_open") and Path("/proc").is_dir():
-        for entry in Path("/proc").glob("[0-9]*"):
-            pid = int(entry.name)
-            if pid == os.getpid():
-                continue
-            handle = ProcessHandle.acquire(pid, marker)
-            if handle is not None:
-                found.append(handle)
+        try:
+            for entry in Path("/proc").glob("[0-9]*"):
+                pid = int(entry.name)
+                if pid == os.getpid():
+                    continue
+                handle = ProcessHandle.acquire(pid, marker)
+                if handle is not None:
+                    found.append(handle)
+        except RuntimeError:
+            for handle in found:
+                handle.close()
+            raise
     else:
         listed = subprocess.run(["ps", "-axww", "-E", "-o", "pid=,lstart=,command="], capture_output=True,
                                 text=True, env=PS_ENV)
