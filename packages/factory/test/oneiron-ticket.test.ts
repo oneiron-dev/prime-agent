@@ -111,8 +111,8 @@ say({ type: "message_end", message: { role: "assistant", stopReason: "stop", con
 say({ type: "agent_end" });
 `;
 
-function setup() {
-	const root = mkdtempSync(join(tmpdir(), "factory-ticket-"));
+function setup(parent = tmpdir()) {
+	const root = mkdtempSync(join(parent, "factory-ticket-"));
 	roots.push(root);
 	const bin = join(root, "bin");
 	mkdirSync(bin);
@@ -172,6 +172,31 @@ function setup() {
 const BUILT_AGENT = process.env.PRIME_AGENT_TEST_BINARY;
 /** Sandbox daemon sockets the built-binary verifier may have started; each test's daemon stops before its root goes. */
 const daemonSockets: string[] = [];
+/** The agent HOMEs the built-binary verifier ran seats under; a seat process still running there fails the test. */
+const agentHomes: string[] = [];
+
+/** Kill every process still running with one of the verifier's agent HOMEs (Linux /proc) and name them. */
+function reapAgentHomes(homes: string[]): string[] {
+	const left: string[] = [];
+	for (const entry of readdirSync("/proc").filter((name) => /^\d+$/.test(name))) {
+		let environ: string;
+		try {
+			environ = readFileSync(`/proc/${entry}/environ`, "utf8");
+		} catch {
+			continue;
+		}
+		const variables = environ.split("\0");
+		const home = homes.find((dir) => variables.includes(`HOME=${dir}`));
+		if (!home) continue;
+		try {
+			process.kill(Number(entry), "SIGKILL");
+		} catch {
+			continue;
+		}
+		left.push(`pid ${entry} under ${home}`);
+	}
+	return left;
+}
 const envelope = (id: string, command: object) =>
 	`${JSON.stringify({ type: "command", id, protocol: { name: "prime-agent.daemon", version: 7 }, command })}\n`;
 
@@ -203,14 +228,21 @@ function daemonRequest(
 	});
 }
 
-/** Force-stop a sandbox daemon over its own socket, then wait for its supervisor process to exit. */
+/**
+ * Force-stop a sandbox daemon over its own socket, then wait for its supervisor process to exit. A socket nobody
+ * answers on (a daemon that died without cleaning up) fails the test: the stop cannot be proven.
+ */
 async function stopSandboxDaemon(socket: string): Promise<void> {
 	if (!existsSync(socket)) return;
-	const pid = await new Promise<number | undefined>((resolve) => {
+	const pid = await new Promise<number | undefined>((resolve, reject) => {
 		const client = createConnection(socket);
 		let buffer = "";
 		let pid: number | undefined;
-		client.on("error", () => resolve(pid));
+		client.on("error", (error) =>
+			pid === undefined
+				? reject(new Error(`the sandbox daemon at ${socket} cannot be stopped: ${error.message}`))
+				: resolve(pid),
+		);
 		// The supervisor closes the connection once its stop pass starts.
 		client.on("close", () => resolve(pid));
 		client.on("data", (chunk) => {
@@ -221,7 +253,7 @@ async function stopSandboxDaemon(socket: string): Promise<void> {
 			}
 		});
 	});
-	if (pid === undefined) return;
+	if (pid === undefined) throw new Error(`the sandbox daemon at ${socket} closed before its hello`);
 	// `tail --pid` returns when the supervisor exits; the timeout is a failure bound only.
 	const waited = spawnSync("tail", [`--pid=${pid}`, "-f", "/dev/null"], { timeout: 60_000 });
 	if (waited.status !== 0) {
@@ -231,8 +263,13 @@ async function stopSandboxDaemon(socket: string): Promise<void> {
 }
 
 afterEach(async () => {
-	for (const socket of daemonSockets.splice(0)) await stopSandboxDaemon(socket);
-	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	try {
+		for (const socket of daemonSockets.splice(0)) await stopSandboxDaemon(socket);
+		const left = reapAgentHomes(agentHomes.splice(0));
+		if (left.length) throw new Error(`seat processes outlived the test and were killed: ${left.join(", ")}`);
+	} finally {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	}
 });
 
 describe("Oneiron ticket runner", () => {
@@ -592,20 +629,23 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 	/**
 	 * The matrix's custody contract against the BUILT Rust binary (`PRIME_AGENT_TEST_BINARY`): real seat processes run
 	 * the factory's exact argv (`--offline` and `--no-skills` included), owned seats run the faux provider in-process,
-	 * daemon seats a sandbox daemon whose workers run it. A wrapper pins the sandbox (HOME, TMPDIR, the daemon socket
-	 * and its worker sockets, under $PA_SANDBOX_ROOT or ~/.cache/pa-sb) with nothing else inherited, logs each call's
-	 * argv and hands call N its own script.
+	 * daemon seats a sandbox daemon whose workers run it. The whole run lives under $PA_SANDBOX_ROOT or ~/.cache/pa-sb
+	 * (never the shared /tmp); a wrapper pins the agent's sandbox (HOME, TMPDIR, the daemon socket and its worker
+	 * sockets) with nothing else inherited, logs each call's argv and hands call N its own script.
 	 * Linux only: the teardown waits for the sandbox daemon's exit through `tail --pid`.
 	 */
 	// test-policy: allow conditional-or-disabled-test -- runs only with a built Rust binary (PRIME_AGENT_TEST_BINARY) on Linux; the package suite builds no Rust
 	describe.skipIf(!BUILT_AGENT || process.platform !== "linux")("against the built prime-agent binary", () => {
-		function builtAgent(scripts: object[]) {
-			// The agent's sandbox (HOME, TMPDIR, sockets) stays off the shared /tmp.
+		/** The whole run (checkout, worktree, sessions, the agent's HOME, TMPDIR and sockets) off the shared /tmp. */
+		function builtSetup() {
 			const parent = process.env.PA_SANDBOX_ROOT ?? join(homedir(), ".cache", "pa-sb");
 			mkdirSync(parent, { recursive: true });
-			const sandbox = mkdtempSync(join(parent, "custody-"));
-			roots.push(sandbox);
+			return setup(parent);
+		}
+		function builtAgent(f: ReturnType<typeof setup>, scripts: object[]) {
+			const sandbox = join(f.root, "pa");
 			for (const dir of ["home", "tmp", "s"]) mkdirSync(join(sandbox, dir), { recursive: true });
+			agentHomes.push(join(sandbox, "home"));
 			scripts.forEach((script, index) => {
 				writeFileSync(join(sandbox, `faux-${index + 1}.json`), JSON.stringify(script));
 				writeFileSync(join(sandbox, `daemon-${index + 1}.json`), JSON.stringify({ engine: "faux", ...script }));
@@ -652,8 +692,8 @@ exec env -i PATH=/usr/bin:/bin HOME="$dir/home" TMPDIR="$dir/tmp" PRIME_AGENT_DA
 		const seatFlags = ["--offline", "--no-skills"];
 
 		it("daemon custody: an unfinished writer continues its resident session with -c", async () => {
-			const f = setup();
-			const agent = builtAgent([{ responses: ["Working on it.", "DONE custody-one"] }]);
+			const f = builtSetup();
+			const agent = builtAgent(f, [{ responses: ["Working on it.", "DONE custody-one"] }]);
 			const writer = runner(f, "daemon", agent.wrapper);
 			expect((await writer.writerRounds("write", "start", "continue")).final).toBe("DONE custody-one");
 			const calls = agent.calls().map((argv) => argv.split(" "));
@@ -678,8 +718,8 @@ exec env -i PATH=/usr/bin:/bin HOME="$dir/home" TMPDIR="$dir/tmp" PRIME_AGENT_DA
 		}, 120_000);
 
 		it("daemon custody: a writer killed for silence mid-turn stops the ticket, and the turn runs on", async () => {
-			const f = setup();
-			const agent = builtAgent([held]);
+			const f = builtSetup();
+			const agent = builtAgent(f, [held]);
 			const writer = runner(f, "daemon", agent.wrapper);
 			await expect(writer.writerRounds("write", "start", "continue")).rejects.toThrow(
 				"before its daemon-hosted turn was seen to end; that turn may still be",
@@ -694,8 +734,8 @@ exec env -i PATH=/usr/bin:/bin HOME="$dir/home" TMPDIR="$dir/tmp" PRIME_AGENT_DA
 		}, 120_000);
 
 		it("owned custody: a writer killed for silence mid-turn continues the same session", async () => {
-			const f = setup();
-			const agent = builtAgent([held, { responses: ["DONE custody-one"] }]);
+			const f = builtSetup();
+			const agent = builtAgent(f, [held, { responses: ["DONE custody-one"] }]);
 			const writer = runner(f, "owned", agent.wrapper);
 			expect((await writer.writerRounds("write", "start", "continue")).final).toBe("DONE custody-one");
 			const calls = agent.calls().map((argv) => argv.split(" "));

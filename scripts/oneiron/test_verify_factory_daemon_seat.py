@@ -162,6 +162,21 @@ class TeardownTests(unittest.TestCase):
         finally:
             live.kill()
             live.wait()
+        # With kill, a process that outlived the bound is killed through its own handle.
+        stuck = subprocess.Popen(["sleep", "30"])
+        try:
+            self.assertFalse(verifier.wait_pid_gone(stuck.pid, 0.2, kill=True))
+            self.assertEqual(stuck.wait(timeout=30), -9)
+        finally:
+            if stuck.poll() is None:
+                stuck.kill()
+                stuck.wait()
+
+    def test_a_sandbox_root_under_the_shared_tmp_is_refused(self):
+        for root in (Path("/tmp"), Path("/tmp/pa-sb")):
+            with self.assertRaises(SystemExit):
+                verifier.refuse_shared_tmp(root)
+        verifier.refuse_shared_tmp(Path.home() / ".cache" / "pa-sb")
 
     def test_a_process_started_for_the_sandbox_is_found(self):
         with tempfile.TemporaryDirectory() as root:

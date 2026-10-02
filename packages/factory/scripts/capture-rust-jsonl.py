@@ -99,26 +99,30 @@ def daemon_request(sock_path: pathlib.Path, command: dict) -> tuple[dict, list[d
         return hello, lines
 
 
-def wait_pid_gone(pid: int, bound_s: float) -> bool:
-    """Wait for one process to exit, on the exit itself (a Linux pidfd, a macOS kqueue); False past the bound."""
+def stop_when_gone(pid: int, bound_s: float) -> None:
+    """Wait for one process to exit, on the exit itself (a Linux pidfd, a macOS kqueue); past the bound, SIGKILL it
+    through the same pidfd (a recycled pid is never signalled; macOS signals the pid)."""
     if hasattr(os, "pidfd_open"):
         try:
             fd = os.pidfd_open(pid)
         except ProcessLookupError:
-            return True
+            return
         try:
             poller = select.poll()
             poller.register(fd, select.POLLIN)
-            return bool(poller.poll(int(bound_s * 1000)))
+            if not poller.poll(int(bound_s * 1000)):
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
         finally:
             os.close(fd)
+        return
     queue = select.kqueue()
     try:
         watch = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
                               fflags=select.KQ_NOTE_EXIT)
-        return bool(queue.control([watch], 1, bound_s))
+        if not queue.control([watch], 1, bound_s):
+            os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
-        return True
+        return
     finally:
         queue.close()
 
@@ -134,8 +138,7 @@ def stop_sandbox_daemon(sock_path: pathlib.Path) -> None:
     pid = hello.get("supervisorPid")
     if not isinstance(pid, int):
         return
-    if not wait_pid_gone(pid, SHUTDOWN_BOUND_S):
-        os.kill(pid, signal.SIGKILL)
+    stop_when_gone(pid, SHUTDOWN_BOUND_S)
 
 
 def main() -> None:
@@ -149,6 +152,9 @@ def main() -> None:
     binary = os.path.abspath(args.binary) if os.sep in args.binary else args.binary
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    resolved = args.sandbox_root.expanduser().resolve()
+    if resolved == pathlib.Path("/tmp") or pathlib.Path("/tmp") in resolved.parents:
+        raise SystemExit(f"refusing a sandbox root under the shared /tmp: {resolved}")
     args.sandbox_root.mkdir(parents=True, exist_ok=True)
     root = pathlib.Path(tempfile.mkdtemp(prefix="fcap-", dir=args.sandbox_root))
     home, tmp, work, scripts = root / "h", root / "t", root / "w", root / "scripts"

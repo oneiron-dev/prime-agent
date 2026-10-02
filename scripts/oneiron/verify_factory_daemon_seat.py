@@ -266,9 +266,10 @@ def daemon_request(sock_path: Path, command: dict) -> tuple[dict, dict | None]:
         return hello, None
 
 
-def wait_pid_gone(pid: int, bound_s: float) -> bool:
-    """Wait for one process to exit, on the exit itself (a Linux pidfd, a macOS kqueue), never a poll loop; the bound
-    only turns a process that never exits into False."""
+def wait_pid_gone(pid: int, bound_s: float, *, kill: bool = False) -> bool:
+    """Wait for one process to exit, on the exit itself (a Linux pidfd, a macOS kqueue), never a poll loop. True when
+    it exited within the bound; with `kill`, a process that outlived it gets SIGKILL through the same pidfd, so a
+    recycled pid is never signalled (macOS has no such handle and signals the pid)."""
     if hasattr(os, "pidfd_open"):
         try:
             fd = os.pidfd_open(pid)
@@ -277,14 +278,22 @@ def wait_pid_gone(pid: int, bound_s: float) -> bool:
         try:
             poller = select.poll()
             poller.register(fd, select.POLLIN)
-            return bool(poller.poll(int(bound_s * 1000)))
+            if poller.poll(int(bound_s * 1000)):
+                return True
+            if kill:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            return False
         finally:
             os.close(fd)
     queue = select.kqueue()
     try:
         watch = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
                               fflags=select.KQ_NOTE_EXIT)
-        return bool(queue.control([watch], 1, bound_s))
+        if queue.control([watch], 1, bound_s):
+            return True
+        if kill:
+            os.kill(pid, signal.SIGKILL)
+        return False
     except ProcessLookupError:
         return True
     finally:
@@ -292,7 +301,7 @@ def wait_pid_gone(pid: int, bound_s: float) -> bool:
 
 
 def stop_sandbox_daemon(sock_path: Path) -> tuple[str, bool]:
-    """Force-stop the sandbox daemon over its own socket and wait for its supervisor to exit; SIGKILL that pid if it
+    """Force-stop the sandbox daemon over its own socket and wait for its supervisor to exit; SIGKILL it if it
     outlives the bound. Returns what happened and whether the stop was clean."""
     if not sock_path.exists():
         return "no daemon", True
@@ -303,38 +312,56 @@ def stop_sandbox_daemon(sock_path: Path) -> tuple[str, bool]:
     pid = hello.get("supervisorPid")
     if not isinstance(pid, int):
         return "no supervisor pid", False
-    if wait_pid_gone(pid, REQUEST_BOUND_S):
+    if wait_pid_gone(pid, REQUEST_BOUND_S, kill=True):
         return f"stopped supervisor {pid}", True
-    os.kill(pid, signal.SIGKILL)
     return f"killed supervisor {pid}", False
 
 
 def sandbox_processes(root: Path) -> list[int]:
-    """Live processes started for this sandbox (Linux: their environment or command line names the sandbox root);
-    empty where /proc is absent."""
-    marker = str(root).encode()
-    found = []
-    for entry in Path("/proc").glob("[0-9]*") if Path("/proc").is_dir() else []:
-        try:
-            if marker in (entry / "environ").read_bytes() or marker in (entry / "cmdline").read_bytes():
-                found.append(int(entry.name))
-        except OSError:
-            continue
+    """Live processes started for this sandbox: their environment or command line names the sandbox root (Linux
+    /proc; elsewhere `ps -E`, which appends a process's environment to its command line).
+
+    Raises RuntimeError when the processes cannot be listed: a teardown must not pass without that proof."""
+    marker = str(root)
+    found: list[int] = []
+    if Path("/proc").is_dir():
+        for entry in Path("/proc").glob("[0-9]*"):
+            try:
+                if marker.encode() in (entry / "environ").read_bytes() + (entry / "cmdline").read_bytes():
+                    found.append(int(entry.name))
+            except OSError:
+                continue
+    else:
+        listed = subprocess.run(["ps", "-axww", "-E", "-o", "pid=,command="], capture_output=True, text=True)
+        if listed.returncode != 0:
+            raise RuntimeError(f"cannot list processes: {listed.stderr.strip()}")
+        for line in listed.stdout.splitlines():
+            pid, _, command = line.strip().partition(" ")
+            if marker in command and pid.isdigit():
+                found.append(int(pid))
     return sorted(pid for pid in found if pid != os.getpid())
+
+
+REAP_ROUNDS = 5
 
 
 def reap_sandbox(root: Path) -> list[str]:
     """Wait for every process still running for the sandbox to exit, SIGKILL the ones that outlive the bound (they
-    are this run's own), and report each one that had to be killed."""
-    left = []
-    for pid in sandbox_processes(root):
-        if not wait_pid_gone(pid, REQUEST_BOUND_S):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                continue
-            left.append(f"process {pid} outlived the teardown and was killed")
-    return left
+    are this run's own), and scan again (a process may have started another while it was awaited) until a scan is
+    empty. Reports each process that had to be killed, a sandbox still busy after the last round, or a scan that
+    could not run."""
+    left: list[str] = []
+    for _ in range(REAP_ROUNDS):
+        try:
+            pids = sandbox_processes(root)
+        except RuntimeError as error:
+            return [*left, f"the sandbox teardown cannot be proven: {error}"]
+        if not pids:
+            return left
+        for pid in pids:
+            if not wait_pid_gone(pid, REQUEST_BOUND_S, kill=True):
+                left.append(f"process {pid} outlived the teardown and was killed")
+    return [*left, f"sandbox processes still running after {REAP_ROUNDS} rounds"]
 
 
 def worker_offline_env(pid: int) -> str | None:
@@ -347,6 +374,13 @@ def worker_offline_env(pid: int) -> str | None:
         if name == b"PI_OFFLINE":
             return value.decode()
     return None
+
+
+def refuse_shared_tmp(root: Path) -> None:
+    """Sandboxes never go under the shared /tmp (a quota-limited tmpfs other jobs need)."""
+    resolved = root.expanduser().resolve()
+    if resolved == Path("/tmp") or Path("/tmp") in resolved.parents:
+        raise SystemExit(f"refusing a sandbox root under the shared /tmp: {resolved}")
 
 
 class Sandbox:
@@ -484,6 +518,7 @@ def main() -> int:
     args = parser.parse_args()
     binary = os.path.abspath(args.prime_agent_bin)
     factory_dir = args.factory_dir.resolve()
+    refuse_shared_tmp(args.sandbox_root)
     args.sandbox_root.mkdir(parents=True, exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix="vfds-", dir=args.sandbox_root))
     report: dict = {"sandbox": str(root), "binary": binary}
