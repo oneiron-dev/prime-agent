@@ -1580,6 +1580,60 @@ fn a_passivated_no_tools_session_wakes_without_tools() {
     );
 }
 
+/// The record follows the tools a session runs with now: a worker created
+/// without tool keys (the default selection) that switches onto a session
+/// saved with `--no-tools` serves it with every tool, and after the idle
+/// passivation the daemon's wake keeps them instead of reviving the saved
+/// `--no-tools`.
+#[test]
+fn a_default_worker_that_switched_onto_a_no_tools_session_wakes_with_its_tools() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    let (stdout, stderr, code) = sandbox.run(&["--daemon-hosted", "--no-tools", "-p", "one"]);
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let saved = sandbox.sessions()[0].clone();
+    sandbox.passivate(&saved);
+    let mut wire = sandbox.wire();
+    let created = wire.request(&json!({
+        "type": "create",
+        "lifecycle": "resident",
+        "config": {
+            "cwd": sandbox.home(),
+            "script": sandbox.dir.path().join("script.json"),
+        },
+    }));
+    let worker = created["data"]["activeSessionId"].clone();
+    wire.request(&json!({
+        "type": "switch_session",
+        "activeSessionId": worker,
+        "sessionPath": saved["sessionFile"],
+    }));
+    let switched = sandbox
+        .sessions()
+        .into_iter()
+        .find(|row| row["activeSessionId"] == worker)
+        .expect("the default worker serves the saved session");
+    assert_eq!(switched["sessionId"], saved["sessionId"]);
+    let before = sandbox.tool_state(&switched);
+    let woken = sandbox.passivate_and_wake(&switched);
+    assert_ne!(woken["workerPid"], switched["workerPid"]);
+    let after = sandbox.tool_state(&woken);
+    assert_eq!(
+        (
+            &after.0,
+            after
+                .1
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            &after,
+        ),
+        (&Value::Null, vec!["toolDefinition".to_string()], &before),
+        "the woken worker runs the default tools the session ran with"
+    );
+}
+
 /// A kill retires its worker whatever the policy store does: with every
 /// policy write refused, the stop's last policy write fails (and says so
 /// in the daemon log), and the worker still gets its shutdown, exits, and

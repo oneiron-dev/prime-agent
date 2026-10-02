@@ -154,23 +154,44 @@ impl Supervisor {
     /// Write the policy record (the session policy and the launch tool
     /// selection) for the worker's current session file and set the
     /// resident's repair marker from the outcome (nothing to keep - a
-    /// worker created with neither, an in-memory session - clears it).
+    /// worker created with neither onto a file without a record, an
+    /// in-memory session - clears it).
+    ///
+    /// A worker created without tool keys runs the default selection: when
+    /// it serves a file whose record names another one (it switched onto a
+    /// session saved with `--no-tools`), the record's selection becomes the
+    /// default, so a wake keeps the tools the session runs with now. A
+    /// worker without a policy has none to give, and the record's policy
+    /// stays as kept.
     fn write_session_policy(
         &self,
         resident: &ResidentWorker,
         descriptor: &DaemonWorkerDescriptor,
     ) -> anyhow::Result<()> {
-        let carried =
-            crate::session_policy::SessionLaunch::carried(&descriptor.create_command.rest);
-        let Some(session_file) = descriptor
-            .session_file
-            .as_deref()
-            .filter(|_| !carried.is_empty())
-        else {
+        use crate::session_policy::SessionLaunch;
+        let carried = SessionLaunch::carried(&descriptor.create_command.rest);
+        let Some(session_file) = descriptor.session_file.as_deref() else {
             resident.clear_policy_repair_pending();
             return Ok(());
         };
-        match carried.remember(&self.descriptor_dir, session_file) {
+        let launch = if carried.tool_selection.is_some() {
+            Ok(Some(carried))
+        } else {
+            SessionLaunch::recalled(&self.descriptor_dir, session_file).map(|kept| {
+                kept.map(|kept| SessionLaunch {
+                    policy: carried.policy.or(kept.policy),
+                    tool_selection: Some(pa_types::daemon::ToolSelectionFlags::default()),
+                })
+                .or(Some(carried))
+            })
+        };
+        let written = launch.and_then(|launch| match launch {
+            Some(launch) if !launch.is_empty() => {
+                launch.remember(&self.descriptor_dir, session_file)
+            }
+            _ => Ok(()),
+        });
+        match written {
             Ok(()) => {
                 resident.clear_policy_repair_pending();
                 Ok(())
