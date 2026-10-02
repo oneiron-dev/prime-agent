@@ -552,3 +552,104 @@ fn a_fresh_setup_left_unready_boots_nothing_in_the_background() {
         .count();
     assert_eq!(installs, 1, "the setup ran once, before the first turn");
 }
+
+/// Tool selection gates kernel preparation: a `--no-tools` or `--tools ""`
+/// print run in a fresh home leaves `ipython` inactive, so it prepares no
+/// kernel environment (no `--verbose` preparation or bootstrap-subprocess
+/// trace line, no `uv` call, no venv) and starts no kernel, while its exit
+/// path (kernel abandon, output flush, bounded runtime shutdown) still
+/// runs. The receipts are read after the binary exited: without the gate,
+/// `BeforeFirstTurn` awaits the fresh setup before the first turn, so its
+/// trace and the `uv` log would exist by then.
+#[test]
+fn a_no_tools_print_run_in_a_fresh_home_prepares_and_starts_no_kernel() {
+    for flags in [&["--no-tools"][..], &["--tools", ""][..]] {
+        let mock = MockProvider::start(Box::new(|| {}));
+        let sandbox = Sandbox::new(&mock);
+        let log = sandbox.path("uv.log");
+        sandbox.executable(
+            "bin/uv",
+            &format!(
+                "#!/bin/sh\necho \"begin $*\" >> '{log}'\nexit 1\n",
+                log = log.display()
+            ),
+        );
+        let path = format!(
+            "{}:{}",
+            sandbox.path("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut child = sandbox
+            .command(&[&["--verbose"][..], flags].concat())
+            .env("PATH", path)
+            .env("PRIME_AGENT_KERNEL_VENV", sandbox.path("venv"))
+            .spawn()
+            .expect("spawn the binary");
+        let stdout = forward_lines(child.stdout.take().expect("stdout"));
+        let stderr = forward_lines(child.stderr.take().expect("stderr"));
+        let pid = child.id();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = exit_tx.send(child.wait());
+            child
+        });
+        let Ok(status) = exit_rx.recv_timeout(STEP_BOUND) else {
+            kill(pid);
+            panic!("the {flags:?} run did not end");
+        };
+        let status = status.expect("wait for the binary");
+        let events = json_events(&stdout);
+        let stderr: Vec<String> = stderr.iter().collect();
+        assert!(status.success(), "{flags:?} stderr: {stderr:?}");
+        assert_eq!(answer_text(&events).as_deref(), Some(MOCK_REPLY));
+        let phases: Vec<&str> = stderr
+            .iter()
+            .filter(|line| line.starts_with("[prime-agent exit +"))
+            .filter_map(|line| line.split("] ").nth(1))
+            .collect();
+        let kernel_setup: Vec<&str> = phases
+            .iter()
+            .copied()
+            .filter(|phase| {
+                phase.starts_with("kernel environment") || phase.starts_with("bootstrap subprocess")
+            })
+            .collect();
+        assert_eq!(
+            kernel_setup,
+            Vec::<&str>::new(),
+            "{flags:?} prepared a kernel environment; stderr: {stderr:?}"
+        );
+        let exit_path: Vec<&str> = phases
+            .iter()
+            .copied()
+            .filter(|phase| {
+                [
+                    "kernel abandon",
+                    "output flush",
+                    "runtime shutdown start",
+                    "runtime shutdown end",
+                ]
+                .contains(phase)
+            })
+            .collect();
+        assert_eq!(
+            exit_path,
+            [
+                "kernel abandon",
+                "output flush",
+                "runtime shutdown start",
+                "runtime shutdown end"
+            ],
+            "{flags:?} stderr: {stderr:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).ok(),
+            None,
+            "{flags:?} called uv"
+        );
+        assert!(
+            !sandbox.path("venv").exists(),
+            "{flags:?} built a kernel venv"
+        );
+    }
+}
