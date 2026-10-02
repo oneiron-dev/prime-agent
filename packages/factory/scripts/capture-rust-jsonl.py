@@ -14,6 +14,8 @@ touches a real agent dir, socket or daemon.
 
     python3 scripts/capture-rust-jsonl.py <prime-agent binary> test/fixtures/rust-jsonl [--sandbox-root DIR]
 
+The sandbox root defaults to $PA_SANDBOX_ROOT, else ~/.cache/pa-sb (never the shared /tmp).
+
 Writes `<custody>-<case>.stdout.jsonl`, `<custody>-<case>.session.jsonl` and `<custody>-<case>.exit` per case.
 """
 import argparse
@@ -21,34 +23,42 @@ import json
 import os
 import pathlib
 import shutil
+import select
 import signal
 import socket
 import subprocess
 import tempfile
-import time
 
 # One scripted turn per case; the same script drives the owned and the daemon seat.
 CASES = {
     # A writer turn that ends with the exact completion line.
     "writer-done": {"responses": ["Implemented the change.\nPR BODY:\nAdded the function.\nDONE capture-one"]},
-    # A reviewer that runs a tool, then answers with its verdict; thinking rides the final message.
+    # A reviewer that runs a tool (the kernel's ipython, which must succeed), then answers with its verdict; thinking
+    # rides the final message.
     "review-tool-then-verdict": {"responses": [
         {"content": [{"type": "thinking", "thinking": "Read the diff first."},
-                     {"type": "toolCall", "id": "call-1", "name": "bash", "arguments": {"command": "echo factory-capture"}}]},
+                     {"type": "toolCall", "id": "call-1", "name": "ipython",
+                      "arguments": {"code": "print('factory-capture')"}}]},
         {"content": [{"type": "thinking", "thinking": "The diff is fine."},
                      {"type": "text", "text": "Checked every hunk.\nVERDICT: LANDABLE"}]},
     ]},
-    # A provider error that persists: JSON mode still streams agent_end, and no final may be accepted. The error repeats
-    # for every call, so a daemon worker's automatic retries meet the same error until they give up.
-    "provider-error": {"responses": [{"text": "partial", "stopReason": "error", "errorMessage": "upstream unavailable"}],
+    # A provider error that persists, after the reply already wrote the completion line: JSON mode still streams
+    # agent_end, and no final may be accepted. The error repeats for every call, so a daemon worker's automatic retries
+    # meet the same error until they give up.
+    "provider-error": {"responses": [{"text": "DONE capture-one", "stopReason": "error",
+                                      "errorMessage": "upstream unavailable"}],
                        "repeatLastResponse": True},
     # A reply cut off at the length limit is not a terminal reply either.
     "length-cutoff": {"responses": [{"text": "DONE capture-one", "stopReason": "length"}]},
 }
 CUSTODIES = ("owned", "daemon")
 PROMPT = "Review this diff for ticket capture-one.\n"
-SEAT_TIMEOUT_S = 300
+# The first tool call provisions the sandbox's kernel environment (uv downloads the runtime's packages once).
+SEAT_TIMEOUT_S = 900
+TOOL_OUTPUT = "factory-capture\n"
 SHUTDOWN_BOUND_S = 60
+# Off the shared /tmp: sandboxes and sockets stay under the user's cache.
+DEFAULT_SANDBOX_ROOT = pathlib.Path(os.environ.get("PA_SANDBOX_ROOT") or pathlib.Path.home() / ".cache" / "pa-sb")
 
 
 def seat_argv(binary: str, custody: str, work: pathlib.Path, session_dir: pathlib.Path) -> list[str]:
@@ -57,6 +67,17 @@ def seat_argv(binary: str, custody: str, work: pathlib.Path, session_dir: pathli
     return [binary, "-p", "--mode", "json", "--json-event-profile", "factory-completed", *hosting, "--offline",
             "--provider", "faux", "--model", "faux-1", "--thinking", "low", "--cwd", str(work), "--no-extensions",
             "--no-skills", "--session-dir", str(session_dir), "--append-system-prompt", "You are the capture seat."]
+
+
+def tool_results(stdout: str) -> list[tuple[bool, str]]:
+    """Each tool_execution_end of a captured stream: (isError, its text)."""
+    results = []
+    for line in stdout.splitlines():
+        event = json.loads(line)
+        if event.get("type") == "tool_execution_end":
+            text = "".join(block.get("text", "") for block in event["result"]["content"] if block.get("type") == "text")
+            results.append((bool(event.get("isError")), text))
+    return results
 
 
 def daemon_request(sock_path: pathlib.Path, command: dict) -> tuple[dict, list[dict]]:
@@ -78,14 +99,28 @@ def daemon_request(sock_path: pathlib.Path, command: dict) -> tuple[dict, list[d
         return hello, lines
 
 
-def pid_alive(pid: int) -> bool:
+def wait_pid_gone(pid: int, bound_s: float) -> bool:
+    """Wait for one process to exit, on the exit itself (a Linux pidfd, a macOS kqueue); False past the bound."""
+    if hasattr(os, "pidfd_open"):
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return True
+        try:
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            return bool(poller.poll(int(bound_s * 1000)))
+        finally:
+            os.close(fd)
+    queue = select.kqueue()
     try:
-        os.kill(pid, 0)
+        watch = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                              fflags=select.KQ_NOTE_EXIT)
+        return bool(queue.control([watch], 1, bound_s))
     except ProcessLookupError:
-        return False
-    except PermissionError:
         return True
-    return True
+    finally:
+        queue.close()
 
 
 def stop_sandbox_daemon(sock_path: pathlib.Path) -> None:
@@ -99,10 +134,7 @@ def stop_sandbox_daemon(sock_path: pathlib.Path) -> None:
     pid = hello.get("supervisorPid")
     if not isinstance(pid, int):
         return
-    deadline = time.monotonic() + SHUTDOWN_BOUND_S
-    while pid_alive(pid) and time.monotonic() < deadline:
-        time.sleep(0.1)
-    if pid_alive(pid):
+    if not wait_pid_gone(pid, SHUTDOWN_BOUND_S):
         os.kill(pid, signal.SIGKILL)
 
 
@@ -110,12 +142,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("binary")
     parser.add_argument("out")
-    parser.add_argument("--sandbox-root", default=None, help="parent of the throwaway sandbox (default: $TMPDIR)")
+    parser.add_argument("--sandbox-root", type=pathlib.Path, default=DEFAULT_SANDBOX_ROOT,
+                        help=f"parent of the throwaway sandbox (default: {DEFAULT_SANDBOX_ROOT})")
     args = parser.parse_args()
     # The seats run in the sandbox checkout: a relative binary path resolves here, not there.
     binary = os.path.abspath(args.binary) if os.sep in args.binary else args.binary
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    args.sandbox_root.mkdir(parents=True, exist_ok=True)
     root = pathlib.Path(tempfile.mkdtemp(prefix="fcap-", dir=args.sandbox_root))
     home, tmp, work, scripts = root / "h", root / "t", root / "w", root / "scripts"
     for path in (home, tmp, work, scripts):
@@ -128,11 +162,14 @@ def main() -> None:
     (work / "README.md").write_text("capture\n")
     subprocess.run(["git", "-C", str(work), "add", "README.md"], check=True, env=git_env)
     subprocess.run(["git", "-C", str(work), "commit", "-qm", "initial"], check=True, env=git_env)
+    # The kernel provisions its environment with uv; nothing else from this host's PATH reaches a seat.
+    uv = shutil.which("uv")
+    tool_path = os.pathsep.join([*([os.path.dirname(uv)] if uv else []), "/usr/bin", "/bin"])
     try:
         for custody in CUSTODIES:
             for name, script in CASES.items():
                 session_dir = root / "sessions" / custody / name
-                env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "TMPDIR": str(tmp), "TZ": "UTC",
+                env = {"PATH": tool_path, "HOME": str(home), "TMPDIR": str(tmp), "TZ": "UTC",
                        "LANG": "C.UTF-8", "PRIME_AGENT_DAEMON_SOCKET": str(sock_path),
                        "PRIME_AGENT_SOCKET_DIR": str(root / "s")}
                 if custody == "owned":
@@ -152,6 +189,8 @@ def main() -> None:
                     raise SystemExit(f"{stem}: expected one session file, found {len(sessions)}")
                 (out / f"{stem}.session.jsonl").write_text(sessions[0].read_text())
                 (out / f"{stem}.exit").write_text(f"{result.returncode}\n")
+                if name == "review-tool-then-verdict" and tool_results(result.stdout) != [(False, TOOL_OUTPUT)]:
+                    raise SystemExit(f"{stem}: the tool call did not succeed: {tool_results(result.stdout)}")
     finally:
         stop_sandbox_daemon(sock_path)
         shutil.rmtree(root, ignore_errors=True)

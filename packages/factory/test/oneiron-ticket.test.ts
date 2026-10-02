@@ -1,7 +1,7 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, inject, it, vi } from "vitest";
 import {
@@ -221,7 +221,13 @@ async function stopSandboxDaemon(socket: string): Promise<void> {
 			}
 		});
 	});
-	if (pid !== undefined) spawnSync("tail", [`--pid=${pid}`, "-f", "/dev/null"], { timeout: 60_000 });
+	if (pid === undefined) return;
+	// `tail --pid` returns when the supervisor exits; the timeout is a failure bound only.
+	const waited = spawnSync("tail", [`--pid=${pid}`, "-f", "/dev/null"], { timeout: 60_000 });
+	if (waited.status !== 0) {
+		process.kill(pid, "SIGKILL");
+		throw new Error(`the sandbox daemon ${pid} outlived its shutdown and was killed`);
+	}
 }
 
 afterEach(async () => {
@@ -587,13 +593,18 @@ else process.stdout.write("Tests pass.\\nDONE quote-one\\n");
 	 * The matrix's custody contract against the BUILT Rust binary (`PRIME_AGENT_TEST_BINARY`): real seat processes run
 	 * the factory's exact argv (`--offline` and `--no-skills` included), owned seats run the faux provider in-process,
 	 * daemon seats a sandbox daemon whose workers run it. A wrapper pins the sandbox (HOME, TMPDIR, the daemon socket
-	 * and its worker sockets) with nothing else inherited, logs each call's argv and hands call N its own script.
+	 * and its worker sockets, under $PA_SANDBOX_ROOT or ~/.cache/pa-sb) with nothing else inherited, logs each call's
+	 * argv and hands call N its own script.
 	 * Linux only: the teardown waits for the sandbox daemon's exit through `tail --pid`.
 	 */
 	// test-policy: allow conditional-or-disabled-test -- runs only with a built Rust binary (PRIME_AGENT_TEST_BINARY) on Linux; the package suite builds no Rust
 	describe.skipIf(!BUILT_AGENT || process.platform !== "linux")("against the built prime-agent binary", () => {
-		function builtAgent(f: ReturnType<typeof setup>, scripts: object[]) {
-			const sandbox = join(f.root, "pa");
+		function builtAgent(scripts: object[]) {
+			// The agent's sandbox (HOME, TMPDIR, sockets) stays off the shared /tmp.
+			const parent = process.env.PA_SANDBOX_ROOT ?? join(homedir(), ".cache", "pa-sb");
+			mkdirSync(parent, { recursive: true });
+			const sandbox = mkdtempSync(join(parent, "custody-"));
+			roots.push(sandbox);
 			for (const dir of ["home", "tmp", "s"]) mkdirSync(join(sandbox, dir), { recursive: true });
 			scripts.forEach((script, index) => {
 				writeFileSync(join(sandbox, `faux-${index + 1}.json`), JSON.stringify(script));
@@ -642,7 +653,7 @@ exec env -i PATH=/usr/bin:/bin HOME="$dir/home" TMPDIR="$dir/tmp" PRIME_AGENT_DA
 
 		it("daemon custody: an unfinished writer continues its resident session with -c", async () => {
 			const f = setup();
-			const agent = builtAgent(f, [{ responses: ["Working on it.", "DONE custody-one"] }]);
+			const agent = builtAgent([{ responses: ["Working on it.", "DONE custody-one"] }]);
 			const writer = runner(f, "daemon", agent.wrapper);
 			expect((await writer.writerRounds("write", "start", "continue")).final).toBe("DONE custody-one");
 			const calls = agent.calls().map((argv) => argv.split(" "));
@@ -663,11 +674,12 @@ exec env -i PATH=/usr/bin:/bin HOME="$dir/home" TMPDIR="$dir/tmp" PRIME_AGENT_DA
 				.map((line) => JSON.parse(line))
 				.filter((entry) => entry.type === "message" && entry.message?.role === "user");
 			expect(users).toHaveLength(2);
-		});
+			// test-policy: allow explicit-test-timeout -- real seat processes (a debug build, a sandbox daemon, the idle kill) need a failure bound past the 5 s default; process events signal progress
+		}, 120_000);
 
 		it("daemon custody: a writer killed for silence mid-turn stops the ticket, and the turn runs on", async () => {
 			const f = setup();
-			const agent = builtAgent(f, [held]);
+			const agent = builtAgent([held]);
 			const writer = runner(f, "daemon", agent.wrapper);
 			await expect(writer.writerRounds("write", "start", "continue")).rejects.toThrow(
 				"before its daemon-hosted turn was seen to end; that turn may still be",
@@ -678,11 +690,12 @@ exec env -i PATH=/usr/bin:/bin HOME="$dir/home" TMPDIR="$dir/tmp" PRIME_AGENT_DA
 				unknown
 			>[];
 			expect(rows.map((row) => [row.workerState, row.isStreaming])).toEqual([["ready", true]]);
-		});
+			// test-policy: allow explicit-test-timeout -- real seat processes (a debug build, a sandbox daemon, the idle kill) need a failure bound past the 5 s default; process events signal progress
+		}, 120_000);
 
 		it("owned custody: a writer killed for silence mid-turn continues the same session", async () => {
 			const f = setup();
-			const agent = builtAgent(f, [held, { responses: ["DONE custody-one"] }]);
+			const agent = builtAgent([held, { responses: ["DONE custody-one"] }]);
 			const writer = runner(f, "owned", agent.wrapper);
 			expect((await writer.writerRounds("write", "start", "continue")).final).toBe("DONE custody-one");
 			const calls = agent.calls().map((argv) => argv.split(" "));
@@ -693,7 +706,8 @@ exec env -i PATH=/usr/bin:/bin HOME="$dir/home" TMPDIR="$dir/tmp" PRIME_AGENT_DA
 			const sessions = join(writer.directory, "sessions", "write");
 			expect(readdirSync(sessions).filter((name) => name.endsWith(".jsonl"))).toHaveLength(1);
 			expect(existsSync(agent.socket)).toBe(false);
-		});
+			// test-policy: allow explicit-test-timeout -- real seat processes (a debug build, a sandbox daemon, the idle kill) need a failure bound past the 5 s default; process events signal progress
+		}, 120_000);
 	});
 
 	it("continues a writer's existing session on round 1 and delivers the owner's note once", async () => {

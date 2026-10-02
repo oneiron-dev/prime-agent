@@ -40,6 +40,13 @@ describe.each(CUSTODIES)("Rust factory-completed streams from a %s seat", (custo
 				[],
 			);
 		}
+		// The reviewer's tool ran in the seat's kernel and succeeded.
+		const toolEnds = lines(streams.review)
+			.map((line) => JSON.parse(line))
+			.filter((event) => event.type === "tool_execution_end");
+		expect(toolEnds.map((event) => [event.isError ?? false, event.result.content[0].text])).toEqual([
+			[false, "factory-capture\n"],
+		]);
 		// The tool turn keeps its completed events, in order, through the verdict's turn.
 		const review = types(streams.review).filter((type) => type !== "message_start");
 		expect(review.slice(review.indexOf("tool_execution_start"))).toEqual([
@@ -64,9 +71,10 @@ describe.each(CUSTODIES)("Rust factory-completed streams from a %s seat", (custo
 		// Thinking and the tool-call turn are not the reply; the verdict is the last text after the tool ran.
 		const review = finalAssistantText(streams.review);
 		expect([review, reviewVerdict(review)]).toEqual(["Checked every hunk.\nVERDICT: LANDABLE", "LANDABLE"]);
-		// A provider error and a length cut-off leave no final, though DONE was written and the length run exited 0.
+		// A provider error and a length cut-off leave no final, though both replies wrote DONE.
 		expect([finalAssistantText(streams.error), finalAssistantText(streams.length)]).toEqual(["", ""]);
-		expect(lines(streams.length).some((line) => line.includes("DONE capture-one"))).toBe(true);
+		for (const stream of [streams.error, streams.length])
+			expect(lines(stream).some((line) => line.includes("DONE capture-one"))).toBe(true);
 		// The owned seat exits 0 after a provider error; the daemon seat's retries give up and it exits 1.
 		expect([fixture(`${custody}-provider-error.exit`), fixture(`${custody}-length-cutoff.exit`)]).toEqual(
 			custody === "owned" ? ["0\n", "0\n"] : ["1\n", "0\n"],
