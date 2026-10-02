@@ -260,6 +260,12 @@ fn answer_text(events: &[Value]) -> Option<String> {
         })
 }
 
+/// Kill a binary the test started that is still running past its failure
+/// bound, so no test process outlives a failing test.
+fn kill(pid: u32) {
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+}
+
 /// Open the FIFO at `gate` for writing and send one line: unblocks the
 /// fake program reading it (the open waits for that reader).
 fn release(gate: &Path) {
@@ -318,13 +324,15 @@ fn print_exits_while_the_kernel_probe_child_is_blocked() {
     });
     let stdout = forward_lines(child.stdout.take().expect("stdout"));
     let stderr = forward_lines(child.stderr.take().expect("stderr"));
+    let pid = child.id();
     let (exit_tx, exit_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = exit_tx.send(child.wait());
         child
     });
     let Ok(status) = exit_rx.recv_timeout(STEP_BOUND) else {
-        // Release the probe so the lingering binary can finish, then fail.
+        // Release the probe and kill the lingering binary, then fail.
+        kill(pid);
         release(&gate);
         panic!(
             "the binary did not exit after its answer; stderr: {:?}",
@@ -413,12 +421,14 @@ fn fresh_home_kernel_setup_finishes_before_the_first_provider_call() {
             let _ = stderr_tx.send(line);
         }
     });
+    let pid = child.id();
     let (exit_tx, exit_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = exit_tx.send(child.wait());
         child
     });
     let Ok(status) = exit_rx.recv_timeout(STEP_BOUND) else {
+        kill(pid);
         panic!(
             "the run did not end; stderr: {:?}; uv log: {:?}",
             stderr_rx.try_iter().collect::<Vec<_>>(),
@@ -452,4 +462,81 @@ fn fresh_home_kernel_setup_finishes_before_the_first_provider_call() {
         ),
         "the fresh setup's steps, in order"
     );
+}
+
+/// A fresh setup that still leaves the venv unready (here the runtime probe
+/// fails after a clean build) is a failed preparation: the run still
+/// answers, and no background boot repeats the setup after the answer.
+#[test]
+fn a_fresh_setup_left_unready_boots_nothing_in_the_background() {
+    let mock = MockProvider::start(Box::new(|| {}));
+    let sandbox = Sandbox::new(&mock);
+    let log = sandbox.path("uv.log");
+    // Every interpreter probe fails; anything else (the kernel) exits.
+    let python = sandbox.executable(
+        "python-unready",
+        "#!/bin/sh\ncase \"$1\" in -c) exit 1 ;; esac\nexit 0\n",
+    );
+    sandbox.executable(
+        "bin/uv",
+        &format!(
+            "#!/bin/sh\necho \"begin $*\" >> '{log}'\ncase \"$1\" in\nvenv) mkdir -p \"$2/bin\" && cp '{python}' \"$2/bin/python\" ;;\nesac\necho \"end $*\" >> '{log}'\nexit 0\n",
+            log = log.display(),
+            python = python.display()
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        sandbox.path("bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = sandbox
+        .command(&["--verbose"])
+        .env("PATH", path)
+        .env("PRIME_AGENT_KERNEL_VENV", sandbox.path("venv"))
+        .spawn()
+        .expect("spawn the binary");
+    let stdout = forward_lines(child.stdout.take().expect("stdout"));
+    let stderr = forward_lines(child.stderr.take().expect("stderr"));
+    let pid = child.id();
+    let (exit_tx, exit_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = exit_tx.send(child.wait());
+        child
+    });
+    let Ok(status) = exit_rx.recv_timeout(STEP_BOUND) else {
+        kill(pid);
+        panic!("the run did not end");
+    };
+    let status = status.expect("wait for the binary");
+    let events = json_events(&stdout);
+    let stderr: Vec<String> = stderr.iter().collect();
+    assert!(status.success(), "stderr: {stderr:?}");
+    assert_eq!(answer_text(&events).as_deref(), Some(MOCK_REPLY));
+    let preparation: Vec<&str> = stderr
+        .iter()
+        .filter_map(|line| line.split("] ").nth(1))
+        .filter(|phase| phase.starts_with("kernel environment preparation"))
+        .map(|phase| phase.split(" (").next().unwrap_or(phase))
+        .collect();
+    assert_eq!(
+        preparation,
+        [
+            "kernel environment preparation start",
+            "kernel environment preparation failed"
+        ],
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr
+            .iter()
+            .any(|line| line.ends_with("the kernel environment is not ready after setup")),
+        "stderr: {stderr:?}"
+    );
+    let installs = std::fs::read_to_string(&log)
+        .expect("the uv log")
+        .lines()
+        .filter(|line| line.starts_with("begin python install"))
+        .count();
+    assert_eq!(installs, 1, "the setup ran once, before the first turn");
 }

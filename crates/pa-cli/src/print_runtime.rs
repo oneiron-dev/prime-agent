@@ -1452,6 +1452,7 @@ async fn run_prompts_and_emit(
             .await
             .map_err(|error| format!("{error:#}"))?;
         engine.session.agent().wait_for_idle().await;
+        crate::headless_exit::phase("settled-turn boundary start");
         // The settled-turn boundary (TS `agent_end`): the overflow
         // compact-and-retry arm, the turn-boundary requests the kernel
         // scheduled mid-turn (`compact.run` / `refine.run`), and the
@@ -1498,6 +1499,7 @@ async fn run_prompts_and_emit(
                 .await
                 .map_err(|error| format!("{error:#}"))?;
         }
+        crate::headless_exit::phase("settled-turn boundary end");
     }
     goal_accounting.unsubscribe().await;
     accounting.unsubscribe().await;
@@ -1530,7 +1532,7 @@ async fn run_prompts_and_emit(
         eprintln!("{stderr}");
         exit_code = 1;
     }
-    crate::headless_exit::phase("answer written");
+    crate::headless_exit::phase("terminal result written");
     // The TS disposal order: print mode returns its exit code first, then
     // the connection teardown disposes the session — which drains a
     // compact-trigger auto-refine that no later boundary consumed (TS
@@ -1538,11 +1540,11 @@ async fn run_prompts_and_emit(
     // turn"). The event subscription is already gone at this point, so the
     // round's surface stays off the stream; the durable rows and the
     // harness state persist.
-    crate::headless_exit::phase("semantic drain start");
+    crate::headless_exit::phase("disposal refinement drain start");
     boundary
         .drain_compact_auto_refine_at_disposal(engine, model, api_key, global_harness_dir)
         .await;
-    crate::headless_exit::phase("semantic drain end");
+    crate::headless_exit::phase("disposal refinement drain end");
     Ok(exit_code)
 }
 

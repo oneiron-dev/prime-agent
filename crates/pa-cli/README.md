@@ -97,10 +97,12 @@ flushes stdout/stderr and shuts its runtime down within `EXIT_BUDGET`
 (300 ms) instead of the runtime drop's unbounded wait. RPC and ACP keep
 `KernelPrewarm::Background`. The hosted client's detach waits the same
 budget (closing the connection detaches anyway) and its runtime shuts down
-the same way. `--verbose` prints the timestamped exit phases (answer
-written, semantic drain, kernel abandon, output flush, runtime shutdown;
-hosted: detach) and the kernel environment trace (readiness check, each
-bootstrap subprocess's start and end) to stderr. Verifiers:
+the same way. `--verbose` prints the timestamped exit phases (the json
+`agent_end` line, each settled-turn boundary, the terminal result, the
+disposal refinement drain, kernel abandon, output flush, runtime shutdown;
+hosted: completion barrier and detach) and the kernel environment trace
+(preparation, readiness check, each bootstrap subprocess's start and end)
+to stderr. Verifiers:
 `headless_exit_e2e`, `scripts/oneiron/verify_headless_exit.py`.
 
 ## Daemon client

@@ -7,9 +7,13 @@
 //! writes) finishes before this point; only work nobody waits for is cut.
 //!
 //! `--verbose` turns on the exit-phase trace: one stderr line per phase,
-//! stamped with the milliseconds since the run started, plus the kernel
-//! environment trace (each bootstrap subprocess's start and end). Off by
-//! default; stdout never carries it.
+//! stamped with the milliseconds since the run started - the json
+//! `agent_end` line written, each settled-turn boundary (compaction,
+//! refinement, continuations), the terminal result, the disposal
+//! refinement drain, the kernel abandon (hosted: the completion barrier and
+//! the detach), the output flush and the runtime shutdown - plus the kernel
+//! environment trace (the readiness check, each bootstrap subprocess's
+//! start and end). Off by default; stdout never carries it.
 
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};

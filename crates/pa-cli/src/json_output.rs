@@ -106,7 +106,13 @@ impl JsonEventSink {
         Self {
             profile,
             serialize: Arc::new(pa_core::session_engine::session_events::agent_event_json),
-            write: Arc::new(|line| println!("{line}")),
+            write: Arc::new(|line| {
+                println!("{line}");
+                // The `--verbose` exit trace starts at the answer's own line.
+                if line.get("type").and_then(Value::as_str) == Some("agent_end") {
+                    crate::headless_exit::phase("agent_end written");
+                }
+            }),
         }
     }
 

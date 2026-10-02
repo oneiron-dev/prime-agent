@@ -168,7 +168,6 @@ async fn hosted_print_main(options: &RunOptions) -> Result<i32, String> {
     };
     // Detach + close (TS `dispose`): the resident session keeps running;
     // the detach waits at most the exit budget (closing detaches anyway).
-    crate::headless_exit::phase("answer written");
     crate::headless_exit::phase("detach start");
     session.close(crate::headless_exit::EXIT_BUDGET).await;
     crate::headless_exit::phase("detach end");
@@ -206,6 +205,7 @@ async fn run_print_flow(session: &HostedHeadlessSession, options: &RunOptions) -
             session.prompt(prompt).await?;
         }
         let status = session.wait_for_completion().await?;
+        crate::headless_exit::phase("completion confirmed");
         let mut exit_code = 0;
         if !json_mode {
             exit_code =
@@ -215,6 +215,7 @@ async fn run_print_flow(session: &HostedHeadlessSession, options: &RunOptions) -
             eprintln!("{stderr}");
             exit_code = 1;
         }
+        crate::headless_exit::phase("terminal result written");
         anyhow::Ok(exit_code)
     };
     match run.await {
