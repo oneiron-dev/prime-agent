@@ -199,6 +199,7 @@ pub struct RunOptions {
     /// the interactive initial-message image arm is not yet wired).
     pub initial_images: Vec<pa_agent::types::ImageContent>,
     pub verbose: bool,
+    /// Effective offline mode: `--offline` or a truthy `PI_OFFLINE`.
     pub offline: bool,
     pub agents_view_requested: bool,
     pub attach_agent: Option<String>,

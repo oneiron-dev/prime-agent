@@ -111,12 +111,79 @@ impl Sandbox {
     }
 
     fn run(&self, args: &[&str]) -> (String, String, i32) {
-        let output = self.command(args).output().expect("binary present");
+        output_of(&mut self.command(args))
+    }
+
+    /// A factory seat's launch: its exact native argv (`nativeSeatArgv` in
+    /// `packages/factory/src/agent-command.ts`, daemon custody) plus
+    /// `extra`, with the prompt on stdin.
+    fn run_seat(&self, profile: SeatOutput, extra: &[&str], prompt: &str) -> (String, String, i32) {
+        let cwd = self.home().display().to_string();
+        let sessions = self.home().join("seat-sessions").display().to_string();
+        let mut args = vec!["-p"];
+        if profile == SeatOutput::FactoryJson {
+            args.extend([
+                "--mode",
+                "json",
+                "--json-event-profile",
+                "factory-completed",
+            ]);
+        }
+        args.extend([
+            "--daemon-hosted",
+            "--offline",
+            "--provider",
+            "faux",
+            "--model",
+            "faux-1",
+            "--thinking",
+            "low",
+            "--cwd",
+            &cwd,
+            "--no-extensions",
+            "--no-skills",
+            "--session-dir",
+            &sessions,
+        ]);
+        args.extend_from_slice(extra);
+        let mut child = self
+            .command(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("binary present");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(prompt.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
         (
             String::from_utf8_lossy(&output.stdout).to_string(),
             String::from_utf8_lossy(&output.stderr).to_string(),
             output.status.code().unwrap_or(-1),
         )
+    }
+
+    /// A hosted session's assembled system prompt, read from its live
+    /// worker (`get_system_prompt`).
+    #[track_caller]
+    fn system_prompt(&self, session_id: &Value) -> String {
+        let row = self
+            .sessions()
+            .into_iter()
+            .find(|row| row["sessionId"] == *session_id)
+            .expect("the session stays resident");
+        let response = self.wire().request(&json!({
+            "type": "get_system_prompt",
+            "activeSessionId": row["activeSessionId"],
+        }));
+        response["data"]["systemPrompt"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     /// A raw protocol client (the daemon is up: a hosted run started it).
@@ -203,6 +270,8 @@ struct Wire {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     next_id: u64,
+    /// The daemon's `daemon_hello`.
+    hello: Value,
 }
 
 impl Wire {
@@ -219,9 +288,10 @@ impl Wire {
             reader: BufReader::new(stream),
             writer,
             next_id: 0,
+            hello: Value::Null,
         };
-        let hello = wire.read_line();
-        assert_eq!(hello["type"], "daemon_hello");
+        wire.hello = wire.read_line();
+        assert_eq!(wire.hello["type"], "daemon_hello");
         wire
     }
 
@@ -266,6 +336,59 @@ impl Wire {
         assert_eq!(response["success"], true, "{response}");
         response
     }
+}
+
+/// A factory seat's output mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeatOutput {
+    /// Plain print mode (the final text on stdout).
+    Text,
+    /// `--mode json --json-event-profile factory-completed`, as every
+    /// native seat runs.
+    FactoryJson,
+}
+
+#[track_caller]
+fn output_of(command: &mut Command) -> (String, String, i32) {
+    let output = command.output().expect("binary present");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+/// A live process's environment (`/proc/<pid>/environ`).
+#[track_caller]
+fn environ(pid: &Value) -> std::collections::BTreeMap<String, String> {
+    let pid = pid.as_u64().expect("a live pid");
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .unwrap()
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            let entry = String::from_utf8_lossy(entry);
+            let (name, value) = entry.split_once('=')?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// The skill names a system prompt's inventory lists (empty: no
+/// `skills-inventory` segment at all).
+fn inventory(system_prompt: &str) -> Vec<String> {
+    let Some((_, listed)) = system_prompt.split_once("<available_skills>") else {
+        return Vec::new();
+    };
+    let listed = listed.split("</available_skills>").next().unwrap();
+    listed
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("<name>")?
+                .strip_suffix("</name>")
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 fn json_lines(stdout: &str) -> Vec<Value> {
@@ -370,7 +493,8 @@ fn continue_and_resume_reuse_the_live_worker() {
 /// While a hosted run streams, another client can attach to the same
 /// resident session; a signal ends the print client (143) by detaching —
 /// the turn keeps running for the daemon — and the reduced profile streams
-/// no progressive snapshots.
+/// no progressive snapshots. The run carries the factory's `--offline`
+/// and `--no-skills`, as every daemon seat does.
 #[test]
 fn second_client_attaches_and_a_signal_only_detaches() {
     // The turn holds in flight until aborted (no timer releases it), so the
@@ -386,6 +510,8 @@ fn second_client_attaches_and_a_signal_only_detaches() {
             "--json-event-profile",
             "factory-completed",
             "--daemon-hosted",
+            "--offline",
+            "--no-skills",
             "-p",
             "slow turn",
         ])
@@ -453,12 +579,12 @@ fn hosted_refuses_what_it_cannot_honor() {
     let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": [] }));
     for (args, expected) in [
         (
-            ["--daemon-hosted", "--no-skills", "-p", "x"].as_slice(),
-            "Error: --daemon-hosted cannot be combined with --no-skills yet: the daemon session does not receive it\n",
+            ["--daemon-hosted", "--no-context-files", "-p", "x"].as_slice(),
+            "Error: --daemon-hosted cannot be combined with --no-context-files yet: the daemon session does not receive it\n",
         ),
         (
-            ["--daemon-hosted", "--offline", "--goal", "g", "-p", "x"].as_slice(),
-            "Error: --daemon-hosted cannot be combined with --goal, --offline yet: the daemon session does not receive them\n",
+            ["--daemon-hosted", "--offline", "--no-skills", "--goal", "g", "--no-prompt-templates", "-p", "x"].as_slice(),
+            "Error: --daemon-hosted cannot be combined with --no-prompt-templates, --goal yet: the daemon session does not receive them\n",
         ),
         (
             ["--daemon-hosted", "--no-session", "-p", "x"].as_slice(),
@@ -677,4 +803,277 @@ fn a_relative_resume_path_reaches_the_saved_session() {
     ]);
     assert_eq!((stdout.as_str(), code), ("HOSTED\n", 0), "stderr: {stderr}");
     assert_eq!(user_texts(saved[0].to_str().unwrap()), ["one", "two"]);
+}
+
+/// A factory daemon seat's exact argv (`--offline` and `--no-skills`
+/// included, the prompt on stdin) runs a resident session in text and in
+/// the factory's json profile.
+#[test]
+fn the_factory_seat_argv_runs_a_hosted_session() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["SEAT-ANSWER"] }));
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &[], "text seat");
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("SEAT-ANSWER\n", 0),
+        "stderr: {stderr}"
+    );
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::FactoryJson, &[], "json seat");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let lines = json_lines(&stdout);
+    assert_eq!(lines[0]["jsonEventProfile"], "factory-completed");
+    let types = types(&lines);
+    assert!(
+        !types
+            .iter()
+            .any(|kind| matches!(*kind, "message_update" | "tool_execution_update")),
+        "{types:?}"
+    );
+    assert_eq!(types.last(), Some(&"agent_end"));
+    let answer = lines
+        .iter()
+        .rev()
+        .find(|line| line["type"] == "message_end" && line["message"]["role"] == "assistant")
+        .expect("the assistant answer streamed");
+    assert_eq!(answer["message"]["content"][0]["text"], "SEAT-ANSWER");
+    // Both seats' sessions stay resident, each in the seat's session dir.
+    let mut seats: Vec<Vec<String>> = sandbox
+        .sessions()
+        .iter()
+        .map(|row| {
+            let file = row["sessionFile"].as_str().unwrap();
+            assert!(
+                Path::new(file).starts_with(sandbox.home().join("seat-sessions")),
+                "{file}"
+            );
+            assert_eq!(row["workerState"], "ready");
+            user_texts(file)
+        })
+        .collect();
+    seats.sort();
+    assert_eq!(seats, [["json seat"], ["text seat"]]);
+}
+
+/// On a warm daemon that runs ONLINE (started without `PI_OFFLINE`), an
+/// `--offline` session gets `PI_OFFLINE=1` in its own worker's environment
+/// only: the supervisor and the online session's worker stay online, and
+/// an RLM child inherits its parent session's policy.
+#[test]
+fn an_offline_session_runs_its_own_worker_offline_on_an_online_daemon() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    // Online, but with no way out: every HTTP client in the daemon goes
+    // through a dead loopback proxy, and telemetry is off.
+    let online = |args: &[&str]| {
+        let mut command = sandbox.command(args);
+        command.env_remove("PI_OFFLINE").env("DO_NOT_TRACK", "1");
+        for proxy in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            command.env(proxy, "http://127.0.0.1:9");
+        }
+        command.env_remove("NO_PROXY").env_remove("no_proxy");
+        output_of(&mut command)
+    };
+    let (stdout, stderr, code) = online(&["--daemon-hosted", "-p", "online"]);
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let (stdout, stderr, code) = online(&[
+        "--daemon-hosted",
+        "--offline",
+        "--no-skills",
+        "-p",
+        "offline",
+    ]);
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let row_of = |prompt: &str| {
+        sandbox
+            .sessions()
+            .into_iter()
+            .find(|row| user_texts(row["sessionFile"].as_str().unwrap()) == [prompt])
+            .unwrap_or_else(|| panic!("the {prompt} session stays resident"))
+    };
+    let (online_row, offline_row) = (row_of("online"), row_of("offline"));
+    // An RLM child's create names its parent's file and no policy: it
+    // inherits the parent session's.
+    std::fs::create_dir_all(sandbox.home().join("children")).unwrap();
+    let child_of = |parent: &Value| {
+        let mut wire = sandbox.wire();
+        let created = wire.request(&json!({
+            "type": "create",
+            "name": format!("child-of-{}", parent["activeSessionId"].as_str().unwrap()),
+            "lifecycle": "resident",
+            "config": {
+                "cwd": sandbox.home(),
+                "sessionDir": sandbox.home().join("children"),
+                "rlmDepth": 1,
+                "parentSessionPath": parent["sessionFile"],
+                "script": sandbox.dir.path().join("script.json"),
+            },
+        }));
+        let listed = wire.request(&json!({ "type": "list", "all": true }));
+        listed["data"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["activeSessionId"] == created["data"]["activeSessionId"])
+            .expect("the child is listed")["workerPid"]
+            .clone()
+    };
+    let supervisor = sandbox.wire().hello["supervisorPid"].clone();
+    let offline_env = |pid: &Value| environ(pid).get("PI_OFFLINE").cloned();
+    assert_eq!(
+        [
+            offline_env(&supervisor),
+            offline_env(&online_row["workerPid"]),
+            offline_env(&offline_row["workerPid"]),
+            offline_env(&child_of(&online_row)),
+            offline_env(&child_of(&offline_row)),
+        ],
+        [
+            None,
+            None,
+            Some("1".to_string()),
+            None,
+            Some("1".to_string())
+        ]
+    );
+}
+
+/// `--no-skills` reaches the worker's session assembly: the discovered
+/// skill is in a hosted session's inventory by default, the inventory is
+/// gone under `--no-skills`, and an explicit `--skill` still loads (TS
+/// `noSkills` disables discovery only).
+#[test]
+fn no_skills_empties_the_hosted_inventory_and_keeps_explicit_skills() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ok"] }));
+    let skill = |dir: &Path, name: &str| {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(
+            dir.join(name).join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Probe skill for the hosted no-skills verifier\n---\nBody"),
+        )
+        .unwrap();
+        dir.join(name).display().to_string()
+    };
+    skill(
+        &sandbox.home().join(".prime/agent/skills"),
+        "lane-probe-skill",
+    );
+    let explicit = skill(&sandbox.home().join("explicit"), "explicit-probe-skill");
+    let inventory_of = |flags: &[&str]| {
+        let args: Vec<&str> = ["--mode", "json", "--daemon-hosted"]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .chain(["-p", "hi"])
+            .collect();
+        let (stdout, stderr, code) = sandbox.run(&args);
+        assert_eq!(code, 0, "stderr: {stderr}");
+        inventory(&sandbox.system_prompt(&json_lines(&stdout)[0]["id"]))
+    };
+    let discovered = inventory_of(&[]);
+    assert!(
+        discovered.contains(&"lane-probe-skill".to_string()),
+        "{discovered:?}"
+    );
+    assert_eq!(inventory_of(&["--no-skills"]), Vec::<String>::new());
+    assert_eq!(
+        inventory_of(&["--no-skills", "--skill", &explicit]),
+        ["explicit-probe-skill"]
+    );
+}
+
+/// A live session is reused only under the policy it runs with: the same
+/// seat flags continue it on its worker, a run without `--no-skills` is
+/// refused (never applied to the live worker, which keeps running), and a
+/// pre-policy client's create (no policy keys) reuses it as before.
+#[test]
+fn a_live_session_is_reused_only_under_its_own_policy() {
+    let sandbox = Sandbox::new(&json!({
+        "engine": "faux",
+        "responses": ["FIRST", "SECOND", "THIRD"],
+    }));
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &[], "one");
+    assert_eq!((stdout.as_str(), code), ("FIRST\n", 0), "stderr: {stderr}");
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &["-c"], "two");
+    assert_eq!((stdout.as_str(), code), ("SECOND\n", 0), "stderr: {stderr}");
+    let sessions = sandbox.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let live = sessions[0].clone();
+    let file = live["sessionFile"].as_str().unwrap().to_string();
+    // The sandbox keeps `PI_OFFLINE`, so this run is `--offline` only.
+    let (stdout, stderr, code) =
+        sandbox.run(&["--daemon-hosted", "--resume", &file, "-p", "three"]);
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (
+            "",
+            format!(
+                "Error: Session \"{file}\" is live with --offline --no-skills, but this run asked for --offline: a live session keeps its policy, so rerun with the same flags or stop the session first\n"
+            )
+            .as_str(),
+            1
+        )
+    );
+    // A pre-policy client's open reuses the live worker, as before.
+    let reused = sandbox.wire().request(&json!({
+        "type": "create",
+        "sessionPath": file,
+        "config": { "cwd": sandbox.home() },
+    }));
+    assert_eq!(reused["data"]["activeSessionId"], live["activeSessionId"]);
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &["--resume", &file], "three");
+    assert_eq!((stdout.as_str(), code), ("THIRD\n", 0), "stderr: {stderr}");
+    let sessions = sandbox.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    for key in ["activeSessionId", "workerPid", "sessionFile"] {
+        assert_eq!(sessions[0][key], live[key], "{key}");
+    }
+    assert_eq!(user_texts(&file), ["one", "two", "three"]);
+}
+
+/// A daemon of this schema that does not advertise `session_policy` is
+/// never sent a policy it would drop: the seat fails with the reason.
+#[test]
+fn a_daemon_without_the_policy_capability_refuses_the_seat_flags() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": [] }));
+    let listener = std::os::unix::net::UnixListener::bind(sandbox.socket()).unwrap();
+    let hello = json!({
+        "type": "daemon_hello",
+        "protocol": { "name": "prime-agent.daemon", "version": 7 },
+        "schemaId": pa_types::daemon::DAEMON_SCHEMA_ID,
+        "schemaRevision": pa_types::daemon::DAEMON_SCHEMA_REVISION,
+        "serverCapabilities": ["prompt_admission_cancellation"],
+    });
+    // Every connection gets the hello; the sandbox's shutdown closes its
+    // own (the fake has no supervisor to stop).
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                return;
+            };
+            let hello = hello.clone();
+            std::thread::spawn(move || {
+                if writeln!(stream, "{hello}").is_err() {
+                    return;
+                }
+                for line in BufReader::new(stream).lines() {
+                    if line.map_or(true, |line| line.contains("\"shutdown\"")) {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::FactoryJson, &[], "seat");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (
+            "",
+            "Error: The running daemon cannot apply --offline --no-skills to a hosted session (it does not advertise session_policy); stop it so a current one starts, or run without --daemon-hosted\n",
+            1
+        )
+    );
 }

@@ -21,6 +21,11 @@
 //!   outlives the settle budget answers the TS `worker is stopping` shape
 //!   instead of surfacing the lease rejection.
 //!
+//! A create that carries the session policy (`offline`/`noSkills`, fork
+//! revision 31) reuses a live worker only when it runs under the same
+//! policy; a mismatch is refused, never applied to the running worker. A
+//! create without the keys (a pre-policy client) reuses as before.
+//!
 //! A stale binding (the file's previous worker is gone) keeps the launch
 //! path: `record_session_binding` supersedes the old ids at create success
 //! and the `session_binding` events re-attach the superseded clients
@@ -36,6 +41,7 @@ use serde_json::{json, Value};
 
 use crate::backpressure::RouteAdmission;
 use crate::registry::ResidentWorker;
+use crate::session_policy::SessionPolicy;
 use crate::supervisor::{Supervisor, ROUTE_TIMEOUT_MS, WORKER_NOT_CONNECTED};
 
 /// How many settled teardown waits one open re-checks before it answers
@@ -234,13 +240,20 @@ impl Supervisor {
         command: &DaemonCommand,
         client_id: &str,
     ) -> Result<Option<Value>> {
-        let DaemonCommand::Create { lifecycle, .. } = command else {
+        let DaemonCommand::Create {
+            lifecycle, config, ..
+        } = command
+        else {
             return Ok(None);
         };
         let Some(path) = create_target_file(command)? else {
             return Ok(None);
         };
         let path_text = path.to_string_lossy().to_string();
+        // The session policy the open asks for (`None`: a pre-policy
+        // client, which reuses whatever runs).
+        let requested_policy =
+            SessionPolicy::requested(config.as_ref().and_then(Value::as_object))?;
 
         // A settled teardown can hand the file straight to a concurrent
         // opener's successor: each wait re-checks the file's residents
@@ -276,6 +289,22 @@ impl Supervisor {
                     client_owned_conflict(resident, *lifecycle, client_id, &path_text).await
                 {
                     return Err(anyhow!(rejection));
+                }
+                // A live session keeps the policy it was created under:
+                // an open asking for another one is refused, never applied
+                // to (or silently dropped by) the worker another client
+                // may be driving.
+                if let Some(requested) = requested_policy {
+                    let running = SessionPolicy::durable(
+                        &resident.descriptor.lock().await.create_command.rest,
+                    );
+                    if running != requested {
+                        bail!(
+                            "Session \"{path_text}\" is live with {}, but this run asked for {}: a live session keeps its policy, so rerun with the same flags or stop the session first",
+                            running.flags(),
+                            requested.flags()
+                        );
+                    }
                 }
                 match self.reuse_summary_or_holder(resident, &path_text).await? {
                     ReuseAnswer::Summary(summary) => return Ok(Some(summary)),

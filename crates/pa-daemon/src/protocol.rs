@@ -331,6 +331,9 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "abort_and_send_queued",
                 "agent_roster",
                 "direct_peer_transport",
+                // Fork-only (revision 31): the create config's
+                // `offline`/`noSkills` session policy.
+                crate::session_policy::SESSION_POLICY_CAPABILITY,
             ]
             .iter()
             .map(std::string::ToString::to_string),

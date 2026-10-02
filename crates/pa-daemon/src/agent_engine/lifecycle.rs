@@ -1149,11 +1149,18 @@ impl AgentSessionEngine {
             conversation_log_path: session_file,
             additional_skill_paths: create_resources.skills,
             additional_prompt_paths: create_resources.prompt_templates,
-            // The create command carries no discovery switches (the TS
-            // `noSkills`/`noPromptTemplates`/`noContextFiles` config keys
-            // are not part of the Rust create contract), so a worker session
-            // discovers everything; `--daemon-hosted` refuses those flags.
-            resource_loading: pa_core::resources::ResourceLoadingPolicy::default(),
+            // The create command's session policy carries `noSkills` (TS
+            // `AgentSessionRuntimeConfig.noSkills`); prompt templates and
+            // context files stay discovered (`--daemon-hosted` refuses
+            // their switches).
+            resource_loading: pa_core::resources::ResourceLoadingPolicy {
+                skills: if create_resources.no_skills {
+                    pa_core::resources::ResourceDiscovery::Disabled
+                } else {
+                    pa_core::resources::ResourceDiscovery::Enabled
+                },
+                ..pa_core::resources::ResourceLoadingPolicy::default()
+            },
             extra_builtin_skill_overrides: vec![],
             rlm_subagent_host: self.children.clone().map(|children| {
                 children as Arc<dyn pa_core::session_engine::rlm_host::RlmSubagentHost>

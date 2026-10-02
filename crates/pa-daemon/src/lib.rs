@@ -102,6 +102,7 @@ pub(crate) mod session_custom;
 pub mod session_export;
 pub mod session_input_pause;
 pub mod session_navigation;
+pub mod session_policy;
 pub(crate) mod session_scan;
 pub mod session_stats;
 pub mod session_store;

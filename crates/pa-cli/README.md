@@ -72,12 +72,26 @@ cwd and session dir, `--resume` its selector, and the daemon is asked for
 that file by path, since the supervisor refuses `continueRecent`), the
 client ensures the daemon on the resolved socket, and exit or
 SIGINT/SIGTERM/SIGHUP (130/143/129) detach and close without stopping the
-session. Flags the create contract cannot carry (`--no-skills`,
-`--no-prompt-templates`, `--no-context-files`, `--goal`, `--offline`,
-`--fork`) fail before any daemon starts, and so do a factory seat's
-`W7_CARGO_*` launch overlay (a daemon worker runs with the daemon's
-environment) and the flag in rpc/acp mode. Ambient process policy such as
-`PI_OFFLINE` reaches a daemon this run starts, not one already running.
+session. `--offline` (the flag or a truthy `PI_OFFLINE`) and `--no-skills`
+ride the create as the session policy (`pa_daemon::session_policy`, sent
+only to a daemon that advertises `session_policy`; any other daemon makes
+the run fail instead of dropping them): the daemon starts that session's
+worker with `PI_OFFLINE=1` in its own launch environment, whatever the
+supervisor runs with, and assembles the session without skill discovery
+(explicit `--skill` paths still load). Offline means what TS `--offline`
+means, no startup network operations (catalog, private-model and package
+refreshes, update and version checks, telemetry); provider inference, the
+kernel's own environment provisioning, explicit MCP handshakes and the
+model's tools are not blocked. A `-c`/`--resume` of a live session goes
+through the supervisor's create and reuses the worker only under the same
+policy; another policy is refused, never applied to the running worker.
+Flags the create contract cannot carry (`--no-prompt-templates`,
+`--no-context-files`, `--goal`, `--fork`) fail before any daemon starts,
+and so do a factory seat's `W7_CARGO_*` launch overlay (its routing also
+needs the factory's cargo wrapper first on the seat's `PATH`, which a
+daemon worker does not take from one client) and the flag in rpc/acp
+mode. Other ambient process environment reaches a daemon this run starts,
+not one already running.
 Each prompt carries its own `admissionId` (when the daemon advertises
 `prompt_admission_cancellation`; without it a timed-out prompt fails);
 when the supervisor's route budget answers first,

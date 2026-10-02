@@ -185,6 +185,27 @@ impl Supervisor {
                 .map(str::to_string),
             thinking: requested_thinking,
         };
+        // The session policy (fork revision 31), validated before anything
+        // launches; `None` is a pre-policy client (no keys, no policy). An
+        // RLM child's create carries none: it inherits its live parent's
+        // (the TS child runtime inherits the parent's session config), so
+        // an offline seat's subagents stay offline and skill-free.
+        let session_policy = match crate::session_policy::SessionPolicy::requested(config_object)? {
+            Some(policy) => Some(policy),
+            None => match config_object
+                .and_then(|config| config.get("parentSessionPath"))
+                .and_then(Value::as_str)
+            {
+                Some(parent_file) => match self.registry.find_by_session_file(parent_file).await {
+                    Some(parent) => Some(crate::session_policy::SessionPolicy::durable(
+                        &parent.descriptor.lock().await.create_command.rest,
+                    ))
+                    .filter(|policy| !policy.is_default()),
+                    None => None,
+                },
+                None => None,
+            },
+        };
         if *no_session == Some(true) && session_path.is_some() {
             return Err(anyhow!(
                 "Session cannot be both no-session and session-pathed"
@@ -252,6 +273,12 @@ impl Supervisor {
                 durable_rest.insert(key.to_string(), value.clone());
             }
         }
+        // The policy rides the durable create command (both keys, validated
+        // booleans) so a respawned or relaunched worker starts under it:
+        // the launch env reads `offline`, the worker's create `noSkills`.
+        if let Some(policy) = session_policy {
+            policy.write_into(&mut durable_rest);
+        }
         // A child's RLM identity rides the durable create command too, so a
         // respawned or adopted child stays identifiable for ledger appends.
         if let Some(metadata) = &runtime_metadata {
@@ -288,8 +315,11 @@ impl Supervisor {
             session_file: session_path.clone(),
             session_dir: session_dir.clone(),
             // TS main.ts `telemetryDisabled`: only ever `Some(true)`
-            // (the enabled case stays absent on the wire).
-            telemetry_disabled: telemetry_disabled.and(Some(true)),
+            // (the enabled case stays absent on the wire). An offline
+            // session is never telemetered, whatever the client sent.
+            telemetry_disabled: telemetry_disabled.and(Some(true)).or(session_policy
+                .is_some_and(|policy| policy.offline)
+                .then_some(true)),
             created_at: now.clone(),
             updated_at: now,
             lifecycle: DaemonWorkerLifecycle::Starting,

@@ -1,7 +1,7 @@
 //! The hosted headless client (TS `DaemonAgentConnection` behind a print
 //! or json run with `--daemon-hosted`): the daemon owns a RESIDENT session
 //! (listed, attachable from another terminal) and this client drives it over
-//! the supervisor socket with schema-30 commands only — create (or attach
+//! the supervisor socket with schema-31 commands only — create (or attach
 //! the live worker that already hosts the same session file), attach,
 //! stream the session's events, `prompt_and_wait`,
 //! `wait_for_headless_completion`, then detach and close. The client never
@@ -23,6 +23,14 @@
 //! `cancel_prompt_admission` (never `cancelOwned`): only that answer says
 //! whether THIS prompt's turn started. Without the capability a timed-out
 //! prompt has no evidence and fails.
+//!
+//! Session policy (fork revision 31): `--offline` and `--no-skills` ride
+//! the create config as `offline`/`noSkills` when the daemon advertises
+//! `session_policy`, and every open then goes through the supervisor's
+//! create (a live worker for the same file is reused there, but only when
+//! it runs under the same policy). A daemon without the capability gets
+//! neither key and the list-and-attach reuse; asking it for either flag
+//! fails instead of running the session without it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,6 +41,7 @@ use serde_json::{Map, Value};
 use tokio::sync::{mpsc, watch};
 
 use crate::daemon_link::{DaemonLink, LinkFrame, ResponseWait};
+use crate::session_policy::{SessionPolicy, SESSION_POLICY_CAPABILITY};
 use crate::supervisor::SESSION_WORKER_TIMED_OUT;
 
 /// Bound for the session-scoped startup and read commands (create, attach,
@@ -63,6 +72,8 @@ pub struct HostedSessionOptions {
     /// The invocation runs with telemetry disabled (TS `telemetryDisabled`
     /// on create and attach).
     pub telemetry_disabled: bool,
+    /// The session's `--offline`/`--no-skills` policy.
+    pub session_policy: SessionPolicy,
 }
 
 /// What the daemon reported for the hosted session.
@@ -168,9 +179,28 @@ impl HostedHeadlessSession {
         mut self,
         options: HostedSessionOptions,
     ) -> anyhow::Result<(Self, HostedSessionOpened)> {
+        let policy_supported = self
+            .link
+            .server_capabilities
+            .iter()
+            .any(|capability| capability == SESSION_POLICY_CAPABILITY);
+        let mut create_config = options.create_config.clone();
+        if policy_supported {
+            if let Some(config) = create_config.as_object_mut() {
+                options.session_policy.write_into(config);
+            }
+        } else if !options.session_policy.is_default() {
+            anyhow::bail!(
+                "The running daemon cannot apply {} to a hosted session (it does not advertise {SESSION_POLICY_CAPABILITY}); stop it so a current one starts, or run without --daemon-hosted",
+                options.session_policy.flags()
+            );
+        }
+        // With the policy capability every open is a create: the
+        // supervisor reuses a live worker for the same file only when its
+        // policy matches. Without it, the live row is attached directly.
         let live = match &options.session_path {
-            Some(path) => self.live_session_for_file(path).await?,
-            None => None,
+            Some(path) if !policy_supported => self.live_session_for_file(path).await?,
+            Some(_) | None => None,
         };
         let summary = if let Some(summary) = live {
             summary
@@ -184,7 +214,7 @@ impl HostedHeadlessSession {
                 continue_recent: None,
                 no_session: None,
                 name: None,
-                config: Some(options.create_config.clone()),
+                config: Some(create_config),
                 telemetry_disabled: options.telemetry_disabled.then_some(true),
                 runtime_metadata: None,
                 lifecycle: Some(DaemonSessionLifecycle::Resident),

@@ -95,6 +95,12 @@ pub(crate) struct CreateSessionResources {
     pub(crate) skills: Vec<String>,
     pub(crate) prompt_templates: Vec<String>,
     pub(crate) autonomous: Option<pa_core::autonomous::AgentAutonomousConfig>,
+    /// The session policy's `--no-skills` (fork revision 31): no skill
+    /// discovery; the explicit `skills` paths above still load.
+    pub(crate) no_skills: bool,
+    /// The session policy's `--offline`: the worker must have been
+    /// launched with `PI_OFFLINE` (its launch env carries it).
+    pub(crate) offline: bool,
 }
 
 /// The create command's `--models` scope inputs (TS main.ts:548-568 +

@@ -17,7 +17,8 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     assert_eq!(hello["type"], "daemon_hello");
     // Differential goldens captured from the TS supervisor
     // (`prime-agent --mode daemon`, protocol 7, schema 29 — the deployed
-    // TS-main bundle reports the same schema id at the hello).
+    // TS-main bundle reports the same schema id at the hello), plus the
+    // fork's own revision 31 (`session_policy`).
     assert_eq!(
         hello["protocol"],
         serde_json::json!({
@@ -28,7 +29,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         hello["schemaId"]
             .as_str()
             .map(std::string::ToString::to_string),
-        Some("protocol-7-schema-30-8e4b17c2a9f5".to_string())
+        Some("protocol-7-schema-31-26cc82bed9db".to_string())
     );
     assert!(hello["supervisorOwnerToken"].is_string());
     assert!(hello["supervisorProcessStartId"]
@@ -63,6 +64,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
             "abort_and_send_queued",
             "agent_roster",
             "direct_peer_transport",
+            "session_policy",
         ])
     );
 
