@@ -266,6 +266,18 @@ fn kill(pid: u32) {
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
 }
 
+/// Release a fake program blocked reading the FIFO at `gate`, without
+/// blocking when nothing reads it (the failure paths: the open fails
+/// instead of waiting for a reader that never comes).
+fn release_if_waiting(gate: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = File::options()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(gate)
+        .and_then(|mut gate| gate.write_all(b"go\n"));
+}
+
 /// Open the FIFO at `gate` for writing and send one line: unblocks the
 /// fake program reading it (the open waits for that reader).
 fn release(gate: &Path) {
@@ -331,9 +343,9 @@ fn print_exits_while_the_kernel_probe_child_is_blocked() {
         child
     });
     let Ok(status) = exit_rx.recv_timeout(STEP_BOUND) else {
-        // Release the probe and kill the lingering binary, then fail.
+        // Kill the lingering binary and release its probe, then fail.
         kill(pid);
-        release(&gate);
+        release_if_waiting(&gate);
         panic!(
             "the binary did not exit after its answer; stderr: {:?}",
             stderr.try_iter().collect::<Vec<_>>()

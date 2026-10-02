@@ -1461,6 +1461,7 @@ async fn run_prompts_and_emit(
         boundary
             .run_at_settled_turn(engine, model, api_key.clone(), global_harness_dir.clone())
             .await?;
+        crate::headless_exit::phase("compaction and refinement boundary end");
         // The goal boundary's queue drain: the threshold-held continuation
         // (minted ahead of the boundary's compaction) and the budget-limit
         // steer (armed at the crossing turn's message end) run as this
@@ -1478,6 +1479,7 @@ async fn run_prompts_and_emit(
                 global_harness_dir.clone(),
             )
             .await?;
+        crate::headless_exit::phase("goal boundary end");
         // The autonomous arm runs only when the goal does not own the
         // boundary (TS `_getContinuationMessages`: the goal arm takes
         // exclusive priority; autonomous is never consulted while a goal
@@ -1499,7 +1501,7 @@ async fn run_prompts_and_emit(
                 .await
                 .map_err(|error| format!("{error:#}"))?;
         }
-        crate::headless_exit::phase("settled-turn boundary end");
+        crate::headless_exit::phase("autonomous boundary end");
     }
     goal_accounting.unsubscribe().await;
     accounting.unsubscribe().await;
