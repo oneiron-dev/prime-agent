@@ -1034,11 +1034,11 @@ impl SessionEngine {
     }
 
     /// Give the session's kernel up at once, without a final snapshot: a
-    /// one-shot host's last step after its output. An in-flight
-    /// environment setup or boot is cancelled (its subprocesses killed and
-    /// reaped) and a running kernel is killed - what dropping the engine
-    /// does, made explicit and immediate so nothing the kernel started
-    /// outlives the answer.
+    /// one-shot host's last step after its output. An in-flight boot is
+    /// abandoned (the host's runtime shutdown drops it, killing any setup
+    /// child it still runs) and a running kernel is killed - what dropping
+    /// the engine does, made explicit and immediate so nothing the kernel
+    /// started outlives the answer.
     pub fn abandon_kernel(&self) {
         self.provisioner.abandon();
     }

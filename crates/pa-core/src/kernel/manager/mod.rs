@@ -57,10 +57,6 @@ pub struct KernelStartOptions {
     /// Abandons the caller's wait; the startup keeps running for others.
     pub signal: Option<AbortSignal>,
     pub on_bootstrap_progress: Option<KernelBootstrapProgressHandler>,
-    /// Cancels the managed environment setup this start runs (its `uv`
-    /// steps and interpreter probes are killed and reaped): the owner's
-    /// dispose signal, so a disposed session never leaves setup running.
-    pub setup_cancel: Option<AbortSignal>,
 }
 
 /// Lock a mutex, surviving poisoning: the guarded state is plain data, and a

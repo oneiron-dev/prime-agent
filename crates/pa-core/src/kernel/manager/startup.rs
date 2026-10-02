@@ -120,7 +120,10 @@ impl Inner {
             crate::kernel::bootstrap::EnsureKernelPythonOptions {
                 python_skills: skills,
                 on_progress: progress,
-                cancel: options.setup_cancel.clone(),
+                // The venv is shared by every session on the machine: one
+                // session's dispose never cancels its setup. A process exit
+                // drops the setup, which kills its running child.
+                cancel: None,
             },
         )
         .await?;

@@ -51,8 +51,8 @@ pub(crate) use uv::ensure_uv;
 use uv::windows_executable_candidates;
 use version::{
     bootstrap_base_version_current, bootstrap_skill_key, bootstrap_version_current,
-    clear_bootstrap_version, read_bootstrap_version, read_bootstrap_version_raw,
-    write_bootstrap_version, STATE_SNAPSHOT_REQUIREMENT,
+    read_bootstrap_version, read_bootstrap_version_raw, write_bootstrap_version,
+    STATE_SNAPSHOT_REQUIREMENT,
 };
 #[cfg(test)]
 use version::{recorded_skills_cover, BOOTSTRAP_SCHEMA};
@@ -203,12 +203,6 @@ pub(crate) async fn sync_python_skills(
         missing.push(skill);
     }
     if !missing.is_empty() {
-        // The install mutates a venv other runs may already accept as
-        // ready (shared dependencies included): its record goes first, so
-        // an install that never finishes (cancelled, killed, crashed)
-        // leaves a venv no readiness check accepts. The full record is
-        // written again below once the sync finished.
-        clear_bootstrap_version(venv)?;
         // One uv invocation installs the whole batch of missing skills: a
         // fresh kernel bootstrap otherwise pays one process plus build-backend
         // startup per metadata-only editable install (measured: nine serial

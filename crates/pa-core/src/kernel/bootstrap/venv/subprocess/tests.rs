@@ -1,7 +1,7 @@
 //! The owned bootstrap child against fake programs gated on FIFOs the test
 //! holds: a cancelled step is killed and reaped before it fails, a dropped
-//! step's child is killed, and a bootstrap or skill sync cancelled
-//! mid-install leaves no venv a later readiness check accepts.
+//! step's child is killed, and a bootstrap cancelled mid-install leaves no
+//! venv a later readiness check accepts.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -10,7 +10,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::{run_owned, ChildCancel, ChildOutput, KERNEL_SETUP_CANCELLED};
-use crate::kernel::bootstrap::venv::BootstrapPythonSkill;
 use crate::kernel::bootstrap::EnsureKernelPythonOptions;
 use crate::kernel::cancellation::AbortSignal;
 use crate::platform::process::{kill_pid, pid_exists, Signal};
@@ -203,84 +202,5 @@ async fn a_cancelled_bootstrap_leaves_no_venv_a_readiness_check_accepts() {
         )
         .await,
         "a cancelled bootstrap's venv is not ready"
-    );
-}
-
-/// A skill sync cancelled mid-install leaves a venv that was ready before
-/// it unready: the install may already have changed what the earlier
-/// record vouched for (shared dependencies), so that record must not
-/// survive the interruption. The venv starts ready for skill `a`; the sync
-/// adding skill `b` is cancelled; afterwards the venv is not ready even
-/// for `a` alone.
-#[tokio::test]
-async fn a_cancelled_skill_sync_leaves_the_ready_venv_unready() {
-    let gate = Gate::new();
-    let venv = gate.path("venv");
-    std::fs::create_dir_all(venv.join("bin")).unwrap();
-    let python = super::super::kernel_venv_python(&venv);
-    executable(&python, "#!/bin/sh\nexit 0\n");
-    let skill = |name: &str| {
-        let dir = gate.path(&format!("skills/{name}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        BootstrapPythonSkill {
-            import_name: name.to_string(),
-            package_path: dir.to_string_lossy().to_string(),
-            pyproject_path: dir.join("pyproject.toml").to_string_lossy().to_string(),
-            pyproject_hash: format!("hash-{name}"),
-        }
-    };
-    let (installed, added) = (skill("a"), skill("b"));
-    let identity = "sha256:cancelled-sync";
-    super::super::write_bootstrap_version(&venv, identity, std::slice::from_ref(&installed))
-        .unwrap();
-    let python_str = python.to_string_lossy().to_string();
-    let ready_for_installed = || {
-        super::super::kernel_ready(
-            &python_str,
-            &venv,
-            identity,
-            std::slice::from_ref(&installed),
-            ChildCancel::Never,
-        )
-    };
-    assert!(ready_for_installed().await, "the venv starts ready for `a`");
-
-    let uv = gate.path("uv");
-    executable(
-        &uv,
-        &format!(
-            "#!/bin/sh\ncase \"$1\" in\npip)\n{}\n;;\nesac\nexit 0\n",
-            gate.block_lines()
-        ),
-    );
-    let signal = AbortSignal::new();
-    let sync = tokio::spawn({
-        let (venv, python) = (venv.clone(), python.clone());
-        let skills = vec![installed.clone(), added];
-        let options = EnsureKernelPythonOptions {
-            cancel: Some(signal.clone()),
-            ..Default::default()
-        };
-        async move {
-            super::super::sync_python_skills(
-                &uv.to_string_lossy(),
-                &venv,
-                &python,
-                identity,
-                &skills,
-                &options,
-            )
-            .await
-        }
-    });
-    let (pid, alive) = gate.started().await;
-    signal.abort();
-    let error = bounded(sync).await.unwrap().unwrap_err();
-    assert_eq!(error.to_string(), KERNEL_SETUP_CANCELLED);
-    assert!(!pid_exists(pid), "the cancelled install {pid} was reaped");
-    exited(pid, alive).await;
-    assert!(
-        !ready_for_installed().await,
-        "an interrupted sync leaves no record a readiness check accepts"
     );
 }

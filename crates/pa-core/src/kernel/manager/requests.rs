@@ -76,7 +76,6 @@ impl ReplKernelManager {
         self.start(KernelStartOptions {
             signal: opts.signal.clone(),
             on_bootstrap_progress: None,
-            setup_cancel: None,
         })
         .await?;
         if self.state() == KernelState::Shutdown {
