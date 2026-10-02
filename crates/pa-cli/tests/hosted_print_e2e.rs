@@ -149,32 +149,75 @@ impl Sandbox {
     /// saved id. Returns the woken session's row.
     #[track_caller]
     fn passivate_and_wake(&self, row: &Value) -> Value {
-        let active_session_id = row["activeSessionId"].as_str().unwrap();
-        let descriptor: Value = std::fs::read_dir(self.home().join(".prime/agent/daemon-workers"))
-            .unwrap()
-            .flatten()
-            .map(|dir| dir.path().join(format!("{active_session_id}.json")))
-            .find(|path| path.exists())
-            .map(|path| serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap())
-            .expect("the worker descriptor");
-        let worker =
-            pa_core::platform::process::open_pidfd(row["workerPid"].as_u64().unwrap() as u32)
-                .expect("the live worker");
-        let mut wire = self.wire();
-        wire.request(&json!({
+        self.passivate(row);
+        self.wire()
+            .request(&json!({ "type": "attach", "activeSessionId": row["sessionId"] }));
+        self.session_row(&row["sessionId"])
+    }
+
+    /// Passivate a listed session's worker through its own idle-passivation
+    /// ask and wait for the worker's exit.
+    #[track_caller]
+    fn passivate(&self, row: &Value) {
+        let descriptor: Value =
+            serde_json::from_str(&std::fs::read_to_string(self.descriptor_path(row)).unwrap())
+                .unwrap();
+        let worker = Pidfd::open(&row["workerPid"]);
+        self.wire().request(&json!({
             "type": "worker_idle_passivation",
             "workerToken": descriptor["authenticationToken"],
         }));
-        let mut exited = libc::pollfd {
-            fd: worker,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&raw mut exited, 1, STEP_BOUND.as_millis() as i32) };
-        unsafe { libc::close(worker) };
-        assert_eq!(ready, 1, "the passivated worker exited");
-        wire.request(&json!({ "type": "attach", "activeSessionId": row["sessionId"] }));
-        self.session_row(&row["sessionId"])
+        assert!(worker.exited(), "the passivated worker exited");
+    }
+
+    /// The sandbox daemon's worker descriptor directory (one daemon, one
+    /// directory under `daemon-workers`).
+    #[track_caller]
+    fn descriptor_dir(&self) -> PathBuf {
+        let dirs: Vec<PathBuf> = std::fs::read_dir(self.home().join(".prime/agent/daemon-workers"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        dirs[0].clone()
+    }
+
+    /// A listed session's worker descriptor file.
+    #[track_caller]
+    fn descriptor_path(&self, row: &Value) -> PathBuf {
+        let active_session_id = row["activeSessionId"].as_str().unwrap();
+        self.descriptor_dir()
+            .join(format!("{active_session_id}.json"))
+    }
+
+    /// Make the daemon's session policy store refuse every write (its
+    /// directory becomes a file), or accept them again, records intact.
+    #[track_caller]
+    fn set_policy_store(&self, state: PolicyStore) {
+        let store = self.descriptor_dir().join("session-policies");
+        let held = self.descriptor_dir().join("session-policies.held");
+        match state {
+            PolicyStore::Refusing => {
+                std::fs::rename(&store, &held).unwrap();
+                std::fs::write(&store, "refusing").unwrap();
+            }
+            PolicyStore::Writable => {
+                std::fs::remove_file(&store).unwrap();
+                std::fs::rename(&held, &store).unwrap();
+            }
+        }
+    }
+
+    /// Everything the sandbox daemon and its workers logged.
+    fn logs(&self) -> String {
+        std::fs::read_dir(self.home().join(".prime/agent/logs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect()
     }
 
     /// Create an RLM child of a listed session the way a parent's spawn
@@ -438,6 +481,45 @@ impl Wire {
         let response = self.read_until(|line| line["type"] == "response" && line["id"] == id);
         assert_eq!(response["success"], true, "{response}");
         response
+    }
+}
+
+/// Whether the sandbox daemon's session policy store takes writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyStore {
+    /// Every policy write fails (the store's directory is a file).
+    Refusing,
+    /// The store is back, with every record it held.
+    Writable,
+}
+
+/// A live process's pidfd, closed on drop.
+struct Pidfd(i32);
+
+impl Pidfd {
+    #[track_caller]
+    fn open(pid: &Value) -> Self {
+        Self(
+            pa_core::platform::process::open_pidfd(pid.as_u64().expect("a pid") as u32)
+                .expect("a live process"),
+        )
+    }
+
+    /// Whether the process exits inside the step bound (a pidfd turns
+    /// readable when its process exits).
+    fn exited(&self) -> bool {
+        let mut exited = libc::pollfd {
+            fd: self.0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&raw mut exited, 1, STEP_BOUND.as_millis() as i32) == 1 }
+    }
+}
+
+impl Drop for Pidfd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
     }
 }
 
@@ -1321,4 +1403,56 @@ fn a_passivated_session_wakes_under_its_own_policy() {
         ),
         (Some("1".to_string()), Vec::<String>::new())
     );
+}
+
+/// A kill retires its worker whatever the policy store does: with every
+/// policy write refused, the stop's last policy write fails (and says so
+/// in the daemon log), and the worker still gets its shutdown, exits, and
+/// leaves no descriptor behind.
+#[test]
+fn a_kill_retires_its_worker_whatever_the_policy_store_does() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &[], "one");
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let sessions = sandbox.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let row = sessions[0].clone();
+    let descriptor = sandbox.descriptor_path(&row);
+    assert!(descriptor.exists(), "the live worker's descriptor");
+    let worker = Pidfd::open(&row["workerPid"]);
+    sandbox.set_policy_store(PolicyStore::Refusing);
+    sandbox
+        .wire()
+        .request(&json!({ "type": "kill", "activeSessionId": row["activeSessionId"] }));
+    assert!(worker.exited(), "the killed worker exited");
+    assert!(!descriptor.exists(), "the retired worker's descriptor went");
+    assert!(
+        sandbox.logs().contains("SESSION POLICY LOST"),
+        "the refused policy write was logged"
+    );
+}
+
+/// A create whose session policy cannot be kept is refused and leaves no
+/// resident behind: the next open of the same session (the store writable
+/// again) launches its own worker at once instead of finding, or waiting
+/// on, the refused one.
+#[test]
+fn a_refused_admission_leaves_no_resident_behind() {
+    let sandbox = Sandbox::new(&json!({
+        "engine": "faux",
+        "responses": ["ANSWER", "ANSWER"],
+    }));
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &[], "one");
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    let row = sandbox.sessions()[0].clone();
+    let file = row["sessionFile"].as_str().unwrap().to_string();
+    sandbox.passivate(&row);
+    sandbox.set_policy_store(PolicyStore::Refusing);
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &["--resume", &file], "two");
+    assert_eq!((stdout.as_str(), code), ("", 1), "stderr: {stderr}");
+    assert!(stderr.contains("keep the session policy"), "{stderr}");
+    sandbox.set_policy_store(PolicyStore::Writable);
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::Text, &["--resume", &file], "three");
+    assert_eq!((stdout.as_str(), code), ("ANSWER\n", 0), "stderr: {stderr}");
+    assert_eq!(user_texts(&file), ["one", "three"]);
 }
