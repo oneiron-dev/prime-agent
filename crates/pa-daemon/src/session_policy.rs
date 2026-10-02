@@ -122,19 +122,14 @@ impl SessionPolicy {
     /// `descriptor_dir`: a worker's descriptor dies with the worker (idle
     /// passivation, a per-session stop), and the session's next worker (a
     /// wake, a revival, an open that carries no policy) starts under the
-    /// recalled one. The default policy keeps no record.
+    /// recalled one. The explicit default policy is kept too: an online
+    /// session stays online on a supervisor an `--offline` client started.
     ///
     /// # Errors
     ///
     /// Returns the write failure.
     pub(crate) fn remember(self, descriptor_dir: &Path, session_file: &str) -> Result<()> {
         let path = record_path(descriptor_dir, session_file);
-        if self.is_default() {
-            return match std::fs::remove_file(&path) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
-                Ok(()) | Err(_) => Ok(()),
-            };
-        }
         let mut record = Map::from_iter([("sessionFile".to_string(), Value::from(session_file))]);
         self.write_into(&mut record);
         if let Some(parent) = path.parent() {
@@ -143,12 +138,41 @@ impl SessionPolicy {
         crate::descriptor::write_file_atomic(&path, &Value::Object(record).to_string())
     }
 
-    /// The policy [`SessionPolicy::remember`] kept for `session_file`.
+    /// The policy [`SessionPolicy::remember`] kept for `session_file`;
+    /// `Ok(None)` when it kept none.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure for a record that exists but cannot be read
+    /// (the session's next worker must not start without its policy).
+    pub(crate) fn recalled(descriptor_dir: &Path, session_file: &str) -> Result<Option<Self>> {
+        let path = record_path(descriptor_dir, session_file);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => bail!(
+                "the session policy record {} for {session_file} cannot be read: {error}",
+                path.display()
+            ),
+        };
+        let unreadable = || {
+            anyhow::anyhow!(
+                "the session policy record {} for {session_file} is not a policy",
+                path.display()
+            )
+        };
+        let record: Value = serde_json::from_str(&text).map_err(|_| unreadable())?;
+        Self::requested(record.as_object())
+            .map_err(|_| unreadable())?
+            .map(Some)
+            .ok_or_else(unreadable)
+    }
+
+    /// The policy a durable create command carries; `None` for a worker
+    /// created without one (a pre-policy client).
     #[must_use]
-    pub(crate) fn recalled(descriptor_dir: &Path, session_file: &str) -> Option<Self> {
-        let text = std::fs::read_to_string(record_path(descriptor_dir, session_file)).ok()?;
-        let record: Value = serde_json::from_str(&text).ok()?;
-        Self::requested(record.as_object()).ok().flatten()
+    pub(crate) fn carried(rest: &Map<String, Value>) -> Option<Self> {
+        Self::requested(Some(rest)).ok().flatten()
     }
 }
 
@@ -237,43 +261,44 @@ mod tests {
         }
     }
 
-    /// A remembered policy is recalled for any spelling of the session file
-    /// and survives until the default policy replaces it.
+    /// A remembered policy is recalled for any spelling of the session file;
+    /// the explicit default replaces it (and is recalled as such), and a
+    /// record that exists but is not a policy fails the recall.
     #[test]
-    fn a_remembered_policy_outlives_its_worker_until_the_default_replaces_it() {
+    fn a_remembered_policy_outlives_its_worker() {
         let dir = tempfile::tempdir().unwrap();
         let descriptors = dir.path().join("daemon-workers").join("key");
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         let file = sessions.join("s.jsonl");
         std::fs::write(&file, "{}\n").unwrap();
-        let spelled = sessions.join("..").join("sessions").join("s.jsonl");
+        let (file, spelled) = (
+            file.to_str().unwrap().to_string(),
+            sessions.join("..").join("sessions").join("s.jsonl"),
+        );
+        let spelled = spelled.to_str().unwrap();
         let factory = SessionPolicy {
             offline: true,
             no_skills: true,
         };
+        assert_eq!(SessionPolicy::recalled(&descriptors, &file).unwrap(), None);
+        factory.remember(&descriptors, &file).unwrap();
         assert_eq!(
-            SessionPolicy::recalled(&descriptors, file.to_str().unwrap()),
-            None
-        );
-        factory
-            .remember(&descriptors, file.to_str().unwrap())
-            .unwrap();
-        assert_eq!(
-            SessionPolicy::recalled(&descriptors, spelled.to_str().unwrap()),
+            SessionPolicy::recalled(&descriptors, spelled).unwrap(),
             Some(factory)
         );
         SessionPolicy::default()
-            .remember(&descriptors, spelled.to_str().unwrap())
+            .remember(&descriptors, spelled)
             .unwrap();
         assert_eq!(
-            SessionPolicy::recalled(&descriptors, file.to_str().unwrap()),
-            None
+            SessionPolicy::recalled(&descriptors, &file).unwrap(),
+            Some(SessionPolicy::default())
         );
-        // Forgetting what was never kept is not an error.
-        SessionPolicy::default()
-            .remember(&descriptors, file.to_str().unwrap())
-            .unwrap();
+        std::fs::write(record_path(&descriptors, &file), "{\"sessionFile\": \"x\"}").unwrap();
+        let error = SessionPolicy::recalled(&descriptors, &file)
+            .unwrap_err()
+            .to_string();
+        assert!(error.ends_with("is not a policy"), "{error}");
     }
 
     #[test]

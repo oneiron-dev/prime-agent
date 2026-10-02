@@ -134,6 +134,78 @@ impl Sandbox {
         command
     }
 
+    /// The listed row of the session `session_id` names.
+    #[track_caller]
+    fn session_row(&self, session_id: &Value) -> Value {
+        self.sessions()
+            .into_iter()
+            .find(|row| row["sessionId"] == *session_id)
+            .expect("the session is listed")
+    }
+
+    /// Passivate a listed session's worker through its own idle-passivation
+    /// ask (the worker descriptor goes with it), wait for the worker's exit
+    /// (a pidfd turns readable), then wake the session with an attach by its
+    /// saved id. Returns the woken session's row.
+    #[track_caller]
+    fn passivate_and_wake(&self, row: &Value) -> Value {
+        let active_session_id = row["activeSessionId"].as_str().unwrap();
+        let descriptor: Value = std::fs::read_dir(self.home().join(".prime/agent/daemon-workers"))
+            .unwrap()
+            .flatten()
+            .map(|dir| dir.path().join(format!("{active_session_id}.json")))
+            .find(|path| path.exists())
+            .map(|path| serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap())
+            .expect("the worker descriptor");
+        let worker =
+            pa_core::platform::process::open_pidfd(row["workerPid"].as_u64().unwrap() as u32)
+                .expect("the live worker");
+        let mut wire = self.wire();
+        wire.request(&json!({
+            "type": "worker_idle_passivation",
+            "workerToken": descriptor["authenticationToken"],
+        }));
+        let mut exited = libc::pollfd {
+            fd: worker,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&raw mut exited, 1, STEP_BOUND.as_millis() as i32) };
+        unsafe { libc::close(worker) };
+        assert_eq!(ready, 1, "the passivated worker exited");
+        wire.request(&json!({ "type": "attach", "activeSessionId": row["sessionId"] }));
+        self.session_row(&row["sessionId"])
+    }
+
+    /// Create an RLM child of a listed session the way a parent's spawn
+    /// does (its file as `parentSessionPath`, no policy keys); returns the
+    /// child worker's pid.
+    #[track_caller]
+    fn create_child(&self, parent: &Value) -> Value {
+        std::fs::create_dir_all(self.home().join("children")).unwrap();
+        let mut wire = self.wire();
+        let created = wire.request(&json!({
+            "type": "create",
+            "name": format!("child-of-{}", parent["activeSessionId"].as_str().unwrap()),
+            "lifecycle": "resident",
+            "config": {
+                "cwd": self.home(),
+                "sessionDir": self.home().join("children"),
+                "rlmDepth": 1,
+                "parentSessionPath": parent["sessionFile"],
+                "script": self.dir.path().join("script.json"),
+            },
+        }));
+        let listed = wire.request(&json!({ "type": "list", "all": true }));
+        listed["data"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["activeSessionId"] == created["data"]["activeSessionId"])
+            .expect("the child is listed")["workerPid"]
+            .clone()
+    }
+
     /// The probe skill a session discovers from the agent dir by default.
     fn add_discoverable_skill(&self) {
         let dir = self.home().join(".prime/agent/skills/lane-probe-skill");
@@ -912,30 +984,6 @@ fn an_offline_session_runs_its_own_worker_offline_on_an_online_daemon() {
     let (online_row, offline_row) = (row_of("online"), row_of("offline"));
     // An RLM child's create names its parent's file and no policy: it
     // inherits the parent session's.
-    std::fs::create_dir_all(sandbox.home().join("children")).unwrap();
-    let child_of = |parent: &Value| {
-        let mut wire = sandbox.wire();
-        let created = wire.request(&json!({
-            "type": "create",
-            "name": format!("child-of-{}", parent["activeSessionId"].as_str().unwrap()),
-            "lifecycle": "resident",
-            "config": {
-                "cwd": sandbox.home(),
-                "sessionDir": sandbox.home().join("children"),
-                "rlmDepth": 1,
-                "parentSessionPath": parent["sessionFile"],
-                "script": sandbox.dir.path().join("script.json"),
-            },
-        }));
-        let listed = wire.request(&json!({ "type": "list", "all": true }));
-        listed["data"]["sessions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["activeSessionId"] == created["data"]["activeSessionId"])
-            .expect("the child is listed")["workerPid"]
-            .clone()
-    };
     let supervisor = sandbox.wire().hello["supervisorPid"].clone();
     let offline_env = |pid: &Value| environ(pid).get("PI_OFFLINE").cloned();
     assert_eq!(
@@ -943,8 +991,8 @@ fn an_offline_session_runs_its_own_worker_offline_on_an_online_daemon() {
             offline_env(&supervisor),
             offline_env(&online_row["workerPid"]),
             offline_env(&offline_row["workerPid"]),
-            offline_env(&child_of(&online_row)),
-            offline_env(&child_of(&offline_row)),
+            offline_env(&sandbox.create_child(&online_row)),
+            offline_env(&sandbox.create_child(&offline_row)),
         ],
         [
             None,
@@ -1186,7 +1234,7 @@ fn a_busy_old_daemon_is_never_stopped_by_a_seat() {
 
 /// The inverse isolation: on a daemon an `--offline` run started (its
 /// supervisor runs with `PI_OFFLINE=1`), an online session's worker runs
-/// without it.
+/// without it, after a passivation and wake too, and so does its RLM child.
 #[test]
 fn an_online_session_runs_its_own_worker_online_on_an_offline_daemon() {
     let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
@@ -1213,12 +1261,26 @@ fn an_online_session_runs_its_own_worker_online_on_an_offline_daemon() {
         ],
         [Some("1".to_string()), Some("1".to_string()), None]
     );
+    // It stays online across a passivation and wake, and an RLM child it
+    // spawns inherits its online policy, not the supervisor's offline mode.
+    let online_row = sandbox
+        .sessions()
+        .into_iter()
+        .find(|row| user_texts(row["sessionFile"].as_str().unwrap()) == ["online"])
+        .unwrap();
+    let woken = sandbox.passivate_and_wake(&online_row);
+    let child = sandbox.create_child(&woken);
+    assert_eq!(
+        [offline_env(&woken["workerPid"]), offline_env(&child)],
+        [None, None]
+    );
 }
 
-/// A passivated policy session wakes under its own policy: after the idle
-/// passivation retired its worker (the worker descriptor goes with it), a
-/// wake on an ONLINE daemon (an attach by its saved id) starts the next worker
-/// offline and without skill discovery.
+/// A passivated policy session wakes under its own policy: after a new
+/// session moved its worker onto another file and the idle passivation
+/// retired the worker (the worker descriptor goes with it), a wake on an
+/// ONLINE daemon (an attach by its saved id) starts the next worker offline
+/// and without skill discovery.
 #[test]
 fn a_passivated_session_wakes_under_its_own_policy() {
     let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": ["ANSWER"] }));
@@ -1237,49 +1299,25 @@ fn a_passivated_session_wakes_under_its_own_policy() {
         "seat",
     ]));
     assert_eq!(code, 0, "stderr: {stderr}");
-    let session_id = json_lines(&stdout)[0]["id"].clone();
-    let row_of = || {
-        sandbox
-            .sessions()
-            .into_iter()
-            .find(|row| row["sessionId"] == session_id)
-            .expect("the session is listed")
-    };
-    let before = row_of();
-    let active_session_id = before["activeSessionId"].as_str().unwrap().to_string();
-    // The worker's own idle passivation ask carries its token.
-    let descriptor: Value = std::fs::read_dir(sandbox.home().join(".prime/agent/daemon-workers"))
-        .unwrap()
-        .flatten()
-        .map(|dir| dir.path().join(format!("{active_session_id}.json")))
-        .find(|path| path.exists())
-        .map(|path| serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap())
-        .expect("the worker descriptor");
-    let worker =
-        pa_core::platform::process::open_pidfd(before["workerPid"].as_u64().unwrap() as u32)
-            .expect("the live worker");
-    let mut wire = sandbox.wire();
-    wire.request(&json!({
-        "type": "worker_idle_passivation",
-        "workerToken": descriptor["authenticationToken"],
+    let seat_id = json_lines(&stdout)[0]["id"].clone();
+    let seat = sandbox.session_row(&seat_id);
+    // A new session moves the worker onto another file; its policy follows.
+    sandbox.wire().request(&json!({
+        "type": "new_session",
+        "activeSessionId": seat["activeSessionId"],
     }));
-    // The passivated worker's process exits (a pidfd turns readable).
-    let mut exited = libc::pollfd {
-        fd: worker,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ready = unsafe { libc::poll(&raw mut exited, 1, STEP_BOUND.as_millis() as i32) };
-    unsafe { libc::close(worker) };
-    assert_eq!(ready, 1, "the passivated worker exited");
-    // The wake: an attach to the passivated session by its saved id.
-    wire.request(&json!({ "type": "attach", "activeSessionId": session_id }));
-    let after = row_of();
-    assert_ne!(after["workerPid"], before["workerPid"]);
+    let moved = sandbox
+        .sessions()
+        .into_iter()
+        .find(|row| row["activeSessionId"] == seat["activeSessionId"])
+        .expect("the worker still serves a session");
+    assert_ne!(moved["sessionId"], seat_id);
+    let woken = sandbox.passivate_and_wake(&moved);
+    assert_ne!(woken["workerPid"], moved["workerPid"]);
     assert_eq!(
         (
-            environ(&after["workerPid"]).get("PI_OFFLINE").cloned(),
-            inventory(&sandbox.system_prompt(&session_id)),
+            environ(&woken["workerPid"]).get("PI_OFFLINE").cloned(),
+            inventory(&sandbox.system_prompt(&moved["sessionId"])),
         ),
         (Some("1".to_string()), Vec::<String>::new())
     );

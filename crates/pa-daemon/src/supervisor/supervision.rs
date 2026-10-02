@@ -430,12 +430,8 @@ impl Supervisor {
                 // A session whose policy is online never inherits the
                 // offline mode of a supervisor an `--offline` client
                 // started (a pre-policy session keeps inheriting it).
-                matches!(
-                    crate::session_policy::SessionPolicy::requested(Some(
-                        &descriptor.create_command.rest
-                    )),
-                    Ok(Some(policy)) if !policy.offline
-                ),
+                crate::session_policy::SessionPolicy::carried(&descriptor.create_command.rest)
+                    .is_some_and(|policy| !policy.offline),
             )
         };
 

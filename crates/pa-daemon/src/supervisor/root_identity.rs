@@ -223,6 +223,19 @@ impl Supervisor {
         // relaunch never replays that contradiction).
         descriptor.create_command.session_path = Some(session_file.clone());
         descriptor.create_command.no_session = None;
+        // The moved-to session runs under the worker's policy: its record
+        // follows the move now (the graceful stop rewrites it before any
+        // retirement, so a failed write here only waits for that).
+        if let Some(policy) =
+            crate::session_policy::SessionPolicy::carried(&descriptor.create_command.rest)
+        {
+            if let Err(error) = policy.remember(&self.descriptor_dir, &session_file) {
+                self.log_line(&format!(
+                    "session worker {}: could not keep the session policy for {session_file}: {error:#}",
+                    resident.worker_id
+                ));
+            }
+        }
         // The durable record is the restart edge: a failed persist leaves
         // the LIVE routing correct (the descriptor above already moved)
         // while the persisted identity lags — retry once here, then keep

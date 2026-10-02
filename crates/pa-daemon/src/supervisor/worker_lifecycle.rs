@@ -195,22 +195,19 @@ impl Supervisor {
         // offline and skill-free. `None`: no policy at all (the old
         // behavior).
         let mut session_policy = SessionPolicy::requested(config_object)?;
-        if session_policy.is_none() {
-            session_policy = session_path
-                .as_deref()
-                .and_then(|file| SessionPolicy::recalled(&self.descriptor_dir, file));
+        if let (None, Some(file)) = (session_policy, session_path.as_deref()) {
+            session_policy = SessionPolicy::recalled(&self.descriptor_dir, file)?;
         }
         let parent_file = config_object
             .and_then(|config| config.get("parentSessionPath"))
             .and_then(Value::as_str);
         if let (None, Some(parent_file)) = (session_policy, parent_file) {
             session_policy = match self.registry.find_by_session_file(parent_file).await {
-                Some(parent) => Some(SessionPolicy::durable(
-                    &parent.descriptor.lock().await.create_command.rest,
-                )),
-                None => SessionPolicy::recalled(&self.descriptor_dir, parent_file),
-            }
-            .filter(|policy| !policy.is_default());
+                Some(parent) => {
+                    SessionPolicy::carried(&parent.descriptor.lock().await.create_command.rest)
+                }
+                None => SessionPolicy::recalled(&self.descriptor_dir, parent_file)?,
+            };
         }
         if *no_session == Some(true) && session_path.is_some() {
             return Err(anyhow!(
@@ -469,7 +466,7 @@ impl Supervisor {
                 return Err(anyhow!("session worker create returned no session file"));
             }
         }
-        {
+        let remembered = {
             let mut descriptor = resident.descriptor.lock().await;
             descriptor.lifecycle = DaemonWorkerLifecycle::Ready;
             descriptor.root_session_id = create_summary
@@ -506,15 +503,20 @@ impl Supervisor {
             // The policy outlives this worker: the descriptor goes with it
             // (idle passivation, a per-session stop), and the session's
             // next worker recalls the policy from this record.
-            if let (Some(policy), Some(session_file)) =
-                (session_policy, descriptor.session_file.as_deref())
-            {
-                if let Err(error) = policy.remember(&self.descriptor_dir, session_file) {
-                    self.log_line(&format!(
-                        "session worker {worker_id}: could not keep the session policy for {session_file}: {error:#}"
-                    ));
+            match (session_policy, descriptor.session_file.as_deref()) {
+                (Some(policy), Some(session_file)) => {
+                    policy.remember(&self.descriptor_dir, session_file)
                 }
+                _ => Ok(()),
             }
+        };
+        if let Err(error) = remembered {
+            // A session whose policy cannot be kept is not admitted: its
+            // next worker (a wake, a revival) would start without it.
+            let _ = self.stop_worker(&resident).await;
+            let _ = child.kill().await;
+            let _ = std::fs::remove_file(&descriptor_path);
+            return Err(error.context("keep the session policy"));
         }
         // The create completed with a validated session identity: client
         // commands may now be routed to this worker (the replacement-aware
@@ -786,6 +788,20 @@ impl Supervisor {
         // stop before the shutdown is forwarded, exactly like TS throws
         // for non-direct-child stops, so the worker's crash-recovery
         // contract stays intact.
+        // The session's policy outlives the worker the same way: its next
+        // worker (a wake, a revival) recalls it from the per-session
+        // record, kept here for the file the worker serves NOW (a
+        // new-session or fork moved it since the launch); a record that
+        // cannot be written fails the stop before the worker is told.
+        {
+            let descriptor = resident.descriptor.lock().await;
+            if let (Some(policy), Some(session_file)) = (
+                SessionPolicy::carried(&descriptor.create_command.rest),
+                descriptor.session_file.as_deref(),
+            ) {
+                policy.remember(&self.descriptor_dir, session_file)?;
+            }
+        }
         self.persist_stop_tombstone_stop(resident).await?;
         resident.intentional_stop.store(true, Ordering::SeqCst);
         // The stop is intentional: routes waiting out a replacement must
