@@ -153,12 +153,29 @@ pub fn build_fallback_model(
             })
         })?
     } else {
-        let default_id = default_model_per_provider(provider)?;
-        provider_models
-            .iter()
-            .copied()
-            .find(|model| model.id == default_id)
-            .unwrap_or(provider_models[0])
+        // A provider with a compiled-in default keeps it as the template (TS
+        // parity). A models.json provider has none: TS sends any id to such a
+        // provider, so the port builds the id instead of refusing it, on the
+        // provider's own entry for the id behind one routing prefix
+        // (`<login>/<id>`, as CPA's per-login prefixes, which the proxy strips
+        // upstream; the rest of the id may carry its own namespace, so only the
+        // first segment is a prefix), else the provider's first model.
+        match default_model_per_provider(provider) {
+            Some(default_id) => provider_models
+                .iter()
+                .copied()
+                .find(|model| model.id == default_id)
+                .unwrap_or(provider_models[0]),
+            None => model_id
+                .split_once('/')
+                .and_then(|(_, routed)| {
+                    provider_models
+                        .iter()
+                        .copied()
+                        .find(|model| model.id == routed)
+                })
+                .unwrap_or(provider_models[0]),
+        }
     };
     let mut model = template.clone();
     model.id = model_id.to_string();
@@ -758,6 +775,73 @@ mod tests {
             resolved.model.as_ref().map(|m| m.provider.as_str()),
             Some("openrouter")
         );
+    }
+
+    #[test]
+    fn fallback_model_on_a_models_json_provider_without_a_default() {
+        // cpa-r (models.json) has no compiled-in default; TS sends an unknown
+        // id to such a provider, so the resolver must build it, not refuse it.
+        let mut catalog = catalog();
+        catalog.push(model("cpa-r", "glm-5.3", "GLM on CPA"));
+        let resolved = resolve_cli_model(Some("cpa-r"), "antevon/gpt-6.1-sol", &catalog);
+        let resolved_model = resolved
+            .model
+            .expect("custom id resolves on a models.json provider");
+        assert_eq!(resolved_model.provider, "cpa-r");
+        assert_eq!(resolved_model.id, "antevon/gpt-6.1-sol");
+        assert!(resolved.error.is_none());
+        assert!(resolved
+            .warning
+            .as_deref()
+            .is_some_and(|w| w.contains("Using custom model id")));
+    }
+
+    #[test]
+    fn fallback_model_inherits_the_entry_behind_one_routing_prefix() {
+        let mut catalog = catalog();
+        catalog.push(model("cpa-r", "glm-5.3", "GLM on CPA"));
+        let mut sol = model("cpa-r", "gpt-6.1-sol", "Sol on CPA");
+        sol.context_window = 1_100_000;
+        catalog.push(sol);
+        let mut namespaced = model("cpa-r", "openai/gpt-4o", "GPT-4o on CPA");
+        namespaced.context_window = 200_000;
+        catalog.push(namespaced);
+        // The id behind the login prefix names a provider entry: its limits.
+        let routed = build_fallback_model("cpa-r", "antevon/gpt-6.1-sol", &catalog)
+            .expect("the prefixed id builds on the bare id's entry");
+        assert_eq!(routed.id, "antevon/gpt-6.1-sol");
+        assert_eq!(routed.name, "antevon/gpt-6.1-sol");
+        assert_eq!(routed.context_window, 1_100_000);
+        // Only the first segment is a prefix: the upstream namespace stays.
+        let namespaced = build_fallback_model("cpa-r", "antevon/openai/gpt-4o", &catalog)
+            .expect("a namespaced id behind the prefix builds");
+        assert_eq!(namespaced.context_window, 200_000);
+        // No entry behind the prefix: the provider's first model is the template.
+        let unknown = build_fallback_model("cpa-r", "antevon/gpt-9", &catalog)
+            .expect("an unknown id still builds");
+        assert_eq!(unknown.context_window, 100_000);
+        // The same through the CLI resolver, metadata included.
+        let resolved = resolve_cli_model(Some("cpa-r"), "antevon/gpt-6.1-sol", &catalog);
+        assert_eq!(resolved.model.expect("resolves").context_window, 1_100_000);
+    }
+
+    #[test]
+    fn fallback_model_keeps_the_default_template_on_a_provider_with_one() {
+        // anthropic has a compiled-in default: a prefixed id that happens to end
+        // in one of its model ids must not switch templates (TS parity).
+        let mut catalog = catalog();
+        for entry in &mut catalog {
+            if entry.id == "claude-sonnet-4-5-20250929" {
+                entry.context_window = 50_000;
+            }
+        }
+        let fallback =
+            build_fallback_model("anthropic", "antevon/claude-sonnet-4-5-20250929", &catalog)
+                .expect("builds on the provider default path");
+        assert_eq!(fallback.id, "antevon/claude-sonnet-4-5-20250929");
+        // The default (claude-opus-4-7) is not in this catalog, so the provider's
+        // first model is the template, as before this change.
+        assert_eq!(fallback.context_window, 100_000);
     }
 
     #[test]
