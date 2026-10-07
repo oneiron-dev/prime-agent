@@ -5,6 +5,17 @@ Every contributor (human or agent) must read this before working on this repo.
 
 ## Repository
 
+- **Never set git identity for commits to this repo's history.** Agents must not set
+  `user.name`/`user.email` (config or `-c`) or `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/
+  `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` for commits that land in this repository.
+  Those commits carry the identity of the ambient git config. If such a commit fails for a
+  missing identity, report it instead of adding config. Allowed: the `*_DATE` variables
+  (the golden corpus pins them for reproducibility), throwaway temp repos created by
+  tests, and the release automation's bot identity.
+- **Never add `Co-authored-by` trailers** — not in commit messages, not in squash
+  suggestions, not as attribution for work merged from branches. A PR's commits carry
+  one identity: the ambient git config's. Fabricated or hand-written trailers (including
+  noreply forms) misattribute commits to unrelated GitHub accounts.
 - The repo is PrimeIntellect-ai/prime-agent; the Rust implementation lives on the `main` branch.
 - PRs go to the org repo with base `main`:
   `gh pr create --repo PrimeIntellect-ai/prime-agent --base main`.
@@ -72,6 +83,43 @@ Every contributor (human or agent) must read this before working on this repo.
 - Explain lint exceptions next to the `#[allow(...)]` or workspace configuration; keep
   exceptions narrow. Advisory ignores in `deny.toml` need a reason and review date.
 
+## Performance and the critical path
+
+The UI critical path is paint-latency-critical. First paint, and every
+frame the user waits on, must never block on network, disk sync, or
+background bookkeeping. The launch benchmarks measure this surface
+(cold/warm ready, first paint); a merge that regresses them undoes the
+product's core claim.
+
+Rules:
+
+- Nothing user-visible awaits the network. Any HTTP/socket call on a
+  render path (telemetry, catalog fetch, update check) runs on a
+  background worker; the paint path hands the work off and returns
+  immediately. Delivery semantics (timeout, retry, ordering) live with
+  the worker, not the caller.
+- Telemetry is fire-and-forget from user-facing code. `pa-telemetry`'s
+  background worker owns delivery end to end; no startup, session
+  create, tab open, or first-render path may hold a flush or await a
+  sink.
+- Fire-and-forget boundaries need a red-first test: a hanging sink
+  (one that never replies) must not delay paint. The test fails if any
+  await on the critical path reaches the worker's delivery.
+- Tests that mock a sink or run offline cannot prove the above (the
+  benchmark's mock hides the POST). The regression test with a hanging
+  sink is the required verifier.
+
+Example (the #3288 regression this rule exists to prevent): the
+telemetry startup flush was awaited on the interactive launch path, so
+the analytics POST — a real HTTPS round-trip, ~157 ms — ran before the
+first frame. Every CI check passed because tests set DO_NOT_TRACK=1 and
+the benchmark mocked the provider offline; only real-network launches
+paid the cost. The fix moved the flush to the background worker and
+added `the_startup_flush_never_blocks_the_first_frame` (a hanging sink
+must not delay paint) as the permanent guard. Any change touching the
+launch path must keep that test red-first.
+
+
 ## Merge gates
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
@@ -104,7 +152,8 @@ Every contributor (human or agent) must read this before working on this repo.
 Every user-visible feature ships its adoption telemetry event in the same PR as the feature:
 the event name + properties join the versioned schema (`pa-telemetry`), and a
 seam emits it from day one. Telemetry properties never carry prompt, session, or file content
-(primitives only; see `pa-telemetry`).
+(primitives only; see `pa-telemetry`); delivery is fire-and-forget from user-facing code
+(see Performance and the critical path).
 
 ## Branding
 

@@ -327,6 +327,21 @@ impl ProviderAuthSelector {
             .map(|index| self.providers[*index].clone())
     }
 
+    /// One bracketed paste (TS routes the raw data to the open input):
+    /// the API-key prompt takes it, the provider search filters with it.
+    pub fn paste(&mut self, text: &str) {
+        match &mut self.mode {
+            Mode::Prompt { input, .. } => input.paste(text),
+            Mode::List => {
+                let previous = self.search.value().to_string();
+                self.search.paste(text);
+                if self.search.value() != previous {
+                    self.refilter();
+                }
+            }
+        }
+    }
+
     /// One key id (TS `handleInput`).
     pub fn handle_key(&mut self, key: &str, kb: &KeybindingsManager) -> AuthSelectorAction {
         if key == "ctrl+c" {
@@ -684,6 +699,34 @@ mod tests {
         assert_eq!(selector.search.value(), "l");
     }
 
+    /// A paste in the list filters the providers (the search takes it).
+    #[test]
+    fn a_paste_filters_the_provider_list() {
+        let mut selector =
+            ProviderAuthSelector::new(AuthSelectorKind::Login, vec![openai(), anthropic()]);
+        selector.paste("open");
+        assert_eq!(selector.search.value(), "open");
+        assert_eq!(selector.filtered.len(), 1);
+    }
+
+    /// A paste lands in the API-key prompt (the key reaches the auth
+    /// field, not the hidden composer behind).
+    #[test]
+    fn a_paste_types_into_the_api_key_prompt() {
+        let mut selector = ProviderAuthSelector::new(AuthSelectorKind::Login, vec![openai()]);
+        assert_eq!(
+            selector.handle_key("enter", &kb()),
+            AuthSelectorAction::None
+        );
+        selector.paste("sk-secret");
+        match selector.handle_key("enter", &kb()) {
+            AuthSelectorAction::Login { api_key, .. } => {
+                assert_eq!(api_key.as_deref(), Some("sk-secret"));
+            }
+            other => panic!("expected a login submit, got {other:?}"),
+        }
+    }
+
     #[test]
     fn enter_on_an_api_key_row_opens_the_prompt() {
         let mut selector =
@@ -948,7 +991,12 @@ mod tests {
         assert!(text[4].contains("Paste value"));
         assert_eq!(text[5], "", "the blank between the field and the actions");
         assert_eq!(
-            text[6], " Enter submit  Alt+C copy  Esc/Ctrl+C cancel",
+            text[6],
+            if cfg!(target_os = "macos") {
+                " Enter submit  Option+C copy  Esc/Ctrl+C cancel"
+            } else {
+                " Enter submit  Alt+C copy  Esc/Ctrl+C cancel"
+            },
             "the TS auth-actions row: {text:?}"
         );
         assert_eq!(text.len(), 7, "no bottom rule rides the prompt: {text:?}");

@@ -209,6 +209,25 @@ class SnapshotFileHandleGuardTest(unittest.TestCase):
         # A suspicious blob that does not disassemble fails closed.
         self.assertTrue(detect(b"\x80\x05_create_filehandle\xff\xff"))
 
+    def test_snapshot_unpickler_refuses_raw_fd_numbers_directly(self):
+        import dill
+        import io
+
+        fd = 2_147_483_647
+
+        class Landmine:
+            def __reduce__(self):
+                return (dill._dill._create_filehandle, (fd, "rb", 0, True, open, False, 0, b""))
+
+        blob = dill.dumps(Landmine())
+        self.assertTrue(self.repl._has_filehandle_reducer(blob))
+        unpickler = self.repl._snapshot_unpickler(dill)
+        with self.assertRaisesRegex(
+            pickle.UnpicklingError,
+            f"refusing to reopen raw file descriptor {fd} from a snapshot",
+        ):
+            unpickler(io.BytesIO(blob)).load()
+
     def test_compaction_keeps_recent_data_and_prunes_all_aggregate_overflow(self):
         import math
 

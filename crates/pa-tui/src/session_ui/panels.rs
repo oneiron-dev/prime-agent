@@ -4,13 +4,15 @@
 
 use super::{
     key_event_to_id, mpsc, paused_heartbeat_count, picker_viewport_rows, tray_goal_label,
-    AgentView, BashActivityUpdate, CommandCatalogUpdate, DaemonCommand, DockFocusSource, GoalPanel,
-    HeartbeatsUpdate, InfoContent, InfoPanelAction, KeyEvent, Map, Result, SessionUi, Value,
+    AgentView, BashActivityUpdate, CommandCatalogUpdate, DaemonCommand, DockFocusSource,
+    FactoryUpdate, GoalPanel, HeartbeatsUpdate, InfoContent, InfoPanelAction, KeyEvent, Map,
+    Result, SessionUi, Value,
 };
 
 pub(crate) struct ActivityUpdates {
     pub heartbeats: mpsc::UnboundedSender<HeartbeatsUpdate>,
     pub bash: mpsc::UnboundedSender<BashActivityUpdate>,
+    pub factory: mpsc::UnboundedSender<FactoryUpdate>,
     pub commands: mpsc::UnboundedSender<CommandCatalogUpdate>,
 }
 
@@ -129,6 +131,17 @@ impl SessionUi {
             .iter()
             .filter(|activity| activity.running())
             .count();
+        // The dock's factory indicator counts live runs only — the
+        // view's one liveness rule (`FactoryRunSnapshot::is_live`: a
+        // live state, or children still in flight — a `done` run whose
+        // resident children still run keeps its count like its panel
+        // and its stop control). Fully terminal runs stay as panels
+        // inside the factory page, never in the indicator — the bash
+        // group's running-only scoping, one lane over.
+        let factory_runs = crate::factory_view::parse_factory_runs(&self.factory_graph)
+            .iter()
+            .filter(|run| run.is_live())
+            .count();
         // The dock's subagent count is the live running count only:
         // idle and dead registry rows (passivated children the ledger
         // still seeds) never bloat the indicator — they render in the
@@ -139,6 +152,11 @@ impl SessionUi {
             heartbeats: self.heartbeat_catalog.len(),
             heartbeats_paused: paused_heartbeat_count(&self.heartbeat_catalog),
             bash_running,
+            factory_runs,
+            // The group renders exactly while the daemon advertises the
+            // lane: the factory's opt-in gate (a daemon without the
+            // factory lane never mounts the group).
+            factory_group: self.factory_activity_supported(),
             goal_label,
             selected: self.activity_group,
             focused: self.subagents_focused,
@@ -161,16 +179,13 @@ impl SessionUi {
         }
         match source {
             DockFocusSource::PromptDown => {
-                // TS `SubagentSummaryLine.isSelectable()`: the prompt's
-                // Down is the subagents box's own affordance — subagents
-                // must exist, and the grab selects that group. The dock's
-                // other groups (heartbeats, shells, the goal row) never
-                // take this Down; their shortcut stays
-                // `app.subagents.focus`, so the prompt's arrows keep the
-                // input-history recall in every session shape.
-                if !(self.return_to_agents_view && self.subagent_counts.total > 0) {
-                    return false;
-                }
+                // The prompt's Down always enters the dock, whatever its
+                // counts (the operator's 2026-10-01 consistency ruling: an
+                // all-zero dock, or one with only shells running, must stay
+                // reachable — TS `SubagentSummaryLine.isSelectable()` gated
+                // this on existing subagents, a sanctioned divergence). The
+                // grab lands on the row's first group; Left/Right walk the
+                // rest.
                 self.activity_group = crate::chrome::ActivityGroup::Subagents;
             }
             DockFocusSource::Shortcut => {}
@@ -277,6 +292,10 @@ impl SessionUi {
             crate::chrome::ActivityGroup::Bash => {
                 self.emit_activity_opened("bash");
                 self.open_bash_view(view);
+            }
+            crate::chrome::ActivityGroup::Factory => {
+                self.emit_activity_opened("factory");
+                self.open_factory_page(view);
             }
             crate::chrome::ActivityGroup::Goal => {
                 self.emit_activity_opened("goal");
@@ -390,22 +409,35 @@ impl SessionUi {
     }
 }
 
-/// The retry-episode collapse (SANCTIONED DIVERGENCE from TS, operator
-/// ruling 2026-09-23): pop the trailing failed-attempt error row the
-/// retry supersedes, so the ONE line the episode shows while it runs is
-/// the transient loader (updated in place) and the ONE line it leaves is
-/// the durable outcome row. No-op when the trailing entry is anything
-/// else (an abort row, tool-call-carrying failures, a settled reply).
-pub(crate) fn pop_superseded_attempt_row(view: &mut AgentView) -> bool {
-    if view
-        .chat
-        .last()
-        .is_some_and(crate::snapshot::is_superseded_attempt_row)
-    {
-        view.pop_chat_entry().is_some()
-    } else {
-        false
+/// Supersede only entries owned by the failed assistant generation. A tool
+/// frame can precede its text frame; started cards are never removed. Pop
+/// and restore the affected suffix through the view API to keep its caches
+/// and card indices aligned without rebuilding the committed transcript.
+pub(crate) fn pop_superseded_attempt_row(view: &mut AgentView, rows: &[usize]) -> bool {
+    let removable: std::collections::HashSet<usize> = rows
+        .iter()
+        .copied()
+        .filter(|index| match view.chat.get(*index) {
+            Some(crate::chat::ChatEntry::Assistant(message)) => !message.aborted,
+            Some(crate::chat::ChatEntry::Tool(card)) => card.aborted && !card.started,
+            _ => false,
+        })
+        .collect();
+    let Some(first) = removable.iter().copied().min() else {
+        return false;
+    };
+    let mut retained = Vec::new();
+    while view.chat.len() > first {
+        let index = view.chat.len() - 1;
+        let entry = view.pop_chat_entry().expect("suffix entry");
+        if !removable.contains(&index) {
+            retained.push(entry);
+        }
     }
+    for entry in retained.into_iter().rev() {
+        view.push_entry(entry);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -540,14 +572,14 @@ mod retry_collapse_tests {
             },
             failed_attempt("429 Too many concurrent requests"),
         ]);
-        assert!(pop_superseded_attempt_row(&mut view));
+        assert!(pop_superseded_attempt_row(&mut view, &[1]));
         assert_eq!(view.chat_len(), 1, "only the user row remains");
         // A second pop finds nothing: exactly one row per attempt.
-        assert!(!pop_superseded_attempt_row(&mut view));
+        assert!(!pop_superseded_attempt_row(&mut view, &[]));
 
         // An abort row never pops (aborts are not retried).
         let mut view = view_with(vec![aborted_attempt()]);
-        assert!(!pop_superseded_attempt_row(&mut view));
+        assert!(!pop_superseded_attempt_row(&mut view, &[0]));
 
         // A tool-carrying failure never pops (the cards carry the failure).
         let mut view = view_with(vec![ChatEntry::Assistant(Box::new(
@@ -559,13 +591,49 @@ mod retry_collapse_tests {
                 aborted: false,
             },
         ))]);
-        assert!(!pop_superseded_attempt_row(&mut view));
+        assert!(!pop_superseded_attempt_row(&mut view, &[]));
 
         // A status row (the episode outcome) never pops.
         let mut view = view_with(vec![ChatEntry::Status {
             text: "Recovered after 2 retries: provider down".to_string(),
             kind: StatusKind::Info,
         }]);
-        assert!(!pop_superseded_attempt_row(&mut view));
+        assert!(!pop_superseded_attempt_row(&mut view, &[]));
+    }
+    #[test]
+    fn retry_discards_partial_text_and_uncommitted_cards_but_keeps_committed_tools() {
+        use crate::chat::{MessageBlock, ToolCallCard};
+        let committed = ChatEntry::Tool(Box::new(ToolCallCard {
+            id: "call_once".to_string(),
+            started: true,
+            ..Default::default()
+        }));
+        let partial = ChatEntry::Assistant(Box::new(crate::chat::AssistantMessage {
+            blocks: vec![MessageBlock::Text("failed partial".to_string())],
+            has_tool_calls: false,
+            streaming: false,
+            error: Some("Error: socket closed".to_string()),
+            aborted: false,
+        }));
+        let mut view = view_with(vec![committed.clone(), partial]);
+        assert!(pop_superseded_attempt_row(&mut view, &[1]));
+        assert_eq!(view.chat, vec![committed.clone()]);
+        let partial = ChatEntry::Assistant(Box::new(crate::chat::AssistantMessage {
+            blocks: vec![MessageBlock::Text("uncommitted tool text".to_string())],
+            has_tool_calls: true,
+            streaming: false,
+            error: None,
+            aborted: false,
+        }));
+        let cut = ChatEntry::Tool(Box::new(ToolCallCard {
+            id: "call_cut".to_string(),
+            aborted: true,
+            started: false,
+            ..Default::default()
+        }));
+        let mut view = view_with(vec![committed.clone(), partial, cut]);
+        assert!(pop_superseded_attempt_row(&mut view, &[1, 2]));
+        assert_eq!(view.chat, vec![committed]);
+        assert!(!pop_superseded_attempt_row(&mut view, &[]));
     }
 }

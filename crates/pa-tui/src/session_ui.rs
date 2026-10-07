@@ -7,6 +7,7 @@ mod apply;
 mod auth;
 mod bash;
 mod commands;
+mod factory;
 mod heartbeats;
 mod keys;
 mod lifecycle;
@@ -24,8 +25,13 @@ pub(crate) use apply::CompactionAbortNote;
 use auth::{McpAuthIntent, PendingModelSignIn, SetModelOutcome};
 pub(crate) use bash::BashActivityUpdate;
 use bash::{ResyncBash, SideBashRun};
+pub(crate) use factory::FactoryUpdate;
 use heartbeats::paused_heartbeat_count;
 pub(crate) use heartbeats::HeartbeatsUpdate;
+/// The opening phase's echo gate (run.rs): the fresh-state projection of
+/// `handle_key`'s keymap-aware ladder — a claimed key queues behind the
+/// session open instead of echoing into the editor.
+pub(crate) use keys::opening_echo_key_claimed;
 use keys::SelectionAutoScroll;
 pub(crate) use model_picker::picker_viewport_rows;
 pub(crate) use model_picker::ModelCatalogUpdate;
@@ -222,9 +228,19 @@ pub(crate) struct SessionUi {
     /// The client-process settings seam (`/settings`, `/fullscreen`);
     /// the composition root supplies it.
     client_settings: Option<std::sync::Arc<dyn crate::client_settings::ClientSettings>>,
-    /// The ban-risk warning's once-per-session gate (TS
-    /// `anthropicSubscriptionWarningShown`).
+    /// The ban-risk warning's view-local dedup (TS
+    /// `anthropicSubscriptionWarningShown`): this VIEW's own
+    /// once-per-instance gate. The once-per-SESSION-lifecycle gate (the
+    /// operator 2026-09-29 fix for the every-open re-warn) is the
+    /// daemon-side marker read through `get_state` — see
+    /// [`Self::anthropic_warning_already_shown`] and
+    /// [`Self::mark_anthropic_warning_shown`].
     anthropic_subscription_warning_shown: bool,
+    /// The in-flight `mark_anthropic_warning_shown` fire-and-forget: set
+    /// when the mark task is spawned, cleared by the task itself at its
+    /// end (ack, error, or bound) — the headless exit gate reads it so a
+    /// scripted run never ends with the durable write still in flight.
+    anthropic_warning_mark_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The side-question run currently streaming (TS `activeSideQuestionId`):
     /// at most one run per client, exactly like the daemon enforces.
     active_side_question_id: Option<String>,
@@ -307,6 +323,8 @@ pub(crate) struct SessionUi {
     pub(crate) steering_mode: String,
     /// The chat index of the assistant message still streaming.
     streaming_index: Option<usize>,
+    /// Entries owned by the failed assistant generation, independent of arrival order.
+    failed_attempt_rows: Vec<usize>,
     /// The loader's token accounting (TS `AgentActivityTracker`), reported
     /// monotonically within a run.
     working_tokens: LoaderTokenTracker,
@@ -404,6 +422,32 @@ pub(crate) struct SessionUi {
     /// response from an older request must not repaint a newer snapshot.
     bash_list_epoch: u64,
     bash_updates: mpsc::UnboundedSender<BashActivityUpdate>,
+    /// The last `factory_activity` graph reply (the dock count's cache and
+    /// the page open's mount, the `bash_activities` pattern): the
+    /// always-on 2s poll keeps it current whether or not the page is
+    /// open.
+    factory_graph: serde_json::Value,
+    /// The durable session id the open `/factory` view was mounted on: the
+    /// rebind fold keeps the view across a same-session reattach (`Unknown
+    /// active session` recovery) and closes it only when a different
+    /// session actually takes the view's place.
+    factory_view_session: Option<String>,
+    /// Whether one factory refresh is still in flight (the heartbeat
+    /// refresh's serialization: the tick is only a cadence floor, so it
+    /// queues behind the in-flight cycle instead of minting a newer epoch
+    /// the in-flight reply could never match).
+    factory_refresh_in_flight: bool,
+    /// A tick that fired while a refresh was in flight: the fold launches
+    /// this trailing refresh once the in-flight cycle delivers.
+    factory_refresh_queued: bool,
+    /// Monotonic id of the latest issued factory refresh; an older
+    /// response never repaints a newer snapshot.
+    factory_list_epoch: u64,
+    /// Where background factory refreshes deliver the run graph (the run
+    /// loop folds them into the open view).
+    factory_updates: mpsc::UnboundedSender<FactoryUpdate>,
+    /// The open view's selected run id: the refresh's watch target.
+    factory_selected_run: Option<String>,
     /// The subagent summary line holds keyboard focus.
     subagents_focused: bool,
     activity_group: crate::chrome::ActivityGroup,
@@ -463,8 +507,7 @@ pub(crate) struct SessionUi {
     /// A succeeded compaction replaced the durable transcript (TS
     /// `rebuildChatFromMessages`): the next loop pass re-fetches it.
     pub(crate) transcript_stale: bool,
-    /// Adoption telemetry (`tui scroll used` / `tui exit`); `None` drops
-    /// events.
+    /// Adoption telemetry (counted into `tui exit`); `None` drops events.
     pub(crate) telemetry: Option<std::sync::Arc<dyn crate::interactive::InteractionTelemetry>>,
     /// Whether this run already reported its first scroll action.
     scroll_adoption_emitted: bool,
@@ -613,11 +656,11 @@ pub(crate) enum RebuildKind {
 
 /// Where a compact-dock focus hand-off comes from (TS
 /// `focusSubagentSummary`, shared by `app.subagents.focus` and the
-/// editor's move-below-prompt hook): the selectability gate differs per
+/// editor's move-below-prompt hook): the landing group differs per
 /// caller.
 enum DockFocusSource {
     /// The editor's Down at the prompt's end (TS `onMoveBelowPrompt`
-    /// -> `focusSubagentSummary`): the subagents box's affordance.
+    /// -> `focusSubagentSummary`): lands on the subagents group.
     PromptDown,
     /// The `app.subagents.focus` key: any rendered dock group.
     Shortcut,

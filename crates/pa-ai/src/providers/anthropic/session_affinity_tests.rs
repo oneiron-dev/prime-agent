@@ -327,7 +327,7 @@ const TS_ONLY_COPILOT_HEADERS: [&str; 3] =
 /// overrides of the client's own version and auth headers, and for the
 /// conversation-marker shapes (a final image, two final text blocks,
 /// grouped tool results, a final assistant turn). The transport's own
-/// framing (`host`, `content-length`, `accept-encoding`) is not compared.
+/// framing and SDK `content-type` are excluded by the TS capture driver.
 #[tokio::test]
 async fn ts_capture_parity() {
     let cases: Vec<ParityCase> = serde_json::from_str(TS_CAPTURE).unwrap();
@@ -343,7 +343,10 @@ async fn ts_capture_parity() {
             .headers
             .into_iter()
             .filter(|(name, _)| {
-                !matches!(name.as_str(), "host" | "content-length" | "accept-encoding")
+                !matches!(
+                    name.as_str(),
+                    "host" | "content-length" | "accept-encoding" | "content-type"
+                )
             })
             .collect();
         rust_headers.sort();

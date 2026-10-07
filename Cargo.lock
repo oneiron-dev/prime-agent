@@ -1336,6 +1336,7 @@ dependencies = [
  "pa-models",
  "pa-telemetry",
  "pa-types",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",
@@ -1371,6 +1372,7 @@ version = "0.9.8"
 dependencies = [
  "anyhow",
  "reqwest",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",

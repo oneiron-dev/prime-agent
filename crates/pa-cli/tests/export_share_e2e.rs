@@ -37,8 +37,8 @@ struct Supervisor {
 
 impl Drop for Supervisor {
     fn drop(&mut self) {
-        graceful_shutdown(&self.socket);
         let worker_pids = child_pids_of(self.child.id());
+        graceful_shutdown(&self.socket);
         let _ = self.child.kill();
         let _ = self.child.wait();
         for pid in worker_pids {
@@ -49,9 +49,8 @@ impl Drop for Supervisor {
 }
 
 fn kill_worker(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
+    let _ =
+        pa_core::platform::process::kill_pid(pid as i32, pa_core::platform::process::Signal::Kill);
     let deadline = Instant::now() + Duration::from_secs(5);
     while process_alive(pid) {
         assert!(
@@ -62,6 +61,7 @@ fn kill_worker(pid: u32) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn process_alive(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
         let rest = stat
@@ -72,6 +72,22 @@ fn process_alive(pid: u32) -> bool {
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+fn process_alive(pid: u32) -> bool {
+    if !pa_core::platform::process::pid_exists(pid) {
+        return false;
+    }
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .expect("query the owned worker state");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .is_some_and(|state| !state.starts_with('Z') && !state.starts_with('X'))
+}
+
+#[cfg(target_os = "linux")]
 fn child_pids_of(ppid: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     let entries = std::fs::read_dir("/proc").expect("read /proc");
@@ -95,6 +111,24 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
         }
     }
     pids
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_pids_of(ppid: u32) -> Vec<u32> {
+    let output = Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .expect("query the spawned supervisor's children");
+    assert!(output.status.success(), "the native PID/PPID query failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let child = fields.next()?.parse::<u32>().ok()?;
+            let parent = fields.next()?.parse::<u32>().ok()?;
+            (parent == ppid).then_some(child)
+        })
+        .collect()
 }
 
 fn graceful_shutdown(socket: &Path) {

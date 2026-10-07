@@ -10,6 +10,7 @@ use std::sync::Arc;
 use pa_agent::agent::{Agent, AgentInitialState, AgentOptions};
 use pa_agent::stream::StreamFn;
 use pa_agent::types::{Model, ThinkingLevel};
+use pa_telemetry::base_properties;
 
 use crate::resources::{
     load_resources, ResourceDiscovery, ResourceLoaderOptions, ResourceLoadingPolicy,
@@ -17,9 +18,13 @@ use crate::resources::{
 use crate::session::manager::SessionManager;
 use crate::skills::PromptTemplate;
 
-use pa_telemetry::base_properties;
-
 use super::{AgentSession, PromptOptions, PromptOutcome};
+
+/// The background MCP settle's per-server open bound (the kernel's
+/// `mcp_status` listing opens each not-yet-connected server bounded per
+/// server; the settle is off every user-visible path, so the bound only
+/// keeps the background task from outliving a wedged server forever).
+const MCP_SETTLE_PER_SERVER_TIMEOUT_MS: u64 = 10_000;
 
 /// Everything needed to assemble a session.
 #[derive(Default)]
@@ -88,7 +93,7 @@ pub struct SessionEngineConfig {
     /// The full registry model (input modalities for `model.info`); the
     /// engine derives minimal facts from `model` when absent.
     pub model_info: Option<pa_types::ai::Model>,
-    /// Session telemetry wiring (`PostHog` client + execution mode). `None`
+    /// Session telemetry wiring (the telemetry client + execution mode). `None`
     /// (opt-out) installs nothing; non-depth-0 sessions never install.
     pub telemetry: Option<super::telemetry::TelemetryWiring>,
     /// The embedding's queued-goal-context purge (TS
@@ -142,6 +147,13 @@ pub struct SessionEngineConfig {
     /// the daemon worker stays `None` because its turn dispatch owns
     /// routing (its queued lanes re-dispatch every batch).
     pub image_model_router: Option<super::image_model_routing::ImageModelRouter>,
+    /// The session's semantic-edge identity (TS
+    /// `semanticEdgeLedgerPath` + `semanticParentSessionId` +
+    /// `semanticSpawnedByRequestId`): the recorder's ledger location and
+    /// spawn provenance. `None` keeps the session off the ledger (no
+    /// request ids on the wire).
+    pub semantic_edges: Option<super::semantic_edges::SemanticEdgeIdentity>,
+    pub on_late_sent_agent_message: Option<crate::tools::ipython::LateSentAgentMessageHandler>,
 }
 
 /// How a session prepares its kernel at creation
@@ -200,6 +212,11 @@ pub struct SessionEngine {
     /// the child-observation sink (the daemon children registry) onto it
     /// after the build.
     pub rlm_usage: std::sync::Arc<super::rlm_usage::RlmChildUsageAttributions>,
+    /// The factory host bridge (`/factory` view lane): the daemon/TUI
+    /// request surface over the kernel's factory runs, built from the
+    /// session facts captured in `create_session` (the #3184 capture
+    /// pattern) and reached through [`SessionEngine::factory_activity`].
+    pub factory_host: super::factory_host::FactoryHost,
     /// The session's kernel provisioner. The engine is the STRONG owner on
     /// purpose: the `ipython` tool on the agent and the compaction
     /// kernel-state probe on the session hold weak references, because the
@@ -313,6 +330,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // system prompt's memory line.
     let kernel_memory_limit_gb = settings.get_kernel_memory_limit_gb();
     let kernel_memory_backstop = settings.get_kernel_memory_backstop();
+    // Captured before `settings` moves into the resource loader: the
+    // factory host bridge's preflight facts (the daemon `allowedModels`
+    // pin), like the request-timing snapshot above.
+    let factory_allowed_models = settings.get_allowed_models();
     let (mcp_skill_overrides, mcp_generic_servers, built_manager) =
         mcp_gating(&settings, config.agent_dir.clone()).await?;
     let mcp_manager = config
@@ -380,26 +401,35 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     if let Some(extra) = config.extra_host_handlers.clone() {
         handlers.merge(extra);
     }
+    // Per-session counters (MCP connector use, kernel boots, skills, RLM
+    // child usage, feature outcomes) ride `agent session ended`; the seams
+    // below count into them instead of emitting their own events.
+    let session_counters = std::sync::Arc::new(super::telemetry::SessionCounters::default());
+    // The counters gate from the very creation: the MCP and kernel setup
+    // below starts counting (prewarm boots, connector use) long before
+    // the first turn installs the session telemetry, so an off switch
+    // must already be live — otherwise the pre-install window records
+    // what a later enable would send.
+    if let Some(telemetry_switch) = config
+        .telemetry
+        .as_ref()
+        .and_then(|telemetry| telemetry.telemetry_enabled.as_ref())
+    {
+        session_counters.set_telemetry_enabled(telemetry_switch.enabled.clone());
+    }
     // The `mcp.*` host requests (config/refresh/begin_login) the kernel's
     // generic MCP registry sends while listing or calling generic servers.
-    // Telemetry reports connector usage (server name + action only) when the
+    // Telemetry counts connector use (never the server name) when the
     // session is telemetry-enabled; set before the handlers register so
     // their closures capture the reporter.
-    {
-        let mut manager = mcp_manager.lock().unwrap();
-        if let Some(wiring) = &config.telemetry {
-            let client = wiring.client.clone();
-            let execution_mode = wiring
-                .execution_mode
-                .clone()
-                .unwrap_or_else(|| super::telemetry::EXECUTION_MODE_UNKNOWN.to_string());
-            manager.set_usage_report(Some(std::sync::Arc::new(move |action, server| {
-                let mut properties = base_properties(&execution_mode);
-                properties.set("action", serde_json::Value::from(action));
-                properties.set("server_name", serde_json::Value::from(server));
-                client.track("mcp connector used", properties);
+    if config.telemetry.is_some() {
+        let counters = std::sync::Arc::clone(&session_counters);
+        mcp_manager
+            .lock()
+            .unwrap()
+            .set_usage_report(Some(std::sync::Arc::new(move |_action, _server| {
+                counters.note_mcp_connector_use();
             })));
-        }
     }
     // The `mcp.*` host-request registration takes the shared manager: the
     // inventory handlers (list_plugins/search_plugins/list_connections)
@@ -442,27 +472,20 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     if auto_refine_allowed {
         turn_boundary.register_refine_handlers(&mut handlers);
     }
-    // `kernel bootstrap` telemetry: the provisioner reports every actual
-    // boot (duration, cold/revived, outcome) through the session's client.
-    let on_bootstrap_result = config.telemetry.as_ref().map(|wiring| {
-        let client = wiring.client.clone();
-        let execution_mode = wiring
-            .execution_mode
-            .clone()
-            .unwrap_or_else(|| super::telemetry::EXECUTION_MODE_UNKNOWN.to_string());
+    // Kernel boots (duration, cold/revived, outcome) count into the
+    // session counters.
+    let on_bootstrap_result = config.telemetry.as_ref().map(|_| {
+        let counters = std::sync::Arc::clone(&session_counters);
         std::sync::Arc::new(
             move |stats: crate::kernel::provisioner::KernelBootstrapStats| {
-                let mut properties = base_properties(&execution_mode);
-                properties.set("cold", serde_json::Value::from(stats.cold));
-                properties.set(
-                    "outcome",
-                    serde_json::Value::from(match stats.outcome {
-                        crate::kernel::provisioner::KernelBootstrapOutcome::Ready => "success",
-                        crate::kernel::provisioner::KernelBootstrapOutcome::Error => "error",
-                    }),
+                counters.note_kernel_bootstrap(
+                    stats.cold,
+                    matches!(
+                        stats.outcome,
+                        crate::kernel::provisioner::KernelBootstrapOutcome::Ready
+                    ),
+                    stats.duration_ms,
                 );
-                properties.set("duration_ms", serde_json::Value::from(stats.duration_ms));
-                client.track("kernel bootstrap", properties);
             },
         ) as crate::kernel::provisioner::KernelBootstrapResultHandler
     });
@@ -593,6 +616,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                 super::runtime_wiring::ipython_tool_options(
                     provisioner.clone(),
                     kernel_memory_limit_gb,
+                    config.on_late_sent_agent_message.clone(),
                 ),
             ),
         ),
@@ -639,6 +663,29 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             }
             (Some(KernelPrewarm::Background), _) | (None, true) => provisioner.prewarm(),
             (None, false) => {}
+        }
+        if provisioner.start_requests() > 0 {
+            // The MCP settle rides the same background posture (the
+            // parallel-startup rule: nothing user-visible waits on the MCP
+            // spawn/settle; the join point is first use): once the kernel is
+            // up, the configured generic servers open in the background via
+            // the bounded `mcp_status` listing the connections view uses, so
+            // tool discovery is warm by the first turn. A tool call or
+            // listing that arrives first is never raced to an error — the
+            // runtime's registry serializes per-server opens on its lock and
+            // then reuses the open connection, so the earliest user of a
+            // server joins the settle's in-flight open and succeeds.
+            let settle_servers = generic_mcp_servers.clone();
+            let settle_provisioner = provisioner.clone();
+            tokio::spawn(async move {
+                if settle_provisioner.ensure(None, None).await.is_ok() {
+                    if let Some(manager) = settle_provisioner.manager() {
+                        let _ = manager
+                            .mcp_tool_listing(&settle_servers, MCP_SETTLE_PER_SERVER_TIMEOUT_MS)
+                            .await;
+                    }
+                }
+            });
         }
     }
 
@@ -694,6 +741,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         },
     );
 
+    // Captured before the digest context moves the local harness dir and
+    // the loop wiring moves the session model: the factory host bridge's
+    // config (the #3184 capture pattern).
+    let factory_local_harness_dir = local_harness_dir.clone();
+    let factory_session_model = Some(model.clone());
     // Harness digest inputs: global state from the agent dir, local state
     // from the session artifacts (or the daemon-owned conversation log), and
     // the interfaces the digest may reference.
@@ -774,6 +826,25 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // the session telemetry installed below.
     let transport_adoption =
         std::sync::Arc::new(super::transport_adoption::TransportAdoption::default());
+    // Semantic edges (TS `semantic-edges.ts`): the recorder opens this
+    // session's request-id ledger, and its stream wrapper goes OUTERMOST
+    // over the timing-instrumented fn (TS `sdk.ts` instruments first, the
+    // `AgentSession` constructor wraps semantic edges over it). The side
+    // question keeps the pre-semantic fn, so its calls carry no id.
+    let timing_stream_fn = super::request_timing::instrument_stream_fn(
+        std::sync::Arc::clone(&request_timing_wiring),
+        transport_adoption.instrument(stream_fn),
+    );
+    let side_question_stream_fn = std::sync::Arc::clone(&timing_stream_fn);
+    let semantic_recorder = config.semantic_edges.take().map(|identity| {
+        std::sync::Arc::new(super::semantic_edges::SemanticEdgeRecorder::open(identity))
+    });
+    let agent_stream_fn = match &semantic_recorder {
+        Some(recorder) => {
+            super::semantic_edges::wrap_stream_fn(std::sync::Arc::clone(recorder), timing_stream_fn)
+        }
+        None => timing_stream_fn,
+    };
     let agent = Agent::new(AgentOptions {
         initial_state: AgentInitialState {
             system_prompt: Some(system_prompt.clone()),
@@ -782,10 +853,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             tools: Some(tools),
             messages: initial_messages,
         },
-        stream_fn: Some(super::request_timing::instrument_stream_fn(
-            std::sync::Arc::clone(&request_timing_wiring),
-            transport_adoption.instrument(stream_fn),
-        )),
+        stream_fn: Some(agent_stream_fn),
         // The session conversion rules apply at the loop's LLM boundary
         // (TS `convertToLlm`): bookkeeping custom rows drop, everything
         // else (the harness digest included) becomes a user turn.
@@ -827,6 +895,19 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     });
 
     let agent = Arc::new(agent);
+    // TS `_startRlmChildRun`'s spawn anchor: the `rlm.spawn` host handler
+    // names the parent's in-flight turn through this weak seam (the
+    // bridge is built before the agent exists, and a strong edge would
+    // cycle the bridge -> agent -> kernel -> bridge graph).
+    if let Some(recorder) = &semantic_recorder {
+        let _ = wiring
+            .rlm
+            .semantic_spawn
+            .set(super::rlm_host::SemanticSpawnAnchor {
+                agent: Arc::downgrade(&agent),
+                recorder: std::sync::Arc::clone(recorder),
+            });
+    }
     let telemetry_agent = std::sync::Arc::clone(&agent);
     let mut session = AgentSession::from_session_arc(
         agent.clone(),
@@ -836,6 +917,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     )
     .await?;
     session.set_auto_refine(auto_refine_allowed, auto_refine_gates);
+    session.set_agent_dir(config.agent_dir.clone());
     // Every compaction path reads the session's resolved compaction
     // settings (TS `getCompactionSettings`): `/compact` matches the
     // `compact.*` turn-boundary tool's `keepRecentTokens`/`reserveTokens`.
@@ -882,6 +964,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // The embedding's image-model routing seam (the headless surfaces
     // install theirs; the daemon worker's turn dispatch owns routing).
     session.set_image_model_router(config.image_model_router.clone());
+    // The semantic-edge handoff: the daemon's child registry and retry
+    // park read the recorder; the side question keeps the pre-semantic
+    // fn so its calls carry no id.
+    session.set_semantic_edges(semantic_recorder);
+    session.set_side_question_stream_fn(side_question_stream_fn);
     // The armed image route never outlives the run that armed it (TS
     // `_clearModelOverrideWhenIdle`: the override drops once the turn is
     // idle, so a picker switch between turns is live immediately — the
@@ -944,6 +1031,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                 &telemetry_agent,
                 &wiring,
                 Some(skill_counts),
+                std::sync::Arc::clone(&session_counters),
             )
             .await?;
             Some(std::sync::Arc::new(installed))
@@ -951,13 +1039,13 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         _ => None,
     };
 
-    // The `skill used` adoption event reports through the session's
+    // The `skill_use_count` session counter counts through the session's
     // telemetry handle (installed once the telemetry composition decided
     // whether this session reports at all).
     if let Some(telemetry) = telemetry.as_ref() {
         session.set_skill_telemetry(telemetry.clone());
-        // Same lifetime for the `rlm child usage attributed` adoption
-        // event: the producer's flush reports through this handle.
+        // Same lifetime for the `rlm_child_*` session counters: the
+        // producer's flush counts through this handle.
         wiring.rlm_usage.set_telemetry(telemetry.clone());
         transport_adoption.set_telemetry(telemetry.clone());
         // `provider session affinity configured`: the assembly-time model
@@ -967,6 +1055,20 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         }
     }
     let goal_driver = wiring.runtime.goal_driver().clone();
+    // The factory host bridge: registered from `create_session` (the #3184
+    // pattern), so the daemon/TUI factory surface resolves against this
+    // session's harness dirs, model registry, and the allowlist pin. The
+    // kernel owns the runs; the bridge prefights and tunnels. Captured
+    // before the loop wiring moves the session model and the digest moves
+    // the local harness dir.
+    let factory_host =
+        super::factory_host::FactoryHost::new(super::factory_host::FactoryHostConfig {
+            agent_dir: config.agent_dir.clone(),
+            global_harness_dir: crate::refinement::get_global_harness_state_dir(&config.agent_dir),
+            local_harness_dir: factory_local_harness_dir,
+            session_model: factory_session_model,
+            allowed_models: factory_allowed_models,
+        });
     Ok(SessionEngine {
         session,
         skills: resources.skills,
@@ -980,6 +1082,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         turn_boundary,
         telemetry,
         rlm_usage: wiring.rlm_usage,
+        factory_host,
         provisioner,
         provider_session_id,
     })
@@ -1026,8 +1129,8 @@ impl SessionEngine {
     /// the accepted-turn row (TS `_expandSkillCommand`; the row the daemon
     /// emits before admission must match the text the model turn
     /// receives). Non-skill inputs pass through unchanged; the admitted
-    /// turn's own expansion is idempotent over the block. The `skill used`
-    /// adoption event reports from the admission, not here.
+    /// turn's own expansion is idempotent over the block. The
+    /// `skill_use_count` counter counts at the admission, not here.
     pub fn expand_skill_submission(&self, text: &str) -> String {
         crate::skills::expand_skill_command(text, &self.skills).0
     }
@@ -1104,6 +1207,59 @@ impl SessionEngine {
                 drain_host_requests: true,
             }))
             .await;
+    }
+
+    /// One factory activity over this session's live kernel: the `/factory`
+    /// view's bridge lane (graph/status/watch/run/stop/resume). A `run`
+    /// prefights the spec's declared models first (allowlist pin, request
+    /// auth) so a doomed run fails before any child spawns; then the
+    /// out-of-band frame carries the request into the kernel's executor,
+    /// which owns the run registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the arguments are invalid, the preflight
+    /// fails, the session has no running kernel, or the kernel request
+    /// fails or does not settle.
+    pub async fn factory_activity(
+        &self,
+        action: &str,
+        run_id: Option<&str>,
+        spec_id: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let request = super::factory_host::FactoryActivityRequest::parse(
+            action, run_id, spec_id, timeout_ms,
+        )?;
+        if request.action == "run" {
+            let spec_id = request
+                .spec_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("factory activity run requires specId"))?;
+            // The preflight reads the harness states, the model catalog,
+            // and the auth caches from disk — blocking work off the
+            // executor (the daemon's established settings-read posture:
+            // `spawn_blocking`, never the async lane), so a stalled
+            // filesystem can never stall the worker's other activity.
+            let host = self.factory_host.clone();
+            let spec_id = spec_id.to_string();
+            let preflight = tokio::task::spawn_blocking(move || host.preflight_run(&spec_id))
+                .await
+                .map_err(|join| anyhow::anyhow!("factory run preflight join failed: {join}"))?;
+            preflight?;
+        }
+        let manager = self
+            .provisioner
+            .manager()
+            .ok_or_else(|| anyhow::anyhow!("Kernel is not running"))?;
+        manager
+            .factory_activity(
+                request.action,
+                request.run_id.as_deref(),
+                request.spec_id.as_deref(),
+                request.timeout_ms,
+            )
+            .await
     }
 
     /// Out-of-band kernel bash activity, scoped to this session's live kernel.

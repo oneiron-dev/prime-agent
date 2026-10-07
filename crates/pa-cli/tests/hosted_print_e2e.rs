@@ -119,7 +119,24 @@ impl Sandbox {
     /// is off.
     fn online_command(&self, args: &[&str]) -> Command {
         let mut command = self.command(args);
-        command.env_remove("PI_OFFLINE").env("DO_NOT_TRACK", "1");
+        // The gate prepares this interpreter before testing. A fresh sandbox
+        // HOME must not trigger network bootstrap behind the dead proxy.
+        let kernel_python = std::env::var_os("PA_E2E_KERNEL_PYTHON").map_or_else(
+            || {
+                PathBuf::from(std::env::var_os("HOME").expect("gate HOME"))
+                    .join(".prime/agent/kernel-venv/bin/python")
+            },
+            PathBuf::from,
+        );
+        assert!(
+            kernel_python.is_file(),
+            "prepare the test kernel with --prime-agent-bootstrap or set PA_E2E_KERNEL_PYTHON: {}",
+            kernel_python.display()
+        );
+        command
+            .env("PRIME_AGENT_KERNEL_PYTHON", kernel_python)
+            .env_remove("PI_OFFLINE")
+            .env("DO_NOT_TRACK", "1");
         for proxy in [
             "HTTPS_PROXY",
             "https_proxy",
@@ -427,7 +444,7 @@ impl Drop for Sandbox {
         let supervisor = serde_json::from_str::<Value>(&hello)
             .ok()
             .and_then(|hello| hello["supervisorPid"].as_u64())
-            .and_then(|pid| pa_core::platform::process::open_pidfd(pid as u32));
+            .and_then(|pid| pa_core::platform::process::open_pidfd(pid as u32).ok());
         let shutdown = json!({
             "type": "command",
             "id": "sandbox-shutdown",

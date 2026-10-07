@@ -17,7 +17,7 @@ use super::config_options::{
     config_options_value, model_value, publish_config_options, session_config_options, PickerModel,
     SessionConfigOption,
 };
-use super::daemon::{DaemonAcpState, REQUEST_TIMEOUT, TURN_TIMEOUT};
+use super::daemon::{DaemonAcpState, REQUEST_TIMEOUT};
 use super::jsonrpc;
 use super::producer::{self, UpdateProducer};
 use super::types;
@@ -76,7 +76,7 @@ pub(super) async fn handle_set_config_option(
     // `sessionCloseInFlight`).
     let live = {
         let guard = state.lock().await;
-        !guard.session_close_in_flight
+        guard.session_close_done.is_none()
             && guard
                 .session
                 .as_ref()
@@ -198,7 +198,7 @@ async fn apply_wire_config(
                         model_id: model.id.clone(),
                         rest: Map::default(),
                     },
-                    TURN_TIMEOUT,
+                    REQUEST_TIMEOUT,
                 )
                 .await
                 .map_err(|error| WireConfigError::internal(error.to_string()))?;
@@ -258,7 +258,7 @@ async fn apply_wire_config(
                         level: value.to_string(),
                         rest: Map::default(),
                     },
-                    TURN_TIMEOUT,
+                    REQUEST_TIMEOUT,
                 )
                 .await
                 .map_err(|error| WireConfigError::internal(error.to_string()))?;

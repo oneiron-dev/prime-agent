@@ -47,6 +47,7 @@ use super::provider_retry::{
     is_unsupported_tool_failure, jittered_delay_ms, provider_retry_delay,
     provider_stream_failure_kind, provider_stream_failure_retry_after_ms,
     provider_stream_failure_status, retry_jitter_rand01, ProviderRetryDelay, ProviderRetryPolicy,
+    TRANSPORT_MAX_RETRIES, TRANSPORT_RETRY_DELAYS_MS,
 };
 
 /// The provider-failover policy: per-provider retry budget and backoff
@@ -192,10 +193,31 @@ where
     loop {
         let retries_before_attempt = episode.retries();
         let message = attempt().await?;
+        if message.stop_reason == StopReason::Aborted
+            || (message.stop_reason == StopReason::Error
+                && signal.is_some_and(AbortSignal::is_aborted))
+        {
+            let connection_reset = episode.has_connection_reset();
+            let retries = episode.take();
+            if switched {
+                let _ = restore().await?;
+            }
+            if retries > 0 || connection_reset {
+                emit(AutoRetryEvent::End {
+                    success: false,
+                    attempt: retries,
+                    final_error: Some("Retry cancelled".to_string()),
+                    restored_model: None,
+                })
+                .await?;
+            }
+            return Ok(with_stop_reason_aborted(message));
+        }
         if message.stop_reason != StopReason::Error {
             // An episode the host already closed at a successful message
             // inside this attempt reads zero: no second end. A switched
             // episode closes here, with the restore.
+            let connection_reset = episode.has_connection_reset();
             let total_retries = if switched {
                 episode.take_for_restore()
             } else {
@@ -210,7 +232,7 @@ where
                     restored_model,
                 })
                 .await?;
-            } else if total_retries > 0 {
+            } else if total_retries > 0 || connection_reset {
                 emit(AutoRetryEvent::End {
                     success: true,
                     attempt: total_retries,
@@ -221,12 +243,6 @@ where
             }
             return Ok(message);
         }
-        if signal.is_some_and(AbortSignal::is_aborted) {
-            if switched {
-                let _ = restore().await?;
-            }
-            return Ok(with_stop_reason_aborted(message));
-        }
         // A successful message inside this attempt closed the episode (the
         // host's reset, only before a provider switch): this provider's
         // budget starts over with it.
@@ -234,10 +250,43 @@ where
         if total_retries < retries_before_attempt {
             retries_on_provider = 0;
         }
+        if provider_stream_failure_kind(&message).as_deref() == Some("connection_limit")
+            && quick_policy.enabled
+            && episode.try_refresh_connection()
+        {
+            emit(AutoRetryEvent::Start {
+                attempt: 1,
+                max_attempts: 1,
+                delay_ms: 0,
+                error_message: final_error_of(&message),
+                reason: RetryStartReason::ConnectionReset,
+            })
+            .await?;
+            // The zero-delay wait still consults the host's cancellation probe.
+            if signal.is_some_and(AbortSignal::is_aborted)
+                || !wait(std::time::Duration::ZERO).await
+                || signal.is_some_and(AbortSignal::is_aborted)
+            {
+                if switched {
+                    let _ = restore().await?;
+                }
+                emit(AutoRetryEvent::End {
+                    success: false,
+                    attempt: episode.take(),
+                    final_error: Some("Retry cancelled".to_string()),
+                    restored_model: None,
+                })
+                .await?;
+                return Ok(with_stop_reason_aborted(message));
+            }
+            continue;
+        }
         // Permanent and deterministic failures never walk the chain: a
         // rejected request fails the same way on every provider, and
         // lifecycle/faux failures are not provider failures at all.
-        let non_retryable = is_agent_lifecycle_failure(&message)
+        let transport = episode.constrain_transport(&message);
+        let non_retryable = (transport && !quick_policy.enabled)
+            || is_agent_lifecycle_failure(&message)
             || is_faux_provider_queue_exhausted(&message)
             // A context overflow fails identically on every provider (TS
             // `_isRetryableError`): the compact-and-retry recovery owns it.
@@ -278,7 +327,12 @@ where
         // a long candidate chain gives up here instead of stacking one
         // per-provider budget after another into the ~30 attempts the
         // operator ruled too many.
-        if total_retries > MAX_TOTAL_PROVIDER_RETRIES {
+        let retry_ceiling = if transport {
+            TRANSPORT_MAX_RETRIES
+        } else {
+            MAX_TOTAL_PROVIDER_RETRIES
+        };
+        if total_retries > retry_ceiling {
             if switched {
                 let _ = restore().await?;
             }
@@ -291,7 +345,7 @@ where
             .await?;
             return Ok(message);
         }
-        if retries_on_provider > failover.max_retries {
+        if !transport && retries_on_provider > failover.max_retries {
             // This provider's budget is spent: walk to the next provider
             // serving the same model, or surface the failure.
             let Some(next) = candidates.get(candidate_index) else {
@@ -328,23 +382,38 @@ where
             .await?;
             continue;
         }
-        let delay = failover_retry_delay(
-            retries_on_provider,
-            provider_stream_failure_retry_after_ms(&message),
-            failover,
-            quick_policy.max_retry_delay_ms,
-        );
+        let delay = if transport {
+            ProviderRetryDelay::Wait {
+                delay_ms: TRANSPORT_RETRY_DELAYS_MS
+                    .get(total_retries.saturating_sub(1) as usize)
+                    .copied()
+                    .unwrap_or(0),
+            }
+        } else {
+            failover_retry_delay(
+                retries_on_provider,
+                provider_stream_failure_retry_after_ms(&message),
+                failover,
+                quick_policy.max_retry_delay_ms,
+            )
+        };
         let delay_ms = match delay {
             // Jittered (operator ruling 2026-09-23; the fork TS
             // `providerRetryDelay` rule: ±25%, floored at the server wait):
             // the jittered value is both waited and reported, so the
             // interactive countdown stays honest while retried sessions
             // spread off the same ladder ticks.
-            ProviderRetryDelay::Wait { delay_ms } => jittered_delay_ms(
-                delay_ms,
-                provider_stream_failure_retry_after_ms(&message),
-                retry_jitter_rand01(),
-            ),
+            ProviderRetryDelay::Wait { delay_ms } => {
+                if transport {
+                    delay_ms
+                } else {
+                    jittered_delay_ms(
+                        delay_ms,
+                        provider_stream_failure_retry_after_ms(&message),
+                        retry_jitter_rand01(),
+                    )
+                }
+            }
             ProviderRetryDelay::ExceedsCap { retry_after_ms } => {
                 if switched {
                     let _ = restore().await?;
@@ -388,14 +457,25 @@ where
             }
         };
         emit(AutoRetryEvent::Start {
-            attempt: retries_on_provider,
-            max_attempts: failover.max_retries,
+            attempt: if transport {
+                total_retries
+            } else {
+                retries_on_provider
+            },
+            max_attempts: if transport {
+                TRANSPORT_MAX_RETRIES
+            } else {
+                failover.max_retries
+            },
             delay_ms,
             error_message: final_error_of(&message),
             reason: RetryStartReason::Quick,
         })
         .await?;
-        if !wait(std::time::Duration::from_millis(delay_ms)).await {
+        if signal.is_some_and(AbortSignal::is_aborted)
+            || !wait(std::time::Duration::from_millis(delay_ms)).await
+            || signal.is_some_and(AbortSignal::is_aborted)
+        {
             if switched {
                 let _ = restore().await?;
             }
@@ -1025,6 +1105,234 @@ mod tests {
                 attempt: 4,
                 final_error: None,
                 restored_model: Some("primary/glm-5.3".to_string()),
+            })
+        );
+    }
+    #[tokio::test]
+    async fn transport_retries_use_one_exact_budget_without_walking_backup_providers() {
+        let candidates = vec![model("backup-a"), model("backup-b")];
+        let script = vec![error_message(Some("transport"), None, "socket closed"); 4];
+        let harness = drive(&fast_failover(), &candidates, script).await;
+        assert_eq!(harness.attempts, 4);
+        assert_eq!(harness.waits, vec![2000, 4000, 8000]);
+        assert!(harness.switches.is_empty());
+        assert!(harness.restores.is_empty());
+        assert_eq!(
+            harness.events.last(),
+            Some(&AutoRetryEvent::End {
+                success: false,
+                attempt: 3,
+                final_error: Some("socket closed".to_string()),
+                restored_model: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_transport_failures_keep_one_budget_with_backup_candidates() {
+        for kinds in [
+            ["transport", "transport", "transport", "server_error"],
+            ["server_error", "transport", "server_error", "server_error"],
+            ["server_error", "server_error", "server_error", "transport"],
+        ] {
+            let script = kinds
+                .into_iter()
+                .map(|kind| error_message(Some(kind), None, kind))
+                .collect();
+            let failover = ProviderFailoverPolicy {
+                max_retries: if kinds[0] == "transport" || kinds[1] == "transport" {
+                    2
+                } else {
+                    99
+                },
+                ..fast_failover()
+            };
+            let harness = drive(&failover, &[model("backup-a"), model("backup-b")], script).await;
+            assert_eq!(harness.attempts, 4);
+            assert!(harness.switches.is_empty());
+            assert!(harness.restores.is_empty());
+            assert_eq!(harness.waits.len(), 3);
+            for (index, kind) in kinds.iter().enumerate().take(3) {
+                if kinds[..=index].contains(&"transport") {
+                    assert_eq!(
+                        harness.waits[index], TRANSPORT_RETRY_DELAYS_MS[index],
+                        "{kind}"
+                    );
+                }
+            }
+            assert_eq!(
+                harness.events.last(),
+                Some(&AutoRetryEvent::End {
+                    success: false,
+                    attempt: 3,
+                    final_error: Some(kinds[3].to_string()),
+                    restored_model: None,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_refresh_keeps_transport_rungs_and_never_walks_backups() {
+        let script = vec![
+            error_message(Some("transport"), None, "socket closed"),
+            error_message(Some("transport"), None, "socket closed"),
+            error_message(Some("connection_limit"), Some(400), "aged connection"),
+            error_message(Some("transport"), None, "socket closed"),
+            ok_message("done"),
+        ];
+        let harness = drive(&fast_failover(), &[model("backup-a")], script).await;
+        assert_eq!(harness.attempts, 5);
+        assert_eq!(harness.waits, vec![2000, 4000, 0, 8000]);
+        assert!(harness.switches.is_empty());
+        assert!(harness.restores.is_empty());
+        assert_eq!(
+            harness.events.last(),
+            Some(&AutoRetryEvent::End {
+                success: true,
+                attempt: 3,
+                final_error: None,
+                restored_model: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_refresh_on_a_held_episode_preserves_the_primary_restore_count() {
+        let episode = RetryEpisode::default();
+        let mut attempts = 0;
+        let mut events = Vec::new();
+        let mut switches = Vec::new();
+        let result = run_turn_with_provider_failover(
+            &quick_policy(),
+            &fast_failover(),
+            &[model("backup-a")],
+            0,
+            None,
+            &episode,
+            || {
+                attempts += 1;
+                if attempts == 4 {
+                    assert_eq!(
+                        episode.settle_success(),
+                        None,
+                        "the primary restore holds the end"
+                    );
+                }
+                std::future::ready(Ok(match attempts {
+                    1..=3 => error_message(Some("server_error"), Some(500), "primary down"),
+                    4 => error_message(
+                        Some("connection_limit"),
+                        Some(400),
+                        "aged backup connection",
+                    ),
+                    _ => ok_message("done"),
+                }))
+            },
+            |event| {
+                events.push(event);
+                std::future::ready(Ok(()))
+            },
+            |_| async { true },
+            |next: &Model| {
+                switches.push(next.provider.clone());
+                std::future::ready(Ok(()))
+            },
+            || std::future::ready(Ok(Some("primary/glm-5.3".to_string()))),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((attempts, result.stop_reason), (5, StopReason::Stop));
+        assert_eq!(switches, vec!["backup-a"]);
+        assert!(matches!(
+            &events[3],
+            AutoRetryEvent::Start {
+                attempt: 1,
+                max_attempts: 1,
+                delay_ms: 0,
+                reason: RetryStartReason::ConnectionReset,
+                ..
+            }
+        ));
+        assert_eq!(
+            events.last(),
+            Some(&AutoRetryEvent::End {
+                success: true,
+                attempt: 3,
+                final_error: None,
+                restored_model: Some("primary/glm-5.3".to_string()),
+            })
+        );
+        assert_eq!(events.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_cap_after_committed_success_keeps_the_fresh_per_provider_budget() {
+        let episode = RetryEpisode::default();
+        let mut attempts = 0;
+        let mut switches = Vec::new();
+        let mut events = Vec::new();
+        let result = run_turn_with_provider_failover(
+            &quick_policy(),
+            &fast_failover(),
+            &[model("backup-a")],
+            0,
+            None,
+            &episode,
+            || {
+                attempts += 1;
+                if attempts == 3 {
+                    assert_eq!(
+                        episode.settle_success(),
+                        Some(AutoRetryEvent::End {
+                            success: true,
+                            attempt: 2,
+                            final_error: None,
+                            restored_model: None,
+                        })
+                    );
+                }
+                std::future::ready(Ok(match attempts {
+                    3 => error_message(Some("connection_limit"), Some(400), "aged connection"),
+                    5 => ok_message("done"),
+                    _ => error_message(Some("server_error"), Some(500), "provider down"),
+                }))
+            },
+            |event| {
+                events.push(event);
+                std::future::ready(Ok(()))
+            },
+            |_| async { true },
+            |next: &Model| {
+                switches.push(next.provider.clone());
+                std::future::ready(Ok(()))
+            },
+            || std::future::ready(Ok(Some("primary/glm-5.3".to_string()))),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((attempts, result.stop_reason), (5, StopReason::Stop));
+        assert!(
+            switches.is_empty(),
+            "a committed generation starts a fresh provider budget"
+        );
+        assert!(matches!(
+            &events[3],
+            AutoRetryEvent::Start {
+                attempt: 1,
+                reason: RetryStartReason::Quick,
+                ..
+            }
+        ));
+        assert_eq!(
+            events.last(),
+            Some(&AutoRetryEvent::End {
+                success: true,
+                attempt: 1,
+                final_error: None,
+                restored_model: None,
             })
         );
     }

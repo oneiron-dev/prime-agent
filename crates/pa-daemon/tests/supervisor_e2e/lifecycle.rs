@@ -17,20 +17,22 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     assert_eq!(hello["type"], "daemon_hello");
     // Differential goldens captured from the TS supervisor
     // (`prime-agent --mode daemon`, protocol 7, schema 29 — the deployed
-    // TS-main bundle reports the same schema id at the hello), plus the
-    // fork's own revision 31 (`worker_startup_failure`,
-    // `session_tool_selection`, `session_policy`).
+    // TS-main bundle reports the same schema id at the hello). The combined
+    // Rust schema is revision 32 and retains the fork's revision-31
+    // capabilities (`worker_startup_failure`, `session_tool_selection`,
+    // `session_policy`).
     assert_eq!(
         hello["protocol"],
         serde_json::json!({
             "name": "prime-agent.daemon", "version": 7
         })
     );
+    assert_eq!(hello["schemaRevision"], 32);
     assert_eq!(
         hello["schemaId"]
             .as_str()
             .map(std::string::ToString::to_string),
-        Some("protocol-7-schema-31-a926532e8319".to_string())
+        Some("protocol-7-schema-32-20261006c0a1".to_string())
     );
     assert!(hello["supervisorOwnerToken"].is_string());
     assert!(hello["supervisorProcessStartId"]

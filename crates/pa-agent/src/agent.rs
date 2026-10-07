@@ -1075,11 +1075,6 @@ impl Agent {
         self.inner.follow_up_queue.lock().unwrap().clear();
     }
 
-    pub fn clear_all_queues(&self) {
-        self.clear_steering_queue();
-        self.clear_follow_up_queue();
-    }
-
     /// Previews of the queued steering batches (TS
     /// `getSteeringMessagePreviews`): one text preview per queued batch,
     /// in queue order.
@@ -1435,6 +1430,7 @@ mod tests {
                 cost: crate::types::UsageCost::default(),
                 context_window: 200_000,
                 max_tokens: 8_192,
+                max_tokens_explicit: false,
             }
         }
 
@@ -1544,6 +1540,7 @@ mod tests {
                 cost: crate::types::UsageCost::default(),
                 context_window: 200_000,
                 max_tokens: 8_192,
+                max_tokens_explicit: false,
             }
         }
 
@@ -1604,6 +1601,7 @@ mod tests {
                 cost: crate::types::UsageCost::default(),
                 context_window: 200_000,
                 max_tokens: 8_192,
+                max_tokens_explicit: false,
             }
         }
 

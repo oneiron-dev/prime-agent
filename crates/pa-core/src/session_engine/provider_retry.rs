@@ -42,6 +42,12 @@ pub const DEFAULT_PROVIDER_RETRY_POLICY: ProviderRetryPolicy = ProviderRetryPoli
     max_delay_ms: UNBOUNDED_BACKOFF_MS,
 };
 
+/// Session transport failures have one fixed budget, independent of the
+/// configured provider/quota schedule. They never walk the failover chain.
+pub(crate) const TRANSPORT_MAX_RETRIES: u32 = 3;
+pub(crate) const TRANSPORT_RETRY_DELAYS_MS: [u64; TRANSPORT_MAX_RETRIES as usize] =
+    [2000, 4000, 8000];
+
 /// Resolution of one retry-delay decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderRetryDelay {
@@ -160,6 +166,8 @@ pub fn has_provider_stream_failure(message: &AssistantMessage) -> bool {
 /// blips, so it counts as transient unavailability, not a permanent rejection.
 /// Safety filters deterministically reject identical requests, so they never
 /// retry (TS #2472: a `content_filter` rejection surfaces immediately).
+/// `connection_limit` is terminal here: only the interactive session drivers
+/// may first reserve their separate one-time connection refresh.
 #[must_use]
 pub fn is_permanent_provider_failure_kind(
     kind: Option<&str>,
@@ -172,7 +180,10 @@ pub fn is_permanent_provider_failure_kind(
         // reflills mid-ladder: no retry can succeed until the wallet is
         // topped up, so it settles on the first attempt (the disclosure
         // row still fires — the failure-scoped outcome).
-        Some("invalid_request" | "refusal" | "permission" | "safety" | "payment_required") => true,
+        Some(
+            "connection_limit" | "invalid_request" | "refusal" | "permission" | "safety"
+            | "payment_required",
+        ) => true,
         Some("auth") => retries_performed > 0,
         // Every other kind is transient, the WebSocket `transport` class
         // included: the connection failed before any provider verdict, so

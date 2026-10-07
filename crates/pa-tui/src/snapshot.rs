@@ -243,9 +243,47 @@ fn order_messages_for_transcript(messages: &[Value]) -> Vec<&Value> {
 
 pub fn transcript_to_entries(messages: &[Value]) -> Vec<ChatEntry> {
     let ordered = order_messages_for_transcript(messages);
+    // A recovered reply precedes its outcome row. Supersede the failed
+    // attempts before flattening messages into text and tool cards, so
+    // partial content cannot reappear on reattach and card indices stay valid.
+    let mut superseded = vec![false; ordered.len()];
+    for (index, message) in ordered.iter().enumerate() {
+        if message.get("role").and_then(Value::as_str) != Some("custom")
+            || message.get("customType").and_then(Value::as_str)
+                != Some(crate::custom_message::PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE)
+        {
+            continue;
+        }
+        let mut cursor = index;
+        if message.pointer("/details/success").and_then(Value::as_bool) == Some(true)
+            && cursor > 0
+            && ordered[cursor - 1].get("role").and_then(Value::as_str) == Some("assistant")
+            && !matches!(
+                ordered[cursor - 1]
+                    .get("stopReason")
+                    .and_then(Value::as_str),
+                Some("error" | "aborted")
+            )
+        {
+            cursor -= 1;
+        }
+        while cursor > 0
+            && ordered[cursor - 1].get("role").and_then(Value::as_str) == Some("assistant")
+            && ordered[cursor - 1]
+                .get("stopReason")
+                .and_then(Value::as_str)
+                == Some("error")
+        {
+            cursor -= 1;
+            superseded[cursor] = true;
+        }
+    }
     let mut chat: Vec<ChatEntry> = Vec::new();
     let mut card_index: HashMap<String, Vec<usize>> = HashMap::new();
-    for message in ordered {
+    for (index, message) in ordered.into_iter().enumerate() {
+        if superseded[index] {
+            continue;
+        }
         if let Some(result) = tool_result_message_view(message) {
             let tool_call_id = result.tool_call_id.clone();
             if let Some(result) = settle_last_pending(
@@ -261,21 +299,6 @@ pub fn transcript_to_entries(messages: &[Value]) -> Vec<ChatEntry> {
                 chat.push(orphan_card(result));
             }
             continue;
-        }
-        // The retry-episode collapse (SANCTIONED DIVERGENCE, operator
-        // ruling 2026-09-23): a `provider_retry_outcome` row replaces the
-        // failed attempts its episode superseded, so the rebuilt chat
-        // shows ONE line per episode instead of the per-attempt error
-        // rows TS renders. The superseded rows sit at the tail (attempts
-        // are appended in order), and the collapse never touches tool
-        // cards (their failures ride the cards, not error-only rows).
-        if message.get("role").and_then(Value::as_str) == Some("custom")
-            && message.get("customType").and_then(Value::as_str)
-                == Some(crate::custom_message::PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE)
-        {
-            while chat.last().is_some_and(is_superseded_attempt_row) {
-                chat.pop();
-            }
         }
         let first_new = chat.len();
         chat.extend(message_value_to_entries(message));
@@ -579,3 +602,35 @@ mod tool_fold;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod retry_partial_history_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reattached_history_replaces_failed_partial_rows_and_keeps_the_real_tool_result() {
+        let committed = json!({"role": "assistant", "stopReason": "toolUse", "content": [
+            {"type": "toolCall", "id": "call_once", "name": "probe", "arguments": {}}
+        ]});
+        let result = json!({"role": "toolResult", "toolCallId": "call_once", "toolName": "probe",
+            "content": [{"type": "text", "text": "ran once"}], "isError": false});
+        let failed = json!({"role": "assistant", "stopReason": "error", "errorMessage": "socket closed",
+            "content": [{"type": "text", "text": "failed partial"},
+                {"type": "toolCall", "id": "call_cut", "name": "probe", "arguments": {}}]});
+        let answer = json!({"role": "assistant", "stopReason": "stop",
+            "content": [{"type": "text", "text": "recovered answer"}]});
+        let outcome = json!({"role": "custom", "customType": "provider_retry_outcome", "display": true,
+            "content": "Recovered after 1 retries: socket closed", "details": {"success": true, "attempts": 1}});
+        let entries = transcript_to_entries(&[committed, result, failed, answer, outcome]);
+        assert_eq!(entries.len(), 3);
+        assert!(
+            matches!(&entries[0], ChatEntry::Tool(card) if card.id == "call_once"
+            && card.started && card.result.as_ref().is_some_and(|result|
+                result.content == vec![json!({"type": "text", "text": "ran once"})]))
+        );
+        assert!(matches!(&entries[1], ChatEntry::Assistant(message)
+            if matches!(message.blocks.as_slice(), [MessageBlock::Text(text)] if text == "recovered answer")));
+        assert!(matches!(&entries[2], ChatEntry::Status { .. }));
+    }
+}

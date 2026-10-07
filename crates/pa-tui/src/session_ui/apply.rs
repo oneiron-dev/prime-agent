@@ -145,6 +145,7 @@ impl SessionUi {
         // a pending click's entry index.
         self.last_status_index = None;
         self.pressed_click = None;
+        self.failed_attempt_rows.clear();
         let Ok(data) = self
             .bounded_request(
                 Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
@@ -170,7 +171,7 @@ impl SessionUi {
         self.dirty = true;
     }
 
-    /// Report the first scroll action of the run (`tui scroll used`),
+    /// Report the first scroll action of the run (`tui_scroll_count`),
     /// fire-and-forget so the keypress never waits on the telemetry flush.
     pub(super) fn track_scroll(&mut self, action: &'static str, resumed_following: bool) {
         if self.scroll_adoption_emitted {
@@ -244,7 +245,7 @@ impl SessionUi {
         }
     }
 
-    /// Report a builtin client-command submission (`agent command used`),
+    /// Report a builtin command submission (`agent command used`),
     /// fire-and-forget like the scroll event: the command's handling never
     /// waits on the telemetry flush.
     pub(super) fn track_command_used(&mut self, command: &'static str) {
@@ -312,7 +313,14 @@ impl SessionUi {
                 if active_session_id == self.active_session_id {
                     self.turn_active = false;
                     view.working = None;
-                    self.note(&format!("session closed ({reason})"), view);
+                    if reason == "killed" {
+                        self.error_row(
+                            "The daemon stopped this agent session. Its transcript remains saved and can be reopened from Agents View.",
+                            view,
+                        );
+                    } else {
+                        self.note(&format!("session closed ({reason})"), view);
+                    }
                 }
             }
             DaemonClientEvent::DirectLinkLost { active_session_id } => {
@@ -576,7 +584,12 @@ impl SessionUi {
                 // the episode runs, and the episode's durable outcome row
                 // replaces it at the settle. (TS keeps one error row per
                 // failed attempt; a 429-storm spammed the chat.)
-                pop_superseded_attempt_row(view);
+                let rows = std::mem::take(&mut self.failed_attempt_rows);
+                if pop_superseded_attempt_row(view, &rows) {
+                    self.last_status_index = None;
+                    self.pressed_click = None;
+                    self.last_assistant_text = None;
+                }
                 view.retry = Some(RetryState {
                     attempt,
                     max_attempts,
@@ -598,7 +611,12 @@ impl SessionUi {
                     // the ONE terminal line (the durable outcome row that
                     // follows this event renders it; the row text matches
                     // the old live banner).
-                    pop_superseded_attempt_row(view);
+                    let rows = std::mem::take(&mut self.failed_attempt_rows);
+                    if pop_superseded_attempt_row(view, &rows) {
+                        self.last_status_index = None;
+                        self.pressed_click = None;
+                        self.last_assistant_text = None;
+                    }
                 }
                 // A settled switch restores the primary provider (TS
                 // `restoredModel` status line).
@@ -868,6 +886,7 @@ impl SessionUi {
         // A message_start always opens a new streaming message (the engine
         // emits one per provider call); later frames update it in place.
         if starts_message {
+            self.failed_attempt_rows.clear();
             self.streaming_index = None;
         }
         match self.streaming_index {
@@ -974,6 +993,25 @@ impl SessionUi {
                 &settle_text,
             );
         }
+        if stop_reason == Some("error") {
+            self.failed_attempt_rows = open.into_iter().collect();
+            self.failed_attempt_rows
+                .extend(
+                    view.chat
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, entry)| match entry {
+                            ChatEntry::Tool(card)
+                                if card.aborted
+                                    && !card.started
+                                    && tool_calls.iter().any(|(id, _, _)| id == &card.id) =>
+                            {
+                                Some(index)
+                            }
+                            _ => None,
+                        }),
+                );
+        }
         let Some(error) = crate::snapshot::assistant_error_row(message, tool_calls) else {
             return;
         };
@@ -993,6 +1031,9 @@ impl SessionUi {
                 view.mark_entry_stale(index);
                 return;
             }
+        }
+        if stop_reason == Some("error") {
+            self.failed_attempt_rows.push(view.chat.len());
         }
         // The message rendered no component (empty content): TS still
         // renders the message's own error component, so the failure stacks
@@ -1053,12 +1094,32 @@ impl SessionUi {
                 if !partial {
                     card.ended_at = Some(std::time::Instant::now());
                     self.pending_tools.remove(tool_call_id);
+                    self.track_ipython_bash_rendered(card);
                 }
                 view.mark_entry_stale(index);
                 return true;
             }
         }
         false
+    }
+
+    /// `tui ipython bash rendered`: the settled ipython card that renders
+    /// as bash reports its bash share, primitives only.
+    fn track_ipython_bash_rendered(&self, card: &crate::tool_card::ToolCallCard) {
+        if card.name != "ipython" {
+            return;
+        }
+        let Some(stats) = crate::tool_card::ipython::bash_dominated_stats(card) else {
+            return;
+        };
+        let Some(telemetry) = self.telemetry.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            telemetry
+                .ipython_bash_rendered(stats.bash_lines, stats.cell_lines, stats.count)
+                .await;
+        });
     }
 
     /// Update the loader activity label (agent-activity tracker subset).
@@ -1069,3 +1130,7 @@ impl SessionUi {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "retry_fold_tests.rs"]
+mod retry_fold_tests;

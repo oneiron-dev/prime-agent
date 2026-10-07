@@ -181,6 +181,7 @@ fn socket_ends_map_to_structured_causes() {
         ProviderWsTransportError {
             message: "WebSocket closed before response.completed".to_string(),
             close_code: Some(1006),
+            sdk_name: None,
             transport: Some(StreamTransportFailureDetail {
                 close_code: Some(1006),
                 was_clean: Some(false),
@@ -205,6 +206,7 @@ fn socket_ends_map_to_structured_causes() {
         ProviderWsTransportError {
             message: "WebSocket stream closed before response.completed".to_string(),
             close_code: None,
+            sdk_name: None,
             transport: Some(StreamTransportFailureDetail::websocket(
                 StreamTransportFailureCause::Eof
             )),

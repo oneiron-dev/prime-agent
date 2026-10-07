@@ -148,9 +148,18 @@ impl AgentSessionEngine {
         };
         // Retry/failover adoption telemetry (TS `auto_retry_start` counting):
         // retries increment `retry_count`, provider switches `failover_count`.
-        let telemetry = {
+        // The semantic-edge recorder rides the same snapshot (TS
+        // `prepareTurnRetry` / `clearTurnRetry` ride the retry events: the
+        // parked id makes the retried call reuse the failed attempt's
+        // idempotency key).
+        let (telemetry, retry_scope) = {
             let guard = self.session.blocking_lock();
-            guard.as_deref().and_then(|engine| engine.telemetry.clone())
+            (
+                guard.as_deref().and_then(|engine| engine.telemetry.clone()),
+                guard
+                    .as_deref()
+                    .map(|engine| std::sync::Arc::new(engine.session.retry_scope())),
+            )
         };
         // The failover-captured primary target state (TS `_backupModel`):
         // the model, its thinking level, and its resolved request auth,
@@ -210,6 +219,7 @@ impl AgentSessionEngine {
                     let prompt = prompt.clone();
                     let model = model.clone();
                     let telemetry = telemetry.clone();
+                    let retry_scope = retry_scope.clone();
                     let episode = &episode;
                     async move {
                         // A retry re-issues the failed turn: the failed
@@ -223,11 +233,14 @@ impl AgentSessionEngine {
                             let succeeded = matches!(
                                 &event,
                                 EngineEvent::AssistantMessage(message)
-                                    if message.get("stopReason").and_then(serde_json::Value::as_str)
-                                        != Some("error")
+                                    if !matches!(message.get("stopReason").and_then(serde_json::Value::as_str),
+                                        Some("error" | "aborted"))
                             );
                             if !(**emit)(event) {
                                 return false;
+                            }
+                            if let Some(scope) = retry_scope.as_ref().filter(|_| succeeded) {
+                                scope.settle_success();
                             }
                             let Some(end) = succeeded.then(|| episode.settle_success()).flatten()
                             else {
@@ -267,7 +280,11 @@ impl AgentSessionEngine {
                 |event| {
                     let mut emit = emit_cell.borrow_mut();
                     let telemetry = telemetry.clone();
+                    let retry_scope = retry_scope.clone();
                     async move {
+                        if let Some(scope) = &retry_scope {
+                            scope.observe(&event);
+                        }
                         if let Some(telemetry) = &telemetry {
                             // One retry event in, one telemetry seam out: the
                             // Start counts the retry (plus a backup-provider
@@ -428,6 +445,7 @@ impl AgentSessionEngine {
                 park,
             ),
         );
+        drop(retry_scope);
         match result {
             Ok(message) => match message.stop_reason {
                 // The failure already reached the transcript as the final

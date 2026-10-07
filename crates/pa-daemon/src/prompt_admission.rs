@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use crate::backpressure::RouteAdmission;
 use crate::protocol::{response_failure, response_line, response_success, DaemonResponse};
 use crate::supervisor::{
-    client_command_payload, Supervisor, LONG_ROUTE_TIMEOUT_MS, ROUTE_TIMEOUT_MS,
+    client_command_payload, client_route_timeout, Supervisor, ROUTE_TIMEOUT_MS,
     SESSION_WORKER_TIMED_OUT,
 };
 use crate::worker::Worker;
@@ -251,20 +251,9 @@ impl Supervisor {
                 "Prompt admission was cancelled.",
             );
         }
-        let Some((worker_admission_id, timeout)) =
-            connection.prompt_admissions.with(&key, |admission| {
-                (
-                    admission.worker_admission_id.clone(),
-                    if matches!(
-                        command,
-                        pa_types::daemon::DaemonCommand::PromptAndWait { .. }
-                    ) {
-                        LONG_ROUTE_TIMEOUT_MS
-                    } else {
-                        ROUTE_TIMEOUT_MS
-                    },
-                )
-            })
+        let Some(worker_admission_id) = connection
+            .prompt_admissions
+            .with(&key, |admission| admission.worker_admission_id.clone())
         else {
             // An admission that vanished before the route: the prompt
             // routes through the generic path (TS `admission undefined`).
@@ -272,6 +261,7 @@ impl Supervisor {
                 .route_client_command(command, client_id, attached, command_id, type_name, None)
                 .await;
         };
+        let timeout = client_route_timeout(command);
         // Resolve the session (the generic route's wake-aware resolution).
         let mut rebound_to: Option<String> = None;
         let resident = if let Ok(resident) = self.registry.resolve(active_session_id).await {
@@ -575,7 +565,7 @@ impl Supervisor {
 
 /// The worker's admission registry: admission id -> status (the TS
 /// daemon-mode `promptAdmissions` map). Shared with the turn runner,
-/// which commits a queued admission when its turn starts.
+/// which clears an admitted prompt when its turn settles.
 #[derive(Default, Clone)]
 pub(crate) struct WorkerAdmissions {
     admissions: Arc<Mutex<HashMap<String, AdmissionStatus>>>,
@@ -593,26 +583,20 @@ impl WorkerAdmissions {
             .insert(admission_id.to_string(), AdmissionStatus::Waiting);
     }
 
-    /// The queued prompt was picked up for its turn: a waiting admission
-    /// commits. Returns whether the prompt may run — `false` for one a
-    /// cancel withdrew first (the same lock orders the two, so a later
-    /// cancel answers `owned`); that admission settles here, since its
-    /// prompt never reaches a turn that would clear it.
+    /// Admission at prompt enqueue: a waiting id becomes owned. A cancelled
+    /// or removed id refuses delivery, including cancellation before enqueue.
     pub(crate) fn commit(&self, admission_id: &str) -> bool {
         let mut admissions = self
             .admissions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match admissions.get(admission_id).copied() {
-            Some(AdmissionStatus::Waiting) => {
-                admissions.insert(admission_id.to_string(), AdmissionStatus::Owned);
+        match admissions.get_mut(admission_id) {
+            Some(status @ AdmissionStatus::Waiting) => {
+                *status = AdmissionStatus::Owned;
                 true
             }
-            Some(AdmissionStatus::Owned) | None => true,
-            Some(AdmissionStatus::Cancelled) => {
-                admissions.remove(admission_id);
-                false
-            }
+            Some(AdmissionStatus::Owned) => true,
+            Some(AdmissionStatus::Cancelled) | None => false,
         }
     }
 
@@ -652,36 +636,6 @@ impl Worker {
         self.prompt_admissions.register(admission_id);
     }
 
-    /// Drop the queued prompt a cancelled admission was holding (the TS
-    /// controller aborts before the admission commits, so the prompt never
-    /// runs).
-    pub(crate) fn drop_queued_admitted_prompt(&self, admission_id: &str) {
-        let dropped = {
-            let mut core = self.core.lock().unwrap();
-            let queued = core.steering.len() + core.follow_up.len();
-            core.steering
-                .retain(|item| item.admission_id.as_deref() != Some(admission_id));
-            core.follow_up
-                .retain(|item| item.admission_id.as_deref() != Some(admission_id));
-            core.steering.len() + core.follow_up.len() != queued
-        };
-        // A dropped prompt never reaches the turn that would clear its
-        // admission (TS clears it when the cancelled prompt settles). With
-        // no row to drop, the cancel landed before the prompt's enqueue:
-        // the record stays cancelled for the pickup to refuse and settle.
-        if dropped {
-            self.prompt_admissions.clear(admission_id);
-        }
-        // The cancelled rows leave the lanes: settle the verdict so the
-        // drop cannot leave the admission's busy=true (or its snapshot
-        // rows) promising a revive work that was cancelled. A drop with
-        // other rows still queued stays busy — that work is real, and a
-        // mid-turn drop stays busy through the in-flight turn.
-        self.checkpoint_queue(crate::worker::QueueCheckpoint::Settle {
-            operation: "queue_dropped",
-        });
-    }
-
     /// `cancel_prompt_admission` (the worker arm the supervisor forwards
     /// to): the TS status ladder over the worker's registry.
     pub(crate) fn handle_cancel_prompt_admission(&self, payload: &Value) -> DaemonResponse {
@@ -693,41 +647,52 @@ impl Worker {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let cancel_owned = payload.get("cancelOwned").and_then(Value::as_bool) == Some(true);
-        match self.prompt_admissions.cancel(admission_id) {
-            None => response_success(
-                None,
-                "cancel_prompt_admission",
-                Some(json!({ "status": "unknown" })),
-            ),
-            Some(AdmissionStatus::Owned) => {
-                // A committed prompt with `cancelOwned` aborts its running
-                // turn (the TS controller abort).
-                if cancel_owned {
-                    let mut core = self.core.lock().unwrap();
-                    core.abort_requested = true;
-                    drop(core);
-                    // The TS controller abort cancels the committed turn's
-                    // in-flight fetch immediately (`requestAbort` ->
-                    // `agent.abort()`).
-                    self.engine.abort_in_flight_turn();
-                }
-                response_success(
-                    None,
-                    "cancel_prompt_admission",
-                    Some(json!({ "status": "owned" })),
-                )
+        let (status, dropped_queued, abort_running) = {
+            // The enqueue/commit transition holds this same lock. Decide
+            // whether the owned admission is still queued atomically with
+            // removing it; never abort a different in-flight turn.
+            let mut core = self.core.lock().unwrap();
+            let status = self.prompt_admissions.cancel(admission_id);
+            let queued = core
+                .steering
+                .iter()
+                .chain(&core.follow_up)
+                .any(|item| item.admission_id.as_deref() == Some(admission_id));
+            let dropped_queued = matches!(status, Some(AdmissionStatus::Cancelled))
+                || (cancel_owned && status == Some(AdmissionStatus::Owned) && queued);
+            if dropped_queued {
+                core.steering
+                    .retain(|item| item.admission_id.as_deref() != Some(admission_id));
+                core.follow_up
+                    .retain(|item| item.admission_id.as_deref() != Some(admission_id));
+                self.prompt_admissions.clear(admission_id);
             }
-            // A waiting or already-cancelled admission: the queued prompt
-            // (if any) never runs.
-            Some(_) => {
-                self.drop_queued_admitted_prompt(admission_id);
-                response_success(
-                    None,
-                    "cancel_prompt_admission",
-                    Some(json!({ "status": "cancelled" })),
-                )
+            let abort_running = cancel_owned
+                && status == Some(AdmissionStatus::Owned)
+                && core.running_admission_ids.contains(admission_id);
+            if abort_running {
+                core.abort_requested = true;
             }
+            (status, dropped_queued, abort_running)
+        };
+        if dropped_queued {
+            self.checkpoint_queue(crate::worker::QueueCheckpoint::Settle {
+                operation: "queue_dropped",
+            });
         }
+        if abort_running {
+            self.engine.abort_in_flight_turn();
+        }
+        let status = match status {
+            None => "unknown",
+            Some(AdmissionStatus::Owned) => "owned",
+            Some(AdmissionStatus::Waiting | AdmissionStatus::Cancelled) => "cancelled",
+        };
+        response_success(
+            None,
+            "cancel_prompt_admission",
+            Some(json!({ "status": status })),
+        )
     }
 }
 

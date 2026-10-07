@@ -92,12 +92,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_opener_resolves_an_absolute_path_and_targets_the_url() {
-        let (program, args) = opener("https://example.com/docs").expect("the platform opener");
+    fn an_available_opener_resolves_an_absolute_path_and_targets_the_url() {
+        // A headless Linux installation may have no platform opener.
+        let resolved = opener("https://example.com/docs");
         assert!(
-            program.is_absolute(),
-            "the opener never resolves through PATH: {program:?}"
+            resolved.is_none_or(|(program, args)| {
+                program.is_absolute() && args.iter().any(|arg| arg.contains("example.com"))
+            }),
+            "an available opener must use an absolute path and target the URL"
         );
-        assert!(args.iter().any(|arg| arg.contains("example.com")));
     }
 }

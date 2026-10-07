@@ -452,62 +452,26 @@ async fn run_websocket_attempt(
         );
     }
 
-    let mut events = connection
+    let mut events = match connection
         .send_request(&request_body, options.base.signal.clone())
-        .await?;
+        .await
+    {
+        Ok(events) => events,
+        Err(error) => {
+            release_connection(connection, false, None).await;
+            return Err(error);
+        }
+    };
 
     let mut keep_connection = true;
-    let start_partial = output.clone();
-    let process = async {
-        let model_id = model.id.clone();
-        let hooks = ResponsesStreamHooks {
-            request_service_tier: options.service_tier,
-            resolve_service_tier: Some(Box::new(resolve_codex_service_tier)),
-            apply_service_tier_pricing: Some(Box::new(move |usage, service_tier| {
-                apply_codex_service_tier_pricing(usage, service_tier.as_deref(), &model_id);
-            })),
-        };
-        let mut start_emitted = false;
-        let mut processor = ResponsesStreamProcessor::new(model, output, writer, hooks);
-        // The TS catch settles partial tool calls before the error event
-        // carries the message (TS PR #2783).
-        let streamed: Result<(), CodexStreamError> = async {
-            while let Some(event) = events.recv().await {
-                match event {
-                    websocket::WorkerEvent::Event(event) => {
-                        // Codex can emit lifecycle, telemetry, or vendor
-                        // metadata before rejecting a stale continuation.
-                        // Keep the attempt retryable until an event can
-                        // produce output consumed by the shared processor
-                        // (TS #2374's visible-event gate).
-                        if !start_emitted && is_codex_visible_response_event(&event) {
-                            start_emitted = true;
-                            *websocket_started = true;
-                            writer.push(AssistantMessageEvent::Start {
-                                partial: start_partial.clone(),
-                            });
-                        }
-                        let mapped = map_codex_event(event)?;
-                        processor.handle_event(&mapped.event)?;
-                        if mapped.done {
-                            break;
-                        }
-                    }
-                    websocket::WorkerEvent::End(end) => {
-                        websocket::codex_socket_end(end)?;
-                        break;
-                    }
-                }
-            }
-            processor.finish()?;
-            Ok(())
-        }
-        .await;
-        if streamed.is_err() {
-            processor.settle_partial_tool_calls();
-        }
-        streamed
-    }
+    let process = process_websocket_events(
+        model,
+        options,
+        output,
+        writer,
+        websocket_started,
+        &mut events,
+    )
     .await;
 
     match process {
@@ -557,6 +521,80 @@ async fn run_websocket_attempt(
             Err(error)
         }
     }
+}
+
+/// Collect one Codex response. A missing end event is a transport failure,
+/// never a successful partial response.
+async fn process_websocket_events(
+    model: &Model,
+    options: &OpenAICodexResponsesOptions,
+    output: &mut AssistantMessage,
+    writer: &AssistantMessageEventWriter,
+    websocket_started: &mut bool,
+    events: &mut tokio::sync::mpsc::Receiver<websocket::WorkerEvent>,
+) -> Result<(), CodexStreamError> {
+    let start_partial = output.clone();
+    let model_id = model.id.clone();
+    let hooks = ResponsesStreamHooks {
+        request_service_tier: options.service_tier,
+        resolve_service_tier: Some(Box::new(resolve_codex_service_tier)),
+        apply_service_tier_pricing: Some(Box::new(move |usage, service_tier| {
+            apply_codex_service_tier_pricing(usage, service_tier.as_deref(), &model_id);
+        })),
+    };
+    let mut start_emitted = false;
+    let mut processor = ResponsesStreamProcessor::new(model, output, writer, hooks);
+    // The TS catch settles partial tool calls before the error event
+    // carries the message (TS PR #2783).
+    let streamed: Result<(), CodexStreamError> = async {
+        loop {
+            let Some(event) = events.recv().await else {
+                if options
+                    .base
+                    .signal
+                    .as_ref()
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                {
+                    return Err(CodexStreamError::Aborted);
+                }
+                return websocket::codex_socket_end(
+                    crate::providers::responses_websocket::connection::SocketEnd::Eof,
+                );
+            };
+            match event {
+                websocket::WorkerEvent::Event(event) => {
+                    // Codex can emit lifecycle, telemetry, or vendor
+                    // metadata before rejecting a stale continuation.
+                    // Keep the attempt retryable until an event can
+                    // produce output consumed by the shared processor
+                    // (TS #2374's visible-event gate).
+                    if !start_emitted && is_codex_visible_response_event(&event) {
+                        start_emitted = true;
+                        *websocket_started = true;
+                        writer.push(AssistantMessageEvent::Start {
+                            partial: start_partial.clone(),
+                        });
+                    }
+                    let mapped = map_codex_event(event)?;
+                    processor.handle_event(&mapped.event)?;
+                    if mapped.done {
+                        break;
+                    }
+                }
+                websocket::WorkerEvent::End(end) => {
+                    websocket::codex_socket_end(end)?;
+                    break;
+                }
+            }
+        }
+        processor.finish()?;
+        Ok(())
+    }
+    .await;
+    if streamed.is_err() {
+        processor.settle_partial_tool_calls();
+    }
+    streamed
 }
 
 /// Rebuild an `AssistantMessage` as a `Message` for continuation-item
@@ -910,6 +948,7 @@ mod tests {
             cost: crate::types::zero_model_cost(),
             context_window: 400_000,
             max_tokens: 128_000,
+            max_tokens_explicit: false,
             featured: None,
             headers: None,
             compat: None,
@@ -1592,6 +1631,46 @@ mod tests {
         assert!(
             bodies[2].get("previous_response_id").is_none(),
             "the retry sends the full context: {bodies:?}"
+        );
+    }
+    #[tokio::test]
+    async fn a_lost_websocket_event_sender_never_commits_partial_output() {
+        let model = codex_wire_model();
+        let options = OpenAICodexResponsesOptions::default();
+        let (sender, mut events) = tokio::sync::mpsc::channel(16);
+        for event in codex_response_events("resp_cut", "msg_cut", "uncommitted")
+            .into_iter()
+            .take(4)
+        {
+            sender
+                .send(websocket::WorkerEvent::Event(event))
+                .await
+                .unwrap();
+        }
+        drop(sender);
+        let mut output = crate::providers::faux::faux_assistant_text_message(
+            "",
+            crate::providers::faux::FauxAssistantMessageOptions::default(),
+        );
+        output.content.clear();
+        let (writer, _reader) = create_assistant_message_event_stream();
+        let mut started = false;
+        let error = process_websocket_events(
+            &model,
+            &options,
+            &mut output,
+            &writer,
+            &mut started,
+            &mut events,
+        )
+        .await
+        .unwrap_err()
+        .into_provider_error();
+        assert!(started);
+        assert_eq!(codex_message_text(&output).as_deref(), Some("uncommitted"));
+        assert_eq!(
+            crate::utils_inner::stream_failure::extract_stream_failure_info(&error).kind,
+            crate::utils_inner::stream_failure::StreamFailureKind::Transport,
         );
     }
 }

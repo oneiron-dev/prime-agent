@@ -272,7 +272,14 @@ mod streaming_tray_hint_tests {
         let kb = KeybindingsManager::new();
         assert_eq!(
             streaming_tray_hint(&kb, true, "a draft in the editor"),
-            Some("Alt+Enter to queue message".to_string()),
+            Some(
+                if cfg!(target_os = "macos") {
+                    "Option+Enter to queue message"
+                } else {
+                    "Alt+Enter to queue message"
+                }
+                .to_string()
+            ),
             "the default binding renders the TS sentence"
         );
     }

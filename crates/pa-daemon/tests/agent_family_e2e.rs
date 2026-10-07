@@ -177,10 +177,9 @@ impl Client {
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("set timeout");
         loop {
-            line.clear();
             match self.reader.read_line(&mut line) {
                 Ok(0) => panic!("supervisor closed the connection"),
-                Ok(_) if line.trim().is_empty() => {}
+                Ok(_) if line.trim().is_empty() => line.clear(),
                 Ok(_) => return serde_json::from_str(line.trim()).expect("parse line"),
                 Err(error) => {
                     assert!(
@@ -470,6 +469,7 @@ async fn parent_child_agent_message_round_trip_end_to_end() {
             model: None,
             thinking: None,
             cell_source_code: None,
+            spawned_by_request_id: None,
         })
         .await
         .expect("spawn the child");
@@ -856,6 +856,7 @@ async fn family_edges_never_cross_families_end_to_end() {
                 model: None,
                 thinking: None,
                 cell_source_code: None,
+                spawned_by_request_id: None,
             })
             .await
             .expect("spawn the child");
@@ -913,7 +914,12 @@ async fn family_edges_never_cross_families_end_to_end() {
         )
         .expect("kid artifact dir")
         .flatten()
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        // The semantic-edge ledger rides the same dir (TS: the child's
+        // rlm session dir owns it); only the durable session row counts.
+        .filter(|entry| {
+            entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+                && entry.file_name().to_string_lossy() != "semantic-edges.jsonl"
+        })
         .collect();
         assert_eq!(kid_files.len(), 1, "one kid session file: {kid_files:?}");
         kids.push((
@@ -1013,6 +1019,7 @@ async fn family_edges_never_cross_families_end_to_end() {
             model: None,
             thinking: None,
             cell_source_code: None,
+            spawned_by_request_id: None,
         })
         .await
         .expect("spawn the grandchild");
@@ -1260,4 +1267,171 @@ async fn family_edges_never_cross_families_end_to_end() {
         !parent_messages.contains("[agent-message from child:kid-b]"),
         "a subagent of ANOTHER parent never renders as this session's child: {parent_messages}"
     );
+}
+
+/// Verifier (TS #2529): a parent renames one of its direct children
+/// through the real kernel host handler (`rlm.rename` with the spawn
+/// handle's child id) — the same handler map the parent's kernel
+/// dispatches into. The supervisor's reservation ladder admits the
+/// unique name, the child worker persists it and leaves the
+/// ` by parent` transcript notice, the child's RLM ledger edge carries
+/// the new name, and the parent-side selectors stop matching the old
+/// name (`rlm.collect` by the old name fails, the new name hits).
+#[tokio::test]
+async fn parent_renames_a_child_end_to_end() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+
+    // The parent absorbs turns; the child only runs its spawn turn.
+    let parent_script = write_faux_script(
+        dir.path(),
+        "parent",
+        &json!([{ "text": "parent turn done" }]),
+    );
+    let child_script = write_faux_script(dir.path(), "child", &json!([{ "text": "kid spawned" }]));
+
+    let _daemon = spawn_supervisor(&socket, &agent_dir, &kernel_python);
+    wait_socket_ready(&socket);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+
+    client.send_command(
+        "create-parent",
+        &json!({
+            "type": "create",
+            "name": "parent",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": sessions_dir.to_string_lossy(),
+                "script": parent_script.to_string_lossy(),
+            },
+        }),
+    );
+    let created = client.read_response("create-parent");
+    assert_eq!(created["success"], true, "create parent failed: {created}");
+    let parent = &created["data"];
+    let parent_active_session_id = parent["activeSessionId"]
+        .as_str()
+        .or_else(|| parent["id"].as_str())
+        .expect("parent active session id")
+        .to_string();
+    let parent_session_id = parent["sessionId"].as_str().expect("parent session id");
+    let parent_session_file = parent["sessionFile"]
+        .as_str()
+        .expect("parent session file")
+        .to_string();
+
+    let children = SupervisorChildSessions::new(
+        Arc::new(SupervisorLink::new(socket.clone())),
+        agent_dir.clone(),
+        parent_active_session_id.clone(),
+        std::sync::Arc::new(pa_daemon::model_allowlist::ModelRefusalTelemetry::new(
+            agent_dir.clone(),
+            /*telemetry_disabled*/ true,
+        )),
+    );
+    children.set_identity(ParentIdentity {
+        rlm_depth: 0,
+        rlm_max_depth: 2,
+        model: Some("faux/faux-1".to_string()),
+        cwd: Some(dir.path().to_string_lossy().to_string()),
+        session_id: Some(parent_session_id.to_string()),
+        session_file: Some(parent_session_file.clone()),
+        thinking: None,
+        child_script: Some(child_script.to_string_lossy().to_string()),
+    });
+    let handle = children
+        .spawn(RlmSpawnRequest {
+            prompt: "work on the lane".to_string(),
+            name: Some("kid".to_string()),
+            model: None,
+            thinking: None,
+            spawned_by_request_id: None,
+            cell_source_code: None,
+        })
+        .await
+        .expect("spawn the child");
+    assert_eq!(handle.name, "kid");
+    children.notify_turn_done();
+    // Wait for the spawn turn to settle (bounded), then read the roster's
+    // live/persisted child ids.
+    let settle_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let roster = children.list_subagents().await.expect("child roster");
+        let row = roster.first().expect("one child row");
+        if row.status == "completed" || row.status == "error" {
+            assert_eq!(row.status, "completed", "spawn turn: {row:?}");
+            break;
+        }
+        assert!(
+            Instant::now() < settle_deadline,
+            "kid spawn turn never settled: {row:?}; daemon log tail: {}",
+            daemon_log_tail(&dir.path().join("receipts"))
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let roster = children.list_subagents().await.expect("child roster");
+    let child_row = roster.first().expect("one child row");
+    let child_active_session_id = child_row
+        .active_session_id
+        .clone()
+        .expect("child active session id");
+
+    // The parent-side kernel host surface over the same registry (the
+    // wiring the parent worker's engine performs): the rename dispatches
+    // through the REAL `rlm.rename` handler, with the spawn handle's
+    // child id as the selector.
+    let children = Arc::new(children);
+    let wiring = pa_core::session_engine::runtime_wiring::wire_session_runtime(
+        pa_core::session::manager::SessionManager::in_memory(dir.path()),
+        dir.path(),
+        pa_core::session_engine::runtime_wiring::RlmWiring {
+            model_registry: None,
+            subagent_host: Some(Arc::clone(&children) as Arc<dyn RlmSubagentHost>),
+        },
+        None,
+        None,
+    );
+    let rename = wiring
+        .handlers
+        .get("rlm.rename")
+        .expect("rlm.rename handler registered")
+        .clone();
+    let reply = rename(HostRequestPayload {
+        data: json!({
+            "name": "  bench-runner ",
+            "session_id": handle.rlm_child_id,
+        }),
+        cell_source_code: None,
+    })
+    .await
+    .expect("the rename dispatch");
+    assert_eq!(reply, json!({ "name": "bench-runner" }));
+
+    // The child's transcript carries the parent-directed notice.
+    client.wait_idle("w-child-rename", &child_active_session_id);
+    let child_messages = client.messages("gm-child-rename", &child_active_session_id);
+    assert!(
+        child_messages
+            .matches("Session renamed `kid` -> `bench-runner` by parent")
+            .count()
+            >= 1,
+        "the renamed session sees the notice: {child_messages}"
+    );
+
+    // The child's RLM ledger edge carries the new name (the passive roster
+    // keeps it after passivation).
+    let ledger = pa_daemon::rlm_ledger::RlmSpawnLedger::new(&agent_dir, &sessions_dir, |_| {});
+    let edges = ledger.edges(true).expect("ledger edges");
+    let edge = edges
+        .iter()
+        .find(|edge| edge.child_id == handle.rlm_child_id)
+        .expect("the child's ledger edge");
+    assert_eq!(edge.name, "bench-runner", "the ledger rename landed");
 }

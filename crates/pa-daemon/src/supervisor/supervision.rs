@@ -1,12 +1,12 @@
 //! Worker supervision: the watch loop, the restart backoff, and
 //! the spawn/connect plumbing.
-use super::routing::fail_unsent_request;
+use super::routing::{fail_unsent_request, WORKER_REQUEST_TIMEOUT_MS, WORKER_SOCKET_CLOSED};
 use super::{
     anyhow, connect_transport, create_command_payload, json, mpsc, persist_worker,
-    probe_worker_socket, util, worker_connect_deadline, write_frame, Arc, Child, ClientRouting,
-    Command, Context, DaemonWorkerLifecycle, Duration, Ordering, PathBuf, PrivateFrameReader,
-    ResidentWorker, Result, RouteAdmission, Supervisor, TypedCreateRejection, Value, WorkerReply,
-    WorkerRequest, DEFAULT_PRIVATE_FRAME_LIMITS, LONG_ROUTE_TIMEOUT_MS, ROUTE_TIMEOUT_MS,
+    persist_worker_at, probe_worker_socket, util, write_frame, Arc, Child, ClientRouting, Command,
+    Context, DaemonWorkerLifecycle, Duration, Ordering, PathBuf, PrivateFrameReader,
+    ResidentWorker, Result, RouteAdmission, Supervisor, TempSync, TypedCreateRejection, Value,
+    WorkerReply, WorkerRequest, DEFAULT_PRIVATE_FRAME_LIMITS, ROUTE_TIMEOUT_MS,
     WORKER_AUTH_FLOOR_MS,
 };
 use crate::lease::is_process_alive;
@@ -20,6 +20,9 @@ pub(super) const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 pub(super) const STABLE_LIFETIME_MS: u64 = 30_000;
 const BASE_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 30_000;
+/// The adopted-worker liveness poll used only where the kernel exit watch
+/// cannot register (no pidfd, descriptor exhaustion, Windows).
+const ADOPTED_EXIT_FALLBACK_POLL: Duration = Duration::from_secs(30);
 
 impl Supervisor {
     /// Watch a worker process: on unexpected exit, restart with backoff.
@@ -71,24 +74,30 @@ impl Supervisor {
                     return;
                 }
             } else if adopted_pid != 0 {
-                // Adopted worker: poll liveness (cannot wait on a foreign
-                // pid). A previous relaunch that produced no worker leaves
-                // pid 0 here - there is nothing to watch, and polling pid 0
-                // would report a phantom exit; fall straight to the
-                // failure/backoff/relaunch arm instead.
-                loop {
-                    if self.shutting_down.load(Ordering::SeqCst)
-                        || resident.intentional_stop.load(Ordering::SeqCst)
-                    {
-                        return;
+                // Adopted worker (no Child handle): park on the kernel's
+                // exit notification for the pid. A previous relaunch that
+                // produced no worker leaves pid 0 here - there is nothing
+                // to watch, and a watch on pid 0 would report a phantom
+                // exit; fall straight to the failure/backoff/relaunch arm
+                // instead.
+                if let Err(error) =
+                    pa_core::platform::process::wait_for_exit(adopted_pid as u32).await
+                {
+                    // The slow fallback, only where the kernel exit watch
+                    // cannot register.
+                    self.log_line(&format!(
+                        "session worker {}: kernel exit watch unavailable ({error}); polling liveness every {}s",
+                        resident.worker_id,
+                        ADOPTED_EXIT_FALLBACK_POLL.as_secs()
+                    ));
+                    while matches!(is_process_alive(adopted_pid as u32), Ok(true)) {
+                        tokio::time::sleep(ADOPTED_EXIT_FALLBACK_POLL).await;
                     }
-                    if !matches!(is_process_alive(adopted_pid as u32), Ok(true)) {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                if resident.intentional_stop.load(Ordering::SeqCst)
-                    || self.shutting_down.load(Ordering::SeqCst)
+                // A relaunch elsewhere (update abandon, retry) took over the
+                // resident with a new process.
+                if self.is_stopping(&resident)
+                    || resident.descriptor.lock().await.pid != adopted_pid
                 {
                     return;
                 }
@@ -231,8 +240,10 @@ impl Supervisor {
         // nothing).
         self.declare_compaction_terminal(resident, || resident.compaction.observe_worker_gone())
             .await;
-        let deadline = worker_connect_deadline();
-        let mut child = self.spawn_worker_process(resident, deadline).await?;
+        let deadline = self.connect_deadline();
+        let mut child = self
+            .spawn_worker_process(resident, deadline, TempSync::Synced)
+            .await?;
         // A failed connect never leaves a spawned-but-unwired worker
         // process behind (the watch kills or reaps it), and a worker that
         // dies mid-handshake reports its own exit.
@@ -299,7 +310,7 @@ impl Supervisor {
                     resident,
                     "create",
                     payload,
-                    LONG_ROUTE_TIMEOUT_MS,
+                    WORKER_REQUEST_TIMEOUT_MS,
                     RouteAdmission::SupervisorInternal,
                 ),
             )
@@ -404,6 +415,7 @@ impl Supervisor {
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
         connect_deadline: tokio::time::Instant,
+        spawn_record_sync: TempSync,
     ) -> Result<Child> {
         // One env definition for spawn and for the update roster's
         // `launch_env` row (spec §8: "env snapshot to respawn the worker
@@ -477,7 +489,20 @@ impl Supervisor {
             descriptor.pid = u64::from(child_pid);
             descriptor.process_start_id = crate::protocol::process_start_id(child_pid);
             descriptor.lifecycle = DaemonWorkerLifecycle::Starting;
-            let _ = persist_worker(&resident.descriptor_path, &descriptor);
+            // The spawn record's durability is per launch class
+            // (`spawn_record_sync`): a fresh create rides the TS
+            // `persistWorker` shape — the atomic rename without the
+            // pre-rename fsync (TS's `writeFileAtomicSync` fsync is
+            // opt-in and the descriptor family never requests it) — and
+            // the create-completion persist (`launch_worker`'s
+            // post-create write) re-establishes the durable write as the
+            // metadata-survival barrier. A relaunch REPLACES an
+            // established, already-durable descriptor: it keeps the
+            // synced persist, because a torn unsynced replacement would
+            // lose the descriptor's whole payload — the recovery journal
+            // pointer and the durable create command the next boot's
+            // revival replays.
+            let _ = persist_worker_at(&resident.descriptor_path, &descriptor, spawn_record_sync);
         }
 
         // Probe the worker socket until it accepts connections, watching the
@@ -760,6 +785,17 @@ impl Supervisor {
                             events.send((ClientRouting::Broadcast, std::sync::Arc::new(payload)));
                     }
                 }
+                // The connection is gone: no reply can arrive on it any
+                // more (TS `notifyClosed` -> `rejectAll`); each waiting
+                // route fails with the dropped-request error. A stale
+                // reader drops nothing - the newer connection's handshake
+                // inserts only after its epoch bump.
+                {
+                    let mut pending = reader_resident.pending.lock().await;
+                    if reader_resident.connection_is_current(connection_epoch) {
+                        pending.clear();
+                    }
+                }
                 reader_resident.note_connection_lost(connection_epoch);
                 // The connection ended (EOF or frame error): a run without
                 // an abort request dies with the worker and rides the
@@ -826,25 +862,22 @@ impl Supervisor {
             )
             .await
             .map_err(|error| {
-                // The handshake route's timeout is the connect budget
-                // running out, not a session command timing out: report the
-                // launch-budget failure so a loaded-box launch failure says
-                // what actually happened (never the generic route timeout
-                // text, which pointed triage at the wrong seam).
-                if error.to_string() == super::routing::SESSION_WORKER_TIMED_OUT {
-                    // The worker answered nothing inside the launch budget:
-                    // its captured stderr tail rides the failure (the same
-                    // evidence the probe arm carries).
-                    crate::worker_stderr::not_ready_with_tail(
-                        anyhow!("session worker {} did not come up in time", resident.worker_id),
-                        &crate::worker_stderr::log_path(
-                            &self.options.agent_dir,
-                            &resident.worker_id,
-                        ),
-                    )
-                } else {
-                    error
-                }
+                // A handshake that never finishes is a launch failure, not a
+                // route timeout: report it with the worker's stderr tail.
+                let message = match error.to_string().as_str() {
+                    "Session worker timed out" => {
+                        format!("session worker {} did not come up in time", resident.worker_id)
+                    }
+                    WORKER_SOCKET_CLOSED => format!(
+                        "session worker {} exited before its handshake finished",
+                        resident.worker_id
+                    ),
+                    _ => return error,
+                };
+                crate::worker_stderr::not_ready_with_tail(
+                    anyhow!(message),
+                    &crate::worker_stderr::log_path(&self.options.agent_dir, &resident.worker_id),
+                )
             })?;
         if !response.success {
             return Err(anyhow!(

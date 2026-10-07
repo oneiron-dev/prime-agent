@@ -162,7 +162,11 @@ class TeardownTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.marker, True)
 
     def spawn(self, *argv: str) -> subprocess.Popen:
-        child = subprocess.Popen(list(argv), env={"PATH": "/usr/bin:/bin", "HOME": self.marker})
+        # Include the marker in argv as well as HOME: macOS `ps -E` does not
+        # consistently expose the environment for these short-lived fixtures.
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import sys, time; time.sleep(float(sys.argv[1]))", argv[-1], self.marker],
+            env={"PATH": "/usr/bin:/bin", "HOME": self.marker})
         self.addCleanup(self.reap, child)
         return child
 

@@ -55,6 +55,11 @@ fn the_fleet_models_json_loads_every_provider_and_model_unchanged() {
                     model.insert("provider".to_string(), json!(provider));
                     model.insert("api".to_string(), config["api"].clone());
                     model.insert("baseUrl".to_string(), config["baseUrl"].clone());
+                    // #3362: preserve the configured cap's provenance.
+                    model.insert(
+                        "maxTokensExplicit".to_string(),
+                        json!(definition.get("maxTokens").is_some()),
+                    );
                     let mut compat = config
                         .get("compat")
                         .and_then(Value::as_object)

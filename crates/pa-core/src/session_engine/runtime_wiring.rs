@@ -182,9 +182,15 @@ pub fn wire_session_runtime(
     let rlm_usage = Arc::new(super::rlm_usage::RlmChildUsageAttributions::new(
         session.clone(),
     ));
+    // The daemon supplies the child-session host; an embedding without
+    // one keeps the no-children behavior, whose self-rename appends the
+    // session's own `session_info` name row.
+    let subagent_host = rlm
+        .subagent_host
+        .unwrap_or_else(|| Arc::new(super::rlm_host::NoRlmChildren::new(session.clone())));
     let rlm_bridge = Arc::new(RlmHostBridge::new(
         model_registry,
-        rlm.subagent_host,
+        subagent_host,
         rlm_usage.clone(),
     ));
     register_rlm_host_handlers(&mut handlers, &rlm_bridge);
@@ -338,12 +344,14 @@ impl KernelExecutor for KernelManagerExecutor {
         let manager = self.manager.clone();
         let code = code.to_string();
         let signal = options.signal;
+        let on_late_sent_agent_message = options.on_late_sent_agent_message;
         Box::pin(async move {
             let result = manager
                 .execute(
                     &code,
                     crate::kernel::shared::ExecuteOptions {
                         signal: signal.map(crate::kernel::cancellation::AbortSignal::from_token),
+                        on_late_sent_agent_message,
                         ..Default::default()
                     },
                 )
@@ -394,6 +402,7 @@ fn convert_execute_result(
             })
             .collect(),
         sent_agent_messages: result.sent_agent_messages.unwrap_or_default(),
+        bash_commands: result.bash_commands,
     }
 }
 
@@ -403,10 +412,12 @@ fn convert_execute_result(
 pub fn ipython_tool_options(
     provisioner: Arc<KernelProvisioner>,
     memory_limit_gb: f64,
+    on_late_sent_agent_message: Option<crate::tools::ipython::LateSentAgentMessageHandler>,
 ) -> IpythonToolOptions {
     IpythonToolOptions {
         provisioner,
         ui: None,
         memory_limit_gb,
+        on_late_sent_agent_message,
     }
 }

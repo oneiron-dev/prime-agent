@@ -1,5 +1,5 @@
 //! Golden differential tests: replay the corpus recorded from the REAL
-//! TypeScript tools (see `tests/golden/harness.mjs`) against the Rust port
+//! TypeScript tools (frozen in `tests/golden/corpus/`) against the Rust port
 //! and assert identical model-facing output.
 //!
 //! Corpus cases cover fuzzy edits, file-not-found, bash timeouts and
@@ -30,7 +30,7 @@ fn corpus(name: &str) -> serde_json::Value {
     serde_json::from_str(&std::fs::read_to_string(path).expect("corpus file")).expect("corpus JSON")
 }
 
-/// Normalize temp paths the same way harness.mjs does.
+/// Normalize temp paths to the forms the recorded corpus uses.
 fn norm_string(s: &str, tmp: &str) -> String {
     let out = s.replace(&format!("{tmp}/"), "<TMP>/");
     let re = regex_lite("golden-[A-Za-z0-9_]{6}");
@@ -127,7 +127,7 @@ async fn golden_edit_group_matches_ts() {
         let mut input = case["input"].clone();
         if case["applyPrepareArguments"].as_bool().unwrap_or(false) {
             input = crate::tools::edit::prepare_edit_arguments(input);
-            // The TS harness records the prepared input for such cases.
+            // The TS harness recorded the prepared input for such cases.
             assert_json_eq(
                 &input.clone(),
                 &case["preparedInput"].clone(),
@@ -563,10 +563,16 @@ async fn golden_ipython_group_matches_ts() {
                 None
             },
             memory_limit_gb: 0.0,
+            on_late_sent_agent_message: None,
         };
-        let result =
-            ipython::execute_ipython(&options, case["code"].as_str().expect("code"), None, None)
-                .await;
+        let result = ipython::execute_ipython(
+            &options,
+            case["code"].as_str().expect("code"),
+            None,
+            None,
+            None,
+        )
+        .await;
         let recorded = &case["result"];
         match result {
             Ok(result) => {
@@ -627,6 +633,7 @@ fn golden_schema_group_matches_ts() {
             "ipython" => crate::tools::ipython::create_ipython_tool_definition(
                 "/tmp",
                 IpythonToolOptions {
+                    on_late_sent_agent_message: None,
                     provisioner: Arc::new(MockProvisioner {
                         kernel: Arc::new(MockKernel {
                             executions: Mutex::new(Vec::new()),
@@ -709,10 +716,17 @@ async fn ipython_places_memory_notices_around_the_cell_output() {
         provisioner: mock_provisioner(vec![MockOutcome::Ok(Box::new(stopped))]),
         ui: None,
         memory_limit_gb: 16.0,
+        on_late_sent_agent_message: None,
     };
-    let result = ipython::execute_ipython(&options, "frames = load()", None, None)
-        .await
-        .expect("the cell settles");
+    let result = ipython::execute_ipython(
+        &options,
+        "frames = load()",
+        None,
+        None,
+        /*on_late_sent_agent_message*/ None,
+    )
+    .await
+    .expect("the cell settles");
     assert_eq!(
         (
             result.content[0].as_text(),
@@ -754,6 +768,7 @@ fn ipython_description_states_the_memory_ceiling_only_while_the_ladder_is_on() {
                 provisioner: mock_provisioner(Vec::new()),
                 ui: None,
                 memory_limit_gb,
+                on_late_sent_agent_message: None,
             },
         )
         .description

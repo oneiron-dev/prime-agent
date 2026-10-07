@@ -37,6 +37,9 @@ const READ_POLL: Duration = Duration::from_millis(50);
 pub(crate) struct DaemonClient {
     socket_path: PathBuf,
     reader: BufReader<Box<dyn BlockingTransportStream>>,
+    /// Bytes of a line whose newline has not arrived yet, kept across poll
+    /// timeouts and reads.
+    partial_line: Vec<u8>,
     writer: Box<dyn BlockingTransportStream>,
     hello: Option<serde_json::Value>,
     daemon_closing_reason: Option<String>,
@@ -65,10 +68,14 @@ impl DaemonClient {
 
     fn connect_raw(socket_path: &Path) -> std::io::Result<Self> {
         let stream = connect_blocking(socket_path)?;
+        // Darwin rejects socket options after peer close, even with a reply
+        // still queued. Configure polling before any request can be sent.
+        stream.set_read_timeout(READ_POLL)?;
         let writer = stream.try_clone_box()?;
         Ok(DaemonClient {
             socket_path: socket_path.to_path_buf(),
             reader: BufReader::new(stream),
+            partial_line: Vec::new(),
             writer,
             hello: None,
             daemon_closing_reason: None,
@@ -179,12 +186,7 @@ impl DaemonClient {
         operation: Operation<'_>,
     ) -> Result<String> {
         loop {
-            self.reader
-                .get_mut()
-                .set_read_timeout(READ_POLL)
-                .map_err(|error| anyhow!("daemon socket error: {error}"))?;
-            let mut line = String::new();
-            let read = self.reader.read_line(&mut line);
+            let read = self.reader.read_until(b'\n', &mut self.partial_line);
             match read {
                 Ok(0) => {
                     let reason = self
@@ -198,6 +200,9 @@ impl DaemonClient {
                     ));
                 }
                 Ok(_) => {
+                    let line = String::from_utf8(std::mem::take(&mut self.partial_line)).map_err(
+                        |_| anyhow!("daemon socket error: stream did not contain valid UTF-8"),
+                    )?;
                     if line.trim().is_empty() {
                         continue;
                     }
@@ -317,8 +322,72 @@ mod tests {
         });
         let mut client = DaemonClient::connect(&socket).unwrap();
         let response = client.request(list_command("daemon_1")).unwrap();
-        assert!(response.success);
-        assert!(server.join().is_ok());
+        assert_eq!(
+            response,
+            DaemonResponse {
+                id: Some("daemon_1".to_string()),
+                command: "list".to_string(),
+                success: true,
+                data: Some(json!({ "sessions": [] })),
+                error: None,
+                error_info: None,
+            }
+        );
+        server.join().unwrap();
+    }
+
+    /// The peer has closed before either read starts. Drain the replies,
+    /// including any bytes read ahead into the reader's buffer.
+    #[test]
+    fn read_line_drains_replies_after_peer_close() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            writer
+                .write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n")
+                .unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(request["command"]["id"], request["id"]);
+            let id = request["id"].as_str().unwrap();
+            let replies = [
+                "{\"id\":\"daemon_other\",\"type\":\"response\",\"command\":\"list\",\"success\":true,\"data\":{\"sessions\":[]}}\n"
+                    .to_string(),
+                format!(
+                    "{{\"id\":\"{id}\",\"type\":\"response\",\"command\":\"list\",\"success\":true,\"data\":{{\"sessions\":[]}}}}\n"
+                ),
+            ];
+            writer.write_all(replies.concat().as_bytes()).unwrap();
+            replies
+        });
+        let mut client = DaemonClient::connect(&socket).unwrap();
+        let hello = client.wait_for_hello(HELLO_TIMEOUT_MS).unwrap();
+        let envelope = json!({
+            "type": "command",
+            "id": "daemon_1",
+            "protocol": daemon_protocol(&hello).unwrap(),
+            "clientId": client.protocol_client_id,
+            "command": list_command("daemon_1"),
+        });
+        writeln!(client.writer, "{envelope}").unwrap();
+        client.writer.flush().unwrap();
+        // Joining observes both peer handles being dropped, without a sleep.
+        let replies = server.join().unwrap();
+        for expected in replies {
+            let line = client
+                .read_line(
+                    Instant::now() + Duration::from_millis(REQUEST_TIMEOUT_MS),
+                    REQUEST_TIMEOUT_MS,
+                    Operation::Command("list"),
+                )
+                .unwrap();
+            assert_eq!(line, expected);
+        }
     }
 
     #[test]
@@ -366,5 +435,72 @@ mod tests {
         );
         assert!(text.contains("Socket: "), "{text}");
         server.join().unwrap();
+    }
+
+    /// Replays scripted reads; `None` is a poll timeout.
+    #[derive(Debug)]
+    struct ScriptedReads(std::collections::VecDeque<Option<&'static [u8]>>);
+
+    impl std::io::Read for ScriptedReads {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                Some(Some(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(None) => Err(std::io::ErrorKind::WouldBlock.into()),
+                None => Ok(0),
+            }
+        }
+    }
+
+    impl std::io::Write for ScriptedReads {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl BlockingTransportStream for ScriptedReads {
+        fn try_clone_box(&self) -> std::io::Result<Box<dyn BlockingTransportStream>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        fn set_read_timeout(&self, _: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A line split by poll timeouts, one of them inside a multi-byte
+    /// character, comes back whole.
+    #[test]
+    fn read_line_keeps_bytes_across_poll_timeouts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let mut client = DaemonClient::connect(&socket).unwrap();
+        let line: &'static [u8] = "{\"type\":\"daemon_hello\",\"name\":\"é\"}\n".as_bytes();
+        let split = line.len() - 4; // between the two bytes of "é"
+        client.reader = BufReader::new(Box::new(ScriptedReads(
+            [
+                Some(&line[..10]),
+                None,
+                Some(&line[10..split]),
+                None,
+                Some(&line[split..]),
+            ]
+            .into(),
+        )));
+        let read = client
+            .read_line(
+                Instant::now() + Duration::from_secs(10),
+                10_000,
+                Operation::Handshake,
+            )
+            .unwrap();
+        assert_eq!(read.as_bytes(), line);
     }
 }

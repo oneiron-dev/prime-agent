@@ -42,6 +42,7 @@ async fn engine_runs_tool_loop_and_persists() {
         cost: pa_agent::types::UsageCost::default(),
         context_window: 1_000,
         max_tokens: 100,
+        max_tokens_explicit: false,
     };
     let provider = Arc::new(ScriptedProvider::new(model.clone()));
     // First turn: call the tool. Second turn: final text.
@@ -55,6 +56,8 @@ async fn engine_runs_tool_loop_and_persists() {
     let cwd = tmp.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
     let engine = create_session(SessionEngineConfig {
+        on_late_sent_agent_message: None,
+        semantic_edges: None,
         cron_store: None,
         queued_steering_probe: None,
         image_model_router: None,
@@ -152,12 +155,15 @@ async fn spawned_child_prompt_stamps_its_depth() {
         cost: pa_agent::types::UsageCost::default(),
         context_window: 1_000,
         max_tokens: 100,
+        max_tokens_explicit: false,
     };
     let provider = Arc::new(ScriptedProvider::new(model.clone()));
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
     let engine = create_session(SessionEngineConfig {
+        on_late_sent_agent_message: None,
+        semantic_edges: None,
         cron_store: None,
         queued_steering_probe: None,
         image_model_router: None,
@@ -219,6 +225,7 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
             cost: pa_agent::types::UsageCost::default(),
             context_window: 1_000,
             max_tokens: 100,
+            max_tokens_explicit: false,
         }
     }
 
@@ -228,6 +235,8 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
         stream_fn: pa_agent::stream::StreamFn,
     ) -> SessionEngineConfig {
         SessionEngineConfig {
+            on_late_sent_agent_message: None,
+            semantic_edges: None,
             cron_store: None,
             queued_steering_probe: None,
             image_model_router: None,
@@ -404,6 +413,7 @@ async fn loop_requests_carry_the_provider_session_id() {
             cost: pa_agent::types::UsageCost::default(),
             context_window: 1_000,
             max_tokens: 100,
+            max_tokens_explicit: false,
         };
         let provider = Arc::new(ScriptedProvider::new(model.clone()));
         provider.push_tool_call_turn(
@@ -513,6 +523,7 @@ async fn affinity_configuration_reports_at_assembly_and_model_switch() {
                     client: client.clone(),
                     execution_mode: Some("interactive".to_string()),
                     now: None,
+                    telemetry_enabled: None,
                 }),
                 rlm_depth,
                 ..Default::default()

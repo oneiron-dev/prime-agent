@@ -3,6 +3,17 @@
 These rules mirror the repo standards in AGENTS.md - update both whenever
 either changes.
 
+## Repository identity
+
+- Repository commits use only the ambient Git identity. Never configure or override author/committer names or emails for repository history. Missing identity is an error to report, not repair with configuration.
+- Never add `Co-authored-by` or other assistant attribution trailers.
+
+## Performance and the critical path
+
+- First paint and user-visible frames must never await network, disk sync, telemetry delivery, or background bookkeeping. Hand work to its owning background worker and return.
+- Telemetry delivery is fire-and-forget from startup, session creation, tab opening, and render paths. Timeout, retry, and ordering belong to the delivery worker.
+- A changed fire-and-forget boundary needs a red-first test with a hanging sink. Offline or mocked delivery alone cannot prove paint stays unblocked. Keep `the_startup_flush_never_blocks_the_first_frame` as the launch-path guard.
+
 ## No legacy or migration scaffolding
 
 - When a migration or refactor completes within a PR, its staging scaffolding must be deleted, not kept: no type aliases where two names point at one type, no re-exports "for compatibility" without a live external consumer, no migration-era vocabulary ("staged", "legacy", "new-style") surviving in names, comments, or test titles.
@@ -53,6 +64,11 @@ either changes.
 - Zero-warning posture: the merge gates run clippy at `-D warnings`, so any new warning is a merge blocker. Flag new warnings and any suppression added to hide one.
 - Every inline `#[allow(...)]` or lint exception states its reason in a comment next to it; flag unexplained or broad exceptions. Advisory ignores in `deny.toml` need a reason and a review date.
 - New lint families land whole-site: enabling a family requires fixing every current site in the same change. Flag partial enablements.
+
+## Branding and wire compatibility
+
+- Brand user-visible docs, CLI help, errors, onboarding, TUI labels and quoted user-facing comments as Prime Agent, not pi/pi-mono/pi-ai or Prime Intellect.
+- Preserve byte-compatible TS wire identifiers (`PI_PACKAGE_DIR`, settings/env keys, provider IDs such as `prime-inference`, and `ai.primeintellect.prime-agent` namespaces). Parity beats branding on the wire; require the PR to list preserved identifiers.
 
 ## Generated files
 

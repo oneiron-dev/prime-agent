@@ -129,7 +129,9 @@ pub enum EngineEvent {
     /// carry the aborted/error row), like the TS session's loop-event
     /// forwarding. The rows themselves persist and broadcast through
     /// their own events; this frame carries only the accumulated payload.
-    AgentEnd { messages: Vec<Value> },
+    AgentEnd {
+        messages: Vec<Value>,
+    },
     /// A durable custom message (wire `role: "custom"`): recorded into the
     /// session store and shown to attached clients. Emitted as a
     /// `message_start` + `message_end` pair, matching the TS session's
@@ -138,12 +140,17 @@ pub enum EngineEvent {
     /// A compaction run started (TS `compaction_start` wire event); the
     /// payload is the complete event. Emitted before the summarizer runs so
     /// attached clients can swap their loader to the compaction label.
-    CompactionStart { event: Value },
+    CompactionStart {
+        event: Value,
+    },
     /// A compaction settled (TS `compaction_end` wire event): `entry` is the
     /// `compaction` record to persist (null when the run skipped or
     /// failed), `event` the complete client-facing event (result on
     /// success, errorMessage with its severity otherwise).
-    Compaction { entry: Value, event: Value },
+    Compaction {
+        entry: Value,
+        event: Value,
+    },
     /// The prompt completed (successfully or not).
     Done(std::result::Result<(), String>),
     /// The prompt settled as aborted: the run was aborted before an
@@ -157,12 +164,16 @@ pub enum EngineEvent {
     /// `goal_update`: the session goal state changed (TS wire event; the
     /// ACP adapter surfaces it as the namespaced `_meta.goal` update).
     /// The payload is the TS `GoalState` wire object.
-    GoalUpdate { goal: Value },
+    GoalUpdate {
+        goal: Value,
+    },
     /// `auto_retry_start`: a provider failure is being retried (TS wire
     /// event; the interactive transcript shows the retry countdown). A
     /// `Backup` reason is a provider-failover switch: the failed turn
     /// re-routes to another configured provider serving the same model and
-    /// re-issues immediately.
+    /// re-issues immediately. `ConnectionReset` refreshes the current provider
+    /// once at delay zero, outside the ordinary retry budget; its wire reason
+    /// is the existing optional string field, `"connection_reset"`.
     AutoRetryStart {
         attempt: u32,
         max_attempts: u32,
@@ -178,6 +189,12 @@ pub enum EngineEvent {
         attempt: u32,
         final_error: Option<String>,
         restored_model: Option<String>,
+    },
+    RefineComplete {
+        result: Value,
+    },
+    RefineFailed {
+        error: String,
     },
 }
 
@@ -329,6 +346,22 @@ pub struct RlmSessionIdentity {
     /// `sessionConfig`; the harness analog carries the create's
     /// `childScript` down the recursion). Product sessions carry `None`.
     pub child_script: Option<String>,
+    /// The session's semantic-edge spawn origin (TS
+    /// `semanticParentSessionId` + `semanticSpawnedByRequestId`, carried
+    /// by a subagent create): `Some` only for a create whose runtime
+    /// metadata declares `kind: "subagent"` — a resumed saved subagent
+    /// file is a top-level runtime and spawns no edge, and a replacement
+    /// runtime has none.
+    pub semantic_spawn: Option<SemanticSpawnOrigin>,
+}
+
+/// A created session's semantic-edge provenance (TS
+/// `semanticParentSessionId`/`semanticSpawnedByRequestId`): the parent's
+/// durable session id and the request whose turn spawned this child.
+#[derive(Debug, Clone)]
+pub struct SemanticSpawnOrigin {
+    pub parent_session_id: Option<String>,
+    pub spawned_by_request_id: Option<String>,
 }
 
 /// The resource snapshot for a session without a resource surface (the TS

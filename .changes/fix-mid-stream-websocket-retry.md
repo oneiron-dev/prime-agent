@@ -1,0 +1,1 @@
+- Retry interrupted WebSocket responses from committed context with exactly 2s, 4s and 8s waits, at most three retries. Discard failed sockets and partial replies, preserve completed tools, and replace failed partial content in the live and reloaded transcript. Direct print/json uses the same session retry driver.

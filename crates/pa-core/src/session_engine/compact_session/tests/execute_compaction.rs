@@ -24,6 +24,7 @@ async fn execute_compaction_persists_and_rebuilds() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
@@ -115,6 +116,7 @@ async fn rebuilt_live_context_prevents_repeat_auto_compaction_until_new_usage() 
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
@@ -205,6 +207,7 @@ async fn execute_compaction_streams_summary_deltas_to_the_sink() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: Some(sink),
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
@@ -317,6 +320,7 @@ async fn split_turn_compaction_streams_in_final_order_and_converges() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: Some(sink),
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
@@ -443,6 +447,7 @@ async fn execute_compaction_attaches_harness_digest_snapshot() {
             abort: None,
             harness_digest: Some(inputs),
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
@@ -559,6 +564,7 @@ async fn execute_compaction_fails_on_an_error_summarizer_response() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
@@ -601,6 +607,7 @@ async fn durable_compaction_row_carries_the_ts_record() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),

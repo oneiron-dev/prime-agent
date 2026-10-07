@@ -67,6 +67,7 @@ async fn second_compaction_updates_the_prior_summary_over_new_history() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
@@ -97,6 +98,7 @@ async fn second_compaction_updates_the_prior_summary_over_new_history() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
@@ -237,6 +239,7 @@ async fn second_compaction_request_carries_the_anchor_and_strips_file_blocks() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
@@ -301,6 +304,7 @@ async fn second_compaction_request_carries_the_anchor_and_strips_file_blocks() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
@@ -419,6 +423,7 @@ async fn second_compaction_split_turn_history_updates_prefix_does_not() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),
@@ -455,6 +460,7 @@ async fn second_compaction_split_turn_history_updates_prefix_does_not() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests:
                 crate::session_engine::compaction_exec::SummaryRequestOptions::default(),

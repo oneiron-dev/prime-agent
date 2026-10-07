@@ -31,6 +31,10 @@ pub enum StreamFailureKind {
     Auth,
     Permission,
     InvalidRequest,
+    /// The exact Responses `websocket_connection_limit_reached` code.
+    /// The session may refresh the connection once per committed generation,
+    /// outside its ordinary retry budget; a repeated cap is terminal.
+    ConnectionLimit,
     MalformedResponse,
     /// The provider ended the response stream without its terminal marker:
     /// mid-block, no stop signal, no error frame (the connection just
@@ -497,29 +501,25 @@ impl ProviderConnectionError {
     }
 }
 
-/// A WebSocket transport failure thrown out of a provider stream:
-/// `Display` is the raw short text (verbatim, like the TS). The codex WS
-/// path keeps its unclassified runtime surface (`transport: None`): the
-/// diagnostic records the runtime WS error class name —
-/// `WebSocketCloseError` for close events, plain `Error` otherwise — plus
-/// the numeric close code. The generic Responses WS path carries the
-/// structured detail (TS `WebSocketTransportError`): the failure classifies
-/// as kind `transport` with provider error type `websocket_<cause>`.
+/// A WebSocket transport failure with independent classification and
+/// diagnostic identity. Codex preserves its runtime class and numeric
+/// code; generic Responses uses the structured transport class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderWsTransportError {
     pub message: String,
     pub close_code: Option<u16>,
-    /// The structured transport classification, when the transport
-    /// records one (the generic Responses WebSocket path).
+    /// Explicit runtime class, when the provider preserves one.
+    pub sdk_name: Option<String>,
     pub transport: Option<StreamTransportFailureDetail>,
 }
 
 impl ProviderWsTransportError {
-    /// The TS runtime/WS error class name recorded in the diagnostic
-    /// (`error.name`): the structured class for the generic transport,
-    /// otherwise the close-code presence decides it.
+    /// The diagnostic class, independent of the retry classification.
     #[must_use]
-    pub fn error_name(&self) -> &'static str {
+    pub fn error_name(&self) -> &str {
+        if let Some(name) = self.sdk_name.as_deref() {
+            return name;
+        }
         match (&self.transport, self.close_code) {
             (Some(_), _) => "WebSocketTransportError",
             (None, Some(_)) => "WebSocketCloseError",
@@ -527,14 +527,13 @@ impl ProviderWsTransportError {
         }
     }
 
-    /// The TS diagnostic's `error.code`: the codex close error carries the
-    /// numeric close code; the structured transport error has no `code`
-    /// property (its close code lives in the classification detail).
+    /// Codex keeps its numeric runtime code even with transport detail.
     #[must_use]
     pub fn diagnostic_code(&self) -> Option<u16> {
-        match self.transport {
-            Some(_) => None,
-            None => self.close_code,
+        if self.sdk_name.is_some() || self.transport.is_none() {
+            self.close_code
+        } else {
+            None
         }
     }
 }
@@ -627,48 +626,25 @@ impl From<ProviderHttpError> for ProviderError {
     }
 }
 
-const KIND_MESSAGES: &[(StreamFailureKind, &str)] = &[
-    (StreamFailureKind::Refusal, "Model refused to respond"),
-    (
-        StreamFailureKind::Safety,
-        "Response blocked by provider safety filters",
-    ),
-    (StreamFailureKind::Overloaded, "Provider overloaded"),
-    (StreamFailureKind::RateLimit, "Provider rate limit exceeded"),
-    (StreamFailureKind::ServerError, "Provider server error"),
-    (StreamFailureKind::Auth, "Provider authentication failed"),
-    (
-        StreamFailureKind::Permission,
-        "Provider denied access to the requested resource",
-    ),
-    (
-        StreamFailureKind::InvalidRequest,
-        "Provider rejected the request",
-    ),
-    (
-        StreamFailureKind::MalformedResponse,
-        "Provider returned a malformed response",
-    ),
-    (
-        StreamFailureKind::PaymentRequired,
-        "Provider requires payment",
-    ),
-    (
-        StreamFailureKind::StreamDrop,
-        "Provider dropped the response stream",
-    ),
-    (
-        StreamFailureKind::Transport,
-        "Connection to the provider was lost before the response completed",
-    ),
-    (StreamFailureKind::Unknown, "Provider stream failed"),
-];
-
 fn kind_message(kind: StreamFailureKind) -> &'static str {
-    KIND_MESSAGES
-        .iter()
-        .find(|(candidate, _)| *candidate == kind)
-        .map_or("Provider stream failed", |(_, message)| *message)
+    match kind {
+        StreamFailureKind::Refusal => "Model refused to respond",
+        StreamFailureKind::Safety => "Response blocked by provider safety filters",
+        StreamFailureKind::PaymentRequired => "Provider requires payment",
+        StreamFailureKind::Overloaded => "Provider overloaded",
+        StreamFailureKind::RateLimit => "Provider rate limit exceeded",
+        StreamFailureKind::ServerError => "Provider server error",
+        StreamFailureKind::Auth => "Provider authentication failed",
+        StreamFailureKind::Permission => "Provider denied access to the requested resource",
+        StreamFailureKind::InvalidRequest => "Provider rejected the request",
+        StreamFailureKind::ConnectionLimit => "Provider connection reached its limit",
+        StreamFailureKind::MalformedResponse => "Provider returned a malformed response",
+        StreamFailureKind::StreamDrop => "Provider dropped the response stream",
+        StreamFailureKind::Transport => {
+            "Connection to the provider was lost before the response completed"
+        }
+        StreamFailureKind::Unknown => "Provider stream failed",
+    }
 }
 
 /// Build a user-facing message like "Provider overloaded (`overloaded_error`, 529) [`request_id`: `req_abc`]".

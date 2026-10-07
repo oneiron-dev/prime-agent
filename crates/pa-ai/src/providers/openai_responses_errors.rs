@@ -15,6 +15,7 @@ use serde_json::{Map, Value};
 
 use crate::utils_inner::stream_failure::{
     classify_stream_failure, stream_failure_message, StreamFailureError, StreamFailureInfo,
+    StreamFailureKind,
 };
 
 /// Bound on the user-facing message (TS `redactErrorText` default).
@@ -117,11 +118,17 @@ fn parse_responses_error_frame(event: &Value) -> ResponsesErrorFrame {
 
 /// The classified failure a Responses `error` event raises (the TS
 /// `processResponsesStream` error arm): provider type, separate code, and
-/// status classify the kind; the redacted message is the detail.
+/// status classify the kind; the exact connection-cap code has its own
+/// session-refresh kind. The redacted message is the detail.
 pub(crate) fn responses_error_event_failure(event: &Value) -> StreamFailureError {
     let frame = parse_responses_error_frame(event);
     let info = StreamFailureInfo {
-        kind: classify_stream_failure(frame.provider_error_type.as_deref(), frame.status),
+        kind: if frame.provider_error_code.as_deref() == Some("websocket_connection_limit_reached")
+        {
+            StreamFailureKind::ConnectionLimit
+        } else {
+            classify_stream_failure(frame.provider_error_type.as_deref(), frame.status)
+        },
         provider_error_type: frame.provider_error_type,
         provider_error_code: frame.provider_error_code,
         status: frame.status,
@@ -143,7 +150,6 @@ pub(crate) fn responses_error_event_failure(event: &Value) -> StreamFailureError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils_inner::stream_failure::StreamFailureKind;
     use serde_json::json;
 
     /// The flat `OpenAI` frame: the code is both the provider type and code.

@@ -105,7 +105,7 @@ fn armed_keys_route_to_the_editor_and_the_cancels_disarm() {
     // ctrl+n (the new-session action) is disabled while armed.
     mode.handle_key("ctrl+n");
     assert!(matches!(&mode.composer, Composer::Reply(_)));
-    assert!(!mode.new_session);
+    assert!(mode.opened.is_none());
     // Esc disarms; the query stays untouched (the composer never owned
     // it).
     mode.handle_key("escape");
@@ -376,7 +376,11 @@ fn the_reply_hints_follow_the_target_state() {
     with_text.handle_key("h");
     assert_eq!(
         flat(&with_text.render_hints(120, None)),
-        "Enter send   Alt+Enter queue   Esc/Ctrl+C cancel"
+        if cfg!(target_os = "macos") {
+            "Enter send   Option+Enter queue   Esc/Ctrl+C cancel"
+        } else {
+            "Enter send   Alt+Enter queue   Esc/Ctrl+C cancel"
+        }
     );
     let saved = armed_saved();
     assert_eq!(

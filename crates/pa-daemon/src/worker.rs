@@ -44,8 +44,8 @@ use create::{active_session_id_of, worker_server_capabilities};
 // does not use it), so the unused-import lint is allowed deliberately here.
 #[allow(unused_imports)]
 pub(crate) use summary::{
-    compact_action_label, emit_worker_event_with, push_roster_delta, session_snapshot,
-    session_summary, RosterPushContext,
+    compact_action_label, emit_worker_event_with, persist_custom_row, push_roster_delta,
+    session_snapshot, session_summary, RosterPushContext,
 };
 use turn::TurnRunner;
 
@@ -92,9 +92,9 @@ use crate::peer::{
 };
 use crate::protocol::{
     create_daemon_event_meta, create_daemon_replay_info, current_protocol_info,
-    default_client_capabilities, default_server_capabilities, normalize_client_capabilities,
-    response_failure, response_success, DaemonOutbound, DaemonResponse, DaemonResumeCursor,
-    DaemonSessionClosedReason, DAEMON_APP_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
+    default_client_capabilities, normalize_client_capabilities, response_failure, response_success,
+    DaemonOutbound, DaemonResponse, DaemonResumeCursor, DaemonSessionClosedReason,
+    DAEMON_APP_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
 };
 use crate::registration::RegistrationHandle;
 use crate::session_store::{session_file_name, SessionFile};
@@ -103,6 +103,15 @@ use crate::types::{AgentConnectionState, SessionActionSnapshot};
 
 pub struct Worker {
     pub(crate) config: WorkerConfig,
+    /// The bind-time filesystem identity of this worker's own socket file
+    /// (TS daemon-mode captures `socketIdentity` in the listen callback,
+    /// daemon-mode.ts:718): the exit cleanups pass it as the unlink's
+    /// expected identity, so a file REPLACED at the path after this bind -
+    /// a successor worker the supervisor relaunches on the same
+    /// deterministic path - is never unlinked by this process (the
+    /// D-state-survivor late-exit edge). `None` until `serve` binds
+    /// (named pipes keep `None`: there is no file to stat).
+    pub(crate) bound_socket_identity: std::sync::Mutex<Option<crate::socket::SocketIdentity>>,
     /// Supervisor self-registration handle; `None` for standalone workers.
     registration: Option<RegistrationHandle>,
     /// Live connections authenticated as the supervisor role. A non-zero
@@ -122,7 +131,7 @@ pub struct Worker {
     /// carries the counter's value for the supervisor's stale-delta gate.
     roster_delta_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(crate) work_notify: Arc<Notify>,
-    idle_notify: Arc<Notify>,
+    pub(crate) idle_notify: Arc<Notify>,
     /// The per-connection session-attach registry (the fresh bots'
     /// release findings): connection tokens -> the client ids their
     /// `attach` retained. The release is connection-scoped on EVERY
@@ -188,6 +197,17 @@ pub struct Worker {
     /// the worker rebinds the live session's jobs onto it after create
     /// and every replacement swap (TS `rebindCronJobsToState`).
     pub(crate) scheduled: std::sync::Arc<crate::scheduled_jobs::ScheduledJobs>,
+    /// The session's Herdr reporter (the built-in connector): starts
+    /// disabled and is (re)bound at `create` from the create payload's
+    /// client env — the session's own pane identity, never this
+    /// process's boot context. Replacing it silences the old task
+    /// exactly like the TS session-shutdown arm (no release; a successor
+    /// re-reports), because the task ends when its last handle drops.
+    pub(crate) herdr: std::sync::Arc<std::sync::Mutex<crate::herdr::HerdrReporter>>,
+    /// The reporter epoch (bumped on every (re)bind): a replaced
+    /// reporter's task drops its queued boundary events instead of
+    /// flushing them over the successor's pane state.
+    pub(crate) herdr_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Session creation is one serialized critical section (TS
     /// `openingSessions`: a concurrent open for the same session JOINS
     /// the in-flight one instead of racing it). Commands run on spawned
@@ -336,6 +356,7 @@ impl Worker {
             active_action: None,
             tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
             running_tool_calls: std::collections::HashSet::new(),
+            running_admission_ids: std::collections::HashSet::new(),
         };
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
@@ -376,6 +397,15 @@ impl Worker {
         // The session input-pause table (the admission gate): shared by
         // the worker's arms and the turn runner below.
         let input_pauses = crate::session_input_pause::InputPauseTable::new();
+        // The shared pane-reporter slot: the worker binds it at create and
+        // the turn runner reads it at every boundary (a slot, not a
+        // snapshot, so a create-time rebind reaches the runner too).
+        let herdr_slot =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::herdr::HerdrReporter::default()));
+        // The reporter epoch shared with every reporter the worker
+        // starts: a rebind bumps it so the replaced task drops its
+        // queued boundary events instead of flushing them.
+        let herdr_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         // The worker's prompt-admission registry: shared with the turn
         // runner (the commit happens at turn start).
         let prompt_admissions = crate::prompt_admission::WorkerAdmissions::new();
@@ -594,6 +624,22 @@ impl Worker {
                     );
                 });
                 concrete.set_goal_admission(probe, sink, queue_purge);
+                let late_core = Arc::clone(&core);
+                let late_events = Arc::clone(&events);
+                concrete.set_late_agent_message_sink(std::sync::Arc::new(
+                    move |tool_call_id, message| {
+                        let wire = pa_core::sent_agent_message_json(&message);
+                        crate::user_bash::emit_session_event_frame(
+                            &late_core,
+                            &late_events,
+                            serde_json::json!({
+                                "type": "ipython_sent_agent_message",
+                                "toolCallId": tool_call_id,
+                                "message": wire,
+                            }),
+                        );
+                    },
+                ));
                 // The settled-child kernel release's registered-jobs gate
                 // (TS #2483's `canPassivateSettledSession`
                 // `hasRegisteredCronJob`): the release defers while this
@@ -699,11 +745,20 @@ impl Worker {
                     roster_push_order: std::sync::Arc::clone(&roster_push_order),
                 });
             crate::roster_activity::spawn_roster_activity_watch(&events, roster_pushes.clone());
+            if let Some(children) = agent_engine
+                .as_ref()
+                .and_then(|engine| engine.children.as_ref())
+            {
+                crate::roster_activity::spawn_running_children_watch(
+                    children,
+                    roster_pushes.clone(),
+                );
+            }
             let runner = TurnRunner {
                 recovery: Arc::clone(&recovery),
                 core: Arc::clone(&core),
                 input_pauses: input_pauses.clone(),
-                prompt_admissions,
+                prompt_admissions: prompt_admissions.clone(),
                 work_notify: Arc::clone(&work_notify),
                 idle_notify: Arc::clone(&idle_notify),
                 events: events.clone(),
@@ -716,6 +771,7 @@ impl Worker {
                     link: Arc::clone(&roster_link),
                     worker_token,
                 },
+                herdr: std::sync::Arc::clone(&herdr_slot),
             };
             tokio::spawn(async move {
                 runner.run().await;
@@ -757,13 +813,13 @@ impl Worker {
             remote_source: None,
             probe_override: None,
         });
-        let prompt_admissions = crate::prompt_admission::WorkerAdmissions::new();
         let navigation = crate::session_navigation::SessionNavigation::new(
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),
         );
         Worker {
             config,
+            bound_socket_identity: std::sync::Mutex::new(None),
             registration,
             supervisor_claims,
             core,
@@ -793,9 +849,24 @@ impl Worker {
             navigation,
             prompt_admissions,
             scheduled,
+            herdr: std::sync::Arc::clone(&herdr_slot),
+            herdr_generation: std::sync::Arc::clone(&herdr_generation),
             create_gate: tokio::sync::Mutex::new(()),
             replacement_gate: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// The Herdr session reference the reports carry (TS
+    /// `agent_session_path` / `agent_session_id`): the session file when
+    /// the session has one, otherwise the session id.
+    pub(crate) fn herdr_session_ref(core: &SessionCore) -> crate::herdr::HerdrSessionRef {
+        let store = core.store.as_ref();
+        crate::herdr::HerdrSessionRef::new(
+            store
+                .filter(|store| !store.path.as_os_str().is_empty())
+                .map(|store| store.path.to_string_lossy().to_string()),
+            store.map(|store| store.session_id().to_string()),
+        )
     }
 
     /// The durable tail of a successful close: the resume entry, the
@@ -810,10 +881,13 @@ impl Worker {
         // A graceful exit owns its socket file: remove it now so a respawn
         // does not wait out the stale-socket path (a killed worker cannot
         // clean up, but its killer relaunches through
-        // `prepare_socket_path`).
+        // `prepare_socket_path`). The bind-time identity (captured in
+        // `serve`) is the unlink's expected identity, so a REPLACED file
+        // at the path - a successor worker's live socket - survives this
+        // exit (TS daemon-mode.ts:1078-1080).
         crate::socket::cleanup_socket_path(
             &self.config.socket_path,
-            crate::socket::socket_identity(&self.config.socket_path),
+            self.bound_socket_identity.lock().unwrap().clone(),
         );
         std::process::exit(0)
     }
@@ -844,6 +918,47 @@ impl Worker {
 /// level: sequence + meta under the core lock, then one broadcast (the
 /// free-standing form of `Worker::emit_worker_event`, shared with the
 /// goal admission sink).
+pub(crate) fn refine_complete_event(
+    result: &pa_core::refinement::RefinementResult,
+) -> serde_json::Value {
+    json!({
+        "type": "refine_complete",
+        "result": serde_json::to_value(result).unwrap_or(Value::Null),
+    })
+}
+
+/// Send a background refinement result only if the session that started
+/// the review is still current. Hold the core lock through the broadcast so
+/// navigation cannot move the event onto a different session.
+fn emit_refinement_event_for_session(
+    core: &Arc<Mutex<SessionCore>>,
+    events: &Arc<EventPump>,
+    review_session_id: &str,
+    event: Value,
+) -> bool {
+    let mut core = core.lock().unwrap();
+    if core.store.as_ref().map(SessionFile::session_id) != Some(review_session_id) {
+        return false;
+    }
+    let sequence = core.last_event_sequence + 1;
+    core.last_event_sequence = sequence;
+    let meta = crate::protocol::create_daemon_event_meta(
+        &core.active_session_id,
+        sequence,
+        None,
+        Some(&core.generation),
+    );
+    let outbound = crate::protocol::DaemonOutbound::SessionEvent {
+        active_session_id: core.active_session_id.clone(),
+        event,
+        meta: Some(meta),
+        rest: Map::default(),
+    };
+    let payload = serde_json::to_vec(&outbound).unwrap_or_default();
+    events.send(OutboundFrame::session_event(payload));
+    true
+}
+
 /// Record one durable custom row of the background compact-trigger
 /// review and broadcast its `message_start`/`message_end` pair (the TS
 /// `_emit` for rows the session appends outside a turn): the same shape

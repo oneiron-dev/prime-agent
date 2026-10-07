@@ -448,9 +448,23 @@ fn effective_config_covers_every_definition() {
 #[test]
 fn formats_key_text() {
     assert_eq!(format_key_text("ctrl+o"), "Ctrl+O");
-    assert_eq!(format_key_text("shift+alt+up"), "Shift+Alt+\u{2191}");
+    assert_eq!(
+        format_key_text("shift+alt+up"),
+        if cfg!(target_os = "macos") {
+            "Shift+Option+\u{2191}"
+        } else {
+            "Shift+Alt+\u{2191}"
+        }
+    );
     assert_eq!(format_key_text("escape"), "Esc");
-    assert_eq!(format_key_text("ctrl+o/alt+o"), "Ctrl+O/Alt+O");
+    assert_eq!(
+        format_key_text("ctrl+o/alt+o"),
+        if cfg!(target_os = "macos") {
+            "Ctrl+O/Option+O"
+        } else {
+            "Ctrl+O/Alt+O"
+        }
+    );
 }
 
 #[test]

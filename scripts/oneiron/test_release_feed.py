@@ -184,6 +184,34 @@ class FeedFixture(unittest.TestCase):
 
 
 class PackageTests(FeedFixture):
+    def test_unpromoted_package_is_safe_with_ts_launcher_aliased_to_rust(self) -> None:
+        bin_dir = side_by_side.HOME / ".local" / "bin"
+        bin_dir.mkdir(parents=True)
+        rust_launcher = bin_dir / side_by_side.LAUNCHER_NAME
+        rust_launcher.write_text("existing launcher\n")
+        rust_launcher.chmod(0o755)
+        ts_launcher = bin_dir / side_by_side.TS_LAUNCHER_NAME
+        ts_launcher.symlink_to(side_by_side.LAUNCHER_NAME)
+
+        self.feed.mkdir(parents=True)
+        stable = self.feed / "stable"
+        latest = self.feed / "latest.json"
+        stable.write_text("v0.9.8-oneiron.20260930.1\n")
+        latest.write_text('{"version":"v0.9.8-oneiron.20260930.1"}\n')
+        before = (rust_launcher.read_bytes(), side_by_side.link_state(ts_launcher),
+                  stable.read_bytes(), latest.read_bytes())
+        staging_feed = self.root / "staging-feed"
+
+        self.assertEqual(self.package(make_package_dir(self.root / "pkg"), "--no-promote",
+                                      "--feed-dir", str(staging_feed)), 0)
+
+        self.assertEqual((rust_launcher.read_bytes(), side_by_side.link_state(ts_launcher),
+                          stable.read_bytes(), latest.read_bytes()), before)
+        self.assertFalse((staging_feed / "stable").exists())
+        self.assertFalse((staging_feed / "latest.json").exists())
+        self.assertFalse((self.prefix / "current").exists())
+        self.assertFalse((self.prefix / "previous").exists())
+
     def test_package_publishes_a_stamped_release_and_moves_the_feed_pointers(self) -> None:
         package_dir = make_package_dir(self.root / "pkg")
         stage = package_dir / f"prime-agent-{BASE}-{PLATFORM}"

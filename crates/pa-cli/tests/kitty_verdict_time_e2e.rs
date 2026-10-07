@@ -51,14 +51,11 @@
 //!    pinned to the deadline (~+250ms) — the same 200ms red/green line
 //!    separates both sides of the contract.
 //!
-//! The harness reuses the kitty-probe family's pty shape (the child claims
-//! its own session and controlling tty), which makes the app's own SIGTSTP
-//! a discarded signal for the orphaned process group — the suspend cycle
-//! completes as teardown-then-resume instead of stopping the child. The
-//! teardown bytes are written BEFORE the stop signal is raised either way,
-//! so the measurement is the stop's fate-independent prefix (and the
-//! discard keeps the test runnable in every gate shape, no runner-session
-//! contract needed).
+//! The child claims its own session and controlling tty. Linux may discard
+//! SIGTSTP for that orphaned process group; macOS can leave it stopped. The
+//! parent observes either the native child stop or the terminal remount and
+//! sends SIGCONT only to its stopped child. The teardown measurement stays
+//! before that handshake, so stop/continue scheduling cannot alter it.
 //!
 //! `PA_KITTY_VERDICT_SWEEP=1` (unset in CI — the test returns trivially)
 //! turns the same harness into the characterization sweep: the DA1-class
@@ -78,6 +75,8 @@ use std::time::{Duration, Instant};
 
 use nix::fcntl::{fcntl, FcntlArg::F_SETFL, OFlag};
 use nix::pty::{openpty, Winsize};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use serde_json::{json, Value};
 
 use pa_tui::interactive::{
@@ -579,6 +578,44 @@ impl VerdictHarness {
             "the paste-off arrived without the suspend's mouse release first — \
              the needle's writer was not the suspend teardown"
         );
+        // The release bytes precede SIGTSTP. Observe the actual stop (not
+        // merely the release) before continuing, or observe a remount when
+        // the OS discarded the orphaned group's stop signal.
+        let resumed_at = paste_at + PASTE_DISABLE.len();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.master.drain_once();
+            let mut status = 0;
+            // SAFETY: WUNTRACED queries only the child this harness spawned;
+            // WNOHANG never blocks the parent while it drains the pty.
+            let observed = unsafe {
+                libc::waitpid(
+                    self.child.id() as i32,
+                    &raw mut status,
+                    libc::WNOHANG | libc::WUNTRACED,
+                )
+            };
+            if observed > 0 {
+                assert!(
+                    libc::WIFSTOPPED(status),
+                    "the verdict child exited during suspend"
+                );
+                let mark = self.master.mark();
+                kill(Pid::from_raw(self.child.id() as i32), Signal::SIGCONT)
+                    .expect("continue the stopped verdict child");
+                self.master
+                    .wait_from(mark, b"\x1b[?2004h", "the resumed terminal remount");
+                break;
+            }
+            if contains(&self.master.output[resumed_at..], b"\x1b[?2004h") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the verdict child neither stopped nor remounted"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
         Some(t)
     }
 
@@ -632,7 +669,9 @@ impl VerdictHarness {
     }
 
     fn finish(mut self) {
-        let _ = self.child.kill();
+        if self.child.kill().is_ok() {
+            let _ = kill(Pid::from_raw(self.child.id() as i32), Signal::SIGCONT);
+        }
         // Reap the child so no zombie is left behind.
         let _ = self.child.wait();
     }
@@ -640,8 +679,10 @@ impl VerdictHarness {
 
 impl Drop for VerdictHarness {
     fn drop(&mut self) {
-        // A panicking wait must never leak the pty child.
-        let _ = self.child.kill();
+        // A panicking wait must never leak a stopped pty child.
+        if self.child.kill().is_ok() {
+            let _ = kill(Pid::from_raw(self.child.id() as i32), Signal::SIGCONT);
+        }
         let _ = self.child.wait();
     }
 }
@@ -736,7 +777,7 @@ fn spawn_child(socket: &Path, slave: &OwnedFd) -> Child {
     // and claim the pty slave as the controlling terminal.
     fn claim_controlling_tty(fd: i32) -> std::io::Result<()> {
         nix::unistd::setsid()?;
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY as libc::c_ulong, 0) };
+        let rc = unsafe { libc::ioctl(fd, libc::c_ulong::from(libc::TIOCSCTTY), 0) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error());
         }

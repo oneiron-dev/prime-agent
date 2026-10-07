@@ -1,8 +1,8 @@
 //! The whole-worker idle passivation e2e (TS `idleEvictionMinutes`):
 //! a settled RLM child's supervisor stop leaves the session file and the
-//! parent's roster row intact; a follow-up prompt to the child's live id
-//! WAKES a fresh worker over the saved file and answers; the child's
-//! delete tombstones without a live worker.
+//! parent's roster row intact; the parent's `agent_message.send` to the
+//! passivated child WAKES a fresh worker over the saved file and
+//! delivers.
 //!
 //! The test drives the worker->supervisor passivation request directly
 //! (the child worker's supervisor-link ask, replayed with the child's own
@@ -20,12 +20,15 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use pa_core::kernel::shared::{HostRequestHandlers, HostRequestPayload};
+use pa_core::session_engine::agent_messaging::register_agent_message_host_handlers;
 use pa_core::session_engine::rlm_host::{RlmSpawnRequest, RlmSubagentHost};
+use pa_daemon::agent_messaging::LinkAgentMessageController;
 use pa_daemon::rlm_children::{ParentIdentity, SupervisorChildSessions};
 use pa_daemon::supervisor_link::SupervisorLink;
 
@@ -122,13 +125,30 @@ impl Client {
     }
 }
 
-/// The kernel Python with the runtime installed (the child's kernel cell).
+/// The kernel Python with prime-agent-runtime installed; set
+/// `PA_E2E_KERNEL_PYTHON` to point at an explicit interpreter instead.
 fn kernel_python() -> Option<PathBuf> {
-    let path = std::env::var("PA_TEST_KERNEL_PYTHON")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    path.filter(|p| p.exists())
+    if let Some(explicit) = std::env::var_os("PA_E2E_KERNEL_PYTHON") {
+        let explicit = PathBuf::from(explicit);
+        assert!(
+            explicit.exists(),
+            "PA_E2E_KERNEL_PYTHON {} not found",
+            explicit.display()
+        );
+        return Some(explicit);
+    }
+    let candidate = PathBuf::from(std::env::var("HOME").map_or_else(
+        |_| "/home/ubuntu/.prime/agent/kernel-venv/bin/python".to_string(),
+        |home| format!("{home}/.prime/agent/kernel-venv/bin/python"),
+    ));
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    eprintln!(
+        "kernel python {} not found; skipping live passivation e2e",
+        candidate.display()
+    );
+    None
 }
 
 /// The worker's token from its persisted descriptor (the same lookup the
@@ -183,13 +203,12 @@ fn write_faux_script(dir: &Path, name: &str, responses: &Value) -> PathBuf {
 }
 
 /// A settled RLM child's whole-worker idle passivation: the stop keeps
-/// the parent's roster row (done — the POSITIVE verdict), a follow-up
-/// prompt WAKES a fresh worker over the child's session file and
-/// answers, and the child's delete tombstones without a live worker.
+/// the parent's roster row (done — the POSITIVE verdict), the parent's
+/// `agent_message.send` WAKES a fresh worker over the child's session
+/// file and delivers.
 #[tokio::test]
-async fn a_settled_child_passivates_stays_listable_and_revives_by_prompt() {
+async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message() {
     let Some(kernel_python) = kernel_python() else {
-        eprintln!("kernel python unavailable; skipping the passivation e2e");
         return;
     };
     let dir = tempfile::TempDir::new().expect("temp dir");
@@ -278,6 +297,7 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_prompt() {
             model: None,
             thinking: None,
             cell_source_code: None,
+            spawned_by_request_id: None,
         })
         .await
         .expect("spawn the child");
@@ -287,17 +307,6 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_prompt() {
     // this harness owns the children registry (separate from the parent
     // worker's engine), so the boundary bump is simulated here.
     children.notify_turn_done();
-
-    // The child's durable session id (the passive row keeps it; the
-    // routing id is the live-worker field TS strips at passivation —
-    // clients address a passivated session by the durable id).
-    let child_session_id = {
-        let roster = children.list_subagents().await.expect("child roster");
-        roster
-            .first()
-            .and_then(|row| row.session_id.clone())
-            .expect("the child's durable session id")
-    };
 
     // The child settles done with a resident worker.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -402,43 +411,53 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_prompt() {
         row.status
     );
 
-    // THE REVIVAL: a prompt addressed by the child's DURABLE session id
-    // wakes a fresh worker over the saved file (the route's wake arm
-    // resolves the saved session and launches). The faux engine's script
+    // THE REVIVAL: the parent's real `agent_message.send` to the child,
+    // through the same controller and handler the worker's engine wires:
+    // the send resolves the passivated child through the family view
+    // (keyed by its durable id) and wakes a fresh worker over the saved
+    // file (the supervisor's ledger wake). The faux engine's script
     // is spawn-time config (not session-file state), so the replayed
     // worker's turn runs the default provider: the response's outcome
     // depends on the host's credentials and is not asserted — the WAKE
-    // oracle is the revival prompt's row in the child's session file
+    // oracle is the delivered message's row in the child's session file
     // (only a woken worker writes it); the model-answer revival is the
     // VM census's leg (the real binary against the offline mock).
-    let child_file_rows_before = std::fs::read_to_string({
-        let roster = children
-            .list_subagents()
-            .await
-            .expect("roster for the file");
-        let row = roster
-            .iter()
-            .find(|row| row.active_session_id.as_deref() == Some(child_active_session_id.as_str()))
-            .expect("the child row");
-        std::path::Path::new(&row.session_dir).join(format!(
-            "{}.jsonl",
-            row.session_id.clone().expect("the child's session id")
-        ))
-    })
-    .map_or(0, |content| content.lines().count());
     let revive_prompt = "revive: answer again";
-    client.send_command(
-        "revive",
-        &json!({
-            "type": "prompt_and_wait",
-            "activeSessionId": child_session_id,
+    let parent_token =
+        worker_token(&agent_dir, &parent_active_session_id).expect("the parent worker's token");
+    let own_summary = json!({
+        "activeSessionId": parent_active_session_id,
+        "sessionId": parent_session_id,
+        "sessionName": "parent",
+        "runtimeKind": "top-level",
+    });
+    let children = Arc::new(children);
+    let controller = Arc::new(LinkAgentMessageController::new(
+        Arc::clone(&link),
+        parent_active_session_id.clone(),
+        parent_token,
+        Arc::new(Mutex::new(Some(own_summary))),
+        Some(Arc::clone(&children)),
+    ));
+    let mut handlers = HostRequestHandlers::default();
+    register_agent_message_host_handlers(Arc::clone(&controller) as Arc<_>, &mut handlers);
+    let send = handlers.get("agent_message.send").expect("send handler");
+    let revived = send(HostRequestPayload {
+        data: json!({
             "message": revive_prompt,
+            "receiver_role": "child",
+            "receiver_name": "parked-kid",
         }),
-    );
-    let revived = client.read_response("revive");
-    // The revival respawned a worker for the child's session (a fresh
-    // pid serves the replayed file) and the prompt's row landed in the
-    // child's session file (the delivery half of the revival).
+        cell_source_code: None,
+    })
+    .await
+    .expect("the send must wake the passivated child and deliver");
+    // The send woke a fresh worker for the child's session (a new pid
+    // serves the replayed file); the delivery's receipt arrives before
+    // the delivered turn writes its rows, so the wake's proof is the
+    // message's row itself landing in the child's session file (the
+    // revived worker serves the SAME file — its fresh routing id
+    // differs, so only a woken worker writes it).
     let deadline = Instant::now() + Duration::from_secs(15);
     let child_file = {
         let roster = children
@@ -455,25 +474,313 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_prompt() {
         ))
     };
     loop {
-        // The delivery oracle: the woken worker replayed the file and
-        // the prompt's user row landed in it (the revived worker serves
-        // the SAME file — its fresh routing id differs, so the file's
-        // growth is the wake's proof).
-        let rows_after = std::fs::read_to_string(&child_file).map_or(0, |c| c.lines().count());
-        if rows_after > child_file_rows_before {
+        let grown = std::fs::read_to_string(&child_file).unwrap_or_default();
+        if grown.contains(revive_prompt) {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the revival never delivered the prompt into the child's session file ({child_file:?}, rows {rows_after} <= {child_file_rows_before}, response: {revived})"
+            "the send never delivered the message into the child's session file ({child_file:?}, tail: {:?}, receipt: {revived:?})",
+            grown.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let grown = std::fs::read_to_string(&child_file).expect("the child session file");
-    assert!(
-        grown.contains(revive_prompt),
-        "the revival prompt never landed in the child's session file ({child_file:?}, response: {revived})"
+}
+
+/// The root active ids of the persisted worker descriptors (the
+/// descriptor file's stem is the worker's active session id).
+fn root_worker_ids(agent_dir: &Path) -> Vec<String> {
+    let mut ids = Vec::new();
+    let Ok(instances) = std::fs::read_dir(agent_dir.join("daemon-workers")) else {
+        return ids;
+    };
+    for instance in instances.flatten() {
+        let Ok(entries) = std::fs::read_dir(instance.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(descriptor) = serde_json::from_str::<Value>(&content) else {
+                continue;
+            };
+            if let Some(id) = descriptor
+                .get("rootActiveSessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids.sort();
+    ids
+}
+
+/// The rename arm of the passivation-aware wake (TS
+/// `renameAgentFamilySession` resolving through the hydrated target):
+/// the parent record keeps the child's SPAWN-time active id, a revival
+/// re-keys the supervisor roster's child row to the revived worker's
+/// fresh id (the registration's roster write drops the old id's index),
+/// and the revived worker's own idle passivation stops it again — after
+/// which the parent's rename, addressed by the record's stale id,
+/// resolves NOWHERE (no live resident for the binding, no roster row,
+/// no ledger edge: only the child's DURABLE id still names the session).
+/// The rename must reach the child through the same durable-selector
+/// wake retry `prompt_child` carries: the retry's wake launches a fresh
+/// worker over the child's session file and the rename lands there.
+#[tokio::test]
+async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_child() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({ "idleEvictionMinutes": 1 }).to_string(),
+    )
+    .expect("write settings");
+    let parent_script = write_faux_script(
+        dir.path(),
+        "rename-parent",
+        &json!([{ "text": "parent turn done" }]),
     );
+    let child_script = write_faux_script(
+        dir.path(),
+        "rename-child",
+        &json!([{ "text": "child done" }]),
+    );
+
+    let _daemon = spawn_supervisor(&socket, &agent_dir, &kernel_python);
+    wait_socket_ready(&socket);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+    client.send_command(
+        "create-parent",
+        &json!({
+            "type": "create",
+            "name": "parent",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": sessions_dir.to_string_lossy(),
+                "script": parent_script.to_string_lossy(),
+            },
+        }),
+    );
+    let created = client.read_response("create-parent");
+    assert_eq!(created["success"], true, "create parent failed: {created}");
+    let parent = &created["data"];
+    let parent_active_session_id = parent["activeSessionId"]
+        .as_str()
+        .or_else(|| parent["id"].as_str())
+        .expect("parent active session id")
+        .to_string();
+    let parent_session_id = parent["sessionId"].as_str().expect("parent session id");
+    let parent_session_file = parent["sessionFile"]
+        .as_str()
+        .expect("parent session file")
+        .to_string();
+
+    let link = Arc::new(SupervisorLink::new(socket.clone()));
+    let children = SupervisorChildSessions::new(
+        Arc::clone(&link),
+        agent_dir.clone(),
+        parent_active_session_id.clone(),
+        std::sync::Arc::new(pa_daemon::model_allowlist::ModelRefusalTelemetry::new(
+            agent_dir.clone(),
+            /*telemetry_disabled*/ true,
+        )),
+    );
+    children.set_identity(ParentIdentity {
+        rlm_depth: 0,
+        rlm_max_depth: 2,
+        model: Some("faux/faux-1".to_string()),
+        cwd: Some(dir.path().to_string_lossy().to_string()),
+        session_id: Some(parent_session_id.to_string()),
+        session_file: Some(parent_session_file),
+        thinking: None,
+        child_script: Some(child_script.to_string_lossy().to_string()),
+    });
+    let handle = children
+        .spawn(RlmSpawnRequest {
+            prompt: "work on the lane".to_string(),
+            name: Some("parked-kid".to_string()),
+            model: None,
+            thinking: None,
+            cell_source_code: None,
+            spawned_by_request_id: None,
+        })
+        .await
+        .expect("spawn the child");
+    children.notify_turn_done();
+
+    // The child settles done with a resident worker.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let child_active_session_id = loop {
+        let roster = children.list_subagents().await.expect("child roster");
+        if let Some(row) = roster.first() {
+            if row.status == "done" || row.status == "completed" {
+                break row
+                    .active_session_id
+                    .clone()
+                    .expect("the settled child's live id");
+            }
+        }
+        assert!(Instant::now() < deadline, "the child never settled done");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let (child_session_id, child_session_dir) = {
+        let row = children
+            .list_subagents()
+            .await
+            .expect("roster for the file")
+            .pop()
+            .expect("the child row");
+        (
+            row.session_id.expect("the child's durable session id"),
+            row.session_dir,
+        )
+    };
+    let child_file =
+        std::path::Path::new(&child_session_dir).join(format!("{child_session_id}.jsonl"));
+
+    // THE FIRST PASSIVATION (same ask as the settled-child test).
+    let child_token =
+        worker_token(&agent_dir, &child_active_session_id).expect("the child worker's token");
+    client.send_command(
+        "passivate-1",
+        &json!({
+            "type": "worker_idle_passivation",
+            "workerToken": child_token,
+            "idleMinutes": 1,
+        }),
+    );
+    let passivated = client.read_response("passivate-1");
+    assert_eq!(
+        passivated["success"], true,
+        "the first idle passivation must succeed: {passivated}"
+    );
+
+    // THE REVIVAL: a fresh client attaches by the child's DURABLE session
+    // id (the TUI resume selector): the route's wake arm resolves the
+    // ledger edge and launches a fresh worker over the child's file, and
+    // the fresh worker's registration re-keys the roster's child row to
+    // its fresh active id — the spawn-time id the parent record keeps
+    // stops resolving from here on.
+    let (mut fresh, _hello) = Client::connect(&socket);
+    fresh.send_command(
+        "revive-attach",
+        &json!({ "type": "attach", "activeSessionId": child_session_id }),
+    );
+    let revived = fresh.read_response("revive-attach");
+    assert_eq!(
+        revived["success"], true,
+        "the attach by the durable id must wake the passivated child: {revived}"
+    );
+
+    // The fresh worker's identity (its descriptor's root active id is the
+    // new routing id the roster row now carries).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let revived_active_session_id = loop {
+        let ids = root_worker_ids(&agent_dir)
+            .into_iter()
+            .filter(|id| id != &child_active_session_id && id != &parent_active_session_id)
+            .collect::<Vec<_>>();
+        if let Some(id) = ids.first() {
+            break id.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the revival never wrote a fresh worker descriptor (ids so far: {:?})",
+            root_worker_ids(&agent_dir)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let revived_token =
+        worker_token(&agent_dir, &revived_active_session_id).expect("the fresh worker's token");
+    let revived_pid =
+        worker_pid(&agent_dir, &revived_active_session_id).expect("the fresh worker's pid");
+
+    // THE SECOND PASSIVATION: the revived worker stops the same way, so
+    // the child is passive again — but its roster row is keyed by the
+    // REVIVED id, and the parent record still holds the spawn-time id.
+    client.send_command(
+        "passivate-2",
+        &json!({
+            "type": "worker_idle_passivation",
+            "workerToken": revived_token,
+            "idleMinutes": 1,
+        }),
+    );
+    let passivated = client.read_response("passivate-2");
+    assert_eq!(
+        passivated["success"], true,
+        "the second idle passivation must succeed: {passivated}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while std::path::Path::new(&format!("/proc/{revived_pid}")).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the revived worker survived the second passivation"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // THE RENAME: the parent's rename by the child handle resolves the
+    // record's spawn-time active id — the stale id that no longer
+    // routes. The durable-selector wake retry must land the rename on a
+    // fresh worker over the child's session file.
+    let renamed = children
+        .rename(
+            "renamed-lane".to_string(),
+            Some(handle.rlm_child_id.clone()),
+        )
+        .await;
+    let applied = renamed.unwrap_or_else(|error| {
+        panic!(
+            "the parent rename of the twice-passivated child must reach it through the durable wake: {error:#}"
+        )
+    });
+    assert_eq!(applied, "renamed-lane");
+
+    // The durable oracle: the child's session file carries the new name's
+    // `session_info` row (only a woken worker writes it), and the
+    // parent's registry row follows the applied name.
+    let entries = std::fs::read_to_string(&child_file).unwrap_or_default();
+    let named = entries
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|entry| {
+            entry.get("type").and_then(Value::as_str) == Some("session_info")
+                && entry.get("name").and_then(Value::as_str) == Some("renamed-lane")
+        });
+    assert!(
+        named,
+        "the woken child must carry the renamed session_info row (tail: {:?})",
+        entries
+            .lines()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    let row = children
+        .list_subagents()
+        .await
+        .expect("roster after the rename")
+        .into_iter()
+        .find(|row| row.rlm_child_id == handle.rlm_child_id)
+        .expect("the child row after the rename");
+    assert_eq!(row.session_name, "renamed-lane");
 }
 
 /// An idle unowned ROOT passivates through the same worker-driven ask
@@ -483,7 +790,6 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_prompt() {
 #[tokio::test]
 async fn an_idle_root_passivates_and_resumes_by_its_durable_id_with_its_transcript() {
     let Some(kernel_python) = kernel_python() else {
-        eprintln!("kernel python unavailable; skipping the root passivation e2e");
         return;
     };
     let dir = tempfile::TempDir::new().expect("temp dir");

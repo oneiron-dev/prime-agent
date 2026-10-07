@@ -14,6 +14,7 @@ mod abort_idle_race;
 mod broadcast;
 mod burst;
 mod feed;
+mod interleave;
 mod park;
 mod queue;
 
@@ -57,6 +58,7 @@ fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
         active_action: None,
         tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         running_tool_calls: std::collections::HashSet::new(),
+        running_admission_ids: std::collections::HashSet::new(),
     }));
     TurnRunner {
         core,
@@ -77,6 +79,7 @@ fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
             )),
             worker_token: String::new(),
         },
+        herdr: std::sync::Arc::new(std::sync::Mutex::new(crate::herdr::HerdrReporter::default())),
     }
 }
 

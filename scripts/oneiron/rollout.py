@@ -471,7 +471,7 @@ def receipt_summary(path: Path) -> dict:
 
 
 def status(args: argparse.Namespace) -> int:
-    prefix, bin_dir = sbs.cli_dirs(args)
+    prefix, bin_dir = sbs.cli_paths(args)
     feed_dir = release_feed.feed_dir_for(args, prefix)
     receipts = prefix / "receipts"
     installed = []

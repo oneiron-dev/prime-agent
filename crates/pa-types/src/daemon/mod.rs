@@ -20,9 +20,7 @@ pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
 /// (TS #2506's field, landing ahead of TS main: the Rust deletion lifecycle
 /// captures the tombstoned child's usage durably before any unlink, so the
 /// field is populated where TS's open PR reads a removed path).
-/// Revision 31 is one Oneiron fork-only revision (ahead of TS; its id is
-/// unrelated to the TS fork's revision-31 id) covering every fork change of
-/// the follow-up release:
+/// The Oneiron fork used revision 31 for its additions:
 /// - the create failure of a worker that died during startup is typed
 ///   (`errorInfo.code: "worker_startup_failed"`, server capability
 ///   `worker_startup_failure`); older clients read the code as `Unknown` and
@@ -33,8 +31,13 @@ pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
 /// - the capability-gated `create` keys `offline`/`noSkills` (server
 ///   capability `session_policy`): a hosted session's `--offline` and
 ///   `--no-skills`.
-pub const DAEMON_SCHEMA_REVISION: u64 = 31;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-31-a926532e8319";
+///
+/// Combined revision 32 includes those fork additions and upstream's schema-30
+/// changes plus its `mark_anthropic_warning_shown` command and the `renamedBy`
+/// and `waitForRlmQuiescence` fields. Its fresh identity keeps a pre-merge
+/// revision-31 daemon from passing the schema probe.
+pub const DAEMON_SCHEMA_REVISION: u64 = 32;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-32-20261006c0a1";
 
 pub type DaemonClientId = String;
 pub type DaemonCommandId = String;
@@ -123,6 +126,7 @@ pub struct DaemonEventMeta {
 pub mod agent_roster;
 mod command;
 pub mod framing;
+pub mod herdr_env;
 mod outbound;
 mod plane;
 mod tool_selection;
@@ -137,7 +141,7 @@ pub use outbound::{
     DaemonClosingReason, DaemonErrorInfo, DaemonEventEnvelope, DaemonOutbound,
     DaemonPeerTransportTicket, DaemonResponse, DaemonRuntimeIdentity, DaemonSavedSessionInfo,
     DaemonSessionClosedReason, DaemonSessionSnapshot, SnapshotPurpose, SocketIdentity,
-    UPDATE_RESTART_PREPARING_MESSAGE,
+    KERNEL_NOT_RUNNING_MESSAGE, UPDATE_RESTART_PREPARING_MESSAGE,
 };
 pub use plane::{
     command_plane, is_daemon_mutating_command, is_session_plane_daemon_command,
@@ -200,8 +204,8 @@ mod tests {
     fn protocol_constants_match_ts() {
         assert_eq!(DAEMON_PROTOCOL_NAME, "prime-agent.daemon");
         assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
-        assert_eq!(DAEMON_SCHEMA_REVISION, 31);
-        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-31-a926532e8319");
+        assert_eq!(DAEMON_SCHEMA_REVISION, 32);
+        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-32-20261006c0a1");
         assert_eq!(DAEMON_UPDATE_RESTART_FORMAT_VERSION, 1);
     }
 }

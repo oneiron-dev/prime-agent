@@ -5,7 +5,8 @@
 //! A model that opts in (`compat.supportsWebSocket`) or an explicit
 //! `websocket`/`websocket-cached` transport streams over the Responses
 //! WebSocket transport first ([`crate::providers::responses_websocket`]);
-//! SSE takes over only when the socket failed before its first event.
+//! SSE takes over only when the socket failed before its first event,
+//! while structured connection-cap failures return to the session retry driver.
 
 use serde_json::{json, Map, Value};
 
@@ -391,14 +392,6 @@ async fn run_stream(
     };
     if websocket_enabled {
         let mut started = false;
-        let model_id = model.id.clone();
-        let hooks = ResponsesStreamHooks {
-            request_service_tier: options.service_tier,
-            resolve_service_tier: None,
-            apply_service_tier_pricing: Some(Box::new(move |usage, service_tier| {
-                apply_service_tier_pricing(usage, service_tier.as_deref(), &model_id);
-            })),
-        };
         // WebSocket APIs expose no portable upgrade headers: the hook sees
         // the successful 101 handshake (TS `onOpen`).
         let on_open = || {
@@ -411,6 +404,14 @@ async fn run_stream(
                     model,
                 );
             }
+        };
+        let model_id = model.id.clone();
+        let hooks = ResponsesStreamHooks {
+            request_service_tier: options.service_tier,
+            resolve_service_tier: None,
+            apply_service_tier_pricing: Some(Box::new(move |usage, service_tier| {
+                apply_service_tier_pricing(usage, service_tier.as_deref(), &model_id);
+            })),
         };
         let attempt = match resolve_responses_websocket_url(&model.base_url) {
             Ok(url) => {

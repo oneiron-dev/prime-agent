@@ -341,6 +341,7 @@ fn run_rename(client: &mut DaemonClient, args: &[String], json: bool) -> Result<
         id: None,
         active_session_id,
         name: name.clone(),
+        renamed_by: None,
         rest: serde_json::Map::new(),
     })?;
     let data = require_success(response)?.unwrap_or(Value::Null);
@@ -692,6 +693,9 @@ mod tests {
         list.iter().map(std::string::ToString::to_string).collect()
     }
 
+    // The socket-path/separator shapes are unix paths (the windows transport
+    // is named pipes; the tilde/socket spellings do not exist there).
+    #[cfg(unix)]
     #[test]
     fn parse_consumes_socket_json_and_separator() {
         let parsed =

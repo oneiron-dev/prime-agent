@@ -179,6 +179,7 @@ pub fn handle_public_command(args: &[String]) -> PublicCommandResult {
         "schedule" => run_nested_agent_command("schedule", "cron", &rest),
         "status" => run_status(&rest),
         "doctor" => run_doctor(&rest),
+        "telemetry" => run_telemetry(&rest),
         "incident" => run_incident_command(&rest),
         "shutdown" => run_shutdown(&rest),
         "package" => run_package(&rest),
@@ -187,6 +188,7 @@ pub fn handle_public_command(args: &[String]) -> PublicCommandResult {
         "model" => rewrite_nested_command("model", "list", "--list-models", &rest),
         "session" => rewrite_nested_command("session", "export", "--export", &rest),
         "prompt" => handled_with_exit(crate::prompt_command::run_prompt_command(&rest)),
+        "factory" => handled_with_exit(crate::factory_command::run_factory_command(&rest)),
         "config" => {
             if !rest.is_empty() {
                 return fail(format!("Usage: {APP_NAME} config"), None);
@@ -340,8 +342,9 @@ fn validate_schedule_args(args: &[String]) -> bool {
 }
 
 /// Parse `update`'s options into the shared [`crate::self_update::SelfUpdateOptions`]:
-/// the TS booleans plus the direct-install pair (`--archive <path>` with the
-/// required `--source <https-url>`). Returns `None` on a usage failure
+/// the TS booleans plus the direct-install pair (`--archive <path>` with
+/// `--source <https-url>`, which only a managed install takes and requires).
+/// Returns `None` on a usage failure
 /// (already reported).
 fn parse_update_options(args: &[String]) -> Option<crate::self_update::SelfUpdateOptions> {
     let mut invocation = crate::self_update::SelfUpdateOptions::default();
@@ -410,19 +413,11 @@ fn parse_update_options(args: &[String]) -> Option<crate::self_update::SelfUpdat
             );
             return None;
         }
-        if invocation.source.is_none() {
-            fail(
-                "--archive needs --source <https-url>.",
-                Some(
-                    "The install source is recorded in the release and future updates resolve from it."
-                        .to_string(),
-                ),
-            );
-            return None;
-        }
-        if !pa_core::update::install::install_source_is_valid(
-            invocation.source.as_deref().unwrap_or_default(),
-        ) {
+        if invocation
+            .source
+            .as_deref()
+            .is_some_and(|source| !pa_core::update::install::install_source_is_valid(source))
+        {
             fail(
                 "--source must be an http(s) URL.",
                 Some(format!("Run \"{APP_NAME} help update\" for usage.")),
@@ -487,6 +482,39 @@ fn run_doctor(args: &[String]) -> PublicCommandResult {
         );
     }
     handled()
+}
+
+/// `prime-agent telemetry [status|on|off]`: the same report and settings
+/// switch as the `/telemetry` slash command, for the current directory's
+/// settings scope.
+fn run_telemetry(args: &[String]) -> PublicCommandResult {
+    let usage = || fail(format!("Usage: {APP_NAME} telemetry [status|on|off]"), None);
+    if args.len() > 1 {
+        return usage();
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let agent_dir = crate::config::get_agent_dir();
+    let mut settings = pa_core::settings::SettingsManager::create(&cwd, &agent_dir);
+    let report = match args.first().map(String::as_str) {
+        None | Some("status") => Ok(pa_core::session_engine::telemetry::telemetry_status_text(
+            &settings, &agent_dir,
+        )),
+        Some(choice @ ("on" | "off")) => {
+            pa_core::session_engine::telemetry::set_telemetry_enabled_text(
+                &mut settings,
+                &agent_dir,
+                choice == "on",
+            )
+        }
+        Some(_) => return usage(),
+    };
+    match report {
+        Ok(report) => {
+            println!("{report}");
+            handled()
+        }
+        Err(error) => fail(format!("{error:#}"), None),
+    }
 }
 
 /// `prime-agent incident` (TS `runIncidentCommand`): parse the options,
@@ -655,6 +683,44 @@ fn run_update(args: &[String]) -> PublicCommandResult {
     let Some(options) = parse_update_options(args) else {
         return handled_failed();
     };
+    // `--rollback` and `--archive` on an installer install run the bundled
+    // installer; any other binary stays on the managed-install flow.
+    if options.rollback || options.archive.is_some() {
+        if let Some(prefix) = pa_core::update::installer::running_installer_prefix() {
+            if options.source.is_some() {
+                return fail(
+                    "--source only applies to managed installs.",
+                    Some(
+                        "An installer install keeps updating from its release channel.".to_string(),
+                    ),
+                );
+            }
+            if options.channel.is_some() {
+                return fail(
+                    "--nightly and --stable do not apply to --rollback or --archive.",
+                    Some(format!(
+                        "Switch channels with \"{APP_NAME} update --nightly\" or \"--stable\"."
+                    )),
+                );
+            }
+            // The CLI's --force is the nightly-switch confirmation skip;
+            // the installer's own forced daemon stop is a different flag
+            // the funnel never forwards either — so the local modes refuse
+            // it instead of silently dropping it.
+            if options.force {
+                return fail(
+                    "--force does not apply to --rollback or --archive.",
+                    Some(format!(
+                        "To stop busy daemons first, run \"{APP_NAME} shutdown --force\" and re-run."
+                    )),
+                );
+            }
+            return handled_with_exit(crate::installer_update::run_local(
+                &prefix,
+                options.archive.as_deref(),
+            ));
+        }
+    }
     let persisted_wire = std::env::current_dir()
         .ok()
         .and_then(|cwd| {
@@ -673,14 +739,22 @@ fn run_update(args: &[String]) -> PublicCommandResult {
     }
     // The installer funnel serves the bare update and the channel flags:
     // the channel is the flag, else the saved `updateChannel` setting
-    // (`/nightly on|off`), else the installed one. `--rollback` and
-    // `--archive` stay on the managed-install flow.
+    // (`/nightly on|off`), else the installed one.
     if !options.rollback && options.archive.is_none() {
         let update = crate::installer_update::UpdateOptions {
             check: false,
             channel: options.channel,
         };
         return handled_with_exit(crate::installer_update::run(&update));
+    }
+    if options.archive.is_some() && options.source.is_none() {
+        return fail(
+            "--archive needs --source <https-url>.",
+            Some(
+                "The install source is recorded in the release and future updates resolve from it."
+                    .to_string(),
+            ),
+        );
     }
     handled_with_exit(crate::self_update::run(&options, persisted_wire.as_deref()))
 }
@@ -997,6 +1071,10 @@ mod update_options_tests {
             Some(std::path::PathBuf::from("/tmp/payload"))
         );
         assert_eq!(invocation.source.as_deref(), Some("https://example.com"));
+        // An installer install takes the archive alone (the managed flow's
+        // --source requirement is checked once the install type is known).
+        let invocation = parse(&["--archive", "/tmp/payload"]).unwrap();
+        assert_eq!(invocation.source, None);
         // The source must be an http(s) URL and must not appear alone.
         assert!(parse(&[
             "--archive",

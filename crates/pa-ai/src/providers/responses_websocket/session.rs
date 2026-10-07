@@ -3,7 +3,7 @@
 //!
 //! This is provider connection state, not session-engine state: one
 //! reusable connection per session id, reused only while idle, open, and
-//! under the same connection identity (URL plus normalized handshake
+//! under the same connection identity (URL plus normalized connection
 //! headers, credentials included — process-local, never logged or
 //! persisted). Concurrent acquisitions take generation claims so a later
 //! claim owns the cache slot even when an earlier connection opens later;
@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::connection::{connect, CloseReason, ConnectFailure, EventDialect, WorkerHandle};
@@ -25,10 +26,13 @@ use super::continuation::ContinuationAnchor;
 
 /// Idle connections stay cached this long (TS `CACHE_TTL_MS`).
 pub(crate) const CONNECTION_IDLE_TTL: Duration = Duration::from_mins(5);
+/// Rotate idle sockets on acquisition before the provider's one-hour cap.
+const CONNECTION_MAX_AGE: Duration = Duration::from_mins(55);
 
 /// The process-local reuse key: URL plus lowercased, sorted handshake
-/// headers (a later duplicate replaces an earlier one). It carries the
-/// credentials, so `Debug` never prints it.
+/// headers except the per-call correlation/idempotency pair (a later
+/// duplicate replaces an earlier one). It carries the credentials, so
+/// `Debug` never prints it.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ConnectionIdentity(String);
 
@@ -39,9 +43,12 @@ impl std::fmt::Debug for ConnectionIdentity {
 }
 
 pub(crate) fn connection_identity(url: &str, headers: &[(String, String)]) -> ConnectionIdentity {
+    // These IDs describe a model call, not the connection. They still go
+    // on fresh handshakes; a reused socket cannot resend updated headers.
     let normalized: BTreeMap<String, &str> = headers
         .iter()
         .map(|(name, value)| (name.to_ascii_lowercase(), value.as_str()))
+        .filter(|(name, _)| !matches!(name.as_str(), "x-acp-model-request-id" | "idempotency-key"))
         .collect();
     ConnectionIdentity(serde_json::json!([url, normalized]).to_string())
 }
@@ -49,6 +56,7 @@ pub(crate) fn connection_identity(url: &str, headers: &[(String, String)]) -> Co
 struct Entry {
     worker: WorkerHandle,
     identity: ConnectionIdentity,
+    opened_at: Instant,
     busy: bool,
     /// Bumped on every acquire and release: a pending idle timer fires
     /// only for the generation it was scheduled under.
@@ -251,6 +259,11 @@ pub(crate) async fn acquire(
                 // request ends with the close.
                 old.worker.close(CloseReason::IdentityChanged);
                 retire_old = true;
+            } else if !old.busy && old.opened_at.elapsed() >= CONNECTION_MAX_AGE {
+                // Acquisition-only rotation never interrupts a busy request.
+                // Removing the entry also removes its continuation anchor.
+                old.worker.close(CloseReason::Done);
+                retire_old = true;
             } else if !old.busy && old.worker.is_open() {
                 old.busy = true;
                 reused = Some((old.worker.clone(), old.continuation.clone()));
@@ -314,6 +327,7 @@ pub(crate) async fn acquire(
         Entry {
             worker: worker.clone(),
             identity,
+            opened_at: Instant::now(),
             busy: true,
             expiry_generation: 0,
             continuation: None,
@@ -492,7 +506,24 @@ mod tests {
         };
         let base = connection_identity(
             "ws://h/v1/responses",
-            &headers(&[("Authorization", "Bearer a"), ("X-Team", "t")]),
+            &headers(&[
+                ("Authorization", "Bearer a"),
+                ("X-Team", "t"),
+                ("X-ACP-Model-Request-ID", "edge-1"),
+                ("Idempotency-Key", "edge-1"),
+            ]),
+        );
+        assert_eq!(
+            base,
+            connection_identity(
+                "ws://h/v1/responses",
+                &headers(&[
+                    ("Authorization", "Bearer a"),
+                    ("X-Team", "t"),
+                    ("x-AcP-MoDeL-ReQuEsT-iD", "edge-2"),
+                    ("IDEMPOTENCY-KEY", "edge-2"),
+                ]),
+            )
         );
         assert_eq!(
             base,
@@ -526,6 +557,13 @@ mod tests {
             connection_identity(
                 "ws://other/v1/responses",
                 &headers(&[("Authorization", "Bearer a"), ("X-Team", "t")]),
+            )
+        );
+        assert_ne!(
+            base,
+            connection_identity(
+                "ws://h/v1/responses",
+                &headers(&[("Authorization", "Bearer a"), ("X-Team", "other")]),
             )
         );
         // The credential-bearing identity never prints.

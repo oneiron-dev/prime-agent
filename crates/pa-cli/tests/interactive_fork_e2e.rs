@@ -79,8 +79,8 @@ struct Supervisor {
 /// failing test leaks nothing. Drop runs even on panic.
 impl Drop for Supervisor {
     fn drop(&mut self) {
-        let supervisor_pid = graceful_shutdown(&self.socket);
-        let worker_pids = supervisor_pid.map(child_pids_of).unwrap_or_default();
+        let worker_pids = child_pids_of(self.child.id());
+        let _ = graceful_shutdown(&self.socket);
         let _ = self.child.kill();
         let _ = self.child.wait();
         for pid in worker_pids {
@@ -91,6 +91,7 @@ impl Drop for Supervisor {
 }
 
 /// Pids whose parent is `ppid` (the supervisor's live worker children).
+#[cfg(target_os = "linux")]
 fn child_pids_of(ppid: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     let entries = std::fs::read_dir("/proc").expect("read /proc");
@@ -117,8 +118,27 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
     pids
 }
 
+#[cfg(not(target_os = "linux"))]
+fn child_pids_of(ppid: u32) -> Vec<u32> {
+    let output = Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .expect("query the spawned supervisor's children");
+    assert!(output.status.success(), "the native PID/PPID query failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let child = fields.next()?.parse::<u32>().ok()?;
+            let parent = fields.next()?.parse::<u32>().ok()?;
+            (parent == ppid).then_some(child)
+        })
+        .collect()
+}
+
 /// Liveness that ignores zombies: an unreaped child keeps its `/proc`
 /// entry, so path existence alone would call an exited process alive.
+#[cfg(target_os = "linux")]
 fn process_alive(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
@@ -130,10 +150,24 @@ fn process_alive(pid: u32) -> bool {
     !state.starts_with('Z') && !state.starts_with('X')
 }
 
-fn kill_worker(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
+#[cfg(not(target_os = "linux"))]
+fn process_alive(pid: u32) -> bool {
+    if !pa_core::platform::process::pid_exists(pid) {
+        return false;
     }
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .expect("query the owned worker state");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .is_some_and(|state| !state.starts_with('Z') && !state.starts_with('X'))
+}
+
+fn kill_worker(pid: u32) {
+    let _ =
+        pa_core::platform::process::kill_pid(pid as i32, pa_core::platform::process::Signal::Kill);
     let deadline = Instant::now() + Duration::from_secs(5);
     while process_alive(pid) {
         assert!(
@@ -341,6 +375,14 @@ impl PtyReader {
         self.file.write_all(payload).expect("write to the pty");
     }
 
+    fn drain_once(&mut self) {
+        let mut buffer = [0u8; 8192];
+        match self.file.read(&mut buffer) {
+            Ok(0) | Err(_) => {}
+            Ok(n) => self.output.extend_from_slice(&buffer[..n]),
+        }
+    }
+
     /// Drain the master until the needle appears in the collected stream,
     /// bounded by the harness deadline.
     fn wait_for(&mut self, needle: &str, what: &str) {
@@ -349,11 +391,7 @@ impl PtyReader {
             if find_subsequence(&self.output, needle.as_bytes()).is_some() {
                 return;
             }
-            let mut buffer = [0u8; 8192];
-            match self.file.read(&mut buffer) {
-                Ok(0) | Err(_) => {}
-                Ok(n) => self.output.extend_from_slice(&buffer[..n]),
-            }
+            self.drain_once();
             if Instant::now() > deadline {
                 let text = String::from_utf8_lossy(&self.output);
                 panic!(
@@ -549,13 +587,17 @@ async fn interactive_fork_launch_copies_and_the_daemon_opens_the_fork() {
     pty_reader.write(b"\x04");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        // Exit flushes the transcript to the same pty. Keep consuming it
+        // while waiting, or a full native pty buffer blocks the child.
+        pty_reader.drain_once();
         if let Some(status) = child.try_wait().expect("child status") {
             assert!(status.success(), "the interactive child failed: {status}");
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the interactive child never exited"
+            "the interactive child never exited; pty output:\n{}",
+            String::from_utf8_lossy(&pty_reader.output)
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

@@ -25,6 +25,19 @@ pub struct HeadlessPlan {
 pub enum HeadlessStep {
     /// Submit text (the same editor submit path as a user typing it).
     Submit(String),
+    /// Submit `text` as a `prompt_and_wait` and hold until this run has
+    /// processed every event the turn emitted (each daemon request and the
+    /// event drain are each bounded by `timeout_ms`):
+    /// the daemon answers the wait only at the turn's full settle (after
+    /// its queue-projection update), `get_rlm_children` then reports the
+    /// session's final event sequence, and the barrier releases once the
+    /// run's live tracker reaches it. The supervisor races its response
+    /// and event queues in one select, so the barrier compares sequence
+    /// values instead of trusting arrival order. The run is parked while
+    /// the turn runs (the loop neither paints nor drains events during
+    /// the submit); use `Submit` to observe mid-turn frames. `Submit`
+    /// stays the composer path.
+    SubmitAndSettle { text: String, timeout_ms: u64 },
     /// Type text character by character (raw editor input, so autocomplete
     /// and editor state react exactly as to a keystroke).
     Type(String),
@@ -98,6 +111,11 @@ pub(super) struct HeadlessSettle {
     pub(super) traces_login_pending: bool,
     /// An MCP auth flow is pending.
     pub(super) mcp_auth_pending: bool,
+    /// The Anthropic subscription warning's `mark_anthropic_warning_shown`
+    /// write is still in flight (fire-and-forget in the product — the run
+    /// must still not end with the durable write un-acked; a lost mark
+    /// costs a repeated warning on the session's next open).
+    pub(super) anthropic_warning_mark_pending: bool,
 }
 
 impl HeadlessSettle {
@@ -122,6 +140,7 @@ impl HeadlessSettle {
             auth_panel_open: view.auth_panel.is_some(),
             traces_login_pending: session.pending_traces_login(),
             mcp_auth_pending: session.pending_mcp_auth(),
+            anthropic_warning_mark_pending: session.anthropic_warning_mark_pending(),
         }
     }
 
@@ -175,6 +194,9 @@ impl HeadlessSettle {
         }
         if self.mcp_auth_pending {
             blockers.push("a pending MCP auth flow".to_string());
+        }
+        if self.anthropic_warning_mark_pending {
+            blockers.push("the Anthropic warning's mark write in flight".to_string());
         }
         blockers
     }

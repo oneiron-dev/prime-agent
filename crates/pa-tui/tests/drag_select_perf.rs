@@ -6,12 +6,16 @@
 //!
 //! A mock supervisor serves one attached session; the plan drives
 //! byte-identical SGR mouse reports through the same decode-and-dispatch
-//! path a terminal's mouse takes. The wall-clock budget compares a
-//! 100-drag burst against a no-drag baseline of the same session (the
-//! parse/attach cost cancels), and against the same burst on a small
-//! session: the excess must stay within a small bound of the small
-//! session's — before the sparse-window fixes the large session's burst
-//! spent seconds resolving geometry per frame and per copy.
+//! path a terminal's mouse takes. Two existing `/name` round trips bound
+//! the measured phase: after attach and `ScrollTop` dispatch, through
+//! release, copy and its frame. Both samples include the first marker's
+//! acknowledgement and top-frame render. The baseline uses the same
+//! markers, so setup is
+//! excluded rather than assumed to cancel across independent runs. The
+//! 100-drag excess must stay within the small session's budget — before
+//! the sparse-window fixes the large session's burst spent seconds
+//! resolving geometry per frame and per copy. Whole-run times remain
+//! diagnostic evidence alongside the measured phase times.
 #![cfg(unix)]
 // Pedantic-gate exceptions (every other pedantic warning in this crate is
 // fixed in place; each exception carries its one-line justification):
@@ -44,6 +48,15 @@ use std::sync::{Mutex, MutexGuard};
 
 /// Mouse tracking is process-global state, so the headless runs serialize.
 static RUN_LOCK: Mutex<()> = Mutex::new(());
+
+const PHASE_START: &str = "drag perf start";
+const PHASE_END: &str = "drag perf end";
+
+#[derive(Debug)]
+struct RunTiming {
+    total: Duration,
+    phase: Duration,
+}
 
 fn run_lock() -> MutexGuard<'static, ()> {
     match RUN_LOCK.lock() {
@@ -84,7 +97,7 @@ impl MockSupervisor {
 
     /// Serve one connection: attach a session whose snapshot holds the
     /// requested transcript, then answer the loop's requests.
-    fn serve(self, messages: usize) {
+    fn serve(self, messages: usize) -> Duration {
         let (stream, _) = self.listener.accept().expect("accept");
         let write_stream = stream.try_clone().expect("clone mock socket");
         let mut writer = write_stream;
@@ -99,6 +112,8 @@ impl MockSupervisor {
         write_json(&mut writer, &hello);
 
         let mut line = String::new();
+        let mut phase_started: Option<std::time::Instant> = None;
+        let mut phase_elapsed = None;
         loop {
             line.clear();
             match reader.read_line(&mut line) {
@@ -115,6 +130,15 @@ impl MockSupervisor {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            if command_type == "set_session_name" {
+                let name = command.get("name").and_then(Value::as_str);
+                if name == Some(PHASE_START) {
+                    assert!(phase_started.is_none() && phase_elapsed.is_none());
+                    phase_started = Some(std::time::Instant::now());
+                } else if name == Some(PHASE_END) {
+                    phase_elapsed = Some(phase_started.take().expect("phase start").elapsed());
+                }
+            }
             match command_type.as_str() {
                 "create" => {
                     write_json(
@@ -150,6 +174,7 @@ impl MockSupervisor {
                 }
             }
         }
+        phase_elapsed.expect("both phase markers reached the native command dispatch")
     }
 }
 
@@ -245,10 +270,7 @@ fn options(socket: PathBuf) -> InteractiveOptions {
     }
 }
 
-fn run_plan(
-    messages: usize,
-    steps: Vec<HeadlessStep>,
-) -> (Vec<String>, Vec<String>, std::time::Duration) {
+fn run_plan(messages: usize, steps: Vec<HeadlessStep>) -> (Vec<String>, Vec<String>, RunTiming) {
     let _guard = run_lock();
     let dir = tempfile::TempDir::new().expect("temp dir");
     let socket = dir.path().join("tui.sock");
@@ -267,9 +289,9 @@ fn run_plan(
     let outcome = runtime
         .block_on(run_interactive(options(socket), UiMode::Headless(plan)))
         .expect("interactive run");
-    let elapsed = started.elapsed();
-    let _ = handle.join();
-    (outcome.frames, outcome.copies, elapsed)
+    let total = started.elapsed();
+    let phase = handle.join().expect("mock supervisor");
+    (outcome.frames, outcome.copies, RunTiming { total, phase })
 }
 
 /// The scroll-paused drag burst: mount the window at the transcript top,
@@ -279,20 +301,27 @@ fn run_plan(
 /// row is row 3 in SGR coordinates (0-based 2): the burst presses the
 /// message's first text row and drags through its opening lines.
 fn drag_burst() -> Vec<HeadlessStep> {
-    let mut steps = vec![HeadlessStep::ScrollTop];
+    let mut steps = vec![
+        HeadlessStep::ScrollTop,
+        HeadlessStep::Submit(format!("/name {PHASE_START}")),
+    ];
     steps.push(HeadlessStep::Mouse(press(3, 3)));
     for index in 0..100 {
         steps.push(HeadlessStep::Mouse(drag(3 + (index % 40), 3 + (index % 6))));
     }
     steps.push(HeadlessStep::Mouse(release(43, 8)));
+    steps.push(HeadlessStep::Submit(format!("/name {PHASE_END}")));
     steps
 }
 
-/// One no-drag baseline of the same session shape (parse, attach, first
-/// frames, the top walk): the drag burst's excess over this is the
-/// selection path's own cost.
+/// The same top frame and phase markers without mouse input. Marker
+/// acknowledgement and rendering overhead stays in both phase samples.
 fn baseline() -> Vec<HeadlessStep> {
-    vec![HeadlessStep::ScrollTop]
+    vec![
+        HeadlessStep::ScrollTop,
+        HeadlessStep::Submit(format!("/name {PHASE_START}")),
+        HeadlessStep::Submit(format!("/name {PHASE_END}")),
+    ]
 }
 
 #[test]
@@ -321,8 +350,20 @@ fn drag_select_frame_cost_is_independent_of_session_size() {
     // The drag path's own cost (burst minus baseline) stays in the same
     // band on either session: no per-frame geometry resolve scales it
     // with the transcript.
-    let small_excess = small_drag.saturating_sub(small_baseline);
-    let large_excess = large_drag.saturating_sub(large_baseline);
+    eprintln!(
+        "drag perf: small baseline total={:?} phase={:?}; small drag total={:?} phase={:?}; \
+         large baseline total={:?} phase={:?}; large drag total={:?} phase={:?}",
+        small_baseline.total,
+        small_baseline.phase,
+        small_drag.total,
+        small_drag.phase,
+        large_baseline.total,
+        large_baseline.phase,
+        large_drag.total,
+        large_drag.phase,
+    );
+    let small_excess = small_drag.phase.saturating_sub(small_baseline.phase);
+    let large_excess = large_drag.phase.saturating_sub(large_baseline.phase);
     assert!(
         large_excess < small_excess + Duration::from_millis(250),
         "the large session's drag excess ({large_excess:?}) must stay within \

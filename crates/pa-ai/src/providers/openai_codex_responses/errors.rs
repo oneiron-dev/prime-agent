@@ -10,7 +10,9 @@ use crate::types::{AssistantMessage, Usage};
 use crate::utils::stream_failure::parse_retry_after_ms;
 use crate::utils_inner::diagnostics::now_ms;
 use crate::utils_inner::http::HttpResponse;
-use crate::utils_inner::stream_failure::ProviderError;
+use crate::utils_inner::stream_failure::{
+    ProviderError, StreamTransportFailureCause, StreamTransportFailureDetail,
+};
 
 /// Codex API error (`CodexApiError` in the TS reference). Carries the wire
 /// error code, HTTP status, and retry delay parsed from headers/body.
@@ -100,7 +102,11 @@ impl CodexProtocolError {
 pub enum WebSocketTransportError {
     /// A close-event failure (`WebSocketCloseError` in the TS): the composed
     /// close message plus the numeric close code.
-    Close { message: String, code: u16 },
+    Close {
+        message: String,
+        code: u16,
+        reason: String,
+    },
     /// A connect- or send-phase runtime failure (plain `Error` in the TS).
     Runtime { message: String },
 }
@@ -136,7 +142,11 @@ impl WebSocketTransportError {
         let message = format!("WebSocket closed {code}{reason_text}")
             .trim()
             .to_string();
-        Self::Close { message, code }
+        Self::Close {
+            message,
+            code,
+            reason: reason.to_string(),
+        }
     }
 
     /// A plain runtime failure (`Error` in the TS) with the given text.
@@ -213,9 +223,23 @@ impl CodexStreamError {
                 crate::utils_inner::stream_failure::ProviderWsTransportError {
                     message: error.message().to_string(),
                     close_code: error.close_code(),
-                    // The codex transport keeps its unclassified runtime
-                    // surface (the provider error type is the class name).
-                    transport: None,
+                    sdk_name: Some(error.error_name().to_string()),
+                    transport: Some(match &error {
+                        WebSocketTransportError::Close { code, reason, .. } => {
+                            StreamTransportFailureDetail {
+                                close_code: Some(*code),
+                                close_reason: (!reason.is_empty()).then(|| reason.clone()),
+                                ..StreamTransportFailureDetail::websocket(
+                                    StreamTransportFailureCause::Closed,
+                                )
+                            }
+                        }
+                        WebSocketTransportError::Runtime { .. } => {
+                            StreamTransportFailureDetail::websocket(
+                                StreamTransportFailureCause::Connect,
+                            )
+                        }
+                    }),
                 },
             ),
             CodexStreamError::Aborted => ProviderError::Aborted,
@@ -956,11 +980,77 @@ mod tests {
                         "code": 1011
                     },
                     "details": {
-                        "kind": "unknown",
-                        "providerErrorType": "WebSocketCloseError"
+                        "kind": "transport",
+                        "providerErrorType": "websocket_closed",
+                        "transport": {
+                            "protocol": "websocket", "cause": "closed",
+                            "closeCode": 1011, "closeReason": "mock server reason"
+                        }
                     }
                 }
             ])
         );
+    }
+
+    #[test]
+    fn codex_transport_classification_preserves_runtime_diagnostics_and_unknown_cleanliness() {
+        for runtime in [
+            WebSocketTransportError::close(1006, "Connection ended"),
+            WebSocketTransportError::close(1011, "protocol read failure"),
+            WebSocketTransportError::close(1000, "normal but incomplete"),
+            WebSocketTransportError::runtime("WebSocket send failed"),
+        ] {
+            let mut expected_error = json!({
+                "name": runtime.error_name(), "message": runtime.message(),
+            });
+            let mut transport = json!({"protocol": "websocket"});
+            match &runtime {
+                WebSocketTransportError::Close { code, reason, .. } => {
+                    expected_error["code"] = json!(code);
+                    transport["cause"] = json!("closed");
+                    transport["closeCode"] = json!(code);
+                    transport["closeReason"] = json!(reason);
+                }
+                WebSocketTransportError::Runtime { .. } => {
+                    transport["cause"] = json!("connect");
+                }
+            }
+            let error = CodexStreamError::Transport(runtime).into_provider_error();
+            let mut output = AssistantMessage {
+                content: Vec::new(),
+                api: API_OPENAI_CODEX_RESPONSES.to_string(),
+                provider: "openai-codex".to_string(),
+                model: "gpt-5-codex".to_string(),
+                response_model: None,
+                response_model_source: None,
+                response_id: None,
+                diagnostics: None,
+                usage: crate::types::Usage::default(),
+                stop_reason: crate::types::StopReason::Error,
+                stop_reason_raw: None,
+                error_message: Some(error.to_string()),
+                timestamp: 0,
+                rest: Map::default(),
+            };
+            crate::utils_inner::stream_failure::record_stream_failure(
+                ("openai-codex", "gpt-5-codex", API_OPENAI_CODEX_RESPONSES),
+                &mut output,
+                &error,
+            );
+            let diagnostics = serde_json::to_value(output.diagnostics.as_deref()).unwrap();
+            assert_eq!(
+                diagnostics,
+                json!([{
+                    "type": "provider_stream_failure",
+                    "timestamp": diagnostics[0]["timestamp"],
+                    "error": expected_error,
+                    "details": {
+                        "kind": "transport",
+                        "providerErrorType": format!("websocket_{}", transport["cause"].as_str().unwrap()),
+                        "transport": transport,
+                    },
+                }])
+            );
+        }
     }
 }

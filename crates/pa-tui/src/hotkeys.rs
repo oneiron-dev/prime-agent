@@ -200,14 +200,20 @@ mod tests {
             "{guide}"
         );
         assert!(
-            guide.contains(
+            guide.contains(if cfg!(target_os = "macos") {
+                "| `Shift+Ctrl+\u{2191}` / `Shift+Option+\u{2193}` | Select one paragraph |"
+            } else {
                 "| `Shift+Ctrl+\u{2191}` / `Shift+Alt+\u{2193}` | Select one paragraph |"
-            ),
+            }),
             "{guide}"
         );
         assert!(guide.contains("Select to start / end of text"), "{guide}");
         assert!(
-            guide.contains("| `Alt+\u{2191}` / `Alt+\u{2193}` | Browse and edit queued messages |"),
+            guide.contains(if cfg!(target_os = "macos") {
+                "| `Option+\u{2191}` / `Option+\u{2193}` | Browse and edit queued messages |"
+            } else {
+                "| `Alt+\u{2191}` / `Alt+\u{2193}` | Browse and edit queued messages |"
+            }),
             "{guide}"
         );
     }
@@ -221,7 +227,14 @@ mod tests {
         );
         let kb = KeybindingsManager::with_user_bindings(cfg);
         let guide = hotkeys_guide(&kb);
-        assert!(guide.contains("| `Ctrl+Alt+X` | Cycle overview"), "{guide}");
+        assert!(
+            guide.contains(if cfg!(target_os = "macos") {
+                "| `Ctrl+Option+X` | Cycle overview"
+            } else {
+                "| `Ctrl+Alt+X` | Cycle overview"
+            }),
+            "{guide}"
+        );
         assert!(!guide.contains("`Ctrl+O`"), "{guide}");
     }
 
@@ -236,6 +249,6 @@ mod tests {
         let kb = KeybindingsManager::with_user_bindings(cfg);
         let guide = hotkeys_guide(&kb);
         assert!(guide.contains("| `` | Cycle overview"), "{guide}");
-        assert!(!guide.contains("Ctrl+O"), "{guide}");
+        assert!(!guide.contains("`Ctrl+O`"), "{guide}");
     }
 }

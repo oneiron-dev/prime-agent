@@ -303,7 +303,7 @@ impl Drop for Sandbox {
         let supervisor = serde_json::from_str::<Value>(&hello)
             .ok()
             .and_then(|hello| hello["supervisorPid"].as_u64())
-            .and_then(|pid| pa_core::platform::process::open_pidfd(pid as u32));
+            .and_then(|pid| pa_core::platform::process::open_pidfd(pid as u32).ok());
         let shutdown = json!({
             "type": "command",
             "id": "sandbox-shutdown",

@@ -1,7 +1,8 @@
 //! The `prime-agent update` body: the TS->Rust migration path. One step —
-//! the update fetches the installer from the OFFICIAL DOMAIN endpoint
-//! (`https://app.primeintellect.ai/prime-agent/install.sh`, never a
-//! GitHub raw or workflow URL) and runs it; the script uninstalls the
+//! the update fetches the update channel's installer (stable: the official
+//! domain's `https://app.primeintellect.ai/prime-agent/install.sh`;
+//! nightly: the download base's `install-beta.sh`; never a GitHub raw or
+//! workflow URL) and runs it; the script uninstalls the
 //! TypeScript version, installs the latest Rust build of the update
 //! channel, and never touches `~/.prime/agent` (the sessions and
 //! configuration). The TUI's `/update` runs the same core out-of-band
@@ -93,11 +94,11 @@ pub fn run(options: &UpdateOptions) -> i32 {
     // pin (a test or a pinned install) changes where the funnel actually
     // fetches from, and the banner must not claim a source the run will
     // not use.
+    let channel = requested_installer_channel(options.channel);
     println!(
         "Updating to the latest Rust build — fetching the installer from {}:",
-        installer::installer_script_url()
+        installer::installer_script_url(Some(channel))
     );
-    let channel = requested_installer_channel(options.channel);
     match runtime.block_on(installer::run_installer(
         Some(channel),
         InstallerOutput::Inherit,
@@ -116,6 +117,65 @@ pub fn run(options: &UpdateOptions) -> i32 {
             if let Some(channel) = options.channel {
                 save_channel(channel);
             }
+            0
+        }
+        Err(failure) => {
+            eprintln!("Error: {}", failure.message);
+            1
+        }
+    }
+}
+
+/// The local operation on an installer install: `--rollback` restores the
+/// previous version the last install kept, `--archive` installs a local
+/// release archive. Both run the installer script bundled into this build
+/// against the prefix the running binary was installed under. Returns the
+/// process exit code.
+pub fn run_local(prefix: &std::path::Path, archive: Option<&std::path::Path>) -> i32 {
+    let archive = match archive.map(std::path::absolute).transpose() {
+        Ok(archive) => archive,
+        Err(error) => {
+            eprintln!("Error: could not resolve the archive path: {error}");
+            return 1;
+        }
+    };
+    let args: Vec<&std::ffi::OsStr> = match &archive {
+        Some(path) => vec!["--archive".as_ref(), path.as_os_str()],
+        None => vec!["--rollback".as_ref()],
+    };
+    let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    else {
+        eprintln!("Error: could not start the update runtime.");
+        return 1;
+    };
+    #[cfg(windows)]
+    let handed_off = installer::caller_owns_payload(prefix);
+    match runtime.block_on(installer::run_bundled_installer(prefix, &args)) {
+        Ok(installed) => {
+            #[cfg(windows)]
+            if handed_off {
+                // The handed-off child prints its own outcome to the
+                // inherited terminal after this process exits; this
+                // process never saw the landed version, so the "rolled
+                // back to" line would lie. The announcement rides here —
+                // the child is spawned by now, so a refused pre-flight
+                // (which returns Err below) never announced a background
+                // run that does not exist.
+                println!(
+                    "the {} continues in the background after this command exits — Windows only releases the payload once this process does",
+                    if archive.is_some() { "archive install" } else { "rollback" }
+                );
+                return 0;
+            }
+            let done = if archive.is_some() {
+                "installed"
+            } else {
+                "rolled back to"
+            };
+            let version = installed.version.as_deref().unwrap_or("the previous build");
+            println!("{done} {version} — restart prime-agent to run it");
             0
         }
         Err(failure) => {

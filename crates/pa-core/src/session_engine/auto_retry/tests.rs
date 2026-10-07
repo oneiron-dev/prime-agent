@@ -933,35 +933,11 @@ fn recording_emit(
     }
 }
 
-/// The retry events with the jittered wait zeroed (not under test where
-/// this is used).
-fn without_delays(events: &[AutoRetryEvent]) -> Vec<AutoRetryEvent> {
-    events
-        .iter()
-        .map(|event| match event {
-            AutoRetryEvent::Start {
-                attempt,
-                max_attempts,
-                error_message,
-                reason,
-                ..
-            } => AutoRetryEvent::Start {
-                attempt: *attempt,
-                max_attempts: *max_attempts,
-                delay_ms: 0,
-                error_message: error_message.clone(),
-                reason: reason.clone(),
-            },
-            AutoRetryEvent::End { .. } => event.clone(),
-        })
-        .collect()
-}
-
 fn quick_start(attempt: u32, max_attempts: u32, error_message: &str) -> AutoRetryEvent {
     AutoRetryEvent::Start {
         attempt,
         max_attempts,
-        delay_ms: 0,
+        delay_ms: TRANSPORT_RETRY_DELAYS_MS[(attempt - 1) as usize],
         error_message: error_message.to_string(),
         reason: RetryStartReason::Quick,
     }
@@ -997,7 +973,7 @@ async fn transport_failures_retry_until_the_turn_completes() {
     .unwrap();
     assert_eq!((attempts, message.stop_reason), (3, StopReason::Stop));
     assert_eq!(
-        without_delays(&events.lock().unwrap()),
+        *events.lock().unwrap(),
         vec![
             quick_start(1, 3, "WebSocket closed before response.completed"),
             quick_start(2, 3, "WebSocket stream closed before response.completed"),
@@ -1110,13 +1086,13 @@ async fn a_successful_message_inside_the_turn_starts_a_fresh_episode() {
     // Each failure is the first retry of its own episode; the turn's
     // final success has no episode left to close.
     assert_eq!(
-        without_delays(&events.lock().unwrap()),
+        *events.lock().unwrap(),
         vec![
-            quick_start(1, 2, failure),
+            quick_start(1, 3, failure),
             host_end.clone(),
-            quick_start(1, 2, failure),
+            quick_start(1, 3, failure),
             host_end.clone(),
-            quick_start(1, 2, failure),
+            quick_start(1, 3, failure),
             host_end,
         ]
     );
@@ -1153,15 +1129,20 @@ async fn a_cancel_from_the_retry_start_observer_prevents_a_second_request() {
     assert_eq!((attempts, message.stop_reason), (1, StopReason::Aborted));
 }
 
-/// Transport failures exhaust the quick-retry budget like any transient
-/// failure: the initial attempt plus three retries, then the final error
+/// Transport failures use exactly three unjittered waits, regardless of
+/// the configured generic budget: the initial attempt plus three retries,
+/// then the final error
 /// row carries the socket text.
 #[tokio::test]
 async fn transport_failures_exhaust_with_the_final_error() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut attempts = 0;
+    let waited = std::cell::RefCell::new(Vec::new());
     let message = run_turn_with_auto_retry(
-        &fast_policy(),
+        &ProviderRetryPolicy {
+            max_retries: 99,
+            ..fast_policy()
+        },
         0,
         None,
         &RetryEpisode::default(),
@@ -1170,14 +1151,18 @@ async fn transport_failures_exhaust_with_the_final_error() {
             std::future::ready(Ok(transport_message("WebSocket error", "error")))
         },
         recording_emit(&events),
-        |_| async { true },
+        |delay| {
+            waited.borrow_mut().push(delay.as_millis());
+            std::future::ready(true)
+        },
         None,
     )
     .await
     .unwrap();
     assert_eq!((attempts, message.stop_reason), (4, StopReason::Error));
+    assert_eq!(*waited.borrow(), vec![2000, 4000, 8000]);
     assert_eq!(
-        without_delays(&events.lock().unwrap()),
+        *events.lock().unwrap(),
         vec![
             quick_start(1, 3, "WebSocket error"),
             quick_start(2, 3, "WebSocket error"),
@@ -1226,6 +1211,186 @@ async fn disabled_retries_disclose_a_transport_failure_once() {
             success: false,
             attempt: 0,
             final_error: Some("WebSocket closed before response.completed".to_string()),
+            restored_model: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn mixed_transport_failures_keep_the_generation_ceiling_and_ladder() {
+    for kinds in [
+        ["transport", "transport", "transport", "server_error"],
+        ["server_error", "transport", "server_error", "server_error"],
+        ["server_error", "server_error", "server_error", "transport"],
+    ] {
+        let mut script = kinds.into_iter();
+        let mut attempts = 0;
+        let waits = std::cell::RefCell::new(Vec::new());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let message = run_turn_with_auto_retry(
+            &ProviderRetryPolicy {
+                max_retries: 99,
+                ..fast_policy()
+            },
+            0,
+            None,
+            &RetryEpisode::default(),
+            || {
+                attempts += 1;
+                std::future::ready(Ok(error_message(Some(script.next().unwrap()), None, None)))
+            },
+            recording_emit(&events),
+            |delay| {
+                waits.borrow_mut().push(delay.as_millis() as u64);
+                std::future::ready(true)
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((attempts, message.stop_reason), (4, StopReason::Error));
+        assert_eq!(waits.borrow().len(), 3);
+        for (index, _) in kinds.iter().enumerate().take(3) {
+            if kinds[..=index].contains(&"transport") {
+                assert_eq!(waits.borrow()[index], TRANSPORT_RETRY_DELAYS_MS[index]);
+            }
+        }
+        assert_eq!(
+            events.lock().unwrap().last(),
+            Some(&AutoRetryEvent::End {
+                success: false,
+                attempt: 3,
+                final_error: Some("provider down".to_string()),
+                restored_model: None,
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_committed_success_releases_the_transport_constraint_for_generic_failures() {
+    let episode = RetryEpisode::default();
+    let mut attempts = 0;
+    let result = run_turn_with_auto_retry(
+        &ProviderRetryPolicy {
+            max_retries: 5,
+            ..fast_policy()
+        },
+        0,
+        None,
+        &episode,
+        || {
+            attempts += 1;
+            if attempts == 2 {
+                assert!(episode.settle_success().is_some());
+            }
+            std::future::ready(Ok(if attempts == 1 {
+                transport_message("socket closed", "closed")
+            } else if attempts < 7 {
+                error_message(Some("server_error"), None, None)
+            } else {
+                ok_message()
+            }))
+        },
+        |_| async { Ok(()) },
+        |_| async { true },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!((attempts, result.stop_reason), (7, StopReason::Stop));
+}
+
+#[tokio::test]
+async fn connection_refresh_resets_at_committed_success_without_spending_normal_retries() {
+    let episode = RetryEpisode::default();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut attempts = 0;
+    let result = run_turn_with_auto_retry(
+        &ProviderRetryPolicy {
+            max_retries: 0,
+            ..fast_policy()
+        },
+        0,
+        None,
+        &episode,
+        || {
+            attempts += 1;
+            if attempts == 2 {
+                // A committed tool generation closes the reset loader and
+                // gives the following assistant generation its own allowance.
+                events
+                    .lock()
+                    .unwrap()
+                    .push(episode.settle_success().unwrap());
+            }
+            std::future::ready(Ok(if attempts < 3 {
+                error_message(Some("connection_limit"), Some(400), None)
+            } else {
+                ok_message()
+            }))
+        },
+        recording_emit(&events),
+        |delay| {
+            assert_eq!(delay, std::time::Duration::ZERO);
+            std::future::ready(true)
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (attempts, result.stop_reason, episode.retries()),
+        (3, StopReason::Stop, 0)
+    );
+    let start = AutoRetryEvent::Start {
+        attempt: 1,
+        max_attempts: 1,
+        delay_ms: 0,
+        error_message: "provider down".to_string(),
+        reason: RetryStartReason::ConnectionReset,
+    };
+    let end = AutoRetryEvent::End {
+        success: true,
+        attempt: 0,
+        final_error: None,
+        restored_model: None,
+    };
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![start.clone(), end.clone(), start, end]
+    );
+}
+
+#[tokio::test]
+async fn disabled_retries_disclose_a_cap_without_refreshing() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut attempts = 0;
+    let result = run_turn_with_auto_retry(
+        &ProviderRetryPolicy {
+            enabled: false,
+            ..fast_policy()
+        },
+        0,
+        None,
+        &RetryEpisode::default(),
+        || {
+            attempts += 1;
+            std::future::ready(Ok(error_message(Some("connection_limit"), Some(400), None)))
+        },
+        recording_emit(&events),
+        |_| async { panic!("disabled retries never wait or refresh") },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!((attempts, result.stop_reason), (1, StopReason::Error));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![AutoRetryEvent::End {
+            success: false,
+            attempt: 0,
+            final_error: Some("provider down".to_string()),
             restored_model: None,
         }]
     );

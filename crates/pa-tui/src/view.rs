@@ -116,6 +116,10 @@ pub struct AgentView {
     /// picker): while set, it owns the editor dock like the model
     /// picker.
     pub mcp_view: Option<crate::mcp_view::McpView>,
+    /// The factory page: while set, it owns the editor dock like the
+    /// inline pickers (one panel per live factory run) — the activity
+    /// dock's factory group's destination.
+    pub factory_view: Option<crate::factory_view::FactoryView>,
     /// The `/heartbeats` inline management view (TS
     /// `HeartbeatManagerComponent`, inline-picker style): while set, it
     /// owns the editor dock like the `/model` and `/effort` pickers.
@@ -327,6 +331,55 @@ impl AgentView {
         )
     }
 
+    /// One paste routed by the open overlay, the key dispatch's order:
+    /// the overlay's own input takes it, the input-less overlays consume
+    /// it, and the bare dock's editor takes it when nothing is open.
+    /// Returns whether an overlay took or consumed the paste.
+    pub fn route_paste(&mut self, text: &str) -> bool {
+        if let Some(picker) = self.model_picker.as_mut() {
+            picker.paste(text);
+            return true;
+        }
+        if let Some(picker) = self.effort_picker.as_mut() {
+            picker.paste(text);
+            return true;
+        }
+        if let Some(mcp) = self.mcp_view.as_mut() {
+            mcp.paste(text);
+            return true;
+        }
+        if let Some(selector) = self.tree_selector.as_mut() {
+            selector.paste(text);
+            return true;
+        }
+        if let Some(auth) = self.provider_auth.as_mut() {
+            auth.paste(text);
+            return true;
+        }
+        if let Some(menu) = self.settings_menu.as_mut() {
+            menu.paste(text);
+            return true;
+        }
+        // The input-less frame owners (the key dispatch's same set): the
+        // heartbeats picker, the bash view, the read-only goal and info
+        // panels, the fork selector, the pending confirm, the share
+        // loader, the reload box, and the auth panel (its own channel
+        // drives it). None of them leaves a paste to the editor behind.
+        if self.heartbeats_picker.is_some()
+            || self.bash_view.is_some()
+            || self.goal_panel.is_some()
+            || self.info_panel.is_some()
+            || self.fork_selector.is_some()
+            || self.confirm.is_some()
+            || self.share_loader.is_some()
+            || self.reload_box.is_some()
+            || self.auth_panel.is_some()
+        {
+            return true;
+        }
+        false
+    }
+
     #[must_use]
     pub fn new(theme: Theme) -> Self {
         Self {
@@ -359,6 +412,7 @@ impl AgentView {
             fork_selector: None,
             effort_picker: None,
             mcp_view: None,
+            factory_view: None,
             heartbeats_picker: None,
             goal_panel: None,
             bash_view: None,

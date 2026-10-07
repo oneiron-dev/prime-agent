@@ -50,6 +50,15 @@ prompt wait (the raw error to stderr, exit 1, no later prompts). Client
 commands (`/model`, `/tree`, ...) stay model prompts — TS
 `_normalizeSubmission` classifies only the four session commands before
 admission, so they never cross the turn boundary.
+Direct print retry composition (`print_retry.rs`) supplies an invocation-owned
+cancellation signal (Ctrl+C aborts without killing the process) and serializes
+pa-core's `RetryUpdate` onto the existing retry/message event shapes. The CLI
+does not own retry episodes, semantic parking, or outcome persistence; those
+live in `SessionEngine::run_prompt_with_retry`. Hosted print keeps the daemon
+driver and does not stack another retry loop. A connection-cap refresh projects as
+`auto_retry_start` with the existing optional `reason: "connection_reset"`, attempt 1,
+max 1, and delay 0. Its End/outcome row uses the unchanged ordinary retry count (zero
+when only the connection refreshed). No CLI-owned retry policy or new wire fields are added.
 The json stream emits the TS session-event surface byte-for-shape: the
 session header row (version 3), the `message_update` streaming deltas with
 the slim `assistantMessageEvent` (the daemon wire drops the nested

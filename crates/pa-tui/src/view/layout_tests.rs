@@ -1081,3 +1081,68 @@ fn an_assistant_growth_folds_at_its_own_slot() {
         "the paused selection keeps its content while the answer streams"
     );
 }
+
+#[test]
+fn drag_burst_and_release_keep_full_geometry_cold_for_large_bodies() {
+    let mut view = view();
+    view.splash_suppressed = true;
+    view.chrome.activity = Some(crate::chrome::ActivityDock::default());
+    for index in 0..4000 {
+        let body = "lorem ipsum dolor sit amet ".repeat(350);
+        let entry = if index % 2 == 0 {
+            ChatEntry::User {
+                text: format!("row {index} {body}"),
+            }
+        } else {
+            ChatEntry::Assistant(Box::new(AssistantMessage {
+                blocks: vec![MessageBlock::Text(format!("answer {index} {body}"))],
+                has_tool_calls: false,
+                streaming: false,
+                error: None,
+                aborted: false,
+            }))
+        };
+        view.push_entry(entry);
+    }
+    view.render_frame(100, 30);
+    view.scroll_to_top();
+    let top = view.render_frame(100, 30);
+    let pressed_row: String = top[2].iter().map(|span| span.content.as_str()).collect();
+    assert!(pressed_row.contains("row 0"));
+    assert!(view.begin_selection(2, 2));
+    view.render_frame(100, 30);
+    for index in 0..100 {
+        view.extend_active_selection(2 + index % 6, 2 + index % 40);
+        ENTRY_VISITS.with(|count| count.set(0));
+        ENTRY_RENDERS.with(|count| count.set(0));
+        view.render_frame(100, 30);
+        assert_eq!(ENTRY_VISITS.with(std::cell::Cell::get), 1);
+        assert_eq!(ENTRY_RENDERS.with(std::cell::Cell::get), 0);
+        assert!(view.entry_heights.iter().flatten().all(Option::is_none));
+    }
+    let expected: Vec<String> = top[2..=5]
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let from = if index == 0 { 2 } else { 0 };
+            let to = if index == 3 { 21 } else { usize::MAX };
+            crate::width::slice_line_by_column(row, from, to - from)
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    ENTRY_VISITS.with(|count| count.set(0));
+    ENTRY_RENDERS.with(|count| count.set(0));
+    assert_eq!(view.end_active_selection(), Some(expected.join("\n")));
+    assert_eq!(ENTRY_VISITS.with(std::cell::Cell::get), 2);
+    assert_eq!(ENTRY_RENDERS.with(std::cell::Cell::get), 0);
+    assert!(view.entry_heights.iter().flatten().all(Option::is_none));
+    ENTRY_VISITS.with(|count| count.set(0));
+    view.render_frame(100, 30);
+    assert_eq!(ENTRY_VISITS.with(std::cell::Cell::get), 1);
+    assert_eq!(ENTRY_RENDERS.with(std::cell::Cell::get), 0);
+    assert!(view.entry_heights.iter().flatten().all(Option::is_none));
+}

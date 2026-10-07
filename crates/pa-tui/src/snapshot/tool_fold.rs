@@ -147,8 +147,8 @@ pub struct AssistantErrorRow {
 
 /// The failed-attempt error row a retry supersedes (SANCTIONED DIVERGENCE
 /// from TS, operator ruling 2026-09-23 — the TS chat keeps one such row per
-/// failed attempt): an error-only assistant entry, no blocks and no tool
-/// calls (their cards carry the failure), not an abort. The episode's
+/// failed attempt): a failed assistant entry, including partial text or
+/// thinking, without tool cards, and not an abort. The episode's
 /// `provider_retry_outcome` row replaces every superseded attempt.
 #[must_use]
 pub fn is_superseded_attempt_row(entry: &ChatEntry) -> bool {
@@ -157,7 +157,6 @@ pub fn is_superseded_attempt_row(entry: &ChatEntry) -> bool {
         ChatEntry::Assistant(assistant)
             if assistant.error.is_some()
                 && !assistant.aborted
-                && assistant.blocks.is_empty()
                 && !assistant.has_tool_calls
     )
 }

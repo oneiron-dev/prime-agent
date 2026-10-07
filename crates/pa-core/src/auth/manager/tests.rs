@@ -641,42 +641,87 @@ fn the_token_fetch_holds_no_document_lock_and_a_peer_write_keeps_its_fresher_cre
     // mid-fetch, and the write phase keeps the peer's fresher
     // credential instead of overwriting it with this attempt's own
     // fetched token.
-    let oauth = Arc::new(CountingOAuth {
+    struct GatedOAuth {
+        calls: std::sync::atomic::AtomicUsize,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl OAuthIntegration for GatedOAuth {
+        fn api_key_for(&self, provider: &str, credential: &AuthCredential) -> Option<String> {
+            NoOAuth.api_key_for(provider, credential)
+        }
+
+        fn refresh(
+            &self,
+            _provider: &str,
+            _credentials: &AuthStorageData,
+        ) -> Option<AuthCredential> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered
+                .send(())
+                .expect("the coordinator waits for refresh entry");
+            self.release
+                .lock()
+                .expect("the refresh release gate")
+                .recv()
+                .expect("the coordinator explicitly releases refresh");
+            Some(CountingOAuth::fetched_credential())
+        }
+    }
+
+    // Only bounds liveness waits; completion before release proves the lock contract.
+    let liveness_timeout = std::time::Duration::from_secs(3);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let oauth = Arc::new(GatedOAuth {
         calls: std::sync::atomic::AtomicUsize::new(0),
-        delay_ms: 120,
+        entered: entered_tx,
+        release: std::sync::Mutex::new(release_rx),
     });
-    let (mut auth, backend) =
-        storage_over_backend_with(oauth.clone(), "x-peer", &expired_oauth("old-access"));
-    let writer_backend = Arc::clone(&backend);
-    let (wrote_tx, wrote_rx) = std::sync::mpsc::channel::<std::time::Duration>();
-    std::thread::spawn(move || {
-        // Mid-fetch: the resolving thread is inside the token fetch.
-        std::thread::sleep(std::time::Duration::from_millis(40));
+    let mut data = AuthStorageData::default();
+    data.insert("x-peer", &expired_oauth("old-access"));
+    let mut auth = AuthStorage::in_memory(&data, oauth.clone());
+    let writer_backend = Arc::clone(&auth.storage);
+    let resolver = std::thread::spawn(move || {
+        let api_key = auth.get_api_key("x-peer");
+        (api_key, auth)
+    });
+    if let Err(error) = entered_rx.recv_timeout(liveness_timeout) {
+        let release_result = release_tx.send(());
+        let resolver_result = resolver.join().map(|(api_key, _auth)| api_key);
+        panic!(
+            "the resolver did not enter refresh: {error}; release: {release_result:?}; resolver: {resolver_result:?}"
+        );
+    }
+
+    let (wrote_tx, wrote_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
+    let writer = std::thread::spawn(move || {
         let mut peer = AuthStorageData::default();
         peer.insert(
             "x-peer",
             &oauth_credential("peer-access", now_epoch_ms() + 3_600_000),
         );
-        let content = serde_json::to_string_pretty(&peer.0).unwrap_or_default();
-        let t0 = std::time::Instant::now();
-        writer_backend
-            .with_lock(&mut |current| {
-                let _ = current;
-                Ok(((), Some(content.clone())))
-            })
-            .ok();
+        let content = serde_json::to_string_pretty(&peer.0).expect("serialize the peer credential");
+        let write_result = writer_backend.with_lock(&mut |current| {
+            let _ = current;
+            Ok(((), Some(content.clone())))
+        });
         wrote_tx
-            .send(t0.elapsed())
-            .expect("the test main thread still waits for the write");
+            .send(write_result)
+            .expect("the coordinator waits for the peer write result");
     });
-    let api_key = auth.get_api_key("x-peer");
-    let write_wall = wrote_rx
-        .recv_timeout(std::time::Duration::from_secs(3))
-        .expect("the peer's locked write completed; a token fetch must not hold the document lock");
-    assert!(
-        write_wall < std::time::Duration::from_millis(60),
-        "the concurrent locked write waited {write_wall:?}: the fetch holds no lock"
-    );
+    let write_result = wrote_rx.recv_timeout(liveness_timeout);
+    // Release and join both workers even when the write was blocked by a lock regression.
+    let release_result = release_tx.send(());
+    let resolver_result = resolver.join();
+    let peer_join = writer.join();
+    write_result
+        .expect("the peer's locked write completed before refresh was released")
+        .expect("the peer's locked write succeeded");
+    release_result.expect("release refresh");
+    peer_join.expect("the peer writer finished");
+    let (api_key, auth) = resolver_result.expect("the resolver finished");
     assert_eq!(
         api_key.as_deref(),
         Some("peer-access"),

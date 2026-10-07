@@ -353,6 +353,8 @@ mod tests {
         let engine = Arc::new(
             pa_core::session_engine::engine::create_session(
                 pa_core::session_engine::engine::SessionEngineConfig {
+                    on_late_sent_agent_message: None,
+                    semantic_edges: None,
                     cron_store: None,
                     telemetry: None,
                     cwd: dir.path().to_path_buf(),

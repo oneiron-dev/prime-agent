@@ -18,6 +18,14 @@ pub const DEFAULT_SNAPSHOT_DEBOUNCE_MS: u64 = 1_500;
 pub const SNAPSHOT_EXECUTION_TIMEOUT_MS: u64 = 5_000;
 /// Restore deserializes everything a snapshot serializes: bounded like the repair step.
 pub const RESTORE_EXECUTION_TIMEOUT_MS: u64 = 30_000;
+/// The provisioner's runtime bootstrap imports the runtime and skills in one
+/// cell: bounded like the restore step, so a lost bootstrap frame fails the
+/// boot loudly instead of parking it forever. Shrunk in test builds so the
+/// regression test does not wait out the production bound.
+#[cfg(not(test))]
+pub const BOOTSTRAP_EXECUTION_TIMEOUT_MS: u64 = 30_000;
+#[cfg(test)]
+pub const BOOTSTRAP_EXECUTION_TIMEOUT_MS: u64 = 500;
 pub const KERNEL_ABORT_GRACE_MS: u64 = 1_000;
 pub const KERNEL_BUSY_REUSE_WAIT_MS: u64 = 5_000;
 pub const KERNEL_BUSY_INTERRUPT_INTERVAL_MS: u64 = 500;
@@ -28,6 +36,20 @@ pub const KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE: &str = "The Python kernel is stil
 pub const MAX_BACKGROUND_OUTPUT_CHARS: usize = 64 * 1024;
 
 pub const MAX_KERNEL_STDERR_CHARS: usize = 8 * 1024;
+
+/// The `factory_activity` out-of-band frame's action vocabulary, mirroring
+/// the kernel executor's `ACTIVITY_ACTIONS` (the `/factory` view's bridge).
+pub const FACTORY_ACTIVITY_ACTIONS: [&str; 6] =
+    ["graph", "status", "watch", "run", "stop", "resume"];
+
+/// Upper bound on one `factory_activity` watch's `timeoutMs` (the kernel
+/// caps its own at 60s; the host bridge pins the view's polling cadence
+/// lower). Mirrors the kernel's `ACTIVITY_TIMEOUT_MS_CAP` for the preflight.
+pub const FACTIVITY_WATCH_TIMEOUT_MS_CAP: u64 = 60_000;
+
+/// Fixed settle bound for one `factory_activity` request (a watch adds its
+/// own declared timeout on top, plus this margin for the executor's work).
+pub const FACTIVITY_SETTLE_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_KERNEL_STDERR_LOG_BYTES: u64 = 5 * 1024 * 1024;
 pub const KERNEL_STDERR_LOG_BUDGET_MARKER: &str = "[stderr log budget exhausted]\n";
 
@@ -45,6 +67,8 @@ pub const ATTACHMENT_DISPLAY_MIME: &str = "application/vnd.prime-agent.attachmen
 pub const AGENT_MESSAGE_DISPLAY_MIME: &str = "application/vnd.prime-agent.agent-message+json";
 /// Internal lifetime notices, consumed before user display rendering.
 pub const BASH_ACTIVITY_DISPLAY_MIME: &str = "application/vnd.prime-agent.bash-activity+json";
+/// One `bash()` call's command text (capped) and non-blank line count.
+pub const BASH_COMMAND_DISPLAY_MIME: &str = "application/vnd.prime-agent.bash-command+json";
 
 pub const EXECUTE_STATUS_OK: &str = "ok";
 pub const EXECUTE_STATUS_ERROR: &str = "error";
@@ -173,6 +197,14 @@ impl KernelCellLine {
     }
 }
 
+/// The `bash()` commands one cell started, summarized for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelBashCommands {
+    pub first: String,
+    pub count: usize,
+    pub lines: usize,
+}
+
 /// A kernel error reported by a failed cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelError {
@@ -196,6 +228,8 @@ pub struct ExecuteResult {
     pub attachments: Option<Vec<KernelAttachment>>,
     /// Agent messages sent from this cell, in order.
     pub sent_agent_messages: Option<Vec<KernelSentAgentMessage>>,
+    /// The `bash()` commands this cell started, summarized for display.
+    pub bash_commands: Option<KernelBashCommands>,
     /// Output that arrived without this cell's id (user threads, other cells' leftovers, raw fd writes).
     pub background_output: Option<String>,
     pub status: ExecuteStatus,

@@ -313,7 +313,7 @@ async fn ensure_kernel_python_uncached(
             let mut missing = Vec::new();
             if !has_prime_agent_runtime(&python_str, cancel).await {
                 missing.push(
-                    "a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, explicit harness CRUD methods, and the file-handle snapshot guard".to_string(),
+                    "a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, rlm.rename, explicit harness CRUD methods, and the file-handle snapshot guard".to_string(),
                 );
             }
             if missing.is_empty() {

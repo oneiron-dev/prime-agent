@@ -26,6 +26,7 @@ use super::provider_retry::{
     is_unsupported_tool_failure, jittered_delay_ms, provider_retry_delay,
     provider_stream_failure_kind, provider_stream_failure_retry_after_ms,
     provider_stream_failure_status, retry_jitter_rand01, ProviderRetryDelay, ProviderRetryPolicy,
+    TRANSPORT_MAX_RETRIES, TRANSPORT_RETRY_DELAYS_MS,
 };
 
 /// Why one `auto_retry_start` fired (the TS wire `reason` field).
@@ -33,6 +34,8 @@ use super::provider_retry::{
 pub enum RetryStartReason {
     /// Ordinary quick retry on the current provider.
     Quick,
+    /// One immediate same-provider connection refresh, outside the retry budget.
+    ConnectionReset,
     /// The failed turn re-routes to another configured provider serving the
     /// same model; `backup_model` is the `"provider/model-id"` reference.
     Backup { backup_model: String },
@@ -43,16 +46,17 @@ pub enum RetryStartReason {
 pub enum AutoRetryEvent {
     /// `auto_retry_start`: the loop parks the failed turn and waits.
     Start {
-        /// 1-based retry number.
+        /// 1-based retry number; a connection reset reports its separate 1/1 allowance.
         attempt: u32,
         max_attempts: u32,
         delay_ms: u64,
         error_message: String,
-        /// Which kind of retry this is (quick retry vs provider switch).
+        /// Quick retry, connection refresh, or provider switch.
         reason: RetryStartReason,
     },
-    /// `auto_retry_end`: the loop settled. `attempt` is the number of retries
-    /// performed; `final_error` is present exactly when `success` is false;
+    /// `auto_retry_end`: the loop settled. `attempt` is the number of ordinary
+    /// retries performed (zero for a connection-reset-only episode).
+    /// `final_error` is present exactly when `success` is false;
     /// `restored_model` is the `"provider/model-id"` primary restored after
     /// a provider-switch retry succeeded.
     End {
@@ -71,11 +75,19 @@ pub enum AutoRetryEvent {
 /// fresh episode. The host reports each successful assistant message
 /// through [`RetryEpisode::settle_success`] and emits the `auto_retry_end`
 /// it returns right after that message; the drivers count retries here, so
-/// they see the reset. One episode serves one turn.
+/// they see the reset. A separate one-refresh allowance handles exact
+/// connection caps without changing this count or its transport ladder.
+/// One episode serves one turn.
 #[derive(Debug, Default)]
 pub struct RetryEpisode {
     /// Retries performed in the open episode.
     retries: AtomicU32,
+    /// A transport failure constrains this generation until a committed success.
+    transport_constrained: AtomicBool,
+    /// One connection refresh is allowed per committed assistant generation.
+    connection_refreshed: AtomicBool,
+    /// A refresh opened the retry surface without charging `retries`.
+    connection_reset_in_flight: AtomicBool,
     /// A provider-failover switch is active: the failover driver restores
     /// the primary (and closes the episode with the restored model) when
     /// the turn settles, so a successful message inside the turn resets
@@ -93,6 +105,11 @@ impl RetryEpisode {
     /// Returns that end event for the host to emit right after the
     /// message, or `None` when no retry is in flight.
     pub fn settle_success(&self) -> Option<AutoRetryEvent> {
+        self.transport_constrained.store(false, Ordering::SeqCst);
+        self.connection_refreshed.store(false, Ordering::SeqCst);
+        let connection_reset = self
+            .connection_reset_in_flight
+            .swap(false, Ordering::SeqCst);
         let retries = self.retries.swap(0, Ordering::SeqCst);
         if self.held_for_restore.load(Ordering::SeqCst) {
             // The budget starts over all the same; the episode's end waits
@@ -107,7 +124,7 @@ impl RetryEpisode {
             }
             return None;
         }
-        (retries > 0).then_some(AutoRetryEvent::End {
+        (retries > 0 || connection_reset).then_some(AutoRetryEvent::End {
             success: true,
             attempt: retries,
             final_error: None,
@@ -125,9 +142,37 @@ impl RetryEpisode {
         self.retries.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Close the episode at the turn's end, returning its retry count.
+    /// Close the episode at the turn's end, returning its ordinary retry count.
     pub(crate) fn take(&self) -> u32 {
+        self.transport_constrained.store(false, Ordering::SeqCst);
+        self.connection_refreshed.store(false, Ordering::SeqCst);
+        self.connection_reset_in_flight
+            .store(false, Ordering::SeqCst);
         self.retries.swap(0, Ordering::SeqCst)
+    }
+
+    /// Reserve the generation's single refresh without changing its retry ladder.
+    pub(crate) fn try_refresh_connection(&self) -> bool {
+        if self.connection_refreshed.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        self.connection_reset_in_flight
+            .store(true, Ordering::SeqCst);
+        true
+    }
+
+    pub(crate) fn has_connection_reset(&self) -> bool {
+        self.connection_reset_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Prior generic retries consume the same ladder slots. Once transport
+    /// fails, all remaining retries use the fixed ladder and max-three cap;
+    /// neither another failure kind nor a provider switch reopens a budget.
+    pub(crate) fn constrain_transport(&self, message: &AssistantMessage) -> bool {
+        if provider_stream_failure_kind(message).as_deref() == Some("transport") {
+            self.transport_constrained.store(true, Ordering::SeqCst);
+        }
+        self.transport_constrained.load(Ordering::SeqCst)
     }
 
     /// A provider switch is active for the rest of the turn.
@@ -191,11 +236,29 @@ where
 {
     loop {
         let message = attempt().await?;
+        if message.stop_reason == StopReason::Aborted
+            || (message.stop_reason == StopReason::Error
+                && signal.is_some_and(AbortSignal::is_aborted))
+        {
+            let connection_reset = episode.has_connection_reset();
+            let retries = episode.take();
+            if retries > 0 || connection_reset {
+                emit(AutoRetryEvent::End {
+                    success: false,
+                    attempt: retries,
+                    final_error: Some("Retry cancelled".to_string()),
+                    restored_model: None,
+                })
+                .await?;
+            }
+            return Ok(with_stop_reason_aborted(message));
+        }
         if message.stop_reason != StopReason::Error {
             // An episode the host already closed at a successful message
             // inside this attempt reads zero: no second end.
+            let connection_reset = episode.has_connection_reset();
             let retries_performed = episode.take();
-            if retries_performed > 0 {
+            if retries_performed > 0 || connection_reset {
                 emit(AutoRetryEvent::End {
                     success: true,
                     attempt: retries_performed,
@@ -206,8 +269,33 @@ where
             }
             return Ok(message);
         }
-        if signal.is_some_and(AbortSignal::is_aborted) {
-            return Ok(with_stop_reason_aborted(message));
+        if provider_stream_failure_kind(&message).as_deref() == Some("connection_limit")
+            && policy.enabled
+            && episode.try_refresh_connection()
+        {
+            emit(AutoRetryEvent::Start {
+                attempt: 1,
+                max_attempts: 1,
+                delay_ms: 0,
+                error_message: final_error_of(&message),
+                reason: RetryStartReason::ConnectionReset,
+            })
+            .await?;
+            // The zero-delay wait still consults the host's cancellation probe.
+            if signal.is_some_and(AbortSignal::is_aborted)
+                || !wait(std::time::Duration::ZERO).await
+                || signal.is_some_and(AbortSignal::is_aborted)
+            {
+                emit(AutoRetryEvent::End {
+                    success: false,
+                    attempt: episode.take(),
+                    final_error: Some("Retry cancelled".to_string()),
+                    restored_model: None,
+                })
+                .await?;
+                return Ok(with_stop_reason_aborted(message));
+            }
+            continue;
         }
         // The episode's count after any reset the host made at a
         // successful message inside this attempt.
@@ -254,11 +342,26 @@ where
         // TS `_handleRetryableError` bumps the attempt counter before
         // deciding, so the exhaustion check compares past `max_retries`.
         let retries_performed = episode.bump();
-        let delay = provider_retry_delay(
-            retries_performed,
-            provider_stream_failure_retry_after_ms(&message),
-            policy,
-        );
+        let transport = episode.constrain_transport(&message);
+        let max_retries = if transport {
+            TRANSPORT_MAX_RETRIES
+        } else {
+            policy.max_retries
+        };
+        let delay = if transport {
+            ProviderRetryDelay::Wait {
+                delay_ms: TRANSPORT_RETRY_DELAYS_MS
+                    .get(retries_performed.saturating_sub(1) as usize)
+                    .copied()
+                    .unwrap_or(0),
+            }
+        } else {
+            provider_retry_delay(
+                retries_performed,
+                provider_stream_failure_retry_after_ms(&message),
+                policy,
+            )
+        };
         let delay_ms = match delay {
             // Jittered (operator ruling 2026-09-23; the fork TS
             // `providerRetryDelay` rule: ±25%, floored at the server wait):
@@ -272,7 +375,7 @@ where
                 // give-up), so the exhaustion arm never preempts the
                 // park decision: a quota-blocked attempt on the final
                 // retry still parks when the reset is too far.
-                if retries_performed > policy.max_retries {
+                if retries_performed > max_retries {
                     emit(AutoRetryEvent::End {
                         success: false,
                         attempt: retries_performed - 1,
@@ -282,11 +385,15 @@ where
                     .await?;
                     return Ok(message);
                 }
-                jittered_delay_ms(
-                    delay_ms,
-                    provider_stream_failure_retry_after_ms(&message),
-                    retry_jitter_rand01(),
-                )
+                if transport {
+                    delay_ms
+                } else {
+                    jittered_delay_ms(
+                        delay_ms,
+                        provider_stream_failure_retry_after_ms(&message),
+                        retry_jitter_rand01(),
+                    )
+                }
             }
             ProviderRetryDelay::ExceedsCap { retry_after_ms } => {
                 // The give-up sentence of this arm is the park's abort
@@ -329,13 +436,16 @@ where
         };
         emit(AutoRetryEvent::Start {
             attempt: retries_performed,
-            max_attempts: policy.max_retries,
+            max_attempts: max_retries,
             delay_ms,
             error_message: final_error_of(&message),
             reason: RetryStartReason::Quick,
         })
         .await?;
-        if !wait(std::time::Duration::from_millis(delay_ms)).await {
+        if signal.is_some_and(AbortSignal::is_aborted)
+            || !wait(std::time::Duration::from_millis(delay_ms)).await
+            || signal.is_some_and(AbortSignal::is_aborted)
+        {
             emit(AutoRetryEvent::End {
                 success: false,
                 attempt: retries_performed,

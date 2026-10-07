@@ -59,6 +59,7 @@ fn resolve_socket_dir(
 /// discovery never sweeps it (the socket-dir scan returns nothing on
 /// Windows).
 #[cfg(not(unix))]
+#[must_use]
 pub fn socket_dir() -> PathBuf {
     std::env::temp_dir().join("prime-agent-user")
 }
@@ -88,6 +89,7 @@ pub fn default_daemon_socket_path() -> PathBuf {
 }
 
 #[cfg(not(unix))]
+#[must_use]
 pub fn default_daemon_socket_path() -> PathBuf {
     PathBuf::from(r"\\.\pipe\prime-agent-daemon")
 }
@@ -120,6 +122,7 @@ pub fn worker_socket_path(supervisor_socket_path: &Path, worker_id: &str) -> Pat
 }
 
 #[cfg(not(unix))]
+#[must_use]
 pub fn worker_socket_path(supervisor_socket_path: &Path, worker_id: &str) -> PathBuf {
     let key = hash_key(&supervisor_socket_path.to_string_lossy(), 12);
     PathBuf::from(format!(

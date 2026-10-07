@@ -527,6 +527,7 @@ fn structured_transport_failures_classify_as_transport() {
     let error = ProviderError::Transport(ProviderWsTransportError {
         message: "WebSocket closed before response.completed".to_string(),
         close_code: Some(1006),
+        sdk_name: None,
         transport: Some(StreamTransportFailureDetail {
             close_code: Some(1006),
             was_clean: Some(false),

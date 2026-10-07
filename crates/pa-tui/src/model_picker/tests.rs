@@ -172,7 +172,12 @@ fn scope_toggles_between_the_scoped_list_and_the_catalog() {
         .expect("the search field renders");
     assert!(
         scope_row.is_some_and(|scope_row| {
-            scope_row < search_row && rows[scope_row].contains("Alt+S scope (all/scoped)")
+            scope_row < search_row
+                && rows[scope_row].contains(if cfg!(target_os = "macos") {
+                    "Option+S scope (all/scoped)"
+                } else {
+                    "Alt+S scope (all/scoped)"
+                })
         }),
         "the scope row renders above the search field with its leading space:
 {}",

@@ -1,9 +1,9 @@
 //! The dispatch surface: command routing, the command handlers,
 //! and the abort family.
 use super::{
-    json, response_failure, response_success, KillCloseReason, Lane, QueueCheckpoint, QueuedItem,
-    Result, SessionFile, TurnSettle, VecDeque, Worker, PROMPT_ABORTED_BEFORE_DELIVERY,
-    SIDE_QUESTION_SETTLE_TIMEOUT,
+    json, persist_custom_row, response_failure, response_success, KillCloseReason, Lane,
+    QueueCheckpoint, QueuedItem, Result, SessionFile, TurnSettle, VecDeque, Worker,
+    PROMPT_ABORTED_BEFORE_DELIVERY, SIDE_QUESTION_SETTLE_TIMEOUT,
 };
 
 use serde_json::Value;
@@ -89,7 +89,7 @@ impl Worker {
                 response_success(None, "abort_compaction", None)
             }
             "set_auto_compaction" => self.handle_set_auto_compaction(payload),
-            "wait_for_idle" => self.handle_wait_for_idle().await,
+            "wait_for_idle" => self.handle_wait_for_idle(payload).await,
             "wait_for_headless_completion" => {
                 self.handle_wait_for_headless_completion(payload).await
             }
@@ -121,6 +121,7 @@ impl Worker {
             "shutdown" => self.handle_shutdown().await,
             "rename" => self.handle_rename("rename", payload),
             "set_session_name" => self.handle_rename("set_session_name", payload),
+            "mark_anthropic_warning_shown" => self.handle_mark_anthropic_warning_shown(),
             "rename_saved_session" => self.handle_rename_saved_session(payload),
             "delete_saved_session" => self.handle_delete_saved_session(payload).await,
             "replace_acp_mcp_servers" => self.handle_replace_acp_mcp_servers(payload),
@@ -148,6 +149,7 @@ impl Worker {
             "export_jsonl" => self.exports.export_jsonl(payload),
             "mutate_queued_message" => self.handle_mutate_queued_message(payload),
             "resume_queue" => self.handle_resume_queue(),
+            "factory_activity" => self.handle_factory_activity(payload).await,
             "execute_bash" => self.handle_execute_bash(payload),
             "execute_bash_and_wait" => self.handle_execute_bash_and_wait(payload).await,
             "abort_bash" => self.handle_abort_bash().await,
@@ -422,7 +424,8 @@ impl Worker {
                         kept.push_back(item);
                     } else {
                         if let Some(id) = &item.admission_id {
-                            let _ = self.prompt_admissions.cancel(id);
+                            // A withdrawn prompt clears its admission (TS clearAdmission).
+                            self.prompt_admissions.clear(id);
                         }
                         if let Some(done) = item.done {
                             let _ = done.send(TurnSettle::Withdrawn(
@@ -564,8 +567,18 @@ impl Worker {
             return response;
         }
         let mut core = self.core.lock().unwrap();
-        let steering: Vec<String> = core.steering.drain(..).map(|item| item.message).collect();
-        let follow_up: Vec<String> = core.follow_up.drain(..).map(|item| item.message).collect();
+        let drain_lane = |lane: &mut VecDeque<QueuedItem>| -> Vec<String> {
+            lane.drain(..)
+                .map(|item| {
+                    if let Some(id) = item.admission_id.as_deref() {
+                        self.prompt_admissions.clear(id);
+                    }
+                    item.message
+                })
+                .collect()
+        };
+        let steering: Vec<String> = drain_lane(&mut core.steering);
+        let follow_up: Vec<String> = drain_lane(&mut core.follow_up);
         let snapshot = Self::snapshot_locked(&core);
         drop(core);
         // The cleared lanes are idle again: the verdict refresh rides the
@@ -744,7 +757,40 @@ impl Worker {
             .as_mut()
             .and_then(|store| store.lease.take());
         drop(lease);
+        // The session runtime ended (TS `prime-agent stop <agent>`): the
+        // pane reporter releases its pane as the last write on the wire —
+        // no report may reclaim it afterwards. The slot is taken out
+        // first (swapped to the disabled no-op) so a later attach can
+        // adopt the pane again; the taken handle's release is the
+        // release of the session this kill stopped.
+        let reporter = std::mem::take(&mut *self.herdr.lock().unwrap());
+        reporter.release().await;
         response_success(None, "kill", None)
+    }
+
+    /// `mark_anthropic_warning_shown` (Rust-native, operator directive
+    /// 2026-09-29): the interactive client reports that it just drew the
+    /// Anthropic subscription ban-risk warning; the worker persists the
+    /// once-per-session-lifecycle marker row (the gate a reattach, a resume,
+    /// or a worker replacement reads). Idempotent — a session already marked
+    /// (or an in-memory session with no file) answers success without a
+    /// second row.
+    fn handle_mark_anthropic_warning_shown(&self) -> DaemonResponse {
+        const NAME: &str = "mark_anthropic_warning_shown";
+        if let Err(response) = self.require_created(NAME) {
+            return response;
+        }
+        let mut core = self.core.lock().unwrap();
+        let Some(store) = core.store.as_mut() else {
+            return response_failure(None, NAME, "Session is still initializing", None);
+        };
+        if store.anthropic_warning_shown() {
+            return response_success(None, NAME, None);
+        }
+        match store.mark_anthropic_warning_shown() {
+            Ok(()) => response_success(None, NAME, None),
+            Err(error) => response_failure(None, NAME, &error.to_string(), None),
+        }
     }
 
     pub(crate) fn handle_rename(&self, command: &str, payload: &Value) -> DaemonResponse {
@@ -756,12 +802,48 @@ impl Worker {
             return response_failure(None, command, "Session name cannot be empty", None);
         }
         let mut core = self.core.lock().unwrap();
+        let previous = core
+            .store
+            .as_ref()
+            .and_then(|store| store.session_name().map(str::to_string));
         if let Some(store) = core.store.as_mut() {
             if let Err(error) = store.persist_entry("session_info", json!({ "name": name })) {
                 return response_failure(None, command, &error.to_string(), None);
             }
         }
         let summary = self.summary_locked(&core);
+        // TS #2529 `applyStateSessionName`: a rename that changed an
+        // existing name leaves the renamed session a displayed transcript
+        // notice (" by parent" when the rename arrived from the parent
+        // session); a first name leaves none. The notice's durable row
+        // lands under the SAME core lock as the name write — worker
+        // commands run concurrently, so a second lock scope here could
+        // interleave another command's writes between the name and its
+        // notice, ordering the notice against a contradicted name history.
+        // The broadcast (the client frames) runs after the lock drops, in
+        // the `session_info_changed` order TS emits.
+        let renamed_notice = previous
+            .as_deref()
+            .filter(|previous| *previous != name)
+            .map(|previous| {
+                let content = if payload.get("renamedBy").and_then(Value::as_str)
+                    == Some(
+                        pa_core::session_engine::agent_messaging::AgentFamilyRelationship::Parent
+                            .as_str(),
+                    ) {
+                    format!("Session renamed `{previous}` -> `{name}` by parent")
+                } else {
+                    format!("Session renamed `{previous}` -> `{name}`")
+                };
+                json!({
+                    "customType": pa_core::session_engine::messages::SESSION_RENAMED_CUSTOM_TYPE,
+                    "content": content,
+                    "display": true,
+                })
+            });
+        if let Some(notice) = renamed_notice.as_ref() {
+            persist_custom_row(&mut core, notice);
+        }
         drop(core);
         // TS `session.setSessionName` emits `session_info_changed` so every
         // attached client re-reads the name (the interactive mode patches
@@ -773,6 +855,9 @@ impl Worker {
         // The sender identity follows the live name.
         if let Ok(summary_value) = serde_json::to_value(&summary) {
             self.engine.set_session_summary(summary_value);
+        }
+        if let Some(notice) = renamed_notice.as_ref() {
+            self.broadcast_custom_row(notice);
         }
         response_success(
             None,

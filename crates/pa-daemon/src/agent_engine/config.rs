@@ -106,6 +106,9 @@ pub(crate) struct CreateSessionResources {
     pub(crate) tools: Option<Vec<String>>,
     pub(crate) no_tools: bool,
     pub(crate) no_builtin_tools: bool,
+    /// The creating client's mode (`interactive`, `acp`, ...) for the
+    /// session's telemetry; absent reports `unknown` (TS parity).
+    pub(crate) execution_mode: Option<String>,
 }
 
 impl CreateSessionResources {
@@ -236,5 +239,18 @@ mod tests {
     fn a_wrongly_typed_tool_key_fails_the_create() {
         let payload = serde_json::json!({ "type": "create", "cwd": "/w", "noTools": "yes" });
         assert!(CreateSessionResources::deserialize(&payload).is_err());
+    }
+
+    /// The create payload's `executionMode` reaches the session telemetry;
+    /// a create without one (an agent-spawned session) stays `None`
+    /// (reported as `unknown`, TS parity).
+    #[test]
+    fn create_resources_read_the_execution_mode() {
+        let payload = serde_json::json!({ "cwd": "/tmp", "executionMode": "interactive" });
+        let resources = CreateSessionResources::deserialize(&payload).unwrap();
+        assert_eq!(resources.execution_mode.as_deref(), Some("interactive"));
+        let resources =
+            CreateSessionResources::deserialize(&serde_json::json!({ "cwd": "/tmp" })).unwrap();
+        assert_eq!(resources.execution_mode, None);
     }
 }

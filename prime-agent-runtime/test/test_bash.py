@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import json
 import os
 import resource
@@ -274,11 +275,22 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("fg", result.output)
                 # The shell stays alive as group leader, anchoring its background job.
                 os.killpg(handle.pid, 0)
-                records = await _poll_journal(journal, count=1)
-                self.assertTrue(records[-1]["active"])
+                records = await _poll_journal(
+                    journal,
+                    count=1,
+                    predicate=lambda row: row["pid"] == handle.pid and row["active"] is True,
+                )
                 handle.kill(signal.SIGKILL)
-                records = await _poll_journal(journal, count=2)
-            self.assertFalse(records[-1]["active"])
+                await _poll_group_dead(handle.pid)
+                records = await _poll_journal(
+                    journal,
+                    count=2,
+                    predicate=lambda row: row["pid"] == handle.pid and row["active"] is False,
+                )
+            self.assertEqual(
+                [(record["pid"], record["active"]) for record in records],
+                [(handle.pid, True), (handle.pid, False)],
+            )
 
     async def test_early_shell_exit_returns_and_kills_group(self):
         handle = bash("sleep 30 & exit 7")
@@ -1275,17 +1287,9 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(bash_module.os, "killpg", side_effect=OSError):
             self.assertFalse(bash_module._signal_group(1234567, signal.SIGKILL))
 
-    async def test_journal_configured_but_unwritable_kills_child_and_raises(self):
+    async def test_journal_unwritable_path_does_not_block_spawn(self):
         with tempfile.TemporaryDirectory() as tmp:
             marker = os.path.join(tmp, "marker")
-            pids: list[int] = []
-            real_popen = subprocess.Popen
-
-            def capturing_popen(*args, **kwargs):
-                proc = real_popen(*args, **kwargs)
-                pids.append(proc.pid)
-                return proc
-
             with mock.patch.dict(
                 os.environ,
                 {
@@ -1293,14 +1297,12 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                     "PRIME_AGENT_KERNEL_OWNER_PID": str(os.getpid()),
                 },
             ):
-                with mock.patch.object(bash_module.subprocess, "Popen", capturing_popen):
-                    with self.assertRaises(RuntimeError):
-                        bash(f"touch {marker}")
-            await _poll_group_dead(pids[0])
-            await asyncio.sleep(0.2)
-            self.assertFalse(os.path.exists(marker))
-            with bash_module._live_lock:
-                self.assertFalse(bash_module._live_handles)
+                handle = bash(f"touch {marker}")
+                result = await asyncio.wait_for(handle, timeout=5)
+                await handle._wait_reaped()
+            self.assertEqual(result.exit_code, 0)
+            self.assertTrue(os.path.isfile(marker))
+            self.assertEqual(os.listdir(tmp), ["marker"])
 
     async def test_journal_bad_owner_pid_rejects(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1315,7 +1317,7 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(RuntimeError):
                     bash("echo hi")
 
-    async def test_missing_start_id_rejects_when_configured(self):
+    async def test_missing_start_id_is_accepted_when_configured(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = os.path.join(tmp, "journal.jsonl")
             with mock.patch.dict(
@@ -1326,12 +1328,18 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                 },
             ):
                 with mock.patch.object(bash_module, "_process_start_id", return_value=None):
-                    with self.assertRaises(RuntimeError):
-                        bash("sleep 30")
+                    handle = bash("echo hi")
+                    result = await asyncio.wait_for(handle, timeout=5)
+                    await handle._wait_reaped()
+                records = await _poll_journal(journal, count=2)
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual([record["active"] for record in records], [True, False])
+            self.assertTrue(all(record["pid"] == handle.pid for record in records))
+            self.assertTrue(all("processStartId" not in record for record in records))
 
-    async def test_journal_short_write_rejects_when_configured(self):
-        # A partial os.write would leave a truncated JSON line the host
-        # discards; enrollment must treat it as failure.
+    async def test_journal_short_write_is_best_effort_when_configured(self):
+        # A zero-progress write leaves no complete JSONL record, but does not
+        # make journaling availability a prerequisite for the caller.
         with tempfile.TemporaryDirectory() as tmp:
             journal = os.path.join(tmp, "journal.jsonl")
 
@@ -1346,7 +1354,9 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                 },
             ):
                 with mock.patch.object(bash_module.os, "write", short_write):
-                    self.assertFalse(bash_module._record_journal(os.getpid(), active=False))
+                    self.assertTrue(bash_module._record_journal(os.getpid(), active=False))
+            with open(journal, "rb") as fh:
+                self.assertEqual(fh.read(), b"")
 
     async def test_journal_partial_writes_complete_the_record(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1421,13 +1431,19 @@ async def _poll_group_dead(pgid: int, timeout: float = 5.0) -> None:
     raise AssertionError(f"process group {pgid} still alive after {timeout}s")
 
 
-async def _poll_journal(path: str, count: int, timeout: float = 2.0) -> list[dict]:
+async def _poll_journal(
+    path: str,
+    count: int,
+    timeout: float = 2.0,
+    *,
+    predicate: Callable[[dict], bool] | None = None,
+) -> list[dict]:
     deadline = asyncio.get_running_loop().time() + timeout
     records: list[dict] = []
     while asyncio.get_running_loop().time() < deadline:
         with open(path) as f:
             records = [json.loads(line) for line in f if line.strip()]
-        if len(records) >= count:
+        if len(records) >= count and (predicate is None or any(predicate(row) for row in records)):
             return records
         await asyncio.sleep(0.05)
     return records
