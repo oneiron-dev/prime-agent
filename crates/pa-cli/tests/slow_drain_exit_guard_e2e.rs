@@ -332,22 +332,28 @@ impl SlowDrainHarness {
         let started = Instant::now();
         let deadline = started + deadline;
         let mut paused = false;
+        let mut actual_pause = Duration::ZERO;
+        let mut max_read_gap = Duration::ZERO;
+        let mut last_read_at = started;
+        let mut read_count = 0usize;
         let slice = Duration::from_millis(4);
         let slice_bytes = (rate * slice.as_secs_f64()).max(1.0) as usize;
         let mut drained = 0usize;
         loop {
             if self.child.try_wait().ok().flatten().is_some() {
-                return drained;
+                break;
             }
             if Instant::now() > deadline {
-                return drained;
+                break;
             }
             if !paused
                 && matches!(pattern, DrainPattern::BriefPause)
                 && started.elapsed() >= Duration::from_secs(2)
             {
-                // A controlled scheduler-sized pause, shorter than the unchanged 500ms grace.
-                std::thread::sleep(Duration::from_millis(400));
+                // Leave room for kernel write completion within the unchanged 500ms grace.
+                let pause_started = Instant::now();
+                std::thread::sleep(Duration::from_millis(250));
+                actual_pause = pause_started.elapsed();
                 paused = true;
             }
             let mut buffer = [0u8; 4096];
@@ -355,12 +361,27 @@ impl SlowDrainHarness {
             match self.master.file.read(&mut buffer[..want]) {
                 Ok(0) | Err(_) => std::thread::sleep(slice),
                 Ok(n) => {
+                    let now = Instant::now();
+                    max_read_gap = max_read_gap.max(now.duration_since(last_read_at));
+                    last_read_at = now;
+                    read_count += 1;
                     self.master.output.extend_from_slice(&buffer[..n]);
                     drained += n;
                 }
             }
             std::thread::sleep(slice);
         }
+        let wall = started.elapsed();
+        let active = wall.saturating_sub(actual_pause).as_secs_f64();
+        let bytes_per_second = if active > 0.0 {
+            drained as f64 / active
+        } else {
+            0.0
+        };
+        eprintln!(
+            "drain observation: bytes={drained}, reads={read_count}, wall={wall:?}, pause={actual_pause:?}, max_read_gap={max_read_gap:?}, active_rate={bytes_per_second:.0}B/s"
+        );
+        drained
     }
 }
 
