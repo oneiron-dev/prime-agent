@@ -86,6 +86,21 @@ static HARNESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn a_slow_drain_flushes_the_whole_transcript_without_forcing_the_exit() {
+    assert_slow_drain_completes(DrainPattern::Steady);
+}
+
+#[test]
+fn a_brief_reader_pause_does_not_truncate_a_progressing_exit_flush() {
+    assert_slow_drain_completes(DrainPattern::BriefPause);
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DrainPattern {
+    Steady,
+    BriefPause,
+}
+
+fn assert_slow_drain_completes(pattern: DrainPattern) {
     let _lock = match HARNESS_LOCK.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -106,7 +121,7 @@ fn a_slow_drain_flushes_the_whole_transcript_without_forcing_the_exit() {
 
     // Pace the drain: the deadline lands mid-flush, and the guard must hold
     // its fire on the writer's per-chunk progress.
-    let drained = harness.pump_until_exit(READ_RATE_BYTES_PER_S, Duration::from_secs(120));
+    let drained = harness.pump_until_exit(READ_RATE_BYTES_PER_S, Duration::from_secs(120), pattern);
     let exit_wall = keys_sent.elapsed();
     assert_eq!(
         harness.wait_child_exit(Duration::from_secs(5)),
@@ -116,6 +131,19 @@ fn a_slow_drain_flushes_the_whole_transcript_without_forcing_the_exit() {
     // The kernel still holds every byte it accepted after the process died.
     harness.settle();
     let output = harness.output();
+    let output_path =
+        std::env::temp_dir().join(format!("slow-drain-{pattern:?}-{}.out", std::process::id()));
+    std::fs::write(&output_path, &output).expect("save the raw exit-drain evidence");
+    let leave_count = output
+        .windows(ALT_SCREEN_LEAVE.len())
+        .filter(|window| *window == ALT_SCREEN_LEAVE)
+        .count();
+    assert_eq!(
+        leave_count,
+        1,
+        "a progressing drain must not run the forced restore; raw output {}",
+        output_path.display()
+    );
     let _ = mark;
 
     // The drain really ran past the deadline mid-flush (anti-vacuity).
@@ -184,7 +212,11 @@ fn a_stalled_drain_still_fires_the_force_quit() {
     // Resume the drain: the watchdog has fired, and its forced restore is
     // queued behind the blocked chunk write — the process dies with the
     // guard's exit code, the flush truncated at the stall point.
-    let _ = harness.pump_until_exit(READ_RATE_BYTES_PER_S, Duration::from_secs(60));
+    let _ = harness.pump_until_exit(
+        READ_RATE_BYTES_PER_S,
+        Duration::from_secs(60),
+        DrainPattern::Steady,
+    );
     let exit_wall = keys_sent.elapsed();
     assert_eq!(
         harness.wait_child_exit(Duration::from_secs(5)),
@@ -296,8 +328,10 @@ impl SlowDrainHarness {
 
     /// Read the master at a fixed byte rate until the child exits (a token
     /// bucket refilling at `rate`).
-    fn pump_until_exit(&mut self, rate: f64, deadline: Duration) -> usize {
-        let deadline = Instant::now() + deadline;
+    fn pump_until_exit(&mut self, rate: f64, deadline: Duration, pattern: DrainPattern) -> usize {
+        let started = Instant::now();
+        let deadline = started + deadline;
+        let mut paused = false;
         let slice = Duration::from_millis(4);
         let slice_bytes = (rate * slice.as_secs_f64()).max(1.0) as usize;
         let mut drained = 0usize;
@@ -307,6 +341,14 @@ impl SlowDrainHarness {
             }
             if Instant::now() > deadline {
                 return drained;
+            }
+            if !paused
+                && matches!(pattern, DrainPattern::BriefPause)
+                && started.elapsed() >= Duration::from_secs(2)
+            {
+                // A controlled scheduler-sized pause, shorter than the unchanged 500ms grace.
+                std::thread::sleep(Duration::from_millis(400));
+                paused = true;
             }
             let mut buffer = [0u8; 4096];
             let want = buffer.len().min(slice_bytes.max(1));

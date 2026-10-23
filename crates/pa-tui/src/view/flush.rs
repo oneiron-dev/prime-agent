@@ -53,9 +53,17 @@ impl AgentView {
     }
 }
 
-/// The encoded flush rows leave the process in slices of at most this many bytes: each PTY
-/// write stays one syscall, and a completed chunk write is the exit guard's progress proof.
-const CHUNK_BYTES: usize = 32 * 1024;
+/// Bound each progress write, including a single oversized encoded row. Small writes keep
+/// a draining terminal's proof fresh without extending the exit watchdog's grace window.
+const CHUNK_BYTES: usize = 4 * 1024;
+
+fn write_progress(out: &mut dyn std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    for chunk in bytes.chunks(CHUNK_BYTES) {
+        out.write_all(chunk)?;
+        crate::exit_guard::note_exit_progress();
+    }
+    Ok(())
+}
 
 /// The streaming main-screen flush state: feeds rows section by section, routes them between
 /// the append stream and the repaint ring, writes in bounded chunks.
@@ -86,11 +94,8 @@ impl FlushSink {
                 crate::interactive::write_flush_rows(&mut self.chunk, std::slice::from_ref(row));
                 self.texts.push(text);
                 if self.chunk.len() >= CHUNK_BYTES {
-                    out.write_all(self.chunk.as_bytes())?;
+                    write_progress(out, self.chunk.as_bytes())?;
                     self.chunk.clear();
-                    // A completed chunk write is exit-path progress for
-                    // the exit guard's force-quit hold.
-                    crate::exit_guard::note_exit_progress();
                 }
             } else if self.repaint || index >= self.flushed.len() {
                 // A changed row turns the write into a repaint; a row
@@ -129,9 +134,8 @@ impl FlushSink {
     fn finish(&mut self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
         if self.appending {
             if !self.chunk.is_empty() {
-                out.write_all(self.chunk.as_bytes())?;
+                write_progress(out, self.chunk.as_bytes())?;
                 self.chunk.clear();
-                crate::exit_guard::note_exit_progress();
             }
         } else if self.repaint || self.texts.len() < self.flushed.len() {
             // A frame that shrank never rewinds into a rewrite of
@@ -139,9 +143,8 @@ impl FlushSink {
             let mut buffer = String::from("\x1b[2J\x1b[H");
             let ring: Vec<crate::Line> = std::mem::take(&mut self.ring).into_iter().collect();
             crate::interactive::write_flush_rows(&mut buffer, &ring);
-            out.write_all(buffer.as_bytes())?;
+            write_progress(out, buffer.as_bytes())?;
             self.chunk.clear();
-            crate::exit_guard::note_exit_progress();
         }
         Ok(())
     }
@@ -168,4 +171,56 @@ pub(super) fn split_at_chars(text: &str, at: usize) -> (&str, &str) {
         return (text, "");
     }
     (&text[..end], &text[end..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct CapturedWrites {
+        bytes: Vec<u8>,
+        lengths: Vec<usize>,
+    }
+
+    impl std::io::Write for CapturedWrites {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            self.lengths.push(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn oversized_append_and_repaint_rows_keep_progress_writes_bounded() {
+        let row = vec![crate::Span::raw("界".repeat(CHUNK_BYTES))];
+        for (flushed, repaint) in [(Vec::new(), false), (vec!["old".to_string()], true)] {
+            let mut sink = FlushSink {
+                flushed,
+                texts: Vec::new(),
+                ring: std::collections::VecDeque::new(),
+                chunk: String::new(),
+                screen_height: 40,
+                appending: false,
+                repaint: false,
+            };
+            let mut actual = CapturedWrites::default();
+            sink.feed(&mut actual, std::slice::from_ref(&row))
+                .expect("feed row");
+            sink.finish(&mut actual).expect("finish flush");
+            let mut expected = if repaint {
+                String::from("\x1b[2J\x1b[H")
+            } else {
+                String::new()
+            };
+            crate::interactive::write_flush_rows(&mut expected, std::slice::from_ref(&row));
+            let bytes = expected.into_bytes();
+            let lengths = bytes.chunks(CHUNK_BYTES).map(<[u8]>::len).collect();
+            assert_eq!(actual, CapturedWrites { bytes, lengths });
+        }
+    }
 }

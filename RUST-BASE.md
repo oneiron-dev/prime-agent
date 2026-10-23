@@ -47,7 +47,11 @@ The Oneiron fork of prime-agent on the Rust product. Upstream replaced the TypeS
   disappearing proc entry, while unverifiable/live/stopped owners remain protected; the
   stop verifier proves the lease's exact owner PID without relaxing its escalation bounds. The
   self-update guard verifier executes an immutable tracked launcher with separate writable
-  path data, preserving real daemon startup/RPC checks without a generated-script exec race.
+  path data, preserving real daemon startup/RPC checks without a generated-script exec race. The
+  exit flush now bounds every encoded progress write to 4 KiB (previously 32 KiB row
+  batches could overshoot); a controlled 400ms reader pause proved false force-quit with
+  the unchanged 1500ms deadline/500ms grace. The new pause and byte-parity regressions
+  preserve healthy completeness and the forced-stall control without relaxing time bounds.
 
 ## Carried upstream patches
 
