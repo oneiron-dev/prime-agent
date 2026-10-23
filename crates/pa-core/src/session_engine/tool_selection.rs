@@ -62,6 +62,11 @@ impl ToolSelection {
         builtins: Vec<T>,
         name: impl Fn(&T) -> &str,
     ) -> Vec<T> {
+        let same_name = |left: &str, right: &str| {
+            left == right
+                || (pa_types::ai::is_python_tool_name(left)
+                    && pa_types::ai::is_python_tool_name(right))
+        };
         let mut registry: Vec<(bool, T)> = Vec::new();
         for (is_builtin, tool) in supplied
             .into_iter()
@@ -70,7 +75,7 @@ impl ToolSelection {
         {
             if !registry
                 .iter()
-                .any(|(_, registered)| name(registered) == name(&tool))
+                .any(|(_, registered)| same_name(name(registered), name(&tool)))
             {
                 registry.push((is_builtin, tool));
             }
@@ -88,7 +93,7 @@ impl ToolSelection {
                 for wanted in allowed {
                     if let Some(at) = registry
                         .iter()
-                        .position(|(_, tool)| name(tool) == wanted.as_str())
+                        .position(|(_, tool)| same_name(name(tool), wanted))
                     {
                         active.push(registry.remove(at).1);
                     }
@@ -174,6 +179,29 @@ mod tests {
                 vec!["echo"],
                 vec!["ipython", "echo"],
             ]
+        );
+    }
+
+    #[test]
+    fn python_aliases_select_the_canonical_builtin_once() {
+        let selection = ToolSelection::from_flags(&flags(
+            Some(&["ipython", "python_repl", "python"]),
+            true,
+            true,
+        ));
+        assert_eq!(
+            selection.select(Vec::new(), vec![pa_types::ai::PYTHON_TOOL_NAME], |name| {
+                name
+            }),
+            vec![pa_types::ai::PYTHON_TOOL_NAME],
+        );
+        assert_eq!(
+            ToolSelection::Defaults.select(
+                vec!["ipython"],
+                vec![pa_types::ai::PYTHON_TOOL_NAME],
+                |name| name
+            ),
+            vec!["ipython"],
         );
     }
 

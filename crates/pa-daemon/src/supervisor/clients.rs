@@ -1,14 +1,14 @@
 //! Client connections: the per-connection task - read loop, dispatch,
 //! and the parsed-command execution surface.
 use super::{
-    broadcast, command_type_name, current_protocol_info, daemon_closing_shutdown_event,
-    input_admission_id, json, parse_supervisor_command_line, response_failure, response_line,
-    response_success, salvage_command_type, salvage_id, subscribers, update_gate_refuses, util,
-    Arc, AsyncBufReadExt, AsyncWriteExt, BufReader, ClientRouting, DaemonCommand, DaemonOutbound,
-    DaemonRuntimeIdentity, Duration, EnvelopeParseError, Map, Ordering, Outbound, ResidentWorker,
-    Result, RouteAdmission, Supervisor, TransportStream, TypedCreateRejection, Value,
-    DAEMON_APP_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION, ROUTE_TIMEOUT_MS,
-    UPDATE_PREPARING_MESSAGE,
+    app_version, broadcast, command_type_name, current_protocol_info,
+    daemon_closing_shutdown_event, input_admission_id, json, parse_supervisor_command_line,
+    response_failure, response_line, response_success, salvage_command_type, salvage_id,
+    subscribers, update_gate_refuses, util, Arc, AsyncBufReadExt, AsyncWriteExt, BufReader,
+    ClientRouting, DaemonCommand, DaemonOutbound, DaemonRuntimeIdentity, Duration,
+    EnvelopeParseError, Map, Ordering, Outbound, ResidentWorker, Result, RouteAdmission,
+    Supervisor, TransportStream, TypedCreateRejection, Value, DAEMON_SCHEMA_ID,
+    DAEMON_SCHEMA_REVISION, ROUTE_TIMEOUT_MS, UPDATE_PREPARING_MESSAGE,
 };
 
 /// TS `OWNED_WORKER_DISCONNECT_GRACE_MS`: how long a client-owned worker
@@ -24,9 +24,8 @@ async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &Value) -> 
     Ok(bytes)
 }
 
-/// Write one pre-serialized client line (the byte relay's raw form already
-/// carries its trailing newline). Reports the written byte count like
-/// [`write_line`].
+/// Write one pre-serialized client line (the byte relay's raw form
+/// already carries its trailing newline).
 async fn write_raw_line<W: AsyncWriteExt + Unpin>(writer: &mut W, line: &[u8]) -> Result<usize> {
     let bytes = line.len();
     writer.write_all(line).await?;
@@ -42,13 +41,8 @@ pub(crate) fn client_command_payload(
     let mut payload = serde_json::to_value(command)?;
     if let Some(object) = payload.as_object_mut() {
         object.insert("clientId".to_string(), json!(client_id));
-        // The supervisor always attaches slim, like the TS supervisor's
-        // `attachClient`: summary and messages travel inside the snapshot.
-        // The client's OWN normalized capability set rides alongside as
-        // `clientCapabilities`: the worker echoes it into the attach
-        // result's `client.capabilities`, so the response the supervisor
-        // relays by bytes already carries the echo the supervisor used to
-        // patch into the parsed tree.
+        // The supervisor always attaches slim; the client's OWN capability set rides
+        // alongside as `clientCapabilities`, which the worker echoes into the attach result.
         if let DaemonCommand::Attach { capabilities, .. }
         | DaemonCommand::Reattach { capabilities, .. } = command
         {
@@ -127,7 +121,7 @@ impl Supervisor {
             protocol: current_protocol_info(),
             schema_id: Some(DAEMON_SCHEMA_ID.to_string()),
             schema_revision: Some(DAEMON_SCHEMA_REVISION),
-            app_version: Some(DAEMON_APP_VERSION.to_string()),
+            app_version: Some(app_version().to_string()),
             runtime: Some(DaemonRuntimeIdentity {
                 build_id: concat!("pa-daemon-rs-", env!("CARGO_PKG_VERSION")).to_string(),
                 executable_path: std::env::current_exe()
@@ -162,54 +156,38 @@ impl Supervisor {
         let (targeted_tx, mut targeted_rx) = tokio::sync::mpsc::channel::<Arc<Value>>(
             crate::backpressure::TARGETED_EVENT_QUEUE_CAPACITY,
         );
-        // Connection state shared with the per-command dispatch tasks: the
-        // envelope-overridden client id and the attached-session handle
-        // (attach/detach keep the registry and the session list consistent;
-        // the registry insertion is the delivery boundary).
+        // Connection state shared with the per-command dispatch tasks (the registry
+        // insertion is the delivery boundary).
         let attached = subscribers::ClientSubscriptions::new(connection_id.clone(), targeted_tx);
         // Roster subscription flag shared with the per-command dispatch
         // tasks (`roster_subscribe` flips it; the event arm filters pushes).
         let roster_subscribed: Arc<std::sync::atomic::AtomicBool> =
             Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Per-connection pause-lease state (wave b8): the connection id
-        // lease keys embed, the detach epoch, and the detaching sessions.
         let connection = Arc::new(crate::input_pause_lease::ClientConnectionState::new());
-        // Completed dispatches flow back through this channel so the loop
-        // keeps writing: a long command (a turn, a compaction) must not
-        // block this client's events or its other commands, like the TS
-        // daemon's async command handlers. Bounded at
-        // [`crate::backpressure::CLIENT_OUTBOUND_CAPACITY`]: a client that
-        // reads nothing stalls only its own dispatch tasks once the queue
-        // fills — memory stays bounded per connection — while every other
-        // client and worker is unaffected.
+        // Completed dispatches flow back through this channel so the loop keeps
+        // writing: a long command must not block this client's events or its other
+        // commands. Bounded so a slow client stalls only its own dispatch tasks.
         let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::channel::<(Vec<Outbound>, bool)>(
             crate::backpressure::CLIENT_OUTBOUND_CAPACITY,
         );
-        // One dispatch slot per concurrent command. The read arm is armed
-        // only while a slot is free — at the bound the loop stops reading
-        // the client's socket (the client's own send buffer carries its
-        // input: transport-level flow control instead of unbounded task
-        // spawn), while the dispatch and event arms keep draining, so the
-        // running tasks free their slots and the loop always re-arms the
-        // reader. A spawned task holds its slot until its response bundle
-        // has been handed to the queue, so a task parked on a full
-        // outbound queue still counts against this connection's bound.
+        // One dispatch slot per concurrent command. The read arm is armed only while a
+        // slot is free — at the bound the loop stops reading the client's socket
+        // (transport-level flow control, not unbounded task spawn).
         let dispatch_slots = Arc::new(tokio::sync::Semaphore::new(
             crate::backpressure::CLIENT_DISPATCH_CONCURRENCY,
         ));
-        loop {
+        // Every exit flows through shared disconnect/dispatch cleanup.
+        let served: Result<()> = 'serve: loop {
             tokio::select! {
                 biased;
                 read = lines.next_line(), if dispatch_slots.available_permits() > 0 => {
-                    let Ok(Some(line)) = read else { break };
+                    let Ok(Some(line)) = read else { break 'serve Ok(()) };
                     let trimmed = line.trim().to_string();
                     if trimmed.is_empty() {
                         continue;
                     }
-                    // The arm's guard proved a slot free (this loop is
-                    // the only slot acquirer, and slots only free while
-                    // the loop is between iterations), so the non-blocking
-                    // take always succeeds.
+                    // The arm's guard proved a slot free (this loop is the only slot
+                    // acquirer), so the non-blocking take always succeeds.
                     let dispatch_slot = Arc::clone(&dispatch_slots)
                         .try_acquire_owned()
                         .expect("the read arm's guard held a dispatch slot");
@@ -219,10 +197,8 @@ impl Supervisor {
                     let roster_subscribed = Arc::clone(&roster_subscribed);
                     let connection = Arc::clone(&connection);
                     let dispatch_tx = dispatch_tx.clone();
-                    // The stream clone a mid-handler streaming command
-                    // (list_saved_sessions) writes its progress frames
-                    // through: the SAME channel the response later takes,
-                    // so the frames stay strictly ordered ahead of it.
+                    // A streaming command (list_saved_sessions) writes its progress frames
+                    // through the SAME channel the response later takes, so they stay ordered.
                     let stream_tx = dispatch_tx.clone();
                     let connection_id = connection_id.clone();
                     tokio::spawn(async move {
@@ -238,26 +214,13 @@ impl Supervisor {
                             )
                             .await;
                         if dispatch_tx.send((lines, stop)).await.is_err() && stop {
-                            // The initiating connection left before its response
-                            // was selected. Only a terminal shutdown owns the
-                            // descriptor-deleting stop pass; an update restart
-                            // must leave its descriptors for the successor.
-                            let is_shutdown_owner = supervisor
-                                .shutdown_owner
-                                .lock()
-                                .unwrap()
-                                .as_deref()
-                                == Some(connection_id.as_str());
-                            if is_shutdown_owner
-                                && supervisor.shutting_down.load(Ordering::SeqCst)
-                                && !supervisor.accept_exit.load(Ordering::SeqCst)
-                            {
-                                supervisor.ensure_shutdown_started().await;
-                            }
+                            // Only a terminal shutdown owns the descriptor-deleting stop pass; an
+                            // update restart must leave its descriptors for the successor.
+                            supervisor
+                                .start_shutdown_if_owner(&connection_id)
+                                .await;
                         }
-                        // The slot frees only once the bundle is in the
-                        // queue: a task parked on a full outbound queue
-                        // still counts against this connection's bound.
+                        // The slot frees only once the bundle is in the queue.
                         drop(dispatch_slot);
                     });
                 }
@@ -271,29 +234,15 @@ impl Supervisor {
                     // event-before-response socket order survives the hop.
                     if let Some(payload) = targeted {
                         if let Err(error) = write_line(&mut writer, &payload).await {
-                            // An event-write failure must not strand an
-                            // accepted shutdown: if this connection owns
-                            // the stop, it still starts the pass.
-                            let is_shutdown_owner = self
-                                .shutdown_owner
-                                .lock()
-                                .unwrap()
-                                .as_deref()
-                                == Some(connection_id.as_str());
-                            if is_shutdown_owner
-                                && self.shutting_down.load(Ordering::SeqCst)
-                                && !self.accept_exit.load(Ordering::SeqCst)
-                            {
-                                self.ensure_shutdown_started().await;
-                            }
-                            return Err(error);
+                            // An event-write failure exits through the shared cleanup below.
+                            break 'serve Err(error);
                         }
                     } else {
-                        break;
+                        break 'serve Ok(());
                     }
                 }
                 dispatched = dispatch_rx.recv() => {
-                    let Some((lines, stop)) = dispatched else { break };
+                    let Some((lines, stop)) = dispatched else { break 'serve Ok(()) };
                     for outbound in lines {
                         let written = match &outbound {
                             Outbound::Line(value) => write_line(&mut writer, value).await,
@@ -307,30 +256,20 @@ impl Supervisor {
                                 if stop {
                                     self.ensure_shutdown_started().await;
                                 }
-                                return Err(error);
+                                break 'serve Err(error);
                             }
                         };
-                        // A large outbound response (a catalog scan's
-                        // rows, a routed snapshot before the byte relay,
-                        // any locally-built summary of a grown session)
-                        // carried big transients - the Value tree of a
-                        // Line, the shared payload bytes of a Raw - and
-                        // the frame is out, so return the freed heap to
-                        // the OS instead of letting the arenas hold the
-                        // phase's peak for the daemon's lifetime (the
-                        // #2872 phase-boundary guard, mirrored on the
-                        // supervisor's write path).
+                        // A large outbound response freed big transients: return the heap to
+                        // the OS instead of letting the arenas hold the phase's peak.
                         drop(outbound);
                         pa_types::memory_release::trim_freed_heap_if_large(bytes);
                     }
                     if stop {
-                        // The initiating client's response and daemon_closing
-                        // lines are flushed above; only now may the stop pass
-                        // end the runtime. The accept loop stays up until
-                        // begin_shutdown sets accept_exit, so worker stops
-                        // cannot be cut short by another inbound connection.
+                        // The initiating client's response and daemon_closing lines are flushed
+                        // above; only now may the stop pass end the runtime (the accept loop
+                        // stays up until begin_shutdown sets accept_exit).
                         self.ensure_shutdown_started().await;
-                        break;
+                        break 'serve Ok(());
                     }
                 }
                 event = events.recv() => {
@@ -347,61 +286,31 @@ impl Supervisor {
                             };
                             if deliver {
                                 if let Err(error) = write_line(&mut writer, &payload).await {
-                                    // An event-write failure must not strand an
-                                    // accepted shutdown: if this connection owns
-                                    // the stop, it still starts the pass.
-                                    let is_shutdown_owner = self
-                                        .shutdown_owner
-                                        .lock()
-                                        .unwrap()
-                                        .as_deref()
-                                        == Some(connection_id.as_str());
-                                    if is_shutdown_owner
-                                        && self.shutting_down.load(Ordering::SeqCst)
-                                        && !self.accept_exit.load(Ordering::SeqCst)
-                                    {
-                                        self.ensure_shutdown_started().await;
-                                    }
-                                    return Err(error);
+                                    // An event-write failure exits through the shared cleanup below.
+                                    break 'serve Err(error);
                                 }
                             }
                         }
-                        // A lagged receiver means the shared event ring
-                        // ([`crate::backpressure::EVENT_RING_CAPACITY`])
-                        // dropped this many events for THIS connection:
-                        // the loss itself is the broadcast's defined
-                        // backpressure, but it must never stay invisible
-                        // (finding 4a) — the daemon log records which
-                        // client lost how much.
+                        // A lagged receiver means the ring dropped this many events for THIS
+                        // connection: the loss is the defined backpressure, but never invisible —
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             self.log_line(&format!(
                                 "client {connection_id} lagged on the event ring: {skipped} events dropped"
                             ));
                         }
-                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Closed) => break 'serve Ok(()),
                     }
                 }
             }
-        }
-        // A shutdown command may have been accepted just before this client
-        // disconnected (or its response write failed). Only the connection
-        // that accepted the shutdown may run the stop pass from this
-        // fallback: another client disconnecting in the response window
-        // must not preempt the acknowledgement or turn an update restart
-        // into a terminal descriptor sweep.
-        let is_shutdown_owner =
-            self.shutdown_owner.lock().unwrap().as_deref() == Some(connection_id.as_str());
-        if is_shutdown_owner
-            && self.shutting_down.load(Ordering::SeqCst)
-            && !self.accept_exit.load(Ordering::SeqCst)
-        {
-            self.ensure_shutdown_started().await;
-        }
-        // Detach from every attached session on disconnect (a TUI exit does
-        // not stop the session; the worker keeps running). The registry
-        // entries go first — no session event may be enqueued for a
-        // connection whose loop has exited — then the worker-side detach
-        // routes run as before.
+        };
+        // Only the connection that accepted the shutdown may run the stop pass from this
+        // fallback: another client disconnecting in the response window must not preempt the
+        // acknowledgement. Every exit path lands here, including the write failures.
+        self.retire_client_dispatches(&mut dispatch_rx, &connection_id)
+            .await;
+        // Detach from every attached session on disconnect (a TUI exit does not
+        // stop the session). The registry entries go first — no session event may
+        // be enqueued for a connection whose loop has exited.
         attached.detach_all(&self.session_subscribers);
         let attached_sessions = attached.session_ids();
         for active_session_id in &attached_sessions {
@@ -418,14 +327,39 @@ impl Supervisor {
                     .await;
             }
         }
-        // The disconnect's pause-lease cleanup (TS socket `cleanup`):
-        // in-flight acquisitions invalidate and every lease the
-        // connection held releases on its worker. Every waiting prompt
-        // admission cancels so its in-flight prompt fails with the TS
-        // cancellation error.
+        // The disconnect's pause-lease cleanup: in-flight acquisitions invalidate, every held
+        // lease releases, and waiting prompt admissions cancel with the TS cancellation error.
         self.release_all_client_pauses(&connection).await;
         connection.prompt_admissions.cancel_all_waiting();
-        Ok(())
+        served
+    }
+
+    /// Retire a connection's response path before its asynchronous cleanup.
+    async fn retire_client_dispatches(
+        self: &Arc<Self>,
+        dispatch_rx: &mut tokio::sync::mpsc::Receiver<(Vec<Outbound>, bool)>,
+        connection_id: &str,
+    ) {
+        // Cleanup below awaits worker replies. A shutdown that claims this
+        // connection later must fail its send and run the owner fallback,
+        // rather than successfully enqueueing into a loop that has exited.
+        dispatch_rx.close();
+        self.start_shutdown_if_owner(connection_id).await;
+    }
+
+    /// The accepted-shutdown fallback on a connection's exit: only the
+    /// connection that accepted the shutdown may start the stop pass, so
+    /// another client disconnecting in the response window cannot preempt
+    /// the acknowledgement.
+    async fn start_shutdown_if_owner(self: &Arc<Self>, connection_id: &str) {
+        let is_shutdown_owner =
+            self.shutdown_owner.lock().unwrap().as_deref() == Some(connection_id);
+        if is_shutdown_owner
+            && self.shutting_down.load(Ordering::SeqCst)
+            && !self.accept_exit.load(Ordering::SeqCst)
+        {
+            self.ensure_shutdown_started().await;
+        }
     }
 
     /// Whether any live connection still speaks for `client_id` (one
@@ -527,9 +461,7 @@ impl Supervisor {
 
     /// Handle one client command line: returns outbound lines in order and
     /// whether this client connection should stop.
-    // One more dispatch-context input than the lint's budget: the
-    // per-connection stream sender rides the same context bundle
-    // `execute_parsed_command` takes (its own allow below).
+    // The per-connection stream sender rides the same context bundle (lint budget +1).
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_client(
         self: &Arc<Self>,
@@ -545,11 +477,9 @@ impl Supervisor {
             Ok(envelope) => envelope,
             Err(error) => {
                 let id = salvage_id(line);
-                // TS has two failure spellings: envelope/protocol failures
-                // answer `command: "parse"` (`failure(salvageDaemonCommandId,
-                // "parse", ...)`), while a known envelope holding an unknown
-                // or malformed command type echoes that type
-                // (`failure(command.id, command.type, ...)`).
+                // TS has two failure spellings: envelope/protocol failures answer
+                // `command: "parse"`, while a known envelope holding an unknown or
+                // malformed command type echoes that type.
                 let salvaged_type = salvage_command_type(line);
                 let type_name = if matches!(
                     error,
@@ -571,12 +501,9 @@ impl Supervisor {
             }
         };
         let command_id = envelope.id.clone();
-        // THE REQUEST'S OWN CLIENT ID, captured at parse time (the bots'
-        // finding): `effective_client_id` is per-connection state a later
-        // command on the same connection can overwrite while this
-        // dispatch is still running, and the shutdown attribution must
-        // name the client that SENT the shutdown, not whoever spoke next.
-        // An envelope without a clientId rides the connection's sticky id.
+        // THE REQUEST'S OWN CLIENT ID, captured at parse time: the shutdown
+        // attribution must name the client that SENT the shutdown, not whoever
+        // spoke next (an envelope without a clientId rides the sticky id).
         let request_client_id = envelope
             .client_id
             .clone()
@@ -584,10 +511,8 @@ impl Supervisor {
         if let Some(client_id) = envelope.client_id.clone() {
             *effective_client_id.lock().unwrap() = client_id;
         }
-        // The prompt-admission registration (wave b9, TS parse-time):
-        // a prompt/prompt_and_wait carrying an admissionId reserves it
-        // before dispatch; duplicates and empty ids answer the TS parse
-        // errors with `command: "parse"`.
+        // A prompt carrying an admissionId reserves it before dispatch (TS parse-time);
+        // duplicates and empty ids answer the TS parse errors with `command: "parse"`.
         if let Some(admission_id) = crate::prompt_admission::input_admission_id(&envelope.command) {
             let active_session_id = crate::protocol::command_active_session_id(&envelope.command)
                 .unwrap_or_default()
@@ -608,11 +533,8 @@ impl Supervisor {
             }
         }
         let type_name = command_type_name(&envelope.command).to_string();
-        // Terminal shutdown admission gate: once the shutdown command has
-        // flipped `shutting_down`, no later client command may reach a
-        // worker (the stop pass may already be retiring it). The command
-        // that started the shutdown passed this point before it set the
-        // gate, so its own response path is unaffected.
+        // Terminal shutdown admission gate: once `shutting_down` has flipped, no later
+        // client command may reach a worker (the stop pass may already be retiring it).
         if self.shutting_down.load(Ordering::SeqCst) {
             return (
                 vec![Outbound::Line(response_line(&response_failure(
@@ -624,16 +546,13 @@ impl Supervisor {
                 false,
             );
         }
-        // Update-prepare watchdog on any later command (spec §5): a prepared
-        // transaction whose marker expired returns the supervisor to Serving
-        // before the command is served.
+        // Update-prepare watchdog on any later command (spec §5): an expired marker
+        // returns the supervisor to Serving before the command is served.
         if let Some(abort) = self.update_prepare.abort_if_expired(util::now_ms()) {
             self.finish_update_abort(&abort);
         }
-        // Admission gate: mutating commands are refused while a prepare
-        // transaction is active (TS "Daemon is preparing an update restart"),
-        // except the drain commands during `Draining`. The transaction's own
-        // drivers never reach the gate.
+        // Admission gate: mutating commands are refused while a prepare transaction is
+        // active, except the drain commands during `Draining`.
         let is_update_driver = matches!(
             &envelope.command,
             DaemonCommand::PrepareUpdateRestart { .. } | DaemonCommand::CommitUpdateRestart { .. }
@@ -646,10 +565,8 @@ impl Supervisor {
                             Some(&command_id),
                             &type_name,
                             UPDATE_PREPARING_MESSAGE,
-                            // TS #2391: the typed `update_restarting` info
-                            // rides beside the unchanged plain message, so
-                            // clients can recognize the normal transient
-                            // state and wait through the restart.
+                            // The typed `update_restarting` info rides beside the plain message,
+                            // so clients can recognize the transient state and wait through it.
                             Some(pa_types::daemon::DaemonErrorInfo::UpdateRestarting),
                         )))],
                         false,
@@ -708,17 +625,10 @@ impl Supervisor {
         match command {
             DaemonCommand::AckResult { .. } => (Vec::new(), false),
             DaemonCommand::Restart { .. } | DaemonCommand::Shutdown { .. } => {
-                // WHO asked (the twice-killed fleet's field diagnosis: a
-                // stop seen from the outside was unattributable until the
-                // wire was reconstructed): the request's client id and
-                // command id land in the daemon log the moment the drain
-                // commits, so the client that stopped the daemon - the
-                // installer, an agent session, a person - is nameable
-                // from the log alone. The id is the REQUEST's own (parse-
-                // time capture, not the connection's mutable effective
-                // id), and both values are newline-stripped: the log is
-                // line-structured, and a client-chosen id carrying \n
-                // must not forge attribution lines (the bots' finding).
+                // WHO asked: the request's client id and command id land in the daemon log
+                // the moment the drain commits, so the client that stopped the daemon is
+                // nameable from the log alone. Both values are newline-stripped: a
+                // client-chosen id carrying \n must not forge attribution lines.
                 let logged_client = request_client_id.replace(['\n', '\r'], " ");
                 let logged_command = command_id.replace(['\n', '\r'], " ");
                 self.log_line(&format!(
@@ -735,13 +645,9 @@ impl Supervisor {
                     std::sync::Arc::new(closing.clone()),
                 ));
                 lines.push(closing);
-                // Answer first, then shut down: the connection loop writes
-                // these lines before it awaits begin_shutdown, so the client
-                // always receives the response and daemon_closing before the
-                // stop pass can end the process. The shutdown gate flips
-                // synchronously here — before the response is written — so
-                // no create dispatched after the shutdown can slip past it
-                // and launch a worker the stop pass would miss.
+                // Answer first, then shut down: the client receives the response and
+                // daemon_closing before the stop pass can end the process. The gate flips
+                // synchronously here, so no create dispatched after the shutdown can slip past it.
                 *self.shutdown_owner.lock().unwrap() = Some(connection_id.to_string());
                 self.shutting_down.store(true, Ordering::SeqCst);
                 (lines, true)
@@ -829,9 +735,7 @@ impl Supervisor {
                         false,
                     ),
                     Err(error) => {
-                        // A typed worker rejection carries its wire info to
-                        // the client (the TS `serializeDaemonError` shape);
-                        // untyped failures stay the bare string.
+                        // A typed worker rejection carries its wire info to the client.
                         let (message, error_info) =
                             match error.downcast_ref::<TypedCreateRejection>() {
                                 Some(rejection) => (
@@ -855,9 +759,8 @@ impl Supervisor {
             DaemonCommand::GetDirectWorkerTransport {
                 active_session_id, ..
             } => {
-                // Direct-attach ticket: the supervisor issues a single-use
-                // grant for a registered session and hands the client the
-                // worker's own socket; it stays out of the streaming path.
+                // Direct-attach ticket: a single-use grant for a registered session, handed to
+                // the client with the worker's own socket; it stays out of the streaming path.
                 let response = self
                     .handle_get_direct_worker_transport(&command_id, &type_name, active_session_id)
                     .await;
@@ -875,9 +778,8 @@ impl Supervisor {
                 target_active_session_id,
                 ..
             } => {
-                // Worker-to-worker peer ticket: a single-use `worker`
-                // grant pushed into the target worker's memory, so the
-                // delivery itself bypasses this route plane.
+                // Worker-to-worker peer ticket: a single-use `worker` grant pushed into
+                // the target worker's memory, so the delivery bypasses this route plane.
                 let response = self
                     .handle_get_worker_peer_transport(
                         &command_id,
@@ -889,37 +791,30 @@ impl Supervisor {
                 (vec![response_line(&response)], false)
             }
             DaemonCommand::WorkerRegister { .. } => {
-                // Worker self-registration: rebuilds the roster entry from
-                // the worker's own identity instead of routing to a session.
+                // Worker self-registration: rebuilds the roster entry from the worker's
+                // own identity instead of routing to a session.
                 let response = self
                     .handle_worker_register(&command_id, &type_name, command)
                     .await;
                 (vec![response_line(&response)], false)
             }
             DaemonCommand::CommitUpdateRestart { .. } => {
-                // The coordinator's commit (spec §5 `Prepared -> Stopping`):
-                // consume the prepared transaction, stop the workers
-                // gracefully in budget, and either exit for the update or
-                // abandon it (sessions untouched).
+                // The coordinator's commit (spec §5 `Prepared -> Stopping`): consume the
+                // prepared transaction, stop the workers in budget, and exit or abandon it.
                 self.handle_commit_update_restart(&command_id, &type_name, command)
                     .await
             }
             DaemonCommand::PrepareUpdateRestart { .. } => {
-                // The update-flow coordinator's prepare RPC: accepts (or
-                // idempotently polls) the supervisor-side prepare
-                // transaction (spec §5). Slice 2 drives it to `Fenced` -
-                // the worker snapshot that fills the roster and reaches
-                // `Prepared` is the graceful-stop slice.
+                // The update-flow coordinator's prepare RPC: accepts (or idempotently
+                // polls) the supervisor-side prepare transaction (spec §5).
                 let response = self
                     .handle_prepare_update_restart(&command_id, &type_name, command)
                     .await;
                 (vec![response_line(&response)], false)
             }
             DaemonCommand::UpdateRestoreStatus { .. } => {
-                // The boot restore pass's live snapshot (spec §6/§9): the
-                // successor coordinator's `Restoring` report polls this
-                // for real counts and per-session failures instead of
-                // inferring adoption from the session list.
+                // The boot restore pass's live snapshot (spec §6/§9): the successor
+                // coordinator's `Restoring` report polls this for real counts and failures.
                 let data = self.restore_status_body();
                 (
                     vec![response_line(&response_success(
@@ -930,15 +825,47 @@ impl Supervisor {
                     false,
                 )
             }
+            DaemonCommand::ListPersistentShells { .. } => {
+                // The machine-wide persistent shells, each with its assigned session id.
+                let agent_dir = self.options.agent_dir.clone();
+                let line = crate::persistent_shells::respond(&command_id, &type_name, move || {
+                    Ok(Some(
+                        json!({ "activities": crate::persistent_shells::shell_rows(&agent_dir) }),
+                    ))
+                })
+                .await;
+                (vec![line], false)
+            }
+            DaemonCommand::TailPersistentShell {
+                shell_id, lines, ..
+            } => {
+                let agent_dir = self.options.agent_dir.clone();
+                let (shell_id, lines) = (shell_id.clone(), *lines as usize);
+                let line = crate::persistent_shells::respond(&command_id, &type_name, move || {
+                    crate::persistent_shells::output_tail(&agent_dir, &shell_id, lines)
+                        .map(|tail| tail.map(|tail| json!({ "shellId": shell_id, "tail": tail })))
+                })
+                .await;
+                (vec![line], false)
+            }
+            DaemonCommand::KillPersistentShell { shell_id, .. } => {
+                let agent_dir = self.options.agent_dir.clone();
+                let shell_id = shell_id.clone();
+                let line = crate::persistent_shells::respond(&command_id, &type_name, move || {
+                    crate::persistent_shells::kill_shell(&agent_dir, &shell_id)
+                        .map(|known| known.then(|| json!({ "shellId": shell_id })))
+                })
+                .await;
+                (vec![line], false)
+            }
             DaemonCommand::Prompt {
                 active_session_id, ..
             }
             | DaemonCommand::PromptAndWait {
                 active_session_id, ..
             } if input_admission_id(command).is_some_and(|id| !id.is_empty()) => {
-                // An admitted prompt (wave b9): the cancellation checks,
-                // the admission-id rewrite, and the owned commit around
-                // the routed prompt.
+                // An admitted prompt: the cancellation checks, the admission-id rewrite,
+                // and the owned commit around the routed prompt.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.route_prompt_with_admission(
                     connection,
@@ -952,45 +879,35 @@ impl Supervisor {
                 .await
             }
             DaemonCommand::CancelPromptAdmission { .. } => {
-                // `cancel_prompt_admission` (wave b9): the supervisor's
-                // status ladder over the admission registry.
+                // The supervisor's status ladder over the admission registry.
                 self.handle_cancel_prompt_admission(connection, command, &command_id, &type_name)
                     .await
             }
             DaemonCommand::CompleteOwnedSession { .. } => {
-                // Wave b9: the owner stops its session worker (TS
-                // supervisor arm).
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_complete_owned_session(command, &client_id, &command_id, &type_name)
                     .await
             }
             DaemonCommand::PromoteOwnedSession { .. } => {
-                // Wave b9: the owner clears the ownership (TS
-                // `promoteOwnedWorker`).
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_promote_owned_session(command, &client_id, &command_id, &type_name)
                     .await
             }
             DaemonCommand::RetryWorker { .. } => {
-                // Wave b9 (the audit's retry_worker fix): the recovery is
-                // a supervisor arm - the worker never sees the command.
+                // The recovery is a supervisor arm — the worker never sees the command.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_retry_worker(command, &client_id, &command_id, &type_name)
                     .await
             }
             DaemonCommand::AbortCompaction { .. } => {
-                // The abort supervision: the supervisor answers the abort
-                // itself. The TS daemon-mode `abortCompaction` is an
-                // in-process call that always replies instantly; a wedged
-                // worker must not turn the abort into its own 30s route
-                // timeout and a loader that never clears.
+                // The supervisor answers the abort itself: a wedged worker must not turn
+                // the abort into its own 30s route timeout and a loader that never clears.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_abort_compaction(command, &client_id, attached, &command_id, &type_name)
                     .await
             }
             DaemonCommand::AcquireSessionInputPause { .. } => {
-                // The supervisor-owned lease path (wave b8, TS supervisor
-                // arm): resolve, rewrite the lease key, forward, record.
+                // The supervisor-owned lease path: resolve, rewrite the lease key, forward, record.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_acquire_session_input_pause(
                     connection,
@@ -1002,8 +919,6 @@ impl Supervisor {
                 .await
             }
             DaemonCommand::ReleaseSessionInputPause { .. } => {
-                // The supervisor-owned release (wave b8): the TS outcome
-                // ladder over the lease table.
                 self.handle_release_session_input_pause(
                     connection,
                     command,
@@ -1015,11 +930,8 @@ impl Supervisor {
             DaemonCommand::Detach {
                 active_session_id, ..
             } => {
-                // Detach carries the pause-lease bookkeeping (wave b8):
-                // mark the detaching sessions and bump the epoch BEFORE the
-                // routed detach, then release the client's leases for the
-                // marked sessions once it answered (TS supervisor detach
-                // arm ordering).
+                // Detach carries the pause-lease bookkeeping: mark the detaching sessions and
+                // bump the epoch BEFORE the routed detach, then release the client's leases.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 let attached_ids = attached.session_ids();
                 let marked = Self::begin_detach_pause_bookkeeping(
@@ -1037,9 +949,7 @@ impl Supervisor {
                         Some(stream),
                     )
                     .await;
-                // A selector that resolves to nothing detaches nothing and
-                // still answers success (TS `detachClient` no-ops an id
-                // the client was never attached to).
+                // A selector that resolves to nothing detaches nothing and still answers success.
                 if outcome.0.first().is_some_and(|line| {
                     line.get("success").and_then(Value::as_bool) == Some(false)
                         && line
@@ -1071,10 +981,8 @@ impl Supervisor {
                 target_active_session_id,
                 ..
             } => {
-                // Reattach clears the detach marks for the reattached
-                // sessions (TS reattach arm): a reattached session may
-                // acquire pauses again. The route itself stays the
-                // generic one (streamed attach included).
+                // Reattach clears the detach marks for the reattached sessions (TS
+                // reattach arm): a reattached session may acquire pauses again.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 let outcome = self
                     .route_client_command(
@@ -1096,9 +1004,8 @@ impl Supervisor {
             DaemonCommand::AgentMessagesStatus {
                 active_session_id, ..
             } if active_session_id.is_none() => {
-                // Selector-less `agent_messages_status` (TS supervisor
-                // arm): the first live worker answers, else the TS
-                // empty-status object.
+                // Selector-less `agent_messages_status`: the first live worker answers,
+                // else the TS empty-status object.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_agent_messages_status_broadcast(
                     command,
@@ -1109,14 +1016,12 @@ impl Supervisor {
                 .await
             }
             DaemonCommand::ListAgentPeers { .. } => {
-                // `list_agent_peers` (wave b11, TS supervisor arm): the
-                // worker-token-authenticated peer roster.
+                // `list_agent_peers`: the worker-token-authenticated peer roster.
                 self.handle_list_agent_peers(command, &command_id, &type_name)
                     .await
             }
             DaemonCommand::RenameSavedSession { .. } => {
-                // `rename_saved_session` (wave b11): the reservation ladder
-                // plus the offline catalog rename or the worker forward.
+                // `rename_saved_session`: reservation ladder, then catalog rename or worker route.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_rename_saved_session(
                     command,
@@ -1130,9 +1035,7 @@ impl Supervisor {
             DaemonCommand::DeleteSavedSession {
                 active_session_id, ..
             } if active_session_id.is_none() => {
-                // Selector-less `delete_saved_session` (wave b11): the
-                // supervisor's catalog delete (a selector routes to the
-                // owning worker's arm).
+                // Selector-less `delete_saved_session`: the supervisor's catalog delete.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_delete_saved_session(command, &client_id, &command_id, &type_name)
                     .await
@@ -1140,8 +1043,7 @@ impl Supervisor {
             DaemonCommand::CronList {
                 active_session_id, ..
             } if active_session_id.is_none() => {
-                // Selector-less `cron_list` (wave b10, TS supervisor arm):
-                // merge the live workers' jobs with the passive ones.
+                // Selector-less `cron_list`: merge the live workers' jobs with the passive ones.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_cron_list_catalog(command, &client_id, &command_id, &type_name)
                     .await
@@ -1149,8 +1051,7 @@ impl Supervisor {
             DaemonCommand::HeartbeatsList {
                 active_session_id, ..
             } if active_session_id.is_none() => {
-                // Selector-less `heartbeats_list` (wave b10): the merged
-                // heartbeat catalog.
+                // Selector-less `heartbeats_list`: the merged heartbeat catalog.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_heartbeats_list_catalog(command, &client_id, &command_id, &type_name)
                     .await
@@ -1158,16 +1059,15 @@ impl Supervisor {
             DaemonCommand::CronCancel {
                 active_session_id, ..
             } if active_session_id.is_none() => {
-                // Selector-less `cron_cancel` (wave b10): the owner-worker
-                // search, then the passive store, then the TS error.
+                // Selector-less `cron_cancel`: the owner-worker search, then the passive
+                // store, then the TS error.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_cron_cancel_catalog(command, &client_id, &command_id, &type_name)
                     .await
             }
             DaemonCommand::HeartbeatManage { .. } => {
-                // `heartbeat_manage` (wave b10, TS supervisor arm): passive
-                // jobs are managed against their durable store, live ones
-                // route to their worker.
+                // `heartbeat_manage`: passive jobs are managed against their durable store,
+                // live ones route to their worker.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_heartbeat_manage_catalog(
                     command,
@@ -1179,15 +1079,14 @@ impl Supervisor {
                 .await
             }
             DaemonCommand::CronAdd { .. } => {
-                // `cron_add` (wave b10): the routed add plus the
-                // ownership promotion the command may ask for.
+                // `cron_add`: the routed add plus the ownership promotion the command may
+                // ask for.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_cron_add_catalog(command, &client_id, attached, &command_id, &type_name)
                     .await
             }
             DaemonCommand::HeartbeatSet { .. } => {
-                // `heartbeat_set` (wave b10): the same
-                // forward-and-promote path as `cron_add`.
+                // `heartbeat_set`: the same forward-and-promote path as `cron_add`.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_heartbeat_set_catalog(
                     command,
@@ -1204,8 +1103,7 @@ impl Supervisor {
             | DaemonCommand::AgentMessagesResume {
                 active_session_id, ..
             } if active_session_id.is_none() => {
-                // Selector-less pause/resume (TS supervisor arm): the
-                // broadcast to every live worker.
+                // Selector-less pause/resume: the broadcast to every live worker.
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.handle_agent_messages_pause_resume_broadcast(
                     command,
@@ -1247,12 +1145,82 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// A shutdown or restart request is attributable from the daemon log
-    /// alone (the field diagnosis's ask: the stop that killed the fleet
-    /// twice was unattributable until the wire was reconstructed): the
-    /// request's client id and command id land in the log the moment the
-    /// drain commits. Drives a real connection loop (`handle_client`)
-    /// with the installer probe's own envelope shape.
+    /// A response-write failure can retire the serve loop while an accepted
+    /// shutdown task has not claimed its owner yet. Keep the receiver alive
+    /// through that cleanup window, then release the real shutdown dispatch.
+    #[tokio::test]
+    async fn a_late_shutdown_cannot_send_into_a_retired_client_queue() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .expect("supervisor"),
+        );
+        let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let late_dispatch = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move {
+                release_rx.await.expect("release the in-flight dispatch");
+                let effective = Arc::new(std::sync::Mutex::new("shutdown-client".to_string()));
+                let (targeted_tx, _targeted_rx) = tokio::sync::mpsc::channel(1);
+                let attached = subscribers::ClientSubscriptions::new(
+                    "shutdown-client".to_string(),
+                    targeted_tx,
+                );
+                let roster = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let connection = Arc::new(crate::input_pause_lease::ClientConnectionState::new());
+                let command = json!({
+                    "type": "command", "id": "late-stop",
+                    "protocol": { "name": "prime-agent.daemon", "version": 7 },
+                    "command": { "type": "shutdown", "force": true }
+                })
+                .to_string();
+                let (lines, stop) = supervisor
+                    .dispatch_client(
+                        &command,
+                        &effective,
+                        &attached,
+                        &roster,
+                        &connection,
+                        "shutdown-client",
+                        &dispatch_tx,
+                    )
+                    .await;
+                assert!(stop, "the real shutdown dispatch accepted the stop");
+                let rejected = dispatch_tx.send((lines, stop)).await.is_err();
+                if rejected {
+                    supervisor.start_shutdown_if_owner("shutdown-client").await;
+                }
+                rejected
+            })
+        };
+        assert!(supervisor.shutdown_owner.lock().unwrap().is_none());
+        supervisor
+            .retire_client_dispatches(&mut dispatch_rx, "shutdown-client")
+            .await;
+        assert!(!supervisor.accept_exit.load(Ordering::SeqCst));
+        release_tx.send(()).expect("resume the in-flight shutdown");
+        let rejected = tokio::time::timeout(Duration::from_secs(5), late_dispatch)
+            .await
+            .expect("late dispatch settles")
+            .expect("late dispatch task");
+        assert!(
+            rejected,
+            "a retired response queue accepted the shutdown bundle"
+        );
+        assert!(supervisor.shutting_down.load(Ordering::SeqCst));
+        assert!(supervisor.shutdown_started.load(Ordering::SeqCst));
+        assert!(
+            supervisor.accept_exit.load(Ordering::SeqCst),
+            "the failed-send fallback completed the stop pass"
+        );
+        // The caller still owns the receiver during this cleanup window.
+        assert!(dispatch_rx.recv().await.is_none());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_shutdown_request_logs_its_client() {
@@ -1269,9 +1237,7 @@ mod tests {
             let stream: Box<dyn TransportStream> = Box::new(server_side);
             tokio::spawn(async move { supervisor.handle_client(stream).await })
         };
-        // The greeting arrives before the loop reads: consume it, then send
-        // the installer probe's exact envelope shape (clientId + command
-        // id riding the protocol-7 envelope).
+        // The greeting arrives before the loop reads: consume it first.
         let (client_read, mut client_write) = client_side.into_split();
         let mut client = BufReader::new(client_read);
         let mut hello = String::new();
@@ -1291,10 +1257,8 @@ mod tests {
             .write_all((serde_json::to_string(&envelope).unwrap() + "\n").as_bytes())
             .await
             .expect("send the shutdown envelope");
-        // The drain commits synchronously with the log line (the gate
-        // flips before the response is even written), so the log is the
-        // wait point; the response and daemon_closing follow on their own
-        // schedule.
+        // The drain commits synchronously with the log line, so the log is the wait
+        // point; the response and daemon_closing follow on their own schedule.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let log = loop {
             let log = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -1314,11 +1278,6 @@ mod tests {
         connection.abort();
     }
 
-    /// A client that falls behind the shared event ring loses events (the
-    /// broadcast's defined backpressure), but never silently anymore
-    /// (finding 4a): the loss becomes a durable daemon-log line naming the
-    /// client and the dropped count. Drives a real connection loop
-    /// (`handle_client`) over a real socket pair with a flooded ring.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_lagged_client_event_stream_is_logged() {
@@ -1331,8 +1290,7 @@ mod tests {
         let log_path = crate::paths::daemon_log_path(&options.socket_path, &options.agent_dir);
         let supervisor = Arc::new(Supervisor::new(options).expect("supervisor"));
         let (server_side, client_side) = tokio::net::UnixStream::pair().expect("socket pair");
-        // The test's client only reads; its write half stays held so the
-        // connection's writes fail only when the test ends.
+        // The write half stays held so the connection's writes fail only when the test ends.
         let (client_read, _client_write) = client_side.into_split();
         let connection = {
             let supervisor = Arc::clone(&supervisor);
@@ -1347,9 +1305,8 @@ mod tests {
             hello.contains("\"type\":\"daemon_hello\""),
             "the greeting: {hello}"
         );
-        // The greeting is written BEFORE the loop subscribes to the
-        // event ring, so the flood must wait for the subscription to
-        // exist — sends into a receiver-less ring are dropped.
+        // The greeting is written BEFORE the loop subscribes to the event ring, so the
+        // flood waits for the subscription — sends into a receiver-less ring are dropped.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while supervisor.events.receiver_count() == 0 {
             assert!(
@@ -1358,11 +1315,8 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // Flood the ring well past its capacity with frames too big for
-        // the client's socket buffer: the connection loop parks in its
-        // event write, its receiver falls out of the ring's live window,
-        // and the parked write only completes once the drain frees the
-        // buffer again.
+        // Flood the ring past its capacity with frames too big for the client's socket
+        // buffer: the loop parks in its event write and its receiver falls out of the
         let capacity = crate::backpressure::EVENT_RING_CAPACITY;
         let padding = "x".repeat(2048);
         let flood = capacity + 2048;
@@ -1374,12 +1328,8 @@ mod tests {
                 })),
             ));
         }
-        // Drain the parked connection while watching for the log line: the
-        // loop unparks as the reader frees the socket buffer, its next
-        // event read reports the dropped span, and the loss lands in the
-        // daemon log. The quiet counter only bounds an idle connection,
-        // never a live one (a slow runner may pace the backlog, so the
-        // drain continues as long as the log line has not landed).
+        // Drain the parked connection while watching for the log line: the loop unparks
+        // as the reader frees the buffer, and its next event read reports the dropped span.
         let mut buffer = vec![0u8; 64 * 1024];
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let log = loop {

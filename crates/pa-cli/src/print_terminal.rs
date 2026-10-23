@@ -20,7 +20,7 @@ pub(crate) fn write_text_terminal_result(messages: &[pa_types::session::AgentMes
             eprintln!("{stderr}");
         }
         if exit_code == 0 {
-            if let Some(text) = primary.stdout_text() {
+            if let Some(text) = primary.stdout_text().filter(|text| !text.is_empty()) {
                 println!("{text}");
             }
         }

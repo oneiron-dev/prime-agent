@@ -5,10 +5,6 @@ use super::{
     RestoreResult, SnapshotResult,
 };
 
-// ---------------------------------------------------------------------------
-// ReplKernelManager delegations onto Inner
-// ---------------------------------------------------------------------------
-
 impl ReplKernelManager {
     pub(crate) async fn wait_for_protocol_repair(
         &self,
@@ -75,23 +71,20 @@ impl Inner {
         }
     }
 
-    /// Type-erased entry onto the shared request plumbing: the state-op /
-    /// repair paths recurse back through the queue (rebootstrap -> enqueue),
-    /// so the cycle is broken with `dyn` here, not just `Box::pin`.
+    /// Type-erased entry onto the shared request plumbing: the state-op / repair paths recurse back
+    /// through the queue (rebootstrap -> enqueue), so the cycle is broken with `dyn` here.
     pub(crate) fn enqueue_request(
         self: &Arc<Self>,
         request: Request,
-        code: &str,
         opts: ExecuteOptions,
         execution_timeout_ms: Option<u64>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<InternalExecuteResult>> + Send>,
     > {
         let manager = self.as_manager();
-        let code = code.to_string();
         Box::pin(async move {
             manager
-                .enqueue_request(request, &code, opts, execution_timeout_ms)
+                .enqueue_request(request, opts, execution_timeout_ms)
                 .await
         })
     }

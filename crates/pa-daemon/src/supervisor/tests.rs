@@ -83,7 +83,7 @@ fn churn_accumulates_and_a_stable_lifetime_resets() {
     // No spawn time (an adopted pid): plain accumulation.
     assert_eq!(Supervisor::next_failure_count(&resident, now), 1);
     assert_eq!(Supervisor::next_failure_count(&resident, now), 2);
-    // A stable lifetime: the healthy death starts a fresh count.
+
     resident
         .spawned_at_ms
         .store(now - STABLE_LIFETIME_MS - 1, Ordering::SeqCst);
@@ -95,16 +95,15 @@ fn churn_accumulates_and_a_stable_lifetime_resets() {
     assert_eq!(Supervisor::next_failure_count(&resident, now), 2);
 }
 
-/// A relaunch that FAILS produced no worker, so the count must
-/// accumulate to the give-up cap instead of resetting against the old spawn.
+/// A failed relaunch produced no worker, so the count accumulates instead of
+/// resetting.
 #[tokio::test(start_paused = true)]
 async fn a_failed_relaunch_accumulates_to_the_give_up_cap() {
     let dir = tempfile::TempDir::new().unwrap();
     let agent_dir = dir.path().join("agent");
     std::fs::create_dir_all(&agent_dir).unwrap();
-    // The relaunch fails deterministically: the logs dir cannot be created
-    // (a file stands where it would go), so every spawn dies at the worker
-    // stderr log's open.
+    // The relaunch fails deterministically: a file stands where the logs dir would
+    // go, so every spawn dies at the worker stderr log's open.
     std::fs::write(agent_dir.join("logs"), "not a directory").unwrap();
     let supervisor = Arc::new(
         Supervisor::new(SupervisorOptions {
@@ -144,7 +143,7 @@ async fn a_failed_relaunch_accumulates_to_the_give_up_cap() {
     supervisor.registry.insert(Arc::clone(&resident)).await;
     tokio::time::timeout(
         Duration::from_secs(60),
-        Arc::clone(&supervisor).watch_worker(Arc::clone(&resident), None, 0),
+        Arc::clone(&supervisor).watch_worker(Arc::clone(&resident), None, 0, None),
     )
     .await
     .expect("the watch loop gives up instead of spinning");
@@ -158,11 +157,6 @@ async fn a_failed_relaunch_accumulates_to_the_give_up_cap() {
     );
 }
 
-/// A stop that lands while the watch loop is on the give-up cap leaves
-/// the terminal state to the stop: the give-up arm returns without
-/// persisting `Failed` (the stop's tombstone already owns the next boot's
-/// verdict) and without removing the resident (the stop path owns the
-/// removal), so a cleanly stopped worker is not adopted as `GaveUp`.
 #[tokio::test(start_paused = true)]
 async fn a_stop_during_the_storm_leaves_the_terminal_state_to_the_stop() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -197,8 +191,8 @@ async fn a_stop_during_the_storm_leaves_the_terminal_state_to_the_stop() {
         descriptor,
         dir.path().join("w-storm-stop.descriptor.json"),
     ));
-    // The storm is at the cap and the stop already landed (the stop
-    // path sets the flag before it finalizes the worker).
+    // The storm is at the cap and the stop already landed (the stop sets the flag
+    // first).
     resident
         .consecutive_failures
         .store(MAX_CONSECUTIVE_FAILURES, Ordering::SeqCst);
@@ -206,7 +200,7 @@ async fn a_stop_during_the_storm_leaves_the_terminal_state_to_the_stop() {
     supervisor.registry.insert(Arc::clone(&resident)).await;
     tokio::time::timeout(
         Duration::from_secs(60),
-        Arc::clone(&supervisor).watch_worker(Arc::clone(&resident), None, 0),
+        Arc::clone(&supervisor).watch_worker(Arc::clone(&resident), None, 0, None),
     )
     .await
     .expect("the give-up arm returns instead of spinning");
@@ -255,7 +249,8 @@ async fn an_adopted_watch_hands_off_at_exit_without_a_timer() {
         let mut watch = std::pin::pin!(Arc::clone(&supervisor).watch_worker(
             Arc::clone(&resident),
             None,
-            u64::from(worker.id())
+            u64::from(worker.id()),
+            None
         ));
         assert!(
             futures::poll!(watch.as_mut()).is_pending(),
@@ -272,9 +267,9 @@ async fn an_adopted_watch_hands_off_at_exit_without_a_timer() {
         );
     }
     {
-        // A relaunch elsewhere took the resident: the pid no longer names
-        // the watched process, so the watch hands off instead of running
-        // the crash arm over the replacement.
+        // An explicit new monitor (an update abandon's relaunch) took the
+        // resident. The old watch returns at the exit instead of running
+        // the crash arm over the new owner's process.
         let mut worker = std::process::Command::new("sleep")
             .arg("600")
             .spawn()
@@ -284,13 +279,19 @@ async fn an_adopted_watch_hands_off_at_exit_without_a_timer() {
         let mut watch = std::pin::pin!(Arc::clone(&supervisor).watch_worker(
             Arc::clone(&resident),
             None,
-            u64::from(worker.id())
+            u64::from(worker.id()),
+            None
         ));
         assert!(
             futures::poll!(watch.as_mut()).is_pending(),
             "a live adopted worker keeps the watch parked"
         );
-        resident.descriptor.lock().await.pid = u64::from(std::process::id());
+        supervisor.spawn_monitor(
+            Arc::clone(&resident),
+            None,
+            u64::from(std::process::id()),
+            None,
+        );
         worker.kill().expect("kill sleep");
         worker.wait().expect("reap sleep");
         watch.await;
@@ -300,6 +301,58 @@ async fn an_adopted_watch_hands_off_at_exit_without_a_timer() {
             "the kernel exit notification woke the watch; no poll timer fired"
         );
     }
+}
+
+/// Manual retry can replace the descriptor's pid without arming a monitor.
+/// The adopted predecessor must still hand off, even with an unchanged epoch.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(start_paused = true)]
+async fn a_pid_only_replacement_keeps_the_adopted_predecessor_out_of_crash_recovery() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    // A missed handoff must not spawn the test executable as a worker.
+    std::fs::write(agent_dir.join("logs"), "not a directory").unwrap();
+    let supervisor = Arc::new(
+        Supervisor::new(SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir,
+        })
+        .expect("supervisor"),
+    );
+    let mut predecessor = tokio::process::Command::new("sleep")
+        .arg("600")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn isolated predecessor");
+    let mut replacement = tokio::process::Command::new("sleep")
+        .arg("600")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn isolated replacement");
+    let predecessor_pid = predecessor.id().unwrap();
+    let resident = adopted_watch_resident(dir.path(), predecessor_pid);
+    supervisor.registry.insert(Arc::clone(&resident)).await;
+    let mut watch = std::pin::pin!(Arc::clone(&supervisor).watch_worker(
+        Arc::clone(&resident),
+        None,
+        u64::from(predecessor_pid),
+        None
+    ));
+    assert!(futures::poll!(watch.as_mut()).is_pending());
+    let epoch = resident.monitor_epoch.load(Ordering::SeqCst);
+    resident.descriptor.lock().await.pid = u64::from(replacement.id().unwrap());
+    assert_eq!(resident.monitor_epoch.load(Ordering::SeqCst), epoch);
+    // Reap both test-owned processes before checking the watch's result.
+    predecessor.kill().await.expect("reap isolated predecessor");
+    replacement.kill().await.expect("reap isolated replacement");
+    watch.await;
+    assert_eq!(resident.consecutive_failures.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        resident.descriptor.lock().await.lifecycle,
+        DaemonWorkerLifecycle::Ready
+    );
+    assert!(supervisor.registry.get("w-adopted-watch").await.is_some());
 }
 
 /// The watched adopted worker's resident, with the descriptor carrying the
@@ -329,6 +382,420 @@ fn adopted_watch_resident(dir: &std::path::Path, pid: u32) -> Arc<ResidentWorker
     )
 }
 
+/// The red-first headline: a replacement registration for a resident the
+/// supervisor watches over an adopted pid must transfer the watch to the
+/// registrant's process. On the unfixed tree the predecessor's exit
+/// returned the watch (the pid no longer matched) and the replacement's
+/// death went unobserved: no give-up, no cleanup, a dead resident still
+/// in the registry.
+#[cfg(any(target_os = "linux", target_os = "macos"))] // the kernel-watch arms
+#[tokio::test]
+async fn a_registered_replacement_pid_is_monitored_after_the_predecessor_exits() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let supervisor = Arc::new(
+        Supervisor::new(SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir,
+        })
+        .expect("supervisor"),
+    );
+    let mut predecessor = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn the predecessor");
+    let mut replacement = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn the replacement");
+    let resident = adopted_watch_resident(dir.path(), predecessor.id());
+    let predecessor_journal = dir.path().join("predecessor.orphans.jsonl");
+    let retained = b"";
+    std::fs::write(&predecessor_journal, retained).unwrap();
+    resident.descriptor.lock().await.orphan_process_journal_path =
+        Some(predecessor_journal.to_string_lossy().into_owned());
+    // The give-up budget is at the cap: a supervised death must reach the
+    // give-up at once, so the predecessor's unbookkept exit is observable.
+    resident
+        .consecutive_failures
+        .store(MAX_CONSECUTIVE_FAILURES, Ordering::SeqCst);
+    supervisor.registry.insert(Arc::clone(&resident)).await;
+    let mut old_watch = std::pin::pin!(Arc::clone(&supervisor).watch_worker(
+        Arc::clone(&resident),
+        None,
+        u64::from(predecessor.id()),
+        None
+    ));
+    assert!(
+        futures::poll!(old_watch.as_mut()).is_pending(),
+        "a live adopted worker keeps the watch parked"
+    );
+    // The replacement registers: a new process for the same resident.
+    let command = DaemonCommand::WorkerRegister {
+        id: None,
+        active_session_id: "w-adopted-watch".into(),
+        session_id: None,
+        socket_path: dir
+            .path()
+            .join("replacement.sock")
+            .to_string_lossy()
+            .to_string(),
+        worker_instance_id: "replacement-instance".into(),
+        token: "token".into(),
+        pid: u64::from(replacement.id()),
+        rest: Map::default(),
+    };
+    let registered = supervisor
+        .handle_worker_register("register-1", "worker_register", &command)
+        .await;
+    assert!(
+        registered.success,
+        "the replacement registers: {registered:?}"
+    );
+    let mut registered_descriptor = resident.descriptor.lock().await.clone();
+    let unknown_journal = registered_descriptor
+        .orphan_process_journal_path
+        .clone()
+        .expect("unknown generation reserves an unused path");
+    assert_ne!(Path::new(&unknown_journal), predecessor_journal);
+    assert!(!Path::new(&unknown_journal).exists());
+    crate::descriptor::backfill_orphan_journal_path(
+        &supervisor.descriptor_dir,
+        &mut registered_descriptor,
+    );
+    assert_eq!(
+        registered_descriptor.orphan_process_journal_path.as_deref(),
+        Some(unknown_journal.as_str())
+    );
+    // The predecessor's exit retires the old watch without crash bookkeeping.
+    predecessor.kill().expect("kill the predecessor");
+    predecessor.wait().expect("reap the predecessor");
+    tokio::time::timeout(Duration::from_secs(2), old_watch)
+        .await
+        .expect("the old watch returns at the predecessor's exit");
+    assert_eq!(
+        resident.consecutive_failures.load(Ordering::SeqCst),
+        MAX_CONSECUTIVE_FAILURES
+    );
+    assert_eq!(
+        resident.descriptor.lock().await.lifecycle,
+        DaemonWorkerLifecycle::Ready
+    );
+    // The replacement's death is supervised: the give-up runs at the cap.
+    replacement.kill().expect("kill the replacement");
+    replacement.wait().expect("reap the replacement");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while supervisor.registry.get("w-adopted-watch").await.is_some() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the replacement's death reaches the give-up");
+    assert_eq!(
+        std::fs::read(&predecessor_journal).unwrap(),
+        retained,
+        "a mismatched registration must not reap the predecessor's journal",
+    );
+    let mut reloaded: crate::descriptor::WorkerDescriptor =
+        serde_json::from_slice(&std::fs::read(&resident.descriptor_path).unwrap()).unwrap();
+    crate::descriptor::backfill_orphan_journal_path(&supervisor.descriptor_dir, &mut reloaded);
+    assert_eq!(
+        reloaded.orphan_process_journal_path.as_deref(),
+        Some(unknown_journal.as_str())
+    );
+    assert_eq!(
+        resident.consecutive_failures.load(Ordering::SeqCst),
+        MAX_CONSECUTIVE_FAILURES + 1
+    );
+    assert_eq!(
+        resident.descriptor.lock().await.lifecycle,
+        DaemonWorkerLifecycle::Failed
+    );
+}
+
+/// A second explicit monitor arm retires the old watch at the exit: the
+/// superseded generation must not run crash bookkeeping over the resident
+/// the new arm owns. On the unfixed tree the unchanged pid falls through
+/// to the crash arm and the death counts a failure.
+#[cfg(any(target_os = "linux", target_os = "macos"))] // the kernel-watch arms
+#[tokio::test]
+async fn a_superseded_watch_leaves_the_failure_count_to_the_new_monitor() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let supervisor = Arc::new(
+        Supervisor::new(SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir,
+        })
+        .expect("supervisor"),
+    );
+    let mut worker = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn sleep");
+    let resident = adopted_watch_resident(dir.path(), worker.id());
+    let old_journal = dir.path().join("old.orphans.jsonl");
+    let new_journal = dir.path().join("new.orphans.jsonl");
+    std::fs::write(&old_journal, "").unwrap();
+    std::fs::write(&new_journal, "replacement records").unwrap();
+    let generation = super::supervision::OrphanGeneration {
+        pid: worker.id(),
+        path: old_journal.to_string_lossy().into_owned(),
+    };
+    // The cap is armed: an unsupervised crash arm would give up at once.
+    resident
+        .consecutive_failures
+        .store(MAX_CONSECUTIVE_FAILURES, Ordering::SeqCst);
+    supervisor.registry.insert(Arc::clone(&resident)).await;
+    let mut watch = std::pin::pin!(Arc::clone(&supervisor).watch_worker(
+        Arc::clone(&resident),
+        None,
+        u64::from(worker.id()),
+        Some(generation)
+    ));
+    assert!(
+        futures::poll!(watch.as_mut()).is_pending(),
+        "a live adopted worker keeps the watch parked"
+    );
+    // A new generation owns a distinct journal before the old exit arrives.
+    resident.descriptor.lock().await.orphan_process_journal_path =
+        Some(new_journal.to_string_lossy().into_owned());
+    supervisor.spawn_monitor(
+        Arc::clone(&resident),
+        None,
+        u64::from(std::process::id()),
+        None,
+    );
+    worker.kill().expect("kill sleep");
+    worker.wait().expect("reap sleep");
+    tokio::time::timeout(Duration::from_secs(2), watch)
+        .await
+        .expect("the superseded watch returns at the exit");
+    assert!(
+        !old_journal.exists(),
+        "the superseded monitor still reaps its generation"
+    );
+    assert_eq!(std::fs::read(&new_journal).unwrap(), b"replacement records");
+    assert_eq!(
+        resident.consecutive_failures.load(Ordering::SeqCst),
+        MAX_CONSECUTIVE_FAILURES,
+        "the superseded watch must not count the exit as a failure"
+    );
+    assert_eq!(
+        resident.descriptor.lock().await.lifecycle,
+        DaemonWorkerLifecycle::Ready
+    );
+    assert!(
+        supervisor.registry.get("w-adopted-watch").await.is_some(),
+        "the resident stays owned by the new generation"
+    );
+}
+
+/// A watch parked in the crash backoff must not relaunch over the resident
+/// when another arm claimed it during the sleep: the generation moved on
+/// while this watch was backed off.
+#[cfg(any(target_os = "linux", target_os = "macos"))] // the kernel-watch arms
+#[tokio::test(start_paused = true)]
+async fn a_superseded_watch_in_backoff_does_not_relaunch_over_the_new_owner() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    // An unsupervised relaunch would fail deterministically here: a file
+    // stands where the logs dir would go.
+    std::fs::write(agent_dir.join("logs"), "not a directory").unwrap();
+    let supervisor = Arc::new(
+        Supervisor::new(SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir,
+        })
+        .expect("supervisor"),
+    );
+    let mut worker = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn sleep");
+    let resident = adopted_watch_resident(dir.path(), worker.id());
+    supervisor.registry.insert(Arc::clone(&resident)).await;
+    // A spawned watch, like production's spawn_monitor arms it: the parked
+    // task registers a real waker with the kernel exit watch.
+    let mut watch = tokio::spawn(Arc::clone(&supervisor).watch_worker(
+        Arc::clone(&resident),
+        None,
+        u64::from(worker.id()),
+        None,
+    ));
+    tokio::task::yield_now().await;
+    assert!(
+        futures::poll!(&mut watch).is_pending(),
+        "a live adopted worker keeps the watch parked"
+    );
+    worker.kill().expect("kill sleep");
+    worker.wait().expect("reap sleep");
+    // The crash arm counts its failure, then parks in its backoff: the
+    // millisecond poll parks the runtime long enough to deliver the exit
+    // event while the paused clock stays deep inside the backoff window.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while resident.consecutive_failures.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the crash arm counts the exit before its backoff");
+    // Another arm claims the resident while the watch is backed off.
+    supervisor.spawn_monitor(
+        Arc::clone(&resident),
+        None,
+        u64::from(std::process::id()),
+        None,
+    );
+    tokio::time::timeout(Duration::from_secs(5), watch)
+        .await
+        .expect("the superseded watch returns after the backoff")
+        .expect("the watch task completes");
+    assert_eq!(
+        resident.consecutive_failures.load(Ordering::SeqCst),
+        1,
+        "no relaunch arm ran over the new owner"
+    );
+    assert_eq!(
+        resident.descriptor.lock().await.lifecycle,
+        DaemonWorkerLifecycle::Ready
+    );
+    assert!(
+        supervisor.registry.get("w-adopted-watch").await.is_some(),
+        "the resident stays owned by the new generation"
+    );
+}
+
+/// The abandon-update resident: the commit's stop acked and exited, with
+/// the give-up budget at the cap so a supervised failure settles at once.
+fn abandon_update_resident(dir: &std::path::Path, worker_id: &str) -> Arc<ResidentWorker> {
+    let descriptor: DaemonWorkerDescriptor = serde_json::from_value(serde_json::json!({
+        "version": 2,
+        "workerId": worker_id,
+        "pid": 0,
+        "socketPath": "/tmp/none.sock",
+        "recoveryJournalPath": dir.join(format!("{worker_id}.recovery.jsonl")).to_string_lossy(),
+        "supervisorSocketPath": "/tmp/none.sock",
+        "authenticationToken": "token",
+        "rootActiveSessionId": worker_id,
+        "createdAt": "t",
+        "updatedAt": "t",
+        "lifecycle": "ready",
+        "createCommand": {},
+        "consecutiveFailures": 0,
+    }))
+    .expect("descriptor");
+    let resident = ResidentWorker::new(
+        worker_id.to_string(),
+        descriptor,
+        dir.join(format!("{worker_id}.descriptor.json")),
+    );
+    resident
+        .consecutive_failures
+        .store(MAX_CONSECUTIVE_FAILURES, Ordering::SeqCst);
+    resident
+}
+
+/// The update commit's abandon (a stop refusal in the budget) re-opens
+/// supervision for the worker that already stopped: when the relaunch
+/// fails, the resident is handed back to the crash path instead of
+/// staying unsupervised in the registry. On the unfixed tree the failed
+/// relaunch is only logged.
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_updates_failed_relaunch_arms_supervision_again() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    // The abandon's relaunch fails deterministically: a file stands where
+    // the logs dir would go.
+    std::fs::write(agent_dir.join("logs"), "not a directory").unwrap();
+    let supervisor = Arc::new(
+        Supervisor::new(SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir,
+        })
+        .expect("supervisor"),
+    );
+    // The stopped worker acks the graceful stop (pid 0 is already gone for
+    // the exit wait); the refuser never answers inside the budget.
+    let stopped = abandon_update_resident(dir.path(), "w-abandon-stopped");
+    let (stopped_tx, mut stopped_rx) = mpsc::channel::<WorkerRequest>(1);
+    *stopped.cmd_tx.lock().await = Some(stopped_tx);
+    let pump_resident = Arc::clone(&stopped);
+    tokio::spawn(async move {
+        let request = stopped_rx.recv().await.expect("the stop routes a shutdown");
+        let reply = pump_resident
+            .pending
+            .lock()
+            .await
+            .remove(&request.request_id)
+            .expect("the routed shutdown holds a reply slot");
+        let _ = reply.send(WorkerReply::Typed(crate::protocol::response_success(
+            None, "shutdown", None,
+        )));
+    });
+    supervisor.registry.insert(Arc::clone(&stopped)).await;
+    stopped.note_connection_live();
+    let refused = abandon_update_resident(dir.path(), "w-abandon-refused");
+    let (refused_tx, mut refused_rx) = mpsc::channel::<WorkerRequest>(1);
+    *refused.cmd_tx.lock().await = Some(refused_tx);
+    tokio::spawn(async move {
+        // The refuser never answers: the shutdown request runs out of budget.
+        let _ = refused_rx.recv().await;
+    });
+    supervisor.registry.insert(Arc::clone(&refused)).await;
+    refused.note_connection_live();
+
+    // Reach the committed stop window without the prepare machinery's
+    // snapshot phase: the update state machine is driven directly.
+    let update_id = UpdateId::from("u-abandon".to_string());
+    let budget = UpdateTimeoutBudget::from_env();
+    supervisor
+        .update_prepare
+        .begin(update_id.clone(), util::now_ms(), &budget);
+    supervisor.update_prepare.drain_complete(&update_id);
+    supervisor
+        .update_prepare
+        .snapshot_written(&update_id, util::now_ms(), &budget);
+    supervisor.update_prepare.prepare_acked(&update_id);
+    let command = DaemonCommand::CommitUpdateRestart {
+        id: None,
+        update_id: Some("u-abandon".to_string()),
+        rest: Map::default(),
+    };
+    let (lines, ok) = supervisor
+        .handle_commit_update_restart("commit-1", "commit_update_restart", &command)
+        .await;
+    assert!(!ok, "the refusal abandons the update: {lines:?}");
+
+    // The stopped worker's failed relaunch re-arms supervision: the give-up
+    // (the resident's budget was at the cap) removes the resident instead
+    // of leaving the dead channel in the registry.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while supervisor.registry.get("w-abandon-stopped").await.is_some() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the abandoned relaunch's failure reaches the give-up");
+    assert_eq!(
+        stopped.descriptor.lock().await.lifecycle,
+        DaemonWorkerLifecycle::Failed
+    );
+    assert_eq!(
+        stopped.consecutive_failures.load(Ordering::SeqCst),
+        MAX_CONSECUTIVE_FAILURES + 1
+    );
+    // The refuser's session is untouched: it keeps running.
+    assert!(
+        supervisor.registry.get("w-abandon-refused").await.is_some(),
+        "the refusal keeps its session running"
+    );
+}
+
 /// The saved-session surfaces (the `list --all` summary row and the
 /// `list_saved_sessions` catalog row) carry the persisted thinking
 /// level: the agents-view Model column renders "model:level" for
@@ -356,14 +823,14 @@ fn saved_session_rows_publish_deleted_descendant_usage() {
         output_tokens: 110,
         cost: 0.5,
     });
-    let row = saved_session_row(&info);
+    let row = saved_session_row(&info, &std::collections::HashMap::new());
     assert_eq!(
         row["deletedDescendantUsage"],
         json!({ "inputTokens": 1_100, "outputTokens": 110, "cost": 0.5 })
     );
     // Absent again: the field never rides as a null.
     info.deleted_descendant_usage = None;
-    let row = saved_session_row(&info);
+    let row = saved_session_row(&info, &std::collections::HashMap::new());
     assert!(row.get("deletedDescendantUsage").is_none());
 }
 
@@ -383,7 +850,7 @@ fn saved_session_rows_carry_the_persisted_thinking_level() {
     let summary = saved_session_summary(&info);
     assert_eq!(summary["thinkingLevel"], json!("high"));
     assert!(summary["model"].is_null(), "saved rows carry no model");
-    let row = saved_session_row(&info);
+    let row = saved_session_row(&info, &std::collections::HashMap::new());
     assert_eq!(row["thinkingLevel"], json!("high"));
     assert_eq!(row["model"], json!({ "provider": "p", "modelId": "m" }));
     // A session file without a persisted level stays bare (a fresh
@@ -397,17 +864,15 @@ fn saved_session_rows_carry_the_persisted_thinking_level() {
     assert!(saved_session_summary(&draft_info)
         .get("thinkingLevel")
         .is_none());
-    assert!(saved_session_row(&draft_info)
-        .get("thinkingLevel")
-        .is_none());
+    assert!(
+        saved_session_row(&draft_info, &std::collections::HashMap::new())
+            .get("thinkingLevel")
+            .is_none()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The saved-session surfaces publish the scan's own-usage summary (TS
-/// `serializeSavedSessionInfo` and `summaryForInactiveSession`): the
-/// agents-view spend columns and the archived-row keep-condition read
-/// `usage.cost`; a session with no billable work stays bare, exactly
-/// like TS's undefined serialization.
+/// No billable work stays bare, like TS's undefined serialization.
 #[test]
 fn saved_session_rows_publish_the_own_usage_summary() {
     let dir = std::env::temp_dir().join(format!("pa-saved-usage-{}", uuid::Uuid::new_v4()));
@@ -426,7 +891,7 @@ fn saved_session_rows_publish_the_own_usage_summary() {
     }));
     session.rewrite().unwrap();
     let info = crate::session_store::read_session_info(&path).unwrap();
-    let row = saved_session_row(&info);
+    let row = saved_session_row(&info, &std::collections::HashMap::new());
     assert_eq!(
         row["usage"],
         json!({ "inputTokens": 105, "outputTokens": 10, "cost": 0.25 })
@@ -442,15 +907,77 @@ fn saved_session_rows_publish_the_own_usage_summary() {
     draft.set_path(draft_path.clone());
     draft.rewrite().unwrap();
     let draft_info = crate::session_store::read_session_info(&draft_path).unwrap();
-    assert!(saved_session_row(&draft_info).get("usage").is_none());
+    assert!(
+        saved_session_row(&draft_info, &std::collections::HashMap::new())
+            .get("usage")
+            .is_none()
+    );
     assert!(saved_session_summary(&draft_info).get("usage").is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// TS `summaryForInactiveSession` publishes the header binding: a saved
-/// row carries its `parentSessionPath` (only when one is recorded — TS's
-/// `undefined` is omitted) and its `rlmDepth`, so a non-resident bound
-/// session keeps its family edge for the family classifiers.
+/// The whole catalog row on one fixture that exercises every optional key
+/// (name, state, model, thinking level, parent binding, usage): one literal
+/// comparison, so any wire change — a key added, renamed, or dropped — fails
+/// here first, before any client depends on the new shape.
+#[test]
+fn saved_session_rows_match_the_catalog_row_golden() {
+    let dir = std::env::temp_dir().join(format!("pa-saved-golden-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut session =
+        crate::session_store::SessionFile::create("/repo", Some("/s/parent.jsonl"), 1);
+    // The row's id and created timestamp read from the session header: pin
+    // both, so the golden stays one literal.
+    session.header.id = "golden-session".to_string();
+    session.header.timestamp = "2026-09-21T00:00:00.000Z".to_string();
+    let path = dir.join("golden-session.jsonl");
+    session.set_path(path.clone());
+    session.append_session_info("golden name");
+    // An assistant message with provider/model later overrides the change,
+    // pinning the fold's last-write-wins row.
+    session.append_model_change("prime", "superb");
+    session.append_thinking_level_change("high");
+    session.append_session_state("active");
+    session.append_message(&json!({
+        "role": "user", "content": "fix the login bug", "timestamp": 1_790_000_000_000_u64
+    }));
+    session.append_message(&json!({
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "fixed in auth.rs" }],
+        "provider": "p", "model": "m", "timestamp": 1_790_000_060_000_u64,
+        "usage": {
+            "input": 100, "output": 10, "cacheRead": 5, "cacheWrite": 0,
+            "totalTokens": 115,
+            "cost": { "input": 0.0, "output": 0.25, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.25 }
+        }
+    }));
+    session.rewrite().unwrap();
+
+    let info = crate::session_store::read_session_info(&path).unwrap();
+    assert_eq!(
+        saved_session_row(&info, &std::collections::HashMap::new()),
+        json!({
+            "path": path.to_string_lossy(),
+            "id": "golden-session",
+            "cwd": "/repo",
+            "rlmDepth": 1,
+            "created": "2026-09-21T00:00:00.000Z",
+            "modified": "2026-09-21T14:14:20.000Z",
+            "messageCount": 2,
+            "firstMessage": "fix the login bug",
+            "state": { "status": "active" },
+            "name": "golden name",
+            "parentSessionPath": "/s/parent.jsonl",
+            "model": { "provider": "p", "modelId": "m" },
+            "usage": { "inputTokens": 105, "outputTokens": 10, "cost": 0.25 },
+            "thinkingLevel": "high"
+        })
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `parentSessionPath` only when one is recorded (TS's `undefined` is omitted), so a
+/// non-resident bound session keeps its family edge.
 #[test]
 fn saved_session_summaries_carry_the_parent_binding() {
     let dir = std::env::temp_dir().join(format!("pa-saved-binding-{}", uuid::Uuid::new_v4()));
@@ -514,11 +1041,6 @@ async fn worker_probe_accepts_a_live_socket() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The boot roster seed runs exactly once, in the background, once
-/// adoption settles: the adoption pass hands back the seed task's
-/// handle, and the seed roots are the registry's residents. An empty
-/// descriptor dir adopts nothing; the pre-registered root anchors the
-/// family the seed must publish.
 #[tokio::test]
 async fn adoption_settles_then_seeds_the_roster_once() {
     let dir = std::env::temp_dir().join(format!("pa-adopt-seed-{}", uuid::Uuid::new_v4()));
@@ -615,9 +1137,6 @@ async fn adoption_settles_then_seeds_the_roster_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The shutdown gate: a create dispatched while the supervisor stops
-/// must fail instead of launching a worker the stop pass would miss
-/// (a late create racing a shutdown would orphan its worker process).
 #[tokio::test]
 async fn a_create_while_shutting_down_is_refused() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -653,9 +1172,6 @@ async fn a_create_while_shutting_down_is_refused() {
     );
 }
 
-/// The shutdown gate and the accept loop's exit flag are separate: the
-/// gate refuses creates the moment a terminal stop begins, but the
-/// loop must stay up until `begin_shutdown` finishes stopping the workers.
 #[tokio::test]
 async fn begin_shutdown_sets_the_accept_exit_after_the_stop_pass() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -676,14 +1192,8 @@ async fn begin_shutdown_sets_the_accept_exit_after_the_stop_pass() {
     );
 }
 
-/// A kill whose stop never durably started — the stop tombstone's
-/// persist fails, the only `Err` `stop_worker` takes — must not run
-/// the kill's belt: the worker is untouched and the kill stays
-/// retryable (TS `stopWorkerUntracked` throws before any teardown).
-/// The belt otherwise cancels the session tree's jobs, archives the
-/// root file, and — for a ledger delete — sweeps the child's
-/// artifacts against a live worker whose resident still serves the
-/// file (its stores may still grow).
+/// The stop's only `Err` (tombstone persist) leaves the worker untouched and the kill
+/// retryable.
 #[tokio::test]
 async fn a_failed_stop_persist_gates_the_kill_stop_belt() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -740,9 +1250,8 @@ async fn a_failed_stop_persist_gates_the_kill_stop_belt() {
         last_error: None,
         rest: Map::default(),
     };
-    // The persist target is a directory: the stop tombstone's
-    // atomic write cannot land there (the rename onto a directory
-    // fails), so the stop never durably starts.
+    // The persist target is a directory: the atomic write's rename cannot land there,
+    // so the stop never durably starts.
     let persist_target = sessions_dir.join("w.d");
     std::fs::create_dir(&persist_target).unwrap();
     let resident = ResidentWorker::new("w-live".to_string(), descriptor, persist_target);
@@ -768,13 +1277,7 @@ async fn a_failed_stop_persist_gates_the_kill_stop_belt() {
     );
 }
 
-/// A plain kill holds the route-side tombstone when its stop's
-/// redundant re-write fails: the durable intent is already on disk,
-/// so the stop proceeds (the escalation runs, the registry row goes,
-/// the stop is intentional) instead of aborting and leaving the
-/// killed worker running on its session lease until the next boot —
-/// the finding-#5 symptom. The belt gate stays keyed on the stop
-/// that never durably started: no tombstone at all still fails.
+/// The durable intent is already on disk, so the stop proceeds instead of aborting.
 #[tokio::test]
 async fn an_existing_tombstone_carries_the_stop_past_its_failed_re_write() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -844,13 +1347,8 @@ async fn an_existing_tombstone_carries_the_stop_past_its_failed_re_write() {
     );
 }
 
-/// The first OS signal's drain: the gate rejects new work, every
-/// client gets the `daemon_closing` event, and the running turn
-/// settles inside its worker's routed `shutdown` before the stop
-/// pass retires the worker (descriptor gone - no supervisor-lost
-/// lingering) and lets the accept loop exit. The fake worker holds
-/// its `shutdown` reply on a test-controlled settle, so a pass that
-/// does not wait for the flush barrier fails the assertions below.
+/// The fake worker holds its `shutdown` reply on a test-controlled settle, so a stop
+/// pass that does not wait for the flush barrier fails below.
 #[cfg(unix)] // the signal-drain state machine: unix signal source
 #[tokio::test]
 async fn first_signal_drains_a_settling_turn_and_rejects_new_work() {
@@ -884,12 +1382,8 @@ async fn first_signal_drains_a_settling_turn_and_rejects_new_work() {
         descriptor,
         descriptor_path.clone(),
     ));
-    // The fake worker connection: the routed `shutdown` reply is the
-    // flush barrier, so it is held until the test releases the turn's
-    // settle.
-    // The bounded command-channel type (the backpressure lane's
-    // request-path bound): one slot is plenty for the single routed
-    // `shutdown`.
+    // The fake worker connection: the routed `shutdown` reply is the flush barrier, held
+    // until the test releases the settle. One channel slot is plenty.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<WorkerRequest>(1);
     *resident.cmd_tx.lock().await = Some(cmd_tx);
     let (shutdown_routed_tx, shutdown_routed_rx) = oneshot::channel::<()>();
@@ -958,11 +1452,9 @@ async fn first_signal_drains_a_settling_turn_and_rejects_new_work() {
         .await
         .expect("the drain routes the worker's shutdown")
         .expect("the routed channel stays open");
-    // While the settle is held the pass can never finish (the routed
-    // reply is the flush barrier), so assert it stays unexited across
-    // a polled window: a fire-and-forget drain that retired the
-    // worker early fails here deterministically, not on one fixed
-    // sleep.
+    // While the settle is held the pass can never finish, so assert it stays unexited
+    // across a polled window: a fire-and-forget drain fails here deterministically,
+    // not on one fixed sleep.
     let hold_deadline = std::time::Instant::now() + Duration::from_millis(100);
     while std::time::Instant::now() < hold_deadline {
         assert!(
@@ -1141,10 +1633,9 @@ async fn a_signal_during_an_in_flight_shutdown_forces() {
         "the update exit must not become a terminal stop pass"
     );
 
-    // The update's committed stop window (the coordinator's Stopping
-    // state, before exit_for_update publishes accept_exit): a signal
-    // forces without flipping the gate, so the terminal pass can never
-    // tombstone and delete the descriptors the successor must adopt.
+    // The update's committed stop window: a signal forces without flipping
+    // the gate, so the terminal pass can never tombstone and delete the
+    // descriptors the successor must adopt.
     let dir = tempfile::TempDir::new().unwrap();
     let options = SupervisorOptions {
         socket_path: dir.path().join("daemon.sock"),
@@ -1176,10 +1667,6 @@ async fn a_signal_during_an_in_flight_shutdown_forces() {
         "the committed update stop must not become a terminal stop pass"
     );
 }
-
-// ---------------------------------------------------------------------------
-// The worker-driven idle passivation handler (TS `idleEvictionMinutes`).
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn idle_passivation_requires_the_worker_token() {
@@ -1305,18 +1792,13 @@ async fn idle_passivation_refuses_a_client_owned_worker() {
     );
 }
 
-/// The roster wake's reuse arm (Macroscope's concurrent-wake finding,
-/// the reuse half): a prompt for a passivated child's active-session id
-/// whose roster row resolves to a session file a CONCURRENT revival
-/// already hosts must join the resident — no second launch.
 #[tokio::test]
 async fn a_passivated_row_prompt_joins_an_already_hosting_resident() {
     let dir = tempfile::TempDir::new().unwrap();
     let agent_dir = dir.path().join("agent");
     std::fs::create_dir_all(&agent_dir).unwrap();
-    // The child's file lives in the session-artifacts tree (the RLM
-    // child shape): the saved-session catalog never resolves it, so the
-    // wake falls to the roster row.
+    // The child's file lives in the session-artifacts tree: the saved-session catalog
+    // never resolves it, so the wake falls to the roster row.
     let artifacts = agent_dir.join("session-artifacts").join("child-1");
     std::fs::create_dir_all(&artifacts).unwrap();
     let session_file = artifacts.join("child-1.jsonl");
@@ -1405,11 +1887,6 @@ async fn a_passivated_row_prompt_joins_an_already_hosting_resident() {
     );
 }
 
-/// The roster wake's failure arm: with no resident hosting the row's
-/// file and the launch refused (the shutdown gate stands in for any
-/// launch failure), the wake falls through to the caller's error — the
-/// concurrent-revival race's loser only fails when the rival never
-/// registered.
 #[tokio::test]
 async fn a_passivated_row_prompt_with_no_rival_falls_through_the_failed_launch() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1461,11 +1938,6 @@ async fn a_passivated_row_prompt_with_no_rival_falls_through_the_failed_launch()
     }
 }
 
-/// The passivation-aware delete: a Kill carrying the `rlmLedgerDelete`
-/// marker aimed at a STOPPED child (no resident worker) resolves the
-/// ledger edge and tombstones it — the deletion boundary without a
-/// worker (TS `recordRlmSubagentDeletion` after a whole-worker
-/// eviction).
 #[tokio::test]
 async fn a_ledger_delete_of_a_stopped_child_tombstones_without_a_worker() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1509,8 +1981,7 @@ async fn a_ledger_delete_of_a_stopped_child_tombstones_without_a_worker() {
         .expect("the spawn edge appends");
     assert_eq!(ledger.live_edges().expect("edges").len(), 1);
 
-    // The parent's delete rides the kill route with the marker; the
-    // route finds no resident and the passivation-aware arm must answer
+    // The parent's delete rides the kill route with the marker; the arm must answer
     // success WITH the tombstone applied.
     let outcome = supervisor
         .tombstone_saved_rlm_child(
@@ -1544,10 +2015,8 @@ async fn a_ledger_delete_of_a_stopped_child_tombstones_without_a_worker() {
         )
         .await;
     assert!(miss.is_err(), "a selector with no edge must not delete");
-    // The stopped child's delete teardown mirrors the resident delete's
-    // end state (the second bot round's leftover-partition finding): the
-    // artifact partition is swept and the session file carries the
-    // archived state.
+    // The teardown mirrors the resident delete: the artifact partition is swept and the
+    // session file carries the archived state.
     assert!(
         !artifacts.exists(),
         "the deleted child's artifact partition must be swept"
@@ -1805,10 +2274,6 @@ async fn a_ledger_delete_never_tombstones_an_unrelated_edge_sharing_the_child_id
     assert_eq!(live[0].child, file_b, "the survivor is child-b's edge");
 }
 
-/// The durable-id wake's reuse arm (the second bot round's finding: the
-/// join lived only on the roster path): a revival for a ledger child
-/// whose file a concurrent wake already hosts must join the resident
-/// through the LEDGER path — the path children actually revive by.
 #[tokio::test]
 async fn a_ledger_child_wake_joins_an_already_hosting_resident() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1896,9 +2361,8 @@ async fn a_ledger_child_wake_joins_an_already_hosting_resident() {
         .insert(std::sync::Arc::clone(&resident))
         .await;
     let before = supervisor.registry.list().await.len();
-    // The wake by the child's NAME (the ledger edge's live resolution):
-    // the catalog misses (the artifacts tree), the ledger matches, and
-    // the REUSE arm joins — no second launch.
+    // The wake by the child's NAME: the catalog misses (the artifacts tree), the ledger
+    // matches, and the REUSE arm joins — no second launch.
     let route = supervisor.wake_saved_session("kid-1").await;
     match route {
         super::routing::WakeRoute::Woken(woken) => {

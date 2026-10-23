@@ -29,6 +29,7 @@ for that verdict. The session engine owns the bounded refresh and partial rollba
 Generic cached idle sockets rotate on acquisition at 55 minutes; busy responses are never
 closed by this age check. Generic pre-event network fallback and Codex SSE behavior stay
 unchanged. No helper API or dependency is added.
+`utils::tls::http_client_builder` applies upstream shared extra-CA trust configuration to caller-owned HTTP transports.
 Per-provider internals are `pub(crate)`.
 
 ## Depends on

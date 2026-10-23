@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from rlm import harness as package_harness
 from rlm import rlm as callable_rlm
@@ -522,6 +524,137 @@ class HarnessStateTest(unittest.TestCase):
             self.assertTrue(alias.is_symlink())
             titles = [entry.title for entry in HarnessState(real_path).entries["memory"].values()]
             self.assertEqual(titles, ["Seed", "Through alias"])
+
+    def test_concurrent_subprocess_creates_all_land(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness" / "harness_state.json"
+            start = Path(temp_dir) / "start"
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+            workers = []
+            for worker in range(8):
+                # Unbounded lock retries: on a loaded runner eight contending writers can outlast the
+                # production ~1s acquire budget; this test proves no update is lost, not that budget.
+                code = (
+                    "import time\n"
+                    "from pathlib import Path\n"
+                    "import rlm.harness\n"
+                    "rlm.harness._LOCK_ATTEMPTS = 10**9\n"
+                    "from rlm.harness import HarnessState\n"
+                    f"while not Path({str(start)!r}).exists():\n"
+                    "    time.sleep(0.005)\n"
+                    f"state = HarnessState({str(state_path)!r})\n"
+                    "for i in range(10):\n"
+                    f"    state.create('memory', f'note {worker} {{i}}', f'note {worker} {{i}}', id=f'm-{worker}-{{i}}')\n"
+                )
+                workers.append(
+                    subprocess.Popen([sys.executable, "-c", code], env=env)
+                )
+            start.write_text("", encoding="utf-8")
+            for worker in workers:
+                self.assertEqual(worker.wait(), 0)
+            entries = HarnessState(state_path).list("memory")
+            self.assertEqual(len(entries), 80)
+
+    def test_held_lock_dir_defers_writes_and_pins_the_shared_lock_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness" / "harness_state.json"
+            state = HarnessState(state_path)
+            state.create("memory", "Seed", "Creates the file.", id="seed")
+            lock_dir = Path(f"{os.path.realpath(state_path)}.lock")
+            lock_dir.mkdir()
+            try:
+                with self.assertRaises(RuntimeError) as raised:
+                    state.create("memory", "Second", "Blocked by the lock.", id="second")
+            finally:
+                lock_dir.rmdir()
+            self.assertIn(str(lock_dir), str(raised.exception))
+            entries = HarnessState(state_path).list("memory")
+            self.assertEqual([entry.id for entry in entries], ["seed"])
+
+    def test_save_syncs_parent_after_replace(self) -> None:
+        if os.name != "posix":
+            self.skipTest("directory fsync is POSIX-only")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(path)
+            events: list[str] = []
+            replace, fsync = os.replace, os.fsync
+
+            def observed_replace(source: Path, destination: Path) -> None:
+                replace(source, destination)
+                events.append("replace")
+
+            def observed_fsync(fd: int) -> None:
+                fsync(fd)
+                events.append("directory sync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file sync")
+
+            with patch.object(os, "replace", side_effect=observed_replace), patch.object(
+                os, "fsync", side_effect=observed_fsync
+            ):
+                state.create_memory("Durable", "Saved")
+            self.assertEqual(events[-2:], ["replace", "directory sync"])
+
+    def test_live_stale_lock_is_not_stolen(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            state.create_memory("Seed", "Present")
+            lock_dir = Path(f"{os.path.realpath(state_path)}.lock")
+            owner = state._acquire_lock_dir(lock_dir)
+            os.utime(lock_dir, (1, 1))
+            try:
+                with self.assertRaises(RuntimeError):
+                    state.create_memory("Second", "Blocked")
+                self.assertTrue(state._owner_matches(lock_dir, owner))
+            finally:
+                (lock_dir / "owner").unlink()
+                lock_dir.rmdir()
+            self.assertEqual(len(HarnessState(state_path).list("memory")), 1)
+
+    def test_dead_lock_is_reclaimed_without_old_owner_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            state.create_memory("Seed", "Present")
+            lock_dir = Path(f"{os.path.realpath(state_path)}.lock")
+            owner = state._acquire_lock_dir(lock_dir)
+            worker = subprocess.Popen([sys.executable, "-c", "pass"])
+            worker.wait()
+            (lock_dir / "owner").write_text(f"{worker.pid} dead-token\n", encoding="utf-8")
+            os.utime(lock_dir, (1, 1))
+            state.create_memory("Second", "Saved")
+            self.assertFalse(state._owner_matches(lock_dir, owner))
+            self.assertFalse(lock_dir.exists())
+            self.assertEqual(len(HarnessState(state_path).list("memory")), 2)
+
+    def test_unparseable_stale_owner_is_reclaimed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            state.create_memory("Seed", "Present")
+            lock_dir = Path(f"{os.path.realpath(state_path)}.lock")
+            lock_dir.mkdir()
+            (lock_dir / "owner").write_bytes(b"\xff")
+            os.utime(lock_dir, (1, 1))
+            state.create_memory("Second", "Saved")
+            self.assertFalse(lock_dir.exists())
+            self.assertEqual(len(HarnessState(state_path).list("memory")), 2)
+
+    def test_save_refuses_lost_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            state.create_memory("Seed", "Present")
+            with self.assertRaisesRegex(RuntimeError, "lock lost"):
+                with state._locked():
+                    lock_dir, _ = state._held_lock
+                    (lock_dir / "owner").write_text("999999 other-token\n", encoding="utf-8")
+                    state.save()
+            self.assertTrue(lock_dir.exists())
+            (lock_dir / "owner").unlink()
+            lock_dir.rmdir()
+            self.assertEqual(len(HarnessState(state_path).list("memory")), 1)
 
     def test_load_ignores_unknown_json_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1373,8 +1506,6 @@ class HarnessStateTest(unittest.TestCase):
                 state.list("tool")
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class HarnessSearchTest(unittest.TestCase):
@@ -1502,3 +1633,79 @@ class HarnessSearchTest(unittest.TestCase):
             state.entries["memory"]["rare"].updated_at = "2026-07-01T00:00:00+00:00"
             self.assertEqual([entry.id for entry in state.search("session quantum")], ["rare", "zz_newer", "aa_older", "solo"])
 
+
+
+class HarnessRefinementsSettingTests(unittest.TestCase):
+    def test_disabled_harness_keeps_kernel_api_introspection_available(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"PRIME_AGENT_CODING_AGENT_DIR": tmp}):
+            (Path(tmp) / "settings.json").write_text('{"harnessRefinements":false}')
+            # The real kernel bootstrap probes these methods before any cell runs.
+            for method in ("create_memory", "update_memory", "delete_memory", "create_skill", "record_refinement"):
+                self.assertTrue(callable(getattr(package_harness, method)))
+                self.assertTrue(callable(getattr(callable_rlm.harness, method)))
+            with self.assertRaisesRegex(RuntimeError, "disabled in /settings"):
+                package_harness.create_memory("No", "Do not create")
+            with self.assertRaisesRegex(RuntimeError, "disabled in /settings"):
+                package_harness.snapshot()
+
+    def test_project_settings_cannot_override_the_global_master_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent_dir = Path(tmp) / "agent"
+            project_dir = Path(tmp) / "project" / ".prime" / "agent"
+            agent_dir.mkdir()
+            project_dir.mkdir(parents=True)
+            (agent_dir / "settings.json").write_text('{"harnessRefinements":false}')
+            project_settings = project_dir / "settings.json"
+            project_settings.write_text('{"harnessRefinements":true}')
+            with patch.dict(os.environ, {"PRIME_AGENT_CODING_AGENT_DIR": str(agent_dir), "PRIME_AGENT_SETTINGS_CWD": str(Path(tmp) / "project")}):
+                with self.assertRaisesRegex(RuntimeError, "disabled in /settings"):
+                    HarnessState(Path(tmp) / "harness_state.json", scope="global")
+                (agent_dir / "settings.json").write_text('{"harnessRefinements":true}')
+                project_settings.write_text('{"harnessRefinements":false}')
+                state = HarnessState(Path(tmp) / "harness_state.json", scope="global")
+                state.create_memory("Note", "Global preference wins", id="note")
+                self.assertEqual(state.get("memory", "note").content, "Global preference wins")
+                (agent_dir / "settings.json").write_text('{"harnessRefinements":false}')
+                project_settings.write_text('{"harnessRefinements":true}')
+                with self.assertRaisesRegex(RuntimeError, "disabled in /settings"):
+                    state.get("memory", "note")
+                (agent_dir / "settings.json").write_text('{"harnessRefinements":"false"}')
+                self.assertEqual(state.get("memory", "note").content, "Global preference wins")
+
+    def test_disable_blocks_cached_reads_and_writes_without_deleting_state(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"PRIME_AGENT_CODING_AGENT_DIR": tmp}):
+            settings = Path(tmp) / "settings.json"
+            settings.write_text('{"harnessRefinements":true}')
+            state = get_harness_state(tmp, global_=True)
+            state.create_memory("Note", "Saved memory", id="note")
+            before = state.file_path.read_bytes()
+            settings.write_text('{"harnessRefinements":false}')
+            for action in (lambda: get_harness_state(tmp, global_=True), lambda: state.get("memory", "note"), lambda: state.create_memory("New", "New memory"), state.load, state.save):
+                with self.assertRaisesRegex(RuntimeError, "disabled in /settings"):
+                    action()
+            self.assertEqual(state.file_path.read_bytes(), before)
+            settings.write_text('{"harnessRefinements":true}')
+            self.assertEqual(state.get("memory", "note").content, "Saved memory")
+
+    def test_disabled_refinements_refuse_factory_runs_before_launch(self):
+        import asyncio
+        from rlm import factory
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"PRIME_AGENT_CODING_AGENT_DIR": tmp}):
+            settings = Path(tmp) / "settings.json"
+            settings.write_text('{"factory":{"enabled":true},"harnessRefinements":true}')
+            state = HarnessState(Path(tmp) / "harness_state.json")
+            state.create_factory("Saved factory", "Saved spec", id="saved", dag=FACTORY_DAG)
+            before = state.file_path.read_bytes()
+            executor = factory.FactoryExecutor(harness=state)
+            settings.write_text('{"factory":{"enabled":true},"harnessRefinements":false}')
+            with patch.object(factory, "_DEFAULT_EXECUTOR", executor):
+                for name in ("saved", "review-sweep"):
+                    with self.assertRaisesRegex(RuntimeError, "disabled in /settings"):
+                        asyncio.run(factory.run_factory(name))
+            self.assertEqual(executor._runs, {})
+            self.assertEqual(state.file_path.read_bytes(), before)
+
+
+if __name__ == "__main__":
+    unittest.main()

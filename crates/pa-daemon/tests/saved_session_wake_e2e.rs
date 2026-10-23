@@ -1,28 +1,18 @@
-//! Saved-session wake e2e (messaging-7 gap): a `send_message` that targets a
-//! saved-but-inactive session wakes it. The supervisor catalog-resolves the
-//! selector, spawns a worker over the persisted session file (the headless
-//! resume machinery), and delivers; the woken session's turn completes
-//! against the mock provider. A second send reuses the resident worker, and
-//! a selector that matches no saved session keeps the TS unknown-session
-//! error. The provider is a local always-200 OpenAI-completions mock, so
-//! the woken worker resolves the real engine path hermetically.
-// Pedantic-gate dispositions (fleet-uniform ruling; see this lane's PR for
-// the full rationale).
-// Stack-resident futures by design on the daemon's hot paths; boxing the
-// call sites for a lint tick is a perf regression with zero correctness gain.
+//! Saved-session wake e2e: a `send_message` targeting a saved-but-inactive
+//! session wakes it (catalog-resolve, spawn a worker over the saved file,
+//! deliver); a second send reuses the resident worker, and an unknown
+//! selector keeps the TS unknown-session error.
+// Stack-resident futures by design on the daemon's hot paths.
 #![allow(clippy::large_futures)]
-// 64-bit-only targets; the narrowing casts sit at OS boundaries
-// (pid/fd/time/size) where the values are bounded by the kernel - the
-// dead-guard expect()s would add panic paths where silent wrap was
-// deliberate.
+// Narrowing casts sit at OS boundaries (pid/fd/time/size) where the kernel
+// bounds the values.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-// The fn-length threshold is a style gate, not correctness; the structure
-// campaign owns the god-fn splits as a follow-up.
+// Style gate only, not correctness.
 #![allow(clippy::too_many_lines)]
 // API-shape opinions, not defects; the surfaces are deliberate.
 #![allow(
@@ -56,8 +46,6 @@ impl Drop for Daemon {
     }
 }
 
-/// One always-200 SSE answer per request (the mock the woken session turns
-/// against).
 fn spawn_mock(answer: &'static str) -> PathBuf /* url */ {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
     let url = format!(
@@ -131,15 +119,14 @@ fn spawn_daemon(socket: &Path, agent_dir: &Path) -> Daemon {
         .arg("--agent-dir")
         .arg(agent_dir)
         // The woken worker has no create-config model: it falls back to the
-        // process pair, exactly like the TS daemon's default session config.
+        // process pair (like the TS daemon's default session config).
         .env("PRIME_AGENT_MODEL_PROVIDER", "prime-inference")
         .env("PRIME_AGENT_MODEL", "mock-1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         // A supervisor killed at teardown must not leak its session workers
-        // into later test binaries: the worker's supervisor-lost exit (TS
-        // `exitIfSupervisorOrphanedForTooLong`) runs on this short window
-        // instead of the 5-minute default.
+        // into later test binaries: the worker's supervisor-lost exit runs
+        // on this short window instead of the 5-minute default.
         .env(
             pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
             "15000",
@@ -232,7 +219,6 @@ impl Client {
     }
 }
 
-/// Poll a sync probe until it yields a value.
 fn wait_until<T>(deadline: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + deadline;
     loop {
@@ -244,7 +230,6 @@ fn wait_until<T>(deadline: Duration, mut probe: impl FnMut() -> Option<T>) -> T 
     }
 }
 
-/// One live session's transcript through the supervisor route.
 fn messages(client: &mut Client, id: &str, active_session_id: &str) -> String {
     client.send_command(
         id,
@@ -255,8 +240,23 @@ fn messages(client: &mut Client, id: &str, active_session_id: &str) -> String {
     serde_json::to_string(&response["data"]).expect("messages json")
 }
 
+#[derive(Clone, Copy)]
+enum SavedLocation {
+    Live,
+    Archive,
+}
+
 #[test]
 fn send_to_a_saved_session_wakes_it_and_runs_the_turn() {
+    saved_session_wake(SavedLocation::Live);
+}
+
+#[test]
+fn send_to_an_archived_root_restores_it_and_runs_the_turn() {
+    saved_session_wake(SavedLocation::Archive);
+}
+
+fn saved_session_wake(location: SavedLocation) {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let agent_dir = dir.path().join("agent");
     let sessions = agent_dir.join("sessions");
@@ -286,12 +286,10 @@ fn send_to_a_saved_session_wakes_it_and_runs_the_turn() {
     )
     .expect("write models.json");
     let socket = dir.path().join("daemon.sock");
-    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let daemon = spawn_daemon(&socket, &agent_dir);
     let (mut client, hello) = Client::connect(&socket);
     assert_eq!(hello["type"], "daemon_hello");
 
-    // One session that goes inactive: prompt a turn, then stop the worker.
-    // The session file persists under the agent dir.
     client.send_command(
         "c1",
         &json!({
@@ -337,7 +335,6 @@ fn send_to_a_saved_session_wakes_it_and_runs_the_turn() {
         &json!({ "type": "kill", "activeSessionId": active_id }),
     );
     assert_eq!(client.read_response("k1")["success"], true, "kill failed");
-    // The session went inactive: no live residents, one saved session.
     client.send_command("l1", &json!({ "type": "list" }));
     let list = client.read_response("l1");
     assert_eq!(
@@ -362,9 +359,26 @@ fn send_to_a_saved_session_wakes_it_and_runs_the_turn() {
     assert_eq!(saved_rows.len(), 1, "the killed session is saved");
     assert_eq!(saved_rows[0]["name"], "alpha");
 
-    // The wake: send by name to the inactive session. The supervisor
-    // catalog-resolves "alpha", spawns a worker over the saved file, and
-    // delivers the message with the TS receipt.
+    // Simulate upgrading a store archived by an older Rust daemon. The
+    // current daemon starts with the root already in its archive directory.
+    let archive_path = agent_dir
+        .join("sessions-archive")
+        .join(format!("{session_id}.jsonl"));
+    let live_path = sessions.join(format!("{session_id}.jsonl"));
+    let saved_bytes = std::fs::read(&live_path).expect("saved transcript");
+    let (_daemon, mut client) = match location {
+        SavedLocation::Live => (daemon, client),
+        SavedLocation::Archive => {
+            drop(client);
+            drop(daemon);
+            std::fs::create_dir_all(archive_path.parent().unwrap()).expect("archive dir");
+            std::fs::rename(&live_path, &archive_path).expect("pre-upgrade archive fixture");
+            let daemon = spawn_daemon(&socket, &agent_dir);
+            let (client, _) = Client::connect(&socket);
+            (daemon, client)
+        }
+    };
+
     client.send_command(
         "s1",
         &json!({ "type": "send_message", "targetActiveSessionId": "alpha", "message": "wake up" }),
@@ -379,9 +393,12 @@ fn send_to_a_saved_session_wakes_it_and_runs_the_turn() {
         .expect("woken active id")
         .to_string();
     assert_ne!(woken_id, active_id, "a new worker hosts the woken session");
+    assert!(!archive_path.exists(), "woken root is in the live store");
+    assert!(
+        std::fs::read(&live_path).unwrap().starts_with(&saved_bytes),
+        "wake preserves the complete pre-upgrade transcript"
+    );
 
-    // The woken worker spawned: the roster lists the session again, with the
-    // saved transcript (same sessionId, the wake resumed the file).
     let listed = wait_until(Duration::from_secs(15), || {
         client.send_command("l3", &json!({ "type": "list" }));
         let list = client.read_response("l3");
@@ -394,7 +411,6 @@ fn send_to_a_saved_session_wakes_it_and_runs_the_turn() {
     });
     assert_eq!(listed["sessionName"], "alpha", "{listed}");
 
-    // The delivered prompt ran as a turn and the mock answered it.
     let woken_messages = wait_until(Duration::from_secs(30), || {
         let text = messages(&mut client, "gm2", &woken_id);
         (text.contains("[agent-message from") && text.contains("wake reply")).then_some(text)
@@ -407,8 +423,6 @@ fn send_to_a_saved_session_wakes_it_and_runs_the_turn() {
         "{woken_messages}"
     );
 
-    // The reuse path: a second send finds the resident worker hosting the
-    // file and delivers without a second wake (one new worker only).
     client.send_command(
         "s2",
         &json!({ "type": "send_message", "targetActiveSessionId": "alpha", "message": "again" }),
@@ -426,7 +440,6 @@ fn send_to_a_saved_session_wakes_it_and_runs_the_turn() {
         (text.matches("again").count() == 2).then_some(())
     });
 
-    // An unknown selector that matches no saved session keeps the TS error.
     client.send_command(
         "s3",
         &json!({ "type": "send_message", "targetActiveSessionId": "ghost", "message": "no" }),
@@ -448,8 +461,6 @@ fn send_to_a_saved_session_wakes_it_and_runs_the_turn() {
         format!("Unknown active session: {active_id}")
     );
 
-    // A saved-session id prefix still wakes: the session is resident now,
-    // so the send lands on the reused worker.
     client.send_command(
         "s5",
         &json!({

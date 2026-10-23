@@ -1,7 +1,7 @@
-//! Compact-session tests, the execution family (moved with their
-//! concerns): the persist + rebuild run, the rebuilt live context's
-//! auto-compaction gate, the summary-delta sinks, the harness-digest
-//! snapshot, the error response, and the durable row's full record.
+//! Compact-session tests, the execution family: the persist + rebuild
+//! run, the auto-compaction gate, the summary-delta sinks, the
+//! harness-digest snapshot, the error response, and the durable row's
+//! record.
 use super::*;
 use serde_json::Map;
 
@@ -38,11 +38,10 @@ async fn execute_compaction_persists_and_rebuilds() {
     assert!(run.result.summary.contains("summarized goal"));
     assert!(run.result.usage.is_some());
     assert_eq!(run.entry.summary, run.result.summary);
-    // A user-message cut is not a split turn: exactly one summarizer
-    // wire call, and no split marker in the merged summary.
+    // A user-message cut is not a split turn: one summarizer wire
+    // call, no split marker.
     assert_eq!(registration.call_count(), 1);
     assert!(!run.result.summary.contains("Turn Context (split turn)"));
-    // The compaction entry persisted on the session.
     assert!(session
         .get_entries()
         .iter()
@@ -177,12 +176,8 @@ async fn rebuilt_live_context_prevents_repeat_auto_compaction_until_new_usage() 
     registration.unregister();
 }
 
-/// The live summary-delta sink receives every summarizer text delta
-/// as the model generates it (the daemon's `compaction_summary_delta`
-/// broadcast): the deltas arrive in order, their concatenation is the
-/// generated summary, and the final result still comes from the
-/// terminal assistant message — the sink never gates the run, and
-/// `None` keeps the one-shot completion untouched.
+/// The sink receives every summarizer text delta in order; the final result
+/// still comes from the terminal assistant message.
 #[tokio::test]
 async fn execute_compaction_streams_summary_deltas_to_the_sink() {
     let registration = faux_registration();
@@ -220,8 +215,7 @@ async fn execute_compaction_streams_summary_deltas_to_the_sink() {
     };
     let deltas = deltas.lock().unwrap().join("");
     // The streamed deltas concatenate to exactly the generated
-    // summary text (the faux provider chunks the scripted response
-    // into provider-sized pieces; the sink receives each chunk).
+    // summary.
     assert!(!deltas.is_empty(), "the sink saw at least one delta");
     assert_eq!(deltas, "## Goal\nsummarized goal");
     // The convergence invariant: a client accumulating every delta
@@ -230,14 +224,9 @@ async fn execute_compaction_streams_summary_deltas_to_the_sink() {
     registration.unregister();
 }
 
-/// A split-turn compaction keeps the live stream in final order: the
-/// history summary streams live (its own wire call, in order), the
-/// concurrent turn-prefix call never streams its raw chunks (they
-/// would interleave out of final order), and the split marker with
-/// the completed prefix flushes through the sink as the final chunk —
-/// so the accumulated stream converges to exactly the committed
-/// summary (history, split marker, turn prefix), never a garbled
-/// mixture.
+/// A split-turn compaction keeps the live stream in final order: the history
+/// streams live, the turn-prefix call never streams raw chunks, and the
+/// accumulated stream converges to the committed summary.
 #[tokio::test]
 async fn split_turn_compaction_streams_in_final_order_and_converges() {
     let registration = faux_registration();
@@ -332,18 +321,12 @@ async fn split_turn_compaction_streams_in_final_order_and_converges() {
         panic!("expected the compaction to run");
     };
     assert_eq!(registration.call_count(), 2, "both wire calls ran");
-    // The committed summary decides which scripted response became
-    // the history and which the prefix (the factories answer in
-    // issue order, so the split marker's two halves identify them).
     let summary = &run.result.summary;
     let marker = "\n\n---\n\n**Turn Context (split turn):**\n\n";
     let split = summary
         .split_once(marker)
         .unwrap_or_else(|| panic!("the committed summary carries the split marker: {summary:?}"));
     let (history_text, prefix_text) = (split.0, split.1);
-    // The factories answer in issue order, so whichever scripted
-    // response the concurrent calls took is decided by the committed
-    // summary itself — the two halves are the two scripted texts.
     let mut scripted = vec!["the history summary", "the turn prefix summary"];
     scripted.sort_unstable();
     let mut committed = vec![history_text, prefix_text];
@@ -351,8 +334,6 @@ async fn split_turn_compaction_streams_in_final_order_and_converges() {
     assert_eq!(committed, scripted);
 
     let deltas = deltas.lock().unwrap().clone();
-    // Only the flush carries the split marker, and it is the final
-    // chunk (the prefix call's raw chunks never hit the sink).
     let marker_positions: Vec<usize> = deltas
         .iter()
         .enumerate()
@@ -364,26 +345,17 @@ async fn split_turn_compaction_streams_in_final_order_and_converges() {
         vec![deltas.len() - 1],
         "the split marker rides exactly one chunk, the final flush: {deltas:?}"
     );
-    // Everything before the flush is pure history summary — the
-    // live view reads as the history generating, in order.
     let live_history = deltas[..deltas.len() - 1].concat();
-    // The live view reads as the history summary generating, in
-    // order: a raw prefix chunk interleaving here would break the
-    // equality (the scripted texts differ).
     assert_eq!(live_history, history_text, "deltas: {deltas:?}");
     // The convergence invariant: the accumulated stream IS the
-    // committed summary (history, split marker, turn prefix).
+    // committed summary.
     assert_eq!(deltas.concat(), *summary);
     registration.unregister();
 }
 
-/// The harness digest snapshot rides the durable compaction row (TS
-/// `_performCompaction` -> `appendCompaction(..., this._harnessDigest())`):
-/// the harness-state disk read happens at the commit, so state written
-/// after the inputs were captured (mid-run, the TS test's "written
-/// before compaction" memory) is a fresh read, the digest never flows
-/// through the summarizer, and the rebuilt context leads with the
-/// digest block before the compaction summary.
+/// The harness digest snapshot rides the durable compaction row: the disk
+/// read at the commit stays fresh, the digest never flows through the
+/// summarizer, and the rebuilt context leads with the digest block.
 #[tokio::test]
 async fn execute_compaction_attaches_harness_digest_snapshot() {
     let registration = faux_registration();
@@ -464,11 +436,9 @@ async fn execute_compaction_attaches_harness_digest_snapshot() {
         .as_deref()
         .expect("digest snapshot");
     assert!(digest.contains("Compaction test memory"));
-    // Mechanical attachment: the digest never flows through the summarizer.
     assert!(!run.entry.summary.contains("# Continual Harness State"));
-    // The durable row carries the TS wire shape (`harnessDigest`) plus
-    // the fingerprint of the state behind it (`harnessStateFingerprint`,
-    // TS #2400): one state read feeds the digest and the fingerprint.
+    // The durable row carries the wire shape
+    // (`harnessDigest`/`harnessStateFingerprint`): one read feeds both.
     let serialized = serde_json::to_value(&run.entry).unwrap();
     assert_eq!(
         serialized
@@ -487,9 +457,8 @@ async fn execute_compaction_attaches_harness_digest_snapshot() {
             .and_then(|value| value.as_str()),
         Some(fingerprint)
     );
-    // The fingerprint is the merged-state fingerprint the digest
-    // rendered: rewriting the state (same content, new timestamps)
-    // must not move it, and a real content change must.
+    // Rewriting the state (same content, new timestamps) must not
+    // move the fingerprint; a real content change must.
     let inputs = super::super::harness_digest::HarnessDigestInputs {
         context: super::super::harness_digest::HarnessDigestContext {
             global_dir,
@@ -513,8 +482,6 @@ async fn execute_compaction_attaches_harness_digest_snapshot() {
     crate::refinement::save_harness_state(&local_dir, &state).unwrap();
     let changed = inputs.render_with_fingerprint();
     assert_ne!(changed.state_fingerprint, fingerprint);
-    // Provider conversion leads with the digest block before the
-    // compaction summary; the live context keeps the summary marker.
     let rebuilt = rebuilt_context_after_compaction(&session);
     assert!(matches!(&rebuilt[0], AgentMessage::CompactionSummary(_)));
     let provider_messages = super::super::messages::convert_to_llm(&rebuilt);
@@ -533,8 +500,8 @@ async fn execute_compaction_attaches_harness_digest_snapshot() {
     registration.unregister();
 }
 
-/// An error-stop summarizer response fails the compaction (TS throws
-/// `Summarization failed: ...`), never an empty-summary success.
+/// An error-stop summarizer response fails the compaction, never an
+/// empty-summary success.
 #[tokio::test]
 async fn execute_compaction_fails_on_an_error_summarizer_response() {
     let registration = faux_registration();
@@ -576,7 +543,6 @@ async fn execute_compaction_fails_on_an_error_summarizer_response() {
         error.to_string(),
         "Summarization failed: summarizer exploded"
     );
-    // No compaction entry persisted for the failed run.
     assert!(session
         .get_entries()
         .iter()
@@ -584,9 +550,160 @@ async fn execute_compaction_fails_on_an_error_summarizer_response() {
     registration.unregister();
 }
 
-/// The durable row carries the full TS `CompactionEntry` record:
-/// `fromHook: false` (the built-in origin), the summarizer usage, and
-/// the file-operation details — not just the summary boundary.
+/// A whitespace-only summarizer reply (a blank-but-billed HTTP success)
+/// fails the compaction instead of committing an empty summary that would
+/// replace the transcript.
+#[tokio::test]
+async fn execute_compaction_fails_on_an_empty_summarizer_response() {
+    let registration = faux_registration();
+    let model = registration.get_model();
+    registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Message(
+        pa_ai::faux::faux_assistant_text_message(
+            "  \n",
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        ),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = session_with_turns(tmp.path(), 3);
+    let before = session.get_entries();
+    let error = execute_compaction(
+        &mut session,
+        CompactOptions {
+            model,
+            api_key: None,
+            custom_instructions: None,
+            settings: super::super::compaction::CompactionSettings {
+                keep_recent_tokens: 20,
+                ..Default::default()
+            },
+            abort: None,
+            harness_digest: None,
+            auxiliary: None,
+            semantic_edges: None,
+            summary_delta: None,
+            summary_requests: SummaryRequestOptions::default(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Summarization failed: the summary was empty"
+    );
+    assert_eq!(session.get_entries(), before);
+    registration.unregister();
+}
+
+/// A length-capped summarizer reply retries once with the shorter-summary
+/// instruction: the committed row is the retry's text, with no marker.
+#[tokio::test]
+async fn execute_compaction_retries_a_length_capped_summarizer_response() {
+    let registration = faux_registration();
+    let model = registration.get_model();
+    registration.set_responses(vec![
+        pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_text_message(
+            "cut-off summary",
+            pa_ai::faux::FauxAssistantMessageOptions {
+                stop_reason: Some(pa_types::ai::StopReason::Length),
+                ..Default::default()
+            },
+        )),
+        pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_text_message(
+            "shorter summary",
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        )),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = session_with_turns(tmp.path(), 3);
+    let outcome = execute_compaction(
+        &mut session,
+        CompactOptions {
+            model,
+            api_key: None,
+            custom_instructions: None,
+            settings: super::super::compaction::CompactionSettings {
+                keep_recent_tokens: 20,
+                ..Default::default()
+            },
+            abort: None,
+            harness_digest: None,
+            auxiliary: None,
+            semantic_edges: None,
+            summary_delta: None,
+            summary_requests: SummaryRequestOptions::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let CompactOutcome::Ran(run) = outcome else {
+        panic!("expected the compaction to run");
+    };
+    assert_eq!(run.entry.summary, "shorter summary");
+    // Exactly one retry: the capped reply plus its shorter-summary retry.
+    assert_eq!(registration.call_count(), 2);
+    registration.unregister();
+}
+
+/// A twice-capped summarizer pair still commits: the retry's text rides
+/// behind the truncation marker, and the queue's two responses prove the
+/// retry never loops (a third call would hit the empty queue and fail).
+#[tokio::test]
+async fn execute_compaction_accepts_a_twice_capped_summary_behind_the_marker() {
+    let registration = faux_registration();
+    let model = registration.get_model();
+    let capped = |text: &str| {
+        pa_ai::faux::FauxResponseStep::Message(pa_ai::faux::faux_assistant_text_message(
+            text,
+            pa_ai::faux::FauxAssistantMessageOptions {
+                stop_reason: Some(pa_types::ai::StopReason::Length),
+                ..Default::default()
+            },
+        ))
+    };
+    registration.set_responses(vec![capped("partial one"), capped("partial two")]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = session_with_turns(tmp.path(), 3);
+    let outcome = execute_compaction(
+        &mut session,
+        CompactOptions {
+            model,
+            api_key: None,
+            custom_instructions: None,
+            settings: super::super::compaction::CompactionSettings {
+                keep_recent_tokens: 20,
+                ..Default::default()
+            },
+            abort: None,
+            harness_digest: None,
+            auxiliary: None,
+            semantic_edges: None,
+            summary_delta: None,
+            summary_requests: SummaryRequestOptions::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let CompactOutcome::Ran(run) = outcome else {
+        panic!("expected the compaction to run");
+    };
+    assert_eq!(
+        run.entry.summary,
+        format!(
+            "{}\n\npartial two",
+            super::super::compaction::SUMMARY_TRUNCATED_MARKER
+        )
+    );
+    assert_eq!(registration.call_count(), 2);
+    // The session continues: the twice-capped retry still commits the row.
+    assert!(session
+        .get_entries()
+        .iter()
+        .any(|entry| matches!(entry, FileEntry::Compaction { .. })));
+    registration.unregister();
+}
+
+/// The durable row carries the full record — `fromHook: false`, the usage,
+/// and the file-operation details — not just the summary boundary.
 #[tokio::test]
 async fn durable_compaction_row_carries_the_ts_record() {
     let registration = faux_registration();
@@ -621,8 +738,7 @@ async fn durable_compaction_row_carries_the_ts_record() {
     assert_eq!(run.entry.from_hook, Some(false));
     assert_eq!(run.entry.usage, run.result.usage);
     assert_eq!(run.entry.tokens_before, before);
-    // The persisted session record is the full entry, byte-for-byte
-    // (TS `appendCompaction` stores the same record it returns).
+    // The persisted session record is the full entry, byte-for-byte.
     let persisted = session
         .get_entries()
         .iter()

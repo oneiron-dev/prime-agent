@@ -471,7 +471,7 @@ impl KernelMemoryGuard {
         let mut cache = lock(&self.journal);
         if cache.as_ref().is_none_or(|cached| cached.key != key) {
             let mut by_kernel: HashMap<i32, Vec<i32>> = HashMap::new();
-            match read_active_orphan_processes(&key.path) {
+            match read_active_orphan_processes(&key.path, i64::from(std::process::id())) {
                 Ok(records) => {
                     for record in records {
                         if let Some(kernel_pid) = record.kernel_pid {

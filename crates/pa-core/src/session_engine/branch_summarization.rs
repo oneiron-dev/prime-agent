@@ -1,5 +1,4 @@
-//! Branch summarization for tree navigation. Port of
-//! core/compaction/branch-summarization.ts.
+//! Branch summarization for tree navigation.
 
 use std::collections::HashSet;
 
@@ -29,11 +28,8 @@ pub struct BranchSummaryResult {
     pub aborted: bool,
     pub error: Option<String>,
     pub usage: Option<pa_types::ai::Usage>,
-    /// The model that served the summary call (TS #2411's routed
-    /// auxiliary model, or the session model when no auxiliary is
-    /// configured): the caller persists it on the entry so the per-model
-    /// cost fold bills the spend on the model that billed it, not the
-    /// branch's `model_change` timeline.
+    /// The model that served the summary call: the caller persists it, so the
+    /// cost fold bills the model that billed it, not the branch timeline.
     pub model: Option<(String, String)>,
 }
 
@@ -153,6 +149,14 @@ fn get_message_from_entry(entry: &FileEntry) -> Option<AgentMessage> {
 /// is hit. File ops are collected from ALL entries (cumulative tracking).
 #[must_use]
 pub fn prepare_branch_entries(entries: &[FileEntry], token_budget: u64) -> BranchPreparation {
+    prepare_branch_entries_with_refinements(entries, token_budget, /*enabled*/ true)
+}
+
+fn prepare_branch_entries_with_refinements(
+    entries: &[FileEntry],
+    token_budget: u64,
+    enabled: bool,
+) -> BranchPreparation {
     let mut file_ops = FileOperations::default();
     // Cumulative tracking from prior branch summaries (never hooked ones).
     for entry in entries {
@@ -171,6 +175,17 @@ pub fn prepare_branch_entries(entries: &[FileEntry], token_budget: u64) -> Branc
     let mut total_tokens = 0u64;
     for entry in entries.iter().rev() {
         let Some(message) = get_message_from_entry(entry) else {
+            continue;
+        };
+        // Disabled harness content must not consume budget or terminate selection.
+        let message = if enabled {
+            Some(message)
+        } else {
+            super::refinement_gate::without_refinements(vec![message])
+                .into_iter()
+                .next()
+        };
+        let Some(message) = message else {
             continue;
         };
         extract_file_ops_from_message(&message, &mut file_ops);
@@ -199,7 +214,7 @@ pub fn prepare_branch_entries(entries: &[FileEntry], token_budget: u64) -> Branc
 
 const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
 
-const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Outstanding Work\n- [Running subagents: name / task / status (recovery pointer: rlm.list_subagents())]\n- [Background bash handles: command / status (recovery: the [bash-done] notification; a lost handle cannot be re-awaited)]\n- [Active heartbeats and the goal: schedule / objective (recovery pointers: rlm_heartbeat.list() and goal.get())]\n- [Or \"(none)\" if nothing is in flight]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
 
 /// Build the branch-summary request messages for the model.
 #[must_use]
@@ -209,7 +224,23 @@ pub fn build_branch_summary_request(
     custom_instructions: Option<&str>,
     replace_instructions: bool,
 ) -> (Vec<AgentMessage>, BranchPreparation) {
-    let preparation = prepare_branch_entries(entries, token_budget);
+    build_branch_summary_request_with_refinements(
+        entries,
+        token_budget,
+        custom_instructions,
+        replace_instructions,
+        /*enabled*/ true,
+    )
+}
+
+fn build_branch_summary_request_with_refinements(
+    entries: &[FileEntry],
+    token_budget: u64,
+    custom_instructions: Option<&str>,
+    replace_instructions: bool,
+    enabled: bool,
+) -> (Vec<AgentMessage>, BranchPreparation) {
+    let preparation = prepare_branch_entries_with_refinements(entries, token_budget, enabled);
     let messages = if preparation.messages.is_empty() {
         Vec::new()
     } else {
@@ -257,8 +288,7 @@ pub fn finalize_branch_summary(
     }
 }
 
-/// Options for one branch-summary generation run (TS
-/// `GenerateBranchSummaryOptions`).
+/// Options for one branch-summary generation run.
 pub struct GenerateBranchSummaryOptions<'a> {
     pub model: &'a pa_types::ai::Model,
     pub api_key: Option<String>,
@@ -267,33 +297,21 @@ pub struct GenerateBranchSummaryOptions<'a> {
     pub replace_instructions: bool,
     /// Tokens reserved for prompt + response (TS default 16384).
     pub reserve_tokens: u64,
-    /// The auxiliary-model routing context (TS #2411): when present, the
-    /// summary call resolves its model through the `auxiliaryModel`
-    /// setting with a context-window fit check, falling back to the
-    /// session model. `None` keeps the session model.
+    /// When present, the summary call resolves its model through the
+    /// `auxiliaryModel` setting with a context-window fit check.
     pub auxiliary: Option<&'a super::auxiliary_model::AuxiliaryModelContext>,
 }
 
-/// The TS default reserve budget (`reserveTokens`).
+/// The default reserve budget.
 pub const DEFAULT_BRANCH_RESERVE_TOKENS: u64 = 16_384;
 
-/// The summarizer call cap (TS `maxTokens: 2048`).
+/// The summarizer call cap.
 const BRANCH_SUMMARY_MAX_TOKENS: u64 = 2048;
 
-/// Estimate the context window the branch-summary request needs (TS
-/// #2411's `estimateBranchSummaryRequestTokens`), using the same
-/// entry-slicing budget and prompt builder as the wire call, so the
-/// estimate cannot drift from the request. `context_window` is the window
-/// of the model the session would run the summary on (the fallback): a
-/// resolved auxiliary model must hold two things — the request body
-/// (`generate_branch_summary` builds: the system prompt, the serialized
-/// branch inside its `<conversation>` wrapper, and the completion
-/// budget) and the reserve the branch call subtracts from its window —
-/// the larger of the two decides whether the model fits. A branch that
-/// slices to nothing issues no wire request, but a window at or below the
-/// reserve would slice with a non-positive budget that
-/// [`prepare_branch_entries`] treats as unlimited, so the empty-slice
-/// shape still requires a window above the reserve.
+/// Estimate the context window the branch-summary request needs, using the
+/// same entry-slicing budget and prompt builder as the wire call. The larger
+/// of the request body and the reserve decides whether the auxiliary model
+/// fits; a non-positive budget is treated as unlimited.
 #[must_use]
 pub fn estimate_branch_summary_request_tokens(
     entries: &[FileEntry],
@@ -302,8 +320,6 @@ pub fn estimate_branch_summary_request_tokens(
     custom_instructions: Option<&str>,
     replace_instructions: bool,
 ) -> u64 {
-    // Mirrors `generate_branch_summary`: the same budget decides which
-    // entries fit.
     let window = if context_window > 0 {
         context_window
     } else {
@@ -324,17 +340,12 @@ pub fn estimate_branch_summary_request_tokens(
         .count() as u64)
         .div_ceil(4);
     let prompt_tokens = super::compact_session::summarizer_request_tokens(&request);
-    // The completion budget and the input-slice reserve are separate
-    // draws on the same window, so the larger of the two decides whether
-    // the model fits.
     (system_prompt_tokens + prompt_tokens + BRANCH_SUMMARY_MAX_TOKENS)
         .max(prompt_tokens.saturating_add(reserve_tokens))
 }
 
-/// Generate the abandoned-branch summary (TS `generateBranchSummary`):
-/// prepare the entries under the context budget, run the summarizer with
-/// the shared provider-retry policy, and fold the response into the final
-/// summary text with its file-operation block.
+/// Generate the abandoned-branch summary: prepare the entries under the
+/// context budget, run the summarizer, and fold in the file-ops block.
 pub async fn generate_branch_summary(
     entries: &[FileEntry],
     options: GenerateBranchSummaryOptions<'_>,
@@ -347,18 +358,11 @@ pub async fn generate_branch_summary(
         reserve_tokens,
         auxiliary,
     } = options;
-    // TS #2411 (`_resolveAuxiliaryModel`): the branch summary fires at a
-    // tree-navigation context boundary and runs with its own prompt
-    // prefix, so on the session model it re-reads the whole branch at
-    // peak price — route it to the configured auxiliary model when it is
-    // set, usable, and its known window fits the request; fall back to the
-    // session model otherwise (the pre-#2411 behavior). The fit check
-    // estimates the request the SESSION model would issue (its window
-    // sizes the slice); the routed model then re-slices with its own
-    // window, exactly like TS.
-    // The resolution reads settings/models/auth (and a `!command` secret
-    // key resolves a subprocess when configured), so it runs on the
-    // blocking pool, never the async executor.
+    // The branch summary runs with its own prompt prefix, so on the session model it
+    // re-reads the whole branch — route it to the auxiliary model when its known window fits.
+    // The fit check estimates the request the SESSION model would issue; the
+    // routed model re-slices with its own window. The resolution reads
+    // settings/models/auth, so it runs on the blocking pool.
     let (routed_model, api_key, summary_headers) = match auxiliary {
         Some(context) => {
             let required = estimate_branch_summary_request_tokens(
@@ -383,10 +387,7 @@ pub async fn generate_branch_summary(
                 })
             };
             // A JoinError (the closure panicked) degrades to the session
-            // fallback; the resolver itself never panics — every unusable
-            // selector resolves to the fallback with the warning. The
-            // fallback keeps the merged headers (the registry's single
-            // owner of the team header).
+            // fallback, which keeps the merged headers.
             let routed = join.await.unwrap_or_else(|_| {
                 super::auxiliary_model::session_fallback_with_headers(
                     context,
@@ -405,13 +406,26 @@ pub async fn generate_branch_summary(
         128_000
     };
     let token_budget = context_window.saturating_sub(reserve_tokens);
-    let (request_messages, preparation) = build_branch_summary_request(
+    let enabled = match auxiliary {
+        Some(context) => {
+            let context = context.clone();
+            tokio::task::spawn_blocking(move || {
+                let settings =
+                    crate::settings::SettingsManager::create(&context.cwd, &context.agent_dir);
+                super::refinement_gate::enabled(Some(&settings))
+            })
+            .await
+            .unwrap_or(false)
+        }
+        None => true,
+    };
+    let (request_messages, preparation) = build_branch_summary_request_with_refinements(
         entries,
         token_budget,
         custom_instructions,
         replace_instructions,
+        enabled,
     );
-    // Nothing model-visible remains after filtering.
     if request_messages.is_empty() {
         let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
         return BranchSummaryResult {
@@ -421,8 +435,6 @@ pub async fn generate_branch_summary(
             ..Default::default()
         };
     }
-    // The summarizer call follows the compaction precedent
-    // (`execute_compaction`): one `complete_simple` on the session model.
     let context = pa_types::ai::Context {
         system_prompt: Some(super::compaction_utils::SUMMARIZATION_SYSTEM_PROMPT.to_string()),
         messages: convert_to_llm(&request_messages)
@@ -440,20 +452,21 @@ pub async fn generate_branch_summary(
             .collect(),
         tools: None,
     };
-    let stream_options =
+    let mut stream_options =
         pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
             max_tokens: Some(BRANCH_SUMMARY_MAX_TOKENS),
             api_key,
             headers: summary_headers.map(|headers| headers.into_iter().collect()),
             ..Default::default()
         });
+    stream_options.reasoning = pa_types::ai::minimum_reasoning(model);
     let response = match pa_ai::complete_simple(model, &context, Some(stream_options)).await {
         Ok(response) => response,
         Err(error) => {
             return BranchSummaryResult {
                 error: Some(format!("{error:#}")),
                 ..Default::default()
-            }
+            };
         }
     };
     if response.stop_reason == pa_types::ai::StopReason::Aborted {
@@ -519,9 +532,45 @@ mod tests {
     }
 
     #[test]
+    fn disabled_refinement_notices_cannot_exhaust_the_branch_summary_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = crate::session::manager::SessionManager::in_memory(tmp.path());
+        let conversation = user("Earlier conversation about the task");
+        session.append_message(conversation.clone()).unwrap();
+        session
+            .append_custom_message(
+                "refinement_notice",
+                pa_types::ai::UserContent::Text("saved refinement ".repeat(500)),
+                /*display*/ false,
+                None,
+            )
+            .unwrap();
+        let (request, preparation) = build_branch_summary_request_with_refinements(
+            session.retained_entries(),
+            50,
+            None,
+            /*replace_instructions*/ false,
+            /*enabled*/ false,
+        );
+        assert_eq!(preparation.messages, vec![conversation]);
+        assert!(!request.is_empty());
+        let (enabled_request, _) = build_branch_summary_request_with_refinements(
+            session.retained_entries(),
+            50,
+            None,
+            /*replace_instructions*/ false,
+            /*enabled*/ true,
+        );
+        assert!(
+            enabled_request.is_empty(),
+            "the enabled legacy budget path selects no older rows"
+        );
+    }
+
+    #[test]
     fn collects_old_branch_to_common_ancestor() {
         // root -> u1 -> a1 -> u2 (old leaf)
-        //        \\-> u3 (target, sibling of a1's subtree? no: sibling of u1's children)
+        //        \\-> u3 (target)
         let entries = vec![
             entry("u1", None, user("start")),
             entry("a1", Some("u1"), user("assistant turn")),
@@ -530,7 +579,6 @@ mod tests {
         ];
         let result = collect_entries_for_branch_summary(&entries, Some("u2"), "u3");
         assert_eq!(result.common_ancestor_id.as_deref(), Some("u1"));
-        // u2 and a1 are collected (target ancestor excluded).
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.entries[0].id(), Some("a1"));
         assert_eq!(result.entries[1].id(), Some("u2"));
@@ -546,11 +594,10 @@ mod tests {
                 user(&format!("message {i} with padding")),
             ));
         }
-        // Each message estimates to ~6 tokens; a 6-token budget keeps only
-        // the newest one before the walk breaks.
+        // Each message estimates to ~6 tokens; a 6-token budget keeps
+        // only the newest one.
         let preparation = prepare_branch_entries(&entries, 6);
         assert_eq!(preparation.messages.len(), 1);
-        // A budget below any single message keeps nothing.
         let tight = prepare_branch_entries(&entries, 1);
         assert_eq!(tight.messages.len(), 0);
         let unlimited = prepare_branch_entries(&entries, 0);
@@ -575,8 +622,22 @@ mod tests {
         let summary = result.summary.unwrap();
         assert!(summary.contains("The user explored a different conversation branch"));
         assert!(summary.contains("## Goal"));
-        // Presentation wraps in the branch envelope.
         assert!(branch_summary_presentation("s").contains("[branch-summary]"));
+    }
+
+    #[test]
+    fn branch_summary_request_carries_outstanding_work() {
+        let entries = vec![entry("e0", None, user("explore the widget"))];
+        let (messages, _) = build_branch_summary_request(&entries, 0, None, false);
+        assert_eq!(messages.len(), 1);
+        let text = match &messages[0] {
+            AgentMessage::User(user) => user.content.text(),
+            _ => panic!("expected a user message"),
+        };
+        assert!(text.contains("## Outstanding Work"));
+        assert!(text.contains("rlm.list_subagents()"));
+        assert!(text.contains("the [bash-done] notification"));
+        assert!(text.contains("rlm_heartbeat.list()"));
     }
 
     #[test]
@@ -653,8 +714,6 @@ mod tests {
 
     #[tokio::test]
     async fn empty_branch_summarizes_to_a_note() {
-        // No messages survive the budget filter: the TS short-circuit
-        // returns "No content to summarize" without a model call.
         let model: pa_types::ai::Model = serde_json::from_value(serde_json::json!({
             "id": "m", "name": "m", "api": "openai-completions", "provider": "test",
             "baseUrl": "http://localhost", "reasoning": false, "input": ["text"],
@@ -679,11 +738,8 @@ mod tests {
         assert!(result.error.is_none());
     }
 
-    /// The routing context present with a selector equal to the session
-    /// model keeps the session model: the summary call serves on the
-    /// session model (the faux factory records the model). A selector that
-    /// resolves to no model falls back the same way (TS #2411's
-    /// `_resolveAuxiliaryModel` fallback arms).
+    /// A selector equal to the session model keeps it, and a selector
+    /// that resolves to no model falls back the same way.
     #[tokio::test]
     async fn branch_summary_auxiliary_selector_falls_back_to_the_session_model() {
         static FAUX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -747,14 +803,12 @@ mod tests {
         }
     }
 
-    /// The window estimate mirrors `generate_branch_summary`'s slicing and
-    /// prompt exactly (TS #2411's `estimateBranchSummaryRequestTokens`).
+    /// The window estimate mirrors `generate_branch_summary`'s slicing
+    /// and prompt exactly.
     #[test]
     fn branch_window_estimate_shapes() {
-        // An entry too large for the window's slice budget: no wire request
-        // is issued, but the estimate still requires a window above the
-        // reserve (a window at or below it would slice with a non-positive
-        // budget that `prepare_branch_entries` treats as unlimited).
+        // An entry too large for the slice budget: no wire request, but
+        // the estimate still requires a window above the reserve.
         let big = vec![entry("e0", None, user(&"x".repeat(100_000)))];
         assert_eq!(
             estimate_branch_summary_request_tokens(
@@ -766,9 +820,8 @@ mod tests {
             ),
             DEFAULT_BRANCH_RESERVE_TOKENS + 1
         );
-        // A fitting branch estimates the request body (system prompt +
-        // serialized branch + completion budget) and the reserve draw; the
-        // larger of the two wins, so a bigger reserve grows the estimate.
+        // The larger of the request body and the reserve draw wins, so
+        // a bigger reserve grows the estimate.
         let entries = vec![entry("e0", None, user("explore the widget"))];
         let big_reserve = estimate_branch_summary_request_tokens(
             &entries,
@@ -785,8 +838,6 @@ mod tests {
             false,
         );
         assert!(big_reserve > small_reserve);
-        // A window that slices entries away shrinks the request the model
-        // must hold, so the estimate shrinks with it.
         let wide = vec![
             entry("e0", None, user(&"y".repeat(400_000))),
             entry("e1", Some("e0"), user(&"y".repeat(400_000))),

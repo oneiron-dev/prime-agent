@@ -8,11 +8,6 @@ use super::{
     BASH_ACTIVITY_DISPLAY_MIME, BASH_COMMAND_DISPLAY_MIME, DIFF_DISPLAY_MIME,
     MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS,
 };
-use std::fmt::Write as _;
-
-// ---------------------------------------------------------------------------
-// Event dispatch
-// ---------------------------------------------------------------------------
 
 impl Inner {
     pub(crate) fn handle_event(self: &Arc<Self>, event: Event) {
@@ -41,10 +36,8 @@ impl Inner {
                                 == Some(&(pid as i32))
                             {
                                 g.background_bash_handles.remove(activity_id);
-                                // The last live handle settled: the completion
-                                // notice for it is already admitted, so owed
-                                // continuations may resume. The settlement is
-                                // recorded on the map before the callback runs.
+                                // The last live handle settled: the completion notice for it is
+                                // already admitted, so owed continuations may resume.
                                 settled = g.background_bash_handles.is_empty();
                             }
                         }
@@ -170,30 +163,9 @@ impl Inner {
             return;
         };
         let mut buffers = lock(&execution.buffers);
-        let ExecBuffers {
-            stdout,
-            stdout_chars,
-            stdout_truncated,
-            stderr,
-            stderr_chars,
-            stderr_truncated,
-            ..
-        } = &mut *buffers;
         match stream {
-            StreamName::Stdout => append_truncated(
-                stdout,
-                stdout_truncated,
-                stdout_chars,
-                text,
-                execution.max_chars,
-            ),
-            StreamName::Stderr => append_truncated(
-                stderr,
-                stderr_truncated,
-                stderr_chars,
-                text,
-                execution.max_chars,
-            ),
+            StreamName::Stdout => buffers.stdout.push(text, execution.max_chars),
+            StreamName::Stderr => buffers.stderr.push(text, execution.max_chars),
         }
         drop(buffers);
         if let Some(on_stream) = &execution.opts.on_stream {
@@ -232,13 +204,14 @@ impl Inner {
             Some(Err(_)) => {
                 buffers.attachment_oversized = true;
                 if !buffers.stderr.is_empty() {
-                    buffers.stderr.push('\n');
+                    buffers.stderr.push("\n", execution.max_chars);
                 }
-                let _ = write!(
-                    buffers.stderr,
-                    "attachment dropped: exceeds {MAX_ATTACHMENT_DATA_CHARS} base64 chars"
+                buffers.stderr.push(
+                    &format!(
+                        "attachment dropped: exceeds {MAX_ATTACHMENT_DATA_CHARS} base64 chars"
+                    ),
+                    execution.max_chars,
                 );
-                buffers.stderr_chars = buffers.stderr.chars().count();
                 buffers.status = ExecuteStatus::Error;
             }
             Some(Ok(attachment)) => buffers.attachments.push(attachment),
@@ -380,10 +353,8 @@ mod tests {
         deliver_activity(&manager, activity);
         assert!(manager.has_background_work());
         assert_eq!(fired.load(Ordering::SeqCst), 0);
-        // Malformed or mismatched releases never settle the track (the
-        // TS validation rows): a zero/negative pid, a missing active flag,
-        // an unknown id, and an unrelated display payload all leave the
-        // handle live.
+        // Malformed or mismatched releases never settle the track: a zero/negative pid, a missing
+        // active flag, and an unknown id all leave the handle live.
         for release in [
             json!({ "id": "a".repeat(32), "pid": 0, "active": false }),
             json!({ "id": "a".repeat(32), "pid": -1, "active": false }),
@@ -451,9 +422,8 @@ mod tests {
             json!({ "id": "a".repeat(32), "pid": 42, "active": true }),
         );
         assert!(manager.has_background_work());
-        // The settlement is recorded on the map either way; the callback's
-        // panic lands in the diagnostics tail instead of unwinding through
-        // the event path or the teardown.
+        // The settlement is recorded on the map either way; the callback's panic lands in the
+        // diagnostics tail instead of unwinding.
         deliver_activity(
             &manager,
             json!({ "id": "a".repeat(32), "pid": 42, "active": false }),

@@ -1,32 +1,8 @@
 //! Daemon discovery: find every product daemon in this state root and probe
-//! it for identity and session count (TS `cli/daemon-ps.ts`).
-//!
-//! Discovery merges two sources by socket path: the OS census of listening
-//! unix sockets owned by a product process (the only reliable socket→pid
-//! mapping when daemons run on arbitrary `--daemon-socket` paths), and a sweep
-//! of the default socket dir, which also catches orphaned socket files left
-//! by daemons that are no longer running. Worker sockets (tracked by the
-//! supervisor's worker descriptors) add their supervisor's socket to the set
-//! so a supervisor whose own listener vanished is still reachable for
-//! `shutdown --force`.
-//!
-//! Scope: one *state root* — the agent dir plus the default socket dir. A
-//! daemon started under a different HOME or agent dir is another root's
-//! business; stopping it from here would kill unrelated live sessions.
-//! (TS also keeps a supervisor-ownership registry rule for custom socket
-//! paths outside both directories; that registry is not ported yet, so such
-//! paths are invisible to discovery from another invocation until the
-//! registry lane lands.)
-//!
-//! Containment (operator-mandated): every scan, probe,
-//! and stop is scoped to an explicit [`DaemonStateRoot`] handed in by the
-//! caller — the CLI passes the env-resolved current root, tests pass only
-//! fixture directories they created — and [`NEVER_TOUCH_SOCKET_DIRS`] is a
-//! hard exclusion list the scan, probe, and unlink paths check
-//! unconditionally, so a state root that resolves onto this box's ambient
-//! mission daemons (via a leaked HOME/TMPDIR) still cannot enumerate, probe,
-//! or stop them. A daemon outside the root an invocation was given is
-//! invisible to it, always.
+//! it for identity and session count — the OS census of listening sockets
+//! plus a sweep of the default socket dir (orphaned files included).
+//! Containment is operator-mandated: everything is scoped to one
+//! [`DaemonStateRoot`], and [`NEVER_TOUCH_SOCKET_DIRS`] is checked always.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -46,7 +22,6 @@ pub(crate) mod stop;
 pub(crate) use format::format_daemon_list_table;
 pub(crate) use stop::{run_ps, run_reap, run_shutdown_all};
 
-/// One discovered daemon process: an owning pid and the socket it listens on.
 #[derive(Debug, Clone)]
 pub(crate) struct DiscoveredDaemonProcess {
     pub pid: u32,
@@ -54,30 +29,28 @@ pub(crate) struct DiscoveredDaemonProcess {
     pub uptime_seconds: Option<u64>,
 }
 
-/// The state root an invocation reads: the agent dir and the default socket
-/// dir (TS `DaemonStateRoot`). Both follow HOME/TMPDIR/agent-dir overrides,
-/// so an isolated root resolves to isolated paths.
+/// The state root an invocation reads: the agent dir and the daemon socket
+/// it points at (flag > env > default). Deliberate TS divergence: TS pins
+/// the root to the shared default socket dir regardless of the pin, so an
+/// isolated daemon's `shutdown` also stops the shared daemon.
 #[derive(Debug, Clone)]
 pub(crate) struct DaemonStateRoot {
     pub agent_dir: PathBuf,
-    pub socket_dir: PathBuf,
+    /// The product-default socket dir, `Some` only when the resolved
+    /// socket is the product default. A root pinned elsewhere owns its
+    /// socket, never the pinned socket's directory.
+    pub socket_dir: Option<PathBuf>,
     pub default_socket_path: PathBuf,
 }
 
 /// Directories the discovery code must never touch, unconditionally
-/// (operator-mandated containment guard; see the module docs).
-/// These hold this box's live mission infrastructure;
-/// an ambient `HOME`/`TMPDIR` leaking into a test process makes
-/// `current_state_root()` resolve onto them, so root matching alone cannot
-/// be trusted. NOTE: `/tmp/prime-agent-1000` is also the product-default
-/// socket dir for uid 1000 — the exclusion is deliberate and mission-local.
-/// The `-0` entries are the uid-0
-/// twins: the product-default socket dir is `<tmpdir>/prime-agent-<uid>`,
-/// so on a root-user Linux box (uid 0 — the fleet's root-uid gate and
-/// mission topology) the ambient mission daemon lives under
-/// `/tmp/prime-agent-0` / `/tmp/mission-tmp/prime-agent-0`, and the guard
-/// must cover it exactly like the uid-1000 pair; without them the whole
-/// never-touch protection silently disappears at uid 0.
+/// (operator-mandated containment guard; see the module docs). These hold
+/// this box's live mission infrastructure; an ambient `HOME`/`TMPDIR`
+/// leaking into a test process makes `current_state_root()` resolve onto
+/// them, so root matching alone cannot be trusted. `/tmp/prime-agent-1000`
+/// is also the product-default socket dir for uid 1000 (deliberate,
+/// mission-local); the `-0` entries are the uid-0 twins — without them the
+/// protection silently disappears at uid 0.
 pub(crate) const NEVER_TOUCH_SOCKET_DIRS: &[&str] = &[
     "/tmp/prime-agent-1000",
     "/tmp/mission-tmp/prime-agent-1000",
@@ -86,14 +59,12 @@ pub(crate) const NEVER_TOUCH_SOCKET_DIRS: &[&str] = &[
     "/tmp/mission-tmp/prime-agent-0",
 ];
 
-/// True when `path` is or sits inside a never-touch directory.
 pub(crate) fn is_never_touch(path: &Path) -> bool {
     NEVER_TOUCH_SOCKET_DIRS
         .iter()
         .any(|dir| path.starts_with(Path::new(dir)))
 }
 
-/// Discovered-daemon classification (TS `DaemonStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum DaemonStatus {
@@ -103,7 +74,6 @@ pub(crate) enum DaemonStatus {
     OrphanFile,
 }
 
-/// How a discovered daemon's pid was established (TS `pidSource`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum PidSource {
@@ -111,8 +81,7 @@ pub(crate) enum PidSource {
     Hello,
 }
 
-/// One discovered daemon, probed (TS `DaemonInfo`; field order is the TS JSON
-/// shape, options omitted exactly like the TS spread/conditionals).
+/// One discovered daemon, probed; field order matches the TS JSON shape.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DaemonInfo {
@@ -141,19 +110,27 @@ pub(crate) struct DaemonInfo {
     pub has_tracked_workers: Option<bool>,
 }
 
-/// The current invocation's state root (TS `currentDaemonStateRoot`).
+/// The root this invocation reads, from the same socket resolution every
+/// other mode uses (flag > env > default). The root always owns the
+/// resolved socket and the agent dir; the product-default socket dir joins
+/// the root only when the resolved socket IS the product default (an
+/// explicit pin to the default included) — a pinned root owns its socket,
+/// never the pinned socket's directory (two isolated daemons in one shared
+/// directory would otherwise stop each other).
 pub(crate) fn current_state_root() -> DaemonStateRoot {
+    let default_socket_path = config::resolve_daemon_socket_path(None);
+    let socket_dir = (default_socket_path == pa_daemon::platform::default_daemon_socket_path())
+        .then_some(pa_daemon::platform::socket_dir());
     DaemonStateRoot {
         agent_dir: config::get_agent_dir(),
-        socket_dir: pa_daemon::platform::socket_dir(),
-        default_socket_path: pa_daemon::platform::default_daemon_socket_path(),
+        socket_dir,
+        default_socket_path,
     }
 }
 
-/// A socket belongs to the root when it is the default path, sits in the
-/// socket dir, or anywhere inside the agent dir (TS
-/// `createDaemonStateRootMatcher` minus the not-yet-ported ownership
-/// registry rule).
+/// A socket belongs to the root when it is the resolved default path, sits
+/// in the product-default socket dir (a pinned root has none), or anywhere
+/// inside the agent dir (TS ownership registry not ported).
 fn state_root_matches(root: &DaemonStateRoot, socket_path: &Path) -> bool {
     if is_never_touch(socket_path) {
         return false;
@@ -161,15 +138,17 @@ fn state_root_matches(root: &DaemonStateRoot, socket_path: &Path) -> bool {
     #[cfg(windows)]
     {
         // Windows daemons share one named pipe per machine, so there is
-        // nothing to scope beyond the containment guard (TS
-        // `createDaemonStateRootMatcher` returns an always-true predicate on
-        // win32).
+        // nothing to scope beyond the containment guard.
         let _ = (root, socket_path);
         true
     }
     #[cfg(not(windows))]
     {
-        if socket_path == root.default_socket_path || socket_path.parent() == Some(&root.socket_dir)
+        if socket_path == root.default_socket_path
+            || root
+                .socket_dir
+                .as_ref()
+                .is_some_and(|dir| socket_path.parent() == Some(dir))
         {
             return true;
         }
@@ -177,8 +156,6 @@ fn state_root_matches(root: &DaemonStateRoot, socket_path: &Path) -> bool {
     }
 }
 
-/// True when `directory` is `parent` or sits below it (TS `isInside`). Only
-/// the non-Windows root matcher scopes; the Windows arm accepts any path.
 #[cfg(not(windows))]
 fn inside(directory: Option<&Path>, parent: &Path) -> bool {
     let Some(directory) = directory else {
@@ -190,11 +167,9 @@ fn inside(directory: Option<&Path>, parent: &Path) -> bool {
     }
 }
 
-/// Worker sockets in the given socket dir: `worker-*.sock` (TS
-/// `isWorkerSocketPath`, and what earlier Rust builds minted) or the
-/// fork's short `w-<12 hex supervisor key>-*.sock` — the supervisor's own
-/// socket is never a worker socket. The socket dir comes from the state
-/// root, never the ambient environment.
+/// Worker sockets in the actual worker directory: upstream `worker-*.sock`
+/// or the fork's short `w-<12 hex supervisor key>-*.sock`, never the
+/// supervisor socket. The directory need not be owned by the discovery root.
 pub(crate) fn is_worker_socket_path(socket_path: &Path, socket_dir: &Path) -> bool {
     if socket_path.parent() != Some(socket_dir) {
         return false;
@@ -213,17 +188,24 @@ pub(crate) fn is_worker_socket_path(socket_path: &Path, socket_dir: &Path) -> bo
             .is_some_and(|ext| ext == "sock")
 }
 
-/// Listening daemons in this state root (TS `scanListeningDaemons`). The OS
-/// census is filtered to the root inside the scan, before any probe or
-/// uptime lookup touches a pid: a scan run from one root can never see —
-/// let alone stop — a daemon in another root.
+/// Listening daemons in this state root. The census is filtered to the root
+/// inside the scan: a scan from one root can never see another root's
+/// daemon. Worker sockets never appear: a worker belongs to its supervisor
+/// and stops through its tracked descriptors, so every consumer — discovery,
+/// the shutdown actions, and the `--force` residual sweep — acts on
+/// supervisors only. The worker directory is independent of the optional
+/// discovery directory: an agent-dir override can contain the shared worker
+/// directory even when the root is pinned elsewhere.
 pub(crate) fn scan_listening_daemons(root: &DaemonStateRoot) -> Vec<DiscoveredDaemonProcess> {
+    let worker_socket_dir = pa_daemon::platform::socket_dir();
     scan::scan_all_listening_daemons(config::APP_NAME, root)
+        .into_iter()
+        .filter(|daemon| !is_worker_socket_path(&daemon.socket_path, &worker_socket_dir))
+        .collect()
 }
 
-/// True when the pid still listens on exactly this socket (TS
-/// `isDaemonProcessListening`): a fresh scan against the same root, so a
-/// re-probe sees the same listener set the discovery did.
+/// True when the pid still listens on exactly this socket: a fresh scan against
+/// the same root, so a re-probe sees the discovery's listener set.
 pub(crate) fn is_daemon_process_listening(
     pid: u32,
     socket_path: &Path,
@@ -234,11 +216,15 @@ pub(crate) fn is_daemon_process_listening(
         .any(|daemon| daemon.pid == pid && daemon.socket_path == socket_path)
 }
 
-/// Socket files in the given socket dir (TS `scanSocketDir`): live daemons
-/// and orphaned files alike. Never-touch paths are filtered out here too,
-/// so even a root handed in on purpose cannot sweep them.
+/// Socket files in the root's socket dir: live daemons and orphaned files
+/// alike. A pinned root has no socket dir (`None`), so it sweeps nothing
+/// but its own socket file (added by the caller). Never-touch paths are
+/// filtered here too.
 #[cfg(unix)]
-fn scan_socket_dir(socket_dir: &Path) -> Vec<PathBuf> {
+fn scan_socket_dir(socket_dir: Option<&Path>) -> Vec<PathBuf> {
+    let Some(socket_dir) = socket_dir else {
+        return Vec::new();
+    };
     let Ok(entries) = std::fs::read_dir(socket_dir) else {
         return Vec::new();
     };
@@ -257,18 +243,16 @@ fn scan_socket_dir(socket_dir: &Path) -> Vec<PathBuf> {
 /// default pipe (see [`discover_daemons_with`]; TS `scanSocketDir` returns
 /// [] on win32).
 #[cfg(not(unix))]
-fn scan_socket_dir(_socket_dir: &Path) -> Vec<PathBuf> {
+fn scan_socket_dir(_socket_dir: Option<&Path>) -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// True when the path is a unix socket file.
 #[cfg(unix)]
 fn is_socket_file(path: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
 }
 
-/// One tracked worker from a supervisor descriptor (TS `TrackedWorker`).
 #[derive(Debug, Clone)]
 pub(crate) struct TrackedWorker {
     pub descriptor_path: PathBuf,
@@ -279,9 +263,8 @@ pub(crate) struct TrackedWorker {
     pub recovery_journal_path: PathBuf,
 }
 
-/// Every tracked worker recorded in this agent dir (TS `findAllTrackedWorkers`):
-/// `daemon-workers/*/<worker>.json` descriptors. The `supervisor-config` file
-/// carries no `.json` extension and is skipped by construction.
+/// Every tracked worker recorded in this agent dir: `daemon-workers/*/<worker>.json`
+/// descriptors (`supervisor-config` has no `.json` and is skipped).
 pub(crate) fn find_all_tracked_workers(agent_dir: &Path) -> Vec<TrackedWorker> {
     let root = agent_dir.join("daemon-workers");
     let Ok(entries) = std::fs::read_dir(&root) else {
@@ -307,7 +290,7 @@ pub(crate) fn find_all_tracked_workers(agent_dir: &Path) -> Vec<TrackedWorker> {
 }
 
 /// Parse one descriptor file; invalid or concurrently removed descriptors
-/// are not safe shutdown targets and are skipped (TS `isTrackedWorkerDescriptor`).
+/// are not safe shutdown targets and are skipped.
 fn read_tracked_worker(path: &Path) -> Option<TrackedWorker> {
     let content = std::fs::read_to_string(path).ok()?;
     let descriptor: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -332,7 +315,6 @@ fn read_tracked_worker(path: &Path) -> Option<TrackedWorker> {
     })
 }
 
-/// What a probe learned about one daemon (TS `ProbeResult`).
 #[derive(Debug, Default)]
 pub(crate) struct ProbeResult {
     version: Option<String>,
@@ -346,14 +328,12 @@ pub(crate) struct ProbeResult {
     reachable: bool,
 }
 
-/// Probe one socket: connect (300ms), read the hello (1500ms), and ask for
-/// the session count over `list` (30s when greeted, 1500ms otherwise). Old or
-/// foreign daemons connect without a recognizable greeting; the session
-/// count then also gets the short deadline (TS `probeDaemon`).
+/// Probe one socket: connect (300ms), read the hello (1500ms), and ask for the
+/// session count over `list` (30s when greeted, else 1500ms).
 pub(crate) fn probe_daemon(socket_path: &Path) -> ProbeResult {
     if is_never_touch(socket_path) {
-        // Containment: never even connect to a forbidden path, whatever the
-        // caller's root says.
+        // Containment: never even connect to a forbidden path, whatever
+        // the caller's root says.
         return ProbeResult::default();
     }
     let Ok(mut client) = DaemonClient::connect_probe(socket_path) else {
@@ -425,12 +405,11 @@ pub(crate) fn probe_daemon(socket_path: &Path) -> ProbeResult {
     probe
 }
 
-/// Probe deadlines (TS `probeDaemon`).
 const HELLO_TIMEOUT_MS: u64 = 1_500;
 const LIST_TIMEOUT_MS: u64 = 30_000;
 
-/// Reachable daemons are `current` only when the protocol, schema, and app
-/// version all match this build (TS `classifyReachable`).
+/// Reachable daemons are `current` only when the protocol, schema, and
+/// app version all match this build.
 fn classify_reachable(probe: &ProbeResult) -> DaemonStatus {
     if probe.protocol_version == Some(pa_types::daemon::DAEMON_PROTOCOL_VERSION)
         && probe.schema_id.as_deref() == Some(pa_types::daemon::DAEMON_SCHEMA_ID)
@@ -443,8 +422,7 @@ fn classify_reachable(probe: &ProbeResult) -> DaemonStatus {
 }
 
 /// The hello's supervisor pid, but only when it is alive and its process
-/// identity still matches the one the daemon reported (TS
-/// `verifyHelloSupervisorPid`; the start-id gate defeats pid reuse).
+/// identity still matches (the start-id gate defeats pid reuse).
 pub(crate) fn verify_hello_supervisor_pid(
     pid: Option<u32>,
     expected_process_start_id: Option<&str>,
@@ -466,10 +444,8 @@ pub(crate) fn verify_hello_supervisor_pid(
     Some(pid)
 }
 
-/// Discover every daemon in this state root and probe each (TS
-/// `discoverDaemons`). The root is explicit: the CLI passes the env-resolved
-/// current root, tests pass their own fixture dirs. A daemon outside the
-/// root is never discovered, probed, or stopped.
+/// Discover every daemon in this state root and probe each. The root is
+/// explicit (the CLI passes the env-resolved root; tests pass fixture dirs).
 pub(crate) fn discover_daemons(root: &DaemonStateRoot) -> Vec<DaemonInfo> {
     discover_daemons_with(root, cfg!(windows))
 }
@@ -482,28 +458,42 @@ pub(crate) fn discover_daemons(root: &DaemonStateRoot) -> Vec<DaemonInfo> {
 /// it, so an unanswered one with no listener or tracked worker is simply
 /// absent - there is no orphan file to report or remove.
 fn discover_daemons_with(root: &DaemonStateRoot, named_pipes: bool) -> Vec<DaemonInfo> {
-    let mut process_by_socket = std::collections::HashMap::new();
-    for daemon in scan_listening_daemons(root) {
-        if is_worker_socket_path(&daemon.socket_path, &root.socket_dir) {
-            continue;
-        }
-        process_by_socket.insert(daemon.socket_path.clone(), daemon);
-    }
+    // The census itself excludes worker sockets (see [`scan_listening_daemons`]).
+    let process_by_socket: std::collections::HashMap<PathBuf, DiscoveredDaemonProcess> =
+        scan_listening_daemons(root)
+            .into_iter()
+            .map(|daemon| (daemon.socket_path.clone(), daemon))
+            .collect();
     let tracked = find_all_tracked_workers(&root.agent_dir);
     let worker_sockets: BTreeSet<PathBuf> = tracked
         .iter()
         .map(|worker| worker.supervisor_socket_path.clone())
         .collect();
+    // The product-default socket dir's orphan sweep (worker socket files
+    // belong to their supervisors); a pinned root has no dir to sweep and
+    // considers only its own socket file, so a dead pinned daemon's stale
+    // file is still found and removable.
+    #[cfg(unix)]
+    let pinned_socket_file = is_socket_file(&root.default_socket_path);
+    #[cfg(not(unix))]
+    let pinned_socket_file = false;
+    let orphan_files: Vec<PathBuf> = root
+        .socket_dir
+        .as_deref()
+        .map(|dir| {
+            scan_socket_dir(Some(dir))
+                .into_iter()
+                .filter(|path| !is_worker_socket_path(path, dir))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut sockets: BTreeSet<PathBuf> = process_by_socket
         .keys()
         .cloned()
-        .chain(
-            scan_socket_dir(&root.socket_dir)
-                .into_iter()
-                .filter(|path| !is_worker_socket_path(path, &root.socket_dir)),
-        )
+        .chain(orphan_files)
         .chain(worker_sockets.iter().cloned())
         .chain(named_pipes.then(|| root.default_socket_path.clone()))
+        .chain(pinned_socket_file.then(|| root.default_socket_path.clone()))
         .collect();
     sockets.retain(|path| state_root_matches(root, path));
 
@@ -555,8 +545,7 @@ fn discover_daemons_with(root: &DaemonStateRoot, named_pipes: bool) -> Vec<Daemo
     infos
 }
 
-/// Default first, then by status severity, then by socket path (TS
-/// `sortDaemons`).
+/// Default first, then by status severity, then by socket path.
 pub(crate) fn sort_daemons(infos: &mut [DaemonInfo]) {
     infos.sort_by(|left, right| {
         right
@@ -567,29 +556,27 @@ pub(crate) fn sort_daemons(infos: &mut [DaemonInfo]) {
     });
 }
 
-/// The quiet-period decision for the shutdown residual sweep (TS
-/// `evaluateShutdownQuietPeriod`): a sweep completes once no listener has
-/// been seen for a full quiet period.
+/// The quiet-period decision for the shutdown residual sweep: a sweep
+/// completes once no listener has been seen for a full quiet period.
 pub(crate) fn evaluate_shutdown_quiet_period(now_ms: u128, quiet_since_ms: Option<u128>) -> bool {
     quiet_since_ms
         .is_some_and(|quiet_since| now_ms.saturating_sub(quiet_since) >= SHUTDOWN_QUIET_PERIOD_MS)
 }
 
-/// How long the residual sweep must see no listener before it succeeds (TS
-/// `SHUTDOWN_QUIET_PERIOD_MS`).
+/// How long the residual sweep must see no listener before it succeeds.
 const SHUTDOWN_QUIET_PERIOD_MS: u128 = 1_000;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A synthetic state root inside a fixture directory: unit tests never
-    /// touch the ambient environment's real agent dir or socket dir.
+    /// A synthetic state root inside a fixture directory: unit tests
+    /// never touch the ambient environment's real agent dir or socket dir.
     #[cfg(not(windows))]
     fn fixture_root(dir: &Path) -> DaemonStateRoot {
         DaemonStateRoot {
             agent_dir: dir.join("agent"),
-            socket_dir: dir.join("agent").join("sockets"),
+            socket_dir: Some(dir.join("agent").join("sockets")),
             default_socket_path: dir.join("agent").join("sockets").join("daemon.sock"),
         }
     }
@@ -623,17 +610,13 @@ mod tests {
         ));
     }
 
-    /// Unix scoping semantics; the Windows matcher is deliberately
-    /// always-true after the containment guard (one pipe per machine).
     #[cfg(not(windows))]
     #[test]
     fn state_root_matches_own_paths_only() {
         let root = fixture_root(Path::new("/fixture"));
+        let socket_dir = root.socket_dir.as_deref().expect("fixture socket dir");
         assert!(state_root_matches(&root, &root.default_socket_path));
-        assert!(state_root_matches(
-            &root,
-            &root.socket_dir.join("daemon.sock")
-        ));
+        assert!(state_root_matches(&root, &socket_dir.join("daemon.sock")));
         assert!(state_root_matches(
             &root,
             &root.agent_dir.join("nested/daemon.sock")
@@ -644,22 +627,38 @@ mod tests {
         ));
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn a_pinned_root_claims_only_its_pinned_socket() {
+        let mut root = fixture_root(Path::new("/fixture"));
+        root.default_socket_path = PathBuf::from("/pins/b.sock");
+        root.socket_dir = None;
+        assert!(state_root_matches(&root, &root.default_socket_path));
+        assert!(state_root_matches(
+            &root,
+            &root.agent_dir.join("nested/daemon.sock")
+        ));
+        assert!(!state_root_matches(&root, Path::new("/pins/c.sock")));
+        assert!(!state_root_matches(&root, Path::new("/pins/daemon.sock")));
+    }
+
     #[test]
     fn never_touch_paths_are_excluded_even_when_the_root_points_at_them() {
         for dir in NEVER_TOUCH_SOCKET_DIRS {
             let dir = Path::new(dir);
             let root = DaemonStateRoot {
                 agent_dir: dir.to_path_buf(),
-                socket_dir: dir.to_path_buf(),
+                socket_dir: Some(dir.to_path_buf()),
                 default_socket_path: dir.join("daemon.sock"),
             };
+            let socket_dir = root.socket_dir.clone().expect("never-touch socket dir");
             assert!(
                 !state_root_matches(&root, &root.default_socket_path),
                 "containment must beat root matching for {dir:?}"
             );
             assert!(!state_root_matches(
                 &root,
-                &root.socket_dir.join("worker-x.sock")
+                &socket_dir.join("worker-x.sock")
             ));
         }
         assert!(is_never_touch(Path::new("/tmp/mission-daemon")));
@@ -671,16 +670,13 @@ mod tests {
 
     #[test]
     fn a_scan_rooted_on_a_never_touch_dir_surfaces_no_listeners() {
-        // The ambient mission daemon's workers listen under these dirs and
-        // are owned by real `prime-agent` processes: root matching alone
-        // would find them, the containment guard must not. The loop covers
-        // every guarded dir — the uid-1000 mission paths on a devbox and
-        // their uid-0 twins on a root-user Linux box.
+        // The ambient mission daemon's workers listen under these dirs, owned
+        // by real `prime-agent` processes: root matching alone would find them.
         for dir in NEVER_TOUCH_SOCKET_DIRS {
             let dir = *dir;
             let root = DaemonStateRoot {
                 agent_dir: PathBuf::from(dir),
-                socket_dir: PathBuf::from(dir),
+                socket_dir: Some(PathBuf::from(dir)),
                 default_socket_path: PathBuf::from(dir).join("daemon.sock"),
             };
             assert!(
@@ -692,9 +688,8 @@ mod tests {
 
     #[test]
     fn a_probe_never_connects_to_a_never_touch_path() {
-        // When the guard works, this never opens a connection. A regression
-        // (guard removed) would probe the live mission daemon once and fail
-        // the assertion — never kill it.
+        // When the guard works, this never opens a connection; a regression
+        // would probe the live mission daemon once and fail the assert.
         let probe = probe_daemon(Path::new("/tmp/mission-daemon/daemon.sock"));
         assert!(!probe.reachable);
     }
@@ -704,18 +699,17 @@ mod tests {
     fn discovery_reports_orphan_files_inside_the_given_root_only() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = fixture_root(tmp.path());
-        std::fs::create_dir_all(&root.socket_dir).expect("socket dir");
-        // Bind and drop: the listener's socket file stays behind (std does
-        // not unlink it), an orphan file in the fixture root.
+        let socket_dir = root.socket_dir.clone().expect("fixture socket dir");
+        std::fs::create_dir_all(&socket_dir).expect("socket dir");
+        // Bind and drop: the listener's socket file stays behind (std
+        // does not unlink it), an orphan file in the fixture root.
         drop(
-            std::os::unix::net::UnixListener::bind(root.socket_dir.join("leftover.sock"))
-                .expect("bind"),
+            std::os::unix::net::UnixListener::bind(socket_dir.join("leftover.sock")).expect("bind"),
         );
         let infos = discover_daemons(&root);
         assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].socket_path, root.socket_dir.join("leftover.sock"));
+        assert_eq!(infos[0].socket_path, socket_dir.join("leftover.sock"));
         assert_eq!(infos[0].status, DaemonStatus::OrphanFile);
-        // Not the root's default path: leftover.sock, not daemon.sock.
         assert!(!infos[0].is_default);
     }
 
@@ -728,7 +722,8 @@ mod tests {
         // only the named-pipe arm's fixed endpoint does, like the Windows
         // daemon pipe.
         root.default_socket_path = root.agent_dir.join("daemon-pipe.sock");
-        std::fs::create_dir_all(&root.socket_dir).expect("socket dir");
+        let socket_dir = root.socket_dir.clone().expect("fixture socket dir");
+        std::fs::create_dir_all(&socket_dir).expect("socket dir");
 
         // No daemon on the pipe: nothing is reported, not a fake orphan.
         assert!(discover_daemons_with(&root, true).is_empty());
@@ -742,10 +737,12 @@ mod tests {
                 drop(stream);
             }
         });
-        assert!(
-            discover_daemons_with(&root, false).is_empty(),
-            "the unix arm only sees socket-dir files and listeners"
-        );
+        // The unix arm also considers the root's own socket file (a pinned
+        // socket's orphan file must stay discoverable); only a file that does
+        // not exist is left to the named-pipe arm above.
+        let infos = discover_daemons_with(&root, false);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].socket_path, root.default_socket_path);
         let infos = discover_daemons_with(&root, true);
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].socket_path, root.default_socket_path);

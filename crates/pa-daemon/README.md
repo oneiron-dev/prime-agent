@@ -30,21 +30,13 @@ command gating on peer links), kernel agent_message/agent_observe bridge (`agent
 `worker`-purpose single-use grants minted by `get_worker_peer_transport`
 for a source worker's kernel `agent_message.send`, direct
 `worker_deliver_message` on the target worker's socket with the supervisor
-routed `send_message` as the never-retried fallback), session archiving
-(`session_archive.rs`: the sessions directory must not grow forever — a
-supervisor boot sweep plus a periodic re-sweep at the TS idle-eviction
-cadence retire sessions by age (settings `sessionArchiveMaxAgeDays`,
-default 30) and count (settings `sessionArchiveMaxSessions`, default 200;
-each rule independently off-able) by MOVING them into
-`<agent-dir>/sessions-archive`; resident-worker sessions and sessions with
-active scheduled jobs are never archived; an archived session stays
-resumable — the catalog resolve falls back to the archive, restores the
-file into the sessions dir, and the wake spawns over the live path),
+routed `send_message` as the never-retried fallback),
 saved-session wake
 for non-resident `send_message` targets (`session_catalog.rs`: catalog
-resolve by session-id prefix or exact name, cwd-scoped first, archived
-fallback with restore; a resident
-worker hosting the file is reused, otherwise one spawns over it; RLM
+resolve by session-id prefix or exact name, cwd-scoped first; a live miss
+lazily restores a matching file from `sessions-archive/` without
+overwriting an existing live file; no new sessions are physically archived;
+a resident worker hosting the file is reused, otherwise one spawns over it; RLM
 children fall back to the spawn ledger's live child edges when the catalog
 misses - children persist outside the sessions dir, under the parent's
 session-artifacts tree - and wake over their own session file), wire protocol serve/negotiation (including the
@@ -84,10 +76,7 @@ merge non-resident ledger children (walk roots = saved + resident session
 files), so passivated children stay roster-visible (TS
 `walkPassiveRlmSubagents` / `withPassiveRlmDescendantInfos`). The saved
 session scan (`session_store.rs`) folds each file once into the durable
-catalog row, including the agents-view search corpus the TS scan builds:
-the capped `allMessagesText` transcript text (64 KiB). Archived sessions live in
-`<agent-dir>/sessions-archive` and never reach the catalog scan, so search
-covers live sessions only.
+catalog row.
 Supervisor-backed RLM child sessions
 (`rlm_children.rs`, the daemon side of the pa-core `RlmSubagentHost` seam):
 `rlm.spawn`/`rlm.create_session` create real daemon sessions through the
@@ -248,7 +237,12 @@ boot), re-arms scheduled work (a boot scan of `scheduled-jobs.json`;
 due active jobs of sessionless files are woken once, never archived), and
 reports the pass over `update_restore_status` while `hello.update_resume`
 carries the settle state; client attaches to a not-yet-restored roster row
-queue behind the pass instead of failing. The heartbeat-catalog change
+queue behind the pass instead of failing.
+For historical TypeScript update manifests, the restore pass recreates parents
+before their children, remaps active parent IDs, and restores pending context
+and action queues explicitly because those manifests predate Rust's journals.
+Attaches remain gated until that replay completes.
+The heartbeat-catalog change
 broadcast owns its surface here too (the worker's cron-store
 `on_heartbeat_change` listener emits a `heartbeats_changed` outbound frame
 — TS daemon-mode's `broadcastGlobal` — and the supervisor re-broadcasts it
@@ -264,3 +258,9 @@ Supervisor entrypoint, worker entrypoint, `mcp_login::{WorkerMcpLoginUi, wire_wo
 
 ## Depends on
 pa-types, pa-core (one-way).
+
+The composition root initializes the packaged product version with
+`protocol::configure_app_version` before entering daemon or worker mode.
+`protocol::app_version` supplies that identity to both hello frames and update
+checkpoints; library embedders fall back to the compiled version. Release
+manifest restamping therefore remains consistent with CLI `--version`.

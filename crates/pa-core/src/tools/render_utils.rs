@@ -1,32 +1,6 @@
-//! Result-rendering helpers shared by tool renderers.
-//!
-//! Port of `packages/coding-agent/src/core/tools/render-utils.ts`, including
-//! `sanitizeBinaryOutput` from `utils/shell.ts`, the `strip-ansi` package's
-//! pattern, and the `imageFallback` / `getImageDimensions` helpers from
-//! `packages/tui/src/terminal-image.ts`.
+//! Image dimension parsing from base64 headers.
 
 use base64::Engine;
-
-use pa_types::ai::{ImageContent, TextContent, UserContentBlock};
-
-use crate::tools::shell_utils::sanitize_binary_output;
-
-/// `[Image: ...]` fallback text for an image that cannot be displayed.
-pub fn image_fallback(
-    mime_type: &str,
-    dimensions: Option<ImageDimensions>,
-    filename: Option<&str>,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(filename) = filename {
-        parts.push(filename.to_string());
-    }
-    parts.push(format!("[{mime_type}]"));
-    if let Some(dims) = dimensions {
-        parts.push(format!("{}x{}", dims.width_px, dims.height_px));
-    }
-    format!("[Image: {}]", parts.join(" "))
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageDimensions {
@@ -34,35 +8,13 @@ pub struct ImageDimensions {
     pub height_px: u32,
 }
 
-/// Decode base64 image bytes and read their pixel dimensions.
-///
-/// Mirrors the TS `getImageDimensions(data, mimeType)`: returns `None`
-/// for unknown mime types or undecodable payloads.
-pub fn get_image_dimensions(data: &str, mime_type: &str) -> Option<ImageDimensions> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.trim())
-        .ok()?;
-    match mime_type {
-        "image/png" => png_dimensions(&bytes),
-        "image/gif" => gif_dimensions(&bytes),
-        "image/jpeg" => jpeg_dimensions(&bytes),
-        "image/webp" => webp_dimensions(&bytes),
-        _ => None,
-    }
-}
-
-/// The bounded-prefix decode budget for [`get_image_dimensions_prefix`]
-/// (the image-heavy session-open fix): every supported format's dimension
-/// header lives in the first bytes, and a payload whose header spills past
-/// the budget reports `None` (the caller renders the payload size instead).
+/// The bounded-prefix decode budget for [`get_image_dimensions_prefix`]:
+/// every supported format's dimension header lives in the first bytes.
 pub const IMAGE_DIMENSIONS_PREFIX_BYTES: usize = 1024;
 
-/// Read an image's pixel dimensions from a BOUNDED PREFIX of its base64
-/// payload: the image-heavy session-open fix's render-path guard — a
-/// tool result can carry megabytes of base64, and its metadata row must
-/// never decode the whole string. `None` for unsupported mime types,
-/// payloads whose quantum-aligned prefix does not decode, or headers that
-/// spill past [`IMAGE_DIMENSIONS_PREFIX_BYTES`].
+/// Read an image's pixel dimensions from a BOUNDED PREFIX of its base64 payload — a tool result can
+/// carry megabytes of base64, and its metadata row must never decode the whole string. `None` for
+/// unsupported mime types or an undecodable prefix.
 #[must_use]
 pub fn get_image_dimensions_prefix(
     data: &str,
@@ -70,10 +22,9 @@ pub fn get_image_dimensions_prefix(
     max_decoded_bytes: usize,
 ) -> Option<ImageDimensions> {
     let trimmed = data.trim();
-    // Keep the prefix at a multiple of 4 base64 characters so the slice
-    // decodes as a complete unpadded sequence; `get` returns `None` when
-    // the cut lands inside a multi-byte character (a non-ASCII payload is
-    // not decodable base64 anyway).
+    // Keep the prefix at a multiple of 4 base64 characters so the slice decodes
+    // as a complete unpadded sequence; `get` returns `None` when the cut lands
+    // inside a multi-byte character (a non-ASCII payload is not decodable anyway).
     let take = (max_decoded_bytes.div_ceil(3) * 4).min(trimmed.len());
     let prefix = trimmed.get(..take)?;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -194,167 +145,9 @@ fn webp_dimensions(b: &[u8]) -> Option<ImageDimensions> {
     }
 }
 
-/// Shorten an absolute path under the user's home directory to `~/...`.
-pub fn shorten_path(path: &str) -> String {
-    let home = pa_types::platform::home_dir()
-        .map(|home| home.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if !home.is_empty() && path.starts_with(&home) {
-        return format!("~{}", &path[home.len()..]);
-    }
-    path.to_string()
-}
-
-/// Replace tab characters with three spaces (TUI tool-call rendering).
-pub fn replace_tabs(text: &str) -> String {
-    text.replace('\t', "   ")
-}
-
-/// A tool-result content block (text or image).
-pub type ContentBlock = UserContentBlock;
-
-/// Build a text block.
-pub fn text_block(text: impl Into<String>) -> ContentBlock {
-    ContentBlock::Text(TextContent {
-        text: text.into(),
-        text_signature: None,
-        rest: serde_json::Map::default(),
-    })
-}
-
-/// Build an image block.
-pub fn image_block(data: impl Into<String>, mime_type: impl Into<String>) -> ContentBlock {
-    ContentBlock::Image(ImageContent {
-        data: data.into(),
-        mime_type: mime_type.into(),
-        rest: serde_json::Map::default(),
-    })
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TextOutputOptions {
-    /// Whether image fallbacks should parse image dimensions from base64 data.
-    pub include_image_dimensions: bool,
-}
-
-/// Join a tool result's content into the plain-text output shown for it.
-///
-/// Port of `getTextOutput`: text blocks are ANSI-stripped, sanitized, and
-/// joined with newlines; images that are not shown inline become
-/// `[Image: ...]` fallback lines.
-pub fn get_text_output(
-    content: &[ContentBlock],
-    show_images: bool,
-    options: TextOutputOptions,
-) -> String {
-    let text_blocks: Vec<&str> = content
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text(t) => Some(t.text.as_str()),
-            _ => None,
-        })
-        .collect();
-    let image_blocks: Vec<(&str, &str)> = content
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Image(img) => Some((img.data.as_str(), img.mime_type.as_str())),
-            _ => None,
-        })
-        .collect();
-
-    let mut output = text_blocks
-        .iter()
-        .map(|text| {
-            let stripped = strip_ansi(text);
-            let sanitized = sanitize_binary_output(&stripped);
-            sanitized.replace('\r', "")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if !image_blocks.is_empty() && !show_images {
-        let indicators = image_blocks
-            .iter()
-            .map(|(data, mime_type)| {
-                let dims = if options.include_image_dimensions {
-                    get_image_dimensions(data, mime_type)
-                } else {
-                    None
-                };
-                image_fallback(mime_type, dims, None)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        output = if output.is_empty() {
-            indicators
-        } else {
-            format!("{output}\n{indicators}")
-        };
-    }
-
-    output
-}
-
-/// Remove ANSI escape sequences, using the exact pattern of the `strip-ansi` npm package.
-pub fn strip_ansi(text: &str) -> String {
-    let re = fancy_regex::Regex::new(
-        r"[\x{001B}\x{009B}][\[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]*)*)?\x{0007})|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-ntqry=><~]))",
-    )
-    .expect("valid strip-ansi pattern");
-    re.replace_all(text, "").into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn strip_ansi_removes_csi_sequences() {
-        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
-        assert_eq!(strip_ansi("\x1b[1;32mbold green\x1b[39;49m"), "bold green");
-        assert_eq!(strip_ansi("plain"), "plain");
-    }
-
-    // The home read goes through the platform wall exactly like the
-    // product's shortening (USERPROFILE on win32), so the test runs
-    // everywhere the home resolves.
-    #[test]
-    fn shorten_path_replaces_home() {
-        let Some(home) = pa_types::platform::home_dir() else {
-            return;
-        };
-        let home = home.to_string_lossy();
-        assert_eq!(shorten_path(&format!("{home}/a/b")), "~/a/b");
-        assert_eq!(shorten_path("/etc/passwd"), "/etc/passwd");
-    }
-
-    #[test]
-    fn text_output_joins_and_strips() {
-        let blocks = vec![text_block("a\r\n"), text_block("\x1b[2mb\x1b[0m")];
-        assert_eq!(
-            get_text_output(&blocks, true, TextOutputOptions::default()),
-            "a\n\nb"
-        );
-    }
-
-    #[test]
-    fn image_fallback_text() {
-        assert_eq!(
-            image_fallback("image/png", None, None),
-            "[Image: [image/png]]"
-        );
-        assert_eq!(
-            image_fallback(
-                "image/png",
-                Some(ImageDimensions {
-                    width_px: 4,
-                    height_px: 2
-                }),
-                None
-            ),
-            "[Image: [image/png] 4x2]"
-        );
-    }
 
     #[test]
     fn png_dimensions_parsed() {
@@ -366,7 +159,8 @@ mod tests {
         b.extend_from_slice(&3u32.to_be_bytes());
         b.extend_from_slice(&[8, 6, 0, 0, 0]);
         let data = base64::engine::general_purpose::STANDARD.encode(&b);
-        let dims = get_image_dimensions(&data, "image/png").unwrap();
+        let dims = get_image_dimensions_prefix(&data, "image/png", IMAGE_DIMENSIONS_PREFIX_BYTES)
+            .expect("minimal png parses");
         assert_eq!((dims.width_px, dims.height_px), (2, 3));
     }
 }

@@ -553,6 +553,8 @@ impl HostedHeadlessSession {
         let command = DaemonCommand::GetMessages {
             id: None,
             active_session_id: self.active_session_id.clone(),
+            page: None,
+            capabilities: None,
             rest: Map::default(),
         };
         let data = success_data(self.link.request(command, REQUEST_BOUND).await?)?;

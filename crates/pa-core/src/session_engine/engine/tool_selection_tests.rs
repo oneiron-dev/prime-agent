@@ -145,15 +145,21 @@ async fn each_selection_reaches_the_provider_request() {
         ToolSelection::Allowlist(names.iter().map(|name| (*name).to_string()).collect())
     };
     let cases = vec![
-        (ToolSelection::Defaults, vec!["echo", "ipython"], true),
+        (
+            ToolSelection::Defaults,
+            vec!["echo", PYTHON_TOOL_NAME],
+            true,
+        ),
         (ToolSelection::NoTools, vec![], false),
         (ToolSelection::SuppliedOnly, vec!["echo"], false),
-        (allow(&["ipython"]), vec!["ipython"], true),
+        (allow(&["ipython"]), vec![PYTHON_TOOL_NAME], true),
+        (allow(&["python"]), vec![PYTHON_TOOL_NAME], true),
+        (allow(&[PYTHON_TOOL_NAME]), vec![PYTHON_TOOL_NAME], true),
         (allow(&[]), vec![], false),
         (allow(&["echo"]), vec!["echo"], false),
         (
             allow(&["nope", "ipython", "echo", "ipython", "read"]),
-            vec!["ipython", "echo"],
+            vec![PYTHON_TOOL_NAME, "echo"],
             true,
         ),
     ];
@@ -276,7 +282,7 @@ async fn no_tools_never_asks_for_a_kernel_even_with_prewarm_and_a_snapshot() {
 
 /// The append sources: the no-REPL prompt appends the resolved text (an
 /// explicit source, or the discovered `APPEND_SYSTEM.md` when none is
-/// given); the layered prompt keeps its shipped guideline bullet.
+/// given). Both prompt kinds append the resolved text verbatim.
 #[tokio::test]
 async fn append_text_follows_the_prompt_kind() {
     let fixture = fixture();
@@ -302,6 +308,6 @@ async fn append_text_follows_the_prompt_kind() {
         format!("{base}\n\nFrom the file.")
     );
     let layered = build(ToolSelection::Defaults, vec!["Be brief.".to_string()]).await;
-    assert!(layered.contains("# Additional Guidance\n\n- Be brief."));
+    assert!(layered.ends_with("\n\nBe brief."));
     assert!(!layered.contains("From the file."));
 }

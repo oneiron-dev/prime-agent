@@ -1,7 +1,5 @@
-//! The interactive client-settings seam implementation: every call opens
-//! the file-backed settings manager over the run's directories (the store
-//! is a pair of small JSON files, so the re-read is the same freshness
-//! the TS manager's `reload` produces) and applies the one setting.
+//! The interactive client-settings seam implementation: every call opens the
+//! file-backed settings manager over the run's directories.
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -9,8 +7,7 @@ use std::sync::Arc;
 
 use pa_tui::client_settings::ClientSettings;
 
-/// The seam handle the interactive run carries (TS injects the same
-/// settings manager into the interactive mode).
+/// The seam handle the interactive run carries.
 #[derive(Clone)]
 pub struct CliClientSettings {
     cwd: PathBuf,
@@ -52,6 +49,50 @@ macro_rules! str_setting {
 }
 
 impl ClientSettings for CliClientSettings {
+    fn harness_refinements(&self) -> bool {
+        self.manager().get_harness_refinements()
+    }
+
+    fn set_harness_refinements(&self, enabled: bool) -> Result<()> {
+        let mut manager = self.manager();
+        manager.set_harness_refinements(enabled)?;
+        // Adoption bookkeeping stays off the UI input/paint path.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let agent_dir = self.agent_dir.clone();
+            runtime.spawn_blocking(move || {
+                let client = pa_core::session_engine::telemetry::build_client(&manager, &agent_dir);
+                let mut properties = pa_telemetry::Properties::new();
+                properties.set("enabled", serde_json::json!(enabled));
+                client.track("harness refinements changed", properties);
+            });
+        }
+        Ok(())
+    }
+
+    fn compaction_threshold_percent(&self) -> f64 {
+        self.manager().get_compaction_threshold_percent()
+    }
+
+    fn set_compaction_threshold_percent(&self, percent: f64) -> Result<()> {
+        self.manager().set_compaction_threshold_percent(percent)?;
+        let settings = self.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let manager = settings.manager();
+                if crate::mode::telemetry_disabled(&manager) {
+                    return;
+                }
+                let client =
+                    pa_core::session_engine::telemetry::build_client(&manager, &settings.agent_dir);
+                let mut properties = pa_telemetry::base_properties("interactive");
+                properties.set("threshold_percent", serde_json::json!(percent));
+                client.track("autocompact threshold changed", properties);
+                let _ = client.shutdown().await;
+            });
+        }
+        Ok(())
+    }
+
     fn theme(&self) -> Option<String> {
         self.manager().get_theme().map(str::to_string)
     }
@@ -61,8 +102,8 @@ impl ClientSettings for CliClientSettings {
     }
 
     fn default_service_tier(&self) -> String {
-        // The wire name of the persisted default tier (TS
-        // `getDefaultServiceTier()`), "default" when unset or unreadable.
+        // The wire name of the persisted default tier; "default" when
+        // unset or unreadable.
         serde_json::to_value(self.manager().get_default_service_tier())
             .ok()
             .and_then(|value| value.as_str().map(str::to_string))
@@ -197,7 +238,7 @@ impl ClientSettings for CliClientSettings {
     );
 
     /// `updateChannel`: the settings enum's wire value; unset reads as
-    /// `None` (TS's global-only `getUpdateChannel`).
+    /// `None`.
     fn update_channel(&self) -> Option<String> {
         let channel = self.manager().get_update_channel()?;
         Some(
@@ -267,9 +308,7 @@ impl ClientSettings for CliClientSettings {
 mod tests {
     use super::*;
 
-    /// The seam over the real settings store: every write persists through
-    /// the pa-core manager and the next read (a fresh manager over the same
-    /// dirs, exactly what every call does) sees it.
+    /// The seam over the real pa-core settings store.
     #[test]
     fn seam_round_trips_through_the_settings_store() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -277,7 +316,6 @@ mod tests {
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
         let settings = CliClientSettings::new(dir.path().to_path_buf(), agent_dir.clone());
 
-        // The TS defaults read first.
         assert!(settings.show_images());
         assert!(!settings.quiet_startup());
         assert_eq!(settings.idle_eviction_minutes(), "90");
@@ -285,7 +323,6 @@ mod tests {
         assert_eq!(settings.tree_filter_mode(), "user-only");
         assert!(settings.warnings_anthropic_extra_usage());
 
-        // Writes persist (the settings file lands in the agent dir).
         settings.set_theme("dark").expect("theme");
         settings.set_idle_eviction_minutes("off").expect("idle");
         settings.set_tree_filter_mode("all").expect("tree filter");
@@ -296,7 +333,6 @@ mod tests {
         assert_eq!(settings.tree_filter_mode(), "all");
         assert!(!settings.show_images());
 
-        // The persisted file the real consumers read.
         let content =
             std::fs::read_to_string(agent_dir.join("settings.json")).expect("settings file");
         let value: serde_json::Value = serde_json::from_str(&content).expect("parse");

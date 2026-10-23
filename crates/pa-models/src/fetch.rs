@@ -1,17 +1,6 @@
 //! The unauthenticated catalog fetch layer.
-//!
-//! Ported from `readJsonResponse` + `CatalogCache.refresh` request handling in
-//! `model-catalog-cache.ts`:
-//! - unauthenticated GET, headers `accept: application/json`,
-//!   `cache-control: no-cache`, `If-None-Match: <etag>` when cached;
-//! - 5 s hard timeout;
-//! - 8 MiB response cap enforced through content-length AND a streaming
-//!   byte count;
-//! - redirects refused: a moved catalog must be a client change
-//!   (`redirect: "error"` in the TS reference);
-//! - `304 Not Modified` keeps the snapshot (caller reuses the cached
-//!   payload and updates `fetchedAt`).
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -24,13 +13,11 @@ pub const MODEL_CATALOG_URL: &str =
 pub const MCP_SERVICE_CATALOG_URL: &str =
     "https://raw.githubusercontent.com/PrimeIntellect-ai/prime-agent-catalog/main/plugins/catalog.v2.json";
 
-/// Hard per-request timeout for catalog fetches.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Hard response size cap for catalog fetches (8 MiB).
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Failure of a catalog HTTP request (`CatalogRequestError` in the TS).
+/// Failure of a catalog HTTP request.
 #[derive(Debug, Error)]
 pub enum FetchError {
     /// Non-success status (the response was not read).
@@ -63,10 +50,12 @@ pub enum FetchOutcome {
 }
 
 /// The shared catalog HTTP client. One instance serves both catalog URLs;
-/// each request is bounded by the timeout and the byte cap.
+/// each request is bounded by the timeout and the byte cap. The `reqwest`
+/// client is built on the first request, so a process that never fetches
+/// never loads the native trust store.
 #[derive(Debug)]
 pub struct CatalogFetcher {
-    client: reqwest::Client,
+    client: OnceLock<reqwest::Client>,
     timeout: Duration,
     max_bytes: usize,
 }
@@ -78,39 +67,42 @@ impl Default for CatalogFetcher {
 }
 
 impl CatalogFetcher {
-    /// The production client: 5 s timeout, no redirects, 8 MiB cap.
     #[must_use]
     pub fn new() -> Self {
         Self::with_limits(FETCH_TIMEOUT, MAX_RESPONSE_BYTES)
     }
 
-    /// A client with explicit bounds (tests; the Prime Inference 2 MiB cap).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the reqwest client fails to build.
+    /// A fetcher with explicit bounds (tests; the Prime Inference 2 MiB cap).
     #[must_use]
     pub fn with_limits(timeout: Duration, max_bytes: usize) -> Self {
-        let client = reqwest::Client::builder()
-            // A moved catalog must be a client change, never a silent hop.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("catalog reqwest client");
         Self {
-            client,
+            client: OnceLock::new(),
             timeout,
             max_bytes,
         }
     }
 
+    fn client(&self) -> &reqwest::Client {
+        self.client.get_or_init(|| {
+            pa_ai::utils::tls::http_client_builder()
+                // A moved catalog must be a client change, never a silent hop.
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("catalog reqwest client")
+        })
+    }
+
     /// GET `url` with catalog headers and the optional cached `ETag`.
+    ///
+    /// # Panics
+    ///
+    /// Panics on the first request if the reqwest client fails to build.
     ///
     /// # Errors
     ///
-    /// Returns `FetchError::Transport` on request failure, refused
-    /// redirects (any 3xx besides 304), or a body over the byte cap;
-    /// `FetchError::Status` on any other non-2xx status (304 returns
-    /// `Ok(FetchOutcome::NotModified)`).
+    /// Returns `FetchError::Transport` on request failure, refused redirects
+    /// (any 3xx besides 304), or a body over the byte cap; `FetchError::Status`
+    /// on any other non-2xx status (304 returns `Ok(FetchOutcome::NotModified)`).
     pub async fn fetch(&self, url: &str, etag: Option<&str>) -> Result<FetchOutcome, FetchError> {
         self.fetch_with(url, etag, &[]).await
     }
@@ -118,12 +110,15 @@ impl CatalogFetcher {
     /// [`CatalogFetcher::fetch`] plus extra request headers (credentials for
     /// the credentialed Prime Inference fetch).
     ///
+    /// # Panics
+    ///
+    /// Panics on the first request if the reqwest client fails to build.
+    ///
     /// # Errors
     ///
-    /// Returns `FetchError::Transport` on request failure, refused
-    /// redirects (any 3xx besides 304), or a body over the byte cap;
-    /// `FetchError::Status` on any other non-2xx status (304 returns
-    /// `Ok(FetchOutcome::NotModified)`).
+    /// Returns `FetchError::Transport` on request failure, refused redirects
+    /// (any 3xx besides 304), or a body over the byte cap; `FetchError::Status`
+    /// on any other non-2xx status (304 returns `Ok(FetchOutcome::NotModified)`).
     pub async fn fetch_with(
         &self,
         url: &str,
@@ -131,7 +126,7 @@ impl CatalogFetcher {
         extra_headers: &[(String, String)],
     ) -> Result<FetchOutcome, FetchError> {
         let mut request = self
-            .client
+            .client()
             .get(url)
             .timeout(self.timeout)
             .header("accept", "application/json")

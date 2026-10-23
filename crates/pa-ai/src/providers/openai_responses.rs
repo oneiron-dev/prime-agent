@@ -64,11 +64,9 @@ pub struct ResolvedResponsesCompat {
 }
 
 pub fn get_responses_compat(model: &Model) -> ResolvedResponsesCompat {
-    // TS reads the responses compat directly: the wire object cannot tag
-    // its shape, and a shared-key-only object (the xAI subscription's
-    // `supportsLongCacheRetention: false`) still decodes — every field is
-    // optional and unknown keys are ignored, so the responses view of any
-    // compat object is lossless for this API.
+    // TS reads the responses compat directly: the wire object cannot tag its shape, and a
+    // shared-key-only object still decodes — every field is optional and unknown keys are ignored,
+    // so the responses view of any compat object is lossless for this API.
     let compat = model.compat.as_ref().and_then(|compat| {
         serde_json::from_value::<pa_types::ai::OpenAiResponsesCompat>(compat.raw.clone().into())
             .ok()
@@ -100,7 +98,7 @@ fn get_prompt_cache_retention(
     }
 }
 
-/// Provider-native options (`OpenAIResponsesOptions` in the TS reference).
+/// Provider-native options.
 #[derive(Clone, Default)]
 pub struct OpenAIResponsesOptions {
     pub base: StreamOptions,
@@ -120,7 +118,6 @@ impl OpenAIResponsesOptions {
     }
 }
 
-/// Port of `streamOpenAIResponses`.
 pub fn stream_openai_responses(
     model: &Model,
     context: &Context,
@@ -529,9 +526,6 @@ async fn run_stream(
         on_response(
             crate::types::ProviderResponse {
                 status: response.status,
-                // Collected into the ordered map: the hook payload can
-                // serialize, and the HTTP header arrival order is not a
-                // stable serialization order.
                 headers: response.headers.clone().into_iter().collect(),
             },
             model,
@@ -568,9 +562,8 @@ async fn run_stream(
             crate::providers::openai_responses_shared::ResponsesStreamProcessor::new(
                 model, output, writer, hooks,
             );
-        // The TS try/catch encloses the streaming section and the abort and
-        // stop-reason checks; the catch settles partial tool calls before the
-        // error event carries the message (TS PR #2783).
+        // The TS try/catch encloses the streaming section and the abort and stop-reason checks; the
+        // catch settles partial tool calls before the error event carries the message.
         stream_result = async {
             let mut decoder = SseDecoder::new();
             loop {
@@ -630,7 +623,6 @@ async fn run_stream(
     Ok(())
 }
 
-/// Port of `streamSimpleOpenAIResponses`.
 pub fn stream_simple_openai_responses(
     model: &Model,
     context: &Context,
@@ -710,8 +702,8 @@ impl Provider for OpenAIResponsesProvider {
 mod tests {
     use super::*;
 
-    /// A responses-served model with a wire `compat` object (the whole
-    /// model need not be responses-shaped for the compat resolution).
+    /// A responses-served model with a wire `compat` object (the whole model need not be
+    /// responses-shaped for the compat resolution).
     // Test-only helper; adapting its signature and call sites would churn test fixtures.
     #[allow(clippy::needless_pass_by_value)]
     fn compat_model(raw: serde_json::Value) -> Model {
@@ -774,10 +766,9 @@ mod tests {
 
     #[test]
     fn the_shared_key_only_compat_decodes_for_responses_models() {
-        // TS `getXaiSubscriptionModel`'s compat carries only
-        // `supportsLongCacheRetention: false`; the responses provider
-        // reads the responses view directly (the wire object cannot tag
-        // its shape).
+        // TS `getXaiSubscriptionModel`'s compat carries only `supportsLongCacheRetention: false`;
+        // the responses provider reads the responses view directly (the wire object cannot tag its
+        // shape).
         let model = compat_model(serde_json::json!({ "supportsLongCacheRetention": false }));
         let compat = get_responses_compat(&model);
         assert!(!compat.supports_long_cache_retention);
@@ -808,11 +799,10 @@ mod tests {
         assert!(compat.supports_long_cache_retention);
     }
 
-    /// A `reasoning: false` model whose map addresses levels (the live
-    /// catalog's `gpt-5.3-chat-latest` shape, served over the Responses
-    /// API) is thinking-capable: the requested effort reaches the request
-    /// with the map's value. The flag alone must not veto a route that
-    /// declares addressable levels.
+    /// A `reasoning: false` model whose map addresses levels (the live catalog's
+    /// `gpt-5.3-chat-latest` shape, served over the Responses API) is thinking-capable: the
+    /// requested effort reaches the request with the map's value. The flag alone must not veto a
+    /// route that declares addressable levels.
     #[test]
     fn a_map_addressable_model_sends_the_reasoning_effort_without_the_flag() {
         let model = serde_json::from_value::<Model>(json!({

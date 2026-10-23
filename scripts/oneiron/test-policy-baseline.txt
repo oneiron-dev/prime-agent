@@ -1,5 +1,14 @@
-# check-test-policy.mjs violations at the pinned Rust base (TEST_POLICY_BASE=oneiron/main).
+# Reviewed upstream test-policy baseline at origin/main 71beca9478f552dc6fc898bba9685f9ce00515cf.
+# TEST_POLICY_BASE=oneiron/main; added sync entries are byte-identical upstream tests.
+prime-agent-runtime/test/test_bash.py [conditional-or-disabled-test] test_degrade_hints_are_budgeted_to_the_first_three: @unittest.skipUnless
 prime-agent-runtime/test/test_bash.py [wall-clock-sleep] test_activity_handles_are_scoped_and_tail_is_bounded: sleep/delay call
+prime-agent-runtime/test/test_bash.py [wall-clock-sleep] test_cancelling_a_later_await_of_a_degraded_handle_only_waits: sleep/delay call
+prime-agent-runtime/test/test_bash.py [wall-clock-sleep] test_degrade_hints_are_budgeted_to_the_first_three: sleep/delay call
+prime-agent-runtime/test/test_bash.py [wall-clock-sleep] test_degrade_hints_are_budgeted_to_the_first_three: sleep/delay call
+prime-agent-runtime/test/test_bash.py [wall-clock-sleep] test_degrade_hints_are_budgeted_to_the_first_three: sleep/delay call
 prime-agent-runtime/test/test_mcp.py [wall-clock-sleep] test_status_isolates_failures_and_timeouts: sleep/delay call
 prime-agent-runtime/test/test_repl.py [wall-clock-sleep] test_bash_activity_is_available_while_cell_is_running: sleep/delay call
+prime-agent-runtime/test/test_repl.py [wall-clock-sleep] test_interrupted_await_inside_bounded_window_still_kills: sleep/delay call
+prime-agent-runtime/test/test_repl.py [wall-clock-sleep] test_interrupted_await_inside_bounded_window_still_kills: sleep/delay call
+prime-agent-runtime/test/test_repl.py [wall-clock-sleep] test_interrupted_await_inside_bounded_window_still_kills: sleep/delay call
 prime-agent-runtime/test/test_repl.py [wall-clock-sleep] test_owner_death_kills_orphan_kernel: sleep/delay call

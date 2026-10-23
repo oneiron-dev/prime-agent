@@ -101,6 +101,7 @@ async fn tool_first_text_later_retry_supersedes_only_the_failed_generation() {
             factory: mpsc::unbounded_channel().0,
             commands: mpsc::unbounded_channel().0,
         },
+        mpsc::unbounded_channel().0,
     )
     .await
     .unwrap();

@@ -1,16 +1,7 @@
 //! The per-session kernel provisioner: owns one kernel manager, guards its
 //! startup, revives the saved namespace before the runtime bootstrap, and
-//! disposes/kills on demand.
-//!
-//! Teardown contract: the provisioner is the manager's strong owner, and the
-//! manager's reader/watcher tasks hold only weak references — so dropping the
-//! last provisioner handle tears the kernel PROCESS down synchronously
-//! (`Inner::drop` sends the kill). An explicit `dispose()` is still the
-//! product path (it flushes a final namespace snapshot first), but no kernel
-//! can outlive the object graph that created it.
-//!
-//! Ported from `core/tools/ipython.ts` (`IpythonKernelProvisioner`) and
-//! `core/kernel/boot-gate.ts`.
+//! disposes/kills on demand. Reader tasks hold only weak references, so no
+//! kernel outlives its provisioner; `dispose()` flushes the snapshot first.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,7 +18,7 @@ use crate::kernel::manager::{KernelStartOptions, ReplKernelManager};
 use crate::kernel::shared::ExecuteStatus;
 use crate::kernel::shared::{
     ExecuteOptions, HostRequestHandlers, KernelManagerOptions, KernelShutdownOptions,
-    KernelSnapshotConfig, BOOTSTRAP_EXECUTION_TIMEOUT_MS,
+    KernelSnapshotConfig, BASH_COMPLETED_REQUEST_TYPE, BOOTSTRAP_EXECUTION_TIMEOUT_MS,
 };
 use crate::kernel::state_snapshot::RestoreResult;
 use crate::kernel::state_snapshot::{manifest_path_in, snapshot_path_in};
@@ -78,8 +69,6 @@ where
     boot().await
 }
 
-/// Options for the provisioner's kernel, mirroring the TS `IpythonToolOptions`
-/// subset the provisioner consumes.
 /// Publishes the restore outcome once the kernel is usable.
 pub type RestoreCallback = Arc<dyn Fn(&RestoreResult) + Send + Sync>;
 
@@ -115,6 +104,11 @@ pub type KernelBootstrapResultHandler = Arc<dyn Fn(KernelBootstrapStats) + Send 
 pub struct IpythonKernelProvisionerOptions {
     /// Python override. Must have prime-agent-runtime installed.
     pub python: Option<PathBuf>,
+    /// Per-cell watchdog budget for user `python_repl` cells, in milliseconds
+    /// (`None`: the watchdog never arms). The daemon engine resolves it from
+    /// settings and disarms it for daemonless sessions; the runtime bootstrap
+    /// and internal state ops never arm it.
+    pub cell_timeout_ms: Option<u64>,
     pub env: HashMap<String, String>,
     /// Command prefix prepended to every kernel `bash()` invocation.
     pub command_prefix: Option<String>,
@@ -132,13 +126,10 @@ pub struct IpythonKernelProvisionerOptions {
     /// Publishes the restore outcome once the kernel is usable.
     pub on_restore: Option<RestoreCallback>,
     /// Fires when the kernel's last live background `bash()` handle
-    /// settles, so owed continuations can resume (TS
-    /// `IpythonToolOptions.onBackgroundWorkSettled`).
+    /// settles, so owed continuations can resume.
     pub on_background_work_settled: Option<crate::kernel::shared::BackgroundWorkSettledCallback>,
-    /// Fires once per kernel start when installed Python skills failed to
-    /// import into the kernel (skill import name -> import error), so the
-    /// session can tell the model before it wastes turns calling them
-    /// (TS `IpythonToolOptions.onUnavailableSkills`).
+    /// Fires once per kernel start when installed Python skills failed to import into the kernel,
+    /// so the session can tell the model before it wastes turns calling them.
     pub on_unavailable_skills: Option<UnavailableSkillsCallback>,
     /// Publishes the per-boot result for the `kernel_bootstrap_*` counters.
     /// Telemetry only; kernel behavior never depends on it.
@@ -255,9 +246,8 @@ struct ProvisionerState {
     doomed_startups: Vec<tokio::sync::watch::Receiver<Option<StartupResult>>>,
 }
 
-/// Owns one kernel for one session: lazily starts it, memoizes the startup so
-/// concurrent callers join the same boot, revives the saved namespace before
-/// the runtime bootstrap, and disposes/kill()s on demand.
+/// Owns one kernel for one session: starts it, memoizes the startup so concurrent callers join the
+/// same boot.
 ///
 /// Cloning shares the same kernel and startup state.
 #[derive(Clone)]
@@ -309,6 +299,20 @@ impl IpythonKernelProvisioner {
         self.lock_state().manager.clone()
     }
 
+    /// The per-cell watchdog budget the kernel executor arms for user cells
+    /// (`None`: the watchdog never arms).
+    #[must_use]
+    pub fn cell_timeout_ms(&self) -> Option<u64> {
+        self.inner.options.cell_timeout_ms
+    }
+
+    /// The Python skills pre-imported at kernel bootstrap.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn python_skills(&self) -> &[KernelPythonSkill] {
+        &self.inner.options.python_skills
+    }
+
     /// Result of reviving a prior session's namespace on the last kernel start.
     #[must_use]
     pub fn last_restore(&self) -> Option<RestoreResult> {
@@ -338,9 +342,7 @@ impl IpythonKernelProvisioner {
         });
     }
 
-    /// The kernel manager, starting it first when necessary. Concurrent
-    /// callers join one startup; the current startup stage is replayed to
-    /// listeners that attach mid-flight.
+    /// The kernel manager, starting it first when necessary. Concurrent callers join one startup.
     ///
     /// # Errors
     ///
@@ -946,9 +948,8 @@ fn emit_startup_progress(
     }
 }
 
-/// Extra startup attempts beyond the first (one transient-failure retry by
-/// default). The promise here is resilience against a wedged boot — a venv
-/// python still settling, a slow fork under load — not masking a broken setup.
+/// Extra startup attempts beyond the first. The promise here is resilience against a wedged boot,
+/// not masking a broken setup.
 const DEFAULT_STARTUP_RETRIES: u32 = 1;
 const DEFAULT_STARTUP_BUDGET_MS: u64 = 90_000;
 const RETRY_BACKOFF_MS: [u64; 4] = [250, 1_000, 2_500, 5_000];
@@ -976,10 +977,7 @@ fn resolve_startup_budget_ms() -> u64 {
 }
 
 /// A failed boot the provisioner may retry on its own: transient spawn or
-/// ready-handshake problems. Structural failures (disposed, aborts, a
-/// misconfigured interpreter, a protocol mismatch, a failed runtime
-/// bootstrap) never auto-retry — each needs either user action or a fresh
-/// attempt initiated by the caller.
+/// ready-handshake problems. Structural failures never auto-retry.
 fn startup_failure_is_retryable(error: &anyhow::Error) -> bool {
     const FATAL_MARKERS: [&str; 9] = [
         "provisioner disposed",
@@ -1061,10 +1059,8 @@ async fn run_startup(
     }
 }
 
-/// Boot one kernel, restore the prior namespace, then run the runtime
-/// bootstrap. Reports the result through `on_bootstrap_result` once per
-/// actual boot (`kernel bootstrap` telemetry): timing starts at the first
-/// spawn, `cold` means no prior namespace snapshot existed to restore.
+/// Boot one kernel, restore the prior namespace, then run the runtime bootstrap. Reports the result
+/// through `on_bootstrap_result` once per actual boot.
 async fn start_kernel(
     inner: &Arc<ProvisionerInner>,
     on_progress: Option<&KernelBootstrapProgressHandler>,
@@ -1134,7 +1130,15 @@ async fn start_kernel_impl(
         gate().await;
     }
     let snapshot_dir = options.snapshot_dir.clone();
-    let bootstrap_code = build_rlm_bootstrap_code(&options.python_skills);
+    // The bounded-await default keys on the bash.completed host handler:
+    // one source of truth (the registry the daemon registers the notice in).
+    let bootstrap_code = build_rlm_bootstrap_code(
+        &options.python_skills,
+        options
+            .host_handlers
+            .get(BASH_COMPLETED_REQUEST_TYPE)
+            .is_some(),
+    );
     let mut env = options.env.clone();
     if let Some(shell_path) = &options.shell_path {
         env.insert(
@@ -1214,9 +1218,7 @@ async fn start_kernel_impl(
             })
             .await;
         // The drained stderr tail is the only extra evidence a failed boot
-        // leaves behind; attach it to the cause so `ensure()` callers see it.
-        // Cap the tail: the in-memory buffer holds up to 8 KiB, but the
-        // surfaced error must stay readable.
+        // leaves; attach it to the cause.
         let stderr_tail = {
             let tail = manager.kernel_stderr();
             let chars: Vec<char> = tail.chars().collect();
@@ -1282,9 +1284,7 @@ async fn start_kernel_impl(
         Ok(bootstrap) if bootstrap.status == ExecuteStatus::Ok => {
             if snapshot_existed {
                 // The just-restored namespace is fresh: the debounced
-                // auto-snapshot the bootstrap scheduled would rewrite identical
-                // content — or, after a failed restore, clobber the healthy
-                // on-disk payload with a skills-only namespace.
+                // auto-snapshot would rewrite identical content.
                 manager.mark_restored_namespace_fresh();
             }
             // Broken skill imports stay importable-looking placeholders;
@@ -1315,9 +1315,8 @@ async fn start_kernel_impl(
             }
         }
         Ok(bootstrap) => {
-            // The kernel booted but its runtime did not initialize: the venv
-            // is the prime suspect, so drop the memoized runtime-ready result
-            // and let the next start re-probe (and rebuild when broken).
+            // The kernel booted but its runtime did not initialize: the venv is the prime suspect,
+            // so drop the memoized runtime-ready result.
             crate::kernel::bootstrap::invalidate_runtime_probe_cache();
             let details = [bootstrap.stderr.clone()]
                 .into_iter()
@@ -1403,6 +1402,200 @@ pub fn provisioner_for_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shell file the resolver accepts: existing, and executable on unix.
+    fn executable_shell(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// The scripted session both shell-setting tests build: a model and
+    /// `stream_fn` the settings validation never reaches, no kernel prewarm.
+    async fn shell_test_session(
+        cwd: PathBuf,
+        agent_dir: PathBuf,
+    ) -> anyhow::Result<crate::session_engine::engine::SessionEngine> {
+        use crate::session_engine::engine::{create_session, SessionEngineConfig};
+
+        let model = pa_agent::types::Model {
+            id: "shell-test".into(),
+            name: "Shell test".into(),
+            api: "test".into(),
+            provider: "test".into(),
+            base_url: "http://localhost".into(),
+            reasoning: false,
+            cost: pa_agent::types::UsageCost::default(),
+            context_window: 1_000,
+            max_tokens: 100,
+            max_tokens_explicit: false,
+        };
+        let provider = Arc::new(pa_agent::scripted::ScriptedProvider::new(model.clone()));
+        create_session(SessionEngineConfig {
+            cwd,
+            agent_dir,
+            model: Some(model),
+            stream_fn: Some(provider.stream_fn()),
+            prewarm_ipython_kernel: None,
+            ..Default::default()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn session_settings_reach_the_kernel_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(cwd.join(".prime/agent")).unwrap();
+        // Project settings override the global setting before the session captures it.
+        let global = executable_shell(dir.path(), "global-bash");
+        let project = executable_shell(dir.path(), "project-bash");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({ "shellPath": global.to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".prime/agent/settings.json"),
+            serde_json::json!({ "shellPath": format!("  {}  ", project.to_string_lossy()) })
+                .to_string(),
+        )
+        .unwrap();
+        let engine = shell_test_session(cwd, agent_dir).await.unwrap();
+        assert_eq!(engine.provisioner.inner.options.shell_path, Some(project));
+    }
+
+    #[tokio::test]
+    async fn session_settings_reach_the_kernel_command_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(cwd.join(".prime/agent")).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({ "shellCommandPrefix": "shopt -s expand_aliases" }).to_string(),
+        )
+        .unwrap();
+        let engine = shell_test_session(cwd, agent_dir).await.unwrap();
+        assert_eq!(
+            engine.provisioner.inner.options.command_prefix.as_deref(),
+            Some("shopt -s expand_aliases")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_serper_key_reaches_the_kernel_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(cwd.join(".prime/agent")).unwrap();
+        std::fs::write(
+            agent_dir.join("auth.json"),
+            r#"{ "serper": { "type": "api_key", "key": "!printf key-from-cmd" } }"#,
+        )
+        .unwrap();
+        let engine = shell_test_session(cwd, agent_dir).await.unwrap();
+        let injected = engine
+            .provisioner
+            .inner
+            .options
+            .env
+            .get("SERPER_API_KEY")
+            .map(String::as_str);
+        // A nonblank ambient SERPER_API_KEY wins (TS parity): the ambient key
+        // reaches the kernel through the inherited env, not the wiring.
+        if std::env::var("SERPER_API_KEY").is_ok_and(|value| !value.trim().is_empty()) {
+            assert_eq!(injected, None);
+        } else {
+            assert_eq!(injected, Some("key-from-cmd"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsaved_session_blanks_the_kernel_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(cwd.join(".prime/agent")).unwrap();
+        let engine = shell_test_session(cwd, agent_dir).await.unwrap();
+        assert_eq!(
+            engine
+                .provisioner
+                .inner
+                .options
+                .env
+                .get("RLM_SESSION_ID")
+                .map(String::as_str),
+            Some(""),
+            "an inherited RLM_SESSION_ID must not reach an unsaved session's kernel"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_websearch_skill_no_serper_key_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(cwd.join(".prime/agent")).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({ "bundledSkills": { "websearch": false } }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("auth.json"),
+            r#"{ "serper": { "type": "api_key", "key": "!printf key-from-cmd" } }"#,
+        )
+        .unwrap();
+        let engine = shell_test_session(cwd, agent_dir).await.unwrap();
+        assert!(
+            !engine
+                .provisioner
+                .inner
+                .options
+                .env
+                .contains_key("SERPER_API_KEY"),
+            "the key rides the env only when a websearch skill is loaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_settings_reject_a_missing_shell_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(cwd.join(".prime/agent")).unwrap();
+        let missing = cwd.join("no-such-shell");
+        std::fs::write(
+            cwd.join(".prime/agent/settings.json"),
+            serde_json::json!({ "shellPath": missing.to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+        let Err(err) = shell_test_session(cwd, agent_dir).await else {
+            panic!("create_session must reject a missing shellPath");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("shellPath"),
+            "error names the setting: {message}"
+        );
+        assert!(
+            message.contains(missing.to_string_lossy().as_ref()),
+            "error names the path: {message}"
+        );
+    }
 
     #[test]
     fn a_spent_stop_arm_releases_only_its_own_boot() {
@@ -1766,7 +1959,6 @@ mod tests {
             ..Default::default()
         };
         let provisioner = IpythonKernelProvisioner::new("/tmp", options);
-        // Returns immediately; the background boot fails on its own.
         provisioner.prewarm();
         // Let the background startup settle into its failure.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1774,8 +1966,7 @@ mod tests {
             !provisioner.has_running_kernel(),
             "the failed prewarm must not leave a running kernel"
         );
-        // The next ensure() surfaces the prewarm's swallowed cause (or a
-        // fresh attempt's identical one) instead of hanging on the memo.
+        // The next ensure() surfaces the swallowed cause, not a memo hang.
         let error = provisioner
             .ensure(None, None)
             .await

@@ -64,7 +64,7 @@ async fn prompt_persists_user_and_assistant() {
 async fn a_skill_command_prompt_expands_into_the_skill_block() {
     // TS `_expandSkillCommand`: a `/skill:<name> [args]` submission
     // persists as the `<skill>` block plus the argument text; the
-    // renderer parses that block back out (TS `parseSkillBlock`).
+    // renderer parses that block back out.
     let mut session = scripted_session().await;
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("SKILL.md");
@@ -133,9 +133,9 @@ async fn an_unknown_skill_command_passes_through() {
     assert_eq!(user_text, "/skill:missing do a thing");
 }
 
-/// A scripted session wired like the engine wires production sessions:
-/// the engine-level `convert_to_llm` plus a harness-digest context, so
-/// the deferred first-turn digest rides the first prompt.
+/// A scripted session wired like production: the engine-level
+/// `convert_to_llm` plus a harness-digest context, so the deferred
+/// first-turn digest rides the first prompt.
 async fn digest_session(provider: Arc<ScriptedProvider>) -> (AgentSession, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let harness = crate::session_engine::harness_digest::HarnessDigestContext {
@@ -175,9 +175,8 @@ async fn digest_session_with_harness(
     .unwrap()
 }
 
-/// A resumed session over the entries of a prior session (the engine's
-/// resume wiring: the loop context is the converted built context, the
-/// manager adopts the same entries).
+/// A resumed session over the entries of a prior session (converted
+/// loop context, adopted manager).
 async fn resumed_digest_session(
     entries: Vec<FileEntry>,
     harness: crate::session_engine::harness_digest::HarnessDigestContext,
@@ -231,11 +230,9 @@ async fn loop_digest_rows(session: &AgentSession) -> Vec<(String, Option<String>
         .collect()
 }
 
-/// TS #2400 + #2394 at the resume boundary: unchanged harness state
-/// does not re-deliver a digest that drifted query terms made look
-/// stale (the state fingerprint matches), and a state change
-/// re-delivers exactly one digest, replacing the superseded copy
-/// instead of stacking.
+/// TS #2400 + #2394 at the resume boundary: unchanged state does not
+/// re-deliver a drifted-looking digest; a state change re-delivers
+/// exactly one, replacing the superseded copy.
 #[tokio::test]
 async fn resume_dedupes_by_state_fingerprint_and_replaces_stale_digests() {
     let tmp = tempfile::tempdir().unwrap();
@@ -319,10 +316,10 @@ async fn resume_dedupes_by_state_fingerprint_and_replaces_stale_digests() {
         panic!("the persisted digest row carries its state fingerprint");
     };
 
-    // Resume over the same entries (converted loop context, adopted
-    // manager): the fresh render ranks `alpha_relevant` first because
-    // the context's task signal mentions it, so only the state
-    // fingerprint can dedupe. The unchanged state must NOT re-deliver.
+    // Resume over the same entries: the fresh render ranks
+    // `alpha_relevant` first (the context's task signal mentions it),
+    // so only the state fingerprint can dedupe. The unchanged state must
+    // NOT re-deliver.
     let resumed = resumed_digest_session(entries.clone(), harness.clone()).await;
     let rows = loop_digest_rows(&resumed).await;
     assert_eq!(
@@ -370,10 +367,9 @@ async fn resume_dedupes_by_state_fingerprint_and_replaces_stale_digests() {
         "the delivered custom row carries its state fingerprint"
     );
     assert!(rows[0].0.contains("Resume test memory"));
-    // The delivered row persisted with its fingerprint. The persisted
-    // transcript keeps every copy (TS #2394: the newest digest remains
-    // authoritative), so the retained row plus the fresh one ride the
-    // file while the live context carries exactly one.
+    // The persisted transcript keeps every copy (TS #2394: the newest
+    // digest remains authoritative), so the file holds both while the
+    // live context carries exactly one.
     let persisted: Vec<String> = refreshed
         .entries()
         .await
@@ -463,8 +459,8 @@ async fn prompt_rides_digest_row_into_the_run() {
     session.agent().wait_for_idle().await;
 
     // The run's agent_end carries the digest custom row with the turn's
-    // prompt messages (TS parity: the digest rides `agent_end.messages`).
-    // The lock snapshots the captured events and never crosses an await.
+    // prompt messages (TS parity). The lock snapshots the captured
+    // events and never crosses an await.
     let (end_messages, kinds) = {
         let captured = events.lock().unwrap();
         let Some(AgentEvent::AgentEnd { messages }) = captured
@@ -545,7 +541,6 @@ async fn prompt_rides_digest_row_into_the_run() {
     let calls = provider.calls();
     assert_eq!(calls.len(), 2);
     assert_eq!(user_text(calls[1].messages.last().unwrap()), "again");
-    // The second run's agent_end carries no digest row.
     let second_end_roles: Vec<String> = {
         let captured = events.lock().unwrap();
         captured
@@ -575,12 +570,9 @@ async fn prompt_rides_digest_row_into_the_run() {
     assert_eq!(digest_rows, 1);
 }
 
-/// An injected custom message admits as the turn's prompt (TS
-/// `_promptInjectedMessage` -> `agent.prompt([customMessage])`): the
-/// transcript and the loop context hold ONE representation of the
-/// turn — the custom row, appended once by the loop's `message_end`
-/// — and the provider request carries the row's user-role view (the
-/// loop-boundary conversion), never a duplicate user message.
+/// The transcript and the loop context hold ONE representation of the
+/// turn (the custom row, appended once), never a duplicate user
+/// message.
 #[tokio::test]
 async fn prompt_injected_message_persists_one_custom_row() {
     let provider = Arc::new(ScriptedProvider::new(test_model()));
@@ -603,10 +595,9 @@ async fn prompt_injected_message_persists_one_custom_row() {
     session.agent().wait_for_idle().await;
 
     // The provider request carries the notice text as its user-role
-    // view — once, with no duplicate user message (TS `convertToLlm`
-    // at the loop boundary). The first-turn harness digest rides
-    // ahead of it (TS commit-time injection), exactly like a plain
-    // prompt's request.
+    // view — once, with no duplicate user message. The first-turn
+    // harness digest rides ahead of it, exactly like a plain prompt's
+    // request.
     let calls = provider.calls();
     assert_eq!(calls.len(), 1);
     let user_texts: Vec<String> = calls[0]
@@ -655,17 +646,12 @@ async fn prompt_injected_message_persists_one_custom_row() {
     );
 }
 
-/// A delivered agent message's custom row produces the byte-identical
-/// provider context to the plain-prompt delivery (TS
-/// `acceptAgentMessagePrompt`: the custom message replaces the turn's
-/// user row while its prompt content still runs the model). The
-/// comparison covers the whole request - system prompt, tools, and
+/// The comparison covers the whole request - system prompt, tools, and
 /// every message row - with only the per-run timestamps normalized.
 #[tokio::test]
 async fn an_agent_message_custom_row_matches_the_plain_prompt_context() {
     let prompt = "[agent-message from child:research-lane]\n\nthe research is done";
 
-    // The plain delivery: the prompt text as the accepted user row.
     let plain_provider = Arc::new(ScriptedProvider::new(test_model()));
     plain_provider.push_text_turn("ack");
     let (plain_session, _plain_tmp) = digest_session(Arc::clone(&plain_provider)).await;
@@ -711,9 +697,8 @@ async fn an_agent_message_custom_row_matches_the_plain_prompt_context() {
     );
 }
 
-/// The provider request with the per-run message timestamps zeroed
-/// (each delivery mints its own runtime stamp; every other byte is
-/// compared).
+/// The provider request with the per-run timestamps zeroed (every
+/// other byte is compared).
 fn normalized_context(context: &pa_agent::stream::LlmContext) -> serde_json::Value {
     let mut value = serde_json::to_value(context).unwrap();
     for message in value["messages"].as_array_mut().unwrap() {
@@ -841,6 +826,434 @@ async fn prompt_persists_tool_results() {
     assert!(entry["timestamp"].as_str().is_some());
 }
 
+/// The tool-call lifecycle trace: a `tool_started` row at call issuance
+/// (call id, tool name, the command text), `tool_progress` heartbeat ticks
+/// while a long call runs, and the completed result carrying its duration.
+/// A stalled call is visible in the session trace while it runs — the
+/// Oscar incident showed a 13-minute recursive grep with a blank trace
+/// between issuance and the user's cancel.
+#[tokio::test]
+async fn long_tool_call_persists_started_tick_and_duration_rows() {
+    struct SlowTool;
+    impl pa_agent::types::AgentTool for SlowTool {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn description(&self) -> &'static str {
+            "sleeps before answering"
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            static PARAMETERS: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            PARAMETERS.get_or_init(|| serde_json::json!({ "type": "object" }))
+        }
+        fn execute(
+            self: Arc<Self>,
+            _tool_call_id: String,
+            _params: serde_json::Value,
+            _signal: pa_agent::abort::AbortSignal,
+            _on_update: pa_agent::types::AgentToolUpdateCallback,
+        ) -> pa_agent::BoxFut<'static, anyhow::Result<pa_agent::types::AgentToolResult>> {
+            Box::pin(async {
+                let started = std::time::Instant::now();
+                // Staged long call: ~5s run with the tick threshold pinned
+                // at 1s, so the heartbeat fires well before completion.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let mut result = pa_agent::types::AgentToolResult::text("done");
+                result.details = serde_json::json!({
+                    "status": "ok",
+                    "durationMs": started.elapsed().as_millis() as u64,
+                });
+                Ok(result)
+            })
+        }
+    }
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    provider.push_tool_call_turn(
+        Some("calling"),
+        vec![(
+            "call-1",
+            "slow",
+            serde_json::json!({ "command": "grep -rli training ~/" }),
+        )],
+    );
+    provider.push_text_turn("done");
+    let options = AgentOptions {
+        initial_state: AgentInitialState {
+            model: Some(test_model()),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        tool_progress: Some(pa_agent::types::ToolProgressCadence {
+            after_ms: 1_000,
+            every_ms: 1_000,
+        }),
+        ..Default::default()
+    };
+    let agent = Agent::new(options);
+    agent.set_tools(vec![Arc::new(SlowTool)]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let session = SessionManager::persisted(std::path::Path::new("/w"), tmp.path());
+    let engine = AgentSession::new(Arc::new(agent), session, vec![])
+        .await
+        .unwrap();
+    engine.prompt("hi", PromptOptions::default()).await.unwrap();
+    engine.agent().wait_for_idle().await;
+    let entries = engine.entries().await;
+
+    let started = entries
+        .iter()
+        .find_map(|entry| match entry {
+            FileEntry::ToolStarted { payload, .. } => Some(payload.clone()),
+            _ => None,
+        })
+        .expect("tool_started row persisted");
+    assert_eq!(started.tool_call_id, "call-1");
+    assert_eq!(started.tool_name, "slow");
+    assert_eq!(
+        started.args,
+        serde_json::json!({ "command": "grep -rli training ~/" })
+    );
+
+    let ticks: Vec<pa_types::session::ToolProgressEntry> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            FileEntry::ToolProgress { payload, .. } => Some(payload.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !ticks.is_empty(),
+        "a 5s call with a 1s tick must emit at least one tool_progress row"
+    );
+    assert!(ticks.len() <= 5, "ticks bounded by the cadence: {ticks:?}");
+    assert!(ticks.iter().all(|tick| tick.tool_call_id == "call-1"));
+    assert!(ticks.iter().all(|tick| tick.tool_name == "slow"));
+    assert!(
+        ticks
+            .iter()
+            .all(|tick| tick.elapsed_ms >= 900 && tick.elapsed_ms < 5_500),
+        "tick elapsed is wall-clock time since the call started: {ticks:?}"
+    );
+
+    let tool_result = entries
+        .iter()
+        .find_map(|entry| match entry {
+            FileEntry::Message {
+                message: SessionAgentMessage::ToolResult(result),
+                ..
+            } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("toolResult entry persisted");
+    assert!(!tool_result.is_error);
+    assert_eq!(
+        tool_result.details.as_ref().and_then(|d| d.get("status")),
+        Some(&serde_json::json!("ok"))
+    );
+    let duration = tool_result
+        .details
+        .as_ref()
+        .and_then(|d| d.get("durationMs"))
+        .and_then(serde_json::Value::as_u64)
+        .expect("completed result carries durationMs");
+    assert!(duration >= 4_500, "durationMs: {duration}");
+
+    // The rows also live on disk in the session jsonl (the trace the
+    // session zip contains), with the new types round-tripping.
+    let file = tmp
+        .path()
+        .join(format!("{}.jsonl", engine.session_id().await))
+        .to_string_lossy()
+        .to_string();
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(file)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let started_line = lines
+        .iter()
+        .find(|line| line.get("type") == Some(&serde_json::json!("tool_started")))
+        .expect("tool_started line on disk");
+    assert_eq!(started_line["toolCallId"], "call-1");
+    assert_eq!(started_line["toolName"], "slow");
+    assert_eq!(started_line["args"]["command"], "grep -rli training ~/");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.get("type") == Some(&serde_json::json!("tool_progress"))),
+        "tool_progress line on disk"
+    );
+}
+
+/// The short-call contract: the start row and the result row persist, and
+/// the heartbeat stays quiet (no `tool_progress` row under the threshold).
+#[tokio::test]
+async fn short_tool_call_persists_started_row_without_progress() {
+    struct FastTool;
+    impl pa_agent::types::AgentTool for FastTool {
+        fn name(&self) -> &'static str {
+            "fast"
+        }
+        fn description(&self) -> &'static str {
+            "answers immediately"
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            static PARAMETERS: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            PARAMETERS.get_or_init(|| serde_json::json!({ "type": "object" }))
+        }
+        fn execute(
+            self: Arc<Self>,
+            _tool_call_id: String,
+            _params: serde_json::Value,
+            _signal: pa_agent::abort::AbortSignal,
+            _on_update: pa_agent::types::AgentToolUpdateCallback,
+        ) -> pa_agent::BoxFut<'static, anyhow::Result<pa_agent::types::AgentToolResult>> {
+            Box::pin(async { Ok(pa_agent::types::AgentToolResult::text("done")) })
+        }
+    }
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    provider.push_tool_call_turn(
+        Some("calling"),
+        vec![("call-1", "fast", serde_json::json!({}))],
+    );
+    provider.push_text_turn("done");
+    let options = AgentOptions {
+        initial_state: AgentInitialState {
+            model: Some(test_model()),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        tool_progress: Some(pa_agent::types::ToolProgressCadence {
+            after_ms: 1_000,
+            every_ms: 1_000,
+        }),
+        ..Default::default()
+    };
+    let agent = Agent::new(options);
+    agent.set_tools(vec![Arc::new(FastTool)]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let session = SessionManager::in_memory(tmp.path());
+    let engine = AgentSession::new(Arc::new(agent), session, vec![])
+        .await
+        .unwrap();
+    engine.prompt("hi", PromptOptions::default()).await.unwrap();
+    engine.agent().wait_for_idle().await;
+    let entries = engine.entries().await;
+    assert!(
+        entries.iter().any(|entry| matches!(entry, FileEntry::ToolStarted { payload, .. } if payload.tool_call_id == "call-1")),
+        "short call still persists its tool_started row"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !matches!(entry, FileEntry::ToolProgress { .. })),
+        "a fast call must not emit tool_progress rows"
+    );
+    assert!(
+        entries.iter().any(|entry| matches!(
+            entry,
+            FileEntry::Message {
+                message: SessionAgentMessage::ToolResult(_),
+                ..
+            }
+        )),
+        "short call persists its toolResult row"
+    );
+}
+
+/// The aborted completion carries the elapsed duration: the trace shows how
+/// long the call ran before the kill, not just that it died. Before this
+/// fix, the aborted toolResult row carried only the bare "Tool execution
+/// aborted" text with no duration.
+#[tokio::test]
+async fn aborted_tool_call_result_carries_elapsed_duration() {
+    struct StalledTool(Arc<std::sync::atomic::AtomicBool>);
+    impl pa_agent::types::AgentTool for StalledTool {
+        fn name(&self) -> &'static str {
+            "stalled"
+        }
+        fn description(&self) -> &'static str {
+            "never finishes on its own"
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            static PARAMETERS: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            PARAMETERS.get_or_init(|| serde_json::json!({ "type": "object" }))
+        }
+        fn execute(
+            self: Arc<Self>,
+            _tool_call_id: String,
+            _params: serde_json::Value,
+            _signal: pa_agent::abort::AbortSignal,
+            _on_update: pa_agent::types::AgentToolUpdateCallback,
+        ) -> pa_agent::BoxFut<'static, anyhow::Result<pa_agent::types::AgentToolResult>> {
+            let entered = Arc::clone(&self.0);
+            Box::pin(async move {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                // The recursive-scan shape: unbounded runtime, only the
+                // abort ends it.
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                Ok(pa_agent::types::AgentToolResult::text("done"))
+            })
+        }
+    }
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    provider.push_tool_call_turn(
+        Some("calling"),
+        vec![("call-1", "stalled", serde_json::json!({}))],
+    );
+    provider.push_text_turn("done");
+    let options = AgentOptions {
+        initial_state: AgentInitialState {
+            model: Some(test_model()),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        ..Default::default()
+    };
+    let agent = Agent::new(options);
+    agent
+        .set_tools(vec![Arc::new(StalledTool(Arc::clone(&entered)))])
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let session = SessionManager::in_memory(tmp.path());
+    let engine = Arc::new(
+        AgentSession::new(Arc::new(agent), session, vec![])
+            .await
+            .unwrap(),
+    );
+    let prompt_engine = Arc::clone(&engine);
+    let prompting =
+        tokio::spawn(async move { prompt_engine.prompt("hi", PromptOptions::default()).await });
+    // Bounded entered wait: a stalled tool that never starts fails the
+    // test instead of hanging the suite.
+    let tool_entered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        tool_entered.is_ok(),
+        "the stalled tool never entered within 2s"
+    );
+    // Let the call run briefly so the elapsed duration is non-zero.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    engine.agent().abort();
+    prompting.await.unwrap().unwrap();
+    engine.agent().wait_for_idle().await;
+    let entries = engine.entries().await;
+    let tool_result = entries
+        .iter()
+        .find_map(|entry| match entry {
+            FileEntry::Message {
+                message: SessionAgentMessage::ToolResult(result),
+                ..
+            } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("aborted toolResult entry persisted");
+    assert!(tool_result.is_error);
+    match &tool_result.content[..] {
+        [pa_types::ai::UserContentBlock::Text(text)] => {
+            assert_eq!(text.text, "Tool execution aborted");
+        }
+        other => panic!("expected the abort error text: {other:?}"),
+    }
+    let details = tool_result
+        .details
+        .as_ref()
+        .expect("aborted result has details");
+    assert_eq!(details.get("status"), Some(&serde_json::json!("aborted")));
+    let duration = details
+        .get("durationMs")
+        .and_then(serde_json::Value::as_u64)
+        .expect("aborted result carries durationMs");
+    assert!(duration >= 100, "durationMs: {duration}");
+}
+
+/// Persisted `ipython`/`python` calls dispatch through `ToolDefinitionBridge`
+/// to the registered Python tool.
+#[tokio::test]
+async fn python_tool_aliases_dispatch_to_python_repl() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let definition = crate::tools::tool_definition::ToolDefinition {
+        name: pa_types::ai::PYTHON_TOOL_NAME.to_string(),
+        label: "Python".to_string(),
+        description: "Echoes its input".to_string(),
+        prompt_snippet: String::new(),
+        parameters: serde_json::json!({ "type": "object" }),
+        execution_mode: None,
+        prepare_arguments: None,
+        execute: {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_id, params, _signal, _on_update| {
+                let text = params
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    Ok(crate::tools::tool_definition::ToolExecutionResult::text(
+                        format!("echo:{text}"),
+                    ))
+                })
+            })
+        },
+    };
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    provider.push_tool_call_turn(
+        Some("calling"),
+        vec![
+            ("call-1", "ipython", serde_json::json!({ "text": "a" })),
+            ("call-2", "python", serde_json::json!({ "text": "b" })),
+        ],
+    );
+    provider.push_text_turn("done");
+    let options = AgentOptions {
+        initial_state: AgentInitialState {
+            model: Some(test_model()),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        ..Default::default()
+    };
+    let agent = Agent::new(options);
+    agent
+        .set_tools(vec![crate::session_engine::tool_bridge::bridge_tool(
+            definition,
+        )])
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let session = SessionManager::in_memory(tmp.path());
+    let engine = AgentSession::new(Arc::new(agent), session, vec![])
+        .await
+        .unwrap();
+    engine.prompt("go", PromptOptions::default()).await.unwrap();
+    engine.agent().wait_for_idle().await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let entries = engine.entries().await;
+    let texts: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            FileEntry::Message {
+                message: SessionAgentMessage::ToolResult(result),
+                ..
+            } => Some(result),
+            _ => None,
+        })
+        .map(|result| {
+            assert!(!result.is_error, "result: {result:?}");
+            match &result.content[..] {
+                [pa_types::ai::UserContentBlock::Text(text)] => text.text.as_str(),
+                _ => panic!("expected a single text block: {result:?}"),
+            }
+        })
+        .collect();
+    assert_eq!(texts, ["echo:a", "echo:b"]);
+}
+
 /// A `toolResult` entry captured from a live TS session (read-only, from
 /// the installed product's own session store) parses into the Rust
 /// session types and re-serializes to the identical wire shape.
@@ -866,7 +1279,6 @@ fn ts_toolresult_entry_round_trips() {
     assert!(!tool_result.is_error);
     assert_eq!(base.id.clone().unwrap_or_default().len(), 8);
     assert_eq!(base.parent_id.as_deref(), Some("8902561b"));
-    // The ipython `details` block survives the round trip intact.
     assert_eq!(
         tool_result.details,
         Some(serde_json::json!({
@@ -877,7 +1289,6 @@ fn ts_toolresult_entry_round_trips() {
             "kernelRestarted": false
         }))
     );
-    // Re-serialization is byte-identical (stable wire shape).
     let serialized = serde_json::to_value(&entry).unwrap();
     assert_eq!(serialized, golden);
 }
@@ -982,7 +1393,6 @@ async fn run_boundaries_record_git_state() {
         .await
         .unwrap();
 
-    // The run starts on a newer commit than the header captured.
     let second_sha = commit(repo.path(), "second");
     engine.prompt("hi", PromptOptions::default()).await.unwrap();
     engine.agent().wait_for_idle().await;

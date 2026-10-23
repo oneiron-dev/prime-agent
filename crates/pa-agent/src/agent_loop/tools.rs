@@ -1,7 +1,6 @@
-//! Tool-call batch execution (TS `executeToolCalls`): sequential and parallel
-//! dispatch, per-tool preparation outcomes, batch termination, and tool-result
-//! message emission. Section of the port of
-//! `packages/agent/src/agent-loop.ts`.
+//! Tool-call batch execution: sequential and parallel dispatch, per-tool
+//! preparation outcomes, batch termination, and tool-result message
+//! emission.
 
 use std::sync::Arc;
 
@@ -18,10 +17,6 @@ use super::tool_call::{
 };
 use super::{AgentEventSink, AgentLoopConfig};
 
-// ---------------------------------------------------------------------------
-// Tool execution
-// ---------------------------------------------------------------------------
-
 pub(crate) struct ExecutedToolCallBatch {
     pub(crate) messages: Vec<ToolResultMessage>,
     pub(crate) terminate: bool,
@@ -33,7 +28,17 @@ pub(crate) struct FinalizedToolCallOutcome {
     pub(crate) is_error: bool,
 }
 
-/// Port of `executeToolCalls`.
+/// Tool lookup by name; exact matches win over alias-based dispatch.
+pub(crate) fn find_tool<'a>(
+    tools: &'a [Arc<dyn AgentTool>],
+    name: &str,
+) -> Option<&'a Arc<dyn AgentTool>> {
+    if let Some(tool) = tools.iter().find(|t| t.name() == name) {
+        return Some(tool);
+    }
+    tools.iter().find(|t| t.accepts_alias(name))
+}
+
 pub(crate) async fn execute_tool_calls(
     current_context: &AgentContext,
     assistant_message: &AssistantMessage,
@@ -47,11 +52,7 @@ pub(crate) async fn execute_tool_calls(
         .cloned()
         .collect::<Vec<ToolCall>>();
     let has_sequential_tool_call = tool_calls.iter().any(|tc| {
-        current_context
-            .tools
-            .iter()
-            .find(|t| t.name() == tc.name)
-            .and_then(|tool| tool.execution_mode())
+        find_tool(&current_context.tools, &tc.name).and_then(|tool| tool.execution_mode())
             == Some(ToolExecutionMode::Sequential)
     });
     if config.tool_execution == ToolExecutionMode::Sequential || has_sequential_tool_call {
@@ -77,7 +78,6 @@ pub(crate) async fn execute_tool_calls(
     }
 }
 
-/// Port of `executeToolCallsSequential`.
 async fn execute_tool_calls_sequential(
     current_context: &AgentContext,
     assistant_message: &AssistantMessage,
@@ -116,7 +116,8 @@ async fn execute_tool_calls_sequential(
                 is_error,
             },
             Preparation::Prepared(prepared) => {
-                let executed = execute_prepared_tool_call(&prepared, signal, emit).await;
+                let executed =
+                    execute_prepared_tool_call(&prepared, config.tool_progress, signal, emit).await;
                 finalize_executed_tool_call(
                     current_context,
                     assistant_message,
@@ -146,8 +147,6 @@ async fn execute_tool_calls_sequential(
     })
 }
 
-/// Port of `executeToolCallsParallel`.
-///
 /// `tool_execution_end` is emitted in completion order (from inside the
 /// concurrent tasks), while tool-result message events are emitted afterwards
 /// in assistant source order, matching the TS reference.
@@ -207,8 +206,13 @@ async fn execute_tool_calls_parallel(
                     args: prepared.args.clone(),
                 };
                 let handle = tokio::spawn(async move {
-                    let executed =
-                        execute_prepared_tool_call(&prepared, Some(&signal), &sink).await;
+                    let executed = execute_prepared_tool_call(
+                        &prepared,
+                        config.tool_progress,
+                        Some(&signal),
+                        &sink,
+                    )
+                    .await;
                     let finalized = finalize_executed_tool_call(
                         &context,
                         &assistant_message,
@@ -267,7 +271,6 @@ pub(crate) struct PreparedToolCall {
     pub(crate) args: serde_json::Value,
 }
 
-/// Port of `shouldTerminateToolBatch`.
 fn should_terminate_tool_batch(finalized_calls: &[FinalizedToolCallOutcome]) -> bool {
     !finalized_calls.is_empty()
         && finalized_calls

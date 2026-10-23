@@ -836,7 +836,6 @@ impl ReplKernelManager {
         let result = self
             .execute_inner(
                 request,
-                "",
                 ExecuteOptions {
                     internal: true,
                     signal: Some(deadline),

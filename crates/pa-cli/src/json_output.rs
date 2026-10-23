@@ -54,6 +54,7 @@ impl JsonEventProfile {
                 | AgentEvent::MessageStart { .. }
                 | AgentEvent::MessageEnd { .. }
                 | AgentEvent::ToolExecutionStart { .. }
+                | AgentEvent::ToolExecutionProgress { .. }
                 | AgentEvent::ToolExecutionEnd { .. } => true,
             },
         }
@@ -197,6 +198,11 @@ mod tests {
                 tool_name: "ipython".to_string(),
                 args: serde_json::json!({ "code": "1+1" }),
             },
+            AgentEvent::ToolExecutionProgress {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "ipython".to_string(),
+                elapsed_ms: 1_000,
+            },
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "ipython".to_string(),
@@ -260,7 +266,7 @@ mod tests {
         for event in every_event() {
             all_sink.agent_event(&event);
         }
-        assert_eq!(all_serialized.load(Ordering::SeqCst), 10);
+        assert_eq!(all_serialized.load(Ordering::SeqCst), 11);
 
         let (reduced_sink, reduced_lines, reduced_serialized) =
             recording_sink(JsonEventProfile::FactoryCompleted);
@@ -269,7 +275,7 @@ mod tests {
         }
         assert_eq!(
             reduced_serialized.load(Ordering::SeqCst),
-            8,
+            9,
             "an omitted snapshot must not be serialized first"
         );
 
@@ -294,6 +300,7 @@ mod tests {
                 "message_update",
                 "message_end",
                 "tool_execution_start",
+                "tool_execution_progress",
                 "tool_execution_update",
                 "tool_execution_end",
                 "turn_end",

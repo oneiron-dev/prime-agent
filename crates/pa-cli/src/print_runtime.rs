@@ -1,6 +1,5 @@
 //! The headless print runtime: single-shot prompt -> answer over the pa-core
-//! session engine with a real pa-ai provider. Port of the text-mode half of
-//! modes/print-mode.ts wired onto `create_session` (the Rust engine facade).
+//! session engine with a real pa-ai provider.
 
 use std::sync::Arc;
 
@@ -12,6 +11,7 @@ use pa_core::session::discovery::{
     find_most_recent_session_for_cwd, resolve_session_path, ResolvedSession, SessionSelectorError,
 };
 use pa_types::ai::Model;
+use tokio::sync::Notify;
 
 use crate::headless_autonomous::{autonomous_runtime_config, HeadlessAutonomous};
 use crate::mode::{AppMode, MissingSubsystem, RunOptions};
@@ -20,15 +20,10 @@ use pa_core::session_engine::provider_adapter::{
     json_round_trip, map_thinking_level, stream_once, switchable_stream_fn, ProviderTarget,
 };
 
-/// The runtime: implements the print (text) mode against the merged session
-/// engine. Modes not wired here still report their typed missing subsystem.
 pub struct PrintRuntime;
 
 impl crate::mode::Runtime for PrintRuntime {
     fn run(&self, options: &RunOptions) -> Result<i32, MissingSubsystem> {
-        // `model list` takes the full runtime path in every mode and exits
-        // (TS main: listModels runs after session assembly, before any mode
-        // transport, and exits 0).
         if options.list_models.is_some() {
             return match crate::list_models::run(options) {
                 Ok(code) => Ok(code),
@@ -69,10 +64,6 @@ impl crate::mode::Runtime for PrintRuntime {
                     }
                 }
             }
-            // The interactive TUI attaches through the daemon (spawning a
-            // supervisor when none is running); the daemon mode runs the
-            // supervisor in-process. Runtime failures print themselves and
-            // exit non-zero, so the typed channel stays for unwired modes.
             AppMode::Interactive => match crate::interactive_mode::run_interactive_mode(options) {
                 Ok(code) => Ok(code),
                 Err(error) => {
@@ -98,9 +89,6 @@ impl crate::mode::Runtime for PrintRuntime {
                     Ok(1)
                 }
             },
-            // RPC mode: the TS `modes/rpc` JSONL command surface over the
-            // same in-process session engine the print mode uses
-            // (daemon-attached transport: the follow-up lane).
             AppMode::Rpc => match run_rpc_mode(options) {
                 Ok(code) => Ok(code),
                 Err(error) => {
@@ -234,6 +222,14 @@ fn daemon_acp_create(
         create_config["childScript"] =
             serde_json::Value::String(child_script.to_string_lossy().to_string());
     }
+    // TS main.ts `launchEnv` (:1092 via the daemon-client create): the
+    // client's own environment travels on the create so the session's
+    // worker runs in the environment of the terminal that invoked it,
+    // not the daemon's boot environment.
+    let launch_env = {
+        let env = pa_types::daemon::launch_env::collect_process_launch_env();
+        (!env.is_empty()).then_some(env)
+    };
     let create = pa_types::daemon::DaemonCommand::Create {
         id: None,
         session_path: session_path.map(|path| path.display().to_string()),
@@ -245,15 +241,12 @@ fn daemon_acp_create(
         runtime_metadata: None,
         lifecycle: Some(lifecycle),
         env: None,
-        launch_env: None,
+        launch_env,
         rest: serde_json::Map::default(),
     };
     Ok((cwd, create))
 }
 
-/// The RPC headless mode: build the in-process session engine the print
-/// mode does, then serve the TS `modes/rpc` JSONL command surface over
-/// stdio until the client closes stdin.
 fn run_rpc_mode(options: &RunOptions) -> Result<i32, String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -264,8 +257,8 @@ fn run_rpc_mode(options: &RunOptions) -> Result<i32, String> {
 
 async fn rpc_mode_main(options: &RunOptions) -> Result<i32, String> {
     let config = &options.config;
-    let (parts, initial_lease) = build_headless_engine_parts_with_lease(options, "rpc").await?;
-    // The CLI `--goal` seed rides the first session like the print mode.
+    let mut initial_lease = None;
+    let parts = build_headless_engine_parts(options, "rpc", &mut initial_lease).await?;
     if let Some(goal) = &config.initial_goal {
         parts
             .engine
@@ -275,10 +268,6 @@ async fn rpc_mode_main(options: &RunOptions) -> Result<i32, String> {
     }
     let factory = rpc_engine_factory(options);
     let mut engine_handle = pa_daemon::rpc::session::RpcEngineHandle::from(parts);
-    // The initial (possibly resumed) session's runtime lease rides the
-    // handle: a later whole-session replacement releases it exactly when
-    // the initial engine stops writing (instead of holding the file
-    // until the process exits).
     engine_handle.session_lease = initial_lease;
     let exit_code = pa_daemon::rpc::run_rpc_mode(pa_daemon::rpc::RpcOptions {
         engine: engine_handle,
@@ -296,33 +285,26 @@ async fn rpc_mode_main(options: &RunOptions) -> Result<i32, String> {
     Ok(exit_code)
 }
 
-/// The engine-replacement seam the RPC mode's `new_session` /
-/// `switch_session` / `fork` commands drive (TS `runtimeHost`
-/// replacement flows): pa-cli owns the assembly, the mode owns the swap.
+/// The engine-replacement seam the RPC mode's `new_session`/`switch_session`/
+/// `fork` commands drive: pa-cli owns the assembly, the mode owns the swap.
 fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngineFactory {
     let options = options.clone();
     std::sync::Arc::new(move |request| {
         let mut options = options.clone();
-        // The replacement sessions ignore the CLI's session-selection
-        // flags (TS replacement flows build their own manager).
+        // The replacement sessions ignore the CLI's session-selection flags.
         options.session.resume = None;
         options.session.resume_bare = false;
         options.session.continue_recent = false;
         options.session.fork = None;
         Box::pin(async move {
-            // The runtime lease the replacement acquired for its target
-            // file: it rides the handle (dropping with the engine on the
-            // next replacement, exactly when the old session stops
-            // writing).
             let (manager, opened_lease) = match &request {
                 pa_daemon::rpc::session::RpcEngineRequest::New {
                     parent_session,
                     cwd,
                 } => {
                     let session_dir = replacement_session_dir(&options);
-                    // The active session's cwd when the command passed
-                    // one (TS `runtimeHost.newSession` over `this.cwd`),
-                    // else the CLI startup directory.
+                    // The active session's cwd when the command passed one, else the CLI startup
+                    // directory.
                     let cwd = cwd.clone().unwrap_or_else(|| options.config.cwd.clone());
                     let manager = match parent_session {
                         Some(parent) => {
@@ -340,12 +322,7 @@ fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngin
                             pa_core::session::manager::SessionManager::persisted(&cwd, &session_dir)
                         }
                     };
-                    // TS `acquireReplacementLease(sessionManager.getSessionFile())`:
-                    // the fresh session's file is leased BEFORE the
-                    // replacement can write it — the runtime lease is the
-                    // cross-process ownership record, and the handle's
-                    // lease slot releases exactly when the engine that
-                    // owned it goes away.
+                    // The fresh session's file is leased BEFORE the replacement can write it.
                     let lease = pa_daemon::lease::acquire_runtime_session_lease(
                         manager
                             .get_session_file()
@@ -361,13 +338,7 @@ fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngin
                 } => {
                     let session_dir = replacement_session_dir(&options);
                     let cwd = options.config.cwd.clone();
-                    // The ownership guard every in-process open applies:
-                    // refuse a file a live daemon worker or another
-                    // process already hosts (a second writer over a
-                    // persisted history), and hold its runtime lease for
-                    // the opened session. A same-path reopen skips the
-                    // guard (TS `acquireReplacementLease` reuses the
-                    // current lease; the session layer adopted it).
+                    // A same-path reopen skips the guard (the session layer adopted it).
                     let lease = if *reuse_lease {
                         None
                     } else {
@@ -376,23 +347,21 @@ fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngin
                             session_path,
                         )?)
                     };
-                    // A failed open's early return drops the lease
-                    // (released), so errors never leave an orphaned hold.
                     let manager = open_session_file(session_path, &session_dir, &cwd, None)?;
-                    // The replacement ADOPTS the opened session's own
-                    // cwd (TS createRuntime builds the runtime over the
-                    // session's project, not the CLI startup
-                    // directory): tools, settings, and file work run
-                    // against the session's repository.
+                    // The replacement ADOPTS the opened session's own cwd: tools,
+                    // settings, and file work run against the session's repository.
                     options.config.cwd = manager.get_cwd().to_path_buf();
                     (manager, lease)
                 }
             };
-            let engine = if let Ok(script) = std::env::var("PRIME_AGENT_FAUX_SCRIPT") {
-                build_faux_engine_with(&options, &script, Some(manager), "rpc").await?
-            } else {
-                build_headless_engine_with(&options, Some(manager), "rpc").await?
-            };
+            let engine = build_engine(
+                &options,
+                faux_script_env()?.as_ref(),
+                Some(manager),
+                "rpc",
+                &HeadlessEmbedding::Rpc,
+            )
+            .await?;
             let mut handle = pa_daemon::rpc::session::RpcEngineHandle::from(engine);
             handle.session_lease = opened_lease;
             Ok(handle)
@@ -400,8 +369,6 @@ fn rpc_engine_factory(options: &RunOptions) -> pa_daemon::rpc::session::RpcEngin
     })
 }
 
-/// The replacement builds' session dir (the resolved one, else the
-/// default under the agent dir).
 fn replacement_session_dir(options: &RunOptions) -> std::path::PathBuf {
     options
         .session
@@ -410,8 +377,6 @@ fn replacement_session_dir(options: &RunOptions) -> std::path::PathBuf {
         .unwrap_or_else(|| options.config.agent_dir.join("sessions"))
 }
 
-/// The RPC mode's engine-handle conversion (the composition root's
-/// `HeadlessEngine` into the mode's handle).
 impl From<HeadlessEngine> for pa_daemon::rpc::session::RpcEngineHandle {
     fn from(parts: HeadlessEngine) -> Self {
         Self {
@@ -419,6 +384,9 @@ impl From<HeadlessEngine> for pa_daemon::rpc::session::RpcEngineHandle {
             model: parts.model,
             api_key: parts.api_key,
             provider_target: parts.provider_target,
+            bash_wake: parts
+                .rpc_bash_wake
+                .expect("the RPC embedding builds its background-bash wake handle"),
             session_lease: None,
         }
     }
@@ -428,105 +396,259 @@ fn run_print_mode(options: &RunOptions) -> Result<i32, String> {
     if options.verbose {
         crate::headless_exit::enable_trace();
     }
+    with_print_runtime(options, |options, lease| {
+        Box::pin(print_mode_main(options, lease))
+    })
+}
+
+/// Own the print lease through runtime shutdown, including errors and unwinding.
+/// The operation seam lets the regression exercise a writer pending at shutdown.
+fn with_print_runtime<Context>(
+    context: &Context,
+    run: impl for<'a> FnOnce(
+        &'a Context,
+        &'a mut Option<pa_daemon::lease::SessionLease>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<i32, String>> + 'a>,
+    >,
+) -> Result<i32, String> {
+    // Declared first so unwinding also stops all runtime tasks before release.
+    let mut lease = None;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    let result = rt.block_on(print_mode_main(options));
-    // The exit follows the answer: a bounded runtime shutdown, never the
-    // implicit drop's unbounded wait for blocking work still running.
+    let result = rt.block_on(run(context, &mut lease));
+    // Semantic writes have settled; cancel residual tasks while retaining the
+    // session lease through the bounded shutdown.
     crate::headless_exit::shut_down(rt);
     result
 }
 
-async fn print_mode_main(options: &RunOptions) -> Result<i32, String> {
+async fn print_mode_main(
+    options: &RunOptions,
+    lease: &mut Option<pa_daemon::lease::SessionLease>,
+) -> Result<i32, String> {
     crate::print_terminal::track_headless_invocation(options).await;
     // `print` or `json`: the telemetry execution mode is the app mode (TS
     // main.ts `executionMode: appMode`).
-    let headless = build_headless_engine(options, options.app_mode.as_str()).await?;
+    crate::telemetry_notice::print_if_due(&options.config);
+    let (session_manager, opened_lease) = select_session_manager_with_lease(options)?;
+    *lease = opened_lease;
+    let session_manager = session_manager.unwrap_or_else(|| {
+        pa_core::session::manager::SessionManager::in_memory(&options.config.cwd)
+    });
+    // The print root's inline-subagent node: the quiescence drive, the
+    // host, and the messaging controller all hang off it. The faux
+    // script (when scripted) rides the recipe down to every child.
+    let faux = faux_script_env()?;
+    let root_node = crate::print_rlm::root_node(options, &session_manager, faux.clone());
+    let headless = build_engine(
+        options,
+        faux.as_ref(),
+        Some(session_manager),
+        options.app_mode.as_str(),
+        &HeadlessEmbedding::Root {
+            node: std::sync::Arc::clone(&root_node),
+        },
+    )
+    .await?;
     let engine = std::sync::Arc::new(headless.engine);
-    let result = async {
-        // The CLI `--goal` seed (TS constructor seeding): a fresh root
-        // branch starts the goal and queues its continuation context as
-        // the first turn's leading row; a resumed or already-seeded branch
-        // keeps its persisted goal. Depth 0 only — the print session is a
-        // root session (TS main.ts gates `initialGoal` on `rlmDepth === 0`
-        // the same way).
+    crate::print_rlm::adopt_built_engine(&root_node, &engine, &headless.model).await;
+    let exit = async {
         if let Some(goal) = &options.config.initial_goal {
             engine
                 .seed_initial_goal(&goal.objective, goal.token_budget.map(u64::from))
                 .await
                 .map_err(|error| format!("{error:#}"))?;
         }
-        run_prompts_and_emit(&engine, &headless.model, headless.api_key.clone(), options).await
+        run_prompts_and_emit(
+            &engine,
+            &headless.model,
+            headless.api_key.clone(),
+            options,
+            &root_node,
+        )
+        .await
     }
     .await;
-    // Every output and every semantic drain is done: the kernel's
-    // background boot (and any setup step it runs) is abandoned now, its
-    // children killed, instead of finishing after the answer.
+    crate::print_rlm::dispose_inline_subagents(&root_node).await;
     crate::headless_exit::phase("kernel abandon");
     engine.abandon_kernel();
-    result
+    exit
 }
 
-/// Assemble the in-process session engine for a headless run: model
-/// resolution, session persistence, and the engine facade. The faux-script
-/// seam (`PRIME_AGENT_FAUX_SCRIPT`) drives the same assembly without the
-/// network; verification harness only, never set by the product.
-///
+/// One engine build for every headless embedding: the scripted
+/// verification seam when a faux script is set, the real provider
+/// otherwise.
+pub(crate) async fn build_engine(
+    options: &RunOptions,
+    faux: Option<&serde_json::Value>,
+    session_manager: Option<pa_core::session::manager::SessionManager>,
+    execution_mode: &str,
+    embedding: &HeadlessEmbedding,
+) -> Result<HeadlessEngine, String> {
+    match faux {
+        Some(script) => {
+            build_faux_engine_with(options, script, session_manager, execution_mode, embedding)
+                .await
+        }
+        None => {
+            build_headless_engine_with(options, session_manager, execution_mode, embedding).await
+        }
+    }
+}
+
+/// The faux-script verification seam (`PRIME_AGENT_FAUX_SCRIPT`; never
+/// set by the product): the script env parse, the per-child queues, and
+/// the scripted engine build.
+mod faux;
+
+pub(crate) use faux::{
+    build_faux_engine_with, faux_response_steps, faux_script_env, FauxChildQueue,
+};
+
 /// The switchable provider target the session's stream reads per call
 /// (shared with the RPC mode, whose picker model switches swap it live).
 pub type ProviderTargetSlot = std::sync::Arc<std::sync::RwLock<Option<ProviderTarget>>>;
 
-/// The assembled headless engine plus the model and request auth it runs
-/// on, so host transports can drive session-command executors
-/// (compact/refine) with the session's own model.
-struct HeadlessEngine {
-    engine: pa_core::session_engine::engine::SessionEngine,
-    model: Model,
-    api_key: Option<String>,
+/// What one engine build varies by session: the print root (inline
+/// subagents over its node), a spawned inline child (its own model,
+/// auth, and session), or the RPC mode (no inline subagents — today's
+/// behavior).
+pub(crate) enum HeadlessEmbedding {
+    Root {
+        node: std::sync::Arc<crate::print_rlm::InlineSessionNode>,
+    },
+    Child(Box<ChildEngineOverrides>),
+    Rpc,
+}
+
+/// One spawned inline child's engine deltas: its model lane, the
+/// thinking level it runs, and the parent-edge identity.
+pub(crate) struct ChildEngineOverrides {
+    pub node: std::sync::Arc<crate::print_rlm::InlineSessionNode>,
+    pub lane: ChildLane,
+    pub thinking: pa_types::ai::ModelThinkingLevel,
+    pub semantic_parent_session_id: Option<String>,
+    pub spawned_by_request_id: Option<String>,
+}
+
+/// A child's model source: a real-provider child carries its resolved
+/// model; a scripted child runs its own faux queue.
+pub(crate) enum ChildLane {
+    Real(Box<Model>),
+    Faux(FauxChildQueue),
+}
+
+/// The per-embedding fields both headless builders (the real provider
+/// and the faux script) share: the inline host + agent-message handlers
+/// with the RLM depth, the background-bash wake both engine seams fire
+/// (the completion row's admission wake and the kernel's
+/// background-settle callback), and the late agent-message receipt sink
+/// print sessions record through.
+pub(crate) struct HeadlessEmbeddingFields {
+    pub(crate) rlm_subagent_host:
+        Option<Arc<dyn pa_core::session_engine::rlm_host::RlmSubagentHost>>,
+    pub(crate) extra_host_handlers: Option<pa_core::kernel::shared::HostRequestHandlers>,
+    pub(crate) rlm_depth: Option<u32>,
+    pub(crate) bash_wake: pa_core::session_engine::bash_notices::BashNoticeWake,
+    /// The RPC mode's wake handle, carried onto the engine handle so the
+    /// queue-pump listener parks on it; `None` outside the RPC embedding.
+    pub(crate) rpc_bash_wake: Option<Arc<Notify>>,
+    /// The late fire-and-forget `agent_message.send` receipt sink
+    /// (#10-print); `None` for the RPC embedding (no print node).
+    pub(crate) on_late_sent_agent_message: Option<pa_core::LateSentAgentMessageHandler>,
+}
+
+/// The embedding-owned fields for one headless engine build: print
+/// sessions wake on the inline node's activity (every quiescence park
+/// listens on it), the RPC mode on the built handle's notify.
+pub(crate) fn headless_embedding_fields(embedding: &HeadlessEmbedding) -> HeadlessEmbeddingFields {
+    let node = match embedding {
+        HeadlessEmbedding::Root { node } => Some(Arc::clone(node)),
+        HeadlessEmbedding::Child(overrides) => Some(Arc::clone(&overrides.node)),
+        HeadlessEmbedding::Rpc => None,
+    };
+    let (rlm_subagent_host, extra_host_handlers) = match &node {
+        Some(node) => {
+            let (host, handlers) = crate::print_rlm::inline_subagent_wiring(node);
+            (Some(host), Some(handlers))
+        }
+        None => (None, None),
+    };
+    let (bash_wake, rpc_bash_wake) = if let Some(node) = &node {
+        let node = Arc::clone(node);
+        (
+            Arc::new(move || node.activity.notify_waiters())
+                as pa_core::session_engine::bash_notices::BashNoticeWake,
+            None,
+        )
+    } else {
+        let notify = Arc::new(Notify::new());
+        let wake = {
+            let notify = Arc::clone(&notify);
+            Arc::new(move || notify.notify_waiters())
+                as pa_core::session_engine::bash_notices::BashNoticeWake
+        };
+        (wake, Some(notify))
+    };
+    let on_late_sent_agent_message = node
+        .as_ref()
+        .map(crate::print_rlm::late_sent_agent_message_sink);
+    HeadlessEmbeddingFields {
+        rlm_subagent_host,
+        extra_host_handlers,
+        rlm_depth: match embedding {
+            HeadlessEmbedding::Child(overrides) => Some(overrides.node.depth),
+            HeadlessEmbedding::Root { .. } | HeadlessEmbedding::Rpc => None,
+        },
+        bash_wake,
+        rpc_bash_wake,
+        on_late_sent_agent_message,
+    }
+}
+
+/// The assembled headless engine, so host transports can drive session-command
+/// executors (compact/refine) with the session's own model.
+pub(crate) struct HeadlessEngine {
+    pub(crate) engine: pa_core::session_engine::engine::SessionEngine,
+    pub(crate) model: Model,
+    pub(crate) api_key: Option<String>,
     /// The live provider target: the stream reads it per call, and the
     /// RPC mode's picker switches swap it (TS `setModel`'s stream
     /// re-registration; `set_model` swaps it without rebuilding the
     /// session).
     provider_target: ProviderTargetSlot,
+    /// The RPC mode's background-bash wake handle; `None` for the print
+    /// embeddings (their wake is the node's activity notify).
+    pub(crate) rpc_bash_wake: Option<Arc<Notify>>,
 }
 
+/// Transfer the opened lease to its mode before fallible engine assembly.
 async fn build_headless_engine_parts(
     options: &RunOptions,
     execution_mode: &str,
+    lease: &mut Option<pa_daemon::lease::SessionLease>,
 ) -> Result<HeadlessEngine, String> {
-    let (engine, lease) = build_headless_engine_parts_with_lease(options, execution_mode).await?;
-    std::mem::forget(lease);
-    Ok(engine)
-}
-
-/// The same assembly, returning the opened session's runtime lease
-/// alongside (a long-lived connection holds it on the engine handle so a
-/// replacement releases it with the engine it guarded; the one-shot
-/// modes forget it for the process lifetime).
-async fn build_headless_engine_parts_with_lease(
-    options: &RunOptions,
-    execution_mode: &str,
-) -> Result<(HeadlessEngine, Option<pa_daemon::lease::SessionLease>), String> {
     // Every headless mode discloses immediately (TS main: only the
     // interactive `deferTelemetryNoticeForOnboarding` holds the notice
     // back behind onboarding; `--list-models` never reaches this
     // assembly, matching the TS exit before its diagnostics report).
     crate::telemetry_notice::print_if_due(&options.config);
-    let (session_manager, lease) = select_session_manager_with_lease(options)?;
-    if let Ok(script) = std::env::var("PRIME_AGENT_FAUX_SCRIPT") {
-        let engine =
-            build_faux_engine_with(options, &script, session_manager, execution_mode).await?;
-        return Ok((engine, lease));
-    }
-    let engine = build_headless_engine_with(options, session_manager, execution_mode).await?;
-    Ok((engine, lease))
+    let (session_manager, opened_lease) = select_session_manager_with_lease(options)?;
+    *lease = opened_lease;
+    build_engine(
+        options,
+        faux_script_env()?.as_ref(),
+        session_manager,
+        execution_mode,
+        &HeadlessEmbedding::Rpc,
+    )
+    .await
 }
 
-/// The session-manager selection every engine build shares
-/// (`--no-session` keeps the engine in-memory; anything else resolves
-/// through the flag order), returning the opened session's runtime
+/// The session-manager selection every engine build shares, returning the opened session's runtime
 /// lease.
 fn select_session_manager_with_lease(
     options: &RunOptions,
@@ -544,30 +666,41 @@ fn select_session_manager_with_lease(
     Ok((Some(manager), lease))
 }
 
-/// The real-provider engine assembly over one session-manager selection
-/// (the print/json path and the RPC mode's replacement builds).
-async fn build_headless_engine_with(
+/// The real-provider engine assembly over one session-manager selection:
+/// model resolution, session persistence, and the engine facade.
+pub(crate) async fn build_headless_engine_with(
     options: &RunOptions,
     session_manager: Option<pa_core::session::manager::SessionManager>,
     execution_mode: &str,
+    embedding: &HeadlessEmbedding,
 ) -> Result<HeadlessEngine, String> {
     let config = &options.config;
 
-    // Model registry: composed catalog + models.json with real auth.
+    // Model registry: composed catalog + models.json with real auth. A
+    // spawned child carries its already-resolved model and request auth
+    // (the spawn resolved them against this same catalog).
     let auth = pa_core::auth::AuthStorage::create(&config.agent_dir);
     let mut registry =
         pa_core::models::ModelRegistry::create(auth, config.agent_dir.join("models.json"));
     registry.load_private_authorization_from_cache();
-    let model = select_model(
-        &mut registry,
-        config.provider.as_deref(),
-        config.model.as_deref(),
-    )?;
-
-    // Resolve request auth once (single-shot mode): the merged headers
-    // ship on the request (the TS `getApiKeyAndHeaders` single-owner path;
-    // TS #2497 removed the provider-side team-header fallback, so the
-    // stored team / `PRIME_TEAM_ID` reach the wire through these headers).
+    let model = match embedding {
+        HeadlessEmbedding::Child(overrides) => match &overrides.lane {
+            ChildLane::Real(model) => (**model).clone(),
+            ChildLane::Faux(_) => {
+                return Err("a scripted child builds through the faux builder".to_string());
+            }
+        },
+        HeadlessEmbedding::Root { .. } | HeadlessEmbedding::Rpc => {
+            // The opened session's active context joins the selection (TS
+            // `createAgentSession`); `--no-session` selects from no session.
+            let session = session_manager
+                .as_ref()
+                .map(pa_core::session::manager::SessionManager::active_context);
+            select_model(&mut registry, config, session.as_ref()).await?
+        }
+    };
+    // Resolve request auth once: the stored team / `PRIME_TEAM_ID` reach the wire through these
+    // headers (children resolve against the same catalog the spawn used).
     let resolved = registry.get_api_key_and_headers(&model, model.headers.as_ref());
 
     // The stream reads the provider target per call (the switchable seam
@@ -584,40 +717,47 @@ async fn build_headless_engine_with(
             headers: resolved.headers.clone(),
             transport: Some(transport),
         })));
-    // The armed image route's target, shared with the stream seam: while
-    // an episode is armed the stream serves THIS target (TS keeps the
-    // routed override over the whole turn, picker switches included), so
-    // a concurrent `set_model` picker write to the slot below cannot
-    // redirect an in-flight routed turn's continuation requests. The
-    // settle clears the slot, and the switch lands there (the settle's
-    // still-routed guard leaves it).
-    let armed_target: std::sync::Arc<std::sync::Mutex<Option<ProviderTarget>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let stream_fn = route_authoritative_stream_fn(
-        std::sync::Arc::clone(&provider_target),
-        std::sync::Arc::clone(&armed_target),
-    );
-    // TS settings.imageModel routing (the headless surfaces' host seam):
-    // image-attaching batches on a session model without image input
-    // route to the configured image model or fail the turn with the
-    // actionable refusal naming the setting.
-    // The routing decision reads the resolved session model live (a
-    // mid-run switch rewrites the serving slot) and receives the LIVE
-    // thinking level per batch (the engine passes its agent state's level,
-    // so a mid-run `/effort` or model switch never routes at a stale level).
-    let image_model_router = headless_image_model_router(
-        &provider_target,
-        std::sync::Arc::clone(&armed_target),
-        config.cwd.clone(),
-        config.agent_dir.clone(),
-        model.clone(),
-    );
     let agent_model: AgentModel = json_round_trip(&model).ok_or("model conversion failed")?;
 
-    // Telemetry (TS `installAgentTelemetry` parity for headless sessions):
-    // the CLI's env/settings opt-out decides; enabled sessions resolve the
-    // configured sinks. Depth 0 only, enforced by the engine.
-    let telemetry = (!config.telemetry_disabled).then(|| {
+    // Children serve their own provider target (the route-authoritative
+    // stream would serve the parent's model, and children have no
+    // image-model routing).
+    let (stream_fn, image_model_router) = if matches!(embedding, HeadlessEmbedding::Child(_)) {
+        (
+            switchable_stream_fn(std::sync::Arc::clone(&provider_target)),
+            None,
+        )
+    } else {
+        // While an episode is armed the stream serves THIS target, so a concurrent
+        // `set_model` picker write cannot redirect an in-flight routed turn.
+        let armed_target: std::sync::Arc<std::sync::Mutex<Option<ProviderTarget>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let stream_fn = route_authoritative_stream_fn(
+            std::sync::Arc::clone(&provider_target),
+            std::sync::Arc::clone(&armed_target),
+        );
+        // TS settings.imageModel routing: image-attaching batches on a session model
+        // without image input route to the configured image model or refuse.
+        (
+            stream_fn,
+            Some(headless_image_model_router(
+                &provider_target,
+                armed_target,
+                config.cwd.clone(),
+                config.agent_dir.clone(),
+                model.clone(),
+            )),
+        )
+    };
+
+    // Telemetry: the CLI's env/settings opt-out decides; depth 0 only, enforced by the engine.
+    // A spawned child never reports (the engine's depth gate holds anyway).
+    let telemetry = (!config.telemetry_disabled
+        && matches!(
+            embedding,
+            HeadlessEmbedding::Root { .. } | HeadlessEmbedding::Rpc
+        ))
+    .then(|| {
         let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
         pa_core::session_engine::telemetry::TelemetryWiring {
             client: pa_core::session_engine::telemetry::build_client(&settings, &config.agent_dir),
@@ -631,11 +771,6 @@ async fn build_headless_engine_with(
             ),
         }
     });
-    // TS `sdk.ts` seeds the Agent's queue modes from the settings manager
-    // (`steeringMode`/`followUpMode`): the print runtime reads the same
-    // settings its telemetry does, so the agent-level queues drain per
-    // the configured modes (the steering default is "all"; follow-ups
-    // keep "one-at-a-time").
     let queue_settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
     let queue_mode = |mode: pa_core::settings::QueueModeSetting| match mode {
         pa_core::settings::QueueModeSetting::All => pa_agent::agent::QueueMode::All,
@@ -643,15 +778,7 @@ async fn build_headless_engine_with(
     };
     let steering_mode = Some(queue_mode(queue_settings.get_steering_mode()));
     let follow_up_mode = Some(queue_mode(queue_settings.get_follow_up_mode()));
-    // TS `createAgentSessionServices` builds every CLI session — print
-    // included — on a manager whose `getUserServers`/`getCatalogSources`
-    // closures re-read settings on every resolution (construction and
-    // each later `refresh()`: the API the remote-catalog change
-    // subscription drives mid-session), and whose declared local catalog
-    // sources resolve. The session's `mcp.config` host handler keeps
-    // serving the registration-time integrations (the pa-core handler
-    // design, shared with the daemon worker). Auth construction blocks;
-    // run it off the async runtime like the engine's own gating does.
+    // Auth construction blocks; run it off the async runtime like the engine's own gating does.
     let mcp_manager = {
         let cwd = config.cwd.clone();
         let agent_dir = config.agent_dir.clone();
@@ -668,20 +795,48 @@ async fn build_headless_engine_with(
     // ledger-less but the request ids still go on the wire.
     let session_manager = session_manager
         .unwrap_or_else(|| pa_core::session::manager::SessionManager::in_memory(&config.cwd));
-    let semantic_edges = Some(
-        pa_core::session_engine::semantic_edges::SemanticEdgeIdentity {
-            session_id: session_manager.get_session_id().to_string(),
-            ledger_path: pa_core::session_engine::semantic_edges::semantic_edge_ledger_path(
-                None,
-                session_manager.get_session_artifact_dir().as_deref(),
+    let HeadlessEmbeddingFields {
+        rlm_subagent_host,
+        extra_host_handlers,
+        rlm_depth,
+        bash_wake,
+        rpc_bash_wake,
+        on_late_sent_agent_message,
+    } = headless_embedding_fields(embedding);
+    let (semantic_edges, thinking_level) = match embedding {
+        HeadlessEmbedding::Child(overrides) => (
+            Some(
+                pa_core::session_engine::semantic_edges::SemanticEdgeIdentity {
+                    session_id: session_manager.get_session_id().to_string(),
+                    // A spawned child's ledger lives in its rlm session dir.
+                    ledger_path: pa_core::session_engine::semantic_edges::semantic_edge_ledger_path(
+                        Some(std::path::Path::new(&overrides.node.session_dir)),
+                        session_manager.get_session_artifact_dir().as_deref(),
+                    ),
+                    parent_session_id: overrides.semantic_parent_session_id.clone(),
+                    spawned_by_request_id: overrides.spawned_by_request_id.clone(),
+                },
             ),
-            parent_session_id: None,
-            spawned_by_request_id: None,
-        },
-    );
+            Some(pa_core::session_engine::provider_adapter::map_thinking_level(overrides.thinking)),
+        ),
+        HeadlessEmbedding::Root { .. } | HeadlessEmbedding::Rpc => (
+            Some(
+                pa_core::session_engine::semantic_edges::SemanticEdgeIdentity {
+                    session_id: session_manager.get_session_id().to_string(),
+                    ledger_path: pa_core::session_engine::semantic_edges::semantic_edge_ledger_path(
+                        None,
+                        session_manager.get_session_artifact_dir().as_deref(),
+                    ),
+                    parent_session_id: None,
+                    spawned_by_request_id: None,
+                },
+            ),
+            Some(resolve_thinking_level(config, &model)),
+        ),
+    };
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
-            on_late_sent_agent_message: None,
+            on_late_sent_agent_message,
             cron_store: None,
             semantic_edges,
             telemetry,
@@ -691,7 +846,7 @@ async fn build_headless_engine_with(
             agent_dir: config.agent_dir.clone(),
             mcp_manager: Some(mcp_manager),
             model: Some(agent_model),
-            thinking_level: Some(resolve_thinking_level(config, &model)),
+            thinking_level,
             stream_fn: Some(stream_fn),
             tools: builtin_tools(&config.cwd),
             custom_system_prompt: config.system_prompt.clone(),
@@ -702,7 +857,7 @@ async fn build_headless_engine_with(
             allow_recursion: None,
             session_manager: Some(session_manager),
             provider_session_id: None,
-            extra_host_handlers: None,
+            extra_host_handlers,
             conversation_log_path: None,
             additional_skill_paths: config
                 .skills
@@ -716,19 +871,20 @@ async fn build_headless_engine_with(
                 .collect(),
             resource_loading: config.resource_loading(),
             extra_builtin_skill_overrides: vec![],
-            rlm_subagent_host: None,
-            rlm_depth: None,
+            rlm_subagent_host,
+            rlm_usage_store: None,
+            progress_note_emit: None,
+            rlm_depth,
+            daemonless: true,
             model_info: Some(model.clone()),
-            // TS print/headless sessions build through the same
-            // `createDefaultRuntimeFactory` runtime (prewarmIpythonKernel:
-            // true), so the kernel prewarms at creation; the engine's
-            // depth-0 gate matches the TS session's. A one-shot print/json
-            // run finishes the environment setup before its first turn.
-            prewarm_ipython_kernel: Some(kernel_prewarm(options.app_mode)),
-            on_background_work_settled: None,
+            prewarm_ipython_kernel: (!matches!(embedding, HeadlessEmbedding::Child(_)))
+                .then_some(kernel_prewarm(options.app_mode)),
+            bash_notice_wake: Some(Arc::clone(&bash_wake)),
+            on_background_work_settled: Some(bash_wake),
             queued_goal_context_purge: None,
             queued_steering_probe: None,
-            image_model_router: Some(image_model_router),
+            should_stop_after_turn: None,
+            image_model_router,
         },
     )
     .await
@@ -738,6 +894,7 @@ async fn build_headless_engine_with(
         model,
         api_key: resolved.api_key,
         provider_target,
+        rpc_bash_wake,
     })
 }
 
@@ -784,11 +941,8 @@ fn route_authoritative_stream_fn(
     )
 }
 
-/// The headless image-model router (TS `resolveImageModelOverride` over the
-/// CLI's settings + registry, applied to the session's swappable stream
-/// target): the routing decision for one dispatched batch — `Err` is the
-/// actionable refusal that fails the turn — and the serving-target swap
-/// (`None` restores the session target).
+/// The routing decision for one dispatched batch (`Err` fails the turn with the
+/// actionable refusal) and the serving-target swap (`None` restores the target).
 fn headless_image_model_router(
     provider_target: &std::sync::Arc<
         std::sync::RwLock<Option<pa_core::session_engine::provider_adapter::ProviderTarget>>,
@@ -800,16 +954,11 @@ fn headless_image_model_router(
     agent_dir: std::path::PathBuf,
     session_model: pa_types::ai::Model,
 ) -> pa_core::session_engine::image_model_routing::ImageModelRouter {
-    // The pre-route session target, captured at the FIRST arm (not at
-    // build): a mid-run model switch rewrites the live slot, and the
-    // capture-then-restore contract (arm -> serve the route -> settle ->
-    // restore) must return the SWITCHED-TO target, never the build-time
-    // snapshot. Cleared on every settle so the next arm re-captures
-    // whatever the session serves by then.
+    // The pre-route session target, captured at the FIRST arm (not at build):
+    // the restore must return the SWITCHED-TO target, never the build-time one.
     let armed_from = std::sync::Arc::new(std::sync::Mutex::new(None));
-    // `armed_target` (the caller's slot, shared with the stream seam) holds
-    // the routed target the arm wrote, so the settle can tell a slot that
-    // still holds the route from one a mid-run `/model` switch rewrote.
+    // Holds the routed target the arm wrote, so the settle can tell a slot
+    // that still holds the route from one a mid-run `/model` switch rewrote.
     let armed_to = armed_target;
     let decide_agent_dir = agent_dir.clone();
     let decide_provider_target = std::sync::Arc::clone(provider_target);
@@ -821,13 +970,8 @@ fn headless_image_model_router(
             if !carries_images {
                 return Ok(None);
             }
-            // The routing decision runs at commit and needs the SESSION
-            // model. During an armed episode the live slot holds the
-            // ROUTED target (a consecutive image batch re-decides before
-            // the previous episode settles), so the capture is the
-            // session model; un-armed, the live slot is the session
-            // target (a mid-run model switch rewrote it). The build-time
-            // pair is the fallback only when both are somehow empty.
+            // The routing decision needs the SESSION model: during an armed episode
+            // the live slot holds the ROUTED target; un-armed, it is the live slot.
             let armed_capture = decide_armed_from
                 .lock()
                 .expect("armed-from lock")
@@ -855,15 +999,8 @@ fn headless_image_model_router(
             registry.load_private_authorization_from_cache();
             let available: Vec<pa_types::ai::Model> =
                 registry.get_available().into_iter().cloned().collect();
-            // Route acceptance uses the same resolved-auth result the arm
-            // path installs: a provider can be signed in (the status
-            // probe) while its key resolution still fails, and a route
-            // accepted on the status probe alone would arm an
-            // unauthenticated target — the image turn's content would
-            // reach the provider without credentials instead of the
-            // actionable unresolvable-reference refusal (TS resolves the
-            // auth at request time and fails the turn before any request
-            // leaves; the port refuses the reference up front).
+            // Route acceptance uses the same resolved-auth result the arm path
+            // installs: a provider can be signed in while its key resolution still fails.
             let resolvable_auth: std::collections::HashSet<(String, String)> = available
                 .iter()
                 .filter(|model| {
@@ -880,10 +1017,8 @@ fn headless_image_model_router(
                     service_tier: None,
                     image_model_reference: image_model_reference.as_deref(),
                     available_models: &available,
-                    // Keyed (provider, id): one provider's authenticated
-                    // row must not vouch for another provider's same-id
-                    // model (the catalog allows shared ids across
-                    // providers).
+                    // Keyed (provider, id): one provider's authenticated row must not vouch for
+                    // another provider's same-id model.
                     has_configured_auth: &|model| {
                         resolvable_auth.contains(&(model.provider.clone(), model.id.clone()))
                     },
@@ -897,15 +1032,11 @@ fn headless_image_model_router(
         let armed_to = std::sync::Arc::clone(&armed_to);
         std::sync::Arc::new(move |route: Option<&pa_core::models::ResolvedImageModel>| {
             if let Some(resolved) = route {
-                // The first swap of the episode captures the session
-                // target it replaces (the later arms re-write the slot,
-                // so only the arm preceding them holds it).
+                // The first swap of the episode captures the session target it replaces.
                 let mut armed_from = armed_from.lock().expect("armed-from lock");
                 if armed_from.is_none() {
                     armed_from.clone_from(&provider_target.read().expect("provider target lock"));
                 }
-                // The routed model's request auth resolves like the
-                // session model's did at startup (registry + headers).
                 let auth = pa_core::auth::AuthStorage::create(&agent_dir);
                 let mut registry =
                     pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
@@ -925,28 +1056,19 @@ fn headless_image_model_router(
                     service_tier: resolved.service_tier,
                     transport,
                 };
-                // The arm records the routed target it writes so the
-                // settle's still-routed guard can tell a slot the route
-                // still holds from one a mid-run `/model` switch rewrote
-                // (without this write the guard always passes).
                 *armed_to.lock().expect("armed-to lock") = Some(target.clone());
                 *provider_target.write().expect("provider target lock") = Some(target);
             } else {
-                // Restore the captured session target ONLY when the slot
-                // still holds the routed target the arm wrote: a mid-run
-                // `/model` switch rewrote the slot with the new session
-                // target, and the settle must not drag requests back to
-                // the pre-route model.
+                // Restore the captured session target ONLY when the slot still holds the routed
+                // target the arm wrote.
                 let captured = armed_from.lock().expect("armed-from lock").take();
                 let routed = armed_to.lock().expect("armed-to lock").take();
                 let current = provider_target
                     .read()
                     .expect("provider target lock")
                     .clone();
-                // The full serving target, credentials included: an ACP
-                // model switch may keep the same model id while rotating
-                // its api key or headers, and the guard must treat that
-                // slot as switched, not as the route's own.
+                // The full serving target, credentials included: a switch may keep the same
+                // id while rotating its api key; the guard treats that slot as switched.
                 let still_routed = match (&current, &routed) {
                     (Some(current), Some(routed)) => {
                         current.model.id == routed.model.id
@@ -970,18 +1092,8 @@ fn headless_image_model_router(
     }
 }
 
-/// The engine alone (callers that do not drive session commands).
-async fn build_headless_engine(
-    options: &RunOptions,
-    execution_mode: &str,
-) -> Result<HeadlessEngine, String> {
-    build_headless_engine_parts(options, execution_mode).await
-}
-
-/// The session header line: the session file's `type: "session"` entry in
-/// the TS wire shape and field order (`getSessionHeader` ->
-/// `JSON.stringify`), so a fresh run reports the same identity row the TS
-/// json stream leads with.
+/// The session header line: the session file's `type: "session"` entry in the
+/// TS wire shape and field order.
 async fn session_header_json(
     engine: &pa_core::session_engine::engine::SessionEngine,
 ) -> Option<serde_json::Value> {
@@ -1034,34 +1146,85 @@ async fn session_header_json(
     Some(serde_json::Value::Object(object))
 }
 
-fn select_model(
+async fn select_model(
     registry: &mut pa_core::models::ModelRegistry,
-    provider: Option<&str>,
-    model: Option<&str>,
+    config: &crate::mode::RuntimeConfig,
+    session: Option<&pa_core::session::SessionContext>,
 ) -> Result<Model, String> {
-    let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
-    let Some(model_name) = model else {
-        // No model selection: prefer the registry's featured default.
-        let all: Vec<Model> = registry.get_all().to_vec();
-        if let Some(default) = pa_core::models::find_preferred_default_model(&available) {
-            return Ok(default.clone());
+    // Explicit selectors retain the CLI resolver's provider inference and do
+    // not inherit an unrelated saved provider.
+    if let Some(model_name) = config.model.as_deref() {
+        let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
+        let resolved =
+            pa_core::models::resolve_cli_model(config.provider.as_deref(), model_name, &available);
+        if let Some(error) = resolved.error {
+            return Err(error);
         }
-        return all.first().cloned().ok_or_else(|| {
-            "No models available. Check your installation or add models to models.json.".to_string()
-        });
-    };
-    let resolved = pa_core::models::resolve_cli_model(provider, model_name, &available);
-    if let Some(error) = resolved.error {
-        return Err(error);
+        return resolved
+            .model
+            .ok_or_else(|| "No matching model found.".to_string());
     }
-    resolved
-        .model
-        .ok_or_else(|| "No matching model found.".to_string())
+    // A resumed session with messages restores its own model before the
+    // defaults chain (TS `createAgentSession`), through the daemon restore's
+    // bounded catalog-readiness wait; a miss falls through on the record.
+    if let Some((provider, model_id)) = session
+        .filter(|context| !context.messages.is_empty())
+        .and_then(|context| context.model.as_ref())
+    {
+        if let Some(model) = pa_core::models::find_session_model_with_readiness_wait(
+            registry,
+            provider,
+            model_id,
+            pa_core::models::SESSION_MODEL_RESTORE_READINESS_TIMEOUT_MS,
+        )
+        .await
+        {
+            return Ok(model);
+        }
+        eprintln!("Could not restore model {provider}/{model_id}");
+    }
+    // A missed restore's readiness window may have refreshed the catalog, so
+    // the defaults chain resolves against the refreshed view.
+    let settings = pa_core::settings::SettingsManager::create(&config.cwd, &config.agent_dir);
+    let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
+    let saved_provider = settings.get_default_provider();
+    let flag_provider = config.provider.as_deref();
+    let saved_model = settings.get_default_model().filter(|_| {
+        flag_provider.is_none_or(|provider| {
+            saved_provider.is_some_and(|saved| provider.eq_ignore_ascii_case(saved))
+        })
+    });
+    if let Some(saved_model) = saved_model {
+        // Saved IDs must exist in the authenticated catalog. Do not synthesize
+        // a fallback model, especially an unauthorized private Prime model.
+        // The lookup is scoped like TS findInitialModel's saved default: the
+        // flag, when given, has already matched the saved provider above.
+        let scope = flag_provider.or(saved_provider);
+        return available.iter().find(|model| {
+            scope.is_none_or(|provider| model.provider.eq_ignore_ascii_case(provider))
+                && (model.id.eq_ignore_ascii_case(saved_model)
+                    || format!("{}/{}", model.provider, model.id).eq_ignore_ascii_case(saved_model))
+        }).cloned().ok_or_else(|| format!("Configured default model \"{saved_model}\" is unavailable. Check settings.json, models.json, and provider authentication."));
+    }
+    // A settings defaultProvider without a defaultModel does not scope the
+    // no-flag choice (TS reads the two keys together); only the flag does.
+    let candidates: Vec<Model> = available
+        .into_iter()
+        .filter(|model| {
+            flag_provider.is_none_or(|provider| model.provider.eq_ignore_ascii_case(provider))
+        })
+        .collect();
+    pa_core::models::find_preferred_default_model(&candidates)
+        .or_else(|| candidates.first())
+        .cloned()
+        .ok_or_else(|| match flag_provider {
+            Some(provider) => format!("No available models for provider \"{provider}\". Check models.json and provider authentication."),
+            None => "No authenticated models available. Configure a provider or select a model explicitly.".to_string(),
+        })
 }
 
-/// Resolve the session thinking level with the sdk.ts `createAgentSession`
-/// order: the CLI flag, then the settings default, then "medium" — always
-/// clamped to what the model supports.
+/// Resolve the session thinking level: the CLI flag, then the settings
+/// default, then "medium" — always clamped to what the model supports.
 fn resolve_thinking_level(
     config: &crate::mode::RuntimeConfig,
     model: &Model,
@@ -1075,7 +1238,6 @@ fn resolve_thinking_level(
                 .get_default_thinking_level()
                 .map(pa_core::settings::ThinkingLevelSetting::model_level)
         })
-        // TS `DEFAULT_THINKING_LEVEL`.
         .unwrap_or(ModelThinkingLevel::Medium);
     let clamped = pa_ai::models::clamp_thinking_level(model, requested);
     map_thinking_level(clamped)
@@ -1156,9 +1318,8 @@ fn select_headless_session(options: &RunOptions) -> Result<HeadlessSession, Stri
 }
 
 /// The in-process session manager for the selected session. The opened
-/// session's runtime lease returns alongside (a long-lived connection
-/// holds it on the engine handle; the one-shot modes forget it for the
-/// process lifetime).
+/// session's runtime lease returns alongside: the driving mode owns it for
+/// its run's lifetime.
 fn build_session_manager_with_lease(
     options: &RunOptions,
 ) -> Result<
@@ -1192,10 +1353,8 @@ fn build_session_manager_with_lease(
     }
 }
 
-/// Build a FRESH persisted manager and lease its eagerly selected file
-/// before the engine can write it (the replacement `New` path's rule —
-/// TS leases the freshly created session too, `acquireReplacementLease`):
-/// another process can never claim the first lease while this one writes.
+/// Build a FRESH persisted manager and lease its eagerly selected file before the engine can write
+/// it.
 fn fresh_session_with_lease(
     cwd: &std::path::Path,
     session_dir: &std::path::Path,
@@ -1207,14 +1366,8 @@ fn fresh_session_with_lease(
     lease_fresh_manager(manager)
 }
 
-/// Lease a freshly materialized session file before the engine can write
-/// it (the fresh `create`/`continue` paths and the `--fork` copy): the
-/// UNGATED runtime acquire the resume path and the daemon's replacement
-/// `New` arm share — `acquire_session_lease` answers `Ok(None)` whenever
-/// the env gate is unset, so it would leave production fresh sessions
-/// unleased. A fresh file's lease cannot be contended (its uuid is new);
-/// an acquire failure here is environmental (the lease directory), so
-/// the session proceeds with a warning instead of failing startup.
+/// Lease a freshly materialized session file before the engine can write it: the
+/// ungated runtime acquire (`Ok(None)` whenever the env gate is unset).
 fn lease_fresh_manager(
     manager: pa_core::session::manager::SessionManager,
 ) -> (
@@ -1239,17 +1392,8 @@ fn lease_fresh_manager(
     (manager, lease)
 }
 
-/// Open a session file with the TS `SessionManager.open` cwd semantics: an
-/// explicit `--cwd` override wins, else the header's cwd, falling back to the
-/// process cwd for unreadable or new files. Resumed sessions keep the
-/// missing-cwd guard from main.ts.
-/// Guard an in-process open of a persisted session file: probe the
-/// daemon's live roster (`-c`/`-r` refuse a file a live daemon worker
-/// already hosts, `SessionAlreadyActiveError`), then acquire the runtime
-/// lease. Returns the HELD lease — the caller owns its lifetime (the
-/// one-shot print paths forget it for the process lifetime; a
-/// long-lived connection holds it per session and drops it with the
-/// engine it guards).
+/// Guard an in-process open: probe the daemon's live roster, then acquire the
+/// runtime lease. Returns the HELD lease — the caller owns its lifetime.
 fn session_open_guard(
     socket_path: Option<&str>,
     session_path: &std::path::Path,
@@ -1285,9 +1429,8 @@ fn session_open_guard(
                     .or_else(|| row.get("id"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
-                // The descriptive refusal (operator-directed): the TS-identical
-                // first line, then the holder's identity and the next steps —
-                // attach to the live session instead of reopening its file.
+                // The descriptive refusal (operator-directed): attach to the live session instead
+                // of reopening its file.
                 let message = match pa_tui::session_open_error::holder_from_roster(
                     std::slice::from_ref(&row),
                     &target,
@@ -1304,31 +1447,18 @@ fn session_open_guard(
             }
         }
     }
-    // The daemon's roster covers only its own sessions; the session store
-    // is shared, so the file may instead be held by a live process no
-    // roster here names - typically the TypeScript product's daemon or one
-    // of its surviving workers, with this Rust daemon running beside it
-    // (each product owns its daemon; the store is the shared part). The
-    // runtime lease table is the one cross-daemon ownership record the
-    // shared agent dir offers, so a live holder refuses the in-process
-    // open with the same refusal the daemon's create path answers - a
-    // print-mode run over a held file would be a second writer on it.
+    // The daemon's roster covers only its own sessions; the session store is
+    // shared, so the lease table is the one cross-daemon ownership record.
     let agent_dir = crate::config::get_agent_dir();
-    // Acquire, not observe: a probe leaves a window where a daemon worker
-    // (or another CLI) acquires the file's runtime lease after the check
-    // and before this in-process open - two writers on one file. The
-    // acquire is atomic against the shared lease table: a live foreign
-    // holder answers with the session-hold refusal, and the returned
-    // lease is the caller's to hold (the one-shot print run IS the
-    // writer and forgets it for the process lifetime, whose dead pid
-    // the liveness probes treat as released).
+    // Acquire, not observe: a probe leaves a window where another process acquires
+    // between the check and this open — two writers on one file.
     match pa_daemon::lease::acquire_runtime_session_lease(session_path, &agent_dir) {
         Ok(lease) => Ok(lease),
         Err(error) => {
             let Some(active) = error.downcast_ref::<pa_daemon::lease::SessionAlreadyActiveError>()
             else {
-                // The lease table itself failed (io, permissions): never
-                // silently proceed over an undeterminable ownership record.
+                // The lease table itself failed (io, permissions): never silently proceed over an
+                // undeterminable ownership record.
                 return Err(format!(
                     "could not verify the session file is not held: {error:#}"
                 ));
@@ -1421,30 +1551,20 @@ pub(crate) fn render_selector_error(error: &SessionSelectorError) -> String {
     )
 }
 
-/// Model tools for the print runtime: `ipython` only (the TS product exposes
-/// only the REPL tool to the model; `bash` and `edit` live in the kernel).
-/// The engine adds the kernel-backed `ipython` tool itself.
+/// Model tools for the print runtime: `python_repl` only — the engine adds the kernel-backed tool
+/// itself.
 fn builtin_tools(_cwd: &std::path::Path) -> Vec<Arc<dyn pa_agent::types::AgentTool>> {
     Vec::new()
 }
 
 /// Admit prompts, stream json events when requested, and decide the exit code
 /// from the headless terminal result plus the autonomous gate contract.
-/// Shared by the real and faux paths. The turn-boundary compaction checks
-/// (the overflow compact-and-retry arm, the requested compaction/refinement
-/// consumption, and the threshold arm) run through
-/// [`crate::print_boundary::TurnBoundary`] at every prompt's quiescent
-/// boundaries. The autonomous continuation loop rides the agent's
-/// natural-turn-end hook (the TS in-run shape: continuations churn inside
-/// the one prompt wait with no run boundary between them); a held
-/// threshold continuation drains through the boundary pair, and a stop
-/// surfaces only through the headless exit contract (TS: no row, no
-/// stream frame).
 async fn run_prompts_and_emit(
     engine: &std::sync::Arc<pa_core::session_engine::engine::SessionEngine>,
     model: &Model,
     api_key: Option<String>,
     options: &RunOptions,
+    root_node: &std::sync::Arc<crate::print_rlm::InlineSessionNode>,
 ) -> Result<i32, String> {
     let json_mode = options.app_mode == AppMode::Json;
     let mut unsubscribe: Option<pa_agent::agent::Subscription> = None;
@@ -1469,61 +1589,48 @@ async fn run_prompts_and_emit(
                 .await,
         );
     }
-    // The goal continuation surface (the #252 residue): the usage
-    // accounting publishes `goal_update` frames, the in-loop hook runs an
-    // active goal's continuations inside the same agent run (the TS
-    // `getContinuationMessages` seam), and the driver drains the queued
-    // turns (the budget-limit steer, the threshold-held continuation) as
-    // this invocation's follow-up runs. Wired in every output mode — the
-    // loop runs identically in text mode, only silently.
+    // The goal continuation surface: wired in every output mode — the loop runs in text mode too,
+    // only silently.
     let goal = std::sync::Arc::new(crate::print_goal::PrintGoalSurface::new(json_mode));
     goal.seed_publish_baseline(engine).await;
+    let goal_updated_at_start = engine.goal_state().await.updated_at;
     let goal_accounting = goal.wire_accounting(engine, engine.session.agent()).await;
-    // The autonomous run (the verifier/eval composition seam): the CLI
-    // flags enable it, a no-flag session starts disabled and `/autonomous`
-    // rewrites it live. Per-message accounting runs against the one shared
-    // state, and the composed in-run continuation hook drives both the
-    // CLI-flag run and the flipped session state (TS: the continuation rides
-    // the agent loop's natural-turn-end hook, in-run).
+    // The autonomous run: the CLI flags enable it, a no-flag session starts disabled and
+    // `/autonomous` rewrites it live.
     let autonomous = std::sync::Arc::new(match options.config.autonomous.as_ref() {
         Some(config) => HeadlessAutonomous::from_cli(config, &options.config.cwd),
         None => HeadlessAutonomous::disabled(&options.config.cwd),
     });
     let accounting = autonomous.wire_accounting(engine.session.agent()).await;
-    // The composed natural-turn-end hook (TS `_getContinuationMessages`):
-    // the goal arm first (exclusive priority), the autonomous arm on the
-    // fall-through, the boundary gates shared (queued input, a requested
-    // compaction, the threshold arm's held continuation).
+    // The composed natural-turn-end hook: the goal arm first (exclusive priority), the
+    // autonomous arm on the fall-through; both arms defer while inline-subagent work is
+    // unsettled.
     crate::print_autonomous::wire_continuation_hook(
         engine,
         engine.session.agent(),
         model,
         &goal,
         &autonomous,
+        Some(root_node),
     );
     let global_harness_dir =
         pa_core::refinement::get_global_harness_state_dir(&options.config.agent_dir);
     let mut boundary = crate::print_boundary::TurnBoundary::new(json_mode);
     // The autonomous runtime state the session-command executor mutates —
-    // the run's own shared state (the session always carries one, TS
-    // `createAgentSession`), so `/autonomous` rewrites the state the hook,
-    // the accounting, and the exit contract read.
+    // `/autonomous` rewrites what the hook, accounting, and exit contract read.
     let autonomous_state = autonomous.state_handle();
-    // A failed session command rejects the prompt wait (TS print-mode's
-    // catch): the raw error prints to stderr and the run exits 1 without
-    // the later prompts or the terminal selection.
+    // A failed session command rejects the prompt wait: the raw error prints to stderr and the run
+    // exits 1.
     let mut command_failure: Option<String> = None;
-    // The `@file` image attachments ride the initial prompt only (TS
-    // `initialImages`); the later CLI messages stay text.
+    // The `@file` image attachments ride the initial prompt only; the later CLI messages stay text.
     'prompts: for (prompt, images) in options
         .initial_message
         .iter()
         .map(|prompt| (prompt, options.initial_images.clone()))
         .chain(options.messages.iter().map(|prompt| (prompt, Vec::new())))
     {
-        // Session commands (TS `_normalizeSubmission`'s `sessionCommand`
-        // arm) never reach the model loop: the pre-turn boundary stays
-        // theirs to skip and the prompt's turn never exists.
+        // Session commands never reach the model loop: the pre-turn boundary stays theirs to skip
+        // and the prompt's turn never exists.
         if let Some(command) = engine.session.classify_session_command(prompt) {
             let execution = crate::print_session_command::execute_prompt_session_command(
                 engine,
@@ -1533,15 +1640,15 @@ async fn run_prompts_and_emit(
                 global_harness_dir.clone(),
                 &autonomous_state,
                 &command,
+                &images,
             )
             .await;
             if let Some(error) = execution.error {
                 command_failure = Some(error);
                 break 'prompts;
             }
-            // A `/goal` start (or resume) scheduled its continuation as
-            // queued session input: the prompt wait drains it inside the
-            // same wait, as the queued turn with its action frames.
+            // A `/goal` start scheduled its continuation as queued session input: the prompt wait
+            // drains it inside the same wait.
             if let Some(continuation) = execution.continuation_message {
                 goal.run_session_command_continuation(
                     engine,
@@ -1553,8 +1660,8 @@ async fn run_prompts_and_emit(
                 )
                 .await?;
             }
-            // The same queue drain a settled turn gets: held continuations
-            // and armed steers run as this prompt's follow-up turns.
+            // The same queue drain a settled turn gets: held continuations and armed steers run as
+            // this prompt's follow-up turns.
             goal.drive_boundary(
                 engine,
                 &mut boundary,
@@ -1565,12 +1672,6 @@ async fn run_prompts_and_emit(
             .await?;
             continue;
         }
-        // The pre-turn boundary (TS `_runPreTurnCompaction`, the full
-        // `_checkCompaction` pass): an aborted trailing turn drops pending
-        // requests, a stale overflow error from a previous run gets its
-        // recovery attempt, and a resumed context above the reserve
-        // headroom (or a pending model request) compacts before the
-        // admitted prompt runs on the compacted context.
         boundary
             .run_pre_turn(engine, model, api_key.clone())
             .await?;
@@ -1583,43 +1684,23 @@ async fn run_prompts_and_emit(
             .await
             .map_err(|error| format!("{error:#}"))?;
         crate::headless_exit::phase("settled-turn boundary start");
-        // The settled-turn boundary (TS `agent_end`): the overflow
-        // compact-and-retry arm, the turn-boundary requests the kernel
-        // scheduled mid-turn (`compact.run` / `refine.run`), and the
-        // threshold arm. The outcomes persist in the session entries the
-        // terminal result reads.
+        engine.session.agent().wait_for_idle().await;
         boundary
             .run_at_settled_turn(engine, model, api_key.clone(), global_harness_dir.clone())
             .await?;
-        crate::headless_exit::phase("compaction and refinement boundary end");
-        // The goal boundary's queue drain: the threshold-held continuation
-        // (minted ahead of the boundary's compaction) and the budget-limit
-        // steer (armed at the crossing turn's message end) run as this
-        // invocation's follow-up turns, each crossing the same boundary
-        // pair; a turn that still ends in a terminal error fails an active
-        // goal once the arms could not save it (TS
-        // `_finishGoalForTerminalAssistantMessage` at `agent_end`, after
-        // `_checkCompaction`).
-        let goal_owns_boundary = goal
-            .drive_boundary(
-                engine,
-                &mut boundary,
-                model,
-                api_key.clone(),
-                global_harness_dir.clone(),
-            )
-            .await?;
-        crate::headless_exit::phase("goal boundary end");
-        // The autonomous arm runs only when the goal does not own the
-        // boundary (TS `_getContinuationMessages`: the goal arm takes
-        // exclusive priority; autonomous is never consulted while a goal
-        // is active).
-        if !goal_owns_boundary {
-            // The held threshold continuation drains as this invocation's
-            // follow-up turn (TS's queued `followUp` admission); its own
-            // natural end churns the in-run hook again. The stop surfaces
-            // only through the headless exit contract (TS: no row, no
-            // stream frame).
+        goal.drive_boundary(
+            engine,
+            &mut boundary,
+            model,
+            api_key.clone(),
+            global_harness_dir.clone(),
+        )
+        .await?;
+        // The autonomous arm runs only when the goal does not own the boundary (the goal arm takes
+        // exclusive priority).
+        if !engine.goal_owns_continuation_wakeup().await {
+            // The held threshold continuation drains as this invocation's follow-up
+            // turn; the stop surfaces only through the exit contract.
             autonomous
                 .drive_boundary(
                     engine,
@@ -1633,33 +1714,122 @@ async fn run_prompts_and_emit(
         }
         crate::headless_exit::phase("autonomous boundary end");
     }
-    goal_accounting.unsubscribe().await;
-    accounting.unsubscribe().await;
-    if let Some(subscription) = unsubscribe {
-        subscription.unsubscribe().await;
-    }
-    // The rejected prompt wait (TS print-mode's catch): print the raw
-    // command error to stderr and exit 1 — no later prompts ran, the
-    // terminal selection is skipped, and the disposal drain still runs.
+    // The rejected prompt wait: print the raw command error to stderr and
+    // exit 1 — no later prompts ran, and the disposal drain still runs.
     if let Some(error) = command_failure {
         eprintln!("{error}");
+        goal_accounting.unsubscribe().await;
+        accounting.unsubscribe().await;
+        if let Some(subscription) = unsubscribe {
+            subscription.unsubscribe().await;
+        }
         boundary
             .drain_compact_auto_refine_at_disposal(engine, model, api_key, global_harness_dir)
             .await;
         return Ok(1);
     }
-    // The TS print-mode exit contract (modes/print-mode.ts): json mode
-    // never derives the exit code from the terminal selection — the event
-    // stream carries everything, and only the autonomous gates (or a thrown
-    // error) exit non-zero.
+    // The #2270 fix: print waits for RLM quiescence — every admitted
+    // descendant settles and its replies and notices drain as turns —
+    // before the terminal result is selected (json mode keeps streaming;
+    // the subscription lives until after the drive). One drive loop then
+    // keeps the run alive while deferred work exists: the deferred
+    // goal/autonomous continuations deliver after the settle ("no
+    // front": the settling child's terminal notice is read first), and
+    // the boundary drain runs whatever turns it drained armed — a
+    // threshold continuation, a budget steer, more descendants.
+    loop {
+        if crate::print_rlm::drive_to_quiescence(
+            root_node,
+            engine,
+            &mut boundary,
+            model,
+            api_key.clone(),
+            global_harness_dir.clone(),
+        )
+        .await?
+        {
+            continue;
+        }
+        if let Some(continuation) = engine.take_owed_goal_continuation().await {
+            goal.publish_goal_update(engine).await;
+            goal.run_queued_turn(
+                engine,
+                &mut boundary,
+                model,
+                api_key.clone(),
+                global_harness_dir.clone(),
+                &continuation,
+            )
+            .await?;
+            continue;
+        }
+        if autonomous
+            .deliver_rlm_continuation(
+                engine,
+                &mut boundary,
+                model,
+                api_key.clone(),
+                global_harness_dir.clone(),
+            )
+            .await?
+        {
+            continue;
+        }
+        // The boundary drain: turns it ran may spawn descendants or arm
+        // more holds, so it reports whether it ran and the loop goes
+        // around — the leading quiescence pass then waits for whatever
+        // they left behind.
+        let mut boundary_ran = goal
+            .drive_boundary(
+                engine,
+                &mut boundary,
+                model,
+                api_key.clone(),
+                global_harness_dir.clone(),
+            )
+            .await?;
+        if !engine.goal_owns_continuation_wakeup().await {
+            boundary_ran |= autonomous
+                .drive_boundary(
+                    engine,
+                    &mut boundary,
+                    model,
+                    api_key.clone(),
+                    global_harness_dir.clone(),
+                )
+                .await?;
+        }
+        if boundary_ran {
+            continue;
+        }
+        break;
+    }
+    goal_accounting.unsubscribe().await;
+    accounting.unsubscribe().await;
+    if let Some(subscription) = unsubscribe {
+        subscription.unsubscribe().await;
+    }
+    let state = engine.session.agent().state().await;
+    let messages: Vec<pa_types::session::AgentMessage> =
+        state.messages.iter().filter_map(json_round_trip).collect();
+    // The print-mode exit contract: json mode never derives the exit code from the
+    // terminal selection — only the autonomous gates exit non-zero; text mode prints
+    // the primary message (error to stderr with exit 1, settled answer to stdout).
     let mut exit_code = 0;
     if !json_mode {
-        let state = engine.session.agent().state().await;
-        let messages: Vec<pa_types::session::AgentMessage> =
-            state.messages.iter().filter_map(json_round_trip).collect();
-        exit_code = crate::print_terminal::write_text_terminal_result(&messages);
+        let goal = engine.goal_state().await;
+        let cap_reason = pa_core::session_engine::goal_driver::CONTINUATION_NO_PROGRESS_CAP_REASON;
+        if goal.status == pa_types::goal::GoalStatus::Error
+            && goal.last_error.as_deref() == Some(cap_reason)
+            && goal.updated_at != goal_updated_at_start
+        {
+            eprintln!("{cap_reason}");
+            exit_code = 1;
+        }
+        let terminal_exit = crate::print_terminal::write_text_terminal_result(&messages);
+        exit_code = exit_code.max(terminal_exit);
     }
-    // The TS print-mode autonomous contract applies to both output modes.
+    // The autonomous contract applies to both output modes.
     if let Some(stderr) = autonomous.exit_stderr().await {
         eprintln!("{stderr}");
         exit_code = 1;
@@ -1680,190 +1850,101 @@ async fn run_prompts_and_emit(
     Ok(exit_code)
 }
 
-/// The faux-script engine: identical session assembly, scripted provider.
-/// The faux assembly over one session-manager selection (the RPC mode's
-/// replacement builds share it under the same script).
-async fn build_faux_engine_with(
-    options: &RunOptions,
-    script: &str,
-    session_manager: Option<pa_core::session::manager::SessionManager>,
-    // The faux harness installs no product telemetry, so the execution
-    // mode label carries through the real path only.
-    _execution_mode: &str,
-) -> Result<HeadlessEngine, String> {
-    let config = &options.config;
-    let script: serde_json::Value = serde_json::from_str(script)
-        .map_err(|error| format!("invalid PRIME_AGENT_FAUX_SCRIPT: {error}"))?;
-    // Response entries: a plain string answers with fixed text;
-    // `{"systemPrompt": true}` answers with the request's system prompt
-    // (binary-level verification of session assembly; never used by the
-    // product); any other object goes through the shared faux-script
-    // parser the daemon worker seam uses — `{"text": ...}`,
-    // `{"content": [...]}` blocks (thinking, text, tool calls), and the
-    // scripted `stopReason`/`errorMessage`/`delayMs` fields the
-    // overflow-recovery harnesses script provider error turns with.
-    let response_steps: Vec<pa_ai::faux::FauxResponseStep> = script
-        .get("responses")
-        .and_then(serde_json::Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .map(|entry| match entry {
-                    serde_json::Value::String(text) => Ok(pa_ai::faux::FauxResponseStep::Message(
-                        pa_ai::faux::faux_assistant_text_message(
-                            text,
-                            pa_ai::faux::FauxAssistantMessageOptions::default(),
-                        ),
-                    )),
-                    serde_json::Value::Object(map)
-                        if map.get("systemPrompt").and_then(serde_json::Value::as_bool)
-                            == Some(true) =>
-                    {
-                        Ok(pa_ai::faux::FauxResponseStep::Factory(std::sync::Arc::new(
-                            |context, _options, _call, _model| {
-                                Ok(pa_ai::faux::faux_assistant_text_message(
-                                    context.system_prompt.as_deref().unwrap_or_default(),
-                                    pa_ai::faux::FauxAssistantMessageOptions::default(),
-                                ))
-                            },
-                        )))
-                    }
-                    serde_json::Value::Object(_) => {
-                        pa_ai::faux::script::parse_faux_script(&serde_json::json!({
-                            "responses": [entry]
-                        }))
-                        .map(|parsed| {
-                            let mut steps = parsed.responses.into_iter();
-                            let first = steps
-                                .next()
-                                .expect("an object entry parses into one response step");
-                            debug_assert!(steps.next().is_none());
-                            first
-                        })
-                    }
-                    _ => Ok(pa_ai::faux::FauxResponseStep::Message(
-                        pa_ai::faux::faux_assistant_text_message(
-                            "",
-                            pa_ai::faux::FauxAssistantMessageOptions::default(),
-                        ),
-                    )),
-                })
-                .collect::<Result<Vec<_>, String>>()
-        })
-        .ok_or_else(|| "PRIME_AGENT_FAUX_SCRIPT requires a responses array".to_string())??;
-    // The same faux-script model contract as the daemon worker seam: a
-    // `reasoning` model makes the harness script thinking-capable turns so
-    // thinking-level resolution can be verified without the network.
-    let reasoning = script
-        .get("reasoning")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    // The script pins the context window (the harness contract):
-    // threshold/overflow verifiers size it to the probe they run.
-    let context_window = script
-        .get("contextWindow")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(100_000);
-    // The stable faux identity (`api: "faux"`, `provider: "faux"`) the
-    // daemon's scripted engine registers under: verification fixtures can
-    // declare faux-provider models in models.json, and the ACP pickers'
-    // in-process discovery then resolves them like real auth-configured
-    // models.
-    let registration =
-        pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
-            api: Some("faux".to_string()),
-            provider: Some("faux".to_string()),
-            models: Some(vec![pa_ai::faux::FauxModelDefinition {
-                id: "faux-1".to_string(),
-                name: Some("Faux Model".to_string()),
-                reasoning: Some(reasoning),
-                input: Some(vec![pa_types::ai::ModelInput::Text]),
-                cost: None,
-                context_window: Some(context_window),
-                max_tokens: Some(4_096),
-            }]),
-            ..Default::default()
-        });
-    registration.set_responses(response_steps);
-    let model = registration.get_model();
-    let agent_model = json_round_trip(&model).ok_or("model conversion failed")?;
-    let provider_target: ProviderTargetSlot =
-        std::sync::Arc::new(std::sync::RwLock::new(Some(ProviderTarget {
-            api_key: None,
-            model: model.clone(),
-            service_tier: None,
-            headers: None,
-            transport: None,
-        })));
-    let stream_fn = switchable_stream_fn(std::sync::Arc::clone(&provider_target));
-    // The faux path shares the session-manager wiring (persist / --no-session
-    // / --resume / --continue) with the real provider path so binary-level
-    // tests can verify persistence without the network.
-    let engine = pa_core::session_engine::engine::create_session(
-        pa_core::session_engine::engine::SessionEngineConfig {
-            on_late_sent_agent_message: None,
-            cron_store: None,
-            // Faux verification harness: no product telemetry.
-            semantic_edges: None,
-            steering_mode: None,
-            follow_up_mode: None,
-            telemetry: None,
-            cwd: config.cwd.clone(),
-            agent_dir: config.agent_dir.clone(),
-            mcp_manager: None,
-            model: Some(agent_model),
-            thinking_level: Some(resolve_thinking_level(config, &model)),
-            stream_fn: Some(stream_fn),
-            tools: builtin_tools(&config.cwd),
-            custom_system_prompt: config.system_prompt.clone(),
-            prompt_guidelines: Vec::new(),
-            append_system_prompt: config.append_system_prompt.clone(),
-            tool_selection: config.tool_selection(),
-            generic_mcp_servers: vec![],
-            allow_recursion: None,
-            session_manager,
-            provider_session_id: None,
-            extra_host_handlers: None,
-            conversation_log_path: None,
-            additional_skill_paths: vec![],
-            additional_prompt_paths: vec![],
-            // The same discovery policy as the real assembly, so the
-            // binary-level verifiers observe the `--no-*` flags.
-            resource_loading: config.resource_loading(),
-            extra_builtin_skill_overrides: vec![],
-            rlm_subagent_host: None,
-            rlm_depth: None,
-            model_info: Some(model.clone()),
-            // The faux engine is a Rust-only verification harness, not a
-            // product surface: no background kernel boot in tests.
-            prewarm_ipython_kernel: None,
-            on_background_work_settled: None,
-            queued_goal_context_purge: None,
-            queued_steering_probe: None,
-            image_model_router: None,
-        },
-    )
-    .await
-    .map_err(|error| format!("{error:#}"))?;
-    Ok(HeadlessEngine {
-        engine,
-        model,
-        api_key: None,
-        provider_target,
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    // --- print-mode MCP wiring (TS `createAgentSessionServices` parity) ---
 
-    /// The arm records the routed target it writes, so the settle
-    /// restores the captured session target only while the slot still
-    /// holds the route; a mid-run `/model` switch rewrote the slot with
-    /// the new session target, and the settle must leave it (the
-    /// regression this pins: the arm once skipped the `armed_to` write,
-    /// so the settle's still-routed guard always passed and dragged the
-    /// slot back to the pre-route session target).
+    /// Runtime cancellation unblocks a pending writer; ownership must remain
+    /// held until that blocking writer finishes, even on errors or unwinding.
+    #[test]
+    fn print_lease_outlives_runtime_writers_on_every_return_path() {
+        #[derive(Clone, Copy)]
+        enum Outcome {
+            Success,
+            Error,
+            Panic,
+        }
+        struct Fixture {
+            session_path: std::path::PathBuf,
+            agent_dir: std::path::PathBuf,
+            outcome: Outcome,
+        }
+        struct UnblockWriter(std::sync::mpsc::Sender<()>);
+        impl Drop for UnblockWriter {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        for outcome in [Outcome::Success, Outcome::Error, Outcome::Panic] {
+            let home = tempfile::TempDir::new().unwrap();
+            let fixture = Fixture {
+                session_path: home.path().join("session.jsonl"),
+                agent_dir: home.path().join("agent"),
+                outcome,
+            };
+            let held_at_write = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer_observation = std::sync::Arc::clone(&held_at_write);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::with_print_runtime(&fixture, |fixture, lease| {
+                    Box::pin(async move {
+                        *lease = Some(
+                            pa_daemon::lease::acquire_runtime_session_lease(
+                                &fixture.session_path,
+                                &fixture.agent_dir,
+                            )
+                            .unwrap(),
+                        );
+                        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+                        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                        tokio::spawn(async move {
+                            let _unblock = UnblockWriter(cancel_tx);
+                            let _ = ready_tx.send(());
+                            std::future::pending::<()>().await;
+                        });
+                        ready_rx.await.unwrap();
+                        let session_path = fixture.session_path.clone();
+                        let agent_dir = fixture.agent_dir.clone();
+                        let (writer_ready_tx, writer_ready_rx) = tokio::sync::oneshot::channel();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = writer_ready_tx.send(());
+                            cancel_rx.recv().unwrap();
+                            writer_observation.store(
+                                pa_daemon::lease::live_lease_owner(&agent_dir, &session_path)
+                                    .is_some(),
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                            std::fs::write(&session_path, "writer settled\n").unwrap();
+                        });
+                        writer_ready_rx.await.unwrap();
+                        match fixture.outcome {
+                            Outcome::Success => Ok(0),
+                            Outcome::Error => Err("failed after lease acquisition".to_string()),
+                            Outcome::Panic => panic!("unwind after lease acquisition"),
+                        }
+                    })
+                })
+            }));
+            match outcome {
+                Outcome::Success => assert_eq!(result.unwrap(), Ok(0)),
+                Outcome::Error => assert_eq!(
+                    result.unwrap(),
+                    Err("failed after lease acquisition".to_string())
+                ),
+                Outcome::Panic => assert!(result.is_err()),
+            }
+            assert!(held_at_write.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                std::fs::read_to_string(&fixture.session_path).unwrap(),
+                "writer settled\n"
+            );
+            assert!(
+                pa_daemon::lease::live_lease_owner(&fixture.agent_dir, &fixture.session_path)
+                    .is_none()
+            );
+        }
+    }
+
+    /// The settle restores the captured session target only while the slot still holds the route;
+    /// a mid-run `/model` switch rewrote the slot, and stays.
     #[test]
     fn headless_image_router_settle_preserves_a_mid_run_model_switch() {
         fn fixture_model(id: &str) -> pa_types::ai::Model {
@@ -1925,27 +2006,20 @@ mod tests {
             thinking_level: pa_types::ai::ModelThinkingLevel::High,
             service_tier: None,
         };
-        // Arm: the slot now serves the routed image model.
         (router.swap_target)(Some(&expected_route));
         assert_eq!(
             provider_target.read().unwrap().as_ref().unwrap().model.id,
             "image-model"
         );
-        // A mid-run `/model` switch rewrites the live slot with the new
-        // session target while the route is still armed.
         let switched_to = target(fixture_model("switched-model"));
         *provider_target.write().unwrap() = Some(switched_to);
-        // Settle: the switch wins; the settle must not drag the slot back
-        // to the pre-route session target.
         (router.swap_target)(None);
         assert_eq!(
             provider_target.read().unwrap().as_ref().unwrap().model.id,
             "switched-model"
         );
-        // The next episode captures the live slot at ITS first arm, so its
-        // baseline is the post-switch session model: the plain arm ->
-        // serve -> settle contract restores that baseline (the
-        // capture-at-arm, restore-at-settle pair).
+        // The next episode captures the live slot at ITS first arm: its baseline is the post-switch
+        // session model.
         (router.swap_target)(Some(&expected_route));
         (router.swap_target)(None);
         assert_eq!(
@@ -1954,15 +2028,8 @@ mod tests {
         );
     }
 
-    /// The print session's MCP manager serves a settings-declared server
-    /// through the `mcp.config` host request the kernel dispatches
-    /// (`rlm/mcp.py` resolution), and resolves its settings LIVE: a
-    /// settings rewrite reaches the next `refresh()` — the re-resolver
-    /// the remote-catalog change subscription drives mid-session. The
-    /// `mcp.config` handler itself keeps the registration-time
-    /// integrations (the pa-core handler design, shared with the daemon
-    /// worker), so the pre-refresh handler still answers the old roster —
-    /// asserted here so the test states the real production behavior.
+    /// Serves a settings-declared server through `mcp.config` and resolves settings LIVE: a
+    /// rewrite reaches `refresh()`.
     #[tokio::test]
     async fn print_mode_mcp_manager_serves_settings_servers_and_resolves_live() {
         let home = tempfile::TempDir::new().unwrap();
@@ -1984,27 +2051,28 @@ mod tests {
         )
         .unwrap();
         let built_manager = crate::mcp_login::cli_mcp_manager(&cwd, &agent_dir);
-        assert_eq!(
-            built_manager.get_enabled_persistent_generic_servers(),
-            vec!["fixture-echo".to_string()]
-        );
         let manager = std::sync::Arc::new(std::sync::Mutex::new(built_manager));
-        // The kernel's config host request serves the declared server with
-        // the declared stdio config (registration-time integrations).
+        let gating_manager = std::sync::Arc::clone(&manager);
+        let enabled = tokio::task::spawn_blocking(move || {
+            gating_manager
+                .lock()
+                .unwrap()
+                .get_enabled_persistent_generic_servers()
+        })
+        .await
+        .unwrap();
+        assert_eq!(enabled, vec!["fixture-echo".to_string()]);
         let mut handlers = pa_core::kernel::shared::HostRequestHandlers::default();
         pa_core::mcp::McpManager::register_host_handlers(&manager, &mut handlers);
         let config = handlers.get("mcp.config").unwrap().clone();
         let result = config(pa_core::kernel::shared::HostRequestPayload {
             data: serde_json::json!({ "server": "fixture-echo" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
         assert_eq!(result["type"], "stdio");
         assert_eq!(result["command"], "python3");
         assert_eq!(result["args"], serde_json::json!(["echo.py"]));
-        // A settings rewrite reaches the same manager on the next refresh:
-        // the closures re-read settings per resolution.
         std::fs::write(
             agent_dir.join("settings.json"),
             serde_json::json!({
@@ -2019,43 +2087,39 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        {
-            let mut manager = manager.lock().unwrap();
+        let gating_manager = std::sync::Arc::clone(&manager);
+        tokio::task::spawn_blocking(move || {
+            let mut manager = gating_manager.lock().unwrap();
             manager.refresh();
             assert_eq!(
                 manager.get_enabled_persistent_generic_servers(),
                 vec!["second-echo".to_string()]
             );
-        }
-        // The already-registered handler keeps its registration-time
-        // integrations — the registration shape a live session dispatches.
+        })
+        .await
+        .unwrap();
         let result = config(pa_core::kernel::shared::HostRequestPayload {
-            data: serde_json::json!({ "server": "fixture-echo" }),
-            cell_source_code: None,
+            data: serde_json::json!({ "server": "second-echo" }),
         })
         .await
         .unwrap();
         assert_eq!(
-            result["command"], "python3",
-            "the registered handler serves its registration-time integrations"
+            result["command"], "node",
+            "the already-registered handler serves the live integrations"
         );
-        let missing = config(pa_core::kernel::shared::HostRequestPayload {
-            data: serde_json::json!({ "server": "second-echo" }),
-            cell_source_code: None,
+        let withdrawn = config(pa_core::kernel::shared::HostRequestPayload {
+            data: serde_json::json!({ "server": "fixture-echo" }),
         })
         .await
         .unwrap();
         assert!(
-            missing.as_object().unwrap().is_empty(),
-            "the pre-refresh handler does not know the new server"
+            withdrawn.as_object().unwrap().is_empty(),
+            "the rewrite withdrew the old server from the live integrations"
         );
     }
 
-    /// Local service-catalog sources (`mcpCatalogSources`) reach the print
-    /// manager's catalog resolution (TS `getCatalogSources`): the declared
-    /// file's entry surfaces as a local descriptor, and dropping the
-    /// declaration withdraws it on the next resolve — the same live
-    /// settings read as the user-server closure.
+    /// Local service-catalog sources reach the catalog resolution; dropping the declaration
+    /// withdraws the entry on the next resolve.
     #[test]
     fn print_mode_mcp_manager_resolves_declared_catalog_sources() {
         let home = tempfile::TempDir::new().unwrap();
@@ -2101,7 +2165,6 @@ mod tests {
             .find(|service| service.service_id == "my-local")
             .expect("declared source entry resolved");
         assert!(my_local.local_source);
-        // Live: dropping the declaration withdraws the entry on refresh.
         std::fs::write(agent_dir.join("settings.json"), settings(&[])).unwrap();
         manager.refresh();
         assert!(
@@ -2113,3 +2176,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "print_model_tests.rs"]
+mod print_model_tests;

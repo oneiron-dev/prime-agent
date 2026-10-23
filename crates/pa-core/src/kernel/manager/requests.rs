@@ -9,10 +9,6 @@ use super::{
     DEFAULT_MAX_OUTPUT_CHARS, KERNEL_ABORT_GRACE_MS,
 };
 
-// ---------------------------------------------------------------------------
-// Request plumbing
-// ---------------------------------------------------------------------------
-
 pub(crate) use crate::platform::process::Signal;
 
 /// Append stream text up to `max_chars` Unicode scalars, keeping the buffered count in sync.
@@ -47,6 +43,122 @@ pub(crate) fn append_truncated(
     }
 }
 
+/// A bounded cell-stream buffer that keeps the head AND the tail of its text.
+/// Python prints its verdicts last — tracebacks, summaries, exit status — so a
+/// failing run loses exactly its outcome to a head-only cap.
+///
+/// The first three quarters of the stream's cap fill the head; later text
+/// rolls through a tail window of the last quarter, and the dropped middle is
+/// counted for the marker. Every cut goes through `char_indices`/char counts,
+/// so both cut points sit on char boundaries by construction.
+#[derive(Default)]
+pub(crate) struct HeadTailBuffer {
+    head: String,
+    head_chars: usize,
+    tail: String,
+    tail_chars: usize,
+    /// Chars dropped from the middle, named by [`Self::finish`].
+    omitted: usize,
+}
+
+impl HeadTailBuffer {
+    /// The stream's head and tail budgets within `max_chars`: the tail gets a
+    /// quarter, the head the rest. The one owner of the split.
+    fn split_cap(max_chars: usize) -> (usize, usize) {
+        let tail_cap = max_chars / 4;
+        (max_chars - tail_cap, tail_cap)
+    }
+
+    /// Whether any text was kept.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.head.is_empty() && self.tail.is_empty()
+    }
+
+    /// Buffer stream text within `max_chars`: fill the head, then roll the
+    /// tail window at its cap, counting the chars that fall out of it.
+    pub(crate) fn push(&mut self, text: &str, max_chars: usize) {
+        let (head_cap, tail_cap) = Self::split_cap(max_chars);
+        if self.head_chars < head_cap {
+            let remaining = head_cap - self.head_chars;
+            let text_chars = text.chars().count();
+            if text_chars <= remaining {
+                self.head.push_str(text);
+                self.head_chars += text_chars;
+                return;
+            }
+            let end = text
+                .char_indices()
+                .nth(remaining)
+                .map_or(text.len(), |(i, _)| i);
+            self.head.push_str(&text[..end]);
+            self.head_chars = head_cap;
+            self.push_tail(&text[end..], tail_cap);
+        } else {
+            self.push_tail(text, tail_cap);
+        }
+    }
+
+    /// Roll text into the tail window. A frame at or over the window's size
+    /// displaces the old tail in place — buffering such a frame whole (then
+    /// draining it) would keep its allocation resident until settle. Smaller
+    /// frames accumulate, compacting the front once the window grows past
+    /// twice its cap (amortized linear, bounded memory).
+    fn push_tail(&mut self, text: &str, tail_cap: usize) {
+        let text_chars = text.chars().count();
+        if text_chars == 0 {
+            return;
+        }
+        if text_chars >= tail_cap {
+            self.omitted += self.tail_chars + text_chars - tail_cap;
+            // Keep the window's worth of the frame's END. The None case is
+            // tail_cap == 0: keep nothing.
+            let keep_from = text
+                .char_indices()
+                .nth(text_chars - tail_cap)
+                .map_or(text.len(), |(i, _)| i);
+            self.tail.clear();
+            self.tail.push_str(&text[keep_from..]);
+            self.tail_chars = tail_cap;
+            return;
+        }
+        self.tail.push_str(text);
+        self.tail_chars += text_chars;
+        if self.tail_chars > 2 * tail_cap {
+            self.drop_tail_front(self.tail_chars - tail_cap);
+        }
+    }
+
+    /// Drop the first `chars` chars off the tail, counting them omitted.
+    fn drop_tail_front(&mut self, chars: usize) {
+        let end = self
+            .tail
+            .char_indices()
+            .nth(chars)
+            .map_or(self.tail.len(), |(i, _)| i);
+        self.tail.drain(..end);
+        self.tail_chars -= chars;
+        self.omitted += chars;
+    }
+
+    /// Resolve the buffered text: trim the tail to its cap, then return head,
+    /// marker, and tail. Text that fit the cap passes through unchanged.
+    pub(crate) fn finish(mut self, max_chars: usize) -> String {
+        let (_, tail_cap) = Self::split_cap(max_chars);
+        if self.tail_chars > tail_cap {
+            self.drop_tail_front(self.tail_chars - tail_cap);
+        }
+        if self.omitted == 0 {
+            let mut text = self.head;
+            text.push_str(&self.tail);
+            return text;
+        }
+        format!(
+            "{}\n[... {} chars omitted ...]\n{}",
+            self.head, self.omitted, self.tail
+        )
+    }
+}
+
 pub(crate) fn describe_failure(result: &ExecuteResult) -> String {
     if let Some(error) = &result.error {
         if error.evalue.is_empty() {
@@ -63,7 +175,6 @@ impl ReplKernelManager {
     pub(crate) async fn enqueue_request(
         &self,
         request: Request,
-        code: &str,
         opts: ExecuteOptions,
         execution_timeout_ms: Option<u64>,
     ) -> anyhow::Result<InternalExecuteResult> {
@@ -95,22 +206,21 @@ impl ReplKernelManager {
                 return Ok(InternalExecuteResult::aborted(started));
             }
         }
-        // Re-check: a final flush may have started while this request awaited
-        // the lazy re-bootstrap; admitting it now would splice it between the
-        // flush\'s captured queue and the final snapshot, unbounding the teardown.
+        // Re-check: a final flush may have started while this request awaited the lazy
+        // re-bootstrap; admitting it now would splice it between the flush\'s captured queue
+        // and the final snapshot, unbounding the teardown.
         if lock(&self.inner.guarded).flushing_snapshot_for_dispose && !opts.internal {
             return Err(anyhow!("Kernel is shutting down"));
         }
 
         let queue_guard = self.inner.execution_queue.lock().await;
 
-        // A repair started while this request was queued or busy-waiting:
-        // release the slot so the repair\'s own restore can run, then requeue
-        // behind it.
+        // A repair started while this request was queued or busy-waiting: release the slot
+        // so the repair\'s own restore can run, then requeue behind it.
         if lock(&self.inner.guarded).protocol_repair.is_some() && !opts.protocol_repair {
             drop(queue_guard);
             self.wait_for_protocol_repair(opts.signal.as_ref()).await?;
-            return Box::pin(self.enqueue_request(request, code, opts, execution_timeout_ms)).await;
+            return Box::pin(self.enqueue_request(request, opts, execution_timeout_ms)).await;
         }
 
         self.wait_for_active_execution_to_clear_for_reuse(opts.signal.as_ref())
@@ -138,7 +248,7 @@ impl ReplKernelManager {
         let mut opts = opts;
         opts.signal = merged;
         let internal = opts.internal;
-        let result = self.execute_inner(request, code, opts, started).await;
+        let result = self.execute_inner(request, opts, started).await;
         if let Some(signal) = &timeout_signal {
             signal.abort();
         }
@@ -163,7 +273,6 @@ impl ReplKernelManager {
     pub(super) async fn execute_inner(
         &self,
         request: Request,
-        code: &str,
         opts: ExecuteOptions,
         started: Instant,
     ) -> anyhow::Result<InternalExecuteResult> {
@@ -212,13 +321,13 @@ impl ReplKernelManager {
         };
         let execution = Arc::new(ActiveExecution {
             request_id: request_id.clone(),
-            code: code.to_string(),
             started,
             max_chars,
             namespace_code,
             restores_namespace,
             buffers: Mutex::new(buffers),
             result_tx: Mutex::new(Some(result_tx)),
+            cell_started: Mutex::new(None),
             opts,
         });
         {
@@ -229,9 +338,8 @@ impl ReplKernelManager {
         // Abort watcher: interrupts the kernel out-of-band, then force-aborts
         // after the grace window if the runtime did not settle the cell.
         if let Some(signal) = execution.opts.signal.clone() {
-            // Weak on both sides: a never-fired signal leaves this watcher
-            // pending forever, and a strong manager would pin the kernel
-            // past the last manager's drop (the reader-retention class).
+            // Weak on both sides: a never-fired signal leaves this watcher pending forever, and a
+            // strong manager would pin the kernel past the last manager's drop.
             let inner = Arc::downgrade(&self.inner);
             let weak_exec = Arc::downgrade(&execution);
             tokio::spawn(async move {
@@ -259,10 +367,6 @@ impl ReplKernelManager {
                 // one (see busy-after-interrupt).
                 inner.force_abort(&execution);
             });
-        }
-
-        if !execution.opts.internal {
-            lock(&self.inner.guarded).last_cell_code = Some(code.to_string());
         }
 
         let mut frame = request.to_json();
@@ -295,15 +399,18 @@ impl ReplKernelManager {
             (send_task, stdin_retire)
         };
 
+        // The cell's own window starts as its frame goes on the wire: boot and
+        // queue wait are excluded so a cold kernel cannot trip the watchdog.
+        *lock(&execution.cell_started) = Some(Instant::now());
         let mut settled_result: Option<anyhow::Result<InternalExecuteResult>> = None;
         let send_outcome: anyhow::Result<()> = {
             let send_promise = &mut send_task;
             tokio::select! {
                 r = send_promise => r.unwrap_or_else(|e| Err(anyhow!("{e}"))),
                 settled = &mut result_rx => {
-                    // The cell settled before the write completed (fast runtime).
-                    // Only an aborted status may skip waiting for the write; a
-                    // failed write on a successful cell must surface.
+                    // The cell settled before the write completed (fast runtime). Only an aborted
+                    // status may skip waiting for the write; a failed write on a successful cell
+                    // must surface.
                     let settled: anyhow::Result<InternalExecuteResult> = match settled {
                         Ok(result) => result,
                         Err(_) => Err(anyhow!("Kernel has been shut down")),
@@ -361,7 +468,7 @@ impl ReplKernelManager {
 
 #[cfg(test)]
 mod tests {
-    use super::append_truncated;
+    use super::{append_truncated, HeadTailBuffer};
 
     #[cfg(unix)]
     #[tokio::test]
@@ -485,6 +592,85 @@ for line in sys.stdin:
         manager.kill();
     }
 
+    /// A cell's streamed output past the cap keeps the head and the tail: a
+    /// long run's printed verdict (tracebacks, summaries, exit status arrive
+    /// last) must survive the buffer, not just the first `max_chars` chars.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_cell_output_keeps_head_and_tail() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Protocol v3: ready, then one execute answered by stdout frames of
+        // filler past the cap (multi-byte text, so cut points can land inside
+        // a char run) with a printed traceback LAST, then done.
+        const TRACEBACK_RUNTIME: &str = r#"#!/usr/bin/env python3
+import json
+import sys
+
+print(json.dumps({"event": "ready", "protocol": 3, "python": "3.13.0"}), flush=True)
+for line in sys.stdin:
+    try:
+        req = json.loads(line)
+    except Exception:
+        continue
+    if req.get("type") == "execute":
+        rid = req.get("id")
+        filler = "é🍁xyz" * 20_000
+        for start in range(0, len(filler), 4_096):
+            chunk = filler[start:start + 4_096]
+            print(json.dumps({"event": "stdout", "id": rid, "text": chunk}), flush=True)
+        traceback = "Traceback (most recent call last):\n ...\nAssertionError: t1-traceback-sentinel\n"
+        print(json.dumps({"event": "stdout", "id": rid, "text": traceback}), flush=True)
+        print(json.dumps({"event": "done", "id": rid, "status": "ok"}), flush=True)
+"#;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let python = dir.path().join("traceback-kernel");
+        std::fs::write(&python, TRACEBACK_RUNTIME).expect("write fake kernel");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake kernel");
+        let manager = ReplKernelManager::new(crate::kernel::shared::KernelManagerOptions {
+            python: Some(python),
+            ..Default::default()
+        });
+        manager
+            .start(KernelStartOptions::default())
+            .await
+            .expect("ready handshake");
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.execute_bounded("1+1", ExecuteOptions::default(), None),
+        )
+        .await
+        .expect("the execute must settle")
+        .expect("execute returns a result");
+        assert_eq!(result.status, ExecuteStatus::Ok);
+        let stdout = result.stdout;
+        let filler = "é🍁xyz".repeat(20_000);
+        let traceback =
+            "Traceback (most recent call last):\n ...\nAssertionError: t1-traceback-sentinel\n";
+        assert!(
+            stdout.starts_with("é🍁xyz"),
+            "the head must keep the stream's first chars"
+        );
+        assert!(
+            stdout.ends_with(traceback),
+            "the tail must keep the verdict printed last"
+        );
+        let omitted = filler.chars().count() + traceback.chars().count() - DEFAULT_MAX_OUTPUT_CHARS;
+        let marker = format!("\n[... {omitted} chars omitted ...]\n");
+        let marker_at = stdout
+            .find(&marker)
+            .expect("the dropped middle must be named by a marker");
+        assert!(
+            marker_at + marker.len() <= stdout.len() - traceback.len(),
+            "the marker must sit between head and tail"
+        );
+        assert!(stdout.chars().count() <= DEFAULT_MAX_OUTPUT_CHARS + marker.chars().count());
+        manager.kill();
+    }
+
     #[test]
     fn capped_stream_matches_original_unicode_and_frame_semantics() {
         let frames = ["", "a", "é", "🍁", "xy", "é🍁abc", "", "tail"];
@@ -522,8 +708,7 @@ for line in sys.stdin:
     #[test]
     fn exact_fill_remainder_counts_as_truncation() {
         // The buffer filled exactly on an earlier frame; a later non-empty
-        // frame is dropped but still marks the stream truncated (TS #2423:
-        // without this, exactly-filled streams reported no truncation).
+        // frame is dropped but still marks the stream truncated (TS #2423).
         let mut buffer = String::from("abcd");
         let mut truncated = false;
         let mut count = 4;
@@ -538,5 +723,63 @@ for line in sys.stdin:
         let mut zero = 0;
         append_truncated(&mut empty, &mut never, &mut zero, "", 4);
         assert!(!never);
+    }
+
+    #[test]
+    fn head_tail_buffer_matches_oracle() {
+        let long_z = "z".repeat(40);
+        let long_multi = "é🍁".repeat(30);
+        // Multi-byte frames long enough to roll the tail window several times.
+        let frames = [
+            "",
+            "a",
+            "é",
+            "🍁",
+            "xy",
+            "é🍁abc",
+            long_z.as_str(),
+            "",
+            "tail",
+            long_multi.as_str(),
+        ];
+        for cap in [0usize, 1, 2, 3, 4, 7, 8, 16] {
+            let mut buffer = HeadTailBuffer::default();
+            let mut all = String::new();
+            for text in frames {
+                buffer.push(text, cap);
+                all.push_str(text);
+            }
+            let expected = oracle(&all, cap);
+            assert_eq!(buffer.finish(cap), expected, "cap {cap}");
+        }
+    }
+
+    /// The oracle: verbatim when everything fits, else the first
+    /// `head_cap` chars, the named elision, and the last `tail_cap` chars.
+    /// The ratio itself comes from `split_cap`, its one owner.
+    fn oracle(all: &str, cap: usize) -> String {
+        let (head_cap, tail_cap) = HeadTailBuffer::split_cap(cap);
+        let chars: Vec<char> = all.chars().collect();
+        if chars.len() <= cap {
+            return all.to_string();
+        }
+        let head: String = chars[..head_cap].iter().collect();
+        let tail: String = chars[chars.len() - tail_cap..].iter().collect();
+        let omitted = chars.len() - head_cap - tail_cap;
+        format!("{head}\n[... {omitted} chars omitted ...]\n{tail}")
+    }
+
+    #[test]
+    fn one_oversized_frame_keeps_the_tail_window_small() {
+        // `print(big_string)` arrives as ONE stdout frame; buffering it whole
+        // would keep the frame's allocation resident until settle.
+        let frame = "é".repeat(1_000_000);
+        let mut buffer = HeadTailBuffer::default();
+        buffer.push(&frame, 16);
+        assert!(
+            buffer.tail.capacity() < 1_024,
+            "the tail window must not retain the frame's allocation"
+        );
+        assert_eq!(buffer.finish(16), oracle(&frame, 16));
     }
 }

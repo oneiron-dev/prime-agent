@@ -7,13 +7,11 @@
 //! `agent_begin/end`, `session_action_update`) map to nothing, exactly like
 //! the TS switch's default arm.
 
+use serde::Deserialize as _;
 use serde_json::{json, Value};
 
 use super::meta::{prime_agent_meta, PrimeAgentCompactionMeta, PrimeAgentSessionMeta};
 use super::types::{AcpSessionUpdate, AcpToolKind, AcpToolStatus, TextBlock};
-
-/// The model-facing Python REPL tool.
-const IPYTHON_TOOL_NAME: &str = "ipython";
 
 /// Correlates streamed chunks with their owning assistant message (the
 /// daemon stream carries the delta on `assistantMessageEvent`) and bash
@@ -43,15 +41,15 @@ impl WireMappingState {
     }
 }
 
-/// The newest assistant stop reason carried by a `message_end` event (the
-/// transport reads it after the turn for the stop-reason response); also
-/// captures an error message on a failed turn.
+/// The assistant stop reason carried by one `message_end` event: the
+/// transport keeps the newest one and reads it after the turn for the
+/// stop-reason response.
 pub struct AssistantStop {
-    pub stop_reason: Option<String>,
+    pub stop_reason: Option<pa_types::ai::StopReason>,
 }
 
-/// Extract the assistant stop/error fields from one wire event, when the
-/// event settles an assistant message.
+/// Extract the assistant stop reason from one wire event, when the event
+/// settles an assistant message.
 pub fn assistant_stop(event: &Value) -> Option<AssistantStop> {
     if event.get("type").and_then(Value::as_str) != Some("message_end") {
         return None;
@@ -63,8 +61,7 @@ pub fn assistant_stop(event: &Value) -> Option<AssistantStop> {
     Some(AssistantStop {
         stop_reason: message
             .get("stopReason")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .and_then(|value| pa_types::ai::StopReason::deserialize(value).ok()),
     })
 }
 
@@ -142,12 +139,12 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
                 .unwrap_or_default()
                 .to_string();
             let args = event.get("args").cloned().unwrap_or(Value::Null);
-            let cell = if tool_name == IPYTHON_TOOL_NAME {
+            let cell = if pa_types::ai::is_python_tool_name(&tool_name) {
                 args.get("code").and_then(Value::as_str).map(str::to_string)
             } else {
                 None
             };
-            let title = if tool_name == IPYTHON_TOOL_NAME {
+            let title = if pa_types::ai::is_python_tool_name(&tool_name) {
                 "Python cell".to_string()
             } else {
                 tool_name.clone()
@@ -458,7 +455,7 @@ fn base64_byte_length(data: &str) -> u64 {
     (data.len() as u64 * 3 / 4).saturating_sub(padding)
 }
 
-/// TS `ipythonRichOutput`: media and diffs ride the namespaced meta.
+/// Media and diffs ride the namespaced meta.
 fn ipython_rich_output(result: Option<&Value>) -> Option<Value> {
     let details = result?.get("details")?;
     let attachments = details
@@ -541,8 +538,8 @@ mod tests {
 
     #[test]
     fn goal_update_maps_to_the_namespaced_goal_meta() {
-        // TS acp-events.ts `case "goal_update"`: the GoalState fields the
-        // meta carries, nothing else.
+        // The GoalState fields the meta carries,
+        // nothing else.
         let mut state = WireMappingState::default();
         let updates = wire_updates(
             &json!({
@@ -646,10 +643,10 @@ mod tests {
     fn assistant_stop_reason_is_captured_from_message_end() {
         let stop = assistant_stop(&json!({
             "type": "message_end",
-            "message": { "role": "assistant", "stopReason": "end_turn" },
+            "message": { "role": "assistant", "stopReason": "length" },
         }))
         .expect("assistant message_end");
-        assert_eq!(stop.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(stop.stop_reason, Some(pa_types::ai::StopReason::Length));
         assert!(assistant_stop(&json!({
             "type": "message_end",
             "message": { "role": "user" },

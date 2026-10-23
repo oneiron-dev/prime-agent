@@ -1,6 +1,5 @@
-//! The session-store unit battery (moved with its concern): the store
-//! lifecycle, the bounded header readers, the attribution folds, the wire
-//! shapes, and the resumable scan.
+//! The session-store unit battery: the store lifecycle, the bounded header readers, the
+//! attribution folds, the wire shapes, and the resumable scan.
 
 use super::*;
 use serde_json::json;
@@ -11,10 +10,8 @@ fn temp_dir() -> PathBuf {
     dir
 }
 
-/// The captured-attribution fixture: real devbox session rows
-/// (content sanitized; cwd and repoUrl neutralized; ids, timestamps, and
-/// usage verbatim) — six `child_usage_attributed` entries target one
-/// assistant row.
+/// The captured-attribution fixture: real devbox session rows (content sanitized,
+/// cwd/repoUrl neutralized; ids, timestamps, and usage verbatim).
 fn captured_attribution_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/attribution-fold-captured.jsonl")
 }
@@ -98,11 +95,9 @@ fn bounded_header_treats_an_empty_file_as_headerless() {
 #[test]
 fn open_folds_captured_child_usage_attributions() {
     let store = SessionFile::open(&captured_attribution_fixture()).unwrap();
-    // The raw file row: input 2690 / totalTokens 23032 / cost $0. The
-    // last attribution's cumulative aggregate replaces it (TS
-    // `applyChildUsageAttributions`): input 52898 / totalTokens 23032
-    // (unchanged — the aggregate keeps the row's context size) / cost
-    // $0.0089957. Six entries fold once, never sum.
+    // The raw file row: input 2690 / totalTokens 23032 / cost $0. The last
+    // attribution's cumulative aggregate replaces it: input 52898 /
+    // totalTokens 23032 (unchanged) / cost $0.0089957. Six entries fold once, never sum.
     let assistant = store.entry("4f61089a").expect("captured target row");
     let usage = &assistant.fields["message"]["usage"];
     assert_eq!(usage["input"], json!(52898));
@@ -137,9 +132,7 @@ fn append_entry_folds_a_live_child_usage_attribution() {
                                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0.01}},
             }),
         );
-    // The live seam folds without a reopen (TS
-    // `SessionManager.append_child_usage_attribution` folds after the
-    // durable append).
+    // The live seam folds without a reopen.
     let row = store.entry(&assistant).unwrap();
     assert_eq!(row.fields["message"]["usage"]["input"], json!(15));
     assert_eq!(row.fields["message"]["usage"]["output"], json!(3));
@@ -161,9 +154,8 @@ fn a_malformed_aggregate_does_not_zero_the_target_row() {
                   "totalTokens": 12,
                   "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
     }));
-    // A malformed aggregate (null / a scalar) must not overwrite the
-    // row's valid usage with nothing — the fold skips it, exactly like
-    // the typed session reader rejects invalid attribution payloads.
+    // A malformed aggregate (null / a scalar) must not overwrite the row's valid usage — the fold
+    // skips it.
     store.append_entry(
         "child_usage_attributed",
         json!({"targetId": assistant, "origin": "spawn_task", "aggregateUsage": null}),
@@ -177,14 +169,7 @@ fn a_malformed_aggregate_does_not_zero_the_target_row() {
     assert_eq!(row.fields["message"]["usage"]["totalTokens"], json!(12));
 }
 
-/// The depth-2 chain (the Macroscope #2671 thread's design pin): a
-/// child session file carrying its OWN grandchild attributions (the
-/// child spawned a child) opens FOLDED — the end-of-load fold replaces
-/// the target assistant row's usage with the newest cumulative
-/// aggregate — and the observer walk (`child_usage_batches` over the
-/// OPENED store) reports the FOLDED aggregate to the root: the
-/// grandchild's billable spend reaches the root parent exactly like
-/// the TS in-process fold does.
+/// The end-of-load fold installs the newest cumulative aggregate (TS in-process fold parity).
 #[test]
 fn the_depth_two_chain_reports_the_folded_aggregate() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -202,12 +187,23 @@ fn the_depth_two_chain_reports_the_folded_aggregate() {
         "totalTokens": 1_040,
         "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0.10 },
     });
+    let kickoff = |id: &str, parent: Option<&str>| {
+        json!({
+            "type": "custom_message", "id": id, "parentId": parent,
+            "timestamp": "2026-09-24T00:00:00.000Z",
+            "customType": "agent_message",
+            "content": "[task from parent]\n\ntask",
+            "display": true,
+            "details": { "id": "spawn:sub-1", "message": "task" },
+        })
+        .to_string()
+    };
     let lines = [
             json!({"type": "session", "version": 3, "id": "child-s1", "timestamp": "2026-09-24T00:00:00.000Z", "cwd": "/tmp"}).to_string(),
-            row("u1", None, json!({"role": "user", "content": "task"})),
+            kickoff("c0", None),
             row(
                 "a1",
-                Some("u1"),
+                Some("c0"),
                 json!({
                     "role": "assistant",
                     "provider": "prime-inference", "model": "internal/glm-5.3-fast",
@@ -216,9 +212,8 @@ fn the_depth_two_chain_reports_the_folded_aggregate() {
                     "usage": assistant_usage,
                 }),
             ),
-            // The grandchild's attribution into the child's spawning row: the
-            // cumulative aggregate (raw + grandchild spend) that the fold
-            // installs at load.
+            // The grandchild's attribution into the child's spawning row: the cumulative aggregate
+            // the fold installs at load.
             json!({
                 "type": "child_usage_attributed", "id": "attr1", "parentId": "a1",
                 "timestamp": "2026-09-24T00:00:01.000Z",
@@ -233,7 +228,6 @@ fn the_depth_two_chain_reports_the_folded_aggregate() {
             .to_string(),
         ];
     std::fs::write(&path, lines.join("\n")).unwrap();
-    // The fold applies at open (TS applyChildUsageAttributions).
     let store = SessionFile::open(&path).unwrap();
     let folded = store.entry("a1").expect("the target row");
     assert_eq!(
@@ -241,9 +235,8 @@ fn the_depth_two_chain_reports_the_folded_aggregate() {
         json!(1_500),
         "the end-of-load fold installed the cumulative aggregate"
     );
-    // The observer walk reads the FOLDED store: the depth-2 batch the
-    // root receives carries the grandchild's spend (input 1,500 — the
-    // raw 1,000 would mean the grandchild vanished at depth 2).
+    // The observer walk reads the FOLDED store: the depth-2 batch carries the
+    // grandchild's spend (input 1,500 — the raw 1,000 would mean it vanished at depth 2).
     let (batches, next) = crate::rlm_child_usage::child_usage_batches(store.entries(), 0);
     assert_eq!(next, store.entries().len(), "the walk consumes the file");
     let spawn = batches
@@ -425,16 +418,12 @@ fn creates_and_loads_a_session() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A corrupt file can hold a parent cycle; the branch walk must
-/// terminate anyway (the same guard `build_session_context` has). The
-/// session-model restore reads the branch through this walk, so a
-/// cyclic file would otherwise hang the create's blocking task.
+/// A cyclic file would otherwise hang the create's blocking task.
 #[test]
 fn a_cyclic_parent_chain_terminates_the_branch_walk() {
     let mut session = SessionFile::create("/tmp", None, 0);
     session.append_message(&json!({"role": "user", "content": "a", "timestamp": 1u64}));
     session.append_message(&json!({"role": "user", "content": "b", "timestamp": 2u64}));
-    // Forge the cycle: the two entries point at each other.
     let first = session.entries[0].id.clone();
     let second = session.entries[1].id.clone();
     session.entries[0].parent_id = Some(second);
@@ -453,9 +442,7 @@ fn a_cyclic_parent_chain_terminates_the_branch_walk() {
     assert!(typed.len() <= 2, "branch_file_entries terminates");
 }
 
-/// The persisted thinking level (`thinking_level_change`): the last
-/// entry wins, like the model; a malformed or empty level never
-/// replaces a prior good one.
+/// A malformed or empty level never replaces a prior good one.
 #[test]
 fn scan_keeps_the_latest_persisted_thinking_level() {
     let dir = temp_dir();
@@ -470,9 +457,7 @@ fn scan_keeps_the_latest_persisted_thinking_level() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A failed append leaves the store unchanged: the in-memory index
-/// only adopts entries the file accepted, so the next append parents
-/// to the last persisted entry and the reloaded file stays walkable.
+/// The in-memory index only adopts entries the file accepted.
 #[test]
 fn failed_persist_keeps_the_store_walkable() {
     let dir = temp_dir();
@@ -507,9 +492,8 @@ fn failed_persist_keeps_the_store_walkable() {
             json!({ "message": { "role": "user", "content": "again" } }),
         )
         .unwrap();
-    // The reloaded file chains first -> third: the failed append added
-    // nothing to the file, so the next one chains from the last
-    // persisted entry.
+    // The reloaded file chains first -> third: the failed append added nothing, so the next one
+    // chains from the last persisted entry.
     let loaded = SessionFile::open(&file).unwrap();
     let chain: Vec<&str> = loaded
         .branch()
@@ -520,13 +504,8 @@ fn failed_persist_keeps_the_store_walkable() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The replay's dedup predicate is the disclosure row's fields: the
-/// create handler recognizes the exact row wherever it came from —
-/// this replacement's own declaration-stamped persist, an earlier
-/// crash-replay's identical row, or the dead worker's own abort arm
-/// (the same fields carrying the worker's persist-time stamp) — and
-/// appends nothing. A different disclosure (another reason or
-/// outcome) stays distinct.
+/// The replay's dedup predicate is the disclosure row's fields: the exact
+/// row is recognized wherever it came from; a different disclosure stays distinct.
 #[test]
 fn declaration_stamped_entry_survives_reload_as_the_same_identity() {
     let dir = temp_dir();
@@ -544,24 +523,21 @@ fn declaration_stamped_entry_survives_reload_as_the_same_identity() {
         .persist_entry_at("custom_message", disclosure.clone(), declared_at)
         .unwrap();
 
-    // The rebuilt transcript (a fresh open) holds the exact row: the
-    // replay's fields-only dedup matches it — the declaration stamp
-    // and any other stamp alike — so the row is not appended twice.
+    // The rebuilt transcript (a fresh open) holds the exact row: the replay's fields-only dedup
+    // matches it, so the row is not appended twice.
     let loaded = SessionFile::open(&file).unwrap();
     let already_disclosed =
         |entry: &SessionEntry| entry.type_ == "custom_message" && entry.fields == disclosure;
     assert!(loaded.entries().iter().any(already_disclosed));
 
-    // The worker's own abort arm carries the same fields under its own
-    // persist-time stamp: still the same disclosure, still not a
-    // duplicate.
+    // The worker's own abort arm carries the same fields under its own persist-time stamp:
+    // still not a duplicate.
     let mut with_own_row = SessionFile::open(&file).unwrap();
     with_own_row
         .persist_entry("custom_message", disclosure.clone())
         .unwrap();
     assert!(with_own_row.entries().iter().any(already_disclosed));
 
-    // A different disclosure (a failed run's row) stays distinct.
     let failed = json!({
         "customType": "compaction_outcome",
         "content": "Compaction failed: Summarization failed",
@@ -575,10 +551,8 @@ fn declaration_stamped_entry_survives_reload_as_the_same_identity() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `branch_bridged` reconstructs the intended chain across a
-/// ghost-parent gap: the missing id was minted but never persisted, so
-/// the walk continues from the gap entry's file predecessor (the
-/// writer's leaf at the time).
+/// The missing id was minted but never persisted, so the walk continues from the gap entry's
+/// file predecessor (the writer's leaf at the time).
 #[test]
 fn branch_bridged_bridges_ghost_parent_gaps() {
     let dir = temp_dir();
@@ -615,10 +589,6 @@ fn branch_bridged_bridges_ghost_parent_gaps() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A gap after a persisted branch move follows the active lineage:
-/// the `branch_summary` marker is the gap entry's file predecessor
-/// and chains from the moved-to entry, so the bridged walk keeps the
-/// active branch and skips the abandoned fork.
 #[test]
 fn branch_bridged_skips_abandoned_chains_after_a_persisted_branch_move() {
     let dir = temp_dir();
@@ -646,9 +616,7 @@ fn branch_bridged_skips_abandoned_chains_after_a_persisted_branch_move() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A clean file bridges nothing: the bridged walk equals the strict
-/// walk, and forked-off entries stay excluded (they resolve by parent
-/// id; only a MISSING parent bridges).
+/// Forked-off entries stay excluded; only a MISSING parent bridges.
 #[test]
 fn branch_bridged_matches_the_strict_walk_on_clean_files() {
     let dir = temp_dir();
@@ -680,36 +648,8 @@ fn branch_bridged_matches_the_strict_walk_on_clean_files() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn scan_builds_transcript_search_text() {
-    let dir = temp_dir();
-    let mut session = SessionFile::create("/tmp", None, 0);
-    let path = dir.join(session_file_name(session.session_id()));
-    session.set_path(path.clone());
-    session.append_message(
-        &json!({"role": "user", "content": "fix the login bug", "timestamp": 1u64}),
-    );
-    session.append_message(&json!({
-        "role": "assistant",
-        "content": [{ "type": "text", "text": "fixed in auth.rs" }],
-        "provider": "p", "model": "m", "timestamp": 2u64
-    }));
-    // Tool traffic is counted but never enters the search corpus.
-    session
-        .append_message(&json!({"role": "toolResult", "content": "tool noise", "timestamp": 3u64}));
-    session.rewrite().unwrap();
-
-    let info = read_session_info(&path).unwrap();
-    assert_eq!(info.all_messages_text, "fix the login bug fixed in auth.rs");
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The saved-row usage summary folds like the TS scan: raw assistant
-/// usage keyed by entry id, the latest attribution aggregate replacing
-/// the raw block, every child block accumulating, summarization usage
-/// added, and the child spend subtracted — the child's own row carries
-/// it, so rollups never double count. `session_usage`'s tests pin the
-/// fold unit-by-unit; this pins the listing scan's wiring.
+/// Raw usage keyed by id, aggregates replacing raw blocks, child spend
+/// subtracted — `session_usage`'s tests pin the fold, this pins the scan's wiring.
 #[test]
 fn scan_folds_the_saved_row_usage_summary() {
     let dir = temp_dir();
@@ -769,10 +709,7 @@ fn scan_folds_the_saved_row_usage_summary() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A persisted partial usage object (`{input, output, totalTokens}`
-/// without `cacheRead`/`cacheWrite`/`cost`) must not reject the whole
-/// entry: TS `JSON.parse` keeps the row, so the count, model, search
-/// text, and every present usage field survive.
+/// TS `JSON.parse` keeps the row, so every present field survives the partial block.
 #[test]
 fn scan_keeps_messages_with_partial_usage_objects() {
     let dir = temp_dir();
@@ -791,7 +728,6 @@ fn scan_keeps_messages_with_partial_usage_objects() {
     let info = read_session_info(&path).unwrap();
     assert_eq!(info.message_count, 2);
     assert_eq!(info.model, Some(("p".to_string(), "m".to_string())));
-    assert!(info.all_messages_text.contains("done"));
     assert_eq!(
         info.usage,
         Some(crate::session_usage::SessionUsageSummary {
@@ -803,8 +739,6 @@ fn scan_keeps_messages_with_partial_usage_objects() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A session with no billable work publishes no usage field (TS
-/// `sessionUsageSummaryFrom` returns undefined).
 #[test]
 fn scan_omits_usage_without_billable_work() {
     let dir = temp_dir();
@@ -820,244 +754,10 @@ fn scan_omits_usage_without_billable_work() {
 }
 
 #[test]
-fn transcript_search_text_caps_at_the_ts_limit() {
-    let dir = temp_dir();
-    let mut session = SessionFile::create("/tmp", None, 0);
-    let path = dir.join(session_file_name(session.session_id()));
-    session.set_path(path.clone());
-    for round in 0..3 {
-        let message = "x".repeat(30 * 1024);
-        session.append_message(&json!({
-            "role": "user", "content": format!("{round} {message}"), "timestamp": round + 1
-        }));
-    }
-    session.rewrite().unwrap();
-
-    let info = read_session_info(&path).unwrap();
-    assert_eq!(
-        info.all_messages_text.chars().count(),
-        SESSION_LIST_SEARCH_TEXT_MAX_CHARS
-    );
-    // Space-joined like TS: exactly one separator between messages.
-    assert!(info.all_messages_text.starts_with("0 xxx"));
-    assert!(info.all_messages_text.contains("1 xxx"));
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn search_text_char_counter_stays_in_lockstep_with_the_corpus() {
-    // The O(1) running counter must equal `chars().count()` of the
-    // corpus at every fold step - including multibyte text, the cap
-    // cut mid-message, and post-cap appends - or the cap guard drifts
-    // from the TS corpus it bounds.
-    let mut acc = SessionScanAccumulator::default();
-    let texts = [
-        "fix the login bug".to_string(),
-        "ünïcödé — multibyte ✓ chars".to_string(),
-        "x".repeat(66 * 1024),
-        "post-cap tail that must not move the corpus".to_string(),
-        "y".repeat(10),
-    ];
-    for (index, text) in texts.iter().enumerate() {
-        let entry = json!({
-            "type": "message",
-            "id": format!("m{index}"),
-            "timestamp": format!("{}", index + 1),
-            "message": {"role": "user", "content": text}
-        });
-        fold_scan_entry(&mut acc, &entry.to_string()).unwrap();
-        assert_eq!(
-            acc.search_text_chars,
-            acc.all_messages_text.chars().count(),
-            "counter drift after fold {index}"
-        );
-        assert!(acc.all_messages_text.chars().count() <= SESSION_LIST_SEARCH_TEXT_MAX_CHARS);
-    }
-    assert_eq!(acc.first_message, "fix the login bug");
-    assert_eq!(acc.message_count, 5);
-    // The cap cut mid-message: the corpus holds exactly the limit.
-    assert_eq!(acc.search_text_chars, SESSION_LIST_SEARCH_TEXT_MAX_CHARS);
-}
-
-#[test]
-fn search_text_char_counter_matches_the_legacy_append() {
-    // The reference append (the pre-counter shape: count, then extend)
-    // must produce the same corpus for the same sequence of texts.
-    let mut corpus = String::new();
-    let mut count = 0usize;
-    let texts = [
-        String::new(),
-        "one".to_string(),
-        "twö with multibyte".to_string(),
-        "z".repeat(SESSION_LIST_SEARCH_TEXT_MAX_CHARS + 10),
-        "post-cap".to_string(),
-    ];
-    for text in &texts {
-        let mut legacy = corpus.clone();
-        if !text.is_empty() {
-            let used = legacy.chars().count();
-            if used < SESSION_LIST_SEARCH_TEXT_MAX_CHARS {
-                if used > 0 {
-                    legacy.push(' ');
-                }
-                let remaining = SESSION_LIST_SEARCH_TEXT_MAX_CHARS - legacy.chars().count();
-                legacy.extend(text.chars().take(remaining));
-            }
-        }
-        count = append_capped_search_text(&mut corpus, text, count);
-        assert_eq!(corpus, legacy);
-        assert_eq!(count, legacy.chars().count());
-    }
-}
-
-#[test]
-fn search_text_counter_lockstep_names_every_corpus_mutation_path() {
-    // Every path that can mutate the capped corpus, at the accumulator
-    // level. Any other path is read-only (build_info derives, the wire
-    // serializes); eviction drops the whole state (counter and corpus
-    // together, so it cannot desync) and store_state keeps it whole.
-    // The paths: (1) a fresh fold's appends, (2) the resume copy a
-    // grown file folds into (clone_for_resume travels the counter),
-    // (3) the torn-tail SNAPSHOT fold (build_info folds the tail into
-    // a clone, the durable accumulator untouched), and (4) a rewritten
-    // file (generation mismatch re-folds from a fresh accumulator).
-    let header_line = session_header_line(&SessionHeader {
-        version: None,
-        id: "s1".to_string(),
-        timestamp: "2026-09-26T00:00:00.000Z".to_string(),
-        cwd: "/repo".to_string(),
-        parent_session: None,
-        rlm_depth: None,
-        git: None,
-        rest: serde_json::Map::default(),
-    })
-    .to_string();
-    let message = |text: &str, index: u64| {
-        json!({
-            "type": "message",
-            "id": format!("m{index}"),
-            "timestamp": index.to_string(),
-            "message": {"role": "user", "content": text}
-        })
-        .to_string()
-    };
-
-    // (1) fresh fold, past the cap.
-    let generation = SessionInfoGeneration {
-        len: 4096,
-        dev: 0,
-        ino: 0,
-        mtime: 0,
-        mtime_ns: 0,
-        ctime: 0,
-        ctime_ns: 0,
-    };
-    let mut state = SessionScanState::fresh(generation);
-    fold_scan_entry(&mut state.acc, &header_line).unwrap();
-    fold_scan_entry(&mut state.acc, &message("first user turn", 1)).unwrap();
-    fold_scan_entry(
-        &mut state.acc,
-        &message(&"x".repeat(SESSION_LIST_SEARCH_TEXT_MAX_CHARS), 2),
-    )
-    .unwrap();
-    assert_eq!(
-        state.acc.search_text_chars,
-        state.acc.all_messages_text.chars().count()
-    );
-    assert_eq!(
-        state.acc.all_messages_text.chars().count(),
-        SESSION_LIST_SEARCH_TEXT_MAX_CHARS
-    );
-
-    // (2) the resume copy: the grown file's next appends fold into
-    // clone_for_resume's accumulator - the counter travels with the
-    // corpus and stays in lockstep for post-cap appends.
-    let mut resumed = state.clone_for_resume();
-    assert_eq!(
-        resumed.acc.search_text_chars,
-        resumed.acc.all_messages_text.chars().count()
-    );
-    fold_scan_entry(&mut resumed.acc, &message("appended after cap", 3)).unwrap();
-    assert_eq!(
-        resumed.acc.search_text_chars,
-        resumed.acc.all_messages_text.chars().count()
-    );
-    assert_eq!(
-        resumed.acc.all_messages_text.chars().count(),
-        SESSION_LIST_SEARCH_TEXT_MAX_CHARS
-    );
-
-    // (3) the torn-tail snapshot: build_info folds the torn final
-    // line into a CLONE, so the durable accumulator's counter stays
-    // untouched; an uncapped snapshot's row gains the tail's text,
-    // the capped one cannot (the tail arm is under the same cap).
-    let durable_before = state.acc.clone();
-    let capped_info = state
-            .build_info(
-                Path::new("/repo/s1.jsonl"),
-                || None,
-                Some(r#"{"type":"message","id":"m4","timestamp":"4","message":{"role":"user","content":"torn tail"}}"#),
-            )
-            .unwrap();
-    assert_eq!(
-        capped_info.all_messages_text, durable_before.all_messages_text,
-        "the cap bounds the snapshot fold too - a torn tail past it changes no corpus byte"
-    );
-    assert_eq!(
-        state.acc.search_text_chars,
-        durable_before.search_text_chars
-    );
-    assert_eq!(
-        state.acc.search_text_chars,
-        state.acc.all_messages_text.chars().count()
-    );
-    let mut uncapped = SessionScanState::fresh(generation);
-    fold_scan_entry(&mut uncapped.acc, &header_line).unwrap();
-    fold_scan_entry(&mut uncapped.acc, &message("user turn one", 1)).unwrap();
-    let uncapped_durable = uncapped.acc.clone();
-    let uncapped_info = uncapped
-            .build_info(
-                Path::new("/repo/s1.jsonl"),
-                || None,
-                Some(r#"{"type":"message","id":"m5","timestamp":"2","message":{"role":"user","content":"user turn two"}}"#),
-            )
-            .unwrap();
-    assert_eq!(
-        uncapped_info.all_messages_text,
-        "user turn one user turn two"
-    );
-    assert_eq!(
-        uncapped.acc.all_messages_text,
-        uncapped_durable.all_messages_text
-    );
-    assert_eq!(
-        uncapped.acc.search_text_chars,
-        uncapped_durable.search_text_chars
-    );
-
-    // (4) a rewritten file re-folds from a fresh accumulator: both
-    // corpus and counter restart at zero together.
-    let mut rewritten = SessionScanState::fresh(generation);
-    assert_eq!(rewritten.acc.search_text_chars, 0);
-    assert!(rewritten.acc.all_messages_text.is_empty());
-    fold_scan_entry(&mut rewritten.acc, &header_line).unwrap();
-    fold_scan_entry(&mut rewritten.acc, &message("rewrite from zero", 1)).unwrap();
-    assert_eq!(
-        rewritten.acc.search_text_chars,
-        rewritten.acc.all_messages_text.chars().count()
-    );
-    assert_eq!(
-        rewritten.acc.all_messages_text, "rewrite from zero",
-        "a rewritten file's corpus is the fresh fold's, not the old session's"
-    );
-}
-
-#[test]
 fn durable_first_kept_entry_id_pins_the_boundary_the_read_retains() {
-    // The parity scenario the frame diff caught: the engine compacts its
-    // in-memory entries and reports an id that never exists in the
-    // session file. The durable re-cut must pin the boundary the
-    // `messages()` read recognizes, or the retained tail is lost.
+    // The parity scenario the frame diff caught: the engine reports an id that
+    // never exists in the file; the re-cut must pin the boundary `messages()`
+    // recognizes, or the retained tail is lost.
     let mut session = SessionFile::create("/tmp", None, 0);
     session.append_message(&json!({"role": "user", "content": "first", "timestamp": 1u64}));
     let usage = json!({
@@ -1077,8 +777,8 @@ fn durable_first_kept_entry_id_pins_the_boundary_the_read_retains() {
     session.append_message(&assistant("second turn done".to_string(), 4u64));
 
     let durable_id = session.durable_first_kept_entry_id(5);
-    // The cut keeps the whole second turn: its user message is the
-    // boundary (estimate: 4 + 2 >= 5 stops at the user entry).
+    // The cut keeps the whole second turn: its user message is the boundary (estimate: 4 + 2 >= 5
+    // stops at the user entry).
     let kept = session
         .branch()
         .iter()
@@ -1095,8 +795,7 @@ fn durable_first_kept_entry_id_pins_the_boundary_the_read_retains() {
         json!({ "summary": "the story", "firstKeptEntryId": durable_id, "tokensBefore": 12 }),
     );
     let messages = session.messages();
-    // Wire order is summary-first (TS `buildSessionContext`); the
-    // retained messages follow.
+    // Wire order is summary-first (TS `buildSessionContext`); the retained messages follow.
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0].get("role"), Some(&json!("compactionSummary")));
     assert_eq!(crate::types::message_text(&messages[1]), "second turn");
@@ -1115,9 +814,7 @@ fn entry_chain_links_parents() {
     assert_eq!(session.leaf_id(), Some(b.as_str()));
 }
 
-/// Appending costs the same whatever the store's size: the id mint checks
-/// collisions against the maintained `by_id` index instead of rebuilding an
-/// id map from every entry on each append.
+/// The id mint checks collisions against the maintained `by_id` index, not a rebuilt map.
 #[test]
 fn append_cost_does_not_grow_with_the_store() {
     let mut small = SessionFile::create("/tmp", None, 0);
@@ -1131,8 +828,7 @@ fn append_cost_does_not_grow_with_the_store() {
             fields: json!({}),
         });
     }
-    // The fastest iteration per store, so a scheduler stall on one leg
-    // cannot flip the comparison.
+    // The fastest iteration per store, so a scheduler stall on one leg cannot flip the comparison.
     let mut small_fastest = std::time::Duration::MAX;
     let mut large_fastest = std::time::Duration::MAX;
     for _ in 0..500 {
@@ -1171,15 +867,9 @@ fn skips_malformed_lines() {
 }
 
 /// The durable compaction row must byte-serialize in the TS key order
-/// (TS `appendCompaction`'s `CompactionEntry` literal, verified against
-/// the TS binary's session file — battery run 20260921T140248Z,
-/// `ts/f7_compaction/sessions/*.jsonl`):
-/// type, id, parentId, timestamp, summary, firstKeptEntryId,
-/// tokensBefore, details, fromHook, customInstructions?, usage,
-/// harnessDigest — with `details` as `{readFiles, modifiedFiles}` and
-/// `usage` in the TS `Usage` field order. The JSON map preserves
-/// insertion order (`serde_json` `preserve_order`), so any drift shows
-/// up here as a wrong key sequence, not just a wrong shape.
+/// (verified against the TS binary's session file, battery run
+/// 20260921T140248Z): type, id, parentId, timestamp, summary, firstKeptEntryId,
+/// tokensBefore, details, fromHook, customInstructions?, usage, harnessDigest.
 #[test]
 fn durable_compaction_row_serializes_in_the_ts_key_order() {
     let entry = pa_types::session::CompactionEntry {
@@ -1235,9 +925,8 @@ fn durable_compaction_row_serializes_in_the_ts_key_order() {
             "harnessDigest",
         ]
     );
-    // The details block is the TS `readFiles`-first literal order, and
-    // usage keeps the TS field order (input, output, cacheRead,
-    // cacheWrite, totalTokens, cost).
+    // The details block is the TS `readFiles`-first literal order, and usage keeps the TS
+    // field order (input, output, cacheRead, cacheWrite, totalTokens, cost).
     let details = serde_json::to_string(parsed["details"].as_object().unwrap()).unwrap();
     assert_eq!(
         details,
@@ -1262,10 +951,6 @@ fn durable_compaction_row_serializes_in_the_ts_key_order() {
     );
 }
 
-/// The in-place tail window matches the rolling `Vec` reference (the
-/// previous implementation) byte for byte across line-length regimes: the
-/// keep cut at the window edge, the short-line roll, the empty line, and
-/// multibyte bytes that never decode mid-window.
 #[test]
 fn resume_tail_window_matches_the_rolling_reference() {
     let mut state = SessionScanState::fresh(SessionInfoGeneration {
@@ -1316,8 +1001,6 @@ fn resume_tail_window_matches_the_rolling_reference() {
     assert_eq!(state.tail, reference);
 }
 
-/// The session header line leads with the `type` tag, exactly like the
-/// TS session file's first line (`{"type":"session","version":...}`).
 #[test]
 fn session_header_line_leads_with_the_type_tag() {
     let header = SessionHeader {
@@ -1332,4 +1015,80 @@ fn session_header_line_leads_with_the_type_tag() {
     };
     let line = serde_json::to_string(&session_header_line(&header)).unwrap();
     assert!(line.starts_with("{\"type\":\"session\",\"version\":3,\"id\":\"abc\""));
+}
+
+#[cfg(unix)] // Windows uses the full reader rather than windowed hydration.
+#[test]
+fn hydrating_full_history_preserves_the_trace_controller() {
+    let dir = temp_dir();
+    let path = dir.join("trace-hydration.jsonl");
+    let mut original = SessionFile::create(dir.to_str().unwrap(), None, 0);
+    original.append_message(&json!({"role":"user", "content":"synthetic", "timestamp":1u64}));
+    original.set_path(path.clone());
+    original.rewrite().unwrap();
+    let mut windowed = SessionFile::open_windowed(&path).unwrap();
+    assert!(windowed.window.is_some());
+    let (_, consent) = pa_core::agent_traces::ContinuousTraceUpload::load_settings(&dir, &dir);
+    let controller =
+        pa_core::agent_traces::ContinuousTraceUpload::install(&dir, &dir, Some(&path), consent)
+            .unwrap();
+    windowed.trace_upload = Some(controller.clone());
+    windowed.ensure_full_history().unwrap();
+    assert!(windowed.window.is_none());
+    assert!(std::sync::Arc::ptr_eq(
+        windowed.trace_upload.as_ref().unwrap(),
+        &controller
+    ));
+}
+
+#[test]
+fn listing_and_frozen_usage_agree_on_duplicate_attribution_ids() {
+    let dir = temp_dir();
+    let mut session = SessionFile::create("/tmp", None, 0);
+    let path = dir.join(session_file_name(session.session_id()));
+    session.set_path(path.clone());
+    let usage = |input, output, cost| {
+        json!({
+            "input": input, "output": output, "cacheRead": 0, "cacheWrite": 0,
+            "totalTokens": input + output,
+            "cost": {"input": 0.0, "output": cost, "cacheRead": 0.0, "cacheWrite": 0.0, "total": cost}
+        })
+    };
+    let target = session.append_message(&json!({
+        "role": "assistant", "content": [], "timestamp": 1_790_110_000_000_u64,
+        "usage": usage(100u64, 10u64, 8.0)
+    }));
+    session.rewrite().unwrap();
+    let attributed = json!({
+        "type": "child_usage_attributed", "id": "report-1", "targetId": target,
+        "timestamp": "2026-10-11T00:00:00.000Z",
+        "childUsage": usage(20, 2, 2.0), "aggregateUsage": usage(120, 12, 10.0)
+    });
+    serde_json::from_str::<super::info::SessionInfoEntry<'_>>(&attributed.to_string()).unwrap();
+    let append = || {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{attributed}").unwrap();
+    };
+    append();
+    let expected = Some(crate::session_usage::SessionUsageSummary {
+        input_tokens: 100,
+        output_tokens: 10,
+        cost: 8.0,
+    });
+    assert_eq!(read_session_info(&path).unwrap().usage, expected);
+    let prefix_len = fs::metadata(&path).unwrap().len();
+    // The appended duplicate must not subtract again in either scanner.
+    append();
+    let grown_len = fs::metadata(&path).unwrap().len();
+    assert!(grown_len > prefix_len);
+    assert_eq!(read_session_info(&path).unwrap().usage, expected);
+    assert_eq!(
+        crate::session_usage::read_session_usage(&path),
+        Some(crate::session_usage::SessionUsageTotals {
+            own: serde_json::from_value(usage(100, 10, 8.0)).unwrap(),
+            total: serde_json::from_value(usage(120, 12, 10.0)).unwrap(),
+        })
+    );
+    fs::remove_dir_all(dir).unwrap();
 }

@@ -1,27 +1,18 @@
 //! The saved-catalog stream is per-file DURING the scan (TS
-//! `listSessionsFromDir`'s `onSession`/`onProgress` per file): the rows
-//! reach the client while the scan still has work left - a grown store's
-//! first row lands long before the scan's final response, instead of one
-//! post-scan burst (the operator's whole-catalog wait the entry anchor's
-//! loading hold rode). The stream is mtime-newest-first (the metadata
-//! pass precedes the folds), so the newest session is the FIRST frame.
-// Pedantic-gate dispositions (fleet-uniform ruling; see this lane's PR for
-// the full rationale).
-// Stack-resident futures by design on the daemon's hot paths; boxing the
-// call sites for a lint tick is a perf regression with zero correctness gain.
+//! `listSessionsFromDir`'s `onSession`/`onProgress`): rows reach the client
+//! while the scan still has work left; the stream is mtime-newest-first,
+//! so the newest session is the FIRST frame.
+// Stack-resident futures by design on the daemon's hot paths.
 #![allow(clippy::large_futures)]
-// 64-bit-only targets; the narrowing casts sit at OS boundaries
-// (pid/fd/time/size) where the values are bounded by the kernel - the
-// dead-guard expect()s would add panic paths where silent wrap was
-// deliberate.
+// Narrowing casts sit at OS boundaries (pid/fd/time/size) where the kernel
+// bounds the values.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-// The fn-length threshold is a style gate, not correctness; the structure
-// campaign owns the god-fn splits as a follow-up.
+// Style gate only, not correctness.
 #![allow(clippy::too_many_lines)]
 // API-shape opinions, not defects; the surfaces are deliberate.
 #![allow(
@@ -137,8 +128,6 @@ impl Client {
     }
 }
 
-/// One valid saved-session fixture: a version-3 header, a display name,
-/// one user/assistant exchange, and a stamped mtime (the scan order key).
 fn write_fixture(
     dir: &Path,
     id: &str,
@@ -156,7 +145,7 @@ fn write_fixture(
     );
     let _ = writeln!(
         content,
-        "{{\"type\":\"message\",\"id\":\"{id}-mu\",\"timestamp\":\"2024-01-01T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"run the drill\",\"timestamp\":0}}}}"
+        "{{\"type\":\"message\",\"id\":\"{id}-mu\",\"timestamp\":\"2024-01-01T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"run the drill\",\"timestamp\":1}}}}"
     );
     for index in 0..grown_lines {
         let _ = writeln!(
@@ -180,20 +169,14 @@ fn write_fixture(
     path
 }
 
-/// The streamed catalog lands DURING the scan, not as one post-scan burst:
-/// with a directory of small newest files and one grown oldest file, the
-/// FIRST `session_list_item` frame must arrive well before the final
-/// response (the grown file's fold is the scan's tail). The batched form
-/// writes every frame after the scan, where the first item and the
-/// response arrive together - the ratio catches it without a wall-clock
-/// budget (self-calibrating against the machine's speed).
+/// The FIRST `session_list_item` frame must arrive well before the final
+/// response (the grown file's fold is the scan's tail); the ratio catches
+/// the batched form without a wall-clock budget (self-calibrating).
 #[test]
 fn the_saved_catalog_streams_per_file_during_the_scan() {
-    // The scan's head: small newest-first rows (the stream's first
-    // frames), one per file, stamped in increasing recency so the mtime
-    // order is deterministic (the newest is first). SMALL_FILES, the
-    // grown file, and one INVALID file: the gate skips it without a
-    // row, so the per-row progress never names its slot.
+    // The scan's head: small newest-first rows, stamped in increasing
+    // recency so the mtime order is deterministic. One INVALID file: the
+    // gate skips it without a row.
     const SMALL_FILES: usize = 30;
     let dir = tempfile::TempDir::new().expect("temp dir");
     let agent_dir = dir.path().join("agent");
@@ -213,8 +196,6 @@ fn the_saved_catalog_streams_per_file_during_the_scan() {
             base + Duration::from_secs(60 + index as u64),
         );
     }
-    // An invalid .jsonl (a parseable non-session first record): the scan
-    // skips it without a fold, so no row streams for it.
     std::fs::write(
         sessions_dir.join("foreign.jsonl"),
         "{\"type\":\"message\",\"id\":\"x\"}\n",
@@ -250,9 +231,6 @@ fn the_saved_catalog_streams_per_file_during_the_scan() {
                 }
                 items += 1;
                 if items == 1 {
-                    // The stream starts with the newest row (the scan
-                    // order is decided by the metadata pass before any
-                    // fold): the entry anchor's row is the FIRST frame.
                     let name = line["session"]["name"]
                         .as_str()
                         .unwrap_or_default()
@@ -289,11 +267,6 @@ fn the_saved_catalog_streams_per_file_during_the_scan() {
     let response_at = response_at.expect("the final response");
     let sessions = sessions.expect("the response carries the sessions");
 
-    // The full catalog arrived: every VALID row as a streamed item and
-    // in the terminal response (the invalid file streams neither), with
-    // per-file progress frames and a completion frame that reaches the
-    // scan's file total (the per-row progress lands short when the
-    // invalid file yields no row).
     assert_eq!(items, SMALL_FILES + 1, "every row streamed as an item");
     assert!(
         progress >= SMALL_FILES,
@@ -316,13 +289,101 @@ fn the_saved_catalog_streams_per_file_during_the_scan() {
         "the completion frame names the scan's end: loaded reaches the total even though the invalid file streams no row"
     );
 
-    // The decisive assertion: the first streamed row landed well before
-    // the scan finished (the grown file's fold is the response's tail). A
-    // post-scan burst delivers the first item and the response together
-    // (the ratio sits at ~1); per-file streaming delivers the newest rows
-    // while the grown file still folds (the ratio sits near zero).
     assert!(
         first_item.as_millis() * 3 < response_at.as_millis().max(1),
         "the first streamed row landed at {first_item:?} but the response at {response_at:?}: the catalog streamed after the whole scan, not per file"
     );
+}
+
+/// Read the stream up to the terminal response and return its `data`.
+fn list_saved(client: &mut Client, id: &str, command: &serde_json::Value) -> serde_json::Value {
+    client.send_command(id, command);
+    loop {
+        let line = client.read_line();
+        if line.get("type").and_then(serde_json::Value::as_str) == Some("response") {
+            assert_eq!(line["success"], true, "list failed: {line}");
+            return line["data"].clone();
+        }
+    }
+}
+
+fn sidecar_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .expect("read sessions dir")
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".info-cache.json")
+        })
+        .count()
+}
+
+/// A paged catalog folds only the newest `limit` files (each fold backfills its sidecar), and the
+/// cursor walks the rest of the store down to the oldest session.
+#[test]
+fn a_paged_catalog_folds_the_newest_page_and_the_cursor_reaches_the_oldest() {
+    const FILES: usize = 400;
+    const PAGE: usize = 200;
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let base = SystemTime::now() - Duration::from_hours(24);
+    for index in 0..FILES {
+        write_fixture(
+            &sessions_dir,
+            &format!("paged-{index:03}"),
+            &format!("row {index:03}"),
+            1,
+            base + Duration::from_secs(index as u64),
+        );
+    }
+    let socket = dir.path().join("daemon.sock");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+
+    let page = list_saved(
+        &mut client,
+        "p1",
+        &serde_json::json!({ "type": "list_saved_sessions", "cwd": "/tmp", "limit": PAGE }),
+    );
+    let rows = page["sessions"].as_array().expect("sessions");
+    assert_eq!(
+        rows.len(),
+        PAGE,
+        "the first page carries the newest files only"
+    );
+    assert_eq!(rows[0]["name"], "row 399");
+    assert_eq!(page["remaining"], FILES - PAGE);
+    assert_eq!(
+        sidecar_count(&sessions_dir),
+        PAGE,
+        "only the page's files were folded (and backfilled)"
+    );
+
+    let rest = list_saved(
+        &mut client,
+        "p2",
+        &serde_json::json!({
+            "type": "list_saved_sessions",
+            "cwd": "/tmp",
+            "cursor": page["nextCursor"],
+        }),
+    );
+    let rows = rest["sessions"].as_array().expect("sessions");
+    assert_eq!(
+        rows.len(),
+        FILES - PAGE,
+        "the cursor walks the rest of the store"
+    );
+    assert_eq!(rows[0]["name"], "row 199");
+    assert_eq!(rows[rows.len() - 1]["name"], "row 000");
+    assert_eq!(rest["remaining"], 0);
+    assert!(
+        rest.get("nextCursor").is_none(),
+        "a finished walk has no cursor: {rest}"
+    );
+    assert_eq!(sidecar_count(&sessions_dir), FILES);
 }

@@ -369,7 +369,7 @@ impl Sandbox {
         let ipython = self.wire().request(&json!({
             "type": "get_tool_definition",
             "activeSessionId": row["activeSessionId"],
-            "name": "ipython",
+            "name": pa_types::ai::PYTHON_TOOL_NAME,
         }));
         (
             row["toolSelection"].clone(),
@@ -770,11 +770,12 @@ fn continue_and_resume_reuse_the_live_worker() {
 /// and `--no-skills`, as every daemon seat does.
 #[test]
 fn second_client_attaches_and_a_signal_only_detaches() {
-    // The turn holds in flight until aborted (no timer releases it), so the
-    // attach and the signal land mid-run.
+    // A paced response stays in flight well beyond the step bound. Its assistant-start
+    // event proves provider admission before the detach and abort, unlike worker pickup.
     let sandbox = Sandbox::new(&json!({
         "engine": "faux",
-        "responses": [{ "text": "held", "holdUntilAborted": true }],
+        "tokensPerSecond": 1.0,
+        "responses": [format!("held {}", "stream ".repeat(2048))],
     }));
     let mut child = sandbox
         .command(&[
@@ -804,10 +805,15 @@ fn second_client_attaches_and_a_signal_only_detaches() {
     let header = line_rx.recv_timeout(STEP_BOUND).unwrap();
     assert_eq!(header["type"], "session");
     assert_eq!(header["jsonEventProfile"], "factory-completed");
+    let mut agent_started = false;
     loop {
         let line = line_rx.recv_timeout(STEP_BOUND).unwrap();
         assert_ne!(line["type"], "message_update");
         if line["type"] == "agent_start" {
+            agent_started = true;
+        }
+        if line["type"] == "message_start" && line["message"]["role"] == "assistant" {
+            assert!(agent_started, "provider admission follows the run start");
             break;
         }
     }
@@ -1064,6 +1070,10 @@ fn a_relative_resume_path_reaches_the_saved_session() {
     let saved: Vec<PathBuf> = std::fs::read_dir(sandbox.home().join(".prime/agent/sessions"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
         .collect();
     assert_eq!(saved.len(), 1, "{saved:?}");
     let relative = saved[0].strip_prefix(sandbox.home()).unwrap();

@@ -1,13 +1,7 @@
-//! Per-worker stderr capture e2e against the real supervisor and worker
-//! binaries: a worker's stderr lands in its per-worker log under the
-//! daemon's logs dir, a worker that never comes up reports the captured
-//! stderr tail in the create failure, and the spawn-time prune bounds the
-//! retained logs. The never-ready case is driven by a `TMPDIR` pointing
-//! at a plain file: the worker resolves its socket dir under `TMPDIR` and
-//! dies at the socket-path preparation with the failure on its
-//! (captured) stderr, so the supervisor's probe budget runs out against a
-//! dead worker — no test-only fault hook, just the real bind path
-//! failing.
+//! Per-worker stderr capture e2e: a worker's stderr lands in its per-worker
+//! log, a never-ready worker reports the captured stderr tail in the create
+//! failure, and the spawn-time prune bounds retained logs (never-ready via
+//! a `TMPDIR` pointing at a plain file - the real bind path failing).
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -148,8 +142,7 @@ impl Client {
     }
 }
 
-/// The active session id a create response answered (the summary's `id`,
-/// the same id that names the worker's stderr log).
+/// The answered id is the same id that names the worker's stderr log.
 fn create_session(client: &mut Client, request_id: &str, config: &Value) -> String {
     client.send_command(request_id, &json!({ "type": "create", "config": config }));
     let created = client.read_response(request_id);
@@ -172,7 +165,6 @@ fn write_script(dir: &Path, responses: &[&str]) -> PathBuf {
     script_path
 }
 
-/// The worker stderr logs currently in the daemon's logs dir.
 fn worker_stderr_logs(agent_dir: &Path) -> Vec<String> {
     std::fs::read_dir(agent_dir.join("logs"))
         .expect("logs dir exists")
@@ -189,8 +181,7 @@ fn worker_stderr_lands_in_the_per_worker_log_and_prunes_retention() {
     let agent_dir = dir.path().join("agent");
     std::fs::create_dir_all(agent_dir.join("logs")).expect("logs dir");
     // Retention pressure: more leftover logs than the daemon keeps, each
-    // older than anything this run writes (backdated mtimes, the
-    // session-archive test convention).
+    // older than anything this run writes.
     for index in 0..70 {
         let path = agent_dir
             .join("logs")
@@ -224,10 +215,8 @@ fn worker_stderr_lands_in_the_per_worker_log_and_prunes_retention() {
         "the worker's stderr output is in its per-worker log: {contents}"
     );
 
-    // The spawn-time prune kept the newest logs only: the aged leftovers
-    // collapse to the retention cap, and this run's fresh log rides above
-    // it inside the prune-protection window (never a prune target while
-    // its launch could still be settling).
+    // The fresh log rides inside the prune-protection window (never a
+    // prune target while its launch could still be settling).
     let remaining = worker_stderr_logs(&agent_dir);
     assert!(remaining.len() <= 65, "retention is bounded: {remaining:?}");
     assert!(remaining.contains(&format!("worker-{session_id}.stderr.log")));

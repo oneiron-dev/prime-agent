@@ -84,7 +84,7 @@ fn counting_gated_kernel(
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nn=$(wc -c < '{}')\nprintf x >> '{}'\nwhile [ ! -f '{}'/gate$n ] && [ -d '{}' ]; do sleep 0.05; done\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\nn=$(( $(wc -c < '{}') ))\nprintf x >> '{}'\nwhile [ ! -f '{}'/gate$n ] && [ -d '{}' ]; do sleep 0.05; done\nexec '{}' \"$@\"\n",
             count.display(),
             count.display(),
             gates.display(),

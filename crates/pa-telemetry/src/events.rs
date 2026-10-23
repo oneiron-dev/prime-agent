@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::properties::Properties;
 use crate::TelemetryClient;
 
-/// The #2117 run trigger: a fresh prompt or a loop continuation.
+/// A fresh prompt or a loop continuation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunTrigger {
     Prompt,
@@ -34,8 +34,8 @@ impl RunTrigger {
     }
 }
 
-/// The #2117 tool category (the fixed vocabulary; `from_tool_name` maps a
-/// concrete tool name onto it, `unknown` for anything unrecognized).
+/// The fixed tool-category vocabulary: `from_tool_name` maps a concrete tool
+/// name onto it, `unknown` for anything unrecognized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolCategory {
     Read,
@@ -65,7 +65,7 @@ impl ToolCategory {
             "grep" => Self::Grep,
             "find" => Self::Find,
             "ls" => Self::Ls,
-            "ipython" => Self::Ipython,
+            "python" | "ipython" => Self::Ipython,
             "mcp" => Self::Mcp,
             "" => Self::Unknown,
             _ => Self::Custom,
@@ -289,6 +289,23 @@ impl AgentHeadlessInvoked {
     }
 }
 
+/// `update_homebrew_refusal`: an installer update rejected because Homebrew
+/// owns the executable. Only the fixed formula/cask layout kind is recorded.
+#[derive(Debug, Clone, Copy)]
+pub struct UpdateHomebrewRefusal {
+    /// `formula` or `cask`; never the executable path.
+    pub kind: &'static str,
+}
+
+impl UpdateHomebrewRefusal {
+    /// Record this refusal on the shared lifecycle telemetry client.
+    pub fn track(&self, client: &TelemetryClient) {
+        let mut properties = Properties::new();
+        properties.set("kind", Value::from(self.kind));
+        client.track("update_homebrew_refusal", properties);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,7 +386,7 @@ mod tests {
         assert_eq!(ToolCategory::from_tool_name("bash"), ToolCategory::Bash);
         assert_eq!(ToolCategory::from_tool_name("Edit"), ToolCategory::Edit);
         assert_eq!(
-            ToolCategory::from_tool_name("ipython"),
+            ToolCategory::from_tool_name("python_repl"),
             ToolCategory::Ipython
         );
         assert_eq!(

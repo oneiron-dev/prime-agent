@@ -32,7 +32,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .bash import _kill_live_handles, record_memory_notice
+from .bash import _kill_live_handles, _rehydrate_persistent_shells, record_memory_notice
 from .memory import REPORT_WALK_NODES, sized_entry, sized_groups, trim_memory
 
 PROTOCOL_VERSION = 3
@@ -1979,6 +1979,8 @@ def main() -> None:
     )
 
     _serve_task = _loop.create_task(_serve(queue, user_module.__dict__))
+    # On the loop, so re-attached shells can deliver their completion notices.
+    _loop.call_soon(_rehydrate_persistent_shells)
     # A KeyboardInterrupt escaping a cell or background task stops
     # run_until_complete; the interrupt is already recorded, so resume serving.
     while not _serve_task.done():

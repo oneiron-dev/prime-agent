@@ -1,4 +1,4 @@
-//! Public command routing, ported from `cli/public-command.ts`.
+//! Public command routing.
 
 use crate::daemon_discovery;
 use std::collections::HashSet;
@@ -17,7 +17,7 @@ use crate::package_command::handle_package_command;
 /// Environment flag marking an interactive self-update child process.
 pub const SELF_UPDATE_INTERACTIVE_CHILD_ENV: &str = "PRIME_AGENT_INTERACTIVE_SELF_UPDATE";
 
-/// Internal update-restart coordinator flags (`cli/daemon-update-restart.ts`).
+/// Internal update-restart coordinator flags.
 pub const DAEMON_UPDATE_RESTART_COORDINATOR_FLAG: &str = "--internal-update-restart-coordinator";
 pub const DAEMON_UPDATE_RESTART_STATUS_FLAG: &str = "--internal-update-restart-status";
 pub const DAEMON_UPDATE_RESTART_ORIGIN_FLAG: &str = "--internal-update-restart-origin";
@@ -52,8 +52,8 @@ fn continue_with(args: Vec<String>) -> PublicCommandResult {
 }
 use std::io::IsTerminal as _;
 
-/// The error message used when a routed command needs a runtime subsystem that
-/// is not linked into this build yet.
+/// The error message used when a routed command needs a runtime subsystem that is not linked into
+/// this build yet.
 fn fail(message: impl AsRef<str>, hint: Option<String>) -> PublicCommandResult {
     eprintln!("Error: {}", message.as_ref());
     if let Some(hint) = hint {
@@ -72,8 +72,8 @@ fn handled() -> PublicCommandResult {
     HANDLED()
 }
 
-/// A handled invocation whose driver already printed everything, with its own
-/// process exit code (shutdown failures exit 1).
+/// A handled invocation whose driver already printed everything, with its own exit code (shutdown
+/// failures exit 1).
 fn handled_with_exit(exit_code: i32) -> PublicCommandResult {
     PublicCommandResult {
         handled: true,
@@ -84,8 +84,8 @@ fn handled_with_exit(exit_code: i32) -> PublicCommandResult {
     }
 }
 
-/// A handled invocation whose `fail()` branch already printed an error: the
-/// exit code is 1, matching `process.exitCode = 1` in the TS `fail` helper.
+/// A handled invocation whose `fail()` branch already printed an error: exit code 1, matching the
+/// TS `fail` helper.
 fn handled_failed() -> PublicCommandResult {
     PublicCommandResult {
         handled: true,
@@ -96,9 +96,8 @@ fn handled_failed() -> PublicCommandResult {
     }
 }
 
-/// Route the argv through the public command layer, mirroring
-/// `handlePublicCommand`. All errors are printed directly; the result reports
-/// whether the invocation was fully handled and with which exit code.
+/// Route the argv through the public command layer. All errors are printed
+/// directly; the result reports whether the invocation was handled, and the code.
 pub fn handle_public_command(args: &[String]) -> PublicCommandResult {
     let public: HashSet<&str> = public_command_names().into_iter().collect();
     let removed: HashSet<&str> = REMOVED_COMMAND_NAMES.iter().copied().collect();
@@ -129,16 +128,8 @@ pub fn handle_public_command(args: &[String]) -> PublicCommandResult {
             .iter()
             .any(|a| a == DAEMON_UPDATE_RESTART_COORDINATOR_FLAG)
     {
-        // The coordinator's own exit code (TS `process.exitCode`), so a
-        // refused or failed coordinator run does not exit 0.
         let result = handle_package_command(&args);
-        return PublicCommandResult {
-            handled: true,
-            args: vec![],
-            explicit_agents_view: false,
-            attach_agent: None,
-            exit_code: result.exit_code,
-        };
+        return handled_with_exit(result.exit_code.unwrap_or(0));
     }
 
     let separator_index = args.iter().position(|a| a == "--");
@@ -263,8 +254,7 @@ fn reject_removed_command(args: &[String]) -> PublicCommandResult {
 }
 
 /// The internal daemon client command behind a public command: `list` stays
-/// `list`, `stop` becomes `kill`, and nested `schedule` becomes `cron`, like
-/// `runInternalAgentCommand`/`runNestedAgentCommand` in public-command.ts.
+/// `list`, `stop` becomes `kill`, and nested `schedule` becomes `cron`.
 fn run_internal_agent_command(command: &str, args: &[String]) -> PublicCommandResult {
     match crate::daemon_command::run_daemon_command(command, args) {
         Ok(()) => handled(),
@@ -468,8 +458,7 @@ fn run_doctor(args: &[String]) -> PublicCommandResult {
     let Some(options) = parse_boolean_options(args, &["--fix", "--json"], "doctor") else {
         return handled_failed();
     };
-    // `doctor` inspects; `doctor --fix` reaps clearly-safe services (TS
-    // runDoctor: runReap with force=false, else runPs).
+    // `doctor` inspects; `doctor --fix` reaps clearly-safe services.
     if options.contains("--fix") {
         daemon_discovery::run_reap(
             options.contains("--json"),
@@ -529,8 +518,8 @@ fn run_incident_command(args: &[String]) -> PublicCommandResult {
             )
         }
     };
-    // Resolve once: re-resolving later can cross UTC midnight and render a
-    // different window than the one that was validated.
+    // Resolve once: re-resolving later can cross UTC midnight and render a different window than
+    // the one that was validated.
     let now_ms = crate::util_time::now_ms() as i64;
     let window = match crate::incident::resolve_incident_window(&options, now_ms) {
         Ok(window) => window,
@@ -556,9 +545,8 @@ fn run_shutdown(args: &[String]) -> PublicCommandResult {
     };
     let force = options.contains("--force");
     let json = options.contains("--json");
-    // The confirmation decision (including the non-TTY failure, which TS
-    // only raises once there are daemons to stop) lives with the discovery
-    // driver, which knows the daemon count.
+    // The confirmation decision (including the non-TTY failure) lives with the discovery driver,
+    // which knows the daemon count.
     let exit_code =
         daemon_discovery::run_shutdown_all(json, force, &daemon_discovery::current_state_root());
     handled_with_exit(exit_code)
@@ -737,10 +725,14 @@ fn run_update(args: &[String]) -> PublicCommandResult {
     ) {
         return handled_with_exit(abort_code);
     }
-    // The installer funnel serves the bare update and the channel flags:
-    // the channel is the flag, else the saved `updateChannel` setting
-    // (`/nightly on|off`), else the installed one.
-    if !options.rollback && options.archive.is_none() {
+    // A Rust archive activated by a historical TS installer still belongs
+    // to that managed root. Keep using its atomic launcher activation so a
+    // custom root/public-bin pair is not silently replaced by ~/.local.
+    let managed_install = std::env::current_exe()
+        .ok()
+        .and_then(|exe| pa_core::update::install::install_root_of(&exe))
+        .is_some();
+    if !managed_install && !options.rollback && options.archive.is_none() {
         let update = crate::installer_update::UpdateOptions {
             check: false,
             channel: options.channel,
@@ -908,9 +900,8 @@ fn require_operand_count(
     false
 }
 
-/// The incident command's dispatch contract (the TS public-command.test.ts
-/// incident suite): parsed options and a once-resolved window reach
-/// `run_incident`; usage errors fail with exit code 1 and the help hint.
+/// The incident command's dispatch contract: parsed options and a once-resolved
+/// window reach `run_incident`; usage errors fail with exit 1 and the hint.
 #[cfg(test)]
 mod incident_dispatch_tests {
     use super::*;
@@ -924,11 +915,8 @@ mod incident_dispatch_tests {
 
     #[test]
     fn routes_the_incident_command_with_parsed_window_options() {
-        // The routed dispatch parses the options, resolves the window
-        // once, and runs the command (over whatever logs exist under the
-        // agent dir — the fixture-backed coverage lives in the incident
-        // module's own tests); a routed run never fails with a usage
-        // error.
+        // The routed dispatch parses the options, resolves the window once, and
+        // runs the command; a routed run never fails with a usage error.
         let result = handle_public_command(&args(&[
             "incident",
             "--since",
@@ -1001,21 +989,17 @@ mod update_options_tests {
         parse_update_options(&args)
     }
 
-    /// The migration dispatch: the bare command and the report-only flag
-    /// never reach the staged-flow parse (`run_update` short-circuits
-    /// both before it), so the staged parse keeps its TS shape exactly.
+    /// The staged parse keeps its TS shape exactly.
     #[test]
     fn the_bare_and_check_invocations_short_circuit_the_staged_parse() {
         let check = ["--check"];
         let version = ["--version"];
         for args in [&check, &version] {
             let args: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
-            // The staged parse rejects the new flag: only the dispatch
-            // accepts it.
+            // The staged parse rejects the new flag: only the dispatch accepts it.
             assert!(parse_update_options(&args).is_none(), "{args:?}");
         }
-        // The staged flags still parse (the managed-install flow keeps
-        // its surface).
+        // The staged flags still parse (the managed-install flow keeps its surface).
         assert!(parse(&["--force"]).is_some());
     }
 
@@ -1040,6 +1024,17 @@ mod update_options_tests {
         assert_eq!(channel(&["--check", "--nightly", "--stable"]), None);
         assert_eq!(channel(&["--check", "--force"]), None);
         assert_eq!(channel(&["--check", "--rollback"]), None);
+    }
+
+    #[test]
+    fn invalid_restart_coordinator_preserves_the_failure_exit_code() {
+        let args = vec![
+            "update".to_string(),
+            DAEMON_UPDATE_RESTART_COORDINATOR_FLAG.to_string(),
+        ];
+        let result = handle_public_command(&args);
+        assert!(result.handled);
+        assert_eq!(result.exit_code, Some(1));
     }
 
     #[test]

@@ -45,7 +45,6 @@ pub(crate) const REQUEST_TIMEOUT: ResponseWait =
 const PROMPT_ADMISSION_CANCELLATION_CAPABILITY: &str = "prompt_admission_cancellation";
 const OWNED_PROMPT_CANCELLATION_CAPABILITY: &str = "owned_prompt_cancellation";
 
-/// Everything the daemon-attached mode needs from the composition.
 #[derive(Clone)]
 pub struct DaemonAcpOptions {
     pub socket_path: PathBuf,
@@ -72,8 +71,6 @@ pub(crate) struct HostedSession {
     pub(crate) acp_session_id: String,
     pub(crate) daemon_active_session_id: String,
     pub(crate) producer: Arc<UpdateProducer>,
-    /// The picker state (TS `AcpSessionEntry`'s configOptions/models) and
-    /// the serialized config queue (`configTask`).
     pub(crate) config: Arc<HostedConfig>,
     cancelling: bool,
     stop_failure: Option<String>,
@@ -83,8 +80,11 @@ pub(crate) struct HostedSession {
     /// The running prompt turn; one at a time. A cancelled turn keeps
     /// the slot until its cancel stop finishes.
     turn: Option<ActiveTurn>,
-    /// The newest assistant stop reason observed on the event stream.
-    assistant_stop_reason: Option<String>,
+    /// The newest assistant stop reason observed on the event stream,
+    /// cleared when a prompt turn is admitted so a turn never reads a
+    /// previous turn's stop reason (read after the settlement for the
+    /// stop-reason response).
+    assistant_stop_reason: Option<pa_types::ai::StopReason>,
     /// The event mapping state lives and dies with the session, like TS.
     mapping: WireMappingState,
     observed_children: std::collections::HashSet<String>,
@@ -144,10 +144,6 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
     let link = Arc::new(DaemonLink::connect(&options.socket_path, "acp").await?);
     let state = Arc::new(Mutex::new(DaemonAcpState::default()));
 
-    // Session events and responses share one socket, so one consumer owns
-    // the ordering: events publish at the active turn before the response
-    // resolves the waiting request (a turn's chunks can never trail its
-    // boundary frames).
     {
         let link = Arc::clone(&link);
         let state = Arc::clone(&state);
@@ -157,11 +153,9 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                 match frame {
                     LinkFrame::Event(frame) => {
                         let event = frame.get("event").cloned().unwrap_or(Value::Null);
-                        // The picker refresh triggers (TS refreshes on
-                        // `agent_end`, `auto_retry_start`, and
-                        // `auto_retry_end` — the runs that can restore a
-                        // failover model or clamp a level): captured under
-                        // the guard, spawned once it is released.
+                        // The refresh triggers: runs that can restore a
+                        // failover model or clamp a level. Captured under
+                        // the guard, spawned once released.
                         let mut refresh: Option<(Arc<HostedConfig>, Arc<UpdateProducer>, String)> =
                             None;
                         {
@@ -203,12 +197,9 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                         if let Some((config, producer, daemon_session_id)) = refresh {
                             let link = Arc::clone(&link);
                             tokio::spawn(async move {
-                                // Serialized like every config operation
-                                // (TS `enqueueConfig`).
                                 let _guard = config.queue.lock().await;
                                 // The background trigger drops refresh
-                                // failures (TS's `.catch(() => undefined)`
-                                // on the enqueue site).
+                                // failures (TS `.catch(() => undefined)`).
                                 let _ = refresh_wire_config(
                                     &link,
                                     &daemon_session_id,
@@ -583,6 +574,9 @@ async fn admit_prompt(
         return Err("A prompt turn is already running for this ACP session".to_string());
     }
     let admission_id = format!("prompt-admission:{}", uuid::Uuid::new_v4());
+    // The stop reason is per-turn: a turn that runs no model call (a
+    // slash command) must not inherit the previous turn's stop reason.
+    hosted.assistant_stop_reason = None;
     hosted.turn = Some(ActiveTurn {
         admission_id: admission_id.clone(),
         cancelled: false,
@@ -959,8 +953,6 @@ async fn handle_session_new(
         }
         guard.session_new_in_flight = true;
     }
-    // Failures below clear the in-flight flag on the way out; on success
-    // the hosted session takes the slot.
     let params = types::NewSessionParams::parse(&params);
     if !state.lock().await.mcp_server_names.is_empty() {
         if let Err(error) = clear_connection_servers(
@@ -1000,9 +992,9 @@ async fn handle_session_new(
 
     let acp_session_id = uuid::Uuid::new_v4().to_string();
     let producer = UpdateProducer::new(acp_session_id.clone(), tx.clone());
-    // The pickers ride the worker's own state and discovery seams: neither
-    // fetch may fail the admission (TS catches discovery failures to an
-    // empty list, and a state fetch failure degrades to no options).
+    // Neither picker fetch may fail the admission: discovery failures
+    // catch to an empty list, a state fetch failure degrades to no
+    // options.
     let (state_value, models) = (
         fetch_connection_state(link, &binding.active_session_id).await,
         fetch_available_models(link, &binding.active_session_id)
@@ -1069,8 +1061,6 @@ async fn handle_session_new(
         }
     }
 
-    // The admission response is queued below, after the session takes its
-    // slot and before the producer gate opens.
     let mut result = json!({
         "sessionId": acp_session_id,
         "configOptions": *hosted.config.published.lock().await,
@@ -1087,12 +1077,10 @@ async fn handle_session_new(
             });
         }
     }
-    // Install the hosted session before the admission response leaves: a
-    // client that immediately sends `session/set_config_option` resolves
-    // against the installed session, not "Unknown ACP session" (TS
-    // assigns `session = entry` before returning the response). The
-    // producer gate opens only after the response is queued on the
-    // sink, so no held update can precede the admission response.
+    // Install the hosted session before the admission response leaves
+    // (an immediate `session/set_config_option` must resolve against
+    // it). The producer gate opens only after the response is queued,
+    // so no held update can precede it.
     let producer = Arc::clone(&hosted.producer);
     let inherited_pause = {
         let mut guard = state.lock().await;
@@ -1350,7 +1338,11 @@ async fn prompt_turn(
         Err(error) => {
             publish_error_boundary(&producer, turn_id).await;
             producer.finish_prompt(turn_id).await;
-            return super::internal_error(&id, &error.to_string());
+            // The lost supervisor link (route timeout, worker loss) is
+            // classified like every other failed-prompt arm: typed data,
+            // never retryable at the boundary — the turn's outcome is
+            // unknown, so a host retry may re-run side-effecting tools.
+            return super::turn_failure_error(&id, &error.to_string(), &error.to_string());
         }
     };
     // TS `abort.signal.aborted` after `promptAndWait`: every turn frame
@@ -1377,7 +1369,14 @@ async fn prompt_turn(
         eprintln!("pa-daemon: acp turn failed: {failure}");
         publish_error_boundary(&producer, turn_id).await;
         producer.finish_prompt(turn_id).await;
-        return super::internal_error(&id, &format!("prime-agent turn failed: {failure}"));
+        // The worker's failure text classifies into the #200 host
+        // contract (the raw text still never rides past `details`), so
+        // the reply data is machine-readable at the transport boundary.
+        return super::turn_failure_error(
+            &id,
+            &failure,
+            &format!("prime-agent turn failed: {failure}"),
+        );
     }
     // The autonomous accounting for the completion envelope: the daemon's
     // headless-completion status (TS `waitForHeadlessCompletion`), fetched
@@ -1395,13 +1394,14 @@ async fn prompt_turn(
     }
     // The completion observation's roster read (TS `getRlmChildSnapshots`
     // throws): a failed read errors the prompt before the boundary, never
-    // publishes a wrong count.
+    // publishes a wrong count — with the same typed data as every other
+    // failed-prompt arm.
     let children = match fetch_rlm_children(link, &hosted_daemon_session_id).await {
         Ok(children) => children,
         Err(error) => {
             publish_error_boundary(&producer, turn_id).await;
             producer.finish_prompt(turn_id).await;
-            return super::internal_error(&id, &error.to_string());
+            return super::turn_failure_error(&id, &error.to_string(), &error.to_string());
         }
     };
     if turn_cancelled(&*state.lock().await, admission_id) {
@@ -1451,8 +1451,9 @@ async fn prompt_turn(
             Ok(status) => status,
             Err(error) => {
                 producer.finish_prompt(turn_id).await;
-                return super::internal_error(
+                return super::turn_failure_error(
                     &id,
+                    &error.to_string(),
                     &format!("ACP lifecycle reconciliation failed: {error}"),
                 );
             }
@@ -1465,8 +1466,9 @@ async fn prompt_turn(
             Ok(children) => children,
             Err(error) => {
                 producer.finish_prompt(turn_id).await;
-                return super::internal_error(
+                return super::turn_failure_error(
                     &id,
+                    &error.to_string(),
                     &format!("ACP lifecycle reconciliation failed: {error}"),
                 );
             }
@@ -1498,17 +1500,36 @@ async fn prompt_turn(
             )
             .await;
         if !published || !completion_published || !terminal_published {
-            return super::internal_error(&id, "Failed to publish ACP completion");
+            // The typed shape even for a publish failure: a host can tell
+            // "classified, not retryable" from an untyped error here too.
+            return super::turn_failure_error(
+                &id,
+                "Failed to publish ACP completion",
+                "Failed to publish ACP completion",
+            );
         }
         break status;
     };
-    // The stop reason follows the TS mapping (acp-stop-reason.ts): the
-    // abort flag read after the settlement, and the settlement's status
-    // (`pending.status`), not the first observation's.
-    let stop_reason = meta::acp_stop_reason_for_status(
-        turn_cancelled(&*state.lock().await, admission_id),
-        Some(&settled_status),
-    );
+    // The stop reason follows the TS mapping (acp-stop-reason.ts) plus the
+    // turn's final assistant stop reason (#3363): the abort flag read after
+    // the settlement, the settlement's status (`pending.status`), not the
+    // first observation's, and the newest assistant stop reason — the link's
+    // one frame consumer applies every message_end (the autonomous
+    // continuations' included, since they run inside the waits above) before
+    // the response that ended each wait resolved, so this read after the
+    // settlement sees the run's final one.
+    let (cancelled, assistant_stop_reason) = {
+        let guard = state.lock().await;
+        (
+            turn_cancelled(&guard, admission_id),
+            guard
+                .session
+                .as_ref()
+                .and_then(|hosted| hosted.assistant_stop_reason),
+        )
+    };
+    let stop_reason =
+        meta::acp_stop_reason_for_status(cancelled, Some(&settled_status), assistant_stop_reason);
     jsonrpc::response(
         &id,
         &serde_json::to_value(types::AcpStopReasonResponse { stop_reason }).expect("serializes"),

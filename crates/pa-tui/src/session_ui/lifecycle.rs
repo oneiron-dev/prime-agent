@@ -1,15 +1,14 @@
-//! The session-lifecycle concern: the open/attach/reattach pipeline
-//! (the session selection's open, the §10 reattach, the attach fold,
-//! and the transcript rebuild it feeds), the stats refresh, and the
-//! detach/exit request helpers.
+//! The open/attach/reattach pipeline (the session selection's open, the
+//! §10 reattach, the attach fold, and the transcript rebuild it feeds),
+//! the stats refresh, and the detach/exit request helpers.
 use super::{
-    attach_data_from_response, create_session, mpsc, reconstruct, resume_hint_from_stats,
-    ActivityUpdates, AgentView, BTreeMap, ChatEntry, CompactionAbortNote, Context, DaemonClient,
-    DaemonCommand, DockFold, Duration, GoalView, HashSet, InteractiveOptions, LoaderTokenTracker,
-    Map, MessageBlock, ModelCatalogUpdate, PromptOrder, PromptSubmitNote, ReattachOutcome,
-    RebuildKind, RecoveryKind, ReloadNote, Result, ResyncBash, SessionSelection, SessionUi,
-    ShareNote, UpdateNote, Value, EXIT_DETACH_TIMEOUT_MS, EXIT_STATS_TIMEOUT_MS,
-    UI_REQUEST_TIMEOUT_MS,
+    attach_capabilities, attach_data_from_response, create_session, last_assistant_text_of, mpsc,
+    reconstruct, resume_hint_from_stats, ActivityUpdates, AgentView, BTreeMap, ChatEntry,
+    CompactionAbortNote, Context, DaemonClient, DaemonCommand, DockFold, Duration, GoalView,
+    HashSet, InteractiveOptions, LoaderTokenTracker, Map, ModelCatalogUpdate, PromptOrder,
+    PromptSubmitNote, ReattachOutcome, RebuildKind, RecoveryKind, ReloadNote, Result, ResyncBash,
+    SessionSelection, SessionUi, ShareNote, TranscriptPageNote, UpdateNote, Value,
+    EXIT_DETACH_TIMEOUT_MS, EXIT_STATS_TIMEOUT_MS, UI_REQUEST_TIMEOUT_MS,
 };
 
 impl SessionUi {
@@ -28,6 +27,7 @@ impl SessionUi {
         catalog_updates: mpsc::UnboundedSender<ModelCatalogUpdate>,
         auth_panel_notes: mpsc::UnboundedSender<crate::auth_panel::AuthPanelRequest>,
         activity_updates: ActivityUpdates,
+        page_notes: mpsc::UnboundedSender<TranscriptPageNote>,
     ) -> Result<SessionUi> {
         let active_session_id = match &options.session {
             SessionSelection::New => create_session(&client, options, None).await?,
@@ -49,13 +49,8 @@ impl SessionUi {
                 create_session(&client, options, Some(&options.session)).await?
             }
         };
-        // The single prompt-submit worker (see [`PromptOrder`]): it owns
-        // the ordered drain, so submit order on the wire is submit order
-        // at the channel, and no per-submit task can reorder two rapid
-        // submissions. The worker lives with the orders channel — the
-        // session drops its sender and the worker's recv() ends, so the
-        // task never outlives the run (the agents-view handoff and the
-        // exit both drop the session).
+        // The single prompt-submit worker (see [`PromptOrder`]) lives with the orders channel: the
+        // session drops its sender, so the task never outlives the run.
         let (orders_tx, orders_rx) = mpsc::unbounded_channel::<PromptOrder>();
         tokio::spawn(Self::prompt_submit_worker(orders_rx, prompt_notes.clone()));
         let mut session = SessionUi {
@@ -88,6 +83,7 @@ impl SessionUi {
             show_images: options.show_images,
             fullscreen_mouse: options.fullscreen_mouse,
             service_tier: None,
+            pending_model_fallback_message: None,
             speed_display_enabled: false,
             speed_stats: None,
             client_settings: options.client_settings.clone(),
@@ -163,6 +159,7 @@ impl SessionUi {
             session_file: None,
             pending_selection: None,
             return_to_agents_view: !options.no_session,
+            panel_returns_to_agents_view: false,
             client_auth: options.client_auth.clone(),
             keybindings: options.keybindings.clone(),
             prompt_stash: options.prompt_stash.clone(),
@@ -175,7 +172,9 @@ impl SessionUi {
             prompt_orders: orders_tx,
             input_submission_generation: 0,
             prompt_in_flight: 0,
-            transcript_stale: false,
+            compaction_settled: false,
+            window: super::window::TranscriptWindow::default(),
+            page_notes,
             telemetry: options.telemetry.clone(),
             scroll_adoption_emitted: false,
             exit_reason: "daemon_closed",
@@ -215,36 +214,24 @@ impl SessionUi {
             .attach_session(&active_session_id, DockFold::FirstFrame)
             .await
             .with_context(|| format!("attaching session {active_session_id}"))?;
-        // The scope-back reopen's restore lands AFTER the attach: the
-        // attach's rebind reset clears the focus, so the reopen's own
-        // restore must survive it.
+        // The scope-back reopen's restore lands AFTER the attach: the attach's rebind reset clears
+        // the focus, so the reopen's own restore must survive it.
         session.subagents_focused = options.restore_dock_focus;
         Ok(session)
     }
 
-    /// Spec §10.2-§10.5: reattach after a restart. The fresh client
-    /// (connected to the successor supervisor) replaces the dead one; the
-    /// attach goes by DURABLE session id, so the slice-5 queued-attach
-    /// contract absorbs any restore still in flight (the §10.3 hello's
-    /// `update_resume.complete` is surfaced as a banner line). The
-    /// transcript rebuilds from the attach snapshot - the same machinery
-    /// `/switch` uses - and the recovery's row lands after it.
-    ///
-    /// `kind` names the driver that owns the recovery: the update restart
-    /// paints its §10.5 banner, while a lost or announced-shutdown window
-    /// (TS #2458) reports the restart version-honestly instead.
+    /// Spec §10.2-§10.5: reattach after a restart — the fresh client replaces the dead one, the
+    /// attach goes by DURABLE session id. `kind` names the driver: the update restart paints its
+    /// §10.5 banner, a lost or announced-shutdown window reports the restart version-honestly.
     pub(crate) async fn reattach_after_recovery(
         &mut self,
         client: DaemonClient,
         view: &mut AgentView,
         kind: RecoveryKind,
     ) -> Result<ReattachOutcome> {
-        // One reattach attempt's budget (§10.4: a queued attach can
-        // legitimately wait out a slow restore — the budget's expiry is a
-        // RETRY outcome, never a fatal one). The bound lives INSIDE this
-        // function — a caller-side timeout would cancel this future
-        // mid-attach and skip the failure-path `close()` below, leaking
-        // the half-installed client's supervisor connection and reader.
+        // One reattach attempt's budget (§10.4: expiry is a RETRY outcome, never fatal). The bound
+        // lives INSIDE this function — a caller-side timeout would cancel this future mid-attach
+        // and skip the failure-path `close()`, leaking the half-installed client's connection.
         const REATTACH_BUDGET: Duration = Duration::from_secs(30);
         let hello_resume = client
             .hello()
@@ -260,13 +247,12 @@ impl SessionUi {
         self.client = client;
         let durable = self.session_id.clone();
         if durable.is_empty() {
-            // A failed reattach must not leave the half-installed client
-            // (its supervisor connection and reader task) running for the
-            // process's lifetime: close it, and the reconnect driver
-            // installs a fresh one on its next attempt.
+            // A failed reattach must not leave the half-installed client running:
+            // close it; the reconnect driver installs a fresh one on its next attempt.
             self.client.hard_close();
             anyhow::bail!("the session's durable id is unknown; cannot reattach");
         }
+        let anchor = self.reader_anchor(view);
         let attach = tokio::time::timeout(
             REATTACH_BUDGET,
             self.attach_session(&durable, DockFold::Held),
@@ -275,11 +261,7 @@ impl SessionUi {
         match attach {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                // A failed reattach must not leave the half-installed
-                // client (its supervisor connection and reader task)
-                // running: dispose it outright (the writer drops, the
-                // socket shuts down, the reader EOFs), and the reconnect
-                // driver installs a fresh one on its next attempt.
+                // Same disposal: the reconnect driver installs a fresh one next attempt.
                 self.client.hard_close();
                 let what = match kind {
                     RecoveryKind::Update => "after the update",
@@ -288,19 +270,15 @@ impl SessionUi {
                 return Err(error.context(format!("reattaching session {durable} {what}")));
             }
             Err(_) => {
-                // A wedged attach outlived the budget (§10.4: a queued
-                // attach can legitimately wait out a slow restore): same
-                // disposal, but the expiry is a RETRY outcome — the
-                // driver's next attempt owns the recovery, never a fatal
-                // exit.
+                // A wedged attach outlived the budget (§10.4): the expiry is a RETRY
+                // outcome — the driver's next attempt owns the recovery.
                 self.client.hard_close();
                 return Ok(ReattachOutcome::AttachBudgetExceeded);
             }
         }
-        // Flush the attach snapshot BEFORE the banner lands: `rebuild_view`
-        // replaces the transcript from the snapshot, so the banner must come
-        // after it to survive the rebuild (§10.5's visible end state).
-        self.rebuild_view(view, &RebuildKind::Resync);
+        // Flush the attach snapshot BEFORE the banner lands: the rebuild replaces the transcript
+        // from the snapshot, so the banner must come after it to survive the rebuild.
+        self.resync_view(anchor, view).await;
         match kind {
             RecoveryKind::Update => match complete {
                 Some(false) => view.push_entry(crate::chat::ChatEntry::Status {
@@ -315,8 +293,8 @@ impl SessionUi {
                 }),
             },
             RecoveryKind::Lost | RecoveryKind::Shutdown => {
-                // TS #2458 `formatDaemonReconnectBanner`: the recovered
-                // window reports the restart version-honestly.
+                // TS `formatDaemonReconnectBanner`: the recovered window reports the restart
+                // version-honestly.
                 let daemon_version = self
                     .client
                     .hello()
@@ -337,19 +315,10 @@ impl SessionUi {
         Ok(ReattachOutcome::Attached)
     }
 
-    /// Detach the current session and attach `id`, rebuilding the transcript
-    /// from the slim attach snapshot.
-    ///
-    /// The attach itself travels over a direct worker link when the
-    /// supervisor issues a ticket (best effort: every failure keeps the
-    /// supervisor-routed path, and a failed direct attach retries once over
-    /// the supervisor).
-    ///
-    /// The NEW attach lands before the old id detaches: a failed re-attach
-    /// (a replacement mid-teardown, a dead worker) must not strand the pane
-    /// locally bound but server-detached - the previous subscription stays
-    /// until the new one exists, and the next supersede notice or the
-    /// submit-path retry re-attaches when a worker can serve the session.
+    /// Detach the current session and attach `id`, rebuilding the transcript from the slim attach
+    /// snapshot; a direct worker link serves the attach when the supervisor issues a ticket (a
+    /// failed direct attach retries once over the supervisor). The NEW attach lands before the old
+    /// id detaches: a failed re-attach must not strand the pane locally bound but server-detached.
     pub(crate) async fn attach_session(
         &mut self,
         active_session_id: &str,
@@ -378,16 +347,9 @@ impl SessionUi {
             id: None,
             active_session_id: session_id.to_string(),
             client_id: None,
-            // `elide_snapshot_images`: the transcript arrives without the
-            // base64 image payloads (their fallback-only metadata rows
-            // ride the marker), so an image-heavy session's attach stops
-            // transferring megabytes the rows never render.
-            capabilities: Some(vec![
-                "attach_snapshot".to_string(),
-                "event_sequence".to_string(),
-                "slim_attach".to_string(),
-                "elide_snapshot_images".to_string(),
-            ]),
+            // `elide_snapshot_images`: the transcript arrives without the base64 image payloads, so
+            // an image-heavy session's attach stops transferring megabytes.
+            capabilities: Some(attach_capabilities()),
             resume_cursor: None,
             telemetry_disabled: self.telemetry_disabled.filter(|disabled| *disabled),
             recovery_config: None,
@@ -410,8 +372,6 @@ impl SessionUi {
                 if !direct_attached {
                     return Err(error);
                 }
-                // The direct attach failed: one supervisor-routed retry
-                // (TS `DaemonAgentConnection.attach` fallback).
                 self.client.drop_direct();
                 self.client
                     .request_ok(attach_command(active_session_id))
@@ -420,12 +380,8 @@ impl SessionUi {
         };
         let data = attached;
         let attach = attach_data_from_response(data)?;
-        // The bash slot follows the attached session's live state (TS
-        // `applyConnectionStateSnapshot` patches `isBashRunning`): the
-        // captured state drives the next rebuild's resync edge. The
-        // mounted card id survives the patch (TS keeps
-        // `activeBashComponent` tracked) — the rebuild's kind decides
-        // its fate.
+        // The bash slot follows the attached session's live state: the captured
+        // state drives the next rebuild's resync edge.
         let state = attach.snapshot.get("state");
         let resync_bash = ResyncBash {
             was_running: self.user_bash_running,
@@ -443,10 +399,8 @@ impl SessionUi {
         let reconstructed = reconstruct(&attach);
         let mounted_session_changes = previous != attach.active_session_id;
         self.active_session_id = attach.active_session_id;
-        // The new attachment exists (the snapshot above rebuilt from it):
-        // retire the superseded id's subscription now, addressed by the
-        // captured previous id (the detach must target the OLD address,
-        // not the id the pane just adopted).
+        // Retire the superseded id's subscription now, addressed by the captured previous id (the
+        // detach must target the OLD address, not the newly adopted one).
         if !previous.is_empty() && previous != self.active_session_id {
             let _ = self
                 .bounded_request(
@@ -463,18 +417,16 @@ impl SessionUi {
         self.attach_event_generation
             .clone_from(&reconstructed.event_generation);
         self.attach_event_sequence = reconstructed.last_event_sequence;
-        // The live tracker starts at the attach's value (the replayed
-        // events' sequences converge onto it by the monotonic max); the
-        // cursor-presence gate keeps a cursor-less attach from stashing
-        // a handoff under collapsed default key values.
+        // The live tracker starts at the attach's value; the cursor-presence gate
+        // keeps a cursor-less attach from stashing a handoff.
         self.last_event_sequence = reconstructed.last_event_sequence;
         self.attach_cursor_present = reconstructed.cursor_present;
-        // The closing notice is per-connection (TS #2458: it clears on
-        // every attach): a later bare session stop must not route into a
-        // stale shutdown recovery's reconnect hang.
+        // The closing notice is per-connection: it clears on every attach, so a later bare session
+        // stop must not route into a stale shutdown recovery's reconnect hang.
         self.daemon_closing_notice = None;
         self.session_name.clone_from(&reconstructed.session_name);
         self.service_tier.clone_from(&reconstructed.service_tier);
+        self.pending_model_fallback_message = reconstructed.model_fallback_message;
         self.session_file = attach
             .snapshot
             .get("state")
@@ -482,22 +434,13 @@ impl SessionUi {
             .and_then(Value::as_str)
             .filter(|file| !file.is_empty())
             .map(str::to_string);
-        // The subagent summary follows the fresh session's family: the old
-        // roster belongs to the previous session, and the focus returns to
-        // the editor (TS `resetSubagentSummary` on rebind).
+        // The subagent summary follows the fresh session's family; the focus
+        // returns to the editor.
         self.roster.clear();
         self.subagents_focused = false;
         self.subscribe_roster().await;
-        // The dock's heartbeat rows follow `dock_fold` (the enum's
-        // contract): a first-content-frame attach folds the fresh fetch
-        // BEFORE the attach returns — the first content frame reads the
-        // final counts, never a late repaint (the operator's
-        // 2026-09-26 zero-shift ruling). TS guarantees the same for its
-        // dock: the counts seed from the attach snapshot
-        // (`seedSubagentSummary`) and the roster subscription is
-        // awaited before the first content render; TS's own heartbeat
-        // fetch stays fire-and-forget only because its summary line
-        // renders no heartbeat rows.
+        // The dock's heartbeat rows follow `dock_fold`: a first-content-frame attach folds the
+        // fresh fetch BEFORE the attach returns (the operator's 2026-09-26 zero-shift ruling).
         match dock_fold {
             DockFold::FirstFrame | DockFold::Fresh => self.heartbeat_catalog.clear(),
             // The held dock keeps its data: an already-up surface's dock
@@ -508,15 +451,11 @@ impl SessionUi {
             DockFold::FirstFrame => self.fetch_heartbeat_catalog().await,
             DockFold::Fresh | DockFold::Held => self.spawn_heartbeat_refresh(),
         }
-        // The slash-command catalog is session-scoped too (TS
-        // `refreshConnectionCatalog` fetches `get_commands` on every
-        // rebind): the skill commands land in the autocomplete provider
-        // when the response arrives.
+        // The slash-command catalog is session-scoped too; the skill commands
+        // land in the autocomplete provider when the response arrives.
         self.spawn_command_catalog_refresh();
-        // The dock's bash rows follow the same `dock_fold` contract; the
-        // capability gate matches the background refresh (older daemons
-        // never see the request), and a failed fold fetch leaves the
-        // cleared registry (the 2s poll refills).
+        // The dock's bash rows follow the same `dock_fold` contract; a failed fold
+        // fetch leaves the cleared registry (the 2s poll refills).
         match dock_fold {
             DockFold::FirstFrame | DockFold::Fresh => {
                 self.bash_activities = serde_json::json!({"activities": []});
@@ -526,8 +465,6 @@ impl SessionUi {
                 // refills; the spawn below asks for the first frame).
                 self.factory_graph = serde_json::json!({"runs": []});
             }
-            // The held dock keeps its registry for the same reason it
-            // keeps the heartbeat catalog above.
             DockFold::Held => {}
         }
         self.activity_group = crate::chrome::ActivityGroup::Subagents;
@@ -542,27 +479,20 @@ impl SessionUi {
         self.pending_model = reconstructed.model_id;
         self.pending_model_provider = reconstructed.model_provider;
         self.pending_thinking_suffix = reconstructed.thinking_suffix;
-        self.last_assistant_text = reconstructed
-            .chat
-            .iter()
-            .rev()
-            .find_map(|entry| match entry {
-                ChatEntry::Assistant(message) => {
-                    message.blocks.iter().rev().find_map(|block| match block {
-                        MessageBlock::Text(text) => Some(text.clone()),
-                        MessageBlock::Thinking(_) => None,
-                    })
-                }
-                _ => None,
-            });
+        // The tray's context usage follows the attach snapshot (TS
+        // `createAgentConnectionState` carries `contextUsage`, and TS's
+        // open path never blocks its first frame on a `getSessionStats`
+        // fetch — `refreshConnectionContextUsage` runs only after a turn
+        // or compaction settles): the rebuild below re-syncs it into the
+        // chrome exactly like the other reconstructed session fields.
+        self.context = reconstructed.context_usage;
+        self.last_assistant_text = last_assistant_text_of(&reconstructed.chat);
         self.pending_queue = Some(reconstructed.queued);
         self.pending_snapshot = Some(reconstructed.chat);
         self.loader_anchor_ms = reconstructed.last_user_prompt_ms;
         self.goal_view.seed(reconstructed.goal.unwrap_or_default());
-        // The resynced state owns the loader (TS `renderResyncedSession`
-        // rebuilds from the snapshot): a turn that is still live behind the
-        // re-attach keeps the spinner, one that died with the old link (or
-        // never ran) does not.
+        // The resynced state owns the loader: a turn still live behind the
+        // re-attach keeps the spinner, one that died with the old link does not.
         let streaming = attach.snapshot.get("state").is_some_and(|state| {
             ["isStreaming", "isCompacting"]
                 .iter()
@@ -591,37 +521,30 @@ impl SessionUi {
             self.turn_ends_seen = 0;
             self.last_prompt_turn_end = 0;
         }
-        // TS `applyConnectionStateSnapshot` -> `bindPromptStashSession`: the
-        // stash state follows the stable id of the session now rendered.
-        // The initial attach and every in-place switch (`/switch`, `/new`)
-        // rebind through here; a rebind hydrates the session's stashed
-        // images into the paste registry.
+        // The stash state follows the stable id of the session now rendered: the initial attach and
+        // every in-place switch rebind through here.
         let stash_session_id = self.session_id.clone();
         self.bind_prompt_stash_session(&stash_session_id);
-        // The attach fold held the wire frame, its decoded tree, and the
-        // folded transcript together; the frame and tree drop here, so
-        // return their freed heap to the OS instead of keeping the load's
-        // peak resident for the TUI's lifetime.
+        // The attach fold's wire frame and decoded tree drop here: return their freed heap to the
+        // OS instead of keeping the load's peak resident for the TUI's lifetime.
         pa_types::memory_release::trim_freed_heap();
-        // The rebuild's first frame materializes the visible window —
-        // its wrap/render churn is the TUI's own transient on top of the
-        // fold's; arm the post-frame trim so that churn returns too
-        // instead of riding the arenas for the process lifetime.
+        // The rebuild's first frame materializes the visible window; arm the
+        // post-frame trim so its wrap/render churn returns too.
         self.trim_after_frame = true;
+        self.window.reset(
+            attach.snapshot["state"]["leafId"]
+                .as_str()
+                .map(str::to_owned),
+            reconstructed.history_before_entry_id,
+            reconstructed.backfill_seam,
+        );
         Ok(())
     }
 
-    /// The instant a rebuilt loader anchors at, from the LAST HUMAN
-    /// PROMPT's wall-clock time (unix ms). The operator's 2026-09-28
-    /// rule: the waiting/executing timer never resets on a view
-    /// transition — it counts since the prompt that started the live
-    /// turn, however long ago that was. TS
-    /// `restoreTurnStartFromMessages` anchors at the run-start
-    /// message's timestamp the same way, with no plausibility cap: a
-    /// placeholder-era timestamp anchors at its own wall time and the
-    /// elapsed reads the wire's garbage (TS clamps only the negative
-    /// display at `formatWorkingElapsed`). Only a FUTURE timestamp
-    /// keeps the re-attach-instant anchor.
+    /// The instant a rebuilt loader anchors at, from the LAST HUMAN PROMPT's wall-clock time
+    /// (operator's 2026-09-28 rule: the timer never resets on a view transition). Like TS
+    /// `restoreTurnStartFromMessages`, no plausibility cap: only a FUTURE timestamp keeps the
+    /// re-attach-instant anchor.
     pub(super) fn loader_anchor_instant(prompt_ms: u64) -> Option<std::time::Instant> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -635,18 +558,13 @@ impl SessionUi {
     /// labels). Called after attach and after every session switch.
     pub(crate) fn rebuild_view(&mut self, view: &mut AgentView, kind: &RebuildKind) {
         let resync_bash = self.resync_bash.take();
-        // The held cards' fate diverges by rebuild: a rebind drops them
-        // with the old transcript (TS `resetCurrentSessionRenderState`), a
-        // resync keeps them mounted above the indicator (TS
-        // `renderResyncedSession` re-attaches `pendingBashComponents`).
+        // The held cards' fate diverges by rebuild: a rebind drops them with the
+        // old transcript, a resync keeps them mounted above the indicator.
         let held_bash = matches!(kind, RebuildKind::Resync)
             .then(|| std::mem::take(&mut view.pending_bash))
             .unwrap_or_default();
-        // A rebind replaces the whole view: the previous session's open
-        // bash view dies with its transcript instead of owning keys over
-        // the new session's registry. Sessions are independent (TS
-        // `rebindCurrentSession`): a rebind also restarts the tok/sec
-        // stats and clears the readout left over from the previous session.
+        // A rebind replaces the whole view: the previous session's open bash view
+        // dies with its transcript, and the tok/sec stats restart per session.
         if matches!(kind, RebuildKind::Rebind) {
             view.bash_view = None;
             // The factory view dies the same death — it snapshots the
@@ -676,26 +594,22 @@ impl SessionUi {
                 self.factory_view_session = None;
                 self.factory_graph = serde_json::json!({"runs": []});
             }
+            // An agents-view panel the rebind tore down takes its return-to-agents-view flag
+            // with it; a kept factory page keeps it.
+            self.panel_returns_to_agents_view &= view.factory_view.is_some();
             // The goal panel dies with the old session too: it is a
             // snapshot of the previous session's goal state, and until
             // the new session's own `goal_update` lands it would keep
             // owning the frame over the rebind with stale content.
             view.goal_panel = None;
-            // The read-only info panel dies the same death: it holds the
-            // previous session's fetched document, and a stale panel
-            // would keep consuming keys over the new session.
             view.info_panel = None;
             self.speed_stats = None;
             view.chrome.speed_text = None;
         }
         self.failed_attempt_rows.clear();
         view.clear_chat();
-        // The rebuilt transcript invalidates the tracked status row and
-        // a pending click's entry index.
         self.last_status_index = None;
         self.pressed_click = None;
-        // The rebuild drops the previous run's pending-tool map (TS
-        // `resetPendingToolState` at the rebuild boundary).
         self.pending_tools.clear();
         self.aborted_tools.clear();
         if let Some(items) = self.pending_snapshot.take() {
@@ -703,11 +617,15 @@ impl SessionUi {
                 view.push_entry(entry);
             }
         }
-        // The rebuild re-registers the live tool cards the way TS
-        // `restoreStreamingMessageFromSnapshot` does (the resumed turn's
-        // streamed calls re-enter the pending map): a post-reconnect
-        // failure frame can still settle them. Settled cards (a final
-        // result attached) stay out.
+        if let Some(message) = self.pending_model_fallback_message.take() {
+            view.push_entry(ChatEntry::Status {
+                text: format!("\u{26a0} {message}"),
+                kind: crate::chat::StatusKind::Warning,
+            });
+            self.last_status_index = None;
+        }
+        // The rebuild re-registers the live tool cards (the resumed turn's streamed calls re-enter
+        // the pending map): a post-reconnect failure frame can still settle them.
         for entry in &view.chat {
             if let ChatEntry::Tool(card) = entry {
                 if card.result.is_none() || card.result_partial {
@@ -719,38 +637,27 @@ impl SessionUi {
             view.chrome.model_id = Some(model);
             view.chrome.model_provider = self.pending_model_provider.take();
         }
-        // The tray badge mirrors the session-scoped tier on every rebuild:
-        // an attach that reports no tier clears the previous session's
-        // badge instead of leaving it stranded (the rebuild is where the
-        // chrome fields re-sync from the reconstructed session).
+        // The tray badge mirrors the session-scoped tier on every rebuild: an
+        // attach that reports no tier clears the previous session's badge.
         view.chrome.service_tier.clone_from(&self.service_tier);
-        // The tray's effort suffix moves with the same snapshot: an
-        // attach's state either carries the session's level or reports a
-        // model without reasoning, and the bare name wins in both cases.
+        // The tray's effort suffix moves with the same snapshot; the bare name
+        // wins when the state reports neither.
         view.chrome.thinking_suffix = self.pending_thinking_suffix.take();
         view.queued = self.pending_queue.take().unwrap_or_default();
-        // A rebuilt view starts from the snapshot's queue: any browse
-        // selection belonged to the previous queue and drops (TS
-        // `resetCurrentSessionRenderState` clears the selection).
+        // Any browse selection belonged to the previous queue and drops.
         let _ = self.queue_selection.reset();
         view.queue_selected = None;
         view.chrome.chat_name = self.session_display();
         view.chrome.context = self.context;
-        self.update_subagent_summary(view);
         // The rebuilt transcript invalidates the announcement row tracking;
         // the goal state itself carries over (seeded at attach).
         self.goal_view.reset_row_tracking();
         self.sync_goal_tray(view);
         self.sync_activity_dock(view);
         view.pending_bash = held_bash;
-        // The rebuild decides the mounted card's fate: a rebind drops it
-        // with the old transcript (TS `resetCurrentSessionRenderState`
-        // settles it cancelled and clears the hold — invisible after the
-        // clear), a resync runs the `renderResyncedSession` bashFinished
-        // edge: a run that ended behind the dead link settles its card
-        // with an unknown exit, flushes the hold when no turn is live,
-        // and releases the pane's side run (its bash_end never arrives —
-        // a transient run is not in the snapshot).
+        // The rebuild decides the mounted card's fate: a rebind drops it with the old transcript; a
+        // resync runs the bashFinished edge — a run that ended behind the dead link settles its
+        // card with an unknown exit.
         match kind {
             RebuildKind::Rebind => {
                 self.user_bash_card = None;
@@ -796,17 +703,8 @@ impl SessionUi {
                 }
             }
         }
-        // The rebuilt chat follows the session's live state: an attached
-        // turn that survived the re-attach keeps its loader (TS
-        // `renderResyncedSession`), and no stale loader survives a rebuild.
-        // The re-mounted loader anchors at the LAST HUMAN PROMPT (the
-        // operator's 2026-09-28 rule: the waiting/executing timer never
-        // resets on a view transition — an agents-view round trip
-        // re-attaches mid-turn and the clock keeps counting from the
-        // prompt that started the turn), so the elapsed readout picks up
-        // where it left off instead of restarting at the re-attach
-        // instant. The live paths (a submit's ack, a turn's engine
-        // start) keep their own anchors; only the rebuild re-derives one.
+        // An attached turn that survived the re-attach keeps its loader; the re-mounted loader
+        // anchors at the LAST HUMAN PROMPT (the operator's 2026-09-28 rule).
         if self.turn_active {
             let anchor = self
                 .loader_anchor_ms
@@ -817,30 +715,19 @@ impl SessionUi {
             view.working = None;
         }
         view.follow();
-        // An open `/heartbeats` picker follows the rebuilt session's
-        // catalog (the channel fold's `apply_catalog` path): without this
-        // a rebind leaves the picker showing the previous session's rows
-        // and its Manage actions target stale jobs.
+        // An open `/heartbeats` picker follows the rebuilt session's catalog — otherwise a rebind
+        // leaves it showing the previous session's rows.
         if let Some(picker) = view.heartbeats_picker.as_mut() {
             picker.apply_catalog(self.heartbeat_catalog.clone(), None);
         }
-        // The brand splash is the EMPTY chat's header (TS mounts
-        // `BrandSplashHeader` in `ui.start()`): a rebuild that folds a
-        // non-empty transcript suppresses it — the chat opened or
-        // switched directly into content, where TS's own direct opens
-        // attach before mount and the tail-anchored viewport scrolls the
-        // splash out of reach — while every rebuild into an empty chat
-        // keeps it (a new session shows its header; the incremental
-        // first-turn growth never passes through here, so a new chat's
-        // splash scrolls away exactly like TS).
+        // The brand splash is the EMPTY chat's header: a rebuild that folds a non-empty transcript
+        // suppresses it, every rebuild into an empty chat keeps it.
         view.splash_suppressed = !view.chat.is_empty();
         self.dirty = true;
     }
 
-    /// Refresh context usage from `get_session_stats` (the TS tray's
-    /// connection refresh): tokens, context window, and percent. The
-    /// title's spend never comes from here — the roster pushes that
-    /// `update_subagent_summary` folds keep it live.
+    /// Refresh context usage from `get_session_stats`: tokens, context window,
+    /// and percent. The title's spend comes from the roster pushes instead.
     pub(crate) async fn refresh_stats(&mut self) {
         let Ok(data) = self
             .bounded_request(
@@ -855,27 +742,16 @@ impl SessionUi {
         else {
             return;
         };
-        // TS `patchConnectionState` REPLACES the context usage snapshot:
-        // unknown usage (tokens null right after a compaction, or a
-        // response without the field) clears the tray display instead of
-        // keeping the stale one.
-        self.context = data.get("contextUsage").and_then(|usage| {
-            let tokens = usage.get("tokens").and_then(Value::as_u64)?;
-            let window = usage.get("contextWindow").and_then(Value::as_u64)?;
-            Some(crate::chrome::ContextUsage {
-                tokens,
-                context_window: window,
-            })
-        });
+        // Unknown usage (tokens null right after a compaction, or a
+        // response without the field) clears the tray display.
+        self.context = data
+            .get("contextUsage")
+            .and_then(crate::chrome::ContextUsage::from_wire);
         self.dirty = true;
     }
 
-    /// Detach on the agents-view handoff without blocking it: the request
-    /// goes on the wire immediately and a background task owns the
-    /// connection until the daemon answers (or the exit cap fires), then
-    /// closes it. Attached-client bookkeeping must not delay the switch;
-    /// the supervisor also detaches this client when the socket closes, so
-    /// the response is not a handoff dependency.
+    /// Detach on the agents-view handoff without blocking it: a background task owns the connection
+    /// until the daemon answers; the supervisor also detaches this client when the socket closes.
     pub(crate) fn detach_for_handoff(&self) {
         let client = self.client.clone();
         let active_session_id = self.active_session_id.clone();
@@ -893,9 +769,9 @@ impl SessionUi {
         });
     }
 
-    /// Detach during the exit path, bounded hard: a wedged worker socket can
-    /// never hold the client open (the exit contract is exit-within-1s even
-    /// then, so this must stay well under the bound).
+    /// Detach during the exit path, bounded hard: a wedged worker socket can never hold the client
+    /// open (the exit contract is exit-within-1s even then, so this must stay well under the
+    /// bound).
     pub(crate) async fn detach_for_exit(&self) {
         let _ = tokio::time::timeout(
             Duration::from_millis(EXIT_DETACH_TIMEOUT_MS),
@@ -908,10 +784,8 @@ impl SessionUi {
         .await;
     }
 
-    /// Fetch the exit resume hint (TS `shutdown` fetches `getSessionStats`
-    /// while the connection is alive, then prints `formatResumeHint` after
-    /// teardown). Bounded best-effort: a wedged worker or a dead connection
-    /// yields no hint instead of holding the exit open.
+    /// Fetch the exit resume hint, bounded best-effort: a wedged worker or a
+    /// dead connection yields no hint instead of holding the exit open.
     pub(crate) async fn exit_resume_hint(&self) -> Option<String> {
         let stats = tokio::time::timeout(
             Duration::from_millis(EXIT_STATS_TIMEOUT_MS),
@@ -923,5 +797,276 @@ impl SessionUi {
         )
         .await;
         resume_hint_from_stats(&stats.ok()?.ok()?)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod backfill_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// One session attached over a mock daemon that answers `attach` and `get_messages`.
+    async fn mock_session(
+        socket: &std::path::Path,
+        backfill_tx: mpsc::UnboundedSender<TranscriptPageNote>,
+    ) -> (SessionUi, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7},\"serverCapabilities\":[],\"clientId\":\"mock\"}\n").await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let kind = request["command"]["type"].as_str().unwrap();
+                let data = match kind {
+                    "attach" => json!({
+                        "activeSessionId": "s1", "snapshot": {
+                            "activeSessionId": "s1", "summary": {"id": "s1", "cwd": "/tmp"},
+                            "state": {"sessionId": "s1", "cwd": "/tmp", "isStreaming": false},
+                            "messages": [], "historyBefore": 1, "lastEventSequence": 0,
+                        }, "replay": {"status": "complete", "toSequence": 0},
+                        "lastEventSequence": 0,
+                    }),
+                    "get_messages" => {
+                        json!({"messages": [{"role": "user", "content": "rebuilt transcript", "timestamp": 1}]})
+                    }
+                    _ => json!({}),
+                };
+                let mut reply = serde_json::to_vec(&json!({
+                    "type": "response", "id": request["id"], "command": kind,
+                    "success": true, "data": data,
+                }))
+                .unwrap();
+                reply.push(b'\n');
+                write.write_all(&reply).await.unwrap();
+            }
+        });
+        let mut options =
+            crate::interactive::tests::options(crate::interactive::ModelSelection::default());
+        options.socket_path = socket.to_path_buf();
+        options.session = SessionSelection::Attach("s1".to_string());
+        let (client, _events) = DaemonClient::connect(socket).await.unwrap();
+        let session = SessionUi::open(
+            client,
+            &options,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            ActivityUpdates {
+                heartbeats: mpsc::unbounded_channel().0,
+                bash: mpsc::unbounded_channel().0,
+                factory: mpsc::unbounded_channel().0,
+                commands: mpsc::unbounded_channel().0,
+            },
+            backfill_tx,
+        )
+        .await
+        .unwrap();
+        (session, server)
+    }
+
+    /// A rebind that tears down an agents-view panel drops its return: a later dock-opened shells
+    /// panel closes back to the dock, never to the agents view.
+    #[tokio::test]
+    async fn a_rebind_drops_the_agents_view_panel_return() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("panel.sock");
+            let (mut session, server) = mock_session(&socket, mpsc::unbounded_channel().0).await;
+            let mut view = AgentView::new(crate::theme::Theme::builtin(
+                "prime",
+                crate::theme::ColorMode::TrueColor,
+            ));
+            session.open_agents_view_panel(
+                crate::interactive::SessionPanel::Shells { shell_id: None },
+                &mut view,
+            );
+            session.rebuild_view(&mut view, &RebuildKind::Rebind);
+            assert!(view.bash_view.is_none(), "the rebind tore the panel down");
+            session.open_bash_view(&mut view);
+            let esc = crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            );
+            session.handle_bash_view_key(esc, &mut view).unwrap();
+            assert!(view.bash_view.is_none(), "Esc closed the dock's panel");
+            assert!(
+                !session.open_agents_view && !session.exit_requested,
+                "the dock's panel closes to the dock"
+            );
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("mock session open, rebind and panel close complete within ten seconds");
+    }
+
+    /// An agents-view shell open selects its shell in the Bash panel, also when the shell lands in
+    /// a later poll than the panel's first (empty) snapshot.
+    #[tokio::test]
+    async fn an_agents_view_shell_open_selects_its_shell() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("shell.sock");
+            let (mut session, server) = mock_session(&socket, mpsc::unbounded_channel().0).await;
+            let shells = json!({"activities": [
+                {"id": "a", "command": "cargo build", "status": "running"},
+                {"id": "s2", "command": "sleep 600", "status": "running"},
+            ]});
+            for preloaded in [true, false] {
+                let theme =
+                    || crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+                let mut view = AgentView::new(theme());
+                session.bash_activities = if preloaded {
+                    shells.clone()
+                } else {
+                    json!({"activities": []})
+                };
+                session.open_agents_view_panel(
+                    crate::interactive::SessionPanel::Shells {
+                        shell_id: Some("s2".to_string()),
+                    },
+                    &mut view,
+                );
+                if !preloaded {
+                    session.apply_bash_activity(
+                        crate::session_ui::bash::BashActivityUpdate::List {
+                            session: session.active_session_id.clone(),
+                            epoch: session.bash_list_epoch,
+                            data: shells.clone(),
+                        },
+                        &mut view,
+                    );
+                }
+                let lines = view.bash_view.as_ref().expect("the Bash panel").render(
+                    &theme(),
+                    80,
+                    view.editor.keybindings(),
+                );
+                let selected = lines
+                    .iter()
+                    .map(|line| {
+                        line.iter()
+                            .map(|span| span.content.as_str())
+                            .collect::<String>()
+                    })
+                    .find(|text| text.starts_with('\u{203a}'))
+                    .expect("a selected row");
+                assert!(
+                    selected.contains("sleep 600"),
+                    "preloaded {preloaded}: {selected}"
+                );
+            }
+            drop(session);
+            server.abort();
+        })
+        .await
+        .expect("mock session open and both panel opens complete within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn an_attach_summary_model_fallback_warns_at_the_session_open() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fallback.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7},\"serverCapabilities\":[],\"clientId\":\"mock\"}\n").await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let kind = request["command"]["type"].as_str().unwrap();
+                let data = match kind {
+                    "attach" => json!({
+                        "activeSessionId": "s1", "snapshot": {
+                            "activeSessionId": "s1",
+                            "summary": {
+                                "id": "s1", "cwd": "/tmp",
+                                "modelFallbackMessage":
+                                    "Default model prime-inference/internal/glm-5.3-fast is not available. Using prime-inference/z-ai/glm-5.3",
+                            },
+                            "state": {"sessionId": "s1", "cwd": "/tmp", "isStreaming": false},
+                            "messages": [], "lastEventSequence": 0,
+                        }, "replay": {"status": "complete", "toSequence": 0},
+                        "lastEventSequence": 0,
+                    }),
+                    _ => json!({}),
+                };
+                let mut reply = serde_json::to_vec(&json!({
+                    "type": "response", "id": request["id"], "command": kind,
+                    "success": true, "data": data,
+                }))
+                .unwrap();
+                reply.push(b'\n');
+                write.write_all(&reply).await.unwrap();
+            }
+        });
+        let mut options =
+            crate::interactive::tests::options(crate::interactive::ModelSelection::default());
+        options.socket_path = socket.clone();
+        options.session = SessionSelection::Attach("s1".to_string());
+        let (client, _events) = DaemonClient::connect(&socket).await.unwrap();
+        let mut session = SessionUi::open(
+            client,
+            &options,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            mpsc::unbounded_channel().0,
+            ActivityUpdates {
+                heartbeats: mpsc::unbounded_channel().0,
+                bash: mpsc::unbounded_channel().0,
+                factory: mpsc::unbounded_channel().0,
+                commands: mpsc::unbounded_channel().0,
+            },
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+        let mut view = AgentView::new(crate::theme::Theme::builtin(
+            "prime",
+            crate::theme::ColorMode::TrueColor,
+        ));
+        session.rebuild_view(&mut view, &RebuildKind::Rebind);
+        let warnings: Vec<String> = view
+            .chat
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::Status { text, kind } if *kind == crate::chat::StatusKind::Warning => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            warnings,
+            vec!["\u{26a0} Default model prime-inference/internal/glm-5.3-fast is not available. Using prime-inference/z-ai/glm-5.3".to_string()],
+            "the startup fallback warns once at the open"
+        );
+        session.rebuild_view(&mut view, &RebuildKind::Resync);
+        assert!(
+            view.chat
+                .iter()
+                .all(|entry| !matches!(entry, ChatEntry::Status { kind: crate::chat::StatusKind::Warning, .. })),
+            "a second rebuild adds no second warning"
+        );
+        drop(session);
+        server.abort();
+        }).await.expect("mock session open, warning rebuild complete within ten seconds");
     }
 }

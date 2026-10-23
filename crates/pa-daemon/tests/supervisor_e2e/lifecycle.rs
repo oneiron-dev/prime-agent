@@ -48,6 +48,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
             "chunked_snapshot",
             "client_owned_sessions",
             "elide_snapshot_images",
+            "windowed_snapshot",
             "delete_rlm_subagent",
             "heartbeat_catalog",
             "heartbeat_management",
@@ -55,6 +56,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
             "side_question_transcript",
             "transient_bash",
             "kernel_bash_activity",
+            "persistent_shells",
             "session_input_admission",
             "prompt_admission_cancellation",
             "owned_prompt_cancellation",
@@ -73,8 +75,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         ])
     );
 
-    // Bare commands are rejected exactly like the TS supervisor: the
-    // client-facing protocol requires the command envelope.
+    // Bare commands are rejected exactly like the TS supervisor.
     client.send(&serde_json::json!({ "type": "list", "id": "bare" }));
     let rejected = client.read_response("bare");
     assert_eq!(rejected["command"], "parse");
@@ -84,13 +85,11 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         "Daemon commands require protocol 7 or newer"
     );
 
-    // Empty list: no live sessions.
     client.send_command("l1", &serde_json::json!({ "type": "list" }));
     let list = client.read_response("l1");
     assert_eq!(list["success"], true, "list failed: {list}");
     assert_eq!(list["data"]["sessions"], serde_json::json!([]));
 
-    // Create a scripted session.
     let script_path = dir.path().join("script.json");
     std::fs::write(
         &script_path,
@@ -120,7 +119,6 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         .expect("session id in create response")
         .to_string();
 
-    // Attach and stream the first turn.
     client.send_command(
         "a1",
         &serde_json::json!({ "type": "attach", "activeSessionId": session_id }),
@@ -137,9 +135,8 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         .keys()
         .map(String::as_str)
         .collect();
-    // TS `createAttachResult` key order (protocol, activeSessionId,
-    // snapshot, replay, lastEventSequence, lastEventCursor, client): the
-    // JSON map preserves insertion order, so this is the wire byte order.
+    // TS `createAttachResult` key order: the JSON map preserves insertion
+    // order, so this is the wire byte order.
     assert_eq!(
         keys,
         vec![
@@ -159,8 +156,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         .keys()
         .map(String::as_str)
         .collect();
-    // TS `createSessionSnapshot` key order: activeSessionId, summary,
-    // state, messages, lastEventSequence, lastEventCursor, children.
+    // TS `createSessionSnapshot` key order.
     assert_eq!(
         snapshot_keys,
         vec![
@@ -190,9 +186,8 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     let (prompt_ack, mut turn_lines) = client.read_response_and_lines("p1");
     assert_eq!(prompt_ack["success"], true, "prompt failed: {prompt_ack}");
 
-    // Streamed session events: message_start, updates, message_end, turn_end.
-    // Any of them may precede the prompt reply (TS order), so the lines
-    // buffered during the ack are drained first.
+    // Any streamed session event may precede the prompt reply (TS order),
+    // so the lines buffered during the ack are drained first.
     let mut saw_start = false;
     let mut updates = 0usize;
     let mut final_text = String::new();
@@ -217,7 +212,6 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     assert!(updates > 0, "assistant updates streamed ({updates} seen)");
     assert_eq!(final_text, "hello from scripted");
 
-    // The final answer is queryable.
     client.send_command(
         "g1",
         &serde_json::json!({
@@ -232,7 +226,6 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     );
     assert_eq!(final_answer["data"]["text"], "hello from scripted");
 
-    // The session appears in list.
     client.send_command("l2", &serde_json::json!({ "type": "list" }));
     let list = client.read_response("l2");
     let sessions = list["data"]["sessions"].as_array().expect("sessions");
@@ -311,11 +304,9 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     assert_eq!(sessions.len(), items);
     assert_eq!(rows[0], sessions[0]);
 
-    // Agent-to-agent messaging: an unknown target is rejected with the TS
-    // supervisor's unknown-session error. The full client-to-client shape
-    // (including the previously-hanging supervisor route) is verified in
-    // tests/peer_messaging_e2e.rs; the worker-side delivery itself is
-    // unit-tested in `worker::agent_message_tests`.
+    // The full client-to-client shape is verified in
+    // tests/peer_messaging_e2e.rs; the worker-side delivery in
+    // `worker::agent_message_tests`.
     client.send_command(
         "m1",
         &serde_json::json!({
@@ -335,7 +326,6 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
         "Unknown active session: no-such-session"
     );
 
-    // Second turn of the script replays the next response.
     client.send_command(
         "p2",
         &serde_json::json!({

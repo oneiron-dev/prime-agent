@@ -1,26 +1,23 @@
-//! Session-model restore with a bounded catalog-readiness wait.
-//!
-//! Port of `findSessionModelWithReadinessWait` (model-resolver.ts): a
-//! revived session's saved model can be missing from the registry only
-//! because the daemon boot's catalog/auth refresh has not settled yet,
-//! so the lookup gives the in-flight refreshes a bounded window before
-//! it is allowed to fail. Without the wait a revived session races the
-//! catalog fetch and silently lands on the startup-chain default
-//! (the featured model) instead of the model it was running on.
+//! Session-model restore with a bounded catalog-readiness wait: a revived
+//! session's saved model can be missing only because the boot's
+//! catalog/auth refresh has not settled. Without the wait the restore
+//! silently lands on the startup-chain default instead of the saved model.
 
 use std::time::Duration;
 
 use pa_types::ai::Model;
 
 use super::registry::ModelRegistry;
+use super::resolver::{
+    is_private_prime_inference_reference, resolve_model_scope_from_models,
+    scope_patterns_select_reference, ScopedModel,
+};
 
-/// TS `SESSION_MODEL_RESTORE_READINESS_TIMEOUT_MS`: the bounded window a
-/// session-model restore waits for in-flight catalog/auth refreshes to
-/// settle before the lookup is allowed to fail.
+/// The bounded window a session-model restore waits for in-flight catalog/auth refreshes to settle
+/// before the lookup may fail.
 pub const SESSION_MODEL_RESTORE_READINESS_TIMEOUT_MS: u64 = 5_000;
 
-/// TS `findRestorable` inside `findSessionModelWithReadinessWait`: the
-/// model is registered and its provider has configured auth.
+/// The model is registered and its provider has configured auth (TS `findRestorable`).
 fn find_restorable(registry: &ModelRegistry, provider: &str, model_id: &str) -> Option<Model> {
     registry
         .get_all()
@@ -30,16 +27,10 @@ fn find_restorable(registry: &ModelRegistry, provider: &str, model_id: &str) -> 
         .cloned()
 }
 
-/// TS `findSessionModelWithReadinessWait`: find a saved session model,
-/// giving in-flight catalog/auth refreshes a bounded window to settle
-/// before the lookup is allowed to fail.
-///
-/// The fast path is a registry lookup (find + configured auth, no
-/// network). Only on a miss does the coalesced registry refresh run —
-/// joining any in-flight catalog fetch on the process-shared chain —
-/// bounded by `readiness_timeout_ms`, and the lookup retries once. A
-/// model that still cannot be found returns `None`, leaving the caller
-/// to fall back (and to say so: the fallback must never be silent).
+/// Find a saved session model, giving in-flight catalog/auth refreshes a
+/// bounded window to settle before the lookup may fail. A miss returns
+/// `None`, leaving the caller to fall back (and to say so: the fallback
+/// must never be silent).
 pub async fn find_session_model_with_readiness_wait(
     registry: &mut ModelRegistry,
     provider: &str,
@@ -58,13 +49,49 @@ pub async fn find_session_model_with_readiness_wait(
     find_restorable(registry, provider, model_id)
 }
 
+pub async fn resolve_model_scope_from_models_with_readiness(
+    registry: &mut ModelRegistry,
+    patterns: &[String],
+    default: Option<(&str, &str)>,
+    is_continuing: bool,
+    readiness_timeout_ms: u64,
+) -> Vec<ScopedModel> {
+    let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
+    let scoped = resolve_model_scope_from_models(patterns, &available);
+    let default_missing = !is_continuing
+        && default.is_some_and(|(provider, model_id)| {
+            is_private_prime_inference_reference(provider, model_id)
+                && !scoped
+                    .iter()
+                    .any(|scoped| scoped.model.provider == provider && scoped.model.id == model_id)
+                && scope_patterns_select_reference(
+                    patterns,
+                    provider,
+                    model_id,
+                    &available,
+                    registry.get_all(),
+                )
+        });
+    if !default_missing {
+        return scoped;
+    }
+    if tokio::time::timeout(
+        Duration::from_millis(readiness_timeout_ms),
+        registry.refresh_available_models(),
+    )
+    .await
+    .is_err()
+    {
+        return scoped;
+    }
+    let available: Vec<Model> = registry.get_available().into_iter().cloned().collect();
+    resolve_model_scope_from_models(patterns, &available)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The restore predicate is find + configured auth: a registered model
-    /// without provider auth is not restorable (TS `findRestorable`), and a
-    /// model missing from the registry is not either.
     #[tokio::test]
     async fn restore_requires_a_registered_model_with_configured_auth() {
         let auth = crate::auth::AuthStorage::in_memory_without_env(

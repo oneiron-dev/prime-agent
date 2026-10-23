@@ -175,14 +175,27 @@ async fn a_cancelled_bootstrap_leaves_no_venv_a_readiness_check_accepts() {
         ),
     );
     let venv = gate.path("venv");
+    let source_dir = super::super::require_runtime_source_dir().unwrap();
+    let runtime_identity = super::super::hash_runtime_source(&source_dir).unwrap();
     let signal = AbortSignal::new();
     let build = tokio::spawn({
         let venv = venv.clone();
+        let runtime_identity = runtime_identity.clone();
         let options = EnsureKernelPythonOptions {
             cancel: Some(signal.clone()),
             ..Default::default()
         };
-        async move { super::super::bootstrap_venv(&uv.to_string_lossy(), &venv, &[], &options).await }
+        async move {
+            super::super::bootstrap_venv(
+                &uv.to_string_lossy(),
+                &venv,
+                &source_dir,
+                &runtime_identity,
+                &[],
+                &options,
+            )
+            .await
+        }
     });
     let (pid, alive) = gate.started().await;
     signal.abort();
@@ -196,7 +209,7 @@ async fn a_cancelled_bootstrap_leaves_no_venv_a_readiness_check_accepts() {
         !super::super::kernel_ready(
             &python.to_string_lossy(),
             &venv,
-            &super::super::resolve_runtime_identity(),
+            &runtime_identity,
             &[],
             ChildCancel::Never,
         )

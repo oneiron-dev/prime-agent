@@ -1,20 +1,12 @@
-//! Provider retry policy: the single shared policy for provider-failure
-//! retries (permanent kinds, Retry-After-aware capped delays).
-//!
-//! Two consumers exist: the session auto-retry loop and one-shot completion
-//! helpers (side questions, compaction, refinement, session summaries). The
-//! decision logic is pure and clock-free so tests stay deterministic; the
-//! caller owns the actual sleep/attempt cycle.
-//!
-//! Structured failures ride the assistant message as a
-//! `provider_stream_failure` diagnostic whose details carry the classified
-//! kind, HTTP status, and server-requested `retryAfterMs`.
+//! Provider retry policy: the single shared policy for provider-failure retries
+//! (permanent kinds, Retry-After-aware capped delays), shared by the session
+//! auto-retry loop and one-shot completion helpers; failures ride the assistant
+//! message as a `provider_stream_failure` diagnostic (kind, status, `retryAfterMs`).
 
 use pa_agent::abort::AbortSignal;
 use pa_agent::types::{AssistantMessage, StopReason};
 use serde_json::Value;
 
-/// The shared retry policy (TS `ProviderRetryPolicy`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRetryPolicy {
     pub enabled: bool,
@@ -22,18 +14,15 @@ pub struct ProviderRetryPolicy {
     pub base_delay_ms: u64,
     /// Max server-requested retry delay before giving up; 0 disables the cap.
     pub max_retry_delay_ms: u64,
-    /// Ceiling on the exponential backoff itself. The TS quick-retry loop
-    /// grows without bound, so the default is unbounded; the provider
-    /// failover schedule caps its doubling (30s).
+    /// Ceiling on the exponential backoff; the default is unbounded
+    /// (the TS quick-retry loop grows without bound).
     pub max_delay_ms: u64,
 }
 
 /// No backoff ceiling (the TS quick-retry schedule).
 pub const UNBOUNDED_BACKOFF_MS: u64 = u64::MAX;
 
-/// Default policy (TS `DEFAULT_PROVIDER_RETRY_POLICY`; also the settings
-/// defaults: `retry.enabled` true, `maxRetries` 3, `baseDelayMs` 2000,
-/// `provider.maxRetryDelayMs` 60000).
+/// Default policy (also the settings defaults).
 pub const DEFAULT_PROVIDER_RETRY_POLICY: ProviderRetryPolicy = ProviderRetryPolicy {
     enabled: true,
     max_retries: 3,
@@ -79,9 +68,8 @@ pub fn is_faux_provider_queue_exhausted(message: &AssistantMessage) -> bool {
         && message.error_message.as_deref() == Some("No more faux responses queued")
 }
 
-/// A context-overflow failure (TS `_isRetryableError`'s overflow guard): the
-/// request itself is too large, so re-issuing it unchanged can never succeed.
-/// The session-level compact-and-retry recovery owns it instead.
+/// A context-overflow failure: re-issuing it unchanged can never
+/// succeed; the compact-and-retry recovery owns it.
 #[must_use]
 pub fn is_context_overflow_failure(message: &AssistantMessage, context_window: u64) -> bool {
     // The shared overflow classifier works over the wire message shape;
@@ -95,19 +83,14 @@ pub fn is_context_overflow_failure(message: &AssistantMessage, context_window: u
     pa_ai::is_context_overflow(&wire, (context_window > 0).then_some(context_window))
 }
 
-/// The model router's tool-use rejection marker (observed on
-/// prime-inference as a 404 whose body the SDK surfaces verbatim:
-/// `404 No endpoints found that support tool use. Try disabling ...`).
-/// Matched case-insensitively against the user-facing failure text,
-/// but only together with the classified 404 status: the text alone is
-/// provider-controllable and must never steer the retry policy on its
-/// own (a transient 5xx quoting the same words stays retryable).
+/// The model router's tool-use rejection marker, matched case-insensitively but
+/// only together with the classified 404 status: the text alone is
+/// provider-controllable and must never steer the retry policy on its own.
 const UNSUPPORTED_TOOL_FAILURE_MARKER: &str = "no endpoints found that support tool use";
 
-/// A router rejection for a model that cannot serve tool use. Unlike the
-/// plain routing-blip 404 (transient), the request's tools make this a
-/// permanent capability mismatch: every provider serving the same model
-/// rejects it identically, so it is never retried and never fails over.
+/// A router rejection for a model that cannot serve tool use: a
+/// permanent capability mismatch (every provider rejects identically),
+/// never retried and never failed over.
 #[must_use]
 pub fn is_unsupported_tool_failure(message: &AssistantMessage) -> bool {
     provider_stream_failure_status(message) == Some(404)
@@ -150,12 +133,9 @@ pub fn provider_stream_failure_status(message: &AssistantMessage) -> Option<u16>
         .and_then(|status| u16::try_from(status).ok())
 }
 
-/// Whether a failed turn recorded a provider stream failure (the
-/// `provider_stream_failure` diagnostic): the failure-scoped disclosure's
-/// gate. Agent-lifecycle failures and the faux test provider's queue
-/// exhaustion carry none, and an abort conversion is a user action, not a
-/// provider failure — those stay silent (the 402 diagnosis: only a real
-/// provider failure must never settle silently).
+/// The failure-scoped disclosure's gate. Lifecycle and faux queue
+/// failures and abort conversions stay silent (the 402 diagnosis: only
+/// a real provider failure must never settle silently).
 #[must_use]
 pub fn has_provider_stream_failure(message: &AssistantMessage) -> bool {
     !is_faux_provider_queue_exhausted(message) && provider_stream_failure_details(message).is_some()
@@ -225,8 +205,7 @@ pub fn jittered_delay_ms(delay_ms: u64, retry_after_ms: Option<u64>, rand01: f64
 }
 
 /// One uniform sample in `[0, 1]` for [`jittered_delay_ms`]: a time-seeded
-/// xorshift step (uniformity is not security here, only spread across
-/// concurrent processes).
+/// xorshift step (uniformity is not security here, only spread).
 pub fn retry_jitter_rand01() -> f64 {
     static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -265,18 +244,9 @@ pub fn provider_retry_delay(
     ProviderRetryDelay::Wait { delay_ms }
 }
 
-/// One-shot completion with the shared retry policy, for consumers outside the
-/// session auto-retry loop (provider clients never retry internally).
-///
-/// `attempt` produces one assistant message per call; a message whose stop
-/// reason is `error` is classified against the policy and retried when
-/// transient. `wait` sleeps one retry delay; returning `false` marks the wait
-/// aborted and stops the loop with `Aborted` (a cancel that raced the failure
-/// is an abort, not a provider failure). An attempt error propagates to the
-/// caller, like a `throw` inside the TS attempt closure.
-///
-/// The wait future is injectable so deterministic callers (scripts, tests)
-/// can avoid real timers; poll it with any executor (`futures` works).
+/// One-shot completion with the shared retry policy, for consumers outside the session
+/// auto-retry loop. A message whose stop reason is `error` is classified against the
+/// policy and retried when transient; `wait` returning `false` aborts with `Aborted`.
 ///
 /// # Errors
 ///
@@ -490,7 +460,6 @@ mod tests {
             provider_retry_delay(3, None, &policy),
             ProviderRetryDelay::Wait { delay_ms: 8000 }
         );
-        // Server-requested wait wins when larger.
         assert_eq!(
             provider_retry_delay(1, Some(9000), &policy),
             ProviderRetryDelay::Wait { delay_ms: 9000 }
@@ -538,7 +507,7 @@ mod tests {
             None
         ));
         // TS #2472: safety filters deterministically reject identical
-        // requests, so they never retry.
+        // requests.
         assert!(is_permanent_provider_failure_kind(Some("safety"), 0, None));
         assert!(is_permanent_provider_failure_kind(
             Some("safety"),
@@ -556,14 +525,12 @@ mod tests {
             1,
             Some(401)
         ));
-        // 404 is transient.
         assert!(!is_permanent_provider_failure_kind(
             Some("invalid_request"),
             0,
             Some(404)
         ));
-        // A 402's deterministic kind is permanent on the first attempt:
-        // a wallet drain does not refill inside the retry ladder.
+        // A 402's deterministic kind is permanent on the first attempt.
         assert!(is_permanent_provider_failure_kind(
             Some("payment_required"),
             0,
@@ -816,7 +783,6 @@ mod tests {
         )
         .await
         .unwrap();
-        // One initial attempt plus two retries.
         assert_eq!(attempts, 3);
         assert_eq!(message.stop_reason, StopReason::Error);
     }
@@ -1014,12 +980,8 @@ mod tests {
         assert_eq!(retry_after, ProviderRetryDelay::Wait { delay_ms: 2000 });
     }
 
-    /// The router's tool-use rejection (the dogfood incident text) is
-    /// permanent, matched case-insensitively — but only together with
-    /// the classified 404 status: provider-controllable text alone
-    /// never steers the retry policy. A plain routing-blip 404 without
-    /// the marker stays transient, and a 5xx quoting the marker stays
-    /// retryable.
+    /// Provider-controllable text alone never steers the retry policy;
+    /// the rejection is permanent only together with the 404 status.
     #[test]
     fn unsupported_tool_rejections_are_terminal() {
         let mut unsupported = error_message(Some("invalid_request"), Some(404), None);
@@ -1033,14 +995,9 @@ mod tests {
         let mut blip = error_message(Some("invalid_request"), Some(404), None);
         blip.error_message = Some("404 model route not found".to_string());
         assert!(!is_unsupported_tool_failure(&blip));
-        // The marker text without the 404 status is not a tool-capability
-        // rejection: a transient 5xx quoting the router's words stays
-        // retryable (the status gate keeps the text from steering the
-        // policy on its own).
         let mut transient = error_message(Some("server_error"), Some(503), None);
         transient.error_message = Some("503 No endpoints found that support tool use".to_string());
         assert!(!is_unsupported_tool_failure(&transient));
-        // No classified status at all: same rule.
         let mut unclassified = error_message(Some("server_error"), None, None);
         unclassified.error_message = Some("No endpoints found that support tool use".to_string());
         assert!(!is_unsupported_tool_failure(&unclassified));

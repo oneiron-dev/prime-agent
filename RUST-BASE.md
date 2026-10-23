@@ -1,8 +1,8 @@
 # Rust base (Oneiron fork)
 
 The Oneiron fork of prime-agent on the Rust product. Upstream replaced the TypeScript product on
-`main` with the Rust port (`39bc99a91`, 2026-09-30); this branch line follows it. The TS fork
-(`main`, deployed as `0.9.6-oneiron.*`) stays the launcher until cutover.
+`main` with the Rust port (`39bc99a91`, 2026-09-30); this branch line follows it. The historical TS fork
+(`main`, deployed as `0.9.6-oneiron.*`) is not part of these Rust syncs.
 
 ## Pin
 
@@ -21,16 +21,38 @@ The Oneiron fork of prime-agent on the Rust product. Upstream replaced the TypeS
   #3197 is now upstream-merged; the still-open #3201 local patch remains. The historical
   base above is unchanged; this is a merge, not a rebase or integration-branch force-update.
 
+- Upstream sync 2026-10-24: merged pinned `main` `71beca9478f552dc6fc898bba9685f9ce00515cf`
+  (170 upstream-only commits) into PR #34 head `f64ee8f74e8cc15ca7dd7a84126065599011e644`.
+  This brings 259 upstream commits into integration tip `925ee93ab0fa50eb47067285aade7fcc3722ed59`,
+  including PR #34's 89. Resolved 112 conflicted paths, keeping upstream's unlocked compaction,
+  inline print RLM, transcript paging, bundled runtime validation and process-generation cleanup
+  while porting the fork capabilities below into those owners. Upstream version is `0.10.1`;
+  CI still pins Rust `1.98.1`. #3201 remains OPEN and its provider/model compatibility merge
+  stays carried; #3197 is already upstream-merged and is no longer in the carried table.
+  The model-visible Python tool is upstream's `python_repl`; explicit `--tools ipython` and
+  `--tools python` select that same tool. No-tools still starts no kernel. Integration fixes
+  retain awaiter state on persistent Bash handles and lazy factory loading. The local lockfile
+  advances Tokio `1.53.1` to `1.53.3` for `RUSTSEC-2026-0386`; the two owned-descriptor
+  registrations use its I/O-safe constructor API. The local test gate preserves CI's
+  `CARGO_INCREMENTAL=0` through its environment scrub. Post-integration verifiers restore
+  the runtime's bounded-await prompt contract, partition faux cached usage without double-counting
+  prompt tokens (preventing repeated compaction after summary cache replacement), and normalize
+  the gated interpreter fixture's padded macOS `wc` output. Native PTY verifiers close the master
+  before reaping a killed child, drain output while awaiting exit, and reopen the synthetic
+  shell's slave after controlling-session hangup without changing terminal state. The sync PR
+  records the complete initial conflict ledger, supplemental fixes and local check evidence;
+  the full CI workspace union uses a clean source-bound Linux snapshot, separately from native
+  Mac portable/fork checks and unsupported Linux-only fixtures in the first Mac run.
+
 ## Carried upstream patches
 
-Cherry-picked with `-x`, so each commit names its upstream source. Drop a patch when its PR
-merges upstream; a rebase onto a base that contains the merged change drops it automatically
-when the diff is identical, otherwise drop it by hand.
+Originally cherry-picked with `-x`, so each commit names its upstream source. On each merge
+sync, drop the carried delta only when upstream contains the merged change. Preserve upstream
+ancestry with merge commits; never rebase or squash the integration history.
 
-| PR | Title | Upstream head | Find locally | State at pin |
+| PR | Title | Upstream head | Find locally | State at 2026-10-24 sync |
 |---|---|---|---|---|
-| #3197 | retry silently dropped provider streams | `e4e7641b7` | `git log --grep 'cherry picked from commit e4e7641b7'` | open |
-| #3201 | models: merge custom model compat over provider compat | `697c48def` | `git log --grep 'cherry picked from commit 697c48def'` | open |
+| #3201 | models: merge custom model compat over provider compat | `697c48def` | `git log --grep 'cherry picked from commit 697c48def'` | OPEN; retained (not upstream-equivalent) |
 
 ## Fork-only changes
 
@@ -48,12 +70,12 @@ when the diff is identical, otherwise drop it by hand.
 | Mid-stream WebSocket retry | `crates/pa-ai/src/providers/openai_codex_responses/`, `crates/pa-core/src/session_engine/{auto_retry,provider_retry,provider_failover}.rs`, `crates/pa-cli/src/print_retry.rs`, `crates/pa-tui/src/{snapshot,session_ui}/` | A Codex event channel disappearing before completion is a typed transport failure, never a committed partial. Session transport retries use exactly 2000/4000/8000 ms with three retries total, independent of configured provider jitter/quota/failover schedules (the enabled toggle still applies). Failed sockets and continuation anchors are discarded; retry continues committed history/tool results without executing cut calls. Direct print/json composes the same retry driver, and live/reloaded transcripts supersede failed partial text and uncommitted tool cards. Existing retry wire events and outcome rows are reused; no protocol/schema change. |
 | Headless selection skips `provider_retry_outcome` | `crates/pa-core/src/session_engine/headless.rs` | Upstream's one-row retry disclosure (a sanctioned TS divergence) is persisted after the episode's last assistant and hid it from text-mode selection; TS, which keeps only the per-attempt rows, prints the recovered answer. |
 | Effective `--no-skills`/`--no-prompt-templates`/`--no-context-files` | `crates/pa-core/src/resources/mod.rs` (`ResourceLoadingPolicy`) | Upstream parses the flags but always discovered every resource; the `sol` wrapper and factory rely on `--no-skills` for prompt size. |
-| Headless exit follows the answer | `crates/pa-cli/src/headless_exit.rs`, `crates/pa-core/src/kernel/bootstrap/venv/subprocess.rs`, `KernelPrewarm` in `crates/pa-core/src/session_engine/engine.rs` | Upstream's print runtime started the kernel bootstrap in the background and dropped its Tokio runtime implicitly, which waits without bound for the bootstrap's blocking `uv`/interpreter children: a fresh home's first one-shot exited 43 s after its answer. Print/json now set the kernel environment up before the first turn (`KernelPrewarm::BeforeFirstTurn`), run every setup child as an owned, cancellable tokio child, abandon the kernel boot after the last output and shut the runtime down within 300 ms; the hosted client's detach waits the same budget. `--verbose` traces the exit phases. Resident sessions keep `KernelPrewarm::Background`. Either mode runs only when `ipython` is active after the launch tool selection (`--tools`/`--no-tools`/`--no-builtin-tools`). |
-| `--tools`/`--no-tools`/`--no-builtin-tools` honoured (kept against upstream #3211, `a3700282c`, which deletes them) | `crates/pa-core/src/session_engine/tool_selection.rs`, `crates/pa-core/src/prompts/no_repl.rs`, `crates/pa-core/src/session_engine/engine.rs`, `crates/pa-types/src/daemon/tool_selection.rs`, `crates/pa-cli/src/{args,mode,prompt_command}.rs`, the daemon create/summary/headless client, `crates/pa-tui/src/interactive.rs` | Upstream parsed the flags but always added `ipython` and the harness prompt; `sol` and the factory pass `--no-tools` for plain calls. TS semantics: an explicit list wins over both disable flags, then `--no-tools`, then `--no-builtin-tools`. A session with no active tools sends no tool definitions; any session without `ipython` prepares no kernel environment, starts no kernel and gets the TS no-tools prompt byte for byte (`crates/pa-core/tests/golden/corpus/no-tools-prompt-ts.txt`). Daemon wire: schema revision 31 (fork-only id), capability `session_tool_selection`, create keys `tools`/`noTools`/`noBuiltinTools` (durable for respawns, and kept with the session policy in the per-session record, so a passivated session wakes, a session moved onto by `new_session`/fork keeps, and an RLM child inherits the selection; a record without the keys reads as the defaults), summary `toolSelection`. A rebase onto #3211 must keep the flags, their help rows and this implementation. |
-| Unknown model ids on a models.json provider resolve as custom models (#32) | `build_fallback_model` in `crates/pa-core/src/models/resolver.rs` | TS sends any `--model` id to a provider defined in models.json; the port's fallback returned `None` for every provider without a compiled-in default (every models.json provider: cpa, cpa-r, cpa-a), so CPA's per-login prefix routing (`--provider cpa-r --model antevon/gpt-6.1-sol`, the proxy strips the prefix upstream) failed with `Model ... not found`. The fallback template is the provider's own entry for the id behind one routing prefix (only the first path segment is a prefix: `antevon/openai/gpt-4o` keeps its namespace), else the provider's first model; a provider with a compiled-in default keeps that template (TS parity). Resolver tests cover the boundaries. A rebase onto upstream must keep this. |
+| Headless exit follows the answer | `crates/pa-cli/src/headless_exit.rs`, `crates/pa-core/src/kernel/bootstrap/venv/subprocess.rs`, `KernelPrewarm` in `crates/pa-core/src/session_engine/engine.rs` | Upstream's print runtime started the kernel bootstrap in the background and dropped its Tokio runtime implicitly, which waits without bound for the bootstrap's blocking `uv`/interpreter children: a fresh home's first one-shot exited 43 s after its answer. Print/json now set the kernel environment up before the first turn (`KernelPrewarm::BeforeFirstTurn`), run every setup child as an owned, cancellable tokio child, abandon the kernel boot after the last output and shut the runtime down within 300 ms; the hosted client's detach waits the same budget. `--verbose` traces the exit phases. Resident sessions keep `KernelPrewarm::Background`. Either mode runs only when the Python REPL tool (`python_repl`, with `ipython`/`python` selection aliases) is active after the launch tool selection (`--tools`/`--no-tools`/`--no-builtin-tools`). |
+| `--tools`/`--no-tools`/`--no-builtin-tools` honoured (kept against upstream #3211, `a3700282c`, which deletes them) | `crates/pa-core/src/session_engine/tool_selection.rs`, `crates/pa-core/src/prompts/no_repl.rs`, `crates/pa-core/src/session_engine/engine.rs`, `crates/pa-types/src/daemon/tool_selection.rs`, `crates/pa-cli/src/{args,mode,prompt_command}.rs`, the daemon create/summary/headless client, `crates/pa-tui/src/interactive.rs` | Upstream parsed the flags but always added `ipython` and the harness prompt; `sol` and the factory pass `--no-tools` for plain calls. TS semantics: an explicit list wins over both disable flags, then `--no-tools`, then `--no-builtin-tools`. A session with no active tools sends no tool definitions; any session without `ipython` prepares no kernel environment, starts no kernel and gets the TS no-tools prompt byte for byte (`crates/pa-core/tests/golden/corpus/no-tools-prompt-ts.txt`). Daemon wire: schema revision 31 (fork-only id), capability `session_tool_selection`, create keys `tools`/`noTools`/`noBuiltinTools` (durable for respawns, and kept with the session policy in the per-session record, so a passivated session wakes, a session moved onto by `new_session`/fork keeps, and an RLM child inherits the selection; a record without the keys reads as the defaults), summary `toolSelection`. A merge that includes #3211 must keep the flags, their help rows and this implementation. |
+| Unknown model ids on a models.json provider resolve as custom models (#32) | `build_fallback_model` in `crates/pa-core/src/models/resolver.rs` | TS sends any `--model` id to a provider defined in models.json; the port's fallback returned `None` for every provider without a compiled-in default (every models.json provider: cpa, cpa-r, cpa-a), so CPA's per-login prefix routing (`--provider cpa-r --model antevon/gpt-6.1-sol`, the proxy strips the prefix upstream) failed with `Model ... not found`. The fallback template is the provider's own entry for the id behind one routing prefix (only the first path segment is a prefix: `antevon/openai/gpt-4o` keeps its namespace), else the provider's first model; a provider with a compiled-in default keeps that template (TS parity). Resolver tests cover the boundaries. An upstream merge must keep this. |
 | Side-by-side install + probe | `scripts/oneiron/side_by_side.py` | Installs a staged release beside the TS build and writes receipts. |
 | Release feed, rollout, rollback, status | `scripts/oneiron/release_feed.py`, `rollout.py`, `daemon_idle.py` (subcommands of `side_by_side.py`), `docs/oneiron/RELEASE.md`, `docs/oneiron/ROLLBACK.md` | Stamps a `package_release.py` build into a versioned feed release (`feed/releases/v<ver>/`), rolls it out with verified sums, a probe before selection and an idle-only Rust daemon check, and rolls back to the previous install; every step writes a receipt. `crates/pa-core/tests/oneiron_feed_manifest.rs` checks the feed manifest against the native updater's parser. |
-| Test-policy gate | `scripts/check-test-policy.mjs` (from the TS fork), `scripts/oneiron/test_policy_gate.py` | Runs the fork's test policy with `TEST_POLICY_BASE=oneiron/main` and fails only on violations beyond the 4 upstream ones present at the pin (`scripts/oneiron/test-policy-baseline.txt`). |
+| Test-policy gate | `scripts/check-test-policy.mjs` (from the TS fork), `scripts/oneiron/test_policy_gate.py` | Runs the fork's test policy with `TEST_POLICY_BASE=oneiron/main` and fails only on violations beyond the reviewed upstream baseline (`scripts/oneiron/test-policy-baseline.txt`): 4 original entries plus 8 occurrences in 3 byte-identical upstream tests at the 2026-10-24 sync. |
 | Factory package | `packages/factory` (Node, not in the Cargo workspace) | The TS fork's work factory as its own package, `prime-agent-factory`; its seats run the `prime-agent` binary as a subprocess. Gate: `npm ci && npm run check` in that directory. |
 
 ## Side-by-side contract (until cutover)
@@ -169,13 +191,12 @@ scripts/oneiron/gate.sh crates pa-core pa-daemon -- <filter>   # focused
   `PA_*`; an explicit `PA_TS_BINARY` is kept), TZ=UTC and the TS binary off PATH, the way a CI
   runner sees it. A failed build or bootstrap fails the gate.
 
-## Re-pinning
+## Subsequent upstream syncs
 
-1. `git fetch upstream`. Pick a `main` sha whose ci/continuous runs are green, then
-   `git branch rust-base-<sha9> <sha>` and push it.
-2. Rebase onto it on a new branch: `git rebase --onto rust-base-<new> rust-base-<old> <copy of rust-oneiron>`.
-   Patches whose upstream PRs merged drop out; check what remains with
-   `git cherry -v upstream/main`.
-3. Run the gates, then `python3 scripts/oneiron/test_policy_gate.py --write-baseline` if upstream's
-   runtime tests changed. Update this file's Pin section.
-4. Moving `rust-oneiron` to the rebased line is a force-update, so it needs the owner's word.
+1. `git fetch origin`. Pin the newest upstream `main` SHA and read its CI toolchain and gates.
+2. Create an isolated sync branch from `rust-oneiron` (or an explicitly included pending sync PR).
+3. Merge the pinned SHA with `git merge --no-ff`; never rebase or squash fork integration history.
+4. Keep upstream structure, preserve the fork capabilities above, record every conflict, and drop
+   a carried patch only after upstream includes its merged equivalent.
+5. Run the local sandboxed gates, update this sync record, and open a PR into `rust-oneiron`.
+   The owner or orchestrator verifies and merges it; do not force-update the integration branch.
