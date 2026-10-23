@@ -133,32 +133,44 @@ impl Worker {
             Ok(layer) => layer,
             Err(error) => return response_failure(None, "set_subagent_model", &error, None),
         };
-        let row = pa_core::session_engine::helper_model::session_override_row(&layer);
+        // The live override and its durable row change together under the core lock, so
+        // concurrent setters (and a session replacement's store swap) leave the latest row equal
+        // to the live value. The row goes to the worker-owned session file (a cleared override is
+        // a row too): a resume, a respawn or an idle wake re-seeds from it. A session without a
+        // file keeps the override for this worker only.
+        {
+            let mut core = self.core.lock().unwrap();
+            let row = pa_core::session_engine::helper_model::session_override_row(&layer);
+            if let Err(error) = self.engine.set_subagent_model(layer) {
+                return response_failure(None, "set_subagent_model", &error.to_string(), None);
+            }
+            if let Some(store) = core.store.as_mut() {
+                if let Err(error) = store.persist_entry("custom", row) {
+                    return response_failure(
+                        None,
+                        "set_subagent_model",
+                        &format!(
+                            "the helper model applies to this worker but was not saved: {error}"
+                        ),
+                        None,
+                    );
+                }
+            }
+        }
         // The status reads the settings file and the model catalog: off the worker's runtime.
         let engine = std::sync::Arc::clone(&self.engine);
-        let status = match tokio::task::spawn_blocking(move || engine.set_subagent_model(layer))
-            .await
-            .unwrap_or_else(|error| Err(anyhow::anyhow!("helper model task failed: {error}")))
+        let status = match tokio::task::spawn_blocking(move || engine.subagent_model_status()).await
         {
             Ok(status) => status,
             Err(error) => {
-                return response_failure(None, "set_subagent_model", &error.to_string(), None)
-            }
-        };
-        // The durable row goes to the worker-owned session file (a cleared override is a row
-        // too): a resume, a respawn or an idle wake re-seeds from it. A session without a file
-        // keeps the override for this worker only.
-        let mut core = self.core.lock().unwrap();
-        if let Some(store) = core.store.as_mut() {
-            if let Err(error) = store.persist_entry("custom", row) {
                 return response_failure(
                     None,
                     "set_subagent_model",
-                    &format!("the helper model applies to this worker but was not saved: {error}"),
+                    &format!("helper model status task failed: {error}"),
                     None,
-                );
+                )
             }
-        }
+        };
         response_success(None, "set_subagent_model", Some(status))
     }
 }

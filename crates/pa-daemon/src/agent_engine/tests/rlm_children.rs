@@ -452,8 +452,9 @@ fn the_session_override_beats_the_settings_file_and_reseeds_from_the_session_fil
         })
     );
     let unknown = HelperDefaults::new(Some("cpa-r/not-in-catalog"), None).unwrap();
+    crate::engine::SessionEngine::set_subagent_model(&engine, unknown.clone()).unwrap();
     assert_eq!(
-        crate::engine::SessionEngine::set_subagent_model(&engine, unknown.clone()).unwrap(),
+        crate::engine::SessionEngine::subagent_model_status(&engine),
         json!({
             "model": "cpa-r/not-in-catalog",
             "modelSource": "session",

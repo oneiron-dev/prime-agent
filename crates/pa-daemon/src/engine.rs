@@ -529,7 +529,7 @@ pub trait SessionEngine: Send + Sync {
     }
 
     /// Replace this session's live helper-model override (`set_subagent_model`; the worker writes
-    /// the durable row); answers the resulting status.
+    /// the durable row under the same lock). Cheap and lock-only: no I/O.
     ///
     /// # Errors
     ///
@@ -537,7 +537,7 @@ pub trait SessionEngine: Send + Sync {
     fn set_subagent_model(
         &self,
         layer: pa_core::session_engine::helper_model::HelperDefaults,
-    ) -> Result<Value> {
+    ) -> Result<()> {
         let _ = layer;
         anyhow::bail!("This session does not support a helper-model override")
     }

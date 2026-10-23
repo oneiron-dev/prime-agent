@@ -1383,12 +1383,12 @@ impl SessionEngine for AgentSessionEngine {
     fn set_subagent_model(
         &self,
         layer: pa_core::session_engine::helper_model::HelperDefaults,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<()> {
         let Some(children) = &self.children else {
             anyhow::bail!("This session has no RLM child runtime");
         };
         children.set_subagent_override(layer);
-        Ok(self.subagent_model_status())
+        Ok(())
     }
 
     fn run_prompt(
