@@ -574,10 +574,18 @@ impl SettingsManager {
             .filter(|m| !m.is_empty())
     }
 
-    /// Thinking level for spawns without a pinned level; unset inherits the parent's level.
+    /// Thinking level for spawns without a pinned level: a level name or `parent`; unset, blank
+    /// or unknown values read as unset (the parent's level).
     #[must_use]
-    pub fn get_subagent_default_thinking(&self) -> Option<ThinkingLevelSetting> {
-        self.merged.subagent_default_thinking
+    pub fn get_subagent_default_thinking(&self) -> Option<String> {
+        self.merged
+            .subagent_default_thinking
+            .as_ref()
+            .map(|level| level.trim().to_string())
+            .filter(|level| {
+                level == crate::session_engine::helper_model::INHERIT_PARENT
+                    || pa_types::ai::thinking_level_from_str(level).is_some()
+            })
     }
 
     /// Set (or, with `None`, remove) the global `subagentDefaultModel`.
@@ -595,10 +603,7 @@ impl SettingsManager {
     /// # Errors
     ///
     /// Returns an error when the global settings file cannot be written.
-    pub fn set_subagent_default_thinking(
-        &mut self,
-        level: Option<ThinkingLevelSetting>,
-    ) -> Result<()> {
+    pub fn set_subagent_default_thinking(&mut self, level: Option<String>) -> Result<()> {
         self.global.subagent_default_thinking = level;
         self.save_global(&["subagentDefaultThinking"])
     }

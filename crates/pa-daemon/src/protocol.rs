@@ -140,8 +140,6 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "set_session_name",
     "get_rlm_max_depth_status",
     "set_rlm_max_depth",
-    "get_subagent_model_status",
-    "set_subagent_model",
     "rename_saved_session",
     "delete_saved_session",
     "get_session_context",
@@ -170,6 +168,9 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "list_persistent_shells",
     "tail_persistent_shell",
     "kill_persistent_shell",
+    // Oneiron fork (capability `subagent_model`): the session's helper-model override.
+    "get_subagent_model_status",
+    "set_subagent_model",
 ];
 
 /// Parsed client command envelope.

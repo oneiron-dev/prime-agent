@@ -127,6 +127,8 @@ pub struct HelperRequest<'a> {
     pub model: Option<&'a str>,
     pub thinking: Option<&'a str>,
     pub parent_model: Option<&'a str>,
+    /// The parent's thinking level, when the host knows it.
+    pub parent_thinking: Option<&'a str>,
     /// The session override.
     pub session: &'a HelperDefaults,
     /// The settings file (`subagentDefaultModel`/`subagentDefaultThinking`).
@@ -139,7 +141,8 @@ pub struct ResolvedHelper {
     /// The catalog selector the child runs on.
     pub selector: String,
     pub model_source: HelperSource,
-    /// The child's thinking level; `None` keeps the host's parent level.
+    /// The level the child runs at (clamped to its catalog model); `None` when neither a layer
+    /// nor the parent names one (the child's worker picks its default).
     pub thinking: Option<String>,
     pub thinking_source: HelperSource,
 }
@@ -164,8 +167,8 @@ pub fn resolve_helper(
 
 /// The helper resolution before the allowlist gate (the daemonless print host's entry). The
 /// spawn call's own values keep their strict checks; a default model the catalog does not know
-/// warns once on stderr and falls back to the parent's model; a default thinking level clamps to
-/// what the resolved model supports.
+/// warns once on stderr and falls back to the parent's model; a default thinking level, or the
+/// parent's, clamps to what the resolved model supports.
 ///
 /// # Errors
 /// Returns an error when the spawn call's own model or thinking level does not resolve, or when
@@ -214,26 +217,28 @@ pub fn resolve_helper_unchecked(
             assert_thinking_supported(agent_dir, Some(&level), &selector)?;
             Some(level)
         }
-        // A default level clamps to what the selector's catalog model supports; a model outside
-        // the catalog (a scripted verification model) keeps the level as given.
-        (Some(level), _) => {
-            let catalog_model = selector.split_once('/').and_then(|(provider, id)| {
-                crate::state_getters::worker_model_registry(agent_dir)
-                    .get_rlm_searchable_models()
-                    .into_iter()
-                    .find(|model| model.provider == provider && model.id == id)
-                    .cloned()
-            });
-            Some(match (catalog_model, thinking_level_from_str(&level)) {
-                (Some(model), Some(requested)) => {
-                    pa_ai::models::clamp_thinking_level(&model, requested)
-                        .wire_name()
-                        .to_string()
+        // A default level, else the parent's own, clamps to what the selector's catalog model
+        // supports (the level the child runs at); a model outside the catalog (a scripted
+        // verification model) keeps the level as given.
+        (level, _) => level
+            .or_else(|| request.parent_thinking.map(str::to_string))
+            .map(|level| {
+                let catalog_model = selector.split_once('/').and_then(|(provider, id)| {
+                    crate::state_getters::worker_model_registry(agent_dir)
+                        .get_rlm_searchable_models()
+                        .into_iter()
+                        .find(|model| model.provider == provider && model.id == id)
+                        .cloned()
+                });
+                match (catalog_model, thinking_level_from_str(&level)) {
+                    (Some(model), Some(requested)) => {
+                        pa_ai::models::clamp_thinking_level(&model, requested)
+                            .wire_name()
+                            .to_string()
+                    }
+                    _ => level,
                 }
-                _ => level,
-            })
-        }
-        (None, _) => None,
+            }),
     };
     Ok(ResolvedHelper {
         selector,
@@ -778,6 +783,7 @@ mod tests {
                 model,
                 thinking,
                 parent_model: Some("test-provider/glm-5.3"),
+                parent_thinking: None,
                 session,
                 settings,
             },
@@ -883,6 +889,30 @@ mod tests {
                 thinking_source: HelperSource::Parent,
             }
         );
+        // The parent's own level reports the level the child runs at: clamped to the helper's
+        // non-reasoning model.
+        let resolved = resolve_helper_unchecked(
+            dir.path(),
+            HelperRequest {
+                model: None,
+                thinking: None,
+                parent_model: Some("scripted/faux-1"),
+                parent_thinking: Some("high"),
+                session: &HelperDefaults::default(),
+                settings: &helper_layer(Some("test-provider/glm-5.3"), None),
+            },
+            "subagent",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            ResolvedHelper {
+                selector: "test-provider/glm-5.3".to_string(),
+                model_source: HelperSource::Settings,
+                thinking: Some("off".to_string()),
+                thinking_source: HelperSource::Parent,
+            }
+        );
         assert!(helper_model_known(dir.path(), "parent"));
         assert!(helper_model_known(
             dir.path(),
@@ -903,6 +933,7 @@ mod tests {
                 model: None,
                 thinking: None,
                 parent_model: Some("prime-inference/z-ai/glm-5.3"),
+                parent_thinking: None,
                 session: &HelperDefaults::default(),
                 settings: &settings,
             },

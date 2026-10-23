@@ -192,7 +192,6 @@ impl AgentSessionEngine {
             rlm_depth: std::sync::atomic::AtomicU32::new(0),
             rlm_max_depth_source: std::sync::Mutex::new("default"),
             pending_max_depth: std::sync::Mutex::new(None),
-            pending_subagent_override: std::sync::Mutex::new(None),
             reloaded_goal_update: std::sync::Mutex::new(None),
             faux_model: std::sync::OnceLock::new(),
             overflow_recovery: std::sync::Mutex::new(OverflowRecovery::default()),
@@ -431,7 +430,6 @@ impl AgentSessionEngine {
             if let Some(handles) = handles {
                 let mut manager = handles.session.lock().await;
                 self.flush_pending_max_depth(&mut manager);
-                self.flush_pending_subagent_override(&mut manager);
             }
         }
         let pending_branch = self

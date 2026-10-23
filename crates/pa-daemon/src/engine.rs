@@ -528,8 +528,8 @@ pub trait SessionEngine: Send + Sync {
         })
     }
 
-    /// Replace this session's helper-model override (`set_subagent_model`); answers the
-    /// resulting status.
+    /// Replace this session's live helper-model override (`set_subagent_model`; the worker writes
+    /// the durable row); answers the resulting status.
     ///
     /// # Errors
     ///

@@ -111,20 +111,17 @@ impl ClientSettings for CliClientSettings {
     }
 
     fn subagent_default_thinking(&self) -> Option<String> {
-        self.manager()
-            .get_subagent_default_thinking()
-            .map(|level| level.model_level().wire_name().to_string())
+        self.manager().get_subagent_default_thinking()
     }
 
     fn set_subagent_default_thinking(&self, level: Option<&str>) -> Result<()> {
-        let parsed = level
-            .map(|level| {
-                pa_types::ai::thinking_level_from_str(level)
-                    .map(pa_core::settings::ThinkingLevelSetting::from_model_level)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid thinking level \"{level}\""))
-            })
-            .transpose()?;
-        self.manager().set_subagent_default_thinking(parsed)
+        if let Some(level) =
+            level.filter(|level| pa_types::ai::thinking_level_from_str(level).is_none())
+        {
+            anyhow::bail!("Invalid thinking level \"{level}\"");
+        }
+        self.manager()
+            .set_subagent_default_thinking(level.map(str::to_string))
     }
 
     fn default_service_tier(&self) -> String {

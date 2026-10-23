@@ -953,17 +953,12 @@ impl SessionEngine for AgentSessionEngine {
             .lock()
             .expect("semantic identity lock") = semantic_identity;
         // The helper-model override: the session file's latest `subagent_model_state` row (a
-        // `/subagent-model`, or an earlier birth), else the create's own (an RLM parent's), which
-        // the session persists at its first build so a resume or a wake keeps it.
+        // `set_subagent_model`, or an RLM child's birth row the worker wrote at create), else the
+        // create's own.
         let subagent_override = pa_core::session_engine::helper_model::persisted_session_override(
             identity.session_file.as_deref(),
         )
-        .unwrap_or_else(|| {
-            if !identity.subagent_override.is_empty() {
-                self.park_subagent_override(&identity.subagent_override);
-            }
-            identity.subagent_override
-        });
+        .unwrap_or(identity.subagent_override);
         if let Some(children) = &self.children {
             let parent = ParentIdentity {
                 rlm_depth: identity.rlm_depth,
@@ -1392,9 +1387,7 @@ impl SessionEngine for AgentSessionEngine {
         let Some(children) = &self.children else {
             anyhow::bail!("This session has no RLM child runtime");
         };
-        children.set_subagent_override(layer.clone());
-        // The durable `subagent_model_state` entry: a resumed or woken session re-seeds from it.
-        self.persist_subagent_override(&layer);
+        children.set_subagent_override(layer);
         Ok(self.subagent_model_status())
     }
 

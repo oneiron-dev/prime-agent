@@ -43,6 +43,7 @@ async fn resolve_child_helper(
         model,
         thinking,
         parent_model: identity.model.as_deref(),
+        parent_thinking: identity.thinking.as_deref(),
         session: &identity.subagent_override,
         settings: &settings,
     };
@@ -130,7 +131,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 )
                 .await?;
                 let model = helper.selector;
-                let thinking = helper.thinking.or_else(|| identity.thinking.clone());
+                let thinking = helper.thinking;
                 let child_dir = this.child_session_dir(&child_id, &identity)?;
                 let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
                 let runtime_metadata = json!({
@@ -346,7 +347,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let sessions_dir = crate::paths::sessions_dir(&this.agent_dir)?;
             std::fs::create_dir_all(&sessions_dir)
                 .with_context(|| format!("create sessions dir {}", sessions_dir.display()))?;
-            let thinking = helper.thinking.or_else(|| identity.thinking.clone());
+            let thinking = helper.thinking;
             let created = this
                 .launch_child(
                     "root",

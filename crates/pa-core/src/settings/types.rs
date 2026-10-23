@@ -308,9 +308,11 @@ pub struct Settings {
     /// Model ("provider/model-id") a spawned agent runs on when its spawn call names none; unset
     /// or `parent` inherits the parent's model. The session override beats it.
     pub subagent_default_model: Option<String>,
-    /// Thinking level a spawned agent runs at when its spawn call names none; unset inherits the
-    /// parent's level. Clamped to what the helper's model supports.
-    pub subagent_default_thinking: Option<ThinkingLevelSetting>,
+    /// Thinking level a spawned agent runs at when its spawn call names none (`off` ... `max`, or
+    /// `parent`, which lets a project setting override a global level); unset inherits the
+    /// parent's level. Clamped to what the helper's model supports. Raw text: the getter
+    /// validates it.
+    pub subagent_default_thinking: Option<String>,
     pub update_channel: Option<UpdateChannel>,
     pub recent_models: Option<Vec<String>>,
     pub auxiliary_model: Option<String>,

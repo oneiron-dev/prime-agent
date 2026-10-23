@@ -118,9 +118,7 @@ impl HelperDefaults {
     pub fn from_settings(settings: &SettingsManager) -> Self {
         Self {
             model: settings.get_subagent_default_model(),
-            thinking: settings
-                .get_subagent_default_thinking()
-                .map(|level| level.model_level().wire_name().to_string()),
+            thinking: settings.get_subagent_default_thinking(),
         }
     }
 
@@ -260,11 +258,11 @@ pub fn persisted_session_override(path: Option<&str>) -> Option<HelperDefaults> 
         .rev()
         // A matching row's raw text carries the `customType` literal or a `\u`-escape.
         .filter(|line| line.contains(SUBAGENT_MODEL_STATE_CUSTOM_TYPE) || line.contains("\\u"))
-        .find_map(session_override_row)
+        .find_map(parse_override_row)
 }
 
 /// One candidate line's override: `Some` for a `subagent_model_state` custom row.
-fn session_override_row(line: &str) -> Option<HelperDefaults> {
+fn parse_override_row(line: &str) -> Option<HelperDefaults> {
     let value: Value = serde_json::from_str(line.trim()).ok()?;
     if value.get("type").and_then(Value::as_str) != Some("custom")
         || value.get("customType").and_then(Value::as_str) != Some(SUBAGENT_MODEL_STATE_CUSTOM_TYPE)
@@ -276,12 +274,13 @@ fn session_override_row(line: &str) -> Option<HelperDefaults> {
     Some(HelperDefaults::new(field("model"), field("thinking")).unwrap_or_default())
 }
 
-/// The `subagent_model_state` row data for one override.
+/// The fields of the `custom` session entry that persists one override (the worker's
+/// `SessionFile::persist_entry("custom", ...)`); unset fields persist as `null`.
 #[must_use]
-pub fn session_override_row_data(layer: &HelperDefaults) -> Value {
+pub fn session_override_row(layer: &HelperDefaults) -> Value {
     serde_json::json!({
-        "model": layer.model,
-        "thinking": layer.thinking,
+        "customType": SUBAGENT_MODEL_STATE_CUSTOM_TYPE,
+        "data": { "model": layer.model, "thinking": layer.thinking },
     })
 }
 
@@ -416,29 +415,46 @@ mod tests {
             HelperDefaults::load_settings(dir.path(), &agent_dir),
             HelperDefaults::default()
         );
+        // A project's `parent` overrides a global level: the walk stops at the parent.
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"subagentDefaultThinking":"max"}"#,
+        )
+        .unwrap();
+        let project = dir.path().join(".prime").join("agent");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("settings.json"),
+            r#"{"subagentDefaultThinking":"parent"}"#,
+        )
+        .unwrap();
+        let settings = HelperDefaults::load_settings(dir.path(), &agent_dir);
+        assert_eq!(settings, layer(None, Some(INHERIT_PARENT)));
+        assert_eq!(
+            plan_helper(None, None, &HelperDefaults::default(), &settings).thinking,
+            HelperPick {
+                value: None,
+                source: HelperSource::Parent,
+            }
+        );
     }
 
     #[test]
     fn the_latest_persisted_row_is_the_session_override() {
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("session.jsonl");
-        let row = |data: Value| {
-            serde_json::json!({
-                "type": "custom",
-                "customType": SUBAGENT_MODEL_STATE_CUSTOM_TYPE,
-                "data": data,
-            })
-            .to_string()
+        // The entry the worker's `persist_entry("custom", ...)` writes.
+        let row = |layer: &HelperDefaults| {
+            let mut entry = session_override_row(layer);
+            entry["type"] = Value::String("custom".to_string());
+            entry.to_string()
         };
         std::fs::write(
             &file,
             [
                 r#"{"type":"session","id":"s"}"#.to_string(),
-                row(session_override_row_data(&layer(Some("cpa-r/kimi"), None))),
-                row(session_override_row_data(&layer(
-                    Some("cpa-r/deepseek-flash-1017"),
-                    Some("max"),
-                ))),
+                row(&layer(Some("cpa-r/kimi"), None)),
+                row(&layer(Some("cpa-r/deepseek-flash-1017"), Some("max"))),
                 r#"{"type":"message","id":"m"}"#.to_string(),
             ]
             .join("\n"),
@@ -452,7 +468,7 @@ mod tests {
         // A cleared override is an explicit, empty row.
         let mut content = std::fs::read_to_string(&file).unwrap();
         content.push('\n');
-        content.push_str(&row(session_override_row_data(&HelperDefaults::default())));
+        content.push_str(&row(&HelperDefaults::default()));
         std::fs::write(&file, content).unwrap();
         assert_eq!(
             persisted_session_override(Some(&path)),

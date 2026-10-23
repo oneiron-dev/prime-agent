@@ -593,6 +593,30 @@ impl Worker {
                     }
                 }
             }
+            // An RLM child's inherited helper-model override is its birth row: a resume, an idle
+            // wake or a reopen of the child's own file reads it back (the durable create keys
+            // replay only on a respawn), and a later `set_subagent_model` row supersedes it.
+            if !subagent_override.is_empty() {
+                if let Some(store) = core.store.as_mut() {
+                    let path = store.path.to_string_lossy().to_string();
+                    if pa_core::session_engine::helper_model::persisted_session_override(Some(
+                        &path,
+                    ))
+                    .is_none()
+                    {
+                        if let Err(error) = store.persist_entry(
+                            "custom",
+                            pa_core::session_engine::helper_model::session_override_row(
+                                &subagent_override,
+                            ),
+                        ) {
+                            eprintln!(
+                                "pa-daemon: failed to persist the inherited subagent_model_state: {error:#}"
+                            );
+                        }
+                    }
+                }
+            }
             core.created = true;
             core.abort_requested = false;
             // A fresh session starts live: the previous close's

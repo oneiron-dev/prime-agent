@@ -20,7 +20,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
     // TS-main bundle reports the same schema id at the hello). The combined
     // Rust schema is revision 33 and retains the fork's revision-31
     // capabilities (`worker_startup_failure`, `session_tool_selection`,
-    // `session_policy`).
+    // `session_policy`), plus the fork's capability-gated `subagent_model`.
     assert_eq!(
         hello["protocol"],
         serde_json::json!({
@@ -72,6 +72,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
             "worker_startup_failure",
             "session_tool_selection",
             "session_policy",
+            "subagent_model",
         ])
     );
 

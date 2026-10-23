@@ -447,6 +447,14 @@ const WIRE_FIXTURES: &[(&str, &str)] = &[
         r#"{"type": "set_rlm_max_depth", "activeSessionId": "sess", "maxDepth": 2}"#,
     ),
     (
+        "get_subagent_model_status",
+        r#"{"type": "get_subagent_model_status", "activeSessionId": "sess"}"#,
+    ),
+    (
+        "set_subagent_model",
+        r#"{"type": "set_subagent_model", "activeSessionId": "sess", "model": "cpa-r/deepseek-flash-1017", "thinking": "max"}"#,
+    ),
+    (
         "rename_saved_session",
         r#"{"type": "rename_saved_session", "sessionPath": "/tmp/x.jsonl", "name": "x"}"#,
     ),
@@ -563,6 +571,9 @@ fn known_command_types_match_the_ts_list() {
                     | "list_persistent_shells"
                     | "tail_persistent_shell"
                     | "kill_persistent_shell"
+                    // Oneiron fork: the helper-model override.
+                    | "get_subagent_model_status"
+                    | "set_subagent_model"
             ),
             "unexpected non-TS command type: {extra}"
         );

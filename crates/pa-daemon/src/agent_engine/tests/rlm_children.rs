@@ -389,12 +389,10 @@ fn can_passivate_worker_mirrors_the_release_gates_and_adds_the_registry_rule() {
 /// The session override of the helper model: `set_subagent_model` replaces what the spawns read
 /// (the status names each field's layer and checks the model against the catalog), and a
 /// session re-seeds from its persisted `subagent_model_state` row ahead of the create's own
-/// override, which otherwise parks for persistence at the first build.
+/// override.
 #[test]
 fn the_session_override_beats_the_settings_file_and_reseeds_from_the_session_file() {
-    use pa_core::session_engine::helper_model::{
-        session_override_row_data, HelperDefaults, SUBAGENT_MODEL_STATE_CUSTOM_TYPE,
-    };
+    use pa_core::session_engine::helper_model::{session_override_row, HelperDefaults};
     let dir = tempfile::TempDir::new().unwrap();
     let agent_dir = dir.path().join("agent");
     std::fs::create_dir_all(&agent_dir).unwrap();
@@ -471,51 +469,43 @@ fn the_session_override_beats_the_settings_file_and_reseeds_from_the_session_fil
         .as_ref()
         .expect("a linked engine hosts children");
     assert_eq!(children.subagent_override(), unknown);
-    // Unbuilt, the durable entry parks for the build.
-    assert_eq!(
-        engine.pending_subagent_override.lock().unwrap().take(),
-        Some(unknown)
-    );
 
-    // A re-seed: the session file's latest row beats the create's own override.
+    // A re-seed: the session file's latest row (the worker writes it) beats the create's own
+    // override; a cleared row clears it.
     let session_file = dir.path().join("session.jsonl");
+    let row = |layer: &HelperDefaults| {
+        let mut entry = session_override_row(layer);
+        entry["type"] = json!("custom");
+        entry["id"] = json!("o1");
+        entry["timestamp"] = json!("2026-01-01T00:00:01.000Z");
+        entry.to_string()
+    };
+    let header = json!({ "type": "session", "version": 3, "id": "s", "timestamp": "2026-01-01T00:00:00.000Z", "cwd": "/w" })
+        .to_string();
+    let inherited = HelperDefaults::new(Some("test-provider/helper-flash"), None).unwrap();
+    let configure = |session_file: Option<String>| {
+        crate::engine::SessionEngine::configure_rlm_identity(
+            &engine,
+            crate::engine::RlmSessionIdentity {
+                session_file,
+                subagent_override: inherited.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    };
     let persisted = HelperDefaults::new(Some("parent"), Some("max")).unwrap();
+    std::fs::write(&session_file, [header.clone(), row(&persisted)].join("\n")).unwrap();
+    configure(Some(session_file.to_string_lossy().to_string()));
+    assert_eq!(children.subagent_override(), persisted);
     std::fs::write(
         &session_file,
-        [
-            json!({ "type": "session", "version": 3, "id": "s", "timestamp": "2026-01-01T00:00:00.000Z", "cwd": "/w" })
-                .to_string(),
-            json!({
-                "type": "custom", "id": "o1", "timestamp": "2026-01-01T00:00:01.000Z",
-                "customType": SUBAGENT_MODEL_STATE_CUSTOM_TYPE,
-                "data": session_override_row_data(&persisted),
-            })
-            .to_string(),
-        ]
-        .join("\n"),
+        [header, row(&persisted), row(&HelperDefaults::default())].join("\n"),
     )
     .unwrap();
-    let inherited = HelperDefaults::new(Some("test-provider/helper-flash"), None).unwrap();
-    let identity = |session_file: Option<String>| crate::engine::RlmSessionIdentity {
-        session_file,
-        subagent_override: inherited.clone(),
-        ..Default::default()
-    };
-    crate::engine::SessionEngine::configure_rlm_identity(
-        &engine,
-        identity(Some(session_file.to_string_lossy().to_string())),
-    )
-    .unwrap();
-    assert_eq!(children.subagent_override(), persisted);
-    assert_eq!(
-        engine.pending_subagent_override.lock().unwrap().take(),
-        None
-    );
-    // No row yet (a fresh RLM child): the create's override applies and parks for its birth.
-    crate::engine::SessionEngine::configure_rlm_identity(&engine, identity(None)).unwrap();
+    configure(Some(session_file.to_string_lossy().to_string()));
+    assert_eq!(children.subagent_override(), HelperDefaults::default());
+    // No row (a fresh RLM child before its birth row, or no file): the create's override.
+    configure(None);
     assert_eq!(children.subagent_override(), inherited);
-    assert_eq!(
-        engine.pending_subagent_override.lock().unwrap().take(),
-        Some(inherited)
-    );
 }

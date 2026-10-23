@@ -722,6 +722,7 @@ impl RlmSubagentHost for InlineHost {
                         model: request.model.as_deref(),
                         thinking: request.thinking.as_deref(),
                         parent_model: parent_selector.as_deref(),
+                        parent_thinking: Some(parent_thinking.wire_name()),
                         session: &config.subagent_override,
                         settings: &settings,
                     },
