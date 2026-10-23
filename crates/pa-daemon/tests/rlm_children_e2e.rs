@@ -209,6 +209,7 @@ fn children(socket: &Path, agent_dir: &Path, script: &Path, depth: u32) -> Super
         session_file: Some(agent_dir.join("parent.jsonl").to_string_lossy().to_string()),
         thinking: None,
         child_script: Some(script.to_string_lossy().to_string()),
+        subagent_override: pa_core::session_engine::helper_model::HelperDefaults::default(),
     });
     sessions.set_parent_session_name(Some("parent-name".to_string()));
     sessions
@@ -614,6 +615,75 @@ async fn rlm_recursion_bound_is_enforced() {
         error.to_string(),
         "rlm.create_session is available only from a depth-0 session"
     );
+}
+
+/// The helper model: a spawn that names no model runs on the settings file's
+/// `subagentDefaultModel` instead of the parent's model, the session override beats the
+/// settings file, and the spawn call's own model beats both (the handle reports what the child
+/// runs on).
+#[tokio::test]
+async fn an_unpinned_spawn_runs_on_the_helper_model() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    std::fs::write(
+        agent_dir.join("models.json"),
+        json!({
+            "providers": {
+                "test-provider": {
+                    "baseUrl": "http://localhost:9",
+                    "apiKey": "test-key",
+                    "api": "openai-completions",
+                    "models": [
+                        { "id": "helper-flash", "name": "Helper", "contextWindow": 1000, "maxTokens": 100 },
+                        { "id": "session-pick", "name": "Session", "contextWindow": 1000, "maxTokens": 100 }
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("models.json");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({ "subagentDefaultModel": "test-provider/helper-flash" }).to_string(),
+    )
+    .expect("settings.json");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let script = write_script(dir.path(), "helper answer");
+    let children = children(&socket, &agent_dir, &script, 0);
+
+    let handle = children
+        .spawn(spawn_request("helper-a", "use the helper"))
+        .await
+        .expect("spawn on the settings default");
+    assert_eq!(handle.model, "test-provider/helper-flash");
+    assert_eq!(handle.thinking, None);
+
+    children.set_subagent_override(
+        pa_core::session_engine::helper_model::HelperDefaults::new(
+            Some("test-provider/session-pick"),
+            Some("off"),
+        )
+        .expect("override"),
+    );
+    let handle = children
+        .spawn(spawn_request("helper-b", "use the session pick"))
+        .await
+        .expect("spawn on the session override");
+    assert_eq!(handle.model, "test-provider/session-pick");
+    assert_eq!(handle.thinking.as_deref(), Some("off"));
+
+    let handle = children
+        .spawn(RlmSpawnRequest {
+            model: Some("test-provider/helper-flash".to_string()),
+            ..spawn_request("helper-c", "pinned")
+        })
+        .await
+        .expect("spawn on the pinned model");
+    assert_eq!(handle.model, "test-provider/helper-flash");
+    children.notify_turn_done();
 }
 
 /// TS #2396's daemon-wide half: the supervisor holds a subagent spawn's name under a

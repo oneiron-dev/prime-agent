@@ -45,7 +45,13 @@ the quiescence drive that holds the run open until every admitted
 descendant settles and its replies and notices drain (the #2270 fix),
 the goal/autonomous deferral behind unsettled work, and the exit
 disposal (kernels snapshotted, drivers joined; no child outlives the
-process).
+process). A child that names no model or thinking level runs on the helper
+model (fork-only, `docs/oneiron/HELPER-MODEL.md`): the invocation's
+`--subagent-model`/`--subagent-thinking` (else `PRIME_SUBAGENT_MODEL`/
+`PRIME_SUBAGENT_THINKING`), then the settings file's
+`subagentDefaultModel`/`subagentDefaultThinking`, then the parent's.
+`--daemon-hosted` and the interactive launch set the same override on their
+session (`set_subagent_model`, behind the `subagent_model` capability).
 Session slash commands (`print_session_command.rs`, the #253 residue): print
 prompts that are `/compact`, `/refine`, `/goal`, or `/autonomous` execute
 through the pa-core session-command executor (the daemon worker's seam — no

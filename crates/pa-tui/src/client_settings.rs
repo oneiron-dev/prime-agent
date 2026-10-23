@@ -18,6 +18,31 @@ pub trait ClientSettings: Send + Sync {
         anyhow::bail!("Harness refinement settings are unavailable")
     }
 
+    /// `subagentDefaultModel`: the helper model spawned agents run on when the spawn call names
+    /// none (`provider/model-id`; unset inherits the parent's model).
+    fn subagent_default_model(&self) -> Option<String> {
+        None
+    }
+    /// Persist (or, with `None`, remove) `subagentDefaultModel` globally.
+    ///
+    /// # Errors
+    /// Returns an error if the settings store fails or is unavailable.
+    fn set_subagent_default_model(&self, _model: Option<&str>) -> Result<()> {
+        anyhow::bail!("Helper model settings are unavailable")
+    }
+    /// `subagentDefaultThinking`: the helper thinking level (a level name; unset inherits the
+    /// parent's level).
+    fn subagent_default_thinking(&self) -> Option<String> {
+        None
+    }
+    /// Persist (or, with `None`, remove) `subagentDefaultThinking` globally.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown level or failed persistence.
+    fn set_subagent_default_thinking(&self, _level: Option<&str>) -> Result<()> {
+        anyhow::bail!("Helper model settings are unavailable")
+    }
+
     /// Automatic compaction percentage ceiling; output headroom may trigger earlier.
     fn compaction_threshold_percent(&self) -> f64;
     /// Persist the percentage globally.

@@ -1,5 +1,5 @@
 //! The `/settings` menu and its row-apply/persist switches, the `/import`
-//! confirm flow, and the fast/rlm-max-depth/reload command surface. The
+//! confirm flow, and the fast/rlm-max-depth/subagent-model/reload command surface. The
 //! fullscreen toggle is retired (the operator's 2026-09-28 ruling removed
 //! the setting and the command).
 use super::{
@@ -245,6 +245,12 @@ impl SessionUi {
             values.theme = settings.theme().unwrap_or_else(|| "prime".to_string());
             // The tier row preselects the saved default instead of the struct default.
             values.default_service_tier = settings.default_service_tier();
+            values.subagent_model = settings
+                .subagent_default_model()
+                .unwrap_or_else(|| crate::settings_menu::HELPER_PARENT.to_string());
+            values.subagent_thinking = settings
+                .subagent_default_thinking()
+                .unwrap_or_else(|| crate::settings_menu::HELPER_PARENT.to_string());
         } else {
             values.show_images = true;
             values.auto_resize_images = true;
@@ -258,7 +264,24 @@ impl SessionUi {
             values.theme = "prime".to_string();
             // No settings seam: the tier row reads "default", never a blank value.
             values.default_service_tier = "default".to_string();
+            values.subagent_model = crate::settings_menu::HELPER_PARENT.to_string();
+            values.subagent_thinking = crate::settings_menu::HELPER_PARENT.to_string();
         }
+        // The helper-model choices: `parent`, the saved value (even off-catalog, so the row's
+        // value stays selectable), then the signed-in providers' catalog models.
+        let mut helper_models = vec![crate::settings_menu::HELPER_PARENT.to_string()];
+        if !helper_models.contains(&values.subagent_model) {
+            helper_models.push(values.subagent_model.clone());
+        }
+        for model in &self.model_catalog {
+            let selector = format!("{}/{}", model.provider, model.id);
+            if self.model_configured_providers.contains(&model.provider)
+                && !helper_models.contains(&selector)
+            {
+                helper_models.push(selector);
+            }
+        }
+        values.available_helper_models = helper_models;
         // This surface ships the builtin themes.
         values.available_themes = pa_types::themes::BUILTIN_THEME_NAMES
             .iter()
@@ -579,6 +602,20 @@ impl SessionUi {
             "thinking" => {
                 self.apply_thinking_level(value, view).await;
             }
+            "subagent-model" | "subagent-thinking" => {
+                // `parent` removes the settings default; spawns read the file at spawn time.
+                let saved = (value != crate::settings_menu::HELPER_PARENT).then_some(value);
+                if let Some(settings) = &self.client_settings {
+                    let result = if id == "subagent-model" {
+                        settings.set_subagent_default_model(saved)
+                    } else {
+                        settings.set_subagent_default_thinking(saved)
+                    };
+                    if let Err(error) = result {
+                        self.error_row(&format!("{error:#}"), view);
+                    }
+                }
+            }
             "theme" => {
                 if let Some(settings) = &self.client_settings {
                     if let Err(error) = settings.set_theme(value) {
@@ -763,6 +800,136 @@ impl SessionUi {
                 }
             }
             Err(error) => self.error_row(&format!("{error:#}"), view),
+        }
+    }
+
+    // Helper model (/subagent-model)
+
+    /// No argument reports the helper model and thinking level this session's spawns resolve to
+    /// when the call names none, with the layer each comes from; `<model> [<thinking>]` replaces
+    /// the session's override immediately, never touching the running turn (`default` leaves a
+    /// field to the settings file, `parent` keeps the spawning agent's value).
+    pub(super) async fn handle_subagent_model_command(&mut self, view: &mut AgentView, args: &str) {
+        const USAGE: &str =
+            "Usage: /subagent-model [<provider/model>|parent|default] [<thinking>|parent]";
+        let tokens: Vec<&str> = args.split_whitespace().collect();
+        let field = |token: &str| (token != "default").then(|| token.to_string());
+        let command = match tokens.as_slice() {
+            [] => DaemonCommand::GetSubagentModelStatus {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                rest: Map::default(),
+            },
+            [model, thinking @ ..] if thinking.len() <= 1 => {
+                let thinking = thinking.first().copied();
+                if let Some(level) = thinking.filter(|level| {
+                    !matches!(*level, "default" | crate::settings_menu::HELPER_PARENT)
+                        && pa_types::ai::thinking_level_from_str(level).is_none()
+                }) {
+                    self.note_as(
+                        &format!("Unknown thinking level \"{level}\". {USAGE}"),
+                        StatusKind::Warning,
+                        view,
+                    );
+                    return;
+                }
+                DaemonCommand::SetSubagentModel {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    model: field(model),
+                    thinking: thinking.and_then(field),
+                    rest: Map::default(),
+                }
+            }
+            _ => {
+                self.note_as(USAGE, StatusKind::Warning, view);
+                return;
+            }
+        };
+        self.subagent_model_request(command, view).await;
+    }
+
+    /// The launch override (`--subagent-model`/`--subagent-thinking` or their env vars) lands on
+    /// the opened session before the first prompt; a session whose settings name a helper model
+    /// checks it, so an unknown default warns at open. Sessions without either skip the round
+    /// trip.
+    pub(crate) async fn apply_launch_subagent_model(&mut self, view: &mut AgentView) {
+        let model = self.model_selection.subagent_model.clone();
+        let thinking = self.model_selection.subagent_thinking.clone();
+        let launch = model.is_some() || thinking.is_some();
+        let configured = self
+            .client_settings
+            .as_ref()
+            .is_some_and(|settings| settings.subagent_default_model().is_some());
+        if !launch && !configured {
+            return;
+        }
+        let command = if launch {
+            DaemonCommand::SetSubagentModel {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                model,
+                thinking,
+                rest: Map::default(),
+            }
+        } else {
+            DaemonCommand::GetSubagentModelStatus {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                rest: Map::default(),
+            }
+        };
+        self.subagent_model_request(command, view).await;
+    }
+
+    /// Send one helper-model command and report the resulting status: the status row, plus a
+    /// warning when the model the spawns default to is not in the catalog (they use the parent's).
+    async fn subagent_model_request(&mut self, command: DaemonCommand, view: &mut AgentView) {
+        if !self
+            .client
+            .supports_server_capability(pa_types::daemon::SUBAGENT_MODEL_CAPABILITY)
+        {
+            self.note_as(
+                "The running daemon does not support helper-model overrides (no subagent_model capability); stop it so a current one starts",
+                StatusKind::Warning,
+                view,
+            );
+            return;
+        }
+        let status = match self
+            .bounded_request(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), command)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                self.error_row(&format!("{error:#}"), view);
+                return;
+            }
+        };
+        let described = |value: &str, source: &str, fallback: &str| match status
+            .get(value)
+            .and_then(Value::as_str)
+        {
+            Some(value) => format!(
+                "{value} ({})",
+                status
+                    .get(source)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            ),
+            None => fallback.to_string(),
+        };
+        let model = described("model", "modelSource", "the parent's model");
+        let thinking = described("thinking", "thinkingSource", "the parent's level");
+        self.plain_row(&format!("Helper model: {model}, thinking {thinking}"), view);
+        if status.get("modelKnown").and_then(Value::as_bool) == Some(false) {
+            self.note_as(
+                &format!(
+                    "Helper model {model} is not in the model catalog; spawned agents use the parent's model"
+                ),
+                StatusKind::Warning,
+                view,
+            );
         }
     }
 

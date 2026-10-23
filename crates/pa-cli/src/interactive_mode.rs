@@ -235,10 +235,14 @@ fn print_resume_hint(hint: Option<&str>) {
 /// The agents-view loop: open the view, run the session it opens, and return
 /// to the view on agents-back or bare `/resume`; every other exit ends the app.
 async fn run_agents_view_flow(
-    base: InteractiveOptions,
+    mut base: InteractiveOptions,
     anchor: Option<String>,
     notice: Option<String>,
 ) -> Result<()> {
+    // The launch helper-model override belongs to the session the launch opened; a session
+    // opened from the view keeps its own (`/subagent-model` changes it there).
+    base.model_selection.subagent_model = None;
+    base.model_selection.subagent_thinking = None;
     let mut anchor = anchor;
     // Every view run reuses the roster connection (a chat run hands it
     // back), so a switch back from a chat skips the handshake.
@@ -489,6 +493,9 @@ fn build_tui_options(
             api_key: config.api_key.clone(),
             // The worker clamps `--thinking` to the model's levels.
             thinking: config.thinking,
+            // The launch helper-model override, set on the opened session.
+            subagent_model: config.subagent_override.model.clone(),
+            subagent_thinking: config.subagent_override.thinking.clone(),
         },
         // The raw `--models` patterns ride the create config (the daemon
         // owns the resolution).

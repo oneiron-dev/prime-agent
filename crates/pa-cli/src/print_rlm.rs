@@ -659,15 +659,18 @@ impl RlmSubagentHost for InlineHost {
                     }
                 }
             }
-            // The child's thinking: the requested level, else the parent's
-            // effective one; a real-provider child clamps it to what its
-            // model supports.
+            // The parent's effective thinking: a scripted child's default, and a real-provider
+            // child's when the helper order names no level.
+            let parent_thinking = node
+                .thinking
+                .lock()
+                .unwrap()
+                .unwrap_or(pa_types::ai::ModelThinkingLevel::Medium);
             let thinking = request
                 .thinking
                 .as_deref()
                 .and_then(pa_ai::models::thinking_level_from_str)
-                .or(*node.thinking.lock().unwrap())
-                .unwrap_or(pa_types::ai::ModelThinkingLevel::Medium);
+                .unwrap_or(parent_thinking);
             // The model lane: a scripted child runs its own faux queue under
             // `children.<spawn name>`; a real-provider child resolves against
             // the catalog, inheriting the parent's selector.
@@ -706,19 +709,31 @@ impl RlmSubagentHost for InlineHost {
                     thinking,
                 )
             } else {
-                let selector = pa_daemon::rlm_child_model::resolve_child_model_unchecked(
+                // The helper order: the call, the invocation's override (`--subagent-model`,
+                // `PRIME_SUBAGENT_MODEL`), the settings file, the parent.
+                let settings = pa_core::session_engine::helper_model::HelperDefaults::load_settings(
+                    &config.cwd,
                     &config.agent_dir,
-                    request.model.as_deref(),
-                    node.model_selector.lock().unwrap().as_deref(),
+                );
+                let parent_selector = node.model_selector.lock().unwrap().clone();
+                let helper = pa_daemon::rlm_child_model::resolve_helper_unchecked(
+                    &config.agent_dir,
+                    pa_daemon::rlm_child_model::HelperRequest {
+                        model: request.model.as_deref(),
+                        thinking: request.thinking.as_deref(),
+                        parent_model: parent_selector.as_deref(),
+                        session: &config.subagent_override,
+                        settings: &settings,
+                    },
                     "subagent",
                 )
                 .map_err(|error| anyhow::anyhow!("{error:#}"))?;
-                pa_daemon::rlm_child_model::assert_thinking_supported(
-                    &config.agent_dir,
-                    request.thinking.as_deref(),
-                    &selector,
-                )
-                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                let selector = helper.selector;
+                let thinking = helper
+                    .thinking
+                    .as_deref()
+                    .and_then(pa_ai::models::thinking_level_from_str)
+                    .unwrap_or(parent_thinking);
                 let auth = pa_core::auth::AuthStorage::create(&config.agent_dir);
                 let mut registry = pa_core::models::ModelRegistry::create(
                     auth,
@@ -856,6 +871,7 @@ impl RlmSubagentHost for InlineHost {
                 name,
                 session_dir: child_node.session_dir.clone(),
                 model: selector,
+                thinking: Some(thinking.wire_name().to_string()),
             })
         })
     }

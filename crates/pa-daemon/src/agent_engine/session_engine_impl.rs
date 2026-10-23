@@ -952,6 +952,18 @@ impl SessionEngine for AgentSessionEngine {
             .semantic_identity
             .lock()
             .expect("semantic identity lock") = semantic_identity;
+        // The helper-model override: the session file's latest `subagent_model_state` row (a
+        // `/subagent-model`, or an earlier birth), else the create's own (an RLM parent's), which
+        // the session persists at its first build so a resume or a wake keeps it.
+        let subagent_override = pa_core::session_engine::helper_model::persisted_session_override(
+            identity.session_file.as_deref(),
+        )
+        .unwrap_or_else(|| {
+            if !identity.subagent_override.is_empty() {
+                self.park_subagent_override(&identity.subagent_override);
+            }
+            identity.subagent_override
+        });
         if let Some(children) = &self.children {
             let parent = ParentIdentity {
                 rlm_depth: identity.rlm_depth,
@@ -962,6 +974,7 @@ impl SessionEngine for AgentSessionEngine {
                 session_file: identity.session_file.clone(),
                 thinking: identity.thinking.clone(),
                 child_script: identity.child_script,
+                subagent_override,
             };
             children.set_identity(parent);
         }
@@ -1344,6 +1357,45 @@ impl SessionEngine for AgentSessionEngine {
             }
         }
         Ok(result)
+    }
+
+    fn subagent_model_status(&self) -> Value {
+        let session = self
+            .children
+            .as_ref()
+            .map(|children| children.subagent_override())
+            .unwrap_or_default();
+        let settings = pa_core::session_engine::helper_model::HelperDefaults::load_settings(
+            &self.cwd(),
+            &self.config.agent_dir,
+        );
+        let plan =
+            pa_core::session_engine::helper_model::plan_helper(None, None, &session, &settings);
+        let model_known = plan.model.value.as_deref().map(|reference| {
+            crate::rlm_child_model::helper_model_known(&self.config.agent_dir, reference)
+        });
+        json!({
+            "model": plan.model.value,
+            "modelSource": plan.model.source.wire_name(),
+            "modelKnown": model_known,
+            "thinking": plan.thinking.value,
+            "thinkingSource": plan.thinking.source.wire_name(),
+            "session": session,
+            "settings": settings,
+        })
+    }
+
+    fn set_subagent_model(
+        &self,
+        layer: pa_core::session_engine::helper_model::HelperDefaults,
+    ) -> anyhow::Result<Value> {
+        let Some(children) = &self.children else {
+            anyhow::bail!("This session has no RLM child runtime");
+        };
+        children.set_subagent_override(layer.clone());
+        // The durable `subagent_model_state` entry: a resumed or woken session re-seeds from it.
+        self.persist_subagent_override(&layer);
+        Ok(self.subagent_model_status())
     }
 
     fn run_prompt(

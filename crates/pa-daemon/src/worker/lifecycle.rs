@@ -293,6 +293,8 @@ impl Worker {
                 child_script,
                 // A TS replacement runtime has no semantic spawn.
                 semantic_spawn: None,
+                // The moved-to session's own persisted override (if any) applies.
+                subagent_override: pa_core::session_engine::helper_model::HelperDefaults::default(),
             }) {
             Ok(()) => self.reseed_rlm_children().await,
             Err(error) => eprintln!("pa-daemon: replacement identity rebind failed: {error:#}"),

@@ -205,6 +205,12 @@ impl Worker {
             .get("childScript")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // The helper-model override an RLM parent passes down (`subagentModel`/
+        // `subagentThinking`); the durable create replays it.
+        let subagent_override = payload
+            .as_object()
+            .map(pa_core::session_engine::helper_model::HelperDefaults::from_create_config)
+            .unwrap_or_default();
 
         // Set by the fresh-path arm when the name landed in its single rewrite:
         // the shared name persist must not append a second `session_info` line.
@@ -636,6 +642,7 @@ impl Worker {
             thinking,
             child_script: child_script.clone(),
             semantic_spawn,
+            subagent_override,
         }) {
             return response_failure(None, "create", &error.to_string(), None);
         }

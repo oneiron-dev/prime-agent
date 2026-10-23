@@ -274,6 +274,9 @@ pub struct RlmSessionIdentity {
     /// file is a top-level runtime and spawns no edge, and a replacement
     /// runtime has none.
     pub semantic_spawn: Option<SemanticSpawnOrigin>,
+    /// The helper-model override the create carries (an RLM parent's own); a persisted
+    /// `subagent_model_state` row in the session file beats it.
+    pub subagent_override: pa_core::session_engine::helper_model::HelperDefaults,
 }
 
 /// A created session's semantic-edge provenance (TS

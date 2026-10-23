@@ -4862,6 +4862,8 @@ fn subscription_options(
         model: Some("claude-test".to_string()),
         api_key: None,
         thinking: None,
+        subagent_model: None,
+        subagent_thinking: None,
     };
     options.provider_auth = Some(pa_tui::provider_auth::ProviderAuthCommandsHandle(
         std::sync::Arc::new(E2ESubscriptionAuth),

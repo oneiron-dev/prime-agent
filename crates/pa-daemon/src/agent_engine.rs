@@ -47,6 +47,7 @@ pub(crate) mod tests;
 pub(crate) use tests::FAUX_TEST_LOCK;
 
 mod goalcore;
+mod helper_model;
 mod lifecycle;
 mod turn_types;
 
@@ -297,6 +298,10 @@ pub struct AgentSessionEngine {
     /// A `set_rlm_max_depth` that landed before the first turn: the durable
     /// entry parks here and flushes at build.
     pending_max_depth: std::sync::Mutex<Option<u64>>,
+    /// A helper-model override set before the session built: the durable
+    /// `subagent_model_state` entry parks here and flushes at build.
+    pending_subagent_override:
+        std::sync::Mutex<Option<pa_core::session_engine::helper_model::HelperDefaults>>,
     /// The resolved faux model, registered once per engine so scripts span
     /// turns. Verification harness only; never set by the product.
     faux_model: std::sync::OnceLock<Model>,

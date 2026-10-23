@@ -92,6 +92,9 @@ pub struct RuntimeConfig {
     pub telemetry_disabled: bool,
     pub serialized_refine: bool,
     pub initial_goal: Option<InitialGoal>,
+    /// The session's helper-model override for spawned agents: `--subagent-model`/
+    /// `--subagent-thinking`, else `PRIME_SUBAGENT_MODEL`/`PRIME_SUBAGENT_THINKING`.
+    pub subagent_override: pa_core::session_engine::helper_model::HelperDefaults,
 }
 
 impl RuntimeConfig {
@@ -382,6 +385,25 @@ pub fn runtime_config_from_args(
             objective: objective.clone(),
             token_budget: parsed.goal_token_budget,
         }),
+        subagent_override: {
+            use pa_core::session_engine::helper_model::{
+                HelperDefaults, SUBAGENT_MODEL_ENV, SUBAGENT_THINKING_ENV,
+            };
+            // Each flag beats its env var; an invalid env level warns and is ignored.
+            let env_model = std::env::var(SUBAGENT_MODEL_ENV).ok();
+            let env_thinking = std::env::var(SUBAGENT_THINKING_ENV).ok();
+            let env_layer = HelperDefaults::new(env_model.as_deref(), env_thinking.as_deref())
+                .unwrap_or_else(|error| {
+                    eprintln!("Warning: {SUBAGENT_THINKING_ENV}: {error}");
+                    HelperDefaults::new(env_model.as_deref(), None).unwrap_or_default()
+                });
+            HelperDefaults::new(
+                parsed.subagent_model.as_deref(),
+                parsed.subagent_thinking.as_deref(),
+            )
+            .unwrap_or_default()
+            .or(&env_layer)
+        },
     }
 }
 
@@ -418,6 +440,85 @@ pub(crate) mod tests {
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// The helper-model override: each `--subagent-*` flag beats its `PRIME_SUBAGENT_*` env
+    /// var, field by field; an invalid env level is ignored, never fatal.
+    #[test]
+    fn subagent_flags_beat_their_env_vars_field_by_field() {
+        use pa_core::session_engine::helper_model::{
+            HelperDefaults, SUBAGENT_MODEL_ENV, SUBAGENT_THINKING_ENV,
+        };
+        let resolve = |argv: &[&str], model: Option<&str>, thinking: Option<&str>| {
+            let saved: Vec<(&str, Option<String>)> = [SUBAGENT_MODEL_ENV, SUBAGENT_THINKING_ENV]
+                .iter()
+                .map(|key| (*key, std::env::var(key).ok()))
+                .collect();
+            for (key, value) in [
+                (SUBAGENT_MODEL_ENV, model),
+                (SUBAGENT_THINKING_ENV, thinking),
+            ] {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let args: Vec<String> = argv.iter().map(ToString::to_string).collect();
+            let config = runtime_config_from_args(
+                &crate::args::parse_args(&args),
+                PathBuf::from("/w"),
+                PathBuf::from("/agent"),
+                None,
+                AppMode::Print,
+                true,
+            );
+            for (key, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            config.subagent_override
+        };
+        let layer = |model: Option<&str>, thinking: Option<&str>| {
+            HelperDefaults::new(model, thinking).unwrap()
+        };
+        assert_eq!(
+            resolve(
+                &["-p", "hi"],
+                Some("cpa-r/deepseek-flash-1017"),
+                Some("max")
+            ),
+            layer(Some("cpa-r/deepseek-flash-1017"), Some("max"))
+        );
+        assert_eq!(
+            resolve(
+                &["--subagent-model", "cpa-r/kimi-k3.1", "-p", "hi"],
+                Some("cpa-r/deepseek-flash-1017"),
+                Some("max")
+            ),
+            layer(Some("cpa-r/kimi-k3.1"), Some("max"))
+        );
+        assert_eq!(
+            resolve(
+                &["--subagent-thinking", "parent", "-p", "hi"],
+                None,
+                Some("max")
+            ),
+            layer(None, Some("parent"))
+        );
+        assert_eq!(
+            resolve(
+                &["-p", "hi"],
+                Some("cpa-r/deepseek-flash-1017"),
+                Some("loud")
+            ),
+            layer(Some("cpa-r/deepseek-flash-1017"), None)
+        );
+        assert_eq!(
+            resolve(&["-p", "hi"], None, None),
+            HelperDefaults::default()
+        );
     }
 
     /// The opt-out chain (the operator's explicit ask): `DO_NOT_TRACK`/`PI_OFFLINE` disable

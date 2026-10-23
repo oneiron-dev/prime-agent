@@ -2,42 +2,52 @@
 //! (`spawn`, `create_session`, `list_subagents`, `delete_subagent`,
 //! `collect`, `rename`) over the supervisor's child-sessions registry,
 //! with the spawn-admission helpers only this surface uses.
+use pa_core::session_engine::helper_model::HelperDefaults;
+
+use crate::rlm_child_model::{resolve_helper, HelperRequest, ResolvedHelper};
+
 use super::{
-    assert_thinking_supported, bail, create_default_rlm_subagent_session_name, json, now_ms,
-    resolve_child_model, rlm_child_label, rlm_depth_limit_error, spawn_name_unavailable_error, Arc,
-    ChildCloseReason, ChildObservationSource, ChildRecord, Context, DaemonCommand, Duration,
-    Instant, Mutex, Path, PathBuf, Result, RlmChildResult, RlmCreateSessionHandle,
-    RlmCreateSessionRequest, RlmDeleteSubagentResult, RlmHostFuture, RlmSpawnHandle,
-    RlmSpawnRequest, RlmSubagentEntry, RlmSubagentHost, SpawnNameReservationGuard,
-    SupervisorChildSessions, SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
-    RENAME_TIMEOUT_MS,
+    bail, create_default_rlm_subagent_session_name, json, now_ms, rlm_child_label,
+    rlm_depth_limit_error, spawn_name_unavailable_error, Arc, ChildCloseReason,
+    ChildObservationSource, ChildRecord, Context, DaemonCommand, Duration, Instant, Mutex, Path,
+    PathBuf, Result, RlmChildResult, RlmCreateSessionHandle, RlmCreateSessionRequest,
+    RlmDeleteSubagentResult, RlmHostFuture, RlmSpawnHandle, RlmSpawnRequest, RlmSubagentEntry,
+    RlmSubagentHost, SpawnNameReservationGuard, SupervisorChildSessions,
+    SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS, RENAME_TIMEOUT_MS,
 };
 
-/// Resolve the child model with the daemon `allowedModels` allowlist enforced, refusing loudly with
-/// the typed error and the `model refused` event; the settings read runs on the blocking pool.
-async fn resolve_child_model_allowlisted(
+/// Resolve the child's model and thinking through the helper order (the call, the session
+/// override, the settings file, the parent) with the daemon `allowedModels` allowlist enforced,
+/// refusing loudly with the typed error and the `model refused` event; the settings reads run on
+/// the blocking pool.
+async fn resolve_child_helper(
     this: &SupervisorChildSessionsInner,
-    reference: Option<&str>,
+    model: Option<&str>,
+    thinking: Option<&str>,
     surface: &'static str,
     target: &str,
-) -> Result<String> {
+) -> Result<ResolvedHelper> {
     let identity = this.identity.lock().expect("identity lock").clone();
     let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
     let load_cwd = cwd.clone();
     let agent_dir = this.agent_dir.clone();
-    let allowlist = tokio::task::spawn_blocking(move || {
-        crate::model_allowlist::load(Path::new(&load_cwd), &agent_dir)
+    let (allowlist, settings) = tokio::task::spawn_blocking(move || {
+        (
+            crate::model_allowlist::load(Path::new(&load_cwd), &agent_dir),
+            HelperDefaults::load_settings(Path::new(&load_cwd), &agent_dir),
+        )
     })
     .await
-    .context("the allowlist load task join failed")?;
-    match resolve_child_model(
-        &this.agent_dir,
-        reference,
-        identity.model.as_deref(),
-        target,
-        &allowlist,
-    ) {
-        Ok(model) => Ok(model),
+    .context("the settings load task join failed")?;
+    let request = HelperRequest {
+        model,
+        thinking,
+        parent_model: identity.model.as_deref(),
+        session: &identity.subagent_override,
+        settings: &settings,
+    };
+    match resolve_helper(&this.agent_dir, request, target, &allowlist) {
+        Ok(resolved) => Ok(resolved),
         Err(error) => {
             if let Some(refusal) = error.downcast_ref::<pa_core::models::ModelAllowlistRefusal>() {
                 this.model_refusal_telemetry.note_refused(
@@ -111,15 +121,16 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let admission = async {
                 this.assert_name_available(&name, identity.rlm_depth + 1)
                     .await?;
-                let model = resolve_child_model_allowlisted(
+                let helper = resolve_child_helper(
                     &this,
                     request.model.as_deref(),
+                    request.thinking.as_deref(),
                     "spawn",
                     "subagent",
                 )
                 .await?;
-                assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
-                let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
+                let model = helper.selector;
+                let thinking = helper.thinking.or_else(|| identity.thinking.clone());
                 let child_dir = this.child_session_dir(&child_id, &identity)?;
                 let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
                 let runtime_metadata = json!({
@@ -136,7 +147,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         Some(&request.prompt),
                         identity.rlm_depth + 1,
                         &model,
-                        thinking,
+                        thinking.as_deref(),
                         &cwd,
                         &child_dir,
                         request.spawned_by_request_id.as_deref(),
@@ -191,10 +202,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 this.children.lock().await.push(Arc::clone(&record));
                 this.refresh_running().await;
                 this.emit_child_update(&record).await;
-                anyhow::Ok((record, created, model))
+                anyhow::Ok((record, created, model, thinking))
             }
             .await;
-            let (record, created, model) = admission?;
+            let (record, created, model, thinking) = admission?;
             // The task prompt runs detached from the spawn admission: the
             // handle returns at registration and the child's first turn
             // starts after the parent's continuation request is in flight.
@@ -301,6 +312,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 name,
                 session_dir: created.session_dir,
                 model,
+                thinking,
             })
         })
     }
@@ -315,14 +327,15 @@ impl RlmSubagentHost for SupervisorChildSessions {
             if identity.rlm_depth != 0 {
                 bail!("rlm.create_session is available only from a depth-0 session");
             }
-            let model = resolve_child_model_allowlisted(
+            let helper = resolve_child_helper(
                 &this,
                 request.model.as_deref(),
+                request.thinking.as_deref(),
                 "create_session",
                 "top-level session",
             )
             .await?;
-            assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
+            let model = helper.selector;
             // A depth-0 resident session is created exactly like a client
             // `create`: the shared sessions dir and the requested cwd.
             let cwd = match &request.cwd {
@@ -333,7 +346,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let sessions_dir = crate::paths::sessions_dir(&this.agent_dir)?;
             std::fs::create_dir_all(&sessions_dir)
                 .with_context(|| format!("create sessions dir {}", sessions_dir.display()))?;
-            let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
+            let thinking = helper.thinking.or_else(|| identity.thinking.clone());
             let created = this
                 .launch_child(
                     "root",
@@ -341,7 +354,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     &request.prompt,
                     0,
                     &model,
-                    thinking,
+                    thinking.as_deref(),
                     &cwd.to_string_lossy(),
                     &sessions_dir,
                     None,
@@ -368,6 +381,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     .unwrap_or_else(|| created.active_session_id.clone()),
                 session_file: created.session_file.unwrap_or_default(),
                 model,
+                thinking,
             })
         })
     }

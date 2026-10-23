@@ -723,6 +723,9 @@ async fn run_interactive_surface(
             )
             .await;
     }
+    // The helper model for spawned agents: the launch override lands before the first prompt,
+    // and an unknown default warns (fork-only).
+    session.apply_launch_subagent_model(&mut view).await;
     // The once-per-installation telemetry disclosure (TS
     // agent-session-services): rendered as an info row here — the alt
     // screen hides any pre-TUI stderr print, so the row is the only

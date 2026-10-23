@@ -42,6 +42,11 @@ pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
 pub const DAEMON_SCHEMA_REVISION: u64 = 33;
 pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-33-20261024a1f7";
 
+/// Fork-only server capability (no schema bump: a client checks it before it sends either
+/// command): the daemon answers `get_subagent_model_status` and `set_subagent_model`, the
+/// session's helper-model override, and its RLM creates carry `subagentModel`/`subagentThinking`.
+pub const SUBAGENT_MODEL_CAPABILITY: &str = "subagent_model";
+
 pub type DaemonClientId = String;
 pub type DaemonCommandId = String;
 pub type DaemonEventId = String;

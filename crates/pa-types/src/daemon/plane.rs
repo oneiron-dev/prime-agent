@@ -88,6 +88,9 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "export_jsonl"
         | "get_rlm_max_depth_status"
         | "set_rlm_max_depth"
+        // Oneiron fork: the helper-model override serves one session.
+        | "get_subagent_model_status"
+        | "set_subagent_model"
         | "get_session_context"
         | "get_session_tree"
         | "get_user_messages_for_forking"
@@ -149,6 +152,8 @@ const READ_ONLY_DAEMON_COMMANDS: &[&str] = &[
     "get_system_prompt",
     "get_rlm_max_depth_status",
     "get_tool_definition",
+    // Oneiron fork.
+    "get_subagent_model_status",
 ];
 
 /// TS `isDaemonMutatingCommand`: mutates unless in the read-only table.

@@ -110,6 +110,11 @@ pub struct ModelSelection {
     pub api_key: Option<String>,
     /// The requested thinking level (`--thinking`); the worker clamps it to the supported levels.
     pub thinking: Option<pa_types::ai::ModelThinkingLevel>,
+    /// The launch helper model for spawned agents (`--subagent-model`, `PRIME_SUBAGENT_MODEL`):
+    /// set on the opened session before the first prompt, like `/subagent-model`.
+    pub subagent_model: Option<String>,
+    /// The launch helper thinking level (`--subagent-thinking`, `PRIME_SUBAGENT_THINKING`).
+    pub subagent_thinking: Option<String>,
 }
 
 /// Adoption telemetry for interactive-view interactions: the composition

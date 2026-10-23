@@ -13,6 +13,7 @@ const KNOWN_FIELDS: &[&str] = &[
     "defaultProvider",
     "defaultModel",
     "subagentDefaultModel",
+    "subagentDefaultThinking",
     "updateChannel",
     "recentModels",
     "auxiliaryModel",

@@ -35,7 +35,25 @@ pub enum SettingsSubmenu {
     Warnings,
     /// "Default Service Tier" (TS `SERVICE_TIER_OPTIONS`).
     ServiceTier,
+    /// "Helper Model" (fork-only): `parent` plus the catalog selectors of the signed-in
+    /// providers, for `subagentDefaultModel`.
+    HelperModel { models: Vec<String> },
 }
+
+/// The helper-model rows' value for "no settings default": spawns use the parent's value.
+pub const HELPER_PARENT: &str = "parent";
+
+/// The helper-thinking row's values: `parent` (no settings default) and the thinking levels.
+const HELPER_THINKING_CHOICES: [&str; 8] = [
+    HELPER_PARENT,
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+];
 
 /// The service-tier descriptions the TS settings submenu lists.
 #[must_use]
@@ -333,6 +351,24 @@ pub fn settings_menu_rows(current: &SettingsCurrentValues) -> Vec<SettingsMenuRo
             }),
         },
         SettingsMenuRow {
+            id: "subagent-model",
+            label: "Helper model",
+            description: "Model for spawned agents when the spawn names none (parent: the spawning agent's model); a session's /subagent-model wins",
+            current: current.subagent_model.clone(),
+            values: None,
+            submenu: Some(SettingsSubmenu::HelperModel {
+                models: current.available_helper_models.clone(),
+            }),
+        },
+        SettingsMenuRow {
+            id: "subagent-thinking",
+            label: "Helper thinking",
+            description: "Thinking level for spawned agents when the spawn names none (parent: the spawning agent's level), clamped to the helper's model",
+            current: current.subagent_thinking.clone(),
+            values: Some(HELPER_THINKING_CHOICES.iter().map(ToString::to_string).collect()),
+            submenu: None,
+        },
+        SettingsMenuRow {
             id: "theme",
             label: "Theme",
             description: "Color theme for the interface",
@@ -375,6 +411,12 @@ pub struct SettingsCurrentValues {
     pub available_thinking_levels: Vec<String>,
     pub theme: String,
     pub available_themes: Vec<String>,
+    /// `subagentDefaultModel`, [`HELPER_PARENT`] when unset.
+    pub subagent_model: String,
+    /// The helper-model submenu's choices: [`HELPER_PARENT`] first.
+    pub available_helper_models: Vec<String>,
+    /// `subagentDefaultThinking`, [`HELPER_PARENT`] when unset.
+    pub subagent_thinking: String,
 }
 
 impl SettingsMenu {
@@ -537,11 +579,15 @@ impl SettingsMenu {
         };
         let row = &mut self.rows[row_index];
         if let Some(kind) = row.submenu.clone() {
-            // The tier submenu preselects the row's current tier.
+            // The tier and helper-model submenus preselect the row's current value.
             let selected = match &kind {
                 SettingsSubmenu::ServiceTier => SERVICE_TIER_CHOICES
                     .iter()
                     .position(|tier| *tier == row.current)
+                    .unwrap_or(0),
+                SettingsSubmenu::HelperModel { models } => models
+                    .iter()
+                    .position(|model| *model == row.current)
                     .unwrap_or(0),
                 _ => 0,
             };
@@ -592,6 +638,7 @@ impl SettingsMenu {
             SettingsSubmenu::Theme { themes } => themes.len(),
             SettingsSubmenu::Warnings => 1,
             SettingsSubmenu::ServiceTier => SERVICE_TIER_CHOICES.len(),
+            SettingsSubmenu::HelperModel { models } => models.len(),
         };
         if kb.matches(key, "tui.select.up") {
             if options > 0 {
@@ -614,24 +661,12 @@ impl SettingsMenu {
         if kb.matches(key, "tui.select.confirm") || key == "space" {
             let row_id = self.rows[sub.row].id;
             let value = match &sub.kind {
-                SettingsSubmenu::Thinking { levels } => {
-                    levels
-                        .get(sub.selected)
-                        .cloned()
-                        .map(|level| SettingsMenuAction::Change {
-                            id: row_id,
-                            value: level,
-                        })
-                }
-                SettingsSubmenu::Theme { themes } => {
-                    themes
-                        .get(sub.selected)
-                        .cloned()
-                        .map(|name| SettingsMenuAction::Change {
-                            id: row_id,
-                            value: name,
-                        })
-                }
+                SettingsSubmenu::Thinking { levels: values }
+                | SettingsSubmenu::Theme { themes: values }
+                | SettingsSubmenu::HelperModel { models: values } => values
+                    .get(sub.selected)
+                    .cloned()
+                    .map(|value| SettingsMenuAction::Change { id: row_id, value }),
                 SettingsSubmenu::Warnings => Some(SettingsMenuAction::Change {
                     id: "warnings-anthropic-extra-usage",
                     value: if sub.selected == 0 {
@@ -844,6 +879,18 @@ impl SettingsMenu {
                     SERVICE_TIER_CHOICES
                         .iter()
                         .map(|tier| (tier.to_string(), Some(service_tier_description(tier))))
+                        .collect(),
+                ),
+                SettingsSubmenu::HelperModel { models } => (
+                    "Helper Model",
+                    "Model for spawned agents when the spawn names none",
+                    models
+                        .iter()
+                        .map(|model| {
+                            let description =
+                                (model == HELPER_PARENT).then_some("The spawning agent's model");
+                            (model.clone(), description)
+                        })
                         .collect(),
                 ),
             };

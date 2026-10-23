@@ -40,6 +40,10 @@ pub struct RlmSpawnHandle {
     pub name: String,
     pub session_dir: String,
     pub model: String,
+    /// The child's thinking level when the host resolved one (the spawn call, the helper
+    /// defaults, or the parent's known level); absent when the child's worker picks its default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 /// `rlm.create_session` handle: one resident depth-0 daemon session.
@@ -50,6 +54,9 @@ pub struct RlmCreateSessionHandle {
     pub name: String,
     pub session_file: String,
     pub model: String,
+    /// The session's thinking level when the host resolved one (see [`RlmSpawnHandle`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 /// One roster row of `rlm.list_subagents`.
@@ -917,6 +924,7 @@ mod tests {
                     name: "worker".into(),
                     session_dir: "/tmp/sub-1".into(),
                     model: "p/m".into(),
+                    thinking: None,
                 })
             })
         }
@@ -933,6 +941,7 @@ mod tests {
                     name: "root-2".into(),
                     session_file: "/tmp/s-2.jsonl".into(),
                     model: "p/m".into(),
+                    thinking: None,
                 })
             })
         }

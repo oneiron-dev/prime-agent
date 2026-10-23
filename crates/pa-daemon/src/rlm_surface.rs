@@ -1,5 +1,6 @@
 //! The RLM child-management surface: the worker arms for
-//! `cancel_rlm_child`, `delete_rlm_subagent`, and `set_rlm_max_depth`.
+//! `cancel_rlm_child`, `delete_rlm_subagent`, and `set_rlm_max_depth`,
+//! plus the fork's `get_subagent_model_status`/`set_subagent_model`.
 //! Each handler answers the exact TS wire shape; the behavior lives in
 //! the engine seams and the supervisor-backed children registry.
 
@@ -93,6 +94,53 @@ impl Worker {
         match result {
             Ok(result) => response_success(None, "set_rlm_max_depth", Some(result)),
             Err(error) => response_failure(None, "set_rlm_max_depth", &error.to_string(), None),
+        }
+    }
+
+    /// `get_subagent_model_status` (fork-only): the helper model and thinking level this
+    /// session's spawns resolve to when the call names none, with the layer each came from.
+    pub(crate) async fn handle_get_subagent_model_status(&self) -> DaemonResponse {
+        if let Err(response) = self.require_created("get_subagent_model_status") {
+            return response;
+        }
+        // The status reads the settings file and the model catalog: off the worker's runtime.
+        let engine = std::sync::Arc::clone(&self.engine);
+        match tokio::task::spawn_blocking(move || engine.subagent_model_status()).await {
+            Ok(status) => response_success(None, "get_subagent_model_status", Some(status)),
+            Err(error) => response_failure(
+                None,
+                "get_subagent_model_status",
+                &format!("helper model status task failed: {error}"),
+                None,
+            ),
+        }
+    }
+
+    /// `set_subagent_model` (fork-only): replace this session's helper-model override with
+    /// `{ model, thinking }` (an absent or null field leaves it to the settings file; `parent`
+    /// keeps the parent's value) and answer the resulting status. The override persists in the
+    /// session file; an unknown model is kept and reported as `modelKnown: false`.
+    pub(crate) async fn handle_set_subagent_model(&self, payload: &Value) -> DaemonResponse {
+        if let Err(response) = self.require_created("set_subagent_model") {
+            return response;
+        }
+        let field = |key: &str| payload.get(key).and_then(Value::as_str);
+        let layer = match pa_core::session_engine::helper_model::HelperDefaults::new(
+            field("model"),
+            field("thinking"),
+        ) {
+            Ok(layer) => layer,
+            Err(error) => return response_failure(None, "set_subagent_model", &error, None),
+        };
+        // The durable entry write blocks on the engine runtime: a blocking thread, as
+        // `set_rlm_max_depth`.
+        let engine = std::sync::Arc::clone(&self.engine);
+        let result = tokio::task::spawn_blocking(move || engine.set_subagent_model(layer))
+            .await
+            .unwrap_or_else(|error| Err(anyhow::anyhow!("helper model task failed: {error}")));
+        match result {
+            Ok(status) => response_success(None, "set_subagent_model", Some(status)),
+            Err(error) => response_failure(None, "set_subagent_model", &error.to_string(), None),
         }
     }
 }

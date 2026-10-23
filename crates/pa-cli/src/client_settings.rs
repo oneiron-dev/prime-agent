@@ -101,6 +101,32 @@ impl ClientSettings for CliClientSettings {
         self.manager().set_theme(theme.to_string())
     }
 
+    fn subagent_default_model(&self) -> Option<String> {
+        self.manager().get_subagent_default_model()
+    }
+
+    fn set_subagent_default_model(&self, model: Option<&str>) -> Result<()> {
+        self.manager()
+            .set_subagent_default_model(model.map(str::to_string))
+    }
+
+    fn subagent_default_thinking(&self) -> Option<String> {
+        self.manager()
+            .get_subagent_default_thinking()
+            .map(|level| level.model_level().wire_name().to_string())
+    }
+
+    fn set_subagent_default_thinking(&self, level: Option<&str>) -> Result<()> {
+        let parsed = level
+            .map(|level| {
+                pa_types::ai::thinking_level_from_str(level)
+                    .map(pa_core::settings::ThinkingLevelSetting::from_model_level)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid thinking level \"{level}\""))
+            })
+            .transpose()?;
+        self.manager().set_subagent_default_thinking(parsed)
+    }
+
     fn default_service_tier(&self) -> String {
         // The wire name of the persisted default tier; "default" when
         // unset or unreadable.

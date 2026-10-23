@@ -104,6 +104,7 @@ impl FakeSupervisor {
             session_path: None,
             telemetry_disabled: false,
             session_policy: SessionPolicy::default(),
+            subagent_override: pa_core::session_engine::helper_model::HelperDefaults::default(),
         }
     }
 
