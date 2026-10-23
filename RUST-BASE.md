@@ -42,7 +42,10 @@ The Oneiron fork of prime-agent on the Rust product. Upstream replaced the TypeS
   shell's slave after controlling-session hangup without changing terminal state. The sync PR
   records the complete initial conflict ledger, supplemental fixes and local check evidence;
   the full CI workspace union uses a clean source-bound Linux snapshot, separately from native
-  Mac portable/fork checks and unsupported Linux-only fixtures in the first Mac run.
+  Mac portable/fork checks and unsupported Linux-only fixtures in the first Mac run. The
+  lease liveness probe also demotes kernel-confirmed dead `X`/`Z` states and rechecks a
+  disappearing proc entry, while unverifiable/live/stopped owners remain protected; the
+  stop verifier proves the lease's exact owner PID without relaxing its escalation bounds.
 
 ## Carried upstream patches
 

@@ -308,6 +308,12 @@ fn pid_exists(pid: u32) -> std::io::Result<bool> {
     }
 }
 
+/// Terminal process states cannot keep a lease owner alive.
+#[cfg(unix)]
+fn terminal_process_state(state: &str) -> bool {
+    matches!(state.trim_start().chars().next(), Some('Z' | 'X'))
+}
+
 /// True only for a process that is actually running: zombies do not count
 /// (TS `isProcessAlive`). Errors when the platform cannot answer.
 ///
@@ -332,10 +338,12 @@ pub fn is_process_alive(pid: u32) -> anyhow::Result<bool> {
         // A zombie still owns /proc; treat it as dead for lease purposes.
         if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
             if let Some(state) = status.lines().find_map(|l| l.strip_prefix("State:")) {
-                return Ok(!state.trim_start().starts_with('Z'));
+                return Ok(!terminal_process_state(state));
             }
         }
-        return Ok(true);
+        // The process can disappear between the directory and status reads.
+        // Only a definitive ESRCH permits reclaim; unknown outcomes stay live.
+        return Ok(!matches!(pid_exists(pid), Ok(false)));
     }
     // No /proc entry: either the platform has no /proc or the pid is gone.
     if !pid_exists(pid)
@@ -352,9 +360,7 @@ pub fn is_process_alive(pid: u32) -> anyhow::Result<bool> {
         let output = std::process::Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "stat="])
             .output()?;
-        String::from_utf8_lossy(&output.stdout)
-            .trim_start()
-            .starts_with('Z')
+        terminal_process_state(&String::from_utf8_lossy(&output.stdout))
     };
     Ok(!zombie)
 }
@@ -568,6 +574,23 @@ mod windows_tests {
 #[cfg(all(test, unix))]
 mod liveness_tests {
     use super::*;
+
+    #[test]
+    fn terminal_states_are_dead_but_stopped_and_unknown_states_stay_live() {
+        assert_eq!(
+            [
+                "R (running)",
+                "S (sleeping)",
+                "D (disk sleep)",
+                "T (stopped)",
+                "Z (zombie)",
+                "X (dead)",
+                ""
+            ]
+            .map(terminal_process_state),
+            [false, false, false, false, true, true, false]
+        );
+    }
 
     /// This very process reads alive wherever the probe lands: /proc's
     /// state line on Linux, kill(0) + the process record where /proc is

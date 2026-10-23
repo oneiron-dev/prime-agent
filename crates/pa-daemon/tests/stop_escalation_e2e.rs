@@ -268,9 +268,20 @@ fn a_hung_worker_is_killed_within_the_escalation_window_and_its_lease_frees() {
     let session_file = session_file_of(&mut client, &session.active_id);
     let (descriptor, worker_pid) = worker_descriptor_of(&agent_dir, &socket, &session.session_id);
 
+    let live_refusal = pa_daemon::lease::acquire_runtime_session_lease(&session_file, &agent_dir);
     assert!(
-        pa_daemon::lease::acquire_runtime_session_lease(&session_file, &agent_dir).is_err(),
+        live_refusal.is_err(),
         "the live worker must hold the session lease"
+    );
+    let live_holder = live_refusal.err().and_then(|error| {
+        error
+            .downcast_ref::<pa_daemon::lease::SessionAlreadyActiveError>()
+            .and_then(|owner| owner.holder_pid)
+    });
+    assert_eq!(
+        live_holder,
+        Some(worker_pid),
+        "the target worker owns the lease"
     );
 
     // SIGSTOP freezes the worker's command pump: the routed kill and the
@@ -321,7 +332,19 @@ fn a_hung_worker_is_killed_within_the_escalation_window_and_its_lease_frees() {
     assert_eq!(session_state(&session_file), "archived");
 
     let lease = pa_daemon::lease::acquire_runtime_session_lease(&session_file, &agent_dir)
-        .expect("the dead worker's lease must be reclaimable");
+        .unwrap_or_else(|error| {
+            let holder = error
+                .downcast_ref::<pa_daemon::lease::SessionAlreadyActiveError>()
+                .and_then(|owner| owner.holder_pid);
+            let holder_state = holder.map(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/status"))
+                    .ok()
+                    .and_then(|status| status.lines().find(|line| line.starts_with("State:")).map(str::to_string))
+            });
+            panic!(
+                "the dead worker's lease must be reclaimable: {error}; worker={worker_pid}, live_holder={live_holder:?}, current_holder={holder:?}, holder_state={holder_state:?}"
+            );
+        });
     drop(lease);
     let reopened = client.request(
         "reopen",
