@@ -1,7 +1,7 @@
 //! The hosted headless client (TS `DaemonAgentConnection` behind a print
 //! or json run with `--daemon-hosted`): the daemon owns a RESIDENT session
 //! (listed, attachable from another terminal) and this client drives it over
-//! the supervisor socket with combined schema-32 commands only — create
+//! the supervisor socket with combined schema-33 commands only — create
 //! (or attach the live worker that already hosts the same session file), attach,
 //! stream the session's events, `prompt_and_wait`,
 //! `wait_for_headless_completion`, then detach and close. The client never
@@ -24,7 +24,7 @@
 //! is running or queued, so the client waits for the session to go idle.
 //! Without the capability a timed-out prompt has no evidence and fails.
 //!
-//! Session policy (fork additions in combined revision 32): `--offline`
+//! Session policy (fork additions in combined revision 33): `--offline`
 //! and `--no-skills` ride the create config as `offline`/`noSkills` when
 //! the daemon advertises
 //! `session_policy`, and every open then goes through the supervisor's

@@ -31,8 +31,16 @@ pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
 /// changes plus its `mark_anthropic_warning_shown` command and the `renamedBy`
 /// and `waitForRlmQuiescence` fields. Its fresh identity keeps a pre-merge
 /// revision-31 daemon from passing the schema probe.
-pub const DAEMON_SCHEMA_REVISION: u64 = 32;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-32-20261006c0a1";
+///
+/// Combined revision 33 is the sync to upstream 71beca947. It adds upstream's
+/// transcript paging (`get_messages` with `page`, `capabilities` and
+/// `historyLeafId`, which the TUI sends without a capability gate) and the
+/// `list_persistent_shells`, `tail_persistent_shell` and
+/// `kill_persistent_shell` commands. Upstream kept its own schema id for
+/// these, so the fork takes a fresh identity again: a revision-32 daemon
+/// reads as stale to a revision-33 client, and the reverse.
+pub const DAEMON_SCHEMA_REVISION: u64 = 33;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-33-20261024a1f7";
 
 pub type DaemonClientId = String;
 pub type DaemonCommandId = String;
@@ -193,8 +201,8 @@ mod tests {
     fn protocol_constants_match_ts() {
         assert_eq!(DAEMON_PROTOCOL_NAME, "prime-agent.daemon");
         assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
-        assert_eq!(DAEMON_SCHEMA_REVISION, 32);
-        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-32-20261006c0a1");
+        assert_eq!(DAEMON_SCHEMA_REVISION, 33);
+        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-33-20261024a1f7");
         assert_eq!(DAEMON_UPDATE_RESTART_FORMAT_VERSION, 1);
     }
 }

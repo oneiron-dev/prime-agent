@@ -1442,6 +1442,53 @@ fn a_busy_old_daemon_is_never_stopped_by_a_seat() {
     );
 }
 
+/// The previous fork release's daemon (combined revision 32, before the
+/// sync to upstream 71beca947) is stale to this build even though it
+/// advertises every fork capability: a seat on it with a live session gets
+/// the stale-daemon refusal after one `list`, and the old daemon never sees
+/// a `create` or the new paged `get_messages`.
+#[test]
+fn a_busy_revision_32_daemon_is_stale_to_this_build() {
+    let sandbox = Sandbox::new(&json!({ "engine": "faux", "responses": [] }));
+    let seen = fake_daemon(
+        &sandbox.socket(),
+        fake_hello(
+            "protocol-7-schema-32-20261006c0a1",
+            &[
+                "prompt_admission_cancellation",
+                "rlm_quiescence_barrier",
+                "worker_startup_failure",
+                "session_tool_selection",
+                "session_policy",
+            ],
+        ),
+        json!([{ "activeSessionId": "busy-1", "isSessionActive": true }]),
+    );
+    let (stdout, stderr, code) = sandbox.run_seat(SeatOutput::FactoryJson, &[], "seat");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (
+            "",
+            format!(
+                "Error: An incompatible Prime Agent daemon is running on {}.\n\nRun:\n  prime-agent shutdown --force\n\nThen retry the original command (the running daemon has active work).\n",
+                sandbox.socket().display()
+            )
+            .as_str(),
+            1
+        )
+    );
+    assert_eq!(
+        [
+            seen.recv_timeout(STEP_BOUND).unwrap(),
+            seen.recv_timeout(STEP_BOUND).unwrap(),
+        ],
+        [
+            FakeDaemonEvent::Command("list".to_string()),
+            FakeDaemonEvent::Closed,
+        ]
+    );
+}
+
 /// The inverse isolation: on a daemon an `--offline` run started (its
 /// supervisor runs with `PI_OFFLINE=1`), an online session's worker runs
 /// without it, after a passivation and wake too, and so does its RLM child.
