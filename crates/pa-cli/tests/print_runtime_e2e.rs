@@ -183,6 +183,37 @@ fn print_mode_goal_cap_reports_the_reason_and_exits_one() {
     assert_eq!(stdout, "follow-up answer\n");
 }
 
+/// The cap's exit code is the run's: when the cap fires during the first
+/// prompt and a later prompt answers with text, the run still exits 1 and
+/// the answer stays off stdout (upstream gates stdout on the same code).
+#[test]
+fn print_mode_goal_cap_keeps_a_later_answer_off_stdout() {
+    let home = isolated_home();
+    let script = serde_json::json!({ "responses": [{}, {}, {}, "later answer"] });
+    let (stdout, stderr, code) = run_in_home(
+        home.path(),
+        &["--goal", "finish the work", "-p", "work", "-p", "more"],
+        &script,
+    );
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("Goal continuation cap reached: consecutive turns made no progress\n"),
+        "stderr: {stderr}"
+    );
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+}
+
+/// An empty settled answer still prints its line: stdout gets one newline,
+/// as in both parents.
+#[test]
+fn print_mode_empty_answer_prints_one_newline() {
+    let home = isolated_home();
+    let script = serde_json::json!({ "responses": [""] });
+    let (stdout, stderr, code) = run_in_home(home.path(), &["-p", "say nothing"], &script);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "\n");
+}
+
 /// The session files holding a runtime lease right now (the owner records
 /// under the agent dir's `session-leases`).
 fn leased_session_files(home: &std::path::Path) -> Vec<String> {

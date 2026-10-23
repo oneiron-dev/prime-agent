@@ -1826,8 +1826,7 @@ async fn run_prompts_and_emit(
             eprintln!("{cap_reason}");
             exit_code = 1;
         }
-        let terminal_exit = crate::print_terminal::write_text_terminal_result(&messages);
-        exit_code = exit_code.max(terminal_exit);
+        crate::print_terminal::write_text_terminal_result(&messages, &mut exit_code);
     }
     // The autonomous contract applies to both output modes.
     if let Some(stderr) = autonomous.exit_stderr().await {

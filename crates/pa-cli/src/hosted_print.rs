@@ -218,8 +218,10 @@ async fn run_print_flow(session: &HostedHeadlessSession, options: &RunOptions) -
         crate::headless_exit::phase("completion confirmed");
         let mut exit_code = 0;
         if !json_mode {
-            exit_code =
-                crate::print_terminal::write_text_terminal_result(&session.messages().await?);
+            crate::print_terminal::write_text_terminal_result(
+                &session.messages().await?,
+                &mut exit_code,
+            );
         }
         if let Some(stderr) = autonomous_exit_stderr(&status, pa_core::autonomous::now_millis()) {
             eprintln!("{stderr}");
