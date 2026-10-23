@@ -558,7 +558,9 @@ pub(crate) mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.message.clone())
                 .collect::<Vec<_>>(),
-            vec!["Unknown built-in tool(s): read. Available built-in tools: ipython".to_string()]
+            vec![
+                "Unknown built-in tool(s): read. Available built-in tools: python_repl".to_string()
+            ]
         );
     }
 }

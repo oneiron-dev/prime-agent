@@ -26,7 +26,7 @@ pub fn parse_thinking_level(value: &str) -> Option<ModelThinkingLevel> {
 /// Removed built-in tool names that used to exist and now produce an error.
 const REMOVED_BUILTIN_TOOL_NAMES: [&str; 5] = ["read", "write", "grep", "find", "ls"];
 /// Current built-in tool names reported in tool validation errors.
-const BUILTIN_TOOL_NAMES: [&str; 1] = ["ipython"];
+const BUILTIN_TOOL_NAMES: [&str; 1] = [pa_types::ai::PYTHON_TOOL_NAME];
 /// Value flags whose free-form text may legitimately start with a dash.
 const FREEFORM_VALUE_FLAGS: [&str; 2] = ["--goal", "--autonomous-gate"];
 /// Prompt value flags whose text may look like a long option (YAML frontmatter).

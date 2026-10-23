@@ -1688,6 +1688,7 @@ async fn run_prompts_and_emit(
         boundary
             .run_at_settled_turn(engine, model, api_key.clone(), global_harness_dir.clone())
             .await?;
+        crate::headless_exit::phase("compaction and refinement boundary end");
         goal.drive_boundary(
             engine,
             &mut boundary,
@@ -1696,6 +1697,7 @@ async fn run_prompts_and_emit(
             global_harness_dir.clone(),
         )
         .await?;
+        crate::headless_exit::phase("goal boundary end");
         // The autonomous arm runs only when the goal does not own the boundary (the goal arm takes
         // exclusive priority).
         if !engine.goal_owns_continuation_wakeup().await {

@@ -131,19 +131,20 @@ fn assert_slow_drain_completes(pattern: DrainPattern) {
     // The kernel still holds every byte it accepted after the process died.
     harness.settle();
     let output = harness.output();
-    let output_path =
-        std::env::temp_dir().join(format!("slow-drain-{pattern:?}-{}.out", std::process::id()));
-    std::fs::write(&output_path, &output).expect("save the raw exit-drain evidence");
     let leave_count = output
         .windows(ALT_SCREEN_LEAVE.len())
         .filter(|window| *window == ALT_SCREEN_LEAVE)
         .count();
-    assert_eq!(
-        leave_count,
-        1,
-        "a progressing drain must not run the forced restore; raw output {}",
-        output_path.display()
-    );
+    if leave_count != 1 {
+        // The raw output is kept only when it is a failure's evidence.
+        let output_path =
+            std::env::temp_dir().join(format!("slow-drain-{pattern:?}-{}.out", std::process::id()));
+        std::fs::write(&output_path, &output).expect("save the raw exit-drain evidence");
+        panic!(
+            "a progressing drain must not run the forced restore: {leave_count} alt-screen leaves; raw output {}",
+            output_path.display()
+        );
+    }
     let _ = mark;
 
     // The drain really ran past the deadline mid-flush (anti-vacuity).
