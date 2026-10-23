@@ -11,15 +11,19 @@ use crate::mode::{AppMode, HeadlessHosting, RunOptions};
 /// trailing compaction-outcome disclosures go to stderr. A run with no
 /// terminal message — e.g. an overflow turn dropped by the compact-and-retry
 /// recovery whose outcome row is the only surface — prints nothing and
-/// leaves the exit code to the outcome rows. Returns the exit code.
-pub(crate) fn write_text_terminal_result(messages: &[pa_types::session::AgentMessage]) -> i32 {
+/// leaves the exit code to the outcome rows. `exit_code` is the run's
+/// shared code: a caller that already failed the run (the goal
+/// no-progress cap) keeps the answer off stdout, as upstream does.
+pub(crate) fn write_text_terminal_result(
+    messages: &[pa_types::session::AgentMessage],
+    exit_code: &mut i32,
+) {
     let result = pa_core::session_engine::headless::select_headless_terminal_result(messages);
-    let mut exit_code = 0;
     if let Some(primary) = result.primary {
-        if let Some(stderr) = primary.stderr_text(&mut exit_code) {
+        if let Some(stderr) = primary.stderr_text(exit_code) {
             eprintln!("{stderr}");
         }
-        if exit_code == 0 {
+        if *exit_code == 0 {
             if let Some(text) = primary.stdout_text() {
                 println!("{text}");
             }
@@ -28,10 +32,9 @@ pub(crate) fn write_text_terminal_result(messages: &[pa_types::session::AgentMes
     for outcome in result.compaction_outcomes {
         eprintln!("{}", outcome.content);
         if outcome.outcome == "failed" {
-            exit_code = 1;
+            *exit_code = 1;
         }
     }
-    exit_code
 }
 
 /// `agent headless invoked` (the headless flags' adoption event): tracked

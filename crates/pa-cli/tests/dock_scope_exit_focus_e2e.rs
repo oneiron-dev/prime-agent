@@ -1,13 +1,5 @@
-// The Tier-C/D ruling (fleet-uniform, 2026-09-28): stack-resident futures
-// by design on hot paths (boxing 130 fns is allocation-churn with zero
-// correctness gain); the fn-length threshold is a style gate, not
-// correctness (the harness fns are intentionally linear); 64-bit targets -
-// the narrowing sits at OS/protocol boundaries where the values are
-// bounded (pid syscalls, epoch/elapsed milliseconds, calendar math,
-// guarded parses), and checked conversions would add panic paths where
-// silent wrap was deliberate (the one genuinely-suspect family, args.rs's
-// parse_positive_u32 lacking its u32::MAX bound, is flagged in the lane
-// dossier for the conductor).
+// large_futures: stack futures on hot paths by design. too_many_lines: style gate
+// only. Casts: 64-bit targets; narrowing sits at bounded OS/protocol boundaries.
 #![allow(
     clippy::large_futures,
     clippy::too_many_lines,
@@ -17,15 +9,11 @@
     clippy::cast_precision_loss
 )]
 
-//! End-to-end verifier for the dock's Subagents panel exit (the
-//! operator's 2026-09-26 ruling): entering the scoped agents view from
-//! the dock and leaving it with ESC/left reopens the scope root's chat
-//! with the dock focused on the SUBAGENTS item — the panel's own dock
-//! icon — not the prompt bar. Proven behaviorally: in the reopened chat
-//! a bare Enter re-opens the scoped view (an Enter on the empty prompt
-//! bar submits nothing), and the scoped view's outcome carries
-//! `scope_back` (the flag the agents-view flow wires into the reopened
-//! run's options).
+//! End-to-end verifier for the dock's Subagents panel exit (the operator's
+//! 2026-09-26 ruling): leaving the scoped agents view reopens the scope
+//! root's chat with the dock focused on the SUBAGENTS item — the panel's own
+//! dock icon — not the prompt bar. Proven behaviorally: a bare Enter re-opens
+//! the scoped view, and the scoped view's outcome carries `scope_back`.
 #![cfg(unix)]
 
 use std::fmt::Write as _;
@@ -35,7 +23,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use pa_tui::agents_view::{AgentsHeadlessPlan, AgentsStep, AgentsViewOptions, AgentsViewUiMode};
+use pa_tui::agents_view::{
+    AgentsHeadlessPlan, AgentsStep, AgentsViewOptions, AgentsViewOutcome, AgentsViewScope,
+    AgentsViewUiMode,
+};
 use pa_tui::interactive::{
     HeadlessPlan, HeadlessStep, InteractiveOptions, ModelSelection, SessionSelection, UiMode,
 };
@@ -88,8 +79,7 @@ fn graceful_shutdown(socket: &Path) {
 }
 
 // The Supervisor holds the Child so its Drop owns the protocol shutdown,
-// the kill, and the wait (teardown runs even on panic); the lint wants the
-// reap inline instead.
+// the kill, and the wait; the lint wants the reap inline instead.
 #[allow(clippy::zombie_processes)]
 fn spawn_supervisor(dir: &Path) -> Supervisor {
     let socket = dir.join("daemon.sock");
@@ -217,12 +207,46 @@ fn session_options(
     }
 }
 
+/// The scoped agents view over `scope`, run headless through `steps`.
+async fn run_scoped_view(
+    socket: &Path,
+    session_dir: &Path,
+    scope: AgentsViewScope,
+    steps: Vec<AgentsStep>,
+) -> AgentsViewOutcome {
+    let view_options = AgentsViewOptions {
+        socket_path: socket.to_path_buf(),
+        cwd: PathBuf::from("/tmp"),
+        session_dir: Some(session_dir.to_path_buf()),
+        theme: "prime".to_string(),
+        version: "0.0.0".to_string(),
+        anchor_session_id: None,
+        scope: Some(scope),
+        query: None,
+        expanded_ancestors: Vec::new(),
+        selected_row_identity: None,
+        selected_key: None,
+        status_message: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        show_hardware_cursor: false,
+        incident_notice_state: None,
+        create_config: serde_json::json!({}),
+    };
+    let plan = AgentsHeadlessPlan {
+        steps,
+        width: 120,
+        height: 36,
+    };
+    pa_tui::agents_view::run_agents_view(view_options, AgentsViewUiMode::Headless(plan), None)
+        .await
+        .expect("scoped agents view run")
+        .outcome
+}
+
 /// One full scope-back cycle: the parent's chat opens with the dock's
-/// Subagents group selectable (one ledger-seeded child), the scoped
-/// agents view is entered from the dock and left with `exit_key`, and
-/// the reopened chat proves its dock holds the focus — the next bare
-/// Enter re-opens the scoped view (an Enter on the empty prompt bar
-/// submits nothing).
+/// Subagents group selectable, the scoped agents view is entered from the
+/// dock and left with `exit_key`, and the reopened chat's bare Enter re-opens
+/// the scoped view.
 async fn scope_exit_keeps_the_subagents_item(exit_key: &'static str) {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let agent_dir = dir.path().join("agent");
@@ -273,7 +297,6 @@ async fn scope_exit_keeps_the_subagents_item(exit_key: &'static str) {
                 crossterm::event::KeyCode::Down,
                 crossterm::event::KeyModifiers::NONE,
             )),
-            HeadlessStep::WaitMs(300),
             HeadlessStep::Key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Enter,
                 crossterm::event::KeyModifiers::NONE,
@@ -304,43 +327,18 @@ async fn scope_exit_keeps_the_subagents_item(exit_key: &'static str) {
         .expect("the scope names the parent's live session");
 
     // Run 2 — the scoped agents view (the Subagents panel): the exit key
-    // hands the pane back to the scope root's chat, and the outcome
-    // carries `scope_back` (the flag the flow wires into the reopened
-    // run's options).
-    let view_options = AgentsViewOptions {
-        socket_path: supervisor.socket.clone(),
-        cwd: PathBuf::from("/tmp"),
-        session_dir: Some(session_dir.clone()),
-        theme: "prime".to_string(),
-        version: "0.0.0".to_string(),
-        anchor_session_id: None,
-        scope: Some(scope),
-        query: None,
-        expanded_ancestors: Vec::new(),
-        selected_row_identity: None,
-        selected_key: None,
-        status_message: None,
-        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
-        show_hardware_cursor: false,
-        incident_notice_state: None,
-        create_config: serde_json::json!({}),
-    };
-    let view_plan = AgentsHeadlessPlan {
-        steps: vec![
+    // hands the pane back to the scope root's chat, and the outcome carries
+    // `scope_back`.
+    let view = run_scoped_view(
+        &supervisor.socket,
+        &session_dir,
+        scope,
+        vec![
             AgentsStep::WaitSettle { timeout_ms: 2_000 },
             AgentsStep::Key(exit_key.to_string()),
         ],
-        width: 120,
-        height: 36,
-    };
-    let view = pa_tui::agents_view::run_agents_view(
-        view_options,
-        AgentsViewUiMode::Headless(view_plan),
-        None,
     )
-    .await
-    .expect("scoped agents view run")
-    .outcome;
+    .await;
     assert_eq!(
         view.selection,
         Some(SessionSelection::Attach(parent_active.clone())),
@@ -400,4 +398,187 @@ async fn scoped_view_escape_returns_to_the_subagents_dock_item() {
 #[tokio::test]
 async fn scoped_view_left_returns_to_the_subagents_dock_item() {
     scope_exit_keeps_the_subagents_item("left").await;
+}
+
+/// A fresh session with no subagents (and no messages yet): Down focuses the
+/// dock, Enter opens the session's own scoped agents view. Returns the scope
+/// and the session's file, the path a child binds to.
+async fn open_fresh_session_scope(socket: &Path, session_dir: &Path) -> (AgentsViewScope, String) {
+    let plan = HeadlessPlan {
+        steps: vec![
+            HeadlessStep::WaitIdle { timeout_ms: 15_000 },
+            HeadlessStep::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            HeadlessStep::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+        ],
+        width: 120,
+        height: 36,
+    };
+    let run = pa_tui::interactive::run_interactive(
+        session_options(socket, session_dir, SessionSelection::New, false),
+        UiMode::Headless(plan),
+    )
+    .await
+    .expect("fresh session run");
+    let scope = run
+        .agents_view_scope
+        .expect("the dock's Enter opens the scoped agents view");
+    let (client, _events) = pa_tui::daemon_client::DaemonClient::connect_with_retry(socket)
+        .await
+        .expect("connect");
+    let roster = client
+        .request_ok(
+            serde_json::from_value(serde_json::json!({ "type": "roster_subscribe" }))
+                .expect("roster_subscribe command"),
+        )
+        .await
+        .expect("roster snapshot");
+    client.close();
+    let session_file = roster["roster"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["summary"]["activeSessionId"] == run.active_session_id.as_str())
+        .and_then(|entry| entry["summary"]["sessionFile"].as_str())
+        .map_or_else(
+            || panic!("the fresh session's roster row: {roster}"),
+            str::to_string,
+        );
+    (scope, session_file)
+}
+
+fn assert_scoped_frame(frame: &str) {
+    assert!(
+        frame.contains("\u{203a} subagents") && frame.contains("No subagents yet."),
+        "the scoped view lists the session's empty subtree:\n{frame}"
+    );
+}
+
+/// The operator's report: a session with zero subagents fell back to the
+/// top-level agents view. Its dock entry opens the session's own scoped
+/// view, empty, and the new action starts a child bound to the session.
+#[tokio::test]
+async fn a_session_without_subagents_opens_its_empty_scoped_view() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let session_dir = dir.path().join("agent").join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    let (scope, session_file) = open_fresh_session_scope(&supervisor.socket, &session_dir).await;
+
+    let view = run_scoped_view(
+        &supervisor.socket,
+        &session_dir,
+        scope,
+        vec![
+            AgentsStep::WaitSettle { timeout_ms: 2_000 },
+            AgentsStep::Key("ctrl+n".to_string()),
+        ],
+    )
+    .await;
+    assert!(
+        !view.scope_dropped,
+        "the scope holds: {:?}",
+        view.frames.last()
+    );
+    let last = view.frames.last().expect("a rendered frame");
+    assert_scoped_frame(last);
+    assert!(
+        last.contains("Ctrl+N new") && last.contains("\u{2190} parent"),
+        "the hint offers the new action and the way back:\n{last}"
+    );
+    assert_eq!(
+        view.selection,
+        Some(SessionSelection::NewChild {
+            parent_session_file: PathBuf::from(session_file),
+            rlm_depth: 1,
+        }),
+        "the new action starts a child of the scoped session"
+    );
+}
+
+/// A child bound to the session while its empty scoped view is open pops in
+/// without reopening the view.
+#[tokio::test]
+async fn a_child_created_under_the_open_empty_scope_appears_live() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let session_dir = dir.path().join("agent").join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    let (scope, session_file) = open_fresh_session_scope(&supervisor.socket, &session_dir).await;
+    let live_dir = dir.path().join("live");
+    std::fs::create_dir_all(&live_dir).expect("live dir");
+
+    // The plan wakes the child's create once the empty scoped view rendered.
+    let empty_rendered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let view = run_scoped_view(
+        &supervisor.socket,
+        &session_dir,
+        scope,
+        vec![
+            AgentsStep::WaitRender {
+                needle: "No subagents yet.".to_string(),
+                timeout_ms: 5_000,
+            },
+            AgentsStep::Notify(empty_rendered.clone()),
+            AgentsStep::WaitRender {
+                needle: "late child".to_string(),
+                timeout_ms: 15_000,
+            },
+            AgentsStep::Key("escape".to_string()),
+        ],
+    );
+    // The child's file lives outside the session dir, so the saved catalog
+    // never lists it: the row can only arrive live from the create. The
+    // frame order below proves the view showed the empty scope first.
+    let create_child = async {
+        empty_rendered.notified().await;
+        let child_path = write_fixture(
+            &live_dir,
+            "late-child",
+            "late child",
+            Some(Path::new(&session_file)),
+            1,
+            &[("join late", "joined")],
+        );
+        let (client, _events) =
+            pa_tui::daemon_client::DaemonClient::connect_with_retry(&supervisor.socket)
+                .await
+                .expect("connect");
+        client
+            .request_ok(
+                serde_json::from_value(serde_json::json!({
+                    "type": "create",
+                    "sessionPath": child_path.to_string_lossy(),
+                    "config": {
+                        "cwd": "/tmp",
+                        "sessionDir": session_dir.to_string_lossy(),
+                    },
+                }))
+                .expect("create command"),
+            )
+            .await
+            .expect("the child session starts");
+        client.close();
+    };
+    let (view, ()) = tokio::join!(view, create_child);
+    let empty = view
+        .frames
+        .iter()
+        .position(|frame| frame.contains("No subagents yet."))
+        .unwrap_or_else(|| panic!("the empty scoped view rendered: {:?}", view.frames.last()));
+    assert_scoped_frame(&view.frames[empty]);
+    let child = view.frames[empty..]
+        .iter()
+        .find(|frame| frame.contains("late child"))
+        .unwrap_or_else(|| panic!("the child row popped in: {:?}", view.frames.last()));
+    assert!(
+        child.contains("\u{203a} subagents"),
+        "the child lists inside the same scoped view:\n{child}"
+    );
+    assert!(!view.scope_dropped);
 }

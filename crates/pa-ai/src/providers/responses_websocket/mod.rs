@@ -164,6 +164,7 @@ fn transport_error(
     ResponsesWsError::Transport(ProviderWsTransportError {
         message: message.into(),
         close_code: detail.close_code,
+        sdk_name: None,
         transport: Some(detail),
     })
 }
@@ -318,9 +319,9 @@ fn response_items(model: &Model, output: &AssistantMessage) -> Vec<Value> {
 /// Port of `processOpenAIResponsesWebSocket`: acquire the session's
 /// connection, send the (possibly delta) request, and feed its events
 /// through the shared Responses processor. `started` turns true at the
-/// first event of any kind (`response.created` included), when the
-/// `start` event is pushed; the caller's SSE fallback is allowed only
-/// before that.
+/// first event (`response.created` and structured errors included), when
+/// the `start` event is pushed. The caller's SSE fallback is allowed only
+/// before that; provider verdicts return to the session retry driver.
 ///
 /// # Errors
 ///

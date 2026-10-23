@@ -1,33 +1,23 @@
-//! Headless e2e for the dock panels' exit focus (the operator's
-//! 2026-09-26 ruling): ESC/left from a dock panel returns to the chat
-//! view with the panel's own dock item still selected — the dock holds
-//! the keyboard focus, not the prompt bar. Each test proves the state
-//! behaviorally: the next Enter re-opens the SAME panel (an Enter on
-//! the empty prompt bar submits nothing), and the run never hands off to
-//! the agents view.
+//! Headless e2e for the dock panels' exit focus (operator ruling
+//! 2026-09-26): ESC/left from a dock panel returns to chat with the
+//! panel's dock item still selected — the dock holds focus, not the
+//! prompt bar; the next Enter re-opens the SAME panel. A panel the agents view requested on open
+//! closes back to the agents view instead.
 #![cfg(unix)]
-// Pedantic-gate exceptions (every other pedantic warning in this crate is
-// fixed in place; each exception carries its one-line justification):
-// - the casts: terminal-layout arithmetic narrows structurally bounded
-//   values (screen coordinates, byte counts, timestamps); guarded
-//   conversions would add panic paths the bounds guarantee away.
+// Casts: structurally bounded terminal-layout arithmetic; guarded conversions add panic paths.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-// - the render routes are flat tables (one arm per route); splitting them
-//   would add indirection without changing the flow.
+// Render routes are flat tables (one arm per route); splitting adds indirection.
 #![allow(clippy::too_many_lines)]
-// - widget state structs carry independent flag bits; a nested struct
-//   would add indirection without changing the shape.
+// Widget state structs carry independent flag bits.
 #![allow(clippy::struct_excessive_bools, clippy::fn_params_excessive_bools)]
-// - the futures are bounded by the surface's lifetime; boxing them would
-//   add an allocation to the steady-state loop.
+// Futures are bounded by the surface's lifetime; boxing adds a steady-state allocation.
 #![allow(clippy::large_futures)]
-// - the wrappers preserve a uniform Result-returning API surface; unwrap
-//   removals would ripple through the callers without changing behavior.
+// The wrappers preserve a uniform Result-returning API surface.
 #![allow(clippy::unnecessary_wraps)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -36,39 +26,43 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pa_tui::interactive::{
-    run_interactive, HeadlessPlan, HeadlessStep, InteractiveOptions, InteractiveOutcome,
-    ModelSelection, SessionSelection, UiMode,
+    run_interactive, run_interactive_agents_view_open, HeadlessPlan, HeadlessStep,
+    InteractiveOptions, InteractiveOutcome, ModelSelection, SessionPanel, SessionSelection, UiMode,
 };
 use serde_json::{json, Value};
 
 struct MockSupervisor {
     listener: UnixListener,
+    /// The factory graph reply; `Some` also advertises the factory lane.
+    factory_graph: Option<Value>,
 }
 
 impl MockSupervisor {
-    fn bind(socket: &std::path::Path) -> Self {
+    fn bind(socket: &std::path::Path, factory_graph: Option<Value>) -> Self {
         MockSupervisor {
             listener: UnixListener::bind(socket).expect("bind mock socket"),
+            factory_graph,
         }
     }
 
-    /// Serve one connection: attach the session with the goal state, and
-    /// answer the loop's requests (the heartbeat catalog, the kernel-bash
-    /// registry, the stats fetch, the detach on exit).
+    /// Serve one connection: attach the session with the goal state, then answer the loop's
+    /// requests.
     fn serve(self) {
         let (stream, _) = self.listener.accept().expect("accept");
         let write_stream = stream.try_clone().expect("clone mock socket");
         let mut writer = write_stream;
         let mut reader = BufReader::new(stream);
 
-        // The hello advertises the kernel-bash activity capability: the
-        // registry poll is capability-gated (the dock and the shells view
-        // stay empty without it), and this battery's shells cases read the
-        // registry's rows.
+        // The hello advertises the kernel-bash activity capability: the registry poll is
+        // capability-gated (the dock and the shells view stay empty without it).
+        let mut capabilities = vec!["kernel_bash_activity"];
+        if self.factory_graph.is_some() {
+            capabilities.push("factory_activity");
+        }
         let hello = json!({
             "type": "daemon_hello",
             "protocol": { "name": "prime-agent.daemon", "version": 7 },
-            "serverCapabilities": ["kernel_bash_activity"],
+            "serverCapabilities": capabilities,
             "clientId": "mock",
         });
         write_json(&mut writer, &hello);
@@ -156,6 +150,18 @@ impl MockSupervisor {
                         }),
                     );
                 }
+                "factory_activity" => {
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": "factory_activity",
+                            "success": true,
+                            "data": self.factory_graph.clone().unwrap_or(Value::Null),
+                        }),
+                    );
+                }
                 "get_session_stats" => {
                     write_json(
                         &mut writer,
@@ -206,9 +212,8 @@ fn write_json(writer: &mut UnixStream, value: &Value) {
     writer.flush().expect("flush mock frame");
 }
 
-/// The slim attach result: one session with an actively pursued goal, so
-/// every dock group except Subagents is selectable (the roster stays
-/// empty).
+/// The slim attach result: one session with an actively pursued goal, so every dock group except
+/// Subagents is selectable.
 fn attach_data(id: &str) -> Value {
     json!({
         "type": "response",
@@ -289,10 +294,18 @@ fn options(socket: PathBuf) -> InteractiveOptions {
 }
 
 fn run_plan(steps: Vec<HeadlessStep>) -> InteractiveOutcome {
+    run_plan_with(steps, None, None)
+}
+
+fn run_plan_with(
+    steps: Vec<HeadlessStep>,
+    open_panel: Option<SessionPanel>,
+    factory_graph: Option<Value>,
+) -> InteractiveOutcome {
     std::env::remove_var("TMUX");
     let dir = tempfile::TempDir::new().expect("temp dir");
     let socket = dir.path().join("tui.sock");
-    let supervisor = MockSupervisor::bind(&socket);
+    let supervisor = MockSupervisor::bind(&socket, factory_graph);
     let handle = std::thread::spawn(move || supervisor.serve());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -305,7 +318,19 @@ fn run_plan(steps: Vec<HeadlessStep>) -> InteractiveOutcome {
         height: 30,
     };
     let outcome = runtime
-        .block_on(run_interactive(options(socket), UiMode::Headless(plan)))
+        .block_on(async {
+            match open_panel {
+                Some(panel) => {
+                    run_interactive_agents_view_open(
+                        options(socket),
+                        UiMode::Headless(plan),
+                        Some(panel),
+                    )
+                    .await
+                }
+                None => run_interactive(options(socket), UiMode::Headless(plan)).await,
+            }
+        })
         .expect("interactive run");
     handle.join().expect("mock supervisor finished");
     outcome
@@ -315,10 +340,9 @@ fn key(code: KeyCode) -> HeadlessStep {
     HeadlessStep::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
-/// The dock's shortcut grab (`app.subagents.focus`, default alt+a): the
-/// prompt's Down is the subagents box's own affordance (#2862's TS
-/// isSelectable), so a session without subagents reaches the dock's other
-/// groups only through the shortcut.
+/// The dock's shortcut grab (`app.subagents.focus`, default alt+a): it
+/// keeps the dock's current selection, where the prompt's Down always
+/// lands on the subagents group.
 fn alt_a() -> HeadlessStep {
     HeadlessStep::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT))
 }
@@ -337,74 +361,59 @@ fn wait_gone(needle: &str) -> HeadlessStep {
     }
 }
 
-/// Enter the dock's Heartbeats panel (the shortcut lands on the default
-/// subagents section; one right steps onto Heartbeates), leave it with the
-/// exit key, and prove the restored
-/// focus: the next Enter re-opens the Heartbeats panel, and the run never
-/// hands off to the agents view.
+/// Enter the dock's Heartbeats panel, leave it with the exit key, and prove the restored focus: the
+/// next Enter re-opens the Heartbeats panel, and the run never hands off to the agents view.
 fn heartbeats_exit_plan(exit: KeyCode) -> Vec<HeadlessStep> {
     vec![
-        // The barrier pins the panel's content (its row label); the
-        // navigation itself steps the rendered groups, empty ones
-        // included, so it never depends on the feed's landing order.
+        // The barriers pin the panel's own column header (the expanded dock row lists the
+        // heartbeat's label too); the navigation steps the rendered rows, empty ones included,
+        // so it never depends on the feed's landing order.
         wait_render("\u{25f7} 1 heartbeat"),
         alt_a(),
         HeadlessStep::WaitMs(150),
-        // The dock's focus starts on the subagents section (the default
-        // selection): one right steps onto the Heartbeates item.
-        key(KeyCode::Right),
+        // The dock's focus starts on the subagents section (the default selection).
+        key(KeyCode::Down),
         HeadlessStep::WaitMs(150),
         key(KeyCode::Enter),
-        wait_render("Workspace tidy"),
+        wait_render("Next run"),
         key(exit),
-        wait_gone("Workspace tidy"),
+        wait_gone("Next run"),
         key(KeyCode::Enter),
-        wait_render("Workspace tidy"),
+        wait_render("Next run"),
     ]
 }
 
-/// Enter the dock's Shells panel (the shortcut, then right twice:
-/// subagents, Heartbeates, then the Shells item), leave it, and prove
-/// the restored focus the same way.
+/// Enter the dock's Shells panel, leave it, and prove the restored focus the same way.
 fn shells_exit_plan(exit: KeyCode) -> Vec<HeadlessStep> {
     vec![
-        // The barrier pins the panel's content (its row); the
-        // navigation steps the rendered groups, empty ones included.
         wait_render("\u{25b8} 1 shell"),
         alt_a(),
         HeadlessStep::WaitMs(150),
-        // Subagents -> Heartbeates -> the Shells item: one press, one
-        // rendered group.
-        key(KeyCode::Right),
+        key(KeyCode::Down),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Down),
         HeadlessStep::WaitMs(150),
         key(KeyCode::Enter),
-        wait_render("render the frames"),
+        wait_render("Duration"),
         key(exit),
-        wait_gone("render the frames"),
+        wait_gone("Duration"),
         key(KeyCode::Enter),
-        wait_render("render the frames"),
+        wait_render("Duration"),
     ]
 }
 
-/// Enter the dock's goal panel (the shortcut, then three rights: it is
-/// the row's last group), leave it, and prove the restored focus the
+/// Enter the dock's goal panel (the row's last group), leave it, and prove the restored focus the
 /// same way.
 fn goal_exit_plan(exit: KeyCode) -> Vec<HeadlessStep> {
     vec![
-        // The barrier pins the panel's content (the goal row's own
-        // label); the navigation steps the rendered groups.
         wait_render("Pursuing goal (0s)"),
         alt_a(),
         HeadlessStep::WaitMs(150),
-        // Subagents -> Heartbeates -> Shells -> the goal row: one
-        // press, one rendered group.
-        key(KeyCode::Right),
+        key(KeyCode::Down),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Down),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Down),
         HeadlessStep::WaitMs(150),
         key(KeyCode::Enter),
         wait_render("land the dock exit focus"),
@@ -415,15 +424,14 @@ fn goal_exit_plan(exit: KeyCode) -> Vec<HeadlessStep> {
     ]
 }
 
-/// ESC from the Heartbeats panel lands back on the dock's Heartbeats
-/// item: the second Enter re-opens the same panel, so the focus never
-/// reached the prompt bar (an empty-draft Enter submits nothing).
+/// ESC from the Heartbeats panel lands back on the dock's Heartbeates item: the second Enter
+/// re-opens the same panel (an empty-draft Enter submits nothing).
 #[test]
 fn heartbeats_panel_esc_returns_to_the_dock_item() {
     let outcome = run_plan(heartbeats_exit_plan(KeyCode::Esc));
     let last = outcome.frames.last().expect("frames were captured");
     assert!(
-        last.contains("Workspace tidy"),
+        last.contains("Next run"),
         "the reopened Heartbeats panel owns the final frame:\n{last}"
     );
     assert!(
@@ -432,36 +440,32 @@ fn heartbeats_panel_esc_returns_to_the_dock_item() {
     );
 }
 
-/// The `/heartbeats` COMMAND path (not the dock's Enter) leaves the
-/// dock's Heartbeates item selected too: with the dock's selection
-/// parked on the goal row, submitting `/heartbeats` and leaving the
-/// view with ESC lands on the Heartbeats item — the next Enter re-opens
-/// the heartbeats view, not the goal panel.
+/// The `/heartbeats` COMMAND path (not the dock's Enter) leaves the dock's Heartbeates item
+/// selected too: with the selection parked on the goal row, submitting `/heartbeats` and leaving
+/// with ESC lands on the Heartbeates item.
 #[test]
 fn heartbeats_command_path_esc_returns_to_the_dock_item() {
     let outcome = run_plan(vec![
-        // The barrier pins the goal row; the dock's selection walks to
-        // the goal section (one press, one rendered group) before the
-        // command opens the panel.
+        // The dock's selection walks to the goal section before the command opens the panel.
         wait_render("Pursuing goal (0s)"),
         alt_a(),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Down),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Down),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Down),
         HeadlessStep::WaitMs(150),
         HeadlessStep::Submit("/heartbeats".to_string()),
-        wait_render("Workspace tidy"),
+        wait_render("Next run"),
         key(KeyCode::Esc),
-        wait_gone("Workspace tidy"),
+        wait_gone("Next run"),
         key(KeyCode::Enter),
-        wait_render("Workspace tidy"),
+        wait_render("Next run"),
     ]);
     let last = outcome.frames.last().expect("frames were captured");
     assert!(
-        last.contains("Workspace tidy"),
+        last.contains("Next run"),
         "the reopened Heartbeats panel owns the final frame:\n{last}"
     );
     assert!(
@@ -474,14 +478,12 @@ fn heartbeats_command_path_esc_returns_to_the_dock_item() {
     );
 }
 
-/// The left arrow (the panel's back key from its list) behaves exactly
-/// like ESC: the dock's Heartbeats item keeps the focus.
 #[test]
 fn heartbeats_panel_left_returns_to_the_dock_item() {
     let outcome = run_plan(heartbeats_exit_plan(KeyCode::Left));
     let last = outcome.frames.last().expect("frames were captured");
     assert!(
-        last.contains("Workspace tidy"),
+        last.contains("Next run"),
         "the reopened Heartbeats panel owns the final frame:\n{last}"
     );
     assert!(
@@ -490,14 +492,12 @@ fn heartbeats_panel_left_returns_to_the_dock_item() {
     );
 }
 
-/// ESC from the Shells panel lands back on the dock's Shells item (the
-/// Bash group): the second Enter re-opens the bash view.
 #[test]
 fn shells_panel_esc_returns_to_the_dock_item() {
     let outcome = run_plan(shells_exit_plan(KeyCode::Esc));
     let last = outcome.frames.last().expect("frames were captured");
     assert!(
-        last.contains("render the frames"),
+        last.contains("Duration"),
         "the reopened Shells panel owns the final frame:\n{last}"
     );
     assert!(
@@ -506,14 +506,12 @@ fn shells_panel_esc_returns_to_the_dock_item() {
     );
 }
 
-/// The left arrow from the Shells list behaves exactly like ESC: the
-/// dock's Shells item keeps the focus.
 #[test]
 fn shells_panel_left_returns_to_the_dock_item() {
     let outcome = run_plan(shells_exit_plan(KeyCode::Left));
     let last = outcome.frames.last().expect("frames were captured");
     assert!(
-        last.contains("render the frames"),
+        last.contains("Duration"),
         "the reopened Shells panel owns the final frame:\n{last}"
     );
     assert!(
@@ -522,8 +520,6 @@ fn shells_panel_left_returns_to_the_dock_item() {
     );
 }
 
-/// ESC from the read-only goal panel lands back on the dock's goal row:
-/// the second Enter re-opens the panel.
 #[test]
 fn goal_panel_esc_returns_to_the_dock_item() {
     let outcome = run_plan(goal_exit_plan(KeyCode::Esc));
@@ -538,8 +534,6 @@ fn goal_panel_esc_returns_to_the_dock_item() {
     );
 }
 
-/// The left arrow (the panel's back key) behaves exactly like ESC: the
-/// dock's goal row keeps the focus.
 #[test]
 fn goal_panel_left_returns_to_the_dock_item() {
     let outcome = run_plan(goal_exit_plan(KeyCode::Left));
@@ -551,5 +545,59 @@ fn goal_panel_left_returns_to_the_dock_item() {
     assert!(
         !outcome.return_to_agents_view,
         "the exit stays in the chat view"
+    );
+}
+
+/// The agents view's shells line opens the chat with the shells panel mounted; Esc hands the pane
+/// straight back to the agents view.
+#[test]
+fn agents_view_shells_panel_esc_returns_to_the_agents_view() {
+    let outcome = run_plan_with(
+        vec![wait_render("render the frames"), key(KeyCode::Esc)],
+        Some(SessionPanel::Shells { shell_id: None }),
+        None,
+    );
+    assert!(
+        outcome
+            .frames
+            .iter()
+            .any(|frame| frame.contains("render the frames")),
+        "the shells panel mounted on open"
+    );
+    assert!(
+        outcome.return_to_agents_view,
+        "the panel's close returns to the agents view"
+    );
+}
+
+/// The factory line mounts the factory page on its run list even with exactly one live run.
+#[test]
+fn agents_view_factory_panel_opens_on_the_run_list_and_returns() {
+    let graph = json!({
+        "runs": [{
+            "runId": "run-1",
+            "specId": "solo-spec",
+            "state": "running",
+            "elapsedMs": 100,
+            "machine": { "states": [], "transitions": [] },
+            "nodes": [],
+            "usage": { "running": 0 },
+        }]
+    });
+    let outcome = run_plan_with(
+        vec![wait_render("solo-spec"), key(KeyCode::Esc)],
+        Some(SessionPanel::FactoryRuns),
+        Some(graph),
+    );
+    assert!(
+        outcome
+            .frames
+            .iter()
+            .any(|frame| frame.contains("solo-spec") && frame.contains("actions \u{b7}")),
+        "the factory page mounted on its run list"
+    );
+    assert!(
+        outcome.return_to_agents_view,
+        "the page's close returns to the agents view"
     );
 }

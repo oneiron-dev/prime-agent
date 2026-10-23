@@ -1,10 +1,9 @@
-//! The HTTP transport seam for the MCP OAuth flow.
-//!
-//! The flow itself is transport-agnostic: it issues exact requests and
-//! validates exact responses, so tests inject a scripted transport (the TS
-//! suite stubs `fetch` the same way) and the product uses a `reqwest` client
-//! that never follows redirects (the TS flow passes `redirect: "error"`,
-//! so a redirected request must fail instead of silently following).
+//! The HTTP transport seam for the MCP OAuth flow: the flow is transport-agnostic, so
+//! tests inject a scripted transport and the product uses a `reqwest` client that never
+//! follows redirects (the TS flow passes `redirect: "error"` — a redirected request must
+//! fail, not silently follow).
+
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 
@@ -65,9 +64,11 @@ pub trait OAuthHttp: Send + Sync {
     ) -> futures::future::BoxFuture<'_, Result<OAuthHttpResponse>>;
 }
 
-/// Production transport: one redirect-refusing `reqwest` client.
+/// Production transport: one redirect-refusing `reqwest` client, built on
+/// the first request so a process that never refreshes an MCP credential
+/// never loads the native trust store.
 pub struct ReqwestOAuthHttp {
-    client: reqwest::Client,
+    client: OnceLock<reqwest::Client>,
 }
 
 impl Default for ReqwestOAuthHttp {
@@ -77,19 +78,20 @@ impl Default for ReqwestOAuthHttp {
 }
 
 impl ReqwestOAuthHttp {
-    /// # Panics
-    ///
-    /// Panics when the underlying `reqwest` client cannot be built; with no
-    /// TLS configuration and redirects disabled this construction cannot
-    /// fail.
     #[must_use]
     pub fn new() -> Self {
         ReqwestOAuthHttp {
-            client: reqwest::Client::builder()
+            client: OnceLock::new(),
+        }
+    }
+
+    fn client(&self) -> &reqwest::Client {
+        self.client.get_or_init(|| {
+            pa_ai::utils::tls::http_client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .expect("reqwest client construction cannot fail with no TLS config"),
-        }
+                .expect("oauth client")
+        })
     }
 }
 
@@ -103,7 +105,7 @@ impl OAuthHttp for ReqwestOAuthHttp {
                 OAuthHttpMethod::Get => reqwest::Method::GET,
                 OAuthHttpMethod::Post => reqwest::Method::POST,
             };
-            let mut builder = self.client.request(method, &request.url);
+            let mut builder = self.client().request(method, &request.url);
             for (name, value) in &request.headers {
                 builder = builder.header(name, value);
             }

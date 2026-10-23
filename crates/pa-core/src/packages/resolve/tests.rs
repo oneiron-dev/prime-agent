@@ -1,8 +1,5 @@
 //! Ported TS resolve test cases (package-manager.test.ts): settings entries,
-//! auto-discovery (settings-base dirs, `.agents/skills` ancestors, ignore
-//! files, symlinks), pattern filtering (top-level arrays, pi manifest,
-//! package filters, `+`/`-` force forms), package dedupe, and the
-//! offline/missing-source policies.
+//! auto-discovery, pattern filtering, dedupe, offline/missing-source policies.
 
 use std::path::{Path, PathBuf};
 
@@ -127,8 +124,6 @@ fn has_path(resources: &[ResolvedResource], suffix: &str) -> bool {
         .iter()
         .any(|r| r.path.to_string_lossy().ends_with(suffix))
 }
-
-// -- resolve: settings entries and auto-discovery --------------------------------
 
 #[test]
 fn resolve_without_configured_sources_returns_only_auto_resources() {
@@ -256,8 +251,6 @@ fn resolves_symlinked_user_and_project_resources_once() {
         None => std::env::remove_var("HOME"),
     }
 }
-
-// -- .agents/skills ancestor scan -----------------------------------------------
 
 #[test]
 fn agents_skills_scan_stops_at_git_repo_root() {
@@ -405,8 +398,6 @@ fn user_skill_entries_dedupe_when_agent_skills_symlinks_agents_skills() {
     }
 }
 
-// -- ignore files ---------------------------------------------------------------
-
 #[test]
 fn skill_directories_respect_gitignore() {
     let mut fixture = Fixture::new();
@@ -437,8 +428,6 @@ fn parent_gitignore_does_not_apply_to_auto_discovery() {
         .iter()
         .any(|r| r.path == skill_path && r.enabled));
 }
-
-// -- pattern filtering: top-level arrays ----------------------------------------
 
 #[test]
 fn top_level_filters_themes_with_glob_patterns() {
@@ -486,8 +475,6 @@ fn top_level_filters_skills_with_exclusion_pattern() {
         .iter()
         .any(|r| r.path.to_string_lossy().contains("bad-skill") && !r.enabled));
 }
-
-// -- pattern filtering: pi manifest ----------------------------------------------
 
 #[test]
 fn manifest_supports_glob_patterns_for_skills() {
@@ -546,8 +533,6 @@ fn manifest_expands_positive_glob_entries_before_collecting_skills() {
         .contains("document-processor-api")
         && r.enabled));
 }
-
-// -- pattern filtering: package filters ------------------------------------------
 
 #[test]
 fn user_filters_layer_on_top_of_manifest_filters() {
@@ -628,8 +613,6 @@ fn package_filters_work_with_direct_paths() {
     assert!(is_enabled(&result.prompts, "one.md"));
     assert!(is_disabled(&result.prompts, "two.md"));
 }
-
-// -- force-include / force-exclude ---------------------------------------------
 
 #[test]
 fn force_include_overrides_exclude_in_package_filters() {
@@ -785,8 +768,6 @@ fn force_exclude_in_package_filters() {
     assert!(is_enabled(&result.prompts, "beta.md"));
 }
 
-// -- package deduplication -------------------------------------------------------
-
 #[test]
 fn same_local_package_in_both_scopes_resolves_once_with_project_scope() {
     let mut fixture = Fixture::new();
@@ -841,8 +822,6 @@ fn different_packages_in_both_scopes_both_resolve() {
         .iter()
         .any(|r| r.path.to_string_lossy().contains("pkg2")));
 }
-
-// -- offline / missing-source policies -------------------------------------------
 
 #[test]
 fn offline_mode_skips_installing_missing_sources() {
@@ -908,8 +887,6 @@ fn on_missing_skip_leaves_the_source_out() {
         .all(|r| r.metadata.origin != ResourceOrigin::Package));
 }
 
-// -- bundled skills -------------------------------------------------------------
-
 #[test]
 fn bundled_skills_collect_with_websearch_excluded_until_enabled() {
     let fixture = Fixture::new();
@@ -917,9 +894,9 @@ fn bundled_skills_collect_with_websearch_excluded_until_enabled() {
     skill_md(&bundled, "websearch", "Search the web");
     skill_md(&bundled, "other-skill", "Other");
     let settings_path = fixture.agent_dir.join("settings.json");
+    let auth_path = fixture.agent_dir.join("auth.json");
     std::fs::create_dir_all(&fixture.agent_dir).unwrap();
 
-    // Default: websearch is bundled and enabled.
     std::fs::write(&settings_path, serde_json::json!({}).to_string()).unwrap();
     let mut manager = PackageManager::with_options(PackageManagerOptions {
         cwd: fixture.manager.cwd().to_path_buf(),
@@ -934,7 +911,13 @@ fn bundled_skills_collect_with_websearch_excluded_until_enabled() {
         .iter()
         .find(|r| r.path.to_string_lossy().contains("websearch"))
         .expect("websearch collected");
-    assert!(websearch.enabled, "websearch enabled by default");
+    // Unset settings ride with the credential: a keyless machine stays off,
+    // a machine carrying an ambient key rides with it.
+    let ambient_key = std::env::var("SERPER_API_KEY").is_ok_and(|value| !value.trim().is_empty());
+    assert_eq!(
+        websearch.enabled, ambient_key,
+        "unset settings ride with the serper credential"
+    );
     assert_eq!(websearch.metadata.source, MetadataSource::Builtin);
     let other = result
         .skills
@@ -942,8 +925,55 @@ fn bundled_skills_collect_with_websearch_excluded_until_enabled() {
         .find(|r| r.path.to_string_lossy().contains("other-skill"))
         .expect("other collected");
     assert!(!other.enabled, "extra builtin overrides apply");
+    if !ambient_key {
+        assert!(
+            !result
+                .skills
+                .iter()
+                .filter(|r| r.enabled)
+                .any(|r| r.path.to_string_lossy().contains("websearch")),
+            "websearch is absent from the enabled skill list on a keyless install"
+        );
 
-    // bundledSkills.websearch=false force-excludes the websearch skill.
+        // A stored Serper key enables the skill with no settings entry: the
+        // upgrade path for users who already have a key.
+        std::fs::write(
+            &auth_path,
+            r#"{ "serper": { "type": "api_key", "key": "stored" } }"#,
+        )
+        .unwrap();
+        let result = manager.resolve().unwrap();
+        let websearch = result
+            .skills
+            .iter()
+            .find(|r| r.path.to_string_lossy().contains("websearch"))
+            .expect("websearch still collected");
+        assert!(
+            websearch.enabled,
+            "a stored serper key enables the skill with no settings entry"
+        );
+    }
+
+    std::fs::write(
+        &settings_path,
+        serde_json::json!({"bundledSkills": {"websearch": true}}).to_string(),
+    )
+    .unwrap();
+    manager.reload_settings().unwrap();
+    let result = manager.resolve().unwrap();
+    let websearch = result
+        .skills
+        .iter()
+        .find(|r| r.path.to_string_lossy().contains("websearch"))
+        .expect("websearch still collected");
+    assert!(
+        websearch.enabled,
+        "websearch resolves when explicitly enabled"
+    );
+    assert_eq!(websearch.metadata.source, MetadataSource::Builtin);
+
+    // The explicit override beats the credential: a stored key stays silent
+    // under `bundledSkills.websearch: false`.
     std::fs::write(
         &settings_path,
         serde_json::json!({"bundledSkills": {"websearch": false}}).to_string(),
@@ -956,7 +986,10 @@ fn bundled_skills_collect_with_websearch_excluded_until_enabled() {
         .iter()
         .find(|r| r.path.to_string_lossy().contains("websearch"))
         .expect("websearch still collected");
-    assert!(!websearch.enabled, "websearch excluded until enabled");
+    assert!(
+        !websearch.enabled,
+        "explicit false overrides a stored credential"
+    );
 }
 
 #[test]

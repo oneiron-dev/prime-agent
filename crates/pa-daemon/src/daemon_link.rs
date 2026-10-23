@@ -38,23 +38,25 @@ pub(crate) enum ResponseWait {
     UntilAnswered,
 }
 
+type PendingResponses = HashMap<String, oneshot::Sender<DaemonResponse>>;
+
 /// A client connection to the supervisor socket.
 pub(crate) struct DaemonLink {
-    writer: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>,
+    pub(crate) writer: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>,
     /// The requests waiting for a response; `None` once the connection
     /// ended ([`DaemonLink::fail_pending`]), so a later request fails at
     /// once instead of waiting for an answer that cannot arrive.
-    pending: std::sync::Mutex<Option<HashMap<String, oneshot::Sender<DaemonResponse>>>>,
+    pub(crate) pending: std::sync::Arc<std::sync::Mutex<Option<PendingResponses>>>,
     /// The classified inbound frames; exactly one consumer drains them.
     pub(crate) frames: Mutex<mpsc::UnboundedReceiver<LinkFrame>>,
-    protocol_version: u64,
+    pub(crate) protocol_version: u64,
     /// The optional features the daemon's hello advertised
     /// (`serverCapabilities`); empty when it named none.
     pub(crate) server_capabilities: Vec<String>,
-    next_request_id: AtomicU64,
+    pub(crate) next_request_id: AtomicU64,
     /// Prefix of request ids and of the envelope client id (`acp`,
     /// `headless`), so the daemon log names the transport.
-    label: &'static str,
+    pub(crate) label: &'static str,
 }
 
 impl DaemonLink {
@@ -145,7 +147,7 @@ impl DaemonLink {
             .collect();
         Ok(DaemonLink {
             writer: std::sync::Mutex::new(Some(line_tx)),
-            pending: std::sync::Mutex::new(Some(HashMap::new())),
+            pending: std::sync::Arc::new(std::sync::Mutex::new(Some(HashMap::new()))),
             frames: Mutex::new(frame_rx),
             protocol_version: version,
             server_capabilities,
@@ -204,6 +206,21 @@ impl DaemonLink {
             ResponseWait::UntilAnswered => rx.await,
         };
         response.map_err(|_| anyhow::anyhow!("the daemon connection closed mid-request"))
+    }
+
+    /// Send a command and reject a daemon failure response.
+    pub(crate) async fn request_ok(
+        &self,
+        command: DaemonCommand,
+        wait: ResponseWait,
+    ) -> anyhow::Result<()> {
+        let response = self.request(command, wait).await?;
+        if !response.success {
+            anyhow::bail!(response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string()));
+        }
+        Ok(())
     }
 
     /// Hand a response to the request waiting for it (the consumer loop

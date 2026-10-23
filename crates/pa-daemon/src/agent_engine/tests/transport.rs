@@ -93,3 +93,39 @@ fn a_stale_route_snapshot_installs_on_the_current_transport() {
         ("image-model", Some(pa_types::ai::Transport::Websocket))
     );
 }
+
+/// The failover switch and restore install the armed route through
+/// `install_armed_route_target`: a transport switch that has landed on the
+/// session but not yet on the armed route's stored target is kept, the
+/// same as the apply path.
+#[test]
+fn the_failover_install_serves_on_the_current_transport() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = bare_engine(dir.path());
+    *engine.provider_target.write().unwrap() = Some(sse_target("session-model"));
+    *engine.image_route.lock().unwrap() = Some(crate::image_route::ImageRoute {
+        target: sse_target("image-model"),
+        agent_override: pa_agent::agent::AgentModelOverride {
+            model: pa_agent::types::Model::unknown(),
+            thinking_level: pa_agent::types::ThinkingLevel::Off,
+        },
+        session_target: None,
+    });
+    // The switch's first lock section: the session transport and the slot
+    // moved, the armed route has not yet.
+    *engine.transport.write().unwrap() = Some(pa_types::ai::Transport::WebsocketCached);
+    assert!(engine.install_armed_route_target());
+    let installed = engine
+        .provider_target
+        .read()
+        .unwrap()
+        .clone()
+        .expect("the routed target serves");
+    assert_eq!(
+        (installed.model.id.as_str(), installed.transport),
+        (
+            "image-model",
+            Some(pa_types::ai::Transport::WebsocketCached)
+        )
+    );
+}

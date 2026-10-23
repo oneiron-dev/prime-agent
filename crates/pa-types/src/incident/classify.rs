@@ -1,5 +1,4 @@
-//! Log-entry classification into incident events (TS
-//! `classifyIncidentEntry` and its helpers).
+//! Log-entry classification into incident events (TS `classifyIncidentEntry` and its helpers).
 
 use super::patterns::{
     ADOPT_FAILED, AUTH_FAILED, CATCH_UP, CRASH_LINE, CRASH_PREFIX, DAEMON_COMMAND, EVICTED_EMPTY,
@@ -34,21 +33,18 @@ pub fn worker_id_from_socket_path(socket_path: Option<&str>) -> Option<&str> {
         .map(|group| group.as_str())
 }
 
-/// One log sighting of a worker id owning a pid at a timestamp (TS
-/// `WorkerPidSighting`).
+/// One log sighting of a worker id owning a pid at a timestamp (TS `WorkerPidSighting`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerPidSighting {
     pub time_ms: i64,
     pub worker_id: String,
 }
 
-/// pid -> worker-id sightings, ordered by time (TS `WorkerPidMap`). A pid
-/// can be reused by a later worker, so attribution picks the owner at
-/// the event time, not the union of every id ever seen on the pid.
+/// pid -> worker-id sightings, ordered by time (TS `WorkerPidMap`); a pid
+/// can be reused, so attribution picks the owner at the event time.
 pub type WorkerPidMap = HashMap<i64, Vec<WorkerPidSighting>>;
 
-/// Map pid -> worker-id sightings from entries whose socket path names a
-/// worker socket (TS `collectWorkerPidMap`).
+/// Map pid -> worker-id sightings from entries whose socket path names a worker socket.
 #[must_use]
 pub fn collect_worker_pid_map(entries: &[IncidentLogEntry]) -> WorkerPidMap {
     let mut map: WorkerPidMap = WorkerPidMap::new();
@@ -70,8 +66,7 @@ pub fn collect_worker_pid_map(entries: &[IncidentLogEntry]) -> WorkerPidMap {
     map
 }
 
-/// The worker that owned `pid` at `time_ms`: the latest sighting at or
-/// before it (TS `workerIdForPid`).
+/// The worker that owned `pid` at `time_ms`: the latest sighting at or before it.
 fn worker_id_for_pid(worker_pids: &WorkerPidMap, pid: Option<i64>, time_ms: i64) -> Option<String> {
     let pid = pid?;
     let sightings = worker_pids.get(&pid)?;
@@ -86,8 +81,7 @@ fn worker_id_for_pid(worker_pids: &WorkerPidMap, pid: Option<i64>, time_ms: i64)
     worker_id.map(|sighting| sighting.worker_id.clone())
 }
 
-/// One classified worker stderr body (TS `classifyWorkerStderrBody`'s
-/// return shape: an event without time or category).
+/// One classified worker stderr body (TS `classifyWorkerStderrBody`'s return shape).
 #[derive(Debug, Clone, PartialEq)]
 struct WorkerStderrEvent {
     severity: IncidentSeverity,
@@ -97,7 +91,6 @@ struct WorkerStderrEvent {
     tokens: Vec<String>,
 }
 
-/// Build an event from an entry (TS `event`).
 fn event(
     entry: &IncidentLogEntry,
     severity: IncidentSeverity,
@@ -117,7 +110,6 @@ fn event(
     )
 }
 
-/// Build an event from an entry with filter tokens.
 fn incident_event(
     entry: &IncidentLogEntry,
     severity: IncidentSeverity,
@@ -138,10 +130,8 @@ fn incident_event(
     }
 }
 
-/// Key events on the entry's socket path so anomalies and aggregation
-/// never mix entries from different daemons sharing one agent.jsonl;
-/// entries without a socket field (the per-daemon fallback log) key on
-/// `daemon` (TS `daemonSubject`).
+/// Key events on the entry's socket path so anomalies never mix entries from different daemons
+/// sharing one agent.jsonl; entries without a socket field key on `daemon` (TS `daemonSubject`).
 fn daemon_subject(entry: &IncidentLogEntry) -> String {
     entry
         .socket_path
@@ -149,8 +139,7 @@ fn daemon_subject(entry: &IncidentLogEntry) -> String {
         .unwrap_or_else(|| "daemon".to_string())
 }
 
-/// The classification of a command failure (TS
-/// `classifyCommandFailure`'s return shape).
+/// The classification of a command failure (TS `classifyCommandFailure`'s return shape).
 struct CommandFailure {
     severity: IncidentSeverity,
     event_class: &'static str,
@@ -158,8 +147,7 @@ struct CommandFailure {
     tokens: Vec<String>,
 }
 
-/// Classify the error body of a failed supervisor/daemon command (TS
-/// `classifyCommandFailure`).
+/// Classify the error body of a failed supervisor/daemon command (TS `classifyCommandFailure`).
 fn classify_command_failure(command: &str, error: &str) -> CommandFailure {
     let err = first_line(error);
     if err.contains("Timed out waiting for daemon worker response") {
@@ -234,8 +222,7 @@ fn classify_command_failure(command: &str, error: &str) -> CommandFailure {
     }
 }
 
-/// Classify the body of a `Session worker <id> stderr: <body>` log line
-/// (TS `classifyWorkerStderrBody`).
+/// Classify a `Session worker <id> stderr: <body>` log line (TS `classifyWorkerStderrBody`).
 fn classify_worker_stderr_body(
     worker_id: &str,
     body: &str,
@@ -243,8 +230,7 @@ fn classify_worker_stderr_body(
 ) -> Option<WorkerStderrEvent> {
     let tokens = vec![worker_id.to_string()];
     if body.trim().is_empty() || STACK_FRAME.is_match(body) {
-        // Stack frames and blank lines belong to the previous stderr
-        // event.
+        // Stack frames and blank lines belong to the previous stderr event.
         return None;
     }
     let line = first_line(body);
@@ -302,8 +288,7 @@ fn classify_worker_stderr_body(
     if let Some(captures) = PASSIVATED.captures(line) {
         let session_id = captures.get(1).map_or("", |m| m.as_str());
         let idle_minutes = captures.get(3).map_or("", |m| m.as_str());
-        // A missing session name logs as `name=""`; that empty token must
-        // not become a filter key.
+        // A missing session name logs as `name=""`; that empty token must not become a filter key.
         let name = captures.get(2).map_or("", |m| m.as_str()).trim_matches('"');
         let mut passivated_tokens = vec![worker_id.to_string(), session_id.to_string()];
         if !name.is_empty() {
@@ -329,8 +314,8 @@ fn classify_worker_stderr_body(
     })
 }
 
-/// Break a `Recovered ... uncertain operations: <list>` body into a count
-/// and a ranked breakdown (TS `recoveryBreakdown`).
+/// Break a `Recovered ... uncertain operations: <list>` body into a count and a ranked
+/// breakdown.
 fn recovery_breakdown(operations: &str) -> (usize, String) {
     let list: Vec<&str> = operations
         .split(',')
@@ -364,8 +349,7 @@ fn recovery_breakdown(operations: &str) -> (usize, String) {
     (list.len(), format!("{breakdown}{rest}"))
 }
 
-/// Classify a provider-failure entry into an aggregate-friendly anomaly
-/// event (TS `providerFailureEvent`).
+/// Classify a provider-failure entry into an aggregate-friendly anomaly event.
 fn provider_failure_event(entry: &IncidentLogEntry, worker_pids: &WorkerPidMap) -> IncidentEvent {
     let worker_id = worker_id_for_pid(worker_pids, entry.pid, entry.time_ms);
     let subject = match (&worker_id, entry.pid) {
@@ -407,10 +391,8 @@ fn provider_failure_event(entry: &IncidentLogEntry, worker_pids: &WorkerPidMap) 
     }
 }
 
-/// Classify one log entry into an incident event; `None` when the entry is
-/// noise (TS `classifyIncidentEntry`).
-// One arm per incident kind, mirroring the TS switch; refactoring is out of
-// scope for this zero-behavior-change sweep.
+/// Classify one log entry into an incident event; `None` when the entry is noise (TS
+/// `classifyIncidentEntry`). One arm per incident kind, mirroring the TS switch.
 #[allow(clippy::too_many_lines)]
 pub fn classify_incident_entry(
     entry: &IncidentLogEntry,
@@ -450,9 +432,7 @@ pub fn classify_incident_entry(
     }
     if let Some(captures) = STARTUP_FAILED.captures(msg) {
         let err = captures.get(1).map_or("", |m| m.as_str());
-        // TS tests the message case-insensitively
-        // (/lock file is already being held/i): real log lines carry
-        // "Lock file is already being held".
+        // TS tests the message case-insensitively (`/lock file is already being held/i`).
         if err
             .to_ascii_lowercase()
             .contains("lock file is already being held")
@@ -506,8 +486,7 @@ pub fn classify_incident_entry(
                 |worker_id| format!("worker {worker_id}"),
             ),
             classified.summary,
-            // Keep the session ids/names classified out of the error, not
-            // just the worker id.
+            // Keep the session ids/names classified out of the error, not just the worker id.
             match worker_id {
                 Some(worker_id) => {
                     let mut tokens = vec![worker_id.to_string()];
@@ -690,8 +669,7 @@ pub fn classify_incident_entry(
         ));
     }
     if WOKE.is_match(msg) {
-        // A scheduled wake is a supervisor lifecycle action, not crash
-        // recovery.
+        // A scheduled wake is a supervisor lifecycle action, not crash recovery.
         return Some(event(
             entry,
             IncidentSeverity::Info,
@@ -730,10 +708,8 @@ pub fn classify_incident_entry(
     }
 
     if entry.component == "coding-agent.daemon" {
-        // The worker logs its own lifecycle lines; reusing the stderr-body
-        // classifier gives them the same summaries as the supervisor's
-        // stderr forward, so the duplicated log pair collapses in the
-        // timeline.
+        // Reusing the stderr-body classifier gives the worker's own lifecycle lines the same
+        // summaries as the supervisor's forward, so the duplicated log pair collapses.
         if let Some(worker_id) = worker_id {
             if let Some(body) = classify_worker_stderr_body(worker_id, msg, false) {
                 return Some(incident_event(
@@ -761,8 +737,7 @@ pub fn classify_incident_entry(
     if entry.component == "coding-agent.daemon-supervisor"
         || entry.component == "coding-agent.daemon"
     {
-        // Unknown diagnostics still matter during an incident; summarize
-        // them.
+        // Unknown diagnostics still matter during an incident; summarize them.
         return Some(event(
             entry,
             if entry.level == "error" {
@@ -782,9 +757,8 @@ pub fn classify_incident_entry(
     None
 }
 
-/// Classify every entry, dropping the duplicate event the daemon writes
-/// both to the structured log and to the worker stderr forward (same
-/// summary, same second) (TS `collectIncidentEvents`).
+/// Classify every entry, dropping the duplicate event the daemon writes both to the structured log
+/// and the worker stderr forward (TS `collectIncidentEvents`).
 #[must_use]
 pub fn collect_incident_events(
     entries: &[IncidentLogEntry],
@@ -796,12 +770,9 @@ pub fn collect_incident_events(
         let Some(incident) = classify_incident_entry(entry, worker_pids) else {
             continue;
         };
-        // The daemon writes the same lifecycle event both to the
-        // structured log (coding-agent.daemon) and to the worker stderr
-        // forward (coding-agent.daemon-supervisor); drop the second copy
-        // when it lands within 2s. A repeat from the SAME component is a
-        // real lifecycle transition — a worker restarted on its durable
-        // id within 2s — and is never a duplicate.
+        // The daemon writes the same lifecycle event to both the structured log and the worker
+        // stderr forward; drop the second copy when it lands within 2s. A repeat from the SAME
+        // component is a real lifecycle transition, never a duplicate.
         if lifecycle_classes().contains(incident.event_class.as_str()) {
             let key = format!("{}|{}", incident.category.as_str(), incident.summary);
             let previous = last_seen.get(&key);

@@ -1,25 +1,21 @@
-//! The turn runner's stream tests (moved with the turn concern).
+//! The turn runner's stream tests.
 use super::*;
 use crate::engine::{
     CompactionOutcome, CompactionRequest, PromptRequest, SessionEngine, SideQuestionOutcome,
     SideQuestionRequest,
 };
 
-// The families moved to child modules at the same tree position
-// (turn_stream_tests::{queue,feed,broadcast,burst,park}); the shared
-// fixtures stay here (burst_runner, turn_session_events, positions_of)
-// - every family drives them, and the children reach them + the worker
-// namespace through `use super::*`.
+// The shared fixtures stay here; the child modules reach them
+// through `use super::*`.
 mod abort_idle_race;
 mod broadcast;
 mod burst;
 mod feed;
+mod interleave;
 mod park;
 mod queue;
 
-/// A minimal turn runner over a fresh session core: exactly what
-/// `run_turn` touches (the store stays `None`, the roster push is a
-/// no-op link, no supervisor socket).
+/// A minimal turn runner over a fresh session core: exactly what `run_turn` touches.
 fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
     let core = Arc::new(Mutex::new(SessionCore {
         active_session_id: "burst-session".to_string(),
@@ -57,6 +53,8 @@ fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
         active_action: None,
         tool_selection: pa_types::daemon::ToolSelectionFlags::default(),
         running_tool_calls: std::collections::HashSet::new(),
+        running_admission_ids: std::collections::HashSet::new(),
+        tool_use_count: 0,
     }));
     TurnRunner {
         core,
@@ -77,6 +75,7 @@ fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
             )),
             worker_token: String::new(),
         },
+        herdr: std::sync::Arc::new(std::sync::Mutex::new(crate::herdr::HerdrReporter::default())),
     }
 }
 
@@ -122,16 +121,20 @@ fn positions_of(events: &[Value], frame_type: &str) -> Vec<usize> {
         .collect()
 }
 
-// The abort gate's arm semantics (the fallback closer's silence
-// association), pinned on the wire: a scripted engine replays the
-// sighting frames through the worker's own gated emit with the flag
-// preset (`run_turn` driven directly - the pickup's delivery-scoped
-// clear never ran), so the final-emit race is deterministic.
+// The abort gate's arm semantics, pinned on the wire: `run_turn` driven
+// directly (the pickup's delivery-scoped clear never ran), so the final-emit
+// race is deterministic.
+#[derive(Default)]
 struct GateProbeEngine {
     frames: Vec<EngineEvent>,
+    boundaries: Mutex<Vec<Option<String>>>,
 }
 
 impl SessionEngine for GateProbeEngine {
+    fn set_prompt_context_boundary(&self, leaf_id: Option<String>) {
+        self.boundaries.lock().unwrap().push(leaf_id);
+    }
+
     fn run_prompt(
         &self,
         _prompt_index: usize,
@@ -187,14 +190,17 @@ impl SessionEngine for GateProbeEngine {
     }
 }
 
-/// One gated sighting battery: the scripted frames through the worker's
-/// turn with the abort flag (and the suppressed-row class) preset.
+/// One gated sighting battery: the scripted frames through the worker's turn with
+/// the abort flag (and the suppressed-row class) preset.
 async fn gate_sighting_events(
     frames: Vec<EngineEvent>,
     abort_requested: bool,
     suppress_aborted_row: bool,
 ) -> Vec<Value> {
-    let engine: Arc<dyn SessionEngine> = Arc::new(GateProbeEngine { frames });
+    let engine: Arc<dyn SessionEngine> = Arc::new(GateProbeEngine {
+        frames,
+        boundaries: Mutex::new(Vec::new()),
+    });
     let runner = burst_runner(Arc::clone(&engine));
     {
         let mut core = runner.core.lock().unwrap();
@@ -232,12 +238,8 @@ async fn gate_sighting_events(
     events
 }
 
-/// The finding's final-emit race, made deterministic: an abort flag
-/// sighting on the trailing `Done` of a run that completed on its own
-/// (the session-command / pre-model-failure shape - no aborted outcome,
-/// no suppressed row) must not arm the fallback's silence: the closer
-/// still pairs the run's opening `agent_start` (TS: an abort of a
-/// finished run no-ops).
+/// A sighting on the trailing `Done` of a self-completed run must not arm the
+/// fallback's silence — the closer still pairs the run's `agent_start`.
 #[tokio::test]
 async fn a_late_abort_sighting_on_a_completed_runs_done_keeps_the_fallback_closer() {
     let events = gate_sighting_events(vec![EngineEvent::Done(Ok(()))], true, false).await;
@@ -255,10 +257,8 @@ async fn a_late_abort_sighting_on_a_completed_runs_done_keeps_the_fallback_close
     );
 }
 
-/// The admission consult's settle: `DoneAborted` with no engine
-/// `agent_end` - the aborted-outcome carrier arms the silence, the
-/// suppressed-run wire shape holds (no synthesized closer for the
-/// aborted turn).
+/// `DoneAborted` with no engine `agent_end`: the aborted-outcome carrier arms the
+/// silence.
 #[tokio::test]
 async fn done_aborted_arms_the_fallback_silence() {
     let events = gate_sighting_events(vec![EngineEvent::DoneAborted], true, false).await;
@@ -268,11 +268,77 @@ async fn done_aborted_arms_the_fallback_silence() {
     );
 }
 
-/// The suppressed-row class (the compact path's detached run): a settle
-/// frame that would forward on a plain flag sighting (the closer test's
-/// shape) drops when `suppress_aborted_row` is set - the arm is what the
-/// assertion discriminates on, not the flag: without the suppress term
-/// the same `ToolResultMessage` reaches the wire as its message pair.
+/// #4: the turn's tool executions count onto the session's `toolUseCount`
+/// (TS bumps the child's counter per `tool_execution_start`), the value the
+/// worker's roster deltas carry.
+#[tokio::test]
+async fn a_turns_tool_executions_count_onto_the_summary() {
+    let engine: Arc<dyn SessionEngine> = Arc::new(GateProbeEngine {
+        frames: vec![
+            EngineEvent::ToolExecutionStart {
+                tool_call_id: "t1".to_string(),
+                tool_name: "bash".to_string(),
+                args: Value::Null,
+            },
+            EngineEvent::ToolExecutionEnd {
+                tool_call_id: "t1".to_string(),
+                result: Value::Null,
+                is_error: false,
+            },
+            EngineEvent::ToolExecutionStart {
+                tool_call_id: "t2".to_string(),
+                tool_name: "edit".to_string(),
+                args: Value::Null,
+            },
+            EngineEvent::Done(Ok(())),
+        ],
+        ..GateProbeEngine::default()
+    });
+    let runner = burst_runner(Arc::clone(&engine));
+    runner
+        .run_turn(
+            engine,
+            vec![QueuedItem {
+                priority: QueuePriority::Human,
+                preview: None,
+                message: "tools".to_string(),
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Queued,
+                forced_batch: false,
+            }],
+        )
+        .await;
+    let summary = {
+        let core = runner.core.lock().unwrap();
+        session_summary(
+            &core,
+            SummaryInputs {
+                thinking_level: "default".to_string(),
+                model: None,
+                model_fallback_message: None,
+                bash_running: false,
+                quota_parked: false,
+                subagents_running: false,
+                progress_note: None,
+            },
+        )
+    };
+    let summary = serde_json::to_value(&summary).unwrap();
+    assert_eq!(
+        summary["toolUseCount"],
+        json!(2),
+        "the summary: {summary:?}"
+    );
+}
+
+/// A settle frame that would forward on a plain flag sighting drops when
+/// `suppress_aborted_row` is set.
 #[tokio::test]
 async fn the_suppressed_row_sighting_drops_and_arms_the_silence() {
     let events = gate_sighting_events(
@@ -296,4 +362,169 @@ async fn the_suppressed_row_sighting_drops_and_arms_the_silence() {
         positions_of(&events, "agent_end").is_empty(),
         "the suppressed-row sighting arms the silence: {events:?}"
     );
+}
+
+/// Engine-only stores cannot persist these transitions: the worker must
+/// commit both rows in the same stream order as the assistant/tool rows.
+#[tokio::test]
+async fn model_transitions_reach_the_worker_owned_session_file() {
+    for abort_suppressed in [None, Some(false), Some(true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let expected = vec![
+            json!({"provider": "backup", "modelId": "model/with/slashes"}),
+            json!({"provider": "primary", "modelId": "model/with/slashes"}),
+        ];
+        let mut frames = vec![
+            EngineEvent::ModelChange(pa_types::session::ModelChangeEntry {
+                provider: "backup".to_string(),
+                model_id: "model/with/slashes".to_string(),
+            }),
+            EngineEvent::AssistantMessage(
+                json!({"role": "assistant", "content": [], "stopReason": "toolUse"}),
+            ),
+            EngineEvent::ModelChange(pa_types::session::ModelChangeEntry {
+                provider: "primary".to_string(),
+                model_id: "model/with/slashes".to_string(),
+            }),
+            EngineEvent::ToolResultMessage(
+                json!({"role": "toolResult", "toolCallId": "probe", "content": []}),
+            ),
+            EngineEvent::Done(Ok(())),
+        ];
+        if abort_suppressed.is_some() {
+            frames.retain(|event| {
+                matches!(event, EngineEvent::ModelChange(_) | EngineEvent::Done(_))
+            });
+        }
+        let engine: Arc<dyn SessionEngine> = Arc::new(GateProbeEngine {
+            frames,
+            boundaries: Mutex::new(Vec::new()),
+        });
+        let runner = burst_runner(Arc::clone(&engine));
+        let mut store = crate::session_store::SessionFile::create("/fixture", None, 0);
+        store.set_path(path.clone());
+        store.rewrite().unwrap();
+        {
+            let mut core = runner.core.lock().unwrap();
+            core.store = Some(store);
+            core.abort_requested = abort_suppressed.is_some();
+            core.suppress_aborted_row = abort_suppressed.unwrap_or(false);
+        }
+        runner
+            .run_turn(
+                engine,
+                vec![QueuedItem {
+                    priority: QueuePriority::Human,
+                    preview: None,
+                    message: "probe".to_string(),
+                    custom_message: None,
+                    agent_message: None,
+                    queue_key: None,
+                    admission_id: None,
+                    images: Vec::new(),
+                    done: None,
+                    queue_visible: true,
+                    policy: TurnPolicy::Queued,
+                    forced_batch: false,
+                }],
+            )
+            .await;
+        let rows: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let transitions: Vec<Value> = rows
+            .iter()
+            .filter(|row| row["type"] == "model_change")
+            .map(|row| json!({"provider": row["provider"], "modelId": row["modelId"]}))
+            .collect();
+        assert_eq!(transitions, expected);
+        let relevant: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row["type"].as_str() {
+                Some("model_change") => Some("model"),
+                Some("message") => row["message"]["role"].as_str(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            relevant,
+            if abort_suppressed.is_some() {
+                vec!["model", "model"]
+            } else {
+                vec!["model", "assistant", "model", "toolResult"]
+            }
+        );
+    }
+}
+
+/// noSession keeps its prefix IDs in the worker's in-memory store; they
+/// cannot fence the engine's durable restore. File-backed prompts capture the
+/// leaf after next-turn prefix rows have persisted.
+#[tokio::test]
+async fn prompt_restore_boundary_is_supplied_only_for_file_backed_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    for file_backed in [false, true] {
+        let engine = Arc::new(GateProbeEngine {
+            frames: vec![EngineEvent::Done(Ok(()))],
+            boundaries: Mutex::new(Vec::new()),
+        });
+        let dynamic: Arc<dyn SessionEngine> = engine.clone();
+        let runner = burst_runner(Arc::clone(&dynamic));
+        let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+        store.append_session_info("prefix");
+        assert!(store.leaf_id().is_some(), "in-memory prefixes have IDs too");
+        if file_backed {
+            store.set_path(dir.path().join("backed.jsonl"));
+            store.rewrite().unwrap();
+        }
+        {
+            let mut core = runner.core.lock().unwrap();
+            core.store = Some(store);
+            core.pending_next_turn.push(json!({
+                "role":"custom", "customType":"prior_context", "content":"keep this prefix",
+                "display":false,
+            }));
+        }
+        runner
+            .run_turn(
+                dynamic,
+                vec![QueuedItem {
+                    priority: QueuePriority::Human,
+                    preview: None,
+                    message: "go".to_string(),
+                    custom_message: None,
+                    agent_message: None,
+                    queue_key: None,
+                    admission_id: None,
+                    images: Vec::new(),
+                    done: None,
+                    queue_visible: true,
+                    policy: TurnPolicy::Queued,
+                    forced_batch: false,
+                }],
+            )
+            .await;
+        let expected = if file_backed {
+            let path = dir.path().join("backed.jsonl");
+            let persisted = crate::session_store::SessionFile::open(&path).unwrap();
+            assert!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("prior_context"),
+                "the captured boundary follows the prefix on disk"
+            );
+            vec![persisted.leaf_id().map(str::to_string)]
+        } else {
+            assert!(!dir.path().join("backed.jsonl").exists());
+            Vec::new()
+        };
+        assert_eq!(
+            *engine.boundaries.lock().unwrap(),
+            expected,
+            "boundary capture must match durable ownership (file_backed={file_backed})"
+        );
+    }
 }

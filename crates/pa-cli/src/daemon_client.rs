@@ -1,15 +1,7 @@
-//! Daemon socket client for the CLI's daemon-backed public commands
-//! (`list`, `stop`, `rename`, `send`, `schedule`).
-//!
-//! Port of `modes/daemon/daemon-client.ts` restricted to the one-shot request
-//! shape these commands use: connect, read the `daemon_hello` greeting, send
-//! one `command` envelope per request, and match responses by request id.
-//! Reconnect/recovery machinery is TUI-oriented and stays out of the CLI.
-//!
-//! The client never spawns a daemon: the TS CLI only auto-starts one for the
-//! internal `daemon start`/`open` commands, which are not reachable from the
-//! public command surface. When no daemon answers the socket, the exact TS
-//! connect error is surfaced to the user.
+//! Daemon socket client for the CLI's daemon-backed public commands (`list`,
+//! `stop`, `rename`, `send`, `schedule`): connect, read the `daemon_hello`,
+//! send one `command` envelope per request, match responses by id. The client
+//! never spawns a daemon; an unanswered socket surfaces the exact TS error.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -24,19 +16,19 @@ use serde_json::json;
 
 use crate::config;
 
-/// Default response timeout, mirroring `DEFAULT_DAEMON_REQUEST_TIMEOUT_MS`.
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
-/// Greeting timeout. The TS `waitForHello` default is 3s; raised to 15s
-/// so daemons busy loading large sessions can still greet in time.
+/// Greeting timeout. The TS default is 3s; raised to 15s so daemons
+/// busy loading large sessions can still greet in time.
 const HELLO_TIMEOUT_MS: u64 = 15_000;
-/// Read poll granularity for deadline-driven reads.
 const READ_POLL: Duration = Duration::from_millis(50);
 
-/// A client connection to one daemon socket.
 #[derive(Debug)]
 pub(crate) struct DaemonClient {
     socket_path: PathBuf,
     reader: BufReader<Box<dyn BlockingTransportStream>>,
+    /// Bytes of a line whose newline has not arrived yet, kept across poll
+    /// timeouts and reads.
+    partial_line: Vec<u8>,
     writer: Box<dyn BlockingTransportStream>,
     hello: Option<serde_json::Value>,
     daemon_closing_reason: Option<String>,
@@ -45,7 +37,6 @@ pub(crate) struct DaemonClient {
 }
 
 impl DaemonClient {
-    /// Connect to the daemon socket, ready for the hello handshake.
     pub(crate) fn connect(socket_path: &Path) -> Result<Self> {
         Self::connect_raw(socket_path).map_err(|error| {
             anyhow!(
@@ -57,18 +48,21 @@ impl DaemonClient {
     }
 
     /// [`Self::connect`] without the user-facing error decoration: discovery
-    /// probes expect unreachable sockets and classify them instead of
-    /// surfacing the connect error.
+    /// probes classify unreachable sockets instead of surfacing the error.
     pub(crate) fn connect_probe(socket_path: &Path) -> Result<Self> {
         Self::connect_raw(socket_path).map_err(|error| anyhow!("connect: {error}"))
     }
 
     fn connect_raw(socket_path: &Path) -> std::io::Result<Self> {
         let stream = connect_blocking(socket_path)?;
+        // Darwin rejects socket options after peer close, even with a reply
+        // still queued. Configure polling before any request can be sent.
+        stream.set_read_timeout(READ_POLL)?;
         let writer = stream.try_clone_box()?;
         Ok(DaemonClient {
             socket_path: socket_path.to_path_buf(),
             reader: BufReader::new(stream),
+            partial_line: Vec::new(),
             writer,
             hello: None,
             daemon_closing_reason: None,
@@ -77,11 +71,8 @@ impl DaemonClient {
         })
     }
 
-    /// Send one command envelope and wait for its response with the default
-    /// timeout.
-    ///
-    /// Errors carry the exact TS client message text, including the socket and
-    /// daemon-log path the TS product prints so users can self-diagnose.
+    /// Send one command envelope and wait for its response. Errors carry the exact
+    /// TS client message text (socket and daemon-log path), so users can self-diagnose.
     pub(crate) fn request(&mut self, command: DaemonCommand) -> Result<DaemonResponse> {
         self.request_with_timeout(command, REQUEST_TIMEOUT_MS)
     }
@@ -104,9 +95,8 @@ impl DaemonClient {
         }
         self.request_id += 1;
         let id = format!("daemon_{}", self.request_id);
-        // The envelope and the command body both carry the request id, like
-        // the TS client's `{ ...command, id }` (the daemon matches responses
-        // by the envelope id; the body id is wire parity).
+        // The envelope and the command body both carry the request id, like the TS
+        // client's `{ ...command, id }` (the daemon matches by the envelope id).
         let mut command_value = serde_json::to_value(command)?;
         if !command_value.is_object() {
             return Err(anyhow!("invalid daemon command"));
@@ -179,12 +169,7 @@ impl DaemonClient {
         operation: Operation<'_>,
     ) -> Result<String> {
         loop {
-            self.reader
-                .get_mut()
-                .set_read_timeout(READ_POLL)
-                .map_err(|error| anyhow!("daemon socket error: {error}"))?;
-            let mut line = String::new();
-            let read = self.reader.read_line(&mut line);
+            let read = self.reader.read_until(b'\n', &mut self.partial_line);
             match read {
                 Ok(0) => {
                     let reason = self
@@ -198,6 +183,9 @@ impl DaemonClient {
                     ));
                 }
                 Ok(_) => {
+                    let line = String::from_utf8(std::mem::take(&mut self.partial_line)).map_err(
+                        |_| anyhow!("daemon socket error: stream did not contain valid UTF-8"),
+                    )?;
                     if line.trim().is_empty() {
                         continue;
                     }
@@ -223,7 +211,6 @@ impl DaemonClient {
     }
 }
 
-/// The operation a read is waiting on; shapes the timeout error text.
 #[derive(Clone, Copy)]
 enum Operation<'a> {
     Handshake,
@@ -241,12 +228,10 @@ impl Operation<'_> {
     }
 }
 
-/// Command type tag on the wire, mirroring `DaemonCommand["type"]`.
 fn command_type_name(command: &DaemonCommand) -> &str {
     pa_daemon::protocol::command_type_name(command)
 }
 
-/// The protocol identity advertised in the hello.
 fn daemon_protocol(hello: &serde_json::Value) -> Result<DaemonProtocolInfo> {
     hello
         .get("protocol")
@@ -255,8 +240,7 @@ fn daemon_protocol(hello: &serde_json::Value) -> Result<DaemonProtocolInfo> {
         .ok_or_else(|| anyhow!("invalid daemon hello"))
 }
 
-/// `Socket: <path>. Daemon log: <log path>.`, mirroring
-/// `daemonEndpointDetails` in daemon-client.ts.
+/// `Socket: <path>. Daemon log: <log path>.`
 fn endpoint_details(socket_path: &Path) -> String {
     let log = pa_daemon::paths::daemon_log_path(socket_path, &config::get_agent_dir());
     format!(
@@ -266,8 +250,8 @@ fn endpoint_details(socket_path: &Path) -> String {
     )
 }
 
-/// Node's `connect` error message for the same failure, so the printed error
-/// matches the TS product (`connect ENOENT <path>` and friends).
+/// Node's `connect` error message for the same failure, so the printed
+/// error matches the TS product (`connect ENOENT <path>` and friends).
 fn node_connect_error(error: &std::io::Error, socket_path: &Path) -> String {
     let path = socket_path.display().to_string();
     match error.kind() {
@@ -294,8 +278,6 @@ mod tests {
         }
     }
 
-    /// A minimal scripted daemon for protocol-level client tests: hello, one
-    /// response line, matching the response id from the request envelope.
     #[test]
     fn request_matches_response_by_id() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -317,8 +299,72 @@ mod tests {
         });
         let mut client = DaemonClient::connect(&socket).unwrap();
         let response = client.request(list_command("daemon_1")).unwrap();
-        assert!(response.success);
-        assert!(server.join().is_ok());
+        assert_eq!(
+            response,
+            DaemonResponse {
+                id: Some("daemon_1".to_string()),
+                command: "list".to_string(),
+                success: true,
+                data: Some(json!({ "sessions": [] })),
+                error: None,
+                error_info: None,
+            }
+        );
+        server.join().unwrap();
+    }
+
+    /// The peer has closed before either read starts. Drain the replies,
+    /// including any bytes read ahead into the reader's buffer.
+    #[test]
+    fn read_line_drains_replies_after_peer_close() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            writer
+                .write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n")
+                .unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(request["command"]["id"], request["id"]);
+            let id = request["id"].as_str().unwrap();
+            let replies = [
+                "{\"id\":\"daemon_other\",\"type\":\"response\",\"command\":\"list\",\"success\":true,\"data\":{\"sessions\":[]}}\n"
+                    .to_string(),
+                format!(
+                    "{{\"id\":\"{id}\",\"type\":\"response\",\"command\":\"list\",\"success\":true,\"data\":{{\"sessions\":[]}}}}\n"
+                ),
+            ];
+            writer.write_all(replies.concat().as_bytes()).unwrap();
+            replies
+        });
+        let mut client = DaemonClient::connect(&socket).unwrap();
+        let hello = client.wait_for_hello(HELLO_TIMEOUT_MS).unwrap();
+        let envelope = json!({
+            "type": "command",
+            "id": "daemon_1",
+            "protocol": daemon_protocol(&hello).unwrap(),
+            "clientId": client.protocol_client_id,
+            "command": list_command("daemon_1"),
+        });
+        writeln!(client.writer, "{envelope}").unwrap();
+        client.writer.flush().unwrap();
+        // Joining observes both peer handles being dropped, without a sleep.
+        let replies = server.join().unwrap();
+        for expected in replies {
+            let line = client
+                .read_line(
+                    Instant::now() + Duration::from_millis(REQUEST_TIMEOUT_MS),
+                    REQUEST_TIMEOUT_MS,
+                    Operation::Command("list"),
+                )
+                .unwrap();
+            assert_eq!(line, expected);
+        }
     }
 
     #[test]
@@ -366,5 +412,72 @@ mod tests {
         );
         assert!(text.contains("Socket: "), "{text}");
         server.join().unwrap();
+    }
+
+    /// Replays scripted reads; `None` is a poll timeout.
+    #[derive(Debug)]
+    struct ScriptedReads(std::collections::VecDeque<Option<&'static [u8]>>);
+
+    impl std::io::Read for ScriptedReads {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                Some(Some(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(None) => Err(std::io::ErrorKind::WouldBlock.into()),
+                None => Ok(0),
+            }
+        }
+    }
+
+    impl std::io::Write for ScriptedReads {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl BlockingTransportStream for ScriptedReads {
+        fn try_clone_box(&self) -> std::io::Result<Box<dyn BlockingTransportStream>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        fn set_read_timeout(&self, _: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A line split by poll timeouts, one of them inside a multi-byte
+    /// character, comes back whole.
+    #[test]
+    fn read_line_keeps_bytes_across_poll_timeouts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let mut client = DaemonClient::connect(&socket).unwrap();
+        let line: &'static [u8] = "{\"type\":\"daemon_hello\",\"name\":\"é\"}\n".as_bytes();
+        let split = line.len() - 4; // between the two bytes of "é"
+        client.reader = BufReader::new(Box::new(ScriptedReads(
+            [
+                Some(&line[..10]),
+                None,
+                Some(&line[10..split]),
+                None,
+                Some(&line[split..]),
+            ]
+            .into(),
+        )));
+        let read = client
+            .read_line(
+                Instant::now() + Duration::from_secs(10),
+                10_000,
+                Operation::Handshake,
+            )
+            .unwrap();
+        assert_eq!(read.as_bytes(), line);
     }
 }

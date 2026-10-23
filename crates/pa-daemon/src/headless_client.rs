@@ -1,8 +1,8 @@
 //! The hosted headless client (TS `DaemonAgentConnection` behind a print
 //! or json run with `--daemon-hosted`): the daemon owns a RESIDENT session
 //! (listed, attachable from another terminal) and this client drives it over
-//! the supervisor socket with schema-31 commands only — create (or attach
-//! the live worker that already hosts the same session file), attach,
+//! the supervisor socket with combined schema-33 commands only — create
+//! (or attach the live worker that already hosts the same session file), attach,
 //! stream the session's events, `prompt_and_wait`,
 //! `wait_for_headless_completion`, then detach and close. The client never
 //! kills or completes the session.
@@ -17,15 +17,16 @@
 //! Route budget: the supervisor answers `prompt_and_wait` with its route
 //! timeout after ten minutes even while the worker still runs the turn
 //! (TS forwards it for 24 hours). Each prompt therefore carries its own
-//! schema-30 `admissionId` when the daemon advertises
-//! `prompt_admission_cancellation` (TS print sends none: its route never
-//! times out), and a timed-out prompt reads its admission back with
-//! `cancel_prompt_admission` (never `cancelOwned`): only that answer says
-//! whether THIS prompt's turn started. Without the capability a timed-out
-//! prompt has no evidence and fails.
+//! `admissionId` when the daemon advertises `prompt_admission_cancellation`
+//! (TS print sends none: its route never times out), and a timed-out prompt
+//! reads its admission back with `cancel_prompt_admission` (never
+//! `cancelOwned`): `owned` means the worker accepted this prompt, whether it
+//! is running or queued, so the client waits for the session to go idle.
+//! Without the capability a timed-out prompt has no evidence and fails.
 //!
-//! Session policy (fork revision 31): `--offline` and `--no-skills` ride
-//! the create config as `offline`/`noSkills` when the daemon advertises
+//! Session policy (fork additions in combined revision 33): `--offline`
+//! and `--no-skills` ride the create config as `offline`/`noSkills` when
+//! the daemon advertises
 //! `session_policy`, and every open then goes through the supervisor's
 //! create (a live worker for the same file is reused there, but only when
 //! it runs under the same policy and its tool selection resolves the same;
@@ -106,9 +107,9 @@ pub type HostedEventSink = Arc<dyn Fn(&Value) + Send + Sync>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum AdmissionAnswer {
-    /// The worker committed the admission: the prompt's turn started.
+    /// The worker accepted the prompt; it may be queued or already running.
     Owned,
-    /// The prompt was still queued; the cancel withdrew it.
+    /// The worker cancelled a prompt before accepting it for delivery.
     Cancelled,
     /// Nothing holds the admission: the prompt never reached the worker,
     /// or it settled between the budget and the read.
@@ -375,22 +376,23 @@ impl HostedHeadlessSession {
 
     /// Run one prompt to its settled turn (`prompt_and_wait`). When the
     /// supervisor's route budget answers first, the prompt's own admission
-    /// decides: `owned` means its turn started (the worker commits an
-    /// admission when the turn starts, before a `/skill:` command expands
-    /// or a session command such as `/compact` runs, so every submission
-    /// is covered and another client's prompt never is), and the client
-    /// waits for the session to go idle; a prompt still queued is
-    /// withdrawn by the same read and never runs.
+    /// decides: `owned` means the worker accepted this prompt (including
+    /// when it is queued behind another turn), so the client waits for the
+    /// session to go idle. The admission read omits `cancelOwned`, preserving
+    /// accepted queued work; a prompt still waiting for worker acceptance can
+    /// be cancelled and will not run. Every submission is covered, including
+    /// `/skill:` expansion and session commands such as `/compact`, and
+    /// another client's prompt never proves this admission was accepted.
     ///
     /// # Errors
     ///
     /// Returns the prompt's rejection (the worker's admission or settle
-    /// error), the route budget's timeout for a prompt that was withdrawn
-    /// while queued, that nothing holds any more, or whose daemon cannot
-    /// read admissions back (it may never have reached the worker, so the
-    /// run fails rather than report it), or a transport failure. A turn
-    /// confirmed past the budget reports the session's idle state, not its
-    /// own settle error.
+    /// error), the route budget's timeout for a prompt cancelled before
+    /// acceptance, when nothing holds the admission any more, or when the
+    /// daemon cannot read admissions back (it may never have reached the
+    /// worker, so the run fails rather than report it), or a transport
+    /// failure. A prompt confirmed accepted past the budget reports the
+    /// session's idle state, not its own settle error.
     pub async fn prompt(&self, prompt: HostedPrompt) -> anyhow::Result<()> {
         let images = (!prompt.images.is_empty())
             .then(|| serde_json::to_value(&prompt.images))
@@ -454,7 +456,7 @@ impl HostedHeadlessSession {
                 Ok(())
             }
             AdmissionAnswer::Cancelled => anyhow::bail!(
-                "{SESSION_WORKER_TIMED_OUT} while the prompt was still queued; it was withdrawn and did not run"
+                "{SESSION_WORKER_TIMED_OUT} before the worker accepted the prompt; it was cancelled and will not run"
             ),
             AdmissionAnswer::Unknown => anyhow::bail!(
                 "{SESSION_WORKER_TIMED_OUT} before the prompt was seen to start; it may not have run"
@@ -551,6 +553,8 @@ impl HostedHeadlessSession {
         let command = DaemonCommand::GetMessages {
             id: None,
             active_session_id: self.active_session_id.clone(),
+            page: None,
+            capabilities: None,
             rest: Map::default(),
         };
         let data = success_data(self.link.request(command, REQUEST_BOUND).await?)?;

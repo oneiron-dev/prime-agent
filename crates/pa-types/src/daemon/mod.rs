@@ -1,12 +1,7 @@
-//! Daemon wire protocol, ported from
-//! `packages/coding-agent/src/modes/daemon/daemon-protocol.ts` and
-//! `daemon-worker-protocol.ts`.
-//!
-//! This is the local JSONL transport between clients (TUI/CLI), the supervisor,
-//! and per-session worker processes. Frame and command shapes match the TS
-//! wire format exactly. Payloads owned by other subsystems (session summaries,
-//! agent-connection state objects, session events) are carried as opaque
-//! [`Value`]s and will gain typed shapes in their owning crates.
+//! Daemon wire protocol (TS `daemon-protocol.ts`, `daemon-worker-protocol.ts`): the local JSONL
+//! transport between clients (TUI/CLI), the supervisor, and per-session workers; shapes match the
+//! TS
+//! wire exactly, payloads owned by other subsystems ride as opaque [`Value`]s.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,9 +15,7 @@ pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
 /// (TS #2506's field, landing ahead of TS main: the Rust deletion lifecycle
 /// captures the tombstoned child's usage durably before any unlink, so the
 /// field is populated where TS's open PR reads a removed path).
-/// Revision 31 is one Oneiron fork-only revision (ahead of TS; its id is
-/// unrelated to the TS fork's revision-31 id) covering every fork change of
-/// the follow-up release:
+/// The Oneiron fork used revision 31 for its additions:
 /// - the create failure of a worker that died during startup is typed
 ///   (`errorInfo.code: "worker_startup_failed"`, server capability
 ///   `worker_startup_failure`); older clients read the code as `Unknown` and
@@ -33,21 +26,29 @@ pub const DAEMON_PROTOCOL_VERSION: u64 = 7;
 /// - the capability-gated `create` keys `offline`/`noSkills` (server
 ///   capability `session_policy`): a hosted session's `--offline` and
 ///   `--no-skills`.
-pub const DAEMON_SCHEMA_REVISION: u64 = 31;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-31-a926532e8319";
+///
+/// Combined revision 32 includes those fork additions and upstream's schema-30
+/// changes plus its `mark_anthropic_warning_shown` command and the `renamedBy`
+/// and `waitForRlmQuiescence` fields. Its fresh identity keeps a pre-merge
+/// revision-31 daemon from passing the schema probe.
+///
+/// Combined revision 33 is the sync to upstream 71beca947. It adds upstream's
+/// transcript paging (`get_messages` with `page`, `capabilities` and
+/// `historyLeafId`, which the TUI sends without a capability gate) and the
+/// `list_persistent_shells`, `tail_persistent_shell` and
+/// `kill_persistent_shell` commands. Upstream kept its own schema id for
+/// these, so the fork takes a fresh identity again: a revision-32 daemon
+/// reads as stale to a revision-33 client, and the reverse.
+pub const DAEMON_SCHEMA_REVISION: u64 = 33;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-33-20261024a1f7";
 
 pub type DaemonClientId = String;
 pub type DaemonCommandId = String;
 pub type DaemonEventId = String;
 pub type DaemonEventSequence = u64;
-/// Client/server capability wire strings (closed TS unions, open on the wire
-/// for older/newer builds, so carried as raw strings).
+/// Client/server capability wire strings (closed TS unions, open on the wire, so raw strings).
 pub type DaemonClientCapability = String;
 pub type DaemonServerCapability = String;
-
-// ---------------------------------------------------------------------------
-// Common frames
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,11 +64,9 @@ pub struct DaemonEventCursor {
     pub sequence: DaemonEventSequence,
 }
 
-/// Resume cursor accepted on attach. The TS wire shape is a union: either a
-/// `DaemonEventCursor` (`generation` + `sequence`, optionally with
-/// `activeSessionId`) or a bare `eventSequence` with optional
-/// `activeSessionId`. A single optional-field struct accepts both forms and
-/// serializes each back to its original shape.
+/// Resume cursor accepted on attach. The TS wire shape is a union (`DaemonEventCursor`, or a bare
+/// `eventSequence`, each with optional `activeSessionId`); this optional-field struct accepts both
+/// forms and serializes each back to its original shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonResumeCursor {
@@ -123,6 +122,8 @@ pub struct DaemonEventMeta {
 pub mod agent_roster;
 mod command;
 pub mod framing;
+pub mod herdr_env;
+pub mod launch_env;
 mod outbound;
 mod plane;
 mod tool_selection;
@@ -132,12 +133,13 @@ mod worker;
 pub use command::{
     CycleDirection, DaemonCommand, DaemonCommandEnvelope, DaemonCommandFrameType,
     DaemonCommandWire, DaemonSessionLifecycle, ForkPosition, PromptInput, StreamingBehavior,
+    TranscriptPage,
 };
 pub use outbound::{
     DaemonClosingReason, DaemonErrorInfo, DaemonEventEnvelope, DaemonOutbound,
     DaemonPeerTransportTicket, DaemonResponse, DaemonRuntimeIdentity, DaemonSavedSessionInfo,
     DaemonSessionClosedReason, DaemonSessionSnapshot, SnapshotPurpose, SocketIdentity,
-    UPDATE_RESTART_PREPARING_MESSAGE,
+    KERNEL_NOT_RUNNING_MESSAGE, UPDATE_RESTART_PREPARING_MESSAGE,
 };
 pub use plane::{
     command_plane, is_daemon_mutating_command, is_session_plane_daemon_command,
@@ -164,8 +166,7 @@ pub use worker::{
     DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 };
 
-/// Round-trip helper shared by the daemon wire tests: a parsed type must
-/// serialize back to the exact original value.
+/// Round-trip helper: a parsed type must serialize back to the exact original value.
 #[cfg(test)]
 pub(crate) fn rt<T: serde::Serialize + for<'de> serde::Deserialize<'de>>(json: &str) {
     let original: serde_json::Value = serde_json::from_str(json).unwrap();
@@ -200,8 +201,8 @@ mod tests {
     fn protocol_constants_match_ts() {
         assert_eq!(DAEMON_PROTOCOL_NAME, "prime-agent.daemon");
         assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
-        assert_eq!(DAEMON_SCHEMA_REVISION, 31);
-        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-31-a926532e8319");
+        assert_eq!(DAEMON_SCHEMA_REVISION, 33);
+        assert_eq!(DAEMON_SCHEMA_ID, "protocol-7-schema-33-20261024a1f7");
         assert_eq!(DAEMON_UPDATE_RESTART_FORMAT_VERSION, 1);
     }
 }

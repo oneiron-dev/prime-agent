@@ -19,6 +19,7 @@
 
 pub mod layers;
 
+pub mod model_prompts;
 mod no_repl;
 
 pub mod system_prompt;

@@ -1,11 +1,8 @@
-//! The venv module's unit battery (moved with its concern): the Windows
-//! executable candidates, the skill-manifest parsing, the version-file round
-//! trip, the two-layer probe memo oracles, the live-probe closure, and the
-//! skill-sync batching.
+//! The venv module's unit battery: Windows executable candidates, the
+//! skill-manifest parsing, the version-file round trip, the two-layer
+//! probe memo oracles, and the skill-sync batching.
 #[test]
 fn windows_executable_candidates_default_order() {
-    // No PATHEXT: the TS default extension order, deduped against the
-    // bare name.
     assert_eq!(
         windows_executable_candidates("uv", None),
         vec![
@@ -20,7 +17,6 @@ fn windows_executable_candidates_default_order() {
 
 #[test]
 fn windows_executable_candidates_follows_pathext_order() {
-    // Supported extensions keep PATHEXT's order; unsupported ones drop.
     assert_eq!(
         windows_executable_candidates("uv", Some(".FOO;.EXE;.BAT")),
         vec!["uv".to_string(), "uv.exe".into(), "uv.bat".into()]
@@ -29,13 +25,10 @@ fn windows_executable_candidates_follows_pathext_order() {
 
 #[test]
 fn windows_executable_candidates_skips_suffix_and_duplicates() {
-    // A name that already ends in a default extension is used bare.
     assert_eq!(
         windows_executable_candidates("uv.exe", Some(".EXE;.BAT")),
         vec!["uv.exe".to_string()]
     );
-    // A candidate equal to the bare name (case-insensitively) never
-    // repeats.
     assert_eq!(
         windows_executable_candidates("node", Some("")),
         vec![
@@ -119,15 +112,12 @@ fn skill(import_name: &str, path: &str, hash: &str) -> BootstrapPythonSkill {
         pyproject_hash: hash.to_string(),
     }
 }
-/// The probe-memo state (in-process map + the shared disk files) is
-/// process-global: every test that touches it serializes on this lock
-/// so a concurrent test's invalidation cannot clear another test's
-/// verdicts mid-run.
+/// The probe-memo state is process-global: every test that touches it
+/// serializes so one test's invalidation cannot clear another's verdicts.
 static MEMO_STATE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Collect every `.runtime-probe-memo.json` under `root` (the override
-/// boundary pin: the override path must create none). Unix only: its
-/// callers are the unix override-path tests.
+/// boundary pin: the override path must create none).
 #[cfg(unix)]
 fn collect_memo_files(root: &Path, found: &mut Vec<std::path::PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(root) {
@@ -198,12 +188,8 @@ fn probe_memo_key_distinguishes_every_input_and_drops_on_invalidate() {
         .is_none_or(|memo| !memo.contains_key(&key)));
 }
 
-/// The out-of-band-detection trio, on a fake venv whose interpreter is
-/// a shell script that counts its own invocations: the memo must hit on
-/// an unchanged venv (the perf point), miss when the installed `rlm`
-/// tree is mutated or the interpreter is replaced (the parity point:
-/// the probe re-runs and detects the damage), and miss after
-/// invalidation.
+/// The out-of-band-detection trio: the memo must hit on an unchanged venv, miss when the installed
+/// `rlm` tree or the interpreter changes, and miss after invalidation.
 #[cfg(unix)]
 #[test]
 fn probe_memo_misses_on_out_of_band_venv_mutation() {
@@ -251,8 +237,6 @@ fn probe_memo_misses_on_out_of_band_venv_mutation() {
     assert!(kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
     assert_eq!(probe_count(), 2, "unchanged venv hits the memo");
 
-    // Out-of-band mutation of the installed rlm: the memo must miss and
-    // the probe must re-run (the detection the parity review demands).
     std::fs::write(rlm.join("core.py"), "y = 2\n").unwrap();
     assert!(kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
     assert_eq!(
@@ -261,7 +245,6 @@ fn probe_memo_misses_on_out_of_band_venv_mutation() {
         "installed-rlm mutation probes runtime and dill instead of masking"
     );
 
-    // Out-of-band interpreter replacement: same detection.
     std::fs::write(
         &python,
         format!(
@@ -278,31 +261,23 @@ fn probe_memo_misses_on_out_of_band_venv_mutation() {
         "interpreter replacement probes runtime and dill"
     );
 
-    // Fingerprint-invisible damage (the fake's verdict file, standing in
-    // for interpreter-internal breakage the witnesses cannot see): the
-    // memo still hits — the masked class, whose detection happens at
-    // kernel-START failure time (the manager invalidates the memo and
-    // the provisioner retry re-probes).
+    // Fingerprint-invisible damage (the fake's verdict file): the memo still hits — the masked
+    // class, detected at kernel-START failure time.
     std::fs::write(&control, "broken\n").unwrap();
     assert!(kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
     assert_eq!(probe_count(), 6, "invisible damage alone does not re-probe");
 
-    // After a failed start (the invalidation it performs), the next
-    // readiness check re-probes and DETECTS the damage.
     invalidate_runtime_probe_cache();
     assert!(!kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
     assert_eq!(probe_count(), 7, "a failing probe is never memoized");
 
-    // Healing plus another invalidation restores readiness through a
-    // real probe, never a stale memo.
     std::fs::remove_file(&control).unwrap();
     invalidate_runtime_probe_cache();
     assert!(kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
     assert_eq!(probe_count(), 9, "invalidation probes runtime and dill");
 
-    // An uninstalled runtime (the out-of-band uninstall class) must
-    // re-probe rather than mask: the installed-rlm witness disappears,
-    // so the real probe runs again (this fake one still passes).
+    // An uninstalled runtime re-probes rather than masks: the installed-rlm
+    // witness disappears (the real probe fails; this fake one passes).
     std::fs::remove_dir_all(&rlm).unwrap();
     assert!(kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
     assert_eq!(
@@ -311,9 +286,6 @@ fn probe_memo_misses_on_out_of_band_venv_mutation() {
         "an uninstalled rlm probes runtime and dill"
     );
 
-    // A deleted interpreter must miss the memo without a probe
-    // invocation (the interpreter stat witness fails): readiness flips
-    // false because the probe cannot even run.
     std::fs::remove_file(&python).unwrap();
     assert!(!kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
     assert_eq!(
@@ -323,11 +295,8 @@ fn probe_memo_misses_on_out_of_band_venv_mutation() {
     );
 }
 
-/// The cross-process layer, pinned: a fresh process (empty in-process
-/// map — every cold open's worker and every spawned child boots as
-/// one) hits the on-disk memo under the same identity key and runs
-/// ZERO interpreter probes. The key recomputation (the content walk)
-/// is the damage detector; only the probes are skipped.
+/// The cross-process layer, pinned: a fresh process (empty in-process map)
+/// hits the on-disk memo under the same identity key and runs ZERO probes.
 #[cfg(unix)]
 #[test]
 fn disk_memo_hits_across_a_fresh_process_with_zero_probes() {
@@ -365,8 +334,6 @@ fn disk_memo_hits_across_a_fresh_process_with_zero_probes() {
         2,
         "the cold call probes runtime and dill and publishes the disk memo"
     );
-    // A fresh process: the in-process map is empty, the verdict lives
-    // on disk under the same key.
     clear_in_process_probe_memo_for_tests();
     assert!(kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
     assert_eq!(
@@ -374,7 +341,6 @@ fn disk_memo_hits_across_a_fresh_process_with_zero_probes() {
         2,
         "a fresh process hits the disk memo with zero interpreter invocations"
     );
-    // Invalidation drops both layers.
     invalidate_runtime_probe_cache();
     assert!(
         !super::super::disk_memo::disk_memo_path(&venv).exists(),
@@ -389,9 +355,7 @@ fn disk_memo_hits_across_a_fresh_process_with_zero_probes() {
 }
 
 /// Damage across processes: process A memoizes, the venv is damaged
-/// out of band, and a FRESH process must miss both layers through the
-/// freshly recomputed key and re-probe — never a stale cross-process
-/// verdict.
+/// out of band, and a FRESH process must miss both layers and re-probe.
 #[cfg(unix)]
 #[test]
 fn disk_memo_damage_across_processes_misses_and_reprobes() {
@@ -426,7 +390,6 @@ fn disk_memo_damage_across_processes_misses_and_reprobes() {
     assert!(kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
     assert_eq!(probe_count(), 2);
 
-    // An out-of-band rlm mutation: process B misses and re-probes.
     clear_in_process_probe_memo_for_tests();
     std::fs::write(rlm.join("core.py"), "y = 2\n").unwrap();
     assert!(kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
@@ -436,9 +399,8 @@ fn disk_memo_damage_across_processes_misses_and_reprobes() {
         "process B re-probes after the out-of-band rlm mutation"
     );
 
-    // The out-of-band uninstall class: same detection in the fresh
-    // process (this fake probe still passes; the real one fails and
-    // the provisioner rebuilds).
+    // The out-of-band uninstall class: the real probe fails and the
+    // provisioner rebuilds (this fake one still passes).
     clear_in_process_probe_memo_for_tests();
     std::fs::remove_dir_all(&rlm).unwrap();
     assert!(kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
@@ -448,10 +410,8 @@ fn disk_memo_damage_across_processes_misses_and_reprobes() {
         "process B re-probes after the rlm uninstall"
     );
 
-    // A repair to the EXACT already-verified content: the restored
-    // state matches the verdict the cold call published, so a fresh
-    // process HITS the disk memo with zero probes — restoring to a
-    // known-good verified state is the memo working as designed.
+    // A repair to the EXACT already-verified content: a fresh process HITS
+    // the disk memo with zero probes — the memo working as designed.
     std::fs::create_dir_all(&rlm).unwrap();
     std::fs::write(rlm.join("__init__.py"), "x = 1\n").unwrap();
     clear_in_process_probe_memo_for_tests();
@@ -463,8 +423,7 @@ fn disk_memo_damage_across_processes_misses_and_reprobes() {
     );
 
     // A rewritten version file (a newer concurrent daemon rebuilt the
-    // venv) fails the cheap version check before any probe or memo
-    // lookup: the rebuild path, not a stale-verdict path.
+    // venv) fails the cheap version check before any probe or memo lookup.
     clear_in_process_probe_memo_for_tests();
     write_bootstrap_version(&venv, "sha256:other-runtime", &[]).unwrap();
     assert!(!kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
@@ -474,8 +433,6 @@ fn disk_memo_damage_across_processes_misses_and_reprobes() {
         "a version-file rewrite fails the cheap check before any probe"
     );
 
-    // A deleted interpreter misses on the stat witness without a probe
-    // invocation, in the fresh process too.
     std::fs::remove_file(&python).unwrap();
     assert!(!kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
     assert_eq!(
@@ -485,13 +442,8 @@ fn disk_memo_damage_across_processes_misses_and_reprobes() {
     );
 }
 
-/// The masked class, pinned against the DISK layer: fingerprint-
-/// invisible damage is masked by a cross-process hit until the first
-/// failed kernel start drops BOTH layers and the retry re-probes and
-/// detects. This is the widened window the disclosure describes —
-/// in #2857 the in-process memo died with the process; here the
-/// window runs until the first failed start, with the same
-/// single-failure-then-heal end state.
+/// The masked class, pinned against the DISK layer: fingerprint-invisible damage is masked by a
+/// cross-process hit until the first failed kernel start drops BOTH layers and.
 #[cfg(unix)]
 #[test]
 fn disk_memo_masked_class_hits_across_processes_until_invalidation() {
@@ -542,8 +494,6 @@ fn disk_memo_masked_class_hits_across_processes_until_invalidation() {
         "the disk hit masks the invisible damage — the widened window"
     );
 
-    // The failed kernel start invalidates BOTH layers; the retry
-    // re-probes and DETECTS.
     invalidate_runtime_probe_cache();
     assert!(
         !super::super::disk_memo::disk_memo_path(&venv).exists(),
@@ -563,12 +513,9 @@ fn disk_memo_masked_class_hits_across_processes_until_invalidation() {
     assert_eq!(probe_count(), 5);
 }
 
-/// The write-vs-invalidate race: a late atomic write landing after an
-/// invalidation resurrects a key-valid entry. That is BENIGN — the
-/// entry's key matches the current environment, so the verdict was
-/// honestly earned — and the next failed start re-invalidates. No
-/// locking: the race's cost equals base's own behavior under the
-/// same breakage.
+/// The write-vs-invalidate race: a late atomic write landing after an invalidation resurrects a
+/// key-valid entry. That is BENIGN — the entry's key matches the current environment — and the next
+/// failed start re-invalidates.
 #[cfg(unix)]
 #[test]
 fn disk_memo_late_write_after_invalidate_is_benign() {
@@ -617,26 +564,22 @@ fn disk_memo_late_write_after_invalidate_is_benign() {
     );
     super::super::disk_memo::disk_memo_write(&super::super::disk_memo::disk_memo_path(&venv), &key);
 
-    // The retry hits the late entry: benign, honestly earned.
     assert!(kernel_ready(&python_str, &venv, "sha256:runtime", &[]));
     assert_eq!(
         probe_count(),
         2,
         "the late write's key-valid entry serves the retry without a probe"
     );
-    // The next failed start re-invalidates.
     invalidate_runtime_probe_cache();
     assert!(!super::super::disk_memo::disk_memo_path(&venv).exists());
 }
 
-/// Env-mutating tests serialize on this lock: the process env is
-/// global (same pattern as the request-timing env lock). Unix only:
-/// its takers are the unix env-override tests.
+/// Env-mutating tests serialize on this lock: the process env is global.
+/// Unix only: its takers are the unix env-override tests.
 #[cfg(unix)]
 static PRIME_AGENT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The d14 boundary pinned at the observable-facts level: a
-/// caller-owned `PRIME_AGENT_KERNEL_PYTHON` override resolves through
+/// A caller-owned `PRIME_AGENT_KERNEL_PYTHON` override resolves through
 /// the DIRECT probe and never reads or writes any memo file.
 #[cfg(unix)]
 #[tokio::test]
@@ -686,9 +629,8 @@ async fn custom_override_never_touches_the_disk_memo() {
     );
 }
 
-/// The Windows venv layout (`<venv>/Lib/site-packages/rlm`, no
-/// python-version layer) is a fingerprint input: mutations under it
-/// change the memo key, and removal drops to the missing marker.
+/// The Windows venv layout (`<venv>/Lib/site-packages/rlm`, no python-version layer) is a
+/// fingerprint input: mutations under it change the memo key.
 #[test]
 fn windows_layout_venv_rlm_is_witnessed() {
     let dir = tempfile::tempdir().unwrap();
@@ -714,12 +656,8 @@ fn windows_layout_venv_rlm_is_witnessed() {
     );
 }
 
-/// Live (ignored by default; run with `--ignored` on a machine with a
-/// kernel venv under `HOME`): the memo behavior against a REAL
-/// interpreter and a REAL `rlm` import — the probe result on the
-/// counting-wrapper venv must come from the memo while the installed
-/// tree is unchanged, and must re-run (and fail) when the installed
-/// `rlm` tree is removed out of band.
+/// Live (ignored by default; run with `--ignored` on a machine with a kernel venv under `HOME`):
+/// the memo behavior against a REAL interpreter and a REAL `rlm` import.
 #[cfg(unix)]
 #[test]
 #[ignore = "live: needs a real kernel venv under HOME (bench VMs)"]
@@ -773,7 +711,7 @@ fn live_probe_memo_reprobes_when_installed_rlm_is_removed() {
         std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let identity = resolve_runtime_identity();
+    let identity = hash_runtime_source(&require_runtime_source_dir().unwrap()).unwrap();
     write_bootstrap_version(&fake, &identity, &[]).unwrap();
 
     let probe_count = || {
@@ -841,11 +779,8 @@ fn live_probe_memo_reprobes_when_installed_rlm_is_removed() {
         "the removed dill re-probed runtime and dill"
     );
 
-    // EXTENDED SEQUENCE (the cross-process layer): restore dill,
-    // re-probe through a real verdict, then simulate a fresh process
-    // and pin that the disk hit runs ZERO real interpreter probes.
-    // The counts above stay the pre-extension sequence the #2857
-    // record carries; the extension below is labeled as such.
+    // EXTENDED SEQUENCE: restore dill, re-probe through a real verdict, then simulate a fresh
+    // process and pin that the disk hit runs ZERO real interpreter probes.
     let mut files = Vec::new();
     collect_python_files(&real_dill, &mut files).unwrap();
     for file in &files {
@@ -865,8 +800,6 @@ fn live_probe_memo_reprobes_when_installed_rlm_is_removed() {
         9,
         "the restored dill re-probes runtime and dill after invalidation"
     );
-    // The fresh-process leg: the in-process map is empty, the verdict
-    // lives on disk under the real content-walk key.
     clear_in_process_probe_memo_for_tests();
     assert!(kernel_ready(
         &python.to_string_lossy(),
@@ -881,14 +814,9 @@ fn live_probe_memo_reprobes_when_installed_rlm_is_removed() {
     );
 }
 
-/// Live-gated closure freeze (run with `--ignored` on a machine with a
-/// real kernel venv): the runtime-ready probe's import closure must
-/// stay stdlib-or-rlm-relative at MODULE level, because the memo
-/// fingerprints exactly the interpreter + `rlm` + `dill` trees — a
-/// module-level third-party import inside the closure would widen the
-/// probe's observable surface beyond what the key covers. The test
-/// AST-parses the INSTALLED runtime sources with the real python, so
-/// it pins the shipped artifact, not the repo checkout.
+/// Live-gated closure freeze (run with `--ignored` on a machine with a real kernel venv): the
+/// runtime-ready probe's import closure must stay stdlib-or- rlm-relative at MODULE level. Pins the
+/// shipped artifact.
 #[test]
 #[ignore = "live: needs a real kernel venv under HOME (bench VMs)"]
 fn live_probe_closure_is_stdlib_or_rlm_relative() {
@@ -1009,7 +937,6 @@ fn extra_recorded_skills_do_not_force_reinstall() {
     ]);
     let current = [skill("edit", "/skills/edit", "h1")];
     assert!(recorded_skills_cover(recorded.as_deref(), &current));
-    // A missing record (new session skill) does force a sync.
     assert!(!recorded_skills_cover(
         recorded.as_deref(),
         &[
@@ -1017,12 +944,10 @@ fn extra_recorded_skills_do_not_force_reinstall() {
             skill("goal", "/skills/goal", "h3")
         ],
     ));
-    // A changed pyproject hash does force a sync.
     assert!(!recorded_skills_cover(
         recorded.as_deref(),
         &[skill("edit", "/skills/edit", "changed")],
     ));
-    // No records at all: nothing is covered.
     assert!(!recorded_skills_cover(None, &current));
     assert!(recorded_skills_cover(None, &[]));
 }
@@ -1088,6 +1013,7 @@ async fn skill_sync_batches_missing_installs_into_one_uv_call() {
         uv.to_str().unwrap(),
         &venv,
         dir.path().join("python").as_path(),
+        dir.path().join("prime-agent-runtime").as_path(),
         "sha256:rt",
         &skills,
         &EnsureKernelPythonOptions::default(),
@@ -1105,6 +1031,7 @@ async fn skill_sync_batches_missing_installs_into_one_uv_call() {
         "the installed skill is not reinstalled: {calls:?}"
     );
     assert_eq!(calls[0].matches("--editable").count(), 1);
+    assert!(calls[0].contains(dir.path().join("prime-agent-runtime").to_str().unwrap()));
     let version = read_bootstrap_version(&venv).expect("version written");
     assert_eq!(
         version.python_skills.as_ref().map(Vec::len),
@@ -1116,9 +1043,7 @@ async fn skill_sync_batches_missing_installs_into_one_uv_call() {
 #[cfg(unix)]
 #[tokio::test]
 async fn skill_sync_falls_back_to_per_skill_installs_on_batch_failure() {
-    // A batch covering several skills fails; the fallback retries each
-    // missing skill alone, so one broken skill still costs only its own
-    // warning and the healthy skills still install.
+    // A batch covering several skills fails; the fallback retries each missing skill alone.
     let dir = tempfile::tempdir().unwrap();
     let uv = fake_uv(
         dir.path(),
@@ -1143,6 +1068,7 @@ async fn skill_sync_falls_back_to_per_skill_installs_on_batch_failure() {
         uv.to_str().unwrap(),
         &venv,
         dir.path().join("python").as_path(),
+        dir.path().join("prime-agent-runtime").as_path(),
         "sha256:rt",
         &skills,
         &options,
@@ -1159,6 +1085,9 @@ async fn skill_sync_falls_back_to_per_skill_installs_on_batch_failure() {
         calls[0].contains("edit") && calls[0].contains("broken"),
         "the batch covers both skills: {calls:?}"
     );
+    for call in &calls {
+        assert!(call.contains(dir.path().join("prime-agent-runtime").to_str().unwrap()));
+    }
     let warnings = warnings.lock().unwrap();
     assert!(
         warnings.len() == 1 && warnings[0].contains("broken"),
@@ -1245,5 +1174,147 @@ fn runtime_probe_requires_the_delivered_snapshot_guard() {
             has_prime_agent_runtime(&missing)
         ),
         (true, false, false)
+    );
+}
+
+/// Permission semantics need a non-root runner: `chmod` cannot deny root, so these
+/// tests skip as root and the gate harness runs the binary via `runuser` as a
+/// non-root user (a shared install dir readable but not writable, like the verifiers
+/// harness's `agent_user` seats).
+#[cfg(unix)]
+fn skip_when_root() -> bool {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: run as a non-root user (chmod cannot deny root)");
+        return true;
+    }
+    false
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A base-ready venv whose directory cannot host the bootstrap lock (EACCES/EROFS on
+/// the candidate) must degrade like a `PRIME_AGENT_KERNEL_PYTHON` override: the
+/// uncovered skill is disabled with a warning and the venv python is returned, with
+/// nothing installed into the read-only venv. Red on the raw EACCES before the fix.
+#[cfg(unix)]
+#[tokio::test]
+async fn unwritable_venv_disables_uncovered_skills_instead_of_failing() {
+    if skip_when_root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let venv = dir.path().join("kernel-venv");
+    let rlm = venv.join("lib/python3.11/site-packages/rlm");
+    std::fs::create_dir_all(&rlm).unwrap();
+    std::fs::write(rlm.join("__init__.py"), "x = 1\n").unwrap();
+    // The fake interpreter passes the runtime and dill probes; only the skill import fails.
+    let python = venv.join("bin/python");
+    std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+    std::fs::write(
+        &python,
+        "#!/bin/sh\nif [ \"$2\" = \"import edit\" ]; then exit 1; fi\nexit 0\n",
+    )
+    .unwrap();
+    set_mode(&python, 0o755);
+    let skill_dir = dir.path().join("skills/edit");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("pyproject.toml"),
+        "[project]\nname = \"edit\"\n",
+    )
+    .unwrap();
+    let runtime_source = require_runtime_source_dir().unwrap();
+    let runtime_identity = hash_runtime_source(&runtime_source).unwrap();
+    write_bootstrap_version(&venv, &runtime_identity, &[]).unwrap();
+
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut options = EnsureKernelPythonOptions::default();
+    let sink = warnings.clone();
+    options.on_progress = Some(std::sync::Arc::new(move |message: &str| {
+        sink.lock().unwrap().push(message.to_string());
+    }));
+    options.python_skills = vec![KernelPythonSkill {
+        name: "edit".to_string(),
+        import_name: "edit".to_string(),
+        package_path: skill_dir.clone(),
+        pyproject_path: skill_dir.join("pyproject.toml"),
+    }];
+
+    set_mode(&venv, 0o555);
+    set_mode(dir.path(), 0o555);
+    let outcome = super::super::ensure_kernel_venv(
+        &options,
+        &normalize_python_skills(&options.python_skills),
+        venv.clone(),
+    )
+    .await;
+    set_mode(dir.path(), 0o755);
+    set_mode(&venv, 0o755);
+
+    let resolved = outcome.expect("a base-ready venv must still yield its python");
+    assert_eq!(resolved.python, python);
+    let warnings = warnings.lock().unwrap();
+    assert!(
+        warnings.len() == 1
+            && warnings[0].contains("Warning: Python skills unavailable in")
+            && warnings[0].contains(&venv.display().to_string())
+            && warnings[0].contains("edit (edit)"),
+        "one warning naming the venv and the disabled skill: {warnings:?}"
+    );
+    assert!(
+        !dir.path().join("kernel-venv.bootstrap.lock").exists(),
+        "the read-only directory hosts no lock"
+    );
+    let version = read_bootstrap_version(&venv).expect("the version file is still readable");
+    assert!(
+        version.python_skills.as_ref().is_none_or(Vec::is_empty),
+        "nothing was installed into the read-only venv: {version:?}"
+    );
+}
+
+/// A venv that cannot host the lock AND cannot run the kernel is a setup error that
+/// names the venv and both env overrides — not the raw candidate-file EACCES.
+/// Red on the raw EACCES before the fix.
+#[cfg(unix)]
+#[tokio::test]
+async fn unwritable_stale_venv_names_the_venv_and_both_env_overrides() {
+    if skip_when_root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let venv = dir.path().join("kernel-venv");
+    let python = venv.join("bin/python");
+    std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+    std::fs::write(&python, "#!/bin/sh\nexit 0\n").unwrap();
+    set_mode(&python, 0o755);
+    // A stale runtime identity: the base is not ready, so the venv needs a rebuild.
+    write_bootstrap_version(&venv, "sha256:stale", &[]).unwrap();
+
+    set_mode(&venv, 0o555);
+    set_mode(dir.path(), 0o555);
+    let error =
+        super::super::ensure_kernel_venv(&EnsureKernelPythonOptions::default(), &[], venv.clone())
+            .await
+            .expect_err("an unusable venv in a read-only dir is a setup error");
+    set_mode(dir.path(), 0o755);
+    set_mode(&venv, 0o755);
+
+    let message = error.to_string();
+    assert!(
+        message.contains(&venv.display().to_string()),
+        "names the venv: {message}"
+    );
+    assert!(
+        message.contains("PRIME_AGENT_KERNEL_VENV")
+            && message.contains("PRIME_AGENT_KERNEL_PYTHON"),
+        "names both env overrides: {message}"
+    );
+    assert!(
+        !message.contains("candidate-"),
+        "no raw lock-candidate path: {message}"
     );
 }

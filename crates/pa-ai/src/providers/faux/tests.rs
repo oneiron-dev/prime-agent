@@ -307,8 +307,8 @@ async fn parses_the_repeat_last_response_script_key_into_the_registration() {
     assert_eq!(registration.call_count(), 2);
     registration.unregister();
 
-    // The knob stays off unless the script opts in: the finite queue and
-    // its exhaustion error are the response-budget contract.
+    // The knob stays off unless the script opts in: the finite queue and its exhaustion error are
+    // the response-budget contract.
     let parsed = script::parse_faux_script(&serde_json::json!({ "responses": ["only"] }))
         .expect("script parses");
     assert!(!parsed.repeat_last_response);
@@ -330,8 +330,8 @@ async fn repeat_last_response_switched_on_after_serving_replays_the_last_step() 
     let last = complete(&registration.get_model(), &context, None)
         .await
         .unwrap();
-    // The queue is dry and the mode was off while it drained; switching
-    // repeat-last on now still has the last served step recorded.
+    // The queue is dry and the mode was off while it drained; switching repeat-last on now still
+    // has the last served step recorded.
     registration.set_repeat_last_response(true);
     let replay = complete(&registration.get_model(), &context, None)
         .await
@@ -628,6 +628,42 @@ async fn does_not_share_cache_across_sessions_or_requests_without_session_id() {
     assert_eq!(third.usage.cache_read, 0);
     assert_eq!(third.usage.cache_write, 0);
     registration.unregister();
+}
+
+#[test]
+fn cached_requests_count_prompt_tokens_once_after_a_summary_replaces_the_prefix() {
+    let cache = Mutex::new(HashMap::new());
+    let options = StreamOptions {
+        session_id: Some("generation-and-summary".into()),
+        ..Default::default()
+    };
+    for prompt in [
+        "generation prompt",
+        "generation prompt plus a turn",
+        "summary prompt",
+        "generation prompt plus another turn",
+    ] {
+        let context = Context {
+            system_prompt: Some(prompt.into()),
+            messages: vec![user_text("hello")],
+            tools: None,
+        };
+        let reply = faux_assistant_message(
+            vec![faux_text("answer")],
+            FauxAssistantMessageOptions::default(),
+        );
+        let response = with_usage_estimate(reply, &context, Some(&options), &cache);
+        let prompt_tokens = estimate_tokens(&serialize_context(&context));
+        let output_tokens = estimate_tokens("answer");
+        assert_eq!(
+            (
+                response.usage.total_tokens,
+                response.usage.input + response.usage.cache_read + response.usage.cache_write
+            ),
+            (prompt_tokens + output_tokens, prompt_tokens),
+            "cache partition for {prompt}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1139,10 +1175,9 @@ async fn supports_aborting_mid_toolcall_stream_when_paced() {
 
 #[tokio::test]
 async fn unregisters_the_provider() {
-    // No registry reset here: clearing the process-wide registry races with
-    // the other faux tests' registrations. The registration's api id is
-    // unique (`random_id`) and `unregister` removes by source id, so the
-    // lookup below is deterministic without nuking parallel tests.
+    // No registry reset here: clearing the process-wide registry races with the other faux tests'
+    // registrations. The registration's api id is unique (`random_id`) and `unregister` removes by
+    // source id, so the lookup below is deterministic without nuking parallel tests.
     let registration = register();
     registration.set_responses(vec![text_msg("hello")]);
     let api = registration.api.clone();

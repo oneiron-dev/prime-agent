@@ -491,12 +491,20 @@ def cli_prefix(args: argparse.Namespace) -> Path:
     return refuse_ts_state("prefix", prefix)
 
 
-def cli_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
-    """The canonical --prefix and --bin-dir, checked against TS state; the
-    Rust launcher in the bin dir may not alias the TS one."""
+def cli_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+    """The canonical --prefix and --bin-dir, checked against TS state.
+
+    Read-only status and an unactivated install do not write or run either
+    launcher, so they can inspect or stage files with an existing alias."""
     prefix = cli_prefix(args)
     bin_dir = refuse_ts_state("bin dir", checked_path(
         "--bin-dir", os.path.expanduser(args.bin_dir or f"{HOME}/.local/bin")))
+    return prefix, bin_dir
+
+
+def cli_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
+    """The canonical --prefix and --bin-dir, with distinct launcher paths."""
+    prefix, bin_dir = cli_paths(args)
     if (bin_dir / LAUNCHER_NAME).resolve() == (bin_dir / TS_LAUNCHER_NAME).resolve():
         raise SystemExit("error: the prime-agent-rs launcher would alias the TS prime-agent launcher")
     return prefix, bin_dir
@@ -997,7 +1005,7 @@ def install(args: argparse.Namespace) -> int:
     # Every destination is validated before anything is written: the prefix
     # (receipts included), the bin dir, and the agent dir, socket dir and
     # kernel venv the seeder and the launcher's --version run will create.
-    prefix, bin_dir = cli_dirs(args)
+    prefix, bin_dir = cli_dirs(args) if args.activate else cli_paths(args)
     runtime = runtime_dirs()
     agent_dir = runtime["agent dir"]
     check_prefix_tree(prefix)

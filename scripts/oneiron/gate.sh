@@ -160,6 +160,7 @@ run_sandboxed_test() {
   # Short paths: tests bind unix sockets under TMPDIR and sun_path holds
   # ~104-108 bytes, so the sandbox sits directly in /tmp as on a CI runner.
   sandbox="$(mktemp -d /tmp/pg.XXXXXX)"
+  sandbox="$(cd "$sandbox" && pwd -P)"
   mkdir -p "$sandbox/h" "$sandbox/t" "$sandbox/bin"
   echo "gate: sandbox $sandbox"
   local ts_reference="${PA_TS_BINARY:-}" shadowed_path="" seen="" dir entry status shadows=0
@@ -191,17 +192,21 @@ run_sandboxed_test() {
     set -e
     export HOME="$sandbox/h" TMPDIR="$sandbox/t" XDG_CONFIG_HOME="$sandbox/h/.config" \
       XDG_DATA_HOME="$sandbox/h/.local/share" XDG_STATE_HOME="$sandbox/h/.local/state" \
-      PATH="$shadowed_path" TZ=UTC
-    # CI runs with a clean env. Every product switch goes: state roots
-    # (session dirs, agent dir), harness state and debug sinks (RLM_*,
-    # PA_*: write destinations, not metadata), update roles (the restart
-    # roster), sockets, venvs, telemetry (a developer's DO_NOT_TRACK=1 flips
-    # the env-precedence tests). HOME/TMPDIR alone would not neutralize an
-    # inherited override.
-    for name in $(env | sed -nE 's/^((PRIME_AGENT|PI|RLM|PA)_[A-Za-z0-9_]*)=.*/\1/p'); do
-      unset "$name"
+      PATH="$shadowed_path" TZ=UTC TERM=xterm-256color
+    # Keep build/cache inputs only: provider credentials can change model
+    # selection even under a fresh HOME, and must not reach test fixtures.
+    for name in $(compgen -e); do
+      case "$name" in
+        HOME|TMPDIR|PATH|TZ|LANG|LC_ALL|TERM|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|\
+        CARGO_HOME|RUSTUP_HOME|RUSTUP_TOOLCHAIN|CARGO_TARGET_DIR|CARGO_BUILD_JOBS|CARGO_INCREMENTAL|\
+        RUSTC_WRAPPER|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_TARGET_*|\
+        SCCACHE_DIR|SCCACHE_IDLE_TIMEOUT|UV_CACHE_DIR|UV_PYTHON_INSTALL_DIR|\
+        PYTHONPYCACHEPREFIX) ;;
+        *) unset "$name" ;;
+      esac
     done
-    unset DO_NOT_TRACK
+    # PTY fixtures must probe their own terminal, not inherit the host's hints.
+    unset TERM_PROGRAM TERM_PROGRAM_VERSION KITTY_WINDOW_ID GHOSTTY_RESOURCES_DIR WEZTERM_PANE TMUX STY
     # The TS-differential suites run `PA_TS_BINARY`, else `prime-agent` on
     # PATH. Here that would be the Oneiron TS fork, not upstream's parity
     # ground truth, so by default neither exists (they skip as on a CI

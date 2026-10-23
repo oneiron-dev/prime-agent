@@ -1,13 +1,5 @@
-// The Tier-C/D ruling (fleet-uniform, 2026-09-28): stack-resident futures
-// by design on hot paths (boxing 130 fns is allocation-churn with zero
-// correctness gain); the fn-length threshold is a style gate, not
-// correctness (the harness fns are intentionally linear); 64-bit targets -
-// the narrowing sits at OS/protocol boundaries where the values are
-// bounded (pid syscalls, epoch/elapsed milliseconds, calendar math,
-// guarded parses), and checked conversions would add panic paths where
-// silent wrap was deliberate (the one genuinely-suspect family, args.rs's
-// parse_positive_u32 lacking its u32::MAX bound, is flagged in the lane
-// dossier for the conductor).
+// large_futures: stack futures on hot paths by design. too_many_lines: style gate
+// only. Casts: 64-bit targets; narrowing sits at bounded OS/protocol boundaries.
 #![allow(
     clippy::large_futures,
     clippy::too_many_lines,
@@ -20,8 +12,7 @@
 //! End-to-end verifier for the TUI export/share commands: a scripted daemon
 //! session driven headlessly — `/export` (HTML and JSONL) writes the file and
 //! reports the TS success row, and `/share` uploads through a stub `gh` on
-//! PATH (no real upload ever leaves the box) and surfaces the share viewer
-//! URL. `Usage: /share` is the TS error row when arguments appear.
+//! PATH and surfaces the share viewer URL.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -37,8 +28,8 @@ struct Supervisor {
 
 impl Drop for Supervisor {
     fn drop(&mut self) {
-        graceful_shutdown(&self.socket);
         let worker_pids = child_pids_of(self.child.id());
+        graceful_shutdown(&self.socket);
         let _ = self.child.kill();
         let _ = self.child.wait();
         for pid in worker_pids {
@@ -49,9 +40,8 @@ impl Drop for Supervisor {
 }
 
 fn kill_worker(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
+    let _ =
+        pa_core::platform::process::kill_pid(pid as i32, pa_core::platform::process::Signal::Kill);
     let deadline = Instant::now() + Duration::from_secs(5);
     while process_alive(pid) {
         assert!(
@@ -62,6 +52,7 @@ fn kill_worker(pid: u32) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn process_alive(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
         let rest = stat
@@ -72,6 +63,22 @@ fn process_alive(pid: u32) -> bool {
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+fn process_alive(pid: u32) -> bool {
+    if !pa_core::platform::process::pid_exists(pid) {
+        return false;
+    }
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .expect("query the owned worker state");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .is_some_and(|state| !state.starts_with('Z') && !state.starts_with('X'))
+}
+
+#[cfg(target_os = "linux")]
 fn child_pids_of(ppid: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     let entries = std::fs::read_dir("/proc").expect("read /proc");
@@ -95,6 +102,24 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
         }
     }
     pids
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_pids_of(ppid: u32) -> Vec<u32> {
+    let output = Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .expect("query the spawned supervisor's children");
+    assert!(output.status.success(), "the native PID/PPID query failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let child = fields.next()?.parse::<u32>().ok()?;
+            let parent = fields.next()?.parse::<u32>().ok()?;
+            (parent == ppid).then_some(child)
+        })
+        .collect()
 }
 
 fn graceful_shutdown(socket: &Path) {
@@ -222,7 +247,6 @@ async fn tui_export_and_share_surface() {
     let previous_viewer_url = std::env::var("PI_SHARE_VIEWER_URL").ok();
     std::env::set_var("PATH", format!("{}:{}", stub_dir.display(), previous_path));
 
-    // A live scripted session: one prompt, one scripted answer.
     // The faux engine (`engine: "faux"`) drives the real agent engine, so
     // the export embeds the real session's tools section.
     let script = serde_json::json!({ "engine": "faux", "responses": [
@@ -362,10 +386,10 @@ async fn tui_export_and_share_surface() {
     // `state.tools` in the live-session export).
     let tools = data["tools"].as_array().expect("tools section");
     assert!(
-        tools.iter().any(|tool| tool["name"] == "ipython"
+        tools.iter().any(|tool| tool["name"] == "python_repl"
             && tool["description"].is_string()
             && tool["parameters"].is_object()),
-        "ipython contract in export tools: {data}"
+        "python_repl contract in export tools: {data}"
     );
     // No custom tool ran: the pre-render section is omitted, not null.
     assert!(

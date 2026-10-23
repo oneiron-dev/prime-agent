@@ -1,18 +1,10 @@
 //! The #2117 error classifier: a failed model call's message becomes a
 //! fixed (category, subtype, code, `http_status`) tuple plus a fixed
-//! diagnostic, with the message policy keeping raw provider text out.
-//!
-//! Classification order (the TS `classifyTelemetryError`): structured
-//! evidence first - a bounded HTTP status, then a recognized safe error
-//! code - then the reviewed fixed-string message set, then nothing: an
-//! unmatched message classifies as subtype `unknown` with the generic
-//! diagnostic, and the raw text never uploads (only its length and a
-//! redaction flag). Reviewed fixed strings are the ONLY message text that
-//! may ride an event; they are application-authored, never provider text.
+//! diagnostic; raw provider text never uploads. Order: a bounded HTTP
+//! status, then a safe error code, then the reviewed fixed-string set.
 
-/// The fixed diagnostic messages per subtype (#2117
-/// `TELEMETRY_ERROR_MESSAGES`). These are the only error descriptions
-/// eligible for upload.
+/// The fixed diagnostic messages per subtype (#2117 `TELEMETRY_ERROR_MESSAGES`):
+/// the only error descriptions eligible for upload.
 pub const ERROR_DIAGNOSTICS: &[(&str, &str)] = &[
     ("credential_missing", "No API key found for [provider]."),
     (
@@ -79,9 +71,32 @@ pub const ERROR_DIAGNOSTICS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The fixed provider transport disclosures pa-ai emits when the turn's
+/// auto-retries exhaust (`ProviderConnectionError::message` and the
+/// AWS h2 failure texts, `crates/pa-ai/src/utils_inner/stream_failure.rs`):
+/// a recognized disclosure prefix is typed evidence, unlike a bare
+/// keyword. Prefix-matched because some families append a cause
+/// (`Request timed out: <cause>`) or the SDK's wrapper
+/// (`Unexpected HTTP client error: TypeError: <raw>`).
+const TRANSPORT_DISCLOSURES: &[(&str, &str)] = &[
+    ("Connection error.", "network_error"),
+    ("Request timed out", "timeout"),
+    (
+        "Unable to connect. Is the computer able to access the url?",
+        "network_error",
+    ),
+    (
+        "Unexpected HTTP client error: TypeError: Unable to connect",
+        "network_error",
+    ),
+    ("Protocol error", "network_error"),
+    ("Stream closed with error code", "network_error"),
+    ("Session closed with error code", "network_error"),
+    ("The pending stream has been canceled", "network_error"),
+];
+
 /// The reviewed fixed-string error messages (#2117
-/// `TELEMETRY_SAFE_ERROR_MESSAGES`): a message that matches one of these
-/// exactly may ride the event as `error_message`.
+/// `TELEMETRY_SAFE_ERROR_MESSAGES`): an exact match may ride as `error_message`.
 const REVIEWED_MESSAGES: &[(&str, &str)] = &[
     ("cancelled", "Request was aborted"),
     ("cancelled", "The operation was aborted."),
@@ -109,9 +124,8 @@ const REVIEWED_MESSAGES: &[(&str, &str)] = &[
     ("filesystem_error", "Auth storage lock was compromised"),
 ];
 
-/// The safe error codes and their subtypes (#2117 `CODE_SUBTYPES`): a
-/// code token in the message classifies the error; the message text
-/// itself never uploads.
+/// The safe error codes and their subtypes (#2117 `CODE_SUBTYPES`): a code
+/// token classifies the error; the message text itself never uploads.
 const CODE_SUBTYPES: &[(&str, &str)] = &[
     ("invalid_api_key", "credential_invalid"),
     ("invalid_token", "credential_invalid"),
@@ -168,8 +182,8 @@ const CODE_SUBTYPES: &[(&str, &str)] = &[
     ("ELOCKED", "filesystem_error"),
 ];
 
-/// The subtype's legacy category (#2117 `SUBTYPE_CATEGORIES`): structured
-/// evidence names the category too, never the raw message wording.
+/// The subtype's legacy category: structured evidence names the
+/// category, never the raw message wording.
 fn subtype_category(subtype: &str) -> &'static str {
     match subtype {
         "credential_missing"
@@ -186,8 +200,7 @@ fn subtype_category(subtype: &str) -> &'static str {
 }
 
 /// Whether the subtype's failures are retryable by the auto-retry policy
-/// (the classifier's static verdict; the retry seam corroborates it with
-/// the actual retry observations).
+/// (the classifier's static verdict).
 fn subtype_retryable(subtype: &str) -> bool {
     matches!(
         subtype,
@@ -223,9 +236,26 @@ pub struct ErrorClassification {
     pub retryable: bool,
 }
 
+impl ErrorClassification {
+    /// The nano-rlm #200 ACP-boundary view: only the exhausted model
+    /// connection family is `model_transport` (the one class a host may
+    /// re-prompt on). HTTP status errors keep their provider categories —
+    /// a host retry is a fresh prompt, not an idempotent replay, so
+    /// `retryable` verdicts from the auto-retry policy (rate limits,
+    /// quota, balance, malformed responses) do not transfer to the
+    /// boundary.
+    #[must_use]
+    pub fn is_model_transport(&self) -> bool {
+        // An HTTP-status classification (a 408 reads as `timeout`) is a
+        // provider answer over a live connection, not a model-connection
+        // failure: the status verdicts keep their provider categories.
+        matches!(self.subtype, "network_error" | "stream_drop" | "timeout")
+            && self.http_status.is_none()
+    }
+}
+
 /// Classify one failed call's error message. The message itself never
-/// uploads: only the fixed tuples, the diagnostic, and - when the text is
-/// a reviewed fixed string - that exact string.
+/// uploads: only the fixed tuples, the diagnostic, and a reviewed string.
 #[must_use]
 pub fn classify_error_message(message: &str) -> ErrorClassification {
     let diagnostic = |subtype: &str| {
@@ -260,10 +290,9 @@ pub fn classify_error_message(message: &str) -> ErrorClassification {
             retryable: subtype_retryable(subtype),
         };
     }
-    // 2. A recognized safe error code token names the subtype. The
-    // match runs case-insensitively in both directions (a lowercase
-    // message carries `econnreset`; the reported code keeps its canonical
-    // spelling).
+    // 2. A recognized safe error code token names the subtype. The match
+    // runs case-insensitively in both directions; the code keeps its
+    // canonical spelling.
     let lowered = message.to_ascii_lowercase();
     if let Some((code, subtype)) = CODE_SUBTYPES.iter().find(|(code, _)| {
         let lowered_code = code.to_ascii_lowercase();
@@ -280,7 +309,26 @@ pub fn classify_error_message(message: &str) -> ErrorClassification {
             retryable: subtype_retryable(subtype),
         };
     }
-    // 3. A reviewed fixed-string message (exact match, the only text that
+    // 3. A fixed provider transport disclosure (prefix match): the
+    // exhausted-connection family pa-ai itself discloses, so the most
+    // common real connection failures classify instead of reading as
+    // `unknown`.
+    if let Some((_, subtype)) = TRANSPORT_DISCLOSURES
+        .iter()
+        .find(|(disclosure, _)| message.starts_with(disclosure))
+    {
+        return ErrorClassification {
+            diagnostic: diagnostic(subtype),
+            safe_message: None,
+            category: subtype_category(subtype),
+            subtype,
+            code: None,
+            http_status: None,
+            classification_source: "transport_disclosure",
+            retryable: subtype_retryable(subtype),
+        };
+    }
+    // 4. A reviewed fixed-string message (exact match, the only text that
     // may upload).
     if let Some((subtype, reviewed)) = REVIEWED_MESSAGES
         .iter()
@@ -297,7 +345,7 @@ pub fn classify_error_message(message: &str) -> ErrorClassification {
             retryable: subtype_retryable(subtype),
         };
     }
-    // 4. Unmatched: the generic diagnostic; the raw text never uploads.
+    // 5. Unmatched: the generic diagnostic; the raw text never uploads.
     ErrorClassification {
         diagnostic: diagnostic("unknown"),
         safe_message: None,
@@ -388,7 +436,6 @@ mod tests {
         assert_eq!(classification.category, "rate_limit");
         assert_eq!(classification.classification_source, "http_status");
         assert!(classification.retryable);
-        // The raw text never rides the classification.
         assert!(classification.safe_message.is_none());
         assert!(!classification.diagnostic.contains("API Error"));
     }
@@ -399,7 +446,6 @@ mod tests {
         assert_eq!(bounded_http_status("error 4012 nope"), None);
         assert_eq!(bounded_http_status("14043"), None);
         assert_eq!(bounded_http_status("no status at all"), None);
-        // Durations in the text never read as statuses.
         assert_eq!(bounded_http_status("timed out after 500ms"), None);
         assert_eq!(bounded_http_status("retry in 429s"), None);
         assert_eq!(bounded_http_status("wait 30m"), None);
@@ -438,7 +484,6 @@ mod tests {
         let aborted = classify("Request was aborted");
         assert_eq!(aborted.subtype, "cancelled");
         assert!(pa_telemetry::ERROR_SUBTYPES.contains(&aborted.subtype));
-        // A near-miss uploads nothing.
         let near_miss = classify("Provider rate limit exceeded for model glm-4.6");
         assert!(near_miss.safe_message.is_none());
         assert_eq!(near_miss.classification_source, "unknown");
@@ -526,6 +571,60 @@ mod tests {
         assert_eq!(billing.subtype, "insufficient_balance");
         assert_eq!(billing.category, "other");
         assert_eq!(billing.http_status, Some(402));
+    }
+
+    #[test]
+    fn transport_disclosures_classify_the_exhausted_connection_family() {
+        // The fixed pa-ai disclosures (`ProviderConnectionError::message`):
+        // the most common real connection failures, all typed transport.
+        let cases = [
+            ("Connection error.", "network_error"),
+            ("Request timed out.", "timeout"),
+            ("Request timed out: fetch timed out", "timeout"),
+            ("Unable to connect. Is the computer able to access the url?", "network_error"),
+            (
+                "Unexpected HTTP client error: TypeError: Unable to connect. Is the computer able to access the url?",
+                "network_error",
+            ),
+            ("Protocol error", "network_error"),
+            ("Stream closed with error code 0x2", "network_error"),
+            ("The pending stream has been canceled", "network_error"),
+        ];
+        for (message, subtype) in cases {
+            let classification = classify(message);
+            assert_eq!(classification.subtype, subtype, "{message}");
+            assert_eq!(classification.classification_source, "transport_disclosure");
+            assert!(classification.is_model_transport(), "{message}");
+        }
+        // A disclosure embedded mid-message is not evidence: only the
+        // provider layer's own prefix form is a typed disclosure.
+        let embedded = classify("tool output: Request timed out mid-run");
+        assert_eq!(embedded.subtype, "unknown");
+        assert!(!embedded.is_model_transport());
+    }
+
+    #[test]
+    fn model_transport_covers_only_the_connection_family() {
+        for message in ["ECONNRESET mid-stream", "Provider dropped the response stream (stream_drop): the stream ended inside a thinking block before the stop signal"] {
+            assert!(classify(message).is_model_transport(), "{message}");
+        }
+        // HTTP status errors keep their provider categories (#200: they
+        // retain the existing behavior, so none is boundary-retryable) —
+        // including the 408, whose `timeout` subtype is a provider
+        // rejection over a live connection, not an exhausted connect.
+        for message in [
+            "API Error: 429 rate limit exceeded",
+            "401 unauthorized",
+            "402 insufficient credits",
+            "500 Internal Server Error",
+            "408 Request Timeout",
+            "context_length_exceeded",
+        ] {
+            let classification = classify(message);
+            assert!(!classification.is_model_transport(), "{message}");
+        }
+        // The SDK timeout disclosure (no status) is the transport family.
+        assert!(classify("Request timed out.").is_model_transport());
     }
 
     #[test]

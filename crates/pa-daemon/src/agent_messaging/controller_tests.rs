@@ -1,16 +1,12 @@
-//! The controller test battery (moved with its concern): family roster,
-//! direct peer delivery, fallback, and observe families.
-
-// ---------------------------------------------------------------------------
-// Controller tests: family roster, direct peer delivery, fallback
-// ---------------------------------------------------------------------------
+//! The controller test battery: family roster, direct peer delivery,
+//! fallback, and observe families.
 
 use super::observe::summaries_from_roster;
 use super::*;
 use crate::protocol::{response_failure, response_success};
 use crate::rlm_children::RlmChildIdentity;
 use crate::supervisor_link::SupervisorLink;
-use pa_core::session_engine::agent_messaging::AgentMessageController;
+use pa_core::session_engine::agent_messaging::{AgentMessageController, AgentObserveController};
 use pa_types::platform::transport::bind_transport;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -56,6 +52,34 @@ async fn spawn_fake_supervisor(
                             "list_agent_peers",
                             Some(json!({ "peers": roster["sessions"] })),
                         ),
+                        // The observe controller's roster walk.
+                        "list" => response_success(
+                            Some(&id),
+                            "list",
+                            Some(json!({ "sessions": roster["sessions"] })),
+                        ),
+                        // Target-specific transcripts let resolver regressions prove
+                        // which worker was read; older fixtures retain their five-row tail.
+                        "get_messages" => {
+                            let active = command["activeSessionId"].as_str().unwrap_or_default();
+                            let messages = roster["messagesByActiveSessionId"]
+                                .get(active)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    json!([
+                                        { "role": "user", "content": "m0", "timestamp": 10 },
+                                        { "role": "user", "content": "m1", "timestamp": 11 },
+                                        { "role": "user", "content": "m2", "timestamp": 12 },
+                                        { "role": "user", "content": "m3", "timestamp": 13 },
+                                        { "role": "user", "content": "m4", "timestamp": 14 },
+                                    ])
+                                });
+                            response_success(
+                                Some(&id),
+                                "get_messages",
+                                Some(json!({ "messages": messages })),
+                            )
+                        }
                         "get_worker_peer_transport" => match ticket_response.clone() {
                             Some(ticket) => {
                                 response_success(Some(&id), &command_type, Some(ticket))
@@ -110,9 +134,8 @@ fn controller(
     }
 }
 
-/// A controller whose children registry holds one resident child
-/// (`sub-kid1`, live id `ddd444`): the same registry shape
-/// `rlm.list_subagents` reads.
+/// A controller whose children registry holds one resident child: the same
+/// registry shape `rlm.list_subagents` reads.
 fn controller_with_children(
     socket: std::path::PathBuf,
     own_summary: Option<Value>,
@@ -125,10 +148,22 @@ fn controller_with_children(
             std::path::PathBuf::from("/agent"),
             /*telemetry_disabled*/ true,
         )),
+        String::new(),
     );
     let mut controller = controller(socket, own_summary);
     controller.children = Some(Arc::new(children));
     controller
+}
+
+/// The observe controller over the same scripted supervisor: roster
+/// reads and transcript reads share one link.
+fn observe_controller(socket: std::path::PathBuf) -> LinkAgentObserveController {
+    LinkAgentObserveController::new(
+        Arc::new(SupervisorLink::new(socket)),
+        "aaa111".to_string(),
+        Arc::new(std::sync::Mutex::new(own_summary())),
+        None,
+    )
 }
 
 /// Seed the children registry with one admitted child (the same state
@@ -195,12 +230,6 @@ async fn family_reads_siblings_from_the_supervisor_roster() {
     assert_eq!(family[1].name, None);
 }
 
-/// The family view labels this session's registry children as Child
-/// members (with the RLM child id and persisted session id as alias
-/// selectors) and its own parent as the Parent member; the child row
-/// is not also a sibling. Siblings are the rows sharing this
-/// session's durable parent edge — a top-level row from another
-/// family is NOT a sibling, even with a matching name.
 #[tokio::test]
 async fn family_labels_children_and_parent_from_the_registry() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -239,9 +268,7 @@ async fn family_labels_children_and_parent_from_the_registry() {
     )
     .await;
     let family = controller.family().await.unwrap();
-    // TS `selectAgentFamily` order: parent, siblings, children. The
-    // unrelated top-level row (xxx999) never enters the family, and
-    // the second "beta" name cannot cross families.
+    // TS `selectAgentFamily` order: parent, siblings, children.
     assert_eq!(family.len(), 3, "{family:?}");
     assert_eq!(family[0].relationship, AgentFamilyRelationship::Parent);
     assert_eq!(family[0].id, "ppp000");
@@ -256,8 +283,6 @@ async fn family_labels_children_and_parent_from_the_registry() {
     assert_eq!(family[2].id, "ddd444");
     assert_eq!(family[2].name.as_deref(), Some("worker-a"));
     assert_eq!(family[2].aliases, vec!["sub-kid1", "sess-d"]);
-    // No member duplicates the child as a sibling; no other family's
-    // session appears in any role.
     assert!(!family
         .iter()
         .any(|member| member.id == "ddd444"
@@ -265,8 +290,6 @@ async fn family_labels_children_and_parent_from_the_registry() {
     assert!(!family.iter().any(|member| member.id == "xxx999"));
 }
 
-/// A child resolves its parent by the persisted session id too (the
-/// live id can change across a parent worker restart).
 #[tokio::test]
 async fn family_resolves_the_parent_by_session_id() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -294,7 +317,8 @@ async fn family_resolves_the_parent_by_session_id() {
 }
 
 /// Registry children the roster does not list stay addressable as Child
-/// members keyed by their registry identity.
+/// members keyed by their durable session id (the wake-resolvable
+/// selector), the spawn-time live id kept as an alias.
 #[tokio::test]
 async fn family_keeps_off_roster_children_addressable() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -321,12 +345,11 @@ async fn family_keeps_off_roster_children_addressable() {
     let family = controller.family().await.unwrap();
     assert_eq!(family.len(), 1, "{family:?}");
     assert_eq!(family[0].relationship, AgentFamilyRelationship::Child);
-    assert_eq!(family[0].id, "eee555");
+    assert_eq!(family[0].id, "sess-e");
     assert_eq!(family[0].name.as_deref(), Some("worker-b"));
-    assert_eq!(family[0].aliases, vec!["sub-kid2", "sess-e"]);
+    assert_eq!(family[0].aliases, vec!["sub-kid2", "sess-e", "eee555"]);
 }
 
-/// A refused ticket falls back to the supervisor-routed `send_message`.
 #[tokio::test]
 async fn refused_ticket_falls_back_to_the_supervisor_route() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -348,8 +371,6 @@ async fn refused_ticket_falls_back_to_the_supervisor_route() {
     );
 }
 
-/// The self-target guard answers with the TS string before any wire
-/// traffic.
 #[tokio::test]
 async fn self_target_is_refused() {
     let controller = controller(std::path::PathBuf::from("/nonexistent.sock"), None);
@@ -367,10 +388,10 @@ async fn self_target_is_refused() {
     );
 }
 
-/// A minted ticket delivers straight to the target worker's socket:
-/// `peer_auth` with the worker purpose, then `worker_deliver_message`
-/// carrying the TS sender identity block, and the receipt maps onto
-/// the kernel shape.
+/// A minted ticket delivers straight to the target worker's socket,
+/// addressed to the ticket's resolved session: `peer_auth` with the
+/// worker purpose, then `worker_deliver_message` carrying the TS
+/// sender identity block, and the receipt maps onto the kernel shape.
 #[tokio::test]
 async fn direct_ticket_delivers_to_the_target_worker_socket() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -470,7 +491,14 @@ async fn direct_ticket_delivers_to_the_target_worker_socket() {
     let socket = dir.path().join("sup.sock");
     spawn_fake_supervisor(socket.clone(), json!({ "sessions": [] }), Some(ticket)).await;
     let controller = controller(socket, own_summary());
-    let receipt = controller.send_agent_message(input()).await.unwrap();
+    // The supervisor resolved the durable selector "sess-b" into the ticket.
+    let receipt = controller
+        .send_agent_message(AgentMessageSendInput {
+            target: "sess-b".to_string(),
+            ..input()
+        })
+        .await
+        .unwrap();
     assert_eq!(receipt.id, "agentmsg_peer");
     assert_eq!(receipt.delivery_status, AgentMessageDeliveryStatus::Queued);
     assert_eq!(receipt.target, "bbb222");
@@ -494,10 +522,6 @@ async fn direct_ticket_delivers_to_the_target_worker_socket() {
     assert_eq!(delivery["sender"]["clientId"], "agent");
 }
 
-/// A session file recorded under a migrated storage root still names
-/// its session: the durable id (the file-name stem) resolves the
-/// alias when the canonical paths differ (the storage-root
-/// re-parenting fix).
 #[test]
 fn same_session_file_resolves_the_storage_root_alias() {
     assert!(same_session_file(
@@ -520,11 +544,6 @@ fn same_session_file_resolves_the_storage_root_alias() {
     ));
 }
 
-/// The observe roster is the caller's nuclear family with
-/// edge-derived labels: its own row carries `isCurrent`, its parent
-/// and true siblings label by their durable edges, and subagents
-/// spawned by OTHER parents never appear (the daemon-wide "every
-/// subagent is a child" mislabel regression).
 #[test]
 fn summaries_label_the_nuclear_family_by_durable_edges() {
     let identity = FamilyIdentity {
@@ -585,8 +604,6 @@ fn summaries_label_the_nuclear_family_by_durable_edges() {
         .find(|s| s.active_session_id.as_deref() == Some("own333"))
         .unwrap();
     assert_eq!(child.relationship, Some(AgentFamilyRelationship::Child));
-    // The other family's subagent and the other root session are
-    // outside the nuclear family: absent, never mislabeled.
     assert!(!summaries
         .iter()
         .any(|s| s.active_session_id.as_deref() == Some("foreign444")));
@@ -595,11 +612,6 @@ fn summaries_label_the_nuclear_family_by_durable_edges() {
         .any(|s| s.active_session_id.as_deref() == Some("root555")));
 }
 
-/// A file binding one level down is a Child (a session a user created
-/// under a parent, no spawn ids, exactly like a spawned one); a
-/// same-depth binding — a fork of a non-root session — is neither
-/// the source's child nor a sibling of its children (TS
-/// `selectAgentFamily`).
 #[test]
 fn summaries_bind_a_child_one_level_down_and_leave_a_same_depth_fork_out() {
     let parent = FamilyIdentity {
@@ -638,9 +650,8 @@ fn summaries_bind_a_child_one_level_down_and_leave_a_same_depth_fork_out() {
         ]
     );
 
-    // From the user child's own view: a binding-only subagent of the
-    // same parent at the same depth is a Sibling; the fork — the
-    // same parent file one level up — is outside the family.
+    // From the user child's own view: a same-depth subagent of the same
+    // parent is a Sibling; the fork one level up is outside the family.
     let user_child = FamilyIdentity {
         active_session_id: "usr111".to_string(),
         session_id: Some("sess-usr".to_string()),
@@ -678,12 +689,6 @@ fn summaries_bind_a_child_one_level_down_and_leave_a_same_depth_fork_out() {
     );
 }
 
-/// A depth-0 binding is no parent edge (TS `familyCatalogEntry`): a
-/// root fork names its source at depth 0 yet stays a root — its
-/// source's Sibling, never its Child, and from its own view (built
-/// through `from_summary`, the production path) its source and every
-/// other root are Siblings, never a Parent. A root's user-created
-/// child is still its Child.
 #[test]
 fn summaries_treat_a_root_fork_as_a_root() {
     let parent = FamilyIdentity {
@@ -725,8 +730,8 @@ fn summaries_treat_a_root_fork_as_a_root() {
         ]
     );
 
-    // From the root fork's own view: its source and every other root
-    // are Siblings, never a Parent.
+    // From the root fork's own view: its source and every other root are
+    // Siblings, never a Parent.
     let fork = FamilyIdentity::from_summary(
         Some(&json!({
             "sessionId": "sess-frk",
@@ -768,13 +773,8 @@ fn summaries_treat_a_root_fork_as_a_root() {
     );
 }
 
-/// A root caller's observe roster lists the other root sessions as
-/// siblings, never another family's subagents, and marks its own row.
-/// TS #2493: observe rows carry the typed family status (the busy
-/// verdict: `running` while work is in flight, `idle` for a
-/// resident-but-quiet session) plus the separate live activity axis —
-/// a quiet row is `idle`, never the pre-fix `inactive` the coarse
-/// activity mapping produced.
+/// TS #2493: observe rows carry the typed family status (the busy verdict) plus the
+/// separate live activity axis — a quiet row is `idle`, never the pre-fix `inactive`.
 #[test]
 fn summaries_carry_the_typed_status_and_activity() {
     let identity = FamilyIdentity {
@@ -813,10 +813,8 @@ fn summaries_carry_the_typed_status_and_activity() {
             "isSessionActive": false, "isRunningTools": false, "attachedClients": 0,
             "parentActiveSessionId": "me000", "parentSessionId": "sess-me",
         }),
-        // A passivated ledger child (the stop strips the live
-        // `activeSessionId` and keys the durable session under `id`):
-        // an INACTIVE family member, never a live quiet session, and
-        // no activity axis (TS `resident: !!summary.activeSessionId`).
+        // A passivated ledger child: an INACTIVE family member, never a
+        // live quiet session, and no activity axis.
         json!({
             "id": "ch333", "sessionId": "sess-ch3", "runtimeKind": "subagent",
             "activity": "idle", "isStreaming": false, "isCompacting": false,
@@ -843,8 +841,6 @@ fn summaries_carry_the_typed_status_and_activity() {
     );
     assert_eq!(row("ch222").status, AgentFamilyStatus::Idle);
     assert_eq!(row("ch222").activity, Some(AgentObserveActivity::Idle));
-    // The passivated child: inactive, with no activity axis at all
-    // (TS marks the field absent for members with no live session).
     let passivated = summaries
         .iter()
         .find(|s| s.session_id == "sess-ch3")
@@ -883,15 +879,11 @@ fn summaries_label_root_siblings_and_never_foreign_children() {
         .find(|s| s.active_session_id.as_deref() == Some("root222"))
         .unwrap();
     assert_eq!(sibling.relationship, Some(AgentFamilyRelationship::Sibling));
-    // Another root's subagent child is not this root's child.
     assert!(!summaries
         .iter()
         .any(|s| s.active_session_id.as_deref() == Some("child999")));
 }
 
-/// The peers roster (`list_agent_peers` -> `agent_peer_summary`) carries
-/// the session file under `sessionPath`, not `sessionFile`: a
-/// passivated parent resolves by the alias on the peers shape too.
 #[tokio::test]
 async fn family_resolves_a_moved_parent_by_the_peers_roster_alias() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -920,10 +912,6 @@ async fn family_resolves_a_moved_parent_by_the_peers_roster_alias() {
     assert_eq!(family[0].id, "rrr777");
 }
 
-/// A child worker replacement (a new live id, the same rlm child id and
-/// persisted session id) joins its registry record by the durable ids:
-/// the family lists the child ONCE, never the roster row plus the
-/// leftover registry entry.
 #[tokio::test]
 async fn family_joins_a_replaced_child_by_its_durable_ids() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -960,11 +948,6 @@ async fn family_joins_a_replaced_child_by_its_durable_ids() {
     assert!(children[0].aliases.contains(&"sub-kid1".to_string()));
 }
 
-/// The family roster resolves a parent whose worker was replaced (the
-/// live id went stale) through the durable persisted id, and a
-/// parent whose recorded path moved (the storage-root migration)
-/// through the session-file alias: the pre-restart child's
-/// parent-reply reaches its true parent, never a name-holder.
 #[tokio::test]
 async fn family_resolves_a_moved_parent_by_the_session_file_alias() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -991,4 +974,271 @@ async fn family_resolves_a_moved_parent_by_the_session_file_alias() {
     assert_eq!(family.len(), 1, "{family:?}");
     assert_eq!(family[0].relationship, AgentFamilyRelationship::Parent);
     assert_eq!(family[0].id, "rrr777");
+}
+
+/// TS `AgentObserveListResult`: the daemon roster walk splits the
+/// caller's own row into `current` and keeps the family in `agents`.
+#[tokio::test]
+async fn list_agents_returns_current_and_family_without_self() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let socket = dir.path().join("sup.sock");
+    spawn_fake_supervisor(
+        socket.clone(),
+        json!({ "sessions": [
+            { "activeSessionId": "aaa111", "sessionId": "sess-a", "sessionName": "alpha",
+              "cwd": "/w", "messageCount": 7 },
+            { "activeSessionId": "bbb222", "sessionId": "sess-b", "sessionName": "beta" },
+            { "activeSessionId": "ddd444", "sessionId": "sess-d", "sessionName": "kid",
+              "runtimeKind": "subagent",
+              "parentActiveSessionId": "aaa111", "parentSessionId": "sess-a",
+              "rlmChildId": "sub-kid1" },
+        ]}),
+        None,
+    )
+    .await;
+    let observer = observe_controller(socket);
+    let list = observer.list_agents().await.unwrap();
+    assert_eq!(list.current.active_session_id.as_deref(), Some("aaa111"));
+    assert!(list.current.is_current);
+    assert_eq!(
+        list.agents.len(),
+        2,
+        "the family roster excludes the caller: {:?}",
+        list.agents
+    );
+    assert!(list.agents.iter().all(|summary| !summary.is_current));
+    assert!(
+        list.agents
+            .iter()
+            .any(|summary| summary.active_session_id.as_deref() == Some("bbb222")),
+        "the sibling stays in the roster"
+    );
+    let child = list
+        .agents
+        .iter()
+        .find(|summary| summary.active_session_id.as_deref() == Some("ddd444"))
+        .expect("the child stays in the roster");
+    assert_eq!(child.relationship, Some(AgentFamilyRelationship::Child));
+}
+
+/// TS `AgentObserveRecentMessagesResult`: the transcript read resolves
+/// the family target first (the family gate), then reports the bounded
+/// window with its clamped bounds.
+#[tokio::test]
+async fn recent_messages_resolves_by_name_and_reports_the_envelope() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let socket = dir.path().join("sup.sock");
+    spawn_fake_supervisor(
+        socket.clone(),
+        json!({ "sessions": [
+            { "activeSessionId": "aaa111", "sessionId": "sess-a", "sessionName": "alpha" },
+            { "activeSessionId": "ddd444", "sessionId": "sess-d", "sessionName": "kid",
+              "runtimeKind": "subagent",
+              "parentActiveSessionId": "aaa111", "parentSessionId": "sess-a" },
+        ]}),
+        None,
+    )
+    .await;
+    let observer = observe_controller(socket);
+    let recent = observer.recent_messages("kid", 2, 90).await.unwrap();
+    assert_eq!(recent.agent.active_session_id.as_deref(), Some("ddd444"));
+    assert_eq!(recent.limit, 2);
+    assert_eq!(recent.max_chars, 90);
+    assert!(
+        recent.truncated,
+        "five scripted rows minus two leave older ones"
+    );
+    assert_eq!(recent.messages.len(), 2);
+    assert_eq!(recent.messages[0].index, 3);
+    assert_eq!(recent.messages[0].text, "m3");
+    // A target outside the nuclear family never reaches the transcript read.
+    let error = observer.recent_messages("ghost", 2, 90).await.unwrap_err();
+    assert_eq!(error.to_string(), "agent ghost is not reachable");
+}
+
+#[tokio::test]
+async fn recent_messages_reads_a_degraded_live_sibling_but_not_a_foreign_stub() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let socket = dir.path().join("sup.sock");
+    spawn_fake_supervisor(
+        socket.clone(),
+        json!({ "sessions": [
+            { "activeSessionId": "aaa111", "sessionId": "sess-a",
+              "parentActiveSessionId": "parent", "parentSessionId": "sess-parent" },
+            { "id": "sibling", "sessionId": "", "lifecycle": "recovering",
+              "parentActiveSessionId": "parent", "parentSessionId": "sess-parent" },
+            { "id": "foreign", "sessionId": "", "lifecycle": "recovering" },
+        ], "messagesByActiveSessionId": {
+            "sibling": [{ "role": "user", "content": "sibling transcript" }],
+            "foreign": [{ "role": "user", "content": "foreign transcript" }],
+        }}),
+        None,
+    )
+    .await;
+    let observer = LinkAgentObserveController::new(
+        Arc::new(SupervisorLink::new(socket)),
+        "aaa111".to_string(),
+        Arc::new(std::sync::Mutex::new(Some(json!({
+            "activeSessionId": "aaa111", "sessionId": "sess-a",
+            "parentActiveSessionId": "parent", "parentSessionId": "sess-parent",
+        })))),
+        None,
+    );
+    let recent = observer.recent_messages("sibling", 8, 800).await.unwrap();
+    assert_eq!(
+        recent.agent.relationship,
+        Some(AgentFamilyRelationship::Sibling)
+    );
+    assert_eq!(recent.messages.len(), 1);
+    assert_eq!(recent.messages[0].text, "sibling transcript");
+    assert_eq!(
+        observer
+            .recent_messages("foreign", 8, 800)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "agent foreign is not reachable",
+    );
+}
+
+/// The supervisor roster row's own facts ride the observation summary,
+/// with `firstMessage` capped at the TS preview width.
+#[test]
+fn summaries_carry_the_supervisor_row_facts() {
+    let identity = FamilyIdentity {
+        active_session_id: "ppp000".to_string(),
+        session_id: Some("sess-p".to_string()),
+        session_file: Some("/agent/sessions/sess-p.jsonl".to_string()),
+        ..Default::default()
+    };
+    let sessions = vec![
+        json!({
+            "activeSessionId": "ppp000", "sessionId": "sess-p",
+            "runtimeKind": "top-level", "activity": "idle",
+            "cwd": "/w/agent", "messageCount": 12,
+        }),
+        json!({
+            "activeSessionId": "kid111", "sessionId": "sess-kid",
+            "sessionName": "kid", "runtimeKind": "subagent", "activity": "working",
+            "cwd": "/w/agent/kid", "messageCount": 3,
+            "parentActiveSessionId": "ppp000", "parentSessionId": "sess-p",
+            "rlmChildId": "sub-kid1", "firstMessage": "x".repeat(300),
+        }),
+    ];
+    let summaries = summaries_from_roster(sessions, &identity, &[]);
+    let child = summaries
+        .iter()
+        .find(|summary| summary.session_id == "sess-kid")
+        .expect("the child row");
+    assert_eq!(child.cwd.as_deref(), Some("/w/agent/kid"));
+    assert_eq!(child.message_count, Some(3));
+    assert_eq!(child.parent_active_session_id.as_deref(), Some("ppp000"));
+    assert_eq!(child.parent_session_id.as_deref(), Some("sess-p"));
+    assert_eq!(child.rlm_child_id.as_deref(), Some("sub-kid1"));
+    assert_eq!(
+        child.first_message.as_ref().map(String::len),
+        Some(240),
+        "firstMessage caps at the TS preview width"
+    );
+    let current = summaries
+        .iter()
+        .find(|summary| summary.is_current)
+        .expect("the caller's own row");
+    assert_eq!(current.cwd.as_deref(), Some("/w/agent"));
+    assert_eq!(current.message_count, Some(12));
+}
+
+/// Normalized active-id and durable-id suffixes still resolve through the
+/// nuclear family to the correct worker transcript (the pre-PR registry contract).
+#[tokio::test]
+async fn observe_recent_suffixes_read_the_selected_family_transcript() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let socket = dir.path().join("sup.sock");
+    spawn_fake_supervisor(socket.clone(), json!({
+        "sessions": [
+            { "activeSessionId": "aaa111", "sessionId": "sess-a" },
+            { "activeSessionId": "abcddd444", "sessionId": "deadbeef-112233",
+              "runtimeKind": "subagent", "parentActiveSessionId": "aaa111", "parentSessionId": "sess-a" },
+        ],
+        "messagesByActiveSessionId": {
+            "aaa111": [{ "role": "user", "content": "wrong parent transcript", "timestamp": 1 }],
+            "abcddd444": [{ "role": "user", "content": "selected child transcript", "timestamp": 2 }],
+        },
+    }), None).await;
+    let observer = observe_controller(socket);
+    for selector in ["DD-D444", "11-2233"] {
+        let recent = observer.recent_messages(selector, 1, 80).await.unwrap();
+        assert_eq!(recent.agent.active_session_id.as_deref(), Some("abcddd444"));
+        assert_eq!(recent.messages[0].text, "selected child transcript");
+    }
+}
+
+/// Names may repeat across parent/child scopes. An ambiguous family name
+/// never authorizes whichever transcript happened to arrive first in the roster.
+#[tokio::test]
+async fn observe_recent_rejects_duplicate_family_names() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let socket = dir.path().join("sup.sock");
+    spawn_fake_supervisor(socket.clone(), json!({ "sessions": [
+        { "activeSessionId": "aaa111", "sessionId": "sess-a", "sessionName": "reviewer" },
+        { "activeSessionId": "ddd444", "sessionId": "sess-d", "sessionName": "reviewer",
+          "runtimeKind": "subagent", "parentActiveSessionId": "aaa111", "parentSessionId": "sess-a" },
+    ]}), None).await;
+    let error = observe_controller(socket)
+        .recent_messages("reviewer", 1, 80)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Ambiguous active session"),
+        "{error}"
+    );
+}
+
+/// The exact active id outranks a different family member named after it,
+/// matching the registry's direct lookup before its suffix/name search.
+#[tokio::test]
+async fn observe_recent_exact_active_id_outranks_a_name_collision() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let socket = dir.path().join("sup.sock");
+    spawn_fake_supervisor(socket.clone(), json!({
+        "sessions": [
+            { "activeSessionId": "aaa111", "sessionId": "sess-a" },
+            { "activeSessionId": "fff555", "sessionId": "sess-f", "sessionName": "ddd444",
+              "runtimeKind": "subagent", "parentActiveSessionId": "aaa111", "parentSessionId": "sess-a" },
+            { "activeSessionId": "ddd444", "sessionId": "sess-d",
+              "runtimeKind": "subagent", "parentActiveSessionId": "aaa111", "parentSessionId": "sess-a" },
+        ],
+        "messagesByActiveSessionId": {
+            "fff555": [{ "role": "user", "content": "wrong name collision", "timestamp": 1 }],
+            "ddd444": [{ "role": "user", "content": "exact active transcript", "timestamp": 2 }],
+        },
+    }), None).await;
+    let recent = observe_controller(socket)
+        .recent_messages("ddd444", 1, 80)
+        .await
+        .unwrap();
+    assert_eq!(recent.messages[0].text, "exact active transcript");
+}
+
+/// Suffix resolution must stay inside the nuclear family; a known foreign
+/// worker with a matching suffix never becomes readable.
+#[tokio::test]
+async fn observe_recent_suffix_does_not_read_a_foreign_transcript() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let socket = dir.path().join("sup.sock");
+    spawn_fake_supervisor(socket.clone(), json!({
+        "sessions": [
+            { "activeSessionId": "aaa111", "sessionId": "sess-a" },
+            { "activeSessionId": "fffddd444", "sessionId": "foreign-id", "sessionName": "foreign",
+              "runtimeKind": "subagent", "parentActiveSessionId": "zzz999", "parentSessionId": "foreign-parent" },
+        ],
+        "messagesByActiveSessionId": {
+            "fffddd444": [{ "role": "user", "content": "foreign private transcript", "timestamp": 1 }],
+        },
+    }), None).await;
+    let error = observe_controller(socket)
+        .recent_messages("ddd444", 1, 80)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "agent ddd444 is not reachable");
 }

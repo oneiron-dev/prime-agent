@@ -35,9 +35,7 @@ use venv::{
     missing_python_skill_import_labels, missing_rlm_extra_import_labels, normalize_python_skills,
     resolve_writable_kernel_venv_dir, sync_python_skills, BootstrapPythonSkill,
 };
-pub use venv::{
-    invalidate_runtime_probe_cache, kernel_venv_dir, kernel_venv_python, resolve_runtime_identity,
-};
+pub use venv::{invalidate_runtime_probe_cache, kernel_venv_dir, kernel_venv_python};
 use venv::{kernel_base_ready, kernel_ready};
 
 use crate::kernel::cancellation::AbortSignal;
@@ -137,6 +135,7 @@ impl EnsureKernelPythonOptions {
 }
 
 /// What one setup call found.
+#[derive(Debug)]
 struct EnsuredPython {
     python: PathBuf,
     /// This call built the venv or installed missing skills: the readiness
@@ -147,14 +146,12 @@ struct EnsuredPython {
 fn format_bootstrap_failure(error: &anyhow::Error) -> anyhow::Error {
     let mut message = format!(
         "Failed to set up the Python kernel runtime. {error:#}\n\
-         First-time setup needs internet to install uv, Python, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. \
+         First-time setup needs the bundled local runtime and internet to install uv, Python, and default Python packages; once set up, Prime Agent runs offline. \
          An interrupted runtime upgrade needs network once more, so re-run this while online. \
          Set PRIME_AGENT_KERNEL_PYTHON to a Python with a current prime-agent-runtime and default Python packages installed to skip auto-bootstrap."
     );
-    // The packaged exe-adjacent sidecar is the kernel runtime source; when it
-    // is missing everywhere (packaged layout and source checkout), name it:
-    // a registry fallback then has no local runtime to fall back from, and
-    // the raw install error alone is not actionable.
+    // The packaged exe-adjacent sidecar is the kernel runtime source; when it is missing everywhere
+    // (packaged layout and source checkout), name it.
     if venv::packaged_runtime_dir().is_none() {
         let package = venv::package_dir();
         let _ = write!(message,
@@ -178,16 +175,11 @@ static IN_FLIGHT: Mutex<InFlightBootstrap> = Mutex::new(None);
 ///
 /// # Errors
 ///
-/// Returns an error when the `PRIME_AGENT_KERNEL_PYTHON` override points to
-/// a Python missing the kernel runtime or default packages, when a writable
-/// venv directory cannot be resolved, or when the kernel venv bootstrap or
-/// its skill sync fails (the failure is formatted with remediation hints,
-/// including a missing packaged runtime directory).
+/// Returns an error when the override Python is invalid or the venv bootstrap fails.
 ///
 /// # Panics
 ///
-/// The in-flight promise stores its outcome under the same lock that takes
-/// it, so the internal `expect` on the stored outcome is unreachable.
+/// The in-flight promise stores its outcome under the same lock, so the `expect` is unreachable.
 pub async fn ensure_kernel_python(options: EnsureKernelPythonOptions) -> anyhow::Result<PathBuf> {
     ensure_kernel_python_joined(&options)
         .await
@@ -221,10 +213,12 @@ pub async fn prepare_kernel_environment(options: EnsureKernelPythonOptions) -> a
         if ensured.prepared {
             let python_skills = normalize_python_skills(&options.python_skills);
             let venv = resolve_writable_kernel_venv_dir()?;
+            let source_dir = venv::require_runtime_source_dir()?;
+            let runtime_identity = venv::hash_runtime_source(&source_dir)?;
             let ready = kernel_ready(
                 &ensured.python.to_string_lossy(),
                 &venv,
-                &resolve_runtime_identity(),
+                &runtime_identity,
                 &python_skills,
                 options.child_cancel(),
             )
@@ -313,7 +307,7 @@ async fn ensure_kernel_python_uncached(
             let mut missing = Vec::new();
             if !has_prime_agent_runtime(&python_str, cancel).await {
                 missing.push(
-                    "a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, explicit harness CRUD methods, and the file-handle snapshot guard".to_string(),
+                    "a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, rlm.rename, rlm._set_completion_notices_wired, explicit harness CRUD methods, and the file-handle snapshot guard".to_string(),
                 );
             }
             if missing.is_empty() {
@@ -355,9 +349,21 @@ async fn ensure_kernel_python_uncached(
     }
 
     let venv = resolve_writable_kernel_venv_dir()?;
+    ensure_kernel_venv(options, python_skills, venv).await
+}
+
+async fn ensure_kernel_venv(
+    options: &EnsureKernelPythonOptions,
+    python_skills: &[BootstrapPythonSkill],
+    venv: PathBuf,
+) -> anyhow::Result<EnsuredPython> {
     let python = kernel_venv_python(&venv);
     let python_str = python.to_string_lossy().to_string();
-    let runtime_identity = resolve_runtime_identity();
+    // Validate the bundled source before any probe or destructive rebuild.
+    let source_dir =
+        venv::require_runtime_source_dir().map_err(|error| format_bootstrap_failure(&error))?;
+    let runtime_identity =
+        venv::hash_runtime_source(&source_dir).map_err(|error| format_bootstrap_failure(&error))?;
     let check_started = Instant::now();
     let ready = kernel_ready(
         &python_str,
@@ -382,9 +388,16 @@ async fn ensure_kernel_python_uncached(
     }
     options.check_cancelled()?;
 
-    let release_lock = tokio::select! {
+    let lock = tokio::select! {
         lock = acquire_bootstrap_lock(&venv) => lock,
         () = options.child_cancel().fired() => return Err(anyhow!(KERNEL_SETUP_CANCELLED)),
+    };
+    let release_lock = match lock {
+        Ok(release_lock) => release_lock,
+        Err(error) if dir_lock::lock_creation_denied(&error) => {
+            return unwritable_venv(options, &python, &venv, &runtime_identity, &error).await;
+        }
+        Err(error) => return Err(error),
     };
     let result = async {
         if kernel_ready(
@@ -415,6 +428,7 @@ async fn ensure_kernel_python_uncached(
                 &uv,
                 &venv,
                 &python,
+                &source_dir,
                 &runtime_identity,
                 python_skills,
                 options,
@@ -435,7 +449,15 @@ async fn ensure_kernel_python_uncached(
             std::fs::remove_dir_all(&venv)
                 .with_context(|| format!("removing {}", venv.display()))?;
         }
-        bootstrap_venv(&uv, &venv, python_skills, options).await?;
+        bootstrap_venv(
+            &uv,
+            &venv,
+            &source_dir,
+            &runtime_identity,
+            python_skills,
+            options,
+        )
+        .await?;
         Ok(EnsuredPython {
             python: python.clone(),
             prepared: true,
@@ -449,6 +471,85 @@ async fn ensure_kernel_python_uncached(
     result.map_err(|error| format_bootstrap_failure(&error))
 }
 
-// ---------------------------------------------------------------------------
-// Runtime bootstrap code (from core/tools/ipython.ts)
-// ---------------------------------------------------------------------------
+/// The venv's directory denies writes to this user, so the bootstrap lock cannot be
+/// created: a base-ready venv degrades the way a `PRIME_AGENT_KERNEL_PYTHON` override
+/// does (uncovered skills disabled with a warning, nothing installed), and anything
+/// less is a setup error naming the venv and both env overrides.
+async fn unwritable_venv(
+    options: &EnsureKernelPythonOptions,
+    python: &std::path::Path,
+    venv: &std::path::Path,
+    runtime_identity: &str,
+    lock_error: &anyhow::Error,
+) -> anyhow::Result<EnsuredPython> {
+    let python_str = python.to_string_lossy().to_string();
+    let ready =
+        kernel_base_ready(&python_str, venv, runtime_identity, options.child_cancel()).await;
+    options.check_cancelled()?;
+    if !ready {
+        return Err(anyhow!(
+            "cannot set up the Python kernel runtime: the kernel venv at {} is not writable by \
+             this user and does not hold a current runtime. Set PRIME_AGENT_KERNEL_VENV to a \
+             writable directory, or set PRIME_AGENT_KERNEL_PYTHON to a Python with a current \
+             prime-agent-runtime and the default Python packages installed. ({lock_error:#})",
+            venv.display()
+        ));
+    }
+    let missing = missing_python_skill_import_labels(
+        &python_str,
+        &options.python_skills,
+        options.child_cancel(),
+    )
+    .await;
+    options.check_cancelled()?;
+    if !missing.is_empty() {
+        options.report(&format!(
+            "Warning: Python skills unavailable in {} and will be disabled: {}",
+            venv.display(),
+            missing.join(", ")
+        ));
+    }
+    Ok(EnsuredPython {
+        python: python.to_path_buf(),
+        prepared: false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn lock_timeout_prevents_venv_rebuild() {
+        let root = tempfile::tempdir().unwrap();
+        let venv = root.path().join("kernel-venv");
+        std::fs::create_dir(&venv).unwrap();
+        let sentinel = venv.join("owner-state");
+        std::fs::write(&sentinel, "another bootstrap owns this venv").unwrap();
+        let owner = acquire_bootstrap_lock(&venv).await.unwrap();
+        let options = EnsureKernelPythonOptions {
+            // Fail before any destructive operation or network access if the
+            // caller regresses and enters setup without acquiring the lock.
+            on_progress: Some(Arc::new(|message| {
+                panic!("bootstrap must stop at the lock error, got progress: {message}");
+            })),
+            ..Default::default()
+        };
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(121),
+            ensure_kernel_venv(&options, &[], venv),
+        )
+        .await
+        .expect("lock acquisition must have a bounded wait")
+        .expect_err("a lock timeout must propagate to the caller");
+
+        assert!(error.to_string().contains("Timed out"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(sentinel).unwrap(),
+            "another bootstrap owns this venv"
+        );
+        assert!(root.path().join("kernel-venv.bootstrap.lock").exists());
+        drop(owner);
+    }
+}

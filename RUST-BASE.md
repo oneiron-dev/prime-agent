@@ -1,8 +1,8 @@
 # Rust base (Oneiron fork)
 
 The Oneiron fork of prime-agent on the Rust product. Upstream replaced the TypeScript product on
-`main` with the Rust port (`39bc99a91`, 2026-09-30); this branch line follows it. The TS fork
-(`main`, deployed as `0.9.6-oneiron.*`) stays the launcher until cutover.
+`main` with the Rust port (`39bc99a91`, 2026-09-30); this branch line follows it. The historical TS fork
+(`main`, deployed as `0.9.6-oneiron.*`) is not part of these Rust syncs.
 
 ## Pin
 
@@ -16,17 +16,56 @@ The Oneiron fork of prime-agent on the Rust product. Upstream replaced the TypeS
   into the TS branches.
 - Toolchain: Rust 1.98.1, the version upstream CI pins (`.github/workflows/ci.yml`). An older
   stable trips clippy lints that 1.98 does not raise.
+- Upstream sync 2026-10-06: merged pinned `main` `672085e883c25a8a5f10c77ad8e5d3fb38dd6584`
+  (89 upstream-only commits) into fork tip `925ee93ab0fa50eb47067285aade7fcc3722ed59`.
+  #3197 is now upstream-merged; the still-open #3201 local patch remains. The historical
+  base above is unchanged; this is a merge, not a rebase or integration-branch force-update.
+
+- Upstream sync 2026-10-24: merged pinned `main` `71beca9478f552dc6fc898bba9685f9ce00515cf`
+  (170 upstream-only commits) into PR #34 head `f64ee8f74e8cc15ca7dd7a84126065599011e644`.
+  This brings 259 upstream commits into integration tip `925ee93ab0fa50eb47067285aade7fcc3722ed59`,
+  including PR #34's 89. Resolved 112 conflicted paths, keeping upstream's unlocked compaction,
+  inline print RLM, transcript paging, bundled runtime validation and process-generation cleanup
+  while porting the fork capabilities below into those owners. Upstream version is `0.10.1`;
+  CI still pins Rust `1.98.1`. #3201 remains OPEN and its provider/model compatibility merge
+  stays carried; #3197 is already upstream-merged and is no longer in the carried table.
+  The model-visible Python tool is upstream's `python_repl`; explicit `--tools ipython` and
+  `--tools python` select that same tool. No-tools still starts no kernel. The daemon schema
+  moves to combined revision 33 with a fresh id (`protocol-7-schema-33-20261024a1f7`): upstream
+  added paged `get_messages` and the persistent-shell commands without changing its own id, so
+  a revision-32 daemon reads as stale to this build and the reverse. Integration fixes
+  retain awaiter state on persistent Bash handles and lazy factory loading. The local lockfile
+  advances Tokio `1.53.1` to `1.53.3` for `RUSTSEC-2026-0386`; the two owned-descriptor
+  registrations use its I/O-safe constructor API. The local test gate preserves CI's
+  `CARGO_INCREMENTAL=0` through its environment scrub. Post-integration verifiers restore
+  the runtime's bounded-await prompt contract, partition faux cached usage without double-counting
+  prompt tokens (preventing repeated compaction after summary cache replacement), and normalize
+  the gated interpreter fixture's padded macOS `wc` output. Native PTY verifiers close the master
+  before reaping a killed child, drain output while awaiting exit, and reopen the synthetic
+  shell's slave after controlling-session hangup without changing terminal state. The sync PR
+  records the complete initial conflict ledger, supplemental fixes and local check evidence;
+  the full CI workspace union uses a clean source-bound Linux snapshot, separately from native
+  Mac portable/fork checks and unsupported Linux-only fixtures in the first Mac run. The
+  lease liveness probe also demotes kernel-confirmed dead `X`/`Z` states and rechecks a
+  disappearing proc entry, while unverifiable/live/stopped owners remain protected; the
+  stop verifier proves the lease's exact owner PID without relaxing its escalation bounds. The
+  self-update guard verifier executes an immutable tracked launcher with separate writable
+  path data, preserving real daemon startup/RPC checks without a generated-script exec race. The
+  exit flush now bounds every encoded progress write to 4 KiB (previously 32 KiB row
+  batches could overshoot); a calibrated 250ms reader pause is red with the old 32 KiB
+  mode and green with 4 KiB on Darwin and Linux. Linux write-completion gaps made the
+  original 400ms probe exceed the unchanged 500ms silence budget. The 1500ms deadline,
+  500ms grace, read rate, healthy completeness and forced-stall assertions remain intact.
 
 ## Carried upstream patches
 
-Cherry-picked with `-x`, so each commit names its upstream source. Drop a patch when its PR
-merges upstream; a rebase onto a base that contains the merged change drops it automatically
-when the diff is identical, otherwise drop it by hand.
+Originally cherry-picked with `-x`, so each commit names its upstream source. On each merge
+sync, drop the carried delta only when upstream contains the merged change. Preserve upstream
+ancestry with merge commits; never rebase or squash the integration history.
 
-| PR | Title | Upstream head | Find locally | State at pin |
+| PR | Title | Upstream head | Find locally | State at 2026-10-24 sync |
 |---|---|---|---|---|
-| #3197 | retry silently dropped provider streams | `e4e7641b7` | `git log --grep 'cherry picked from commit e4e7641b7'` | open |
-| #3201 | models: merge custom model compat over provider compat | `697c48def` | `git log --grep 'cherry picked from commit 697c48def'` | open |
+| #3201 | models: merge custom model compat over provider compat | `697c48def` | `git log --grep 'cherry picked from commit 697c48def'` | OPEN; retained (not upstream-equivalent) |
 
 ## Fork-only changes
 
@@ -34,21 +73,22 @@ when the diff is identical, otherwise drop it by hand.
 |---|---|---|
 | `PRIME_AGENT_SOCKET_DIR` | `crates/pa-daemon/src/platform/paths.rs` | Worker sockets always live in the socket dir, not beside a custom `PRIME_AGENT_DAEMON_SOCKET`; without this a side-by-side install's workers listen inside the TS `prime-agent-<uid>/` dir. Unset keeps TS parity. |
 | Short Unix worker socket names | `crates/pa-daemon/src/platform/paths.rs`, `boot_reap.rs`, `crates/pa-cli/src/daemon_discovery/mod.rs`, `crates/pa-types/src/incident/` | `w-<12 hex supervisor key>-<12 hex worker id>.sock` (32 bytes) instead of TS's `worker-…` (37): any socket dir up to 70 bytes fits macOS `sun_path`. The boot reap, discovery and incident attribution recognize both names. `pa-types` transport refuses a Unix path past the platform's own limit (103 usable bytes on macOS, 107 on Linux, where a longer one is still re-anchored). Windows pipe names unchanged. |
-| A worker that dies during startup fails its create | `crates/pa-daemon/src/supervisor/launch_watch.rs`, `crates/pa-tui/src/interactive/run.rs`, `crates/pa-tui/src/daemon_client.rs` | The supervisor races every launch stage (probe, connect + auth, create) against the child's exit and answers the create at once with the typed `worker_startup_failed` (`errorInfo`: worker id, exit code or signal, log path; the message adds the last line of its stderr), instead of after the 30 s connect budget or the 10-minute create route. Schema revision 31 and the `worker_startup_failure` capability (TS has neither; an older client reads the code as `Unknown`). The TUI restores the terminal and exits 1 with that error instead of handing off to the agents view, and waits 60 s for a `create` (120 s on Windows; TS 30 s), past the daemon's default launch budget, so a worker that never comes up or dies while starting is reported by the daemon. A failed launch is discarded under the worker's registration gate. |
+| A worker that dies during startup fails its create | `crates/pa-daemon/src/supervisor/launch_watch.rs`, `crates/pa-tui/src/interactive/run.rs`, `crates/pa-tui/src/daemon_client.rs` | The supervisor races every launch stage (probe, connect + auth, create) against the child's exit and answers the create at once with the typed `worker_startup_failed` (`errorInfo`: worker id, exit code or signal, log path; the message adds the last line of its stderr), instead of after the 30 s connect budget or the 10-minute create route. Introduced in fork schema revision 31 and carried in the combined revision 33, with the `worker_startup_failure` capability (TS has neither; an older client reads the code as `Unknown`). The TUI restores the terminal and exits 1 with that error instead of handing off to the agents view, and waits 60 s for a `create` (120 s on Windows; TS 30 s), past the daemon's default launch budget, so a worker that never comes up or dies while starting is reported by the daemon. A failed launch is discarded under the worker's registration gate. |
 | `PRIME_AGENT_DISABLE_SELF_UPDATE` | `crates/pa-core/src/update/installer.rs`, `crates/pa-cli/src/self_update.rs` | Upstream's `update` / `/update` fetch and run the takeover installer (stops every TS daemon, replaces `~/.local/bin/prime-agent`); a side-by-side install must refuse. |
 | `--no-extensions` accepted | `crates/pa-cli/src/args.rs` | Upstream removed extensions (#3189); the `sol` wrapper and factory still pass the flag. |
 | `--json-event-profile all\|factory-completed` | `crates/pa-cli/src/json_output.rs` | The TS fork's factory stream: the reduced profile drops the progressive `message_update`/`tool_execution_update` snapshots before serialization. |
-| `--daemon-hosted` | `crates/pa-cli/src/hosted_print.rs`, `crates/pa-daemon/src/headless_client.rs` | The TS fork's resident print/json session (attachable while it runs; detach-only exit). `--offline` and `--no-skills` ride the create as the fork's session policy (schema revision 31, capability `session_policy`, `crates/pa-daemon/src/session_policy.rs`): the offline session's worker starts with `PI_OFFLINE=1` in its own launch env (TS meaning: no startup network operations; not a firewall, and the kernel's environment provisioning is not guarded), `noSkills` turns off skill discovery, an RLM child inherits its parent session's policy, a passivated session wakes under its own (a per-session record beside the worker descriptors), an online-policy worker drops a `PI_OFFLINE` it would inherit from an offline supervisor, and a live session is reused only under the same policy and a tool selection that resolves the same (the refusal names which differs). A daemon without the capability refuses the flags. Still refused: `--no-prompt-templates`, `--no-context-files`, `--goal`, `--fork`, and the factory's `W7_CARGO_*` overlay, the remaining blocker for build-routed daemon seats (the routing also needs the factory's cargo wrapper on the seat's `PATH`, which a shared worker does not take from one client). Wire divergence from TS print: each `prompt_and_wait` carries an `admissionId` (when the daemon advertises `prompt_admission_cancellation`) and a timed-out one is followed by `cancel_prompt_admission`; TS print sends neither because its route never times out. |
+| `--daemon-hosted` | `crates/pa-cli/src/hosted_print.rs`, `crates/pa-daemon/src/headless_client.rs` | The TS fork's resident print/json session (attachable while it runs; detach-only exit). `--offline` and `--no-skills` ride the create as the fork's session policy (introduced in fork schema revision 31, carried in combined revision 33; capability `session_policy`, `crates/pa-daemon/src/session_policy.rs`): the offline session's worker starts with `PI_OFFLINE=1` in its own launch env (TS meaning: no startup network operations; not a firewall, and the kernel's environment provisioning is not guarded), `noSkills` turns off skill discovery, an RLM child inherits its parent session's policy, a passivated session wakes under its own (a per-session record beside the worker descriptors), an online-policy worker drops a `PI_OFFLINE` it would inherit from an offline supervisor, and a live session is reused only under the same policy and a tool selection that resolves the same (the refusal names which differs). A daemon without the capability refuses the flags. Still refused: `--no-prompt-templates`, `--no-context-files`, `--goal`, `--fork`, and the factory's `W7_CARGO_*` overlay, the remaining blocker for build-routed daemon seats (the routing also needs the factory's cargo wrapper on the seat's `PATH`, which a shared worker does not take from one client). Wire divergence from TS print: each `prompt_and_wait` carries an `admissionId` (when the daemon advertises `prompt_admission_cancellation`) and a timed-out one is followed by `cancel_prompt_admission`; TS print sends neither because its route never times out. |
 | A timed-out prompt route keeps its admission | `crates/pa-daemon/src/prompt_admission.rs` | Upstream's 10-minute `prompt_and_wait` route budget is shorter than TS's 24-hour worker forward and deleted the admission with the route, so `cancel_prompt_admission` answered `unknown` for a turn still running. The record now stays until one read has answered for it (or the client's connection closes); `--daemon-hosted` relies on it to tell its own running turn from a queued or lost prompt. No wire field changes. |
 | A cancelled admission never runs | `crates/pa-daemon/src/worker/turn.rs`, `crates/pa-daemon/src/prompt_admission.rs` | Upstream committed a prompt's admission only inside its turn, after the pickup, so a cancel landing in between (or before the enqueue) answered `cancelled` while the prompt ran. The pickup now commits under the registry lock and drops a cancelled prompt, as TS never runs one; withdrawn admissions are cleared. |
+| Mid-stream WebSocket retry | `crates/pa-ai/src/providers/openai_codex_responses/`, `crates/pa-core/src/session_engine/{auto_retry,provider_retry,provider_failover}.rs`, `crates/pa-cli/src/print_retry.rs`, `crates/pa-tui/src/{snapshot,session_ui}/` | A Codex event channel disappearing before completion is a typed transport failure, never a committed partial. Session transport retries use exactly 2000/4000/8000 ms with three retries total, independent of configured provider jitter/quota/failover schedules (the enabled toggle still applies). Failed sockets and continuation anchors are discarded; retry continues committed history/tool results without executing cut calls. Direct print/json composes the same retry driver, and live/reloaded transcripts supersede failed partial text and uncommitted tool cards. Existing retry wire events and outcome rows are reused; no protocol/schema change. |
 | Headless selection skips `provider_retry_outcome` | `crates/pa-core/src/session_engine/headless.rs` | Upstream's one-row retry disclosure (a sanctioned TS divergence) is persisted after the episode's last assistant and hid it from text-mode selection; TS, which keeps only the per-attempt rows, prints the recovered answer. |
 | Effective `--no-skills`/`--no-prompt-templates`/`--no-context-files` | `crates/pa-core/src/resources/mod.rs` (`ResourceLoadingPolicy`) | Upstream parses the flags but always discovered every resource; the `sol` wrapper and factory rely on `--no-skills` for prompt size. |
-| Headless exit follows the answer | `crates/pa-cli/src/headless_exit.rs`, `crates/pa-core/src/kernel/bootstrap/venv/subprocess.rs`, `KernelPrewarm` in `crates/pa-core/src/session_engine/engine.rs` | Upstream's print runtime started the kernel bootstrap in the background and dropped its Tokio runtime implicitly, which waits without bound for the bootstrap's blocking `uv`/interpreter children: a fresh home's first one-shot exited 43 s after its answer. Print/json now set the kernel environment up before the first turn (`KernelPrewarm::BeforeFirstTurn`), run every setup child as an owned, cancellable tokio child, abandon the kernel boot after the last output and shut the runtime down within 300 ms; the hosted client's detach waits the same budget. `--verbose` traces the exit phases. Resident sessions keep `KernelPrewarm::Background`. Either mode runs only when `ipython` is active after the launch tool selection (`--tools`/`--no-tools`/`--no-builtin-tools`). |
-| `--tools`/`--no-tools`/`--no-builtin-tools` honoured (kept against upstream #3211, `a3700282c`, which deletes them) | `crates/pa-core/src/session_engine/tool_selection.rs`, `crates/pa-core/src/prompts/no_repl.rs`, `crates/pa-core/src/session_engine/engine.rs`, `crates/pa-types/src/daemon/tool_selection.rs`, `crates/pa-cli/src/{args,mode,prompt_command}.rs`, the daemon create/summary/headless client, `crates/pa-tui/src/interactive.rs` | Upstream parsed the flags but always added `ipython` and the harness prompt; `sol` and the factory pass `--no-tools` for plain calls. TS semantics: an explicit list wins over both disable flags, then `--no-tools`, then `--no-builtin-tools`. A session with no active tools sends no tool definitions; any session without `ipython` prepares no kernel environment, starts no kernel and gets the TS no-tools prompt byte for byte (`crates/pa-core/tests/golden/corpus/no-tools-prompt-ts.txt`). Daemon wire: schema revision 31 (fork-only id), capability `session_tool_selection`, create keys `tools`/`noTools`/`noBuiltinTools` (durable for respawns, and kept with the session policy in the per-session record, so a passivated session wakes, a session moved onto by `new_session`/fork keeps, and an RLM child inherits the selection; a record without the keys reads as the defaults), summary `toolSelection`. A rebase onto #3211 must keep the flags, their help rows and this implementation. |
-| Unknown model ids on a models.json provider resolve as custom models (#32) | `build_fallback_model` in `crates/pa-core/src/models/resolver.rs` | TS sends any `--model` id to a provider defined in models.json; the port's fallback returned `None` for every provider without a compiled-in default (every models.json provider: cpa, cpa-r, cpa-a), so CPA's per-login prefix routing (`--provider cpa-r --model antevon/gpt-6.1-sol`, the proxy strips the prefix upstream) failed with `Model ... not found`. The fallback template is the provider's own entry for the id behind one routing prefix (only the first path segment is a prefix: `antevon/openai/gpt-4o` keeps its namespace), else the provider's first model; a provider with a compiled-in default keeps that template (TS parity). Resolver tests cover the boundaries. A rebase onto upstream must keep this. |
+| Headless exit follows the answer | `crates/pa-cli/src/headless_exit.rs`, `crates/pa-core/src/kernel/bootstrap/venv/subprocess.rs`, `KernelPrewarm` in `crates/pa-core/src/session_engine/engine.rs` | Upstream's print runtime started the kernel bootstrap in the background and dropped its Tokio runtime implicitly, which waits without bound for the bootstrap's blocking `uv`/interpreter children: a fresh home's first one-shot exited 43 s after its answer. Print/json now set the kernel environment up before the first turn (`KernelPrewarm::BeforeFirstTurn`), run every setup child as an owned, cancellable tokio child, abandon the kernel boot after the last output and shut the runtime down within 300 ms; the hosted client's detach waits the same budget. `--verbose` traces the exit phases. Resident sessions keep `KernelPrewarm::Background`. Either mode runs only when the Python REPL tool (`python_repl`, with `ipython`/`python` selection aliases) is active after the launch tool selection (`--tools`/`--no-tools`/`--no-builtin-tools`). |
+| `--tools`/`--no-tools`/`--no-builtin-tools` honoured (kept against upstream #3211, `a3700282c`, which deletes them) | `crates/pa-core/src/session_engine/tool_selection.rs`, `crates/pa-core/src/prompts/no_repl.rs`, `crates/pa-core/src/session_engine/engine.rs`, `crates/pa-types/src/daemon/tool_selection.rs`, `crates/pa-cli/src/{args,mode,prompt_command}.rs`, the daemon create/summary/headless client, `crates/pa-tui/src/interactive.rs` | Upstream parsed the flags but always added the Python tool (`python_repl`, `ipython` before the rename) and the harness prompt; `sol` and the factory pass `--no-tools` for plain calls. TS semantics: an explicit list wins over both disable flags, then `--no-tools`, then `--no-builtin-tools`. A session with no active tools sends no tool definitions; any session without `python_repl` prepares no kernel environment, starts no kernel and gets the TS no-tools prompt byte for byte (`crates/pa-core/tests/golden/corpus/no-tools-prompt-ts.txt`). Daemon wire: introduced in fork schema revision 31 and carried in the combined revision 33 (fork-only id), capability `session_tool_selection`, create keys `tools`/`noTools`/`noBuiltinTools` (durable for respawns, and kept with the session policy in the per-session record, so a passivated session wakes, a session moved onto by `new_session`/fork keeps, and an RLM child inherits the selection; a record without the keys reads as the defaults), summary `toolSelection`. A merge that includes #3211 must keep the flags, their help rows and this implementation. |
+| Unknown model ids on a models.json provider resolve as custom models (#32) | `build_fallback_model` in `crates/pa-core/src/models/resolver.rs` | TS sends any `--model` id to a provider defined in models.json; the port's fallback returned `None` for every provider without a compiled-in default (every models.json provider: cpa, cpa-r, cpa-a), so CPA's per-login prefix routing (`--provider cpa-r --model antevon/gpt-6.1-sol`, the proxy strips the prefix upstream) failed with `Model ... not found`. The fallback template is the provider's own entry for the id behind one routing prefix (only the first path segment is a prefix: `antevon/openai/gpt-4o` keeps its namespace), else the provider's first model; a provider with a compiled-in default keeps that template (TS parity). Resolver tests cover the boundaries. An upstream merge must keep this. |
 | Side-by-side install + probe | `scripts/oneiron/side_by_side.py` | Installs a staged release beside the TS build and writes receipts. |
 | Release feed, rollout, rollback, status | `scripts/oneiron/release_feed.py`, `rollout.py`, `daemon_idle.py` (subcommands of `side_by_side.py`), `docs/oneiron/RELEASE.md`, `docs/oneiron/ROLLBACK.md` | Stamps a `package_release.py` build into a versioned feed release (`feed/releases/v<ver>/`), rolls it out with verified sums, a probe before selection and an idle-only Rust daemon check, and rolls back to the previous install; every step writes a receipt. `crates/pa-core/tests/oneiron_feed_manifest.rs` checks the feed manifest against the native updater's parser. |
-| Test-policy gate | `scripts/check-test-policy.mjs` (from the TS fork), `scripts/oneiron/test_policy_gate.py` | Runs the fork's test policy with `TEST_POLICY_BASE=oneiron/main` and fails only on violations beyond the 4 upstream ones present at the pin (`scripts/oneiron/test-policy-baseline.txt`). |
+| Test-policy gate | `scripts/check-test-policy.mjs` (from the TS fork), `scripts/oneiron/test_policy_gate.py` | Runs the fork's test policy with `TEST_POLICY_BASE=oneiron/main` and fails only on violations beyond the reviewed upstream baseline (`scripts/oneiron/test-policy-baseline.txt`): 4 original entries plus 8 occurrences in 3 byte-identical upstream tests at the 2026-10-24 sync. |
 | Factory package | `packages/factory` (Node, not in the Cargo workspace) | The TS fork's work factory as its own package, `prime-agent-factory`; its seats run the `prime-agent` binary as a subprocess. Gate: `npm ci && npm run check` in that directory. |
 
 ## Side-by-side contract (until cutover)
@@ -164,13 +204,12 @@ scripts/oneiron/gate.sh crates pa-core pa-daemon -- <filter>   # focused
   `PA_*`; an explicit `PA_TS_BINARY` is kept), TZ=UTC and the TS binary off PATH, the way a CI
   runner sees it. A failed build or bootstrap fails the gate.
 
-## Re-pinning
+## Subsequent upstream syncs
 
-1. `git fetch upstream`. Pick a `main` sha whose ci/continuous runs are green, then
-   `git branch rust-base-<sha9> <sha>` and push it.
-2. Rebase onto it on a new branch: `git rebase --onto rust-base-<new> rust-base-<old> <copy of rust-oneiron>`.
-   Patches whose upstream PRs merged drop out; check what remains with
-   `git cherry -v upstream/main`.
-3. Run the gates, then `python3 scripts/oneiron/test_policy_gate.py --write-baseline` if upstream's
-   runtime tests changed. Update this file's Pin section.
-4. Moving `rust-oneiron` to the rebased line is a force-update, so it needs the owner's word.
+1. `git fetch origin`. Pin the newest upstream `main` SHA and read its CI toolchain and gates.
+2. Create an isolated sync branch from `rust-oneiron` (or an explicitly included pending sync PR).
+3. Merge the pinned SHA with `git merge --no-ff`; never rebase or squash fork integration history.
+4. Keep upstream structure, preserve the fork capabilities above, record every conflict, and drop
+   a carried patch only after upstream includes its merged equivalent.
+5. Run the local sandboxed gates, update this sync record, and open a PR into `rust-oneiron`.
+   The owner or orchestrator verifies and merges it; do not force-update the integration branch.

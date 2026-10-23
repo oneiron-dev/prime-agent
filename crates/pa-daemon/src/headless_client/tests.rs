@@ -461,21 +461,46 @@ async fn an_identical_prompt_from_another_client_does_not_confirm_a_timed_out_pr
     );
 }
 
-/// A prompt still queued behind other work when the budget ran out: the
-/// admission read withdraws it, so it never runs after the client left,
-/// and the run fails saying so.
+/// A prompt already accepted behind other work when the route budget
+/// expires remains queued: its cancellation read omits `cancelOwned` and
+/// the client waits for the session to go idle instead of abandoning work.
 #[tokio::test]
-async fn a_prompt_still_queued_past_the_route_budget_is_withdrawn() {
+async fn an_accepted_queued_prompt_past_the_route_budget_waits_for_idle() {
+    let fake = timed_out_prompt(Vec::new(), "owned");
+    let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
+        .await
+        .unwrap();
+    bounded(session.prompt(prompt("queued"))).await.unwrap();
+    assert_own_admission_read(&fake, "queued");
+    assert_eq!(
+        fake.commands(),
+        [
+            "create",
+            "attach",
+            "prompt_and_wait",
+            "cancel_prompt_admission",
+            "wait_for_headless_completion",
+            "wait_for_headless_completion",
+        ]
+    );
+}
+
+/// A prompt cancelled before the worker accepts it never runs, so the
+/// route timeout is returned instead of waiting for an unrelated turn.
+#[tokio::test]
+async fn a_prompt_cancelled_before_worker_acceptance_fails() {
     let fake = timed_out_prompt(Vec::new(), "cancelled");
     let (session, _) = bounded(HostedHeadlessSession::open(fake.options()))
         .await
         .unwrap();
-    let error = bounded(session.prompt(prompt("queued"))).await.unwrap_err();
+    let error = bounded(session.prompt(prompt("not accepted")))
+        .await
+        .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "Session worker timed out while the prompt was still queued; it was withdrawn and did not run"
+        "Session worker timed out before the worker accepted the prompt; it was cancelled and will not run"
     );
-    assert_own_admission_read(&fake, "queued");
+    assert_own_admission_read(&fake, "not accepted");
     assert_eq!(
         fake.commands(),
         [

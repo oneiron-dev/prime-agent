@@ -282,7 +282,7 @@ def package(args: argparse.Namespace) -> int:
                          f"<prime-agent-{base}-{platform}.debug.gz> (scripts/package_release.py writes it)")
     if not platform.startswith("linux-") and args.decoder:
         raise SystemExit("error: --decoder is only for Linux releases")
-    package_release.validate(stage, base)
+    package_release.validate(stage, base, package_release.binary_name_for_platform(platform))
     fail_if_decoder_in_tree(stage)
     executable_sha256 = sbs.sha256_file(stage / "prime-agent")
     if executable_sha256 != expected_executable:

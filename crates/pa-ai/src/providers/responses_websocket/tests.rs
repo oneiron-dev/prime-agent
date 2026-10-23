@@ -4,6 +4,9 @@
 //! continuation, fallback rules, terminal handling, ownership, and the
 //! transport half of the drop/retry/continuation/fallback scenario.
 
+#[path = "limit_tests.rs"]
+mod limit_tests;
+
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -283,7 +286,13 @@ fn upgrade_headers(records: &[Record]) -> Vec<(String, String)> {
         .filter(|(name, _)| {
             matches!(
                 name.as_str(),
-                "x-team" | "x-model-only" | "session_id" | "x-client-request-id" | "authorization"
+                "x-team"
+                    | "x-model-only"
+                    | "session_id"
+                    | "x-client-request-id"
+                    | "authorization"
+                    | "x-acp-model-request-id"
+                    | "idempotency-key"
             )
         })
         .cloned()
@@ -509,6 +518,96 @@ async fn full_and_cached_modes_share_the_socket_but_not_the_delta() {
             "{transport:?}"
         );
     }
+}
+
+/// Per-call IDs change without replacing the cached socket or losing the
+/// committed tool response's continuation anchor. Only the first call's
+/// IDs travel in the handshake; reused sockets do not refresh headers.
+#[tokio::test]
+async fn per_call_ids_keep_the_cached_socket_and_tool_delta() {
+    let mut server = mock_server::spawn(
+        vec![
+            Upgrade::Accept(vec![
+                Turn::Events(probe_call("resp_1", "call_1", "once")),
+                Turn::Events(response("resp_2", "after tool")),
+            ]),
+            Upgrade::Accept(vec![Turn::Events(response("resp_2", "after tool"))]),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let ws = ws_model(&server);
+    let mut request = options(Some("per-call-ids"), Some(Transport::WebsocketCached));
+    request.base.headers = Some(
+        [
+            pair("X-ACP-Model-Request-ID", "edge-1"),
+            pair("Idempotency-Key", "edge-1"),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let first = run(&ws, &context(vec![user("one")]), &request).await;
+    let AssistantContent::ToolCall(call) = &first.content[0] else {
+        panic!("expected the probe call: {first:?}");
+    };
+    let tool_result = serde_json::from_value(json!({
+        "role": "toolResult", "toolCallId": call.id, "toolName": "probe",
+        "content": [{ "type": "text", "text": "probe ran once" }],
+        "isError": false, "timestamp": 1,
+    }))
+    .expect("tool result message");
+    request.base.headers = Some(
+        [
+            pair("x-AcP-MoDeL-ReQuEsT-iD", "edge-2"),
+            pair("IDEMPOTENCY-KEY", "edge-2"),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let second = run(
+        &ws,
+        &context(vec![user("one"), Message::Assistant(first), tool_result]),
+        &request,
+    )
+    .await;
+    assert_eq!(text_of(&second), "after tool");
+    let records = server.drain();
+    assert_eq!(
+        upgrade_headers(&records),
+        vec![
+            pair("authorization", "Bearer test-key"),
+            pair("idempotency-key", "edge-1"),
+            pair("session_id", "per-call-ids"),
+            pair("x-acp-model-request-id", "edge-1"),
+            pair("x-client-request-id", "per-call-ids"),
+        ]
+    );
+    assert_eq!(
+        seen(records.clone()),
+        vec![
+            Seen::Upgrade(1),
+            Seen::Ws {
+                connection: 1,
+                previous: None,
+                inputs: 1
+            },
+            Seen::Ws {
+                connection: 1,
+                previous: Some("resp_1".to_string()),
+                inputs: 1
+            },
+        ]
+    );
+    let Record::WsRequest { body, .. } = &records[2] else {
+        panic!("expected the continued request: {records:?}");
+    };
+    assert_eq!(
+        body["input"],
+        json!([{
+            "type": "function_call_output", "call_id": "call_1", "output": "probe ran once",
+        }])
+    );
+    crate::cleanup_session_resources(Some("per-call-ids"));
 }
 
 /// A body change (here the model) or a rewritten history invalidates the
@@ -1534,7 +1633,7 @@ async fn an_identity_change_closes_the_busy_socket_under_its_request() {
     )
     .await;
     let ws = ws_model(&server);
-    let stalled = stream_openai_responses(
+    let mut stalled = stream_openai_responses(
         &ws,
         &context(vec![user("one")]),
         Some(&options(Some("rotate-busy"), None)),
@@ -1546,6 +1645,10 @@ async fn an_identity_change_closes_the_busy_socket_under_its_request() {
     assert!(matches!(
         server.next_request().await,
         Record::WsRequest { connection: 1, .. }
+    ));
+    assert!(matches!(
+        stalled.next_event().await,
+        Some(crate::types::AssistantMessageEvent::Start { .. })
     ));
     let mut rotated = options(Some("rotate-busy"), None);
     rotated.base.api_key = Some("rotated-key".to_string());

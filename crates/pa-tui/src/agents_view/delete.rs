@@ -1,18 +1,13 @@
-//! The stop-or-delete flow: the armed confirm (TS `pendingDeleteAgent` /
-//! `pendingKillSubagent`), the wire dispatch the confirm executes, and
-//! the no-effect outcome summary (moved with its concern).
+//! The stop-or-delete flow: the armed confirm, the wire dispatch the confirm executes, and the
+//! no-effect outcome summary.
 use super::{
     mpsc, AgentsViewMode, AgentsViewRow, DaemonClient, DaemonCommand, RowKind, StatusTone, UiInput,
     Value,
 };
 
-/// The armed stop-or-delete row (TS `pendingDeleteAgent` /
-/// `pendingKillSubagent`): which row waits on the second press, and the
-/// word its hint renders (`stop` while the row has live work, `delete`
-/// otherwise — TS `hasLiveWork`). The session key rides along so a
-/// roster replacement (the same identity, a NEW live session) retires
-/// the arm: the second press must confirm the session it will act on,
-/// never silently act on its replacement.
+/// The armed stop-or-delete row: which row waits on the second press, and the word its hint
+/// renders. The session key rides along so a roster replacement retires the arm: the second
+/// press must confirm the session it will act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PendingDelete {
     pub(super) identity: String,
@@ -22,8 +17,7 @@ pub(super) struct PendingDelete {
     pub(super) session_key: Option<String>,
 }
 
-/// One stop-or-delete dispatch the run loop executes (the wire variant
-/// follows the row kind — TS `handleDeleteSelected`'s branches).
+/// One stop-or-delete dispatch the run loop executes (the wire variant follows the row kind).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DeleteAction {
     /// A running subagent: stop it via its parent's session
@@ -47,14 +41,22 @@ pub(super) enum DeleteAction {
     },
     /// A saved, non-live agent: delete the session file
     /// (`delete_saved_session`).
-    DeleteSavedSession { session_path: String, name: String },
+    DeleteSavedSession {
+        session_path: String,
+        name: String,
+    },
+    StopShell {
+        shell_id: String,
+        name: String,
+    },
 }
 
 impl DeleteAction {
-    /// The status line's success text (the wire word plus the row).
     fn success_message(&self) -> String {
         match self {
-            DeleteAction::StopSubagent { name, .. } | DeleteAction::StopAgent { name, .. } => {
+            DeleteAction::StopSubagent { name, .. }
+            | DeleteAction::StopAgent { name, .. }
+            | DeleteAction::StopShell { name, .. } => {
                 format!("Stopped {name}")
             }
             DeleteAction::DeleteSubagent { name, .. } => {
@@ -66,20 +68,19 @@ impl DeleteAction {
         }
     }
 
-    /// The failure prefix (the arm's wire word).
     fn fail_word(&self) -> &'static str {
         match self {
-            DeleteAction::StopSubagent { .. } | DeleteAction::StopAgent { .. } => "Stop",
+            DeleteAction::StopSubagent { .. }
+            | DeleteAction::StopAgent { .. }
+            | DeleteAction::StopShell { .. } => "Stop",
             DeleteAction::DeleteSubagent { .. } | DeleteAction::DeleteSavedSession { .. } => {
                 "Delete"
             }
         }
     }
 
-    /// Whether the wire's own outcome fields say the effect actually
-    /// happened (the honest-success check: a `cancelled: false` or a
-    /// `deleted: false` in a `success` response means the command ran
-    /// but changed nothing — reported as such, never as success).
+    /// Whether the wire's own outcome fields say the effect actually happened (a `cancelled:
+    /// false` in a `success` response means the command ran but changed nothing, never a success).
     pub(super) fn effect_happened(&self, response: &pa_types::daemon::DaemonResponse) -> bool {
         let Some(data) = response.data.as_ref() else {
             return true;
@@ -91,7 +92,7 @@ impl DeleteAction {
             DeleteAction::DeleteSubagent { .. } => {
                 data.get("deleted") != Some(&serde_json::json!(false))
             }
-            DeleteAction::StopAgent { .. } => true,
+            DeleteAction::StopAgent { .. } | DeleteAction::StopShell { .. } => true,
             DeleteAction::DeleteSavedSession { .. } => {
                 data.get("ok").map(serde_json::Value::as_bool) != Some(Some(false))
             }
@@ -99,9 +100,8 @@ impl DeleteAction {
     }
 }
 
-/// The no-effect status summary: the wire's own explanation (`error`
-/// or `reason`) beats a bare `ok: false`, a string value renders bare,
-/// and a payload with no explanation falls back to its own text.
+/// The no-effect status summary: the wire's own explanation (`error` or `reason`) beats a bare
+/// `ok: false`; a payload with no explanation falls back to its own text.
 pub(super) fn no_effect_summary(data: Option<&serde_json::Value>) -> String {
     data.and_then(|data| {
         data.get("error")
@@ -119,11 +119,8 @@ pub(super) fn no_effect_summary(data: Option<&serde_json::Value>) -> String {
     )
 }
 
-/// One stop-or-delete wire dispatch (TS `handleDeleteSelected`'s arms):
-/// the call runs off the key loop with a client clone and its outcome
-/// re-enters the loop as a `DeleteResult` status line — the live roster
-/// push refreshes the rows behind it, so the stopped or deleted row
-/// leaves the list on the next roster event, not on the status itself.
+/// One stop-or-delete wire dispatch: the call runs off the key loop, its outcome re-enters as a
+/// `DeleteResult` status line — the roster push, not the status, refreshes the rows.
 pub(super) fn spawn_delete_dispatch(
     client: &DaemonClient,
     ui_tx: mpsc::UnboundedSender<UiInput>,
@@ -167,10 +164,14 @@ pub(super) fn spawn_delete_dispatch(
                     rest: serde_json::Map::default(),
                 }
             }
+            DeleteAction::StopShell { shell_id, .. } => DaemonCommand::KillPersistentShell {
+                id: None,
+                shell_id: shell_id.clone(),
+                rest: serde_json::Map::default(),
+            },
         };
-        // The outcome's tone (TS `setStatusMessage`'s explicit tones):
-        // a success reads muted, a no-effect stop warning, a failure
-        // error — the status line never re-derives it from the text.
+        // The outcome's tone is explicit: success muted, a no-effect stop warning, a
+        // failure error — the status line never re-derives it from the text.
         let (outcome, tone) = match client.request(request).await {
             Ok(response) if response.success && action.effect_happened(&response) => {
                 (action.success_message(), StatusTone::Muted)
@@ -207,7 +208,8 @@ pub(super) fn spawn_delete_dispatch(
             DeleteAction::DeleteSavedSession { .. }
             | DeleteAction::StopSubagent { .. }
             | DeleteAction::DeleteSubagent { .. }
-            | DeleteAction::StopAgent { .. } => None,
+            | DeleteAction::StopAgent { .. }
+            | DeleteAction::StopShell { .. } => None,
         };
         let _ = ui_tx.send(UiInput::DeleteResult {
             message: outcome,
@@ -218,10 +220,9 @@ pub(super) fn spawn_delete_dispatch(
 }
 
 impl AgentsViewMode {
-    /// The ctrl+x two-press grammar (TS `handleDeleteSelected`'s confirm
-    /// arms): a second press on the same row — with the same live-work
-    /// word it armed with — executes the stop-or-delete dispatch;
-    /// anything else (re-)arms the confirm over the selected row.
+    /// The ctrl+x two-press grammar: a second press on the same row — with the same
+    /// live-work word it armed with — executes the stop-or-delete dispatch; anything
+    /// else (re-)arms the confirm over the selected row.
     pub(super) fn confirm_delete_for_selected(&mut self, was_armed: Option<PendingDelete>) {
         let executes = was_armed.is_some_and(|pending| {
             self.rows.get(self.selected).is_some_and(|row| {
@@ -241,18 +242,19 @@ impl AgentsViewMode {
         let row = self.rows.get(self.selected)?;
         let stop = Self::delete_arm_word(row);
         match row.kind {
-            RowKind::SubagentSummary | RowKind::Code => None,
-            // An agent with a live session stops (TS `stopAgentForDeletion`
-            // keys on the session's existence — an idle-but-live row still
-            // stops, never deletes its file); a saved-only row deletes.
+            RowKind::SubagentSummary | RowKind::Code | RowKind::Shells | RowKind::FactoryRuns => {
+                None
+            }
+            RowKind::PersistentShell => Some(()),
+            // An agent with a live session stops (an idle-but-live row still stops, never
+            // deletes its file); a saved-only row deletes.
             RowKind::Agent if row.summary.get("activeSessionId").is_some() => row
                 .summary
                 .get("activeSessionId")
                 .map(Value::as_str)
                 .map(|_| ()),
-            // A scoped view's promoted direct child is an Agent-kind row
-            // carrying the child id: it rides the child arms, never the
-            // agent arms.
+            // A scoped view's promoted direct child is an Agent-kind row carrying the child id:
+            // it rides the child arms, never the agent arms.
             RowKind::Agent if row.summary.get("rlmChildId").is_some() => {
                 row.summary.get("rlmChildId").map(Value::as_str).map(|_| ())
             }
@@ -263,10 +265,8 @@ impl AgentsViewMode {
                 .map(|_| ()),
             RowKind::Subagent => row.summary.get("rlmChildId").map(Value::as_str).map(|_| ()),
         }?;
-        // A child arm only when its dispatch can resolve: the parent
-        // session (the summary's parentActiveSessionId, or the parent
-        // row's live session) must exist, or the second press would be a
-        // confirmed no-op.
+        // A child arm only when its dispatch can resolve: the parent session must exist, or the
+        // second press would be a confirmed no-op.
         let parent_session_missing = !row
             .summary
             .get("parentActiveSessionId")
@@ -294,10 +294,8 @@ impl AgentsViewMode {
         })
     }
 
-    /// The session a child dispatch targets: the summary's
-    /// parentActiveSessionId, else the parent row's live session (the
-    /// daemon scopes the child lookup by the parent's session — the
-    /// child's own activeSessionId is never the target).
+    /// The session a child dispatch targets: the summary's parentActiveSessionId, else the parent
+    /// row's live session (the child's own activeSessionId is never the target).
     fn child_parent_session_key(&self, row: &AgentsViewRow) -> Option<String> {
         if let Some(parent_id) = row
             .summary
@@ -318,11 +316,9 @@ impl AgentsViewMode {
             .map(str::to_string)
     }
 
-    /// The arm's session key: the session the execution itself targets —
-    /// a child rides its parent's session, a live agent its own, a saved
-    /// row its file. A roster change that swaps the key (a re-parented
-    /// child above all) retires the confirm: the second press acts on
-    /// the session the first press confirmed.
+    /// The arm's session key: the session the execution itself targets — a child rides its parent's
+    /// session, a live agent its own, a saved row its file. A roster change that swaps the key
+    /// retires the confirm.
     pub(super) fn armed_session_key(&self, row: &AgentsViewRow) -> Option<String> {
         if row.kind == RowKind::Subagent || row.summary.get("rlmChildId").is_some() {
             return self.child_parent_session_key(row);
@@ -334,28 +330,25 @@ impl AgentsViewMode {
             .map(str::to_string)
     }
 
-    /// The row's stop-or-delete word (the hint + the execution gate's
-    /// shared derivation): true while the row rides a live session or
-    /// the running section (TS `hasLiveWork`), false for a saved-only
-    /// row.
+    /// The row's stop-or-delete word: true while the row rides a live session or the running
+    /// section, false for a saved-only row.
     pub(super) fn delete_arm_word(row: &AgentsViewRow) -> bool {
-        if row.summary.get("rlmChildId").is_some() {
-            // A child rides its own activity (TS `hasLiveWork` over the
-            // child): the running section is its live work, an idle
-            // child deletes — the retained activeSessionId on an idle
-            // child is not live work.
+        if row.kind == RowKind::PersistentShell {
+            // A listed shell is live: it always stops.
+            true
+        } else if row.summary.get("rlmChildId").is_some() {
+            // A child rides its own activity: the running section is its live work, an idle
+            // child deletes — the retained activeSessionId on an idle child is not live work.
             row.section == crate::agents_view_state::Section::Running
         } else {
-            // An agent keys on its session's existence (TS
-            // `stopAgentForDeletion`): an idle-but-live agent still
-            // stops, never deletes its file.
+            // An agent keys on its session's existence: an idle-but-live agent still stops,
+            // never deletes its file.
             row.summary.get("activeSessionId").is_some()
         }
     }
 
-    /// The executed dispatch for the armed row (the second press): the
-    /// wire variant follows the row kind, exactly TS
-    /// `handleDeleteSelected`'s branches.
+    /// The executed dispatch for the armed row (the second press): the wire variant follows
+    /// the row kind.
     pub(super) fn delete_action_for_selected(&self) -> Option<DeleteAction> {
         let row = self.rows.get(self.selected)?;
         let name = row.title.clone();
@@ -374,13 +367,14 @@ impl AgentsViewMode {
         // Subagent rows (and promoted children) target the child through
         // the parent's live session.
         if let Some(child_id) = child_id {
-            if row.kind == RowKind::SubagentSummary {
+            if matches!(
+                row.kind,
+                RowKind::SubagentSummary | RowKind::Shells | RowKind::FactoryRuns
+            ) {
                 return None;
             }
-            // The child arms always run through the PARENT's session: a
-            // scoped promoted child has no parent row in the list, so the
-            // summary's own parentActiveSessionId carries the parent
-            // session; the nested child walks its parent row.
+            // The child arms always run through the PARENT's session: a scoped promoted child has
+            // no parent row in the list, so its own parentActiveSessionId carries it.
             let active_session_id = self.child_parent_session_key(row)?;
             if Self::delete_arm_word(row) {
                 return Some(DeleteAction::StopSubagent {
@@ -395,11 +389,18 @@ impl AgentsViewMode {
                 name,
             });
         }
-        // Agent rows: a live session stops (idle-but-live included — TS
-        // `stopAgentForDeletion` keys on the session's existence); a
-        // saved-only row deletes its file.
+        // Agent rows: a live session stops (idle-but-live included); a saved-only row deletes
+        // its file.
         match row.kind {
-            RowKind::SubagentSummary | RowKind::Subagent | RowKind::Code => None,
+            RowKind::SubagentSummary
+            | RowKind::Subagent
+            | RowKind::Code
+            | RowKind::Shells
+            | RowKind::FactoryRuns => None,
+            RowKind::PersistentShell => {
+                let shell_id = row.summary.get("shellId")?.as_str()?.to_string();
+                Some(DeleteAction::StopShell { shell_id, name })
+            }
             RowKind::Agent => {
                 if let Some(active_session_id) = active_session_id {
                     Some(DeleteAction::StopAgent {
@@ -414,15 +415,12 @@ impl AgentsViewMode {
         }
     }
 
-    /// The executed delete the run loop takes (the dispatch runs with
-    /// the client, off the key loop).
     pub(super) fn take_delete_action(&mut self) -> Option<DeleteAction> {
         self.pending_delete_action.take()
     }
 
-    /// One landed stop-or-delete outcome: the status line reports it,
-    /// and a deleted saved row leaves the catalog immediately (the live
-    /// roster push covers the other arms; saved rows have no push).
+    /// One landed stop-or-delete outcome: the status line reports it, and a deleted saved row
+    /// leaves the catalog immediately (saved rows have no roster push).
     pub(super) fn delete_result(
         &mut self,
         message: &str,

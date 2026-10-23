@@ -20,7 +20,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -29,28 +29,13 @@ use serde_json::{json, Value};
 use crate::lease::canonical_session_path;
 use crate::util::now_iso;
 
-// The read-back machinery (the wire record grammar, the line parser, the
-// replay state + stat-identity cache records, the edge join keys, the
-// path canonicalizers, and the `live_edges` liveness resolver with its
-// session-artifacts index) moved to the child module at the same tree
-// position (rlm_ledger::replay); the use-binding keeps the facade
-// impl's bare-name resolution (the `replay`/`new`/`rlm_ledger_path`/
-// `edge_is_live`/`live_edges` callers).
 mod replay;
 
 use replay::{
     canonicalize_dir, edge_key, file_identity, is_file, parse_ledger_line, sole_edge_by_child_id,
-    LedgerRecord, LivePathResolver, ReplaySnapshot, ReplayState,
+    DeletedBucket, LedgerRecord, LivePathResolver, ReplaySnapshot, ReplayState,
 };
 
-// The legacy-registry concern (the pre-ledger per-parent registry
-// reader, its bounded header-line probe, and the per-child display
-// sidecar entry + atomic writer) moved to the child module at the same
-// tree position (rlm_ledger::legacy_registry); the re-exports keep the
-// facade's paths stable (rlm_roster.rs, update_roster.rs, and
-// supervisor/{adoption,worker_lifecycle}.rs), the pub(crate) binding
-// keeps the seed caller resolving, and the cfg(test) binding keeps the
-// tests glob resolving without a non-test unused import.
 mod legacy_registry;
 
 pub(crate) use legacy_registry::read_legacy_registry;
@@ -60,10 +45,6 @@ pub use legacy_registry::{
     read_rlm_subagent_display, write_rlm_subagent_display, LegacyRlmSubagentEntry,
     RlmSubagentDisplayEntry,
 };
-
-// The test mass (the ledger battery) moved to the child module at the
-// same tree position (rlm_ledger::tests); the #[cfg(test)] decl rides
-// at the facade tail.
 
 /// Ledger files live under `<agent-dir>/rlm-ledger/`, one per sessions dir.
 pub const RLM_LEDGER_DIR: &str = "rlm-ledger";
@@ -82,7 +63,6 @@ pub enum RlmLedgerDeleteReason {
 }
 
 impl RlmLedgerDeleteReason {
-    /// The wire names (`user`, `parent-teardown`, `revoked`, `gc`).
     #[must_use]
     pub fn from_wire(value: &str) -> Option<Self> {
         match value {
@@ -114,15 +94,12 @@ pub struct RlmLedgerEdge {
     pub depth: u32,
     pub name: String,
     pub deleted: Option<RlmLedgerDeleteReason>,
-    /// The child's captured own usage at deletion: the amendment delete
-    /// record's durable snapshot (TS `SessionUsageSummary` shape), which
-    /// keeps a tombstoned child's spend billable after its transcript is
-    /// gone. `None` on legacy tombstones and live edges.
+    /// The child's captured own usage at deletion, so a tombstoned child's
+    /// spend stays billable; `None` on legacy tombstones and live edges.
     pub deleted_usage: Option<crate::session_usage::SessionUsageSummary>,
 }
 
-/// Inputs for `append_spawn` (validated like a record the reader would
-/// refuse to read back).
+/// Inputs for `append_spawn` (validated like a record the reader would refuse to read back).
 #[derive(Debug, Clone)]
 pub struct RlmSpawnInput {
     pub child_id: String,
@@ -132,10 +109,8 @@ pub struct RlmSpawnInput {
     pub name: String,
 }
 
-/// The per-sessions-dir spawn ledger. Reads are guarded by a file stat
-/// snapshot; the first operation seeds a missing ledger from the legacy
-/// per-parent registries (a seeding failure degrades to an empty ledger and
-/// is never fail-closed).
+/// The per-sessions-dir spawn ledger. Reads are guarded by a file stat snapshot; a missing ledger
+/// is seeded from the legacy registries (seed failure degrades to empty, never fail-closed).
 pub struct RlmSpawnLedger {
     path: PathBuf,
     agent_dir: PathBuf,
@@ -145,13 +120,116 @@ pub struct RlmSpawnLedger {
     log: Box<dyn Fn(&str) + Send + Sync>,
 }
 
-/// Ledger path for one sessions dir (TS `rlmLedgerPath`): a 16-hex sha256 of
-/// the canonical sessions dir under `<agent-dir>/rlm-ledger/`.
+/// Ledger path for one sessions dir: a 16-hex sha256 of the canonical
+/// sessions dir under `<agent-dir>/rlm-ledger/`.
 #[must_use]
 pub fn rlm_ledger_path(agent_dir: &Path, sessions_dir: &Path) -> PathBuf {
     let canonical = canonicalize_dir(sessions_dir);
     let hash = crate::paths::hash_key(&canonical.to_string_lossy(), 16);
     agent_dir.join(RLM_LEDGER_DIR).join(format!("{hash}.jsonl"))
+}
+
+/// The liveness pass shared by the live-edge reads: deleted edges never
+/// resolve; the survivors' recorded endpoints do - a dead endpoint drops
+/// the edge, a moved path resolves through its durable session id - and
+/// the resolved paths replace the recorded ones.
+fn resolve_live_edges(
+    state: &ReplayState,
+    resolver: &mut LivePathResolver,
+) -> Result<Vec<RlmLedgerEdge>> {
+    let mut edges = Vec::with_capacity(state.edges.len());
+    for edge in &state.edges {
+        if edge.deleted.is_some() {
+            continue;
+        }
+        let (Some(child), Some(parent)) = (
+            resolver.resolve(&edge.child)?,
+            resolver.resolve(&edge.parent)?,
+        ) else {
+            continue;
+        };
+        edges.push(RlmLedgerEdge {
+            parent: parent.to_string_lossy().to_string(),
+            child: child.to_string_lossy().to_string(),
+            ..edge.clone()
+        });
+    }
+    Ok(edges)
+}
+
+/// Fold parsed records into the replayed edge set, keeping only the
+/// records whose child id `keep` selects.
+fn fold_records(records: Vec<LedgerRecord>, keep: impl Fn(&str) -> bool) -> ReplayState {
+    let mut state = ReplayState::default();
+    for record in records {
+        match record {
+            LedgerRecord::Spawn {
+                child_id,
+                parent,
+                child,
+                depth,
+                name,
+            } if keep(&child_id) => {
+                let key = edge_key(&child_id, &child);
+                if let Some(at) = state.index.get(&key).copied() {
+                    state.edges[at] = RlmLedgerEdge {
+                        child_id,
+                        parent,
+                        child,
+                        depth,
+                        name,
+                        deleted: None,
+                        deleted_usage: None,
+                    };
+                } else {
+                    state.index.insert(key.clone(), state.edges.len());
+                    state.edges.push(RlmLedgerEdge {
+                        child_id,
+                        parent,
+                        child,
+                        depth,
+                        name,
+                        deleted: None,
+                        deleted_usage: None,
+                    });
+                }
+            }
+            LedgerRecord::Rename {
+                child_id,
+                child,
+                name,
+            } if keep(&child_id) => {
+                let key = edge_key(&child_id, &child);
+                if let Some(&at) = state.index.get(&key) {
+                    state.edges[at].name = name;
+                } else if let Some(at) = sole_edge_by_child_id(&state, &child_id) {
+                    state.edges[at].name = name;
+                }
+            }
+            LedgerRecord::Delete {
+                child_id,
+                child,
+                reason,
+                usage,
+            } if keep(&child_id) => {
+                let key = edge_key(&child_id, &child);
+                let at = match state.index.get(&key).copied() {
+                    Some(at) => Some(at),
+                    None => sole_edge_by_child_id(&state, &child_id),
+                };
+                if let Some(at) = at {
+                    state.edges[at].deleted = Some(reason);
+                    // The snapshot is sticky: a re-tombstone without a usage
+                    // block never clears it; a fresh capture replaces it.
+                    if let Some(usage) = usage {
+                        state.edges[at].deleted_usage = Some(usage);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    state
 }
 
 impl RlmSpawnLedger {
@@ -164,9 +242,8 @@ impl RlmSpawnLedger {
     ) -> Self {
         Self {
             path: rlm_ledger_path(agent_dir, sessions_dir),
-            // The artifact tree the path resolver walks anchors to the
-            // canonical agent dir (the same realpath form the sessions
-            // dir takes), so resolved edges carry one path form.
+            // Canonical agent dir: the resolver's tree anchor takes the
+            // same realpath form as the sessions dir (one path form).
             agent_dir: canonicalize_dir(agent_dir),
             canonical_sessions_dir: canonicalize_dir(sessions_dir),
             seed_attempted: AtomicBool::new(false),
@@ -184,7 +261,7 @@ impl RlmSpawnLedger {
     }
 
     /// Record a spawn admission. The child session path must be unique among
-    /// live edges (a per-process advisory check, exactly like the TS writer).
+    /// live edges (a per-process advisory check).
     ///
     /// # Errors
     ///
@@ -238,8 +315,7 @@ impl RlmSpawnLedger {
     ///
     /// # Errors
     ///
-    /// Returns an error when the rename record cannot be appended (the
-    /// ledger directory, open, serialization, write, or sync fails).
+    /// Returns an error when the rename record cannot be appended.
     pub fn append_rename(&self, child_id: &str, child: &str, name: &str) -> Result<()> {
         let child_path = canonical_session_path(Path::new(child));
         self.append_record(&json!({
@@ -281,9 +357,7 @@ impl RlmSpawnLedger {
     ///
     /// # Errors
     ///
-    /// Returns an error when the tombstone record cannot be appended
-    /// (the ledger directory, open, serialization, write, or sync
-    /// fails).
+    /// Returns an error when the tombstone record cannot be appended.
     pub fn append_delete(
         &self,
         child_id: &str,
@@ -301,20 +375,12 @@ impl RlmSpawnLedger {
         }))
     }
 
-    /// The deletion's durable usage amendment (TS has no equivalent: its
-    /// bucket re-reads the tombstoned child's transcript, which a normal
-    /// delete removes - the Macroscope race). The amendment is a second
-    /// delete record for the same edge carrying the captured own-usage
-    /// snapshot; replay's last-writer-wins merges it into the tombstoned
-    /// edge, so the spend survives the transcript's removal, a saved-
-    /// session delete, and daemon restarts.
+    /// The deletion's durable usage amendment (deliberate TS divergence: TS re-reads the
+    /// tombstoned transcript, which its delete removes): the captured usage rides a second record.
     ///
     /// # Errors
     ///
-    /// Returns an error when the usage snapshot cannot be serialized or
-    /// the tombstone record cannot be appended; a snapshot replay would
-    /// reject (a non-finite or negative cost) rides as absent — the
-    /// bare tombstone still lands.
+    /// Returns an error when the snapshot cannot be serialized or the tombstone cannot be appended.
     pub fn append_delete_with_usage(
         &self,
         child_id: &str,
@@ -348,14 +414,12 @@ impl RlmSpawnLedger {
         }))
     }
 
-    /// Tombstone every edge for one child session path (a path may hold
-    /// duplicate edges from raced or corrupt appends; a live one would
-    /// resurrect a later recreation at that path as a subagent).
+    /// Tombstone every edge for one child session path (duplicate edges from raced or corrupt
+    /// appends; a live one would resurrect a later recreation at that path as a subagent).
     ///
     /// # Errors
     ///
-    /// Returns an error when the replay fails or one of the tombstone
-    /// records cannot be appended.
+    /// Returns an error when the replay fails or one of the tombstone records cannot be appended.
     pub fn tombstone_child_path(
         &self,
         child: &str,
@@ -364,14 +428,12 @@ impl RlmSpawnLedger {
         self.tombstone_child_path_with_usage(child, reason, None)
     }
 
-    /// The saved-session delete's tombstone with the captured usage
-    /// snapshot (the file dies right after this, so the snapshot must ride
-    /// the tombstone: the bucket's lazy file fallback has nothing to read).
+    /// The saved-session delete's tombstone with the captured usage snapshot (the file dies right
+    /// after this, so the bucket's lazy file fallback has nothing to read).
     ///
     /// # Errors
     ///
-    /// Returns an error when the replay fails or one of the per-edge
-    /// tombstones cannot be appended.
+    /// Returns an error when the replay fails or a per-edge tombstone cannot be appended.
     pub fn tombstone_child_path_with_usage(
         &self,
         child: &str,
@@ -418,19 +480,45 @@ impl RlmSpawnLedger {
     /// # Errors
     ///
     /// Returns an error when the ledger replay fails (an oversized
-    /// ledger).
+    /// ledger) or a prior panic poisoned the deleted-usage cache.
     pub fn deleted_descendant_usage_by_parent(
         &self,
     ) -> Result<HashMap<String, crate::session_usage::SessionUsageSummary>> {
+        self.seed_once()?;
+        let state = self.replay_cached()?;
+        let inputs = state
+            .edges
+            .iter()
+            .filter(|edge| edge.deleted.is_some())
+            .map(|edge| file_identity(Path::new(&edge.child)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut cached = state
+            .deleted_bucket
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deleted bucket lock poisoned"))?;
+        if let Some(bucket) = cached.as_ref().filter(|bucket| bucket.inputs == inputs) {
+            return Ok(bucket.usage.clone());
+        }
+        let usage = self.fold_deleted_descendant_usage(&state.edges);
+        *cached = Some(DeletedBucket {
+            inputs,
+            usage: usage.clone(),
+        });
+        Ok(usage)
+    }
+
+    fn fold_deleted_descendant_usage(
+        &self,
+        edges: &[RlmLedgerEdge],
+    ) -> HashMap<String, crate::session_usage::SessionUsageSummary> {
         use crate::session_usage::SessionUsageSummary;
-        let edges = self.edges(true)?;
         let canonical = |path: &str| {
             canonical_session_path(Path::new(path))
                 .to_string_lossy()
                 .to_string()
         };
         let mut live_paths: HashSet<String> = HashSet::new();
-        for edge in &edges {
+        for edge in edges {
             if edge.deleted.is_none() {
                 live_paths.insert(canonical(&edge.child));
             }
@@ -439,7 +527,7 @@ impl RlmSpawnLedger {
         // the child (and its snapshot) for its parent.
         let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
         let mut snapshot_by_path: HashMap<String, Option<SessionUsageSummary>> = HashMap::new();
-        for edge in &edges {
+        for edge in edges {
             if edge.deleted.is_none() {
                 continue;
             }
@@ -473,8 +561,7 @@ impl RlmSpawnLedger {
         };
         let add = |mut left: SessionUsageSummary, right: SessionUsageSummary| {
             // Saturating: the bucket feeds billable rollups — a huge
-            // snapshot must not panic in debug or wrap to an underbill in
-            // release (the same convention as every other usage sum).
+            // snapshot must not panic or wrap to an underbill in release.
             left.input_tokens = left.input_tokens.saturating_add(right.input_tokens);
             left.output_tokens = left.output_tokens.saturating_add(right.output_tokens);
             left.cost += right.cost;
@@ -554,7 +641,7 @@ impl RlmSpawnLedger {
                 usage_by_parent.insert(parent.clone(), total);
             }
         }
-        Ok(usage_by_parent)
+        usage_by_parent
     }
 
     /// Replay edges without liveness reconciliation. Deleted edges are
@@ -575,14 +662,8 @@ impl RlmSpawnLedger {
             .collect())
     }
 
-    /// Live edges reconciled by liveness of their recorded endpoints: a
-    /// parent or child whose session file no longer exists drops the
-    /// edge. A recorded path whose file MOVED (a storage-root migration,
-    /// an artifacts re-parenting) resolves through its durable session id
-    /// first — the sessions dir and the session-artifacts tree hold the
-    /// same session under a different root — and the returned edge
-    /// carries the resolved path, so a restart-era child never anchors to
-    /// a stale path. Only a session with no live file anywhere is dead.
+    /// Live edges reconciled by liveness of their recorded endpoints: a dead endpoint drops the
+    /// edge; a MOVED path resolves through its durable session id first.
     ///
     /// # Errors
     ///
@@ -592,25 +673,36 @@ impl RlmSpawnLedger {
     pub fn live_edges(&self) -> Result<Vec<RlmLedgerEdge>> {
         self.seed_once()?;
         let state = self.replay_cached()?;
-        let mut resolver =
-            LivePathResolver::new(self.agent_dir.clone(), self.canonical_sessions_dir.clone());
-        let mut edges = Vec::with_capacity(state.edges.len());
-        for edge in &state.edges {
-            if edge.deleted.is_some() {
-                continue;
-            }
-            let (Some(child), Some(parent)) = (
-                resolver.resolve(&edge.child),
-                resolver.resolve(&edge.parent),
-            ) else {
-                continue;
-            };
-            edges.push(RlmLedgerEdge {
-                parent: parent.to_string_lossy().to_string(),
-                child: child.to_string_lossy().to_string(),
-                ..edge.clone()
-            });
-        }
+        let mut resolver = LivePathResolver::new(
+            self.agent_dir.clone(),
+            self.canonical_sessions_dir.clone(),
+            &state.artifact_index,
+        );
+        resolve_live_edges(&state, &mut resolver)
+    }
+
+    /// The opened parent file's live edges: only the records of children
+    /// spawned by that parent file (matched by its durable session id,
+    /// the file-name stem) fold and resolve, and only those whose
+    /// resolved parent IS the parent file remain. A parent's read never
+    /// stats, or walks the artifacts tree for, another parent's edges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the ledger replay fails (an oversized
+    /// ledger); a missing ledger replays empty, and only the liveness
+    /// resolution drops edges.
+    pub fn live_edges_of_parent(&self, parent_file: &Path) -> Result<Vec<RlmLedgerEdge>> {
+        self.seed_once()?;
+        let parent_file = canonical_session_path(parent_file);
+        let state = self.replay_of_parent(&parent_file)?;
+        let mut resolver = LivePathResolver::new(
+            self.agent_dir.clone(),
+            self.canonical_sessions_dir.clone(),
+            &state.artifact_index,
+        );
+        let mut edges = resolve_live_edges(&state, &mut resolver)?;
+        edges.retain(|edge| canonical_session_path(Path::new(&edge.parent)) == parent_file);
         Ok(edges)
     }
 
@@ -624,16 +716,26 @@ impl RlmSpawnLedger {
     /// snapshotted counts as live. An unreadable (oversized) ledger reads
     /// as not-live.
     pub fn edge_is_live(&self, child_id: &str, child: &str) -> bool {
-        let child = canonical_session_path(Path::new(child));
+        let canonical_child = canonical_session_path(Path::new(child));
         self.seed_once().is_ok()
             && self.replay_cached().is_ok_and(|state| {
-                state.edges.iter().any(|edge| {
+                let is_live = |edge: &RlmLedgerEdge| {
                     edge.child_id == child_id
                         && edge.deleted.is_none()
-                        && canonical_session_path(Path::new(&edge.child)) == child
+                        && canonical_session_path(Path::new(&edge.child)) == canonical_child
                         && is_file(Path::new(&edge.child))
                         && is_file(Path::new(&edge.parent))
-                })
+                };
+                // Most reads prove liveness through the index. Its keys
+                // were canonicalized at replay, though: a file replaced
+                // by a symlink does not change the ledger's stat identity.
+                // A stale key or tombstoned alias cannot prove absence;
+                // preserve the original read-time path comparison then.
+                state
+                    .index
+                    .get(&edge_key(child_id, child))
+                    .is_some_and(|&at| is_live(&state.edges[at]))
+                    || state.edges.iter().any(is_live)
             })
     }
 
@@ -654,27 +756,57 @@ impl RlmSpawnLedger {
 
     /// Replay behind the stat guard: a file whose identity snapshot is
     /// unchanged reuses the cached edges. A missing file replays empty.
-    fn replay_cached(&self) -> Result<ReplayState> {
+    fn replay_cached(&self) -> Result<Arc<ReplayState>> {
         let identity = file_identity(&self.path)?;
         let mut cache = self.cache.lock().expect("ledger cache lock");
         if let (Some(identity), Some(cached)) = (&identity, cache.as_ref()) {
             if *identity == cached.identity {
-                return Ok(cached.state.clone());
+                return Ok(Arc::clone(&cached.state));
             }
         }
-        let state = self.replay()?;
+        let state = Arc::new(self.replay()?);
         if let Some(identity) = identity {
             *cache = Some(ReplaySnapshot {
                 identity,
-                state: state.clone(),
+                state: Arc::clone(&state),
             });
         }
         Ok(state)
     }
 
     fn replay(&self) -> Result<ReplayState> {
+        Ok(fold_records(self.read_records()?, |_| true))
+    }
+
+    /// The opened parent file's subset of the replayed ledger: fold only
+    /// the records of children spawned by `parent_file` (matched by its
+    /// durable session id, the file-name stem). Every join, including
+    /// the sole-child-id fallback, stays within one child id, so the
+    /// subset fold equals the full fold restricted to that parent's
+    /// children.
+    fn replay_of_parent(&self, parent_file: &Path) -> Result<ReplayState> {
+        let records = self.read_records()?;
+        let own: HashSet<String> = records
+            .iter()
+            .filter_map(|record| match record {
+                LedgerRecord::Spawn {
+                    child_id, parent, ..
+                } if Path::new(parent).file_stem() == parent_file.file_stem() => {
+                    Some(child_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        Ok(fold_records(records, |child_id| own.contains(child_id)))
+    }
+
+    /// The whole ledger's parsed records within its read bounds: the
+    /// byte and record-count caps apply to the whole file; a missing
+    /// ledger reads empty, and one torn or unknown line skips that
+    /// record only.
+    fn read_records(&self) -> Result<Vec<LedgerRecord>> {
         let Ok(bytes) = fs::read(&self.path) else {
-            return Ok(ReplayState::default());
+            return Ok(Vec::new());
         };
         if bytes.len() as u64 > RLM_LEDGER_MAX_BYTES {
             bail!(
@@ -685,105 +817,36 @@ impl RlmSpawnLedger {
         // A torn write inside a multibyte name must spoil one line, not
         // the whole file.
         let content = String::from_utf8_lossy(&bytes);
-        let mut state = ReplayState::default();
-        let mut records = 0usize;
+        let mut records = Vec::new();
+        let mut lines = 0usize;
         for (index, line) in content.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            records += 1;
-            if records > RLM_LEDGER_MAX_RECORDS {
+            lines += 1;
+            if lines > RLM_LEDGER_MAX_RECORDS {
                 bail!(
                     "RLM ledger {} exceeds {RLM_LEDGER_MAX_RECORDS} records; refusing to read",
                     self.path.display()
                 );
             }
-            let record = match parse_ledger_line(line, index) {
-                Ok(Some(record)) => record,
+            match parse_ledger_line(line, index) {
+                Ok(Some(record)) => records.push(record),
                 Ok(None) => {
                     self.log(&format!(
                         "RLM ledger: skipped record with unknown op on line {}",
                         index + 1
                     ));
-                    continue;
                 }
                 Err(error) => {
                     self.log(&format!(
                         "RLM ledger {}: skipped {error:#}",
                         self.path.display()
                     ));
-                    continue;
-                }
-            };
-            match record {
-                LedgerRecord::Spawn {
-                    child_id,
-                    parent,
-                    child,
-                    depth,
-                    name,
-                } => {
-                    let key = edge_key(&child_id, &child);
-                    if let Some(at) = state.index.get(&key).copied() {
-                        state.edges[at] = RlmLedgerEdge {
-                            child_id,
-                            parent,
-                            child,
-                            depth,
-                            name,
-                            deleted: None,
-                            deleted_usage: None,
-                        };
-                    } else {
-                        state.index.insert(key.clone(), state.edges.len());
-                        state.edges.push(RlmLedgerEdge {
-                            child_id,
-                            parent,
-                            child,
-                            depth,
-                            name,
-                            deleted: None,
-                            deleted_usage: None,
-                        });
-                    }
-                }
-                LedgerRecord::Rename {
-                    child_id,
-                    child,
-                    name,
-                } => {
-                    let key = edge_key(&child_id, &child);
-                    if let Some(&at) = state.index.get(&key) {
-                        state.edges[at].name = name;
-                    } else if let Some(at) = sole_edge_by_child_id(&state, &child_id) {
-                        state.edges[at].name = name;
-                    }
-                }
-                LedgerRecord::Delete {
-                    child_id,
-                    child,
-                    reason,
-                    usage,
-                } => {
-                    let key = edge_key(&child_id, &child);
-                    let at = match state.index.get(&key).copied() {
-                        Some(at) => Some(at),
-                        None => sole_edge_by_child_id(&state, &child_id),
-                    };
-                    if let Some(at) = at {
-                        state.edges[at].deleted = Some(reason);
-                        // The snapshot is sticky: a re-tombstone without a
-                        // usage block (an idempotent retry, a bulk path
-                        // tombstone) never clears a captured snapshot; a
-                        // fresh capture replaces it (last writer wins).
-                        if let Some(usage) = usage {
-                            state.edges[at].deleted_usage = Some(usage);
-                        }
-                    }
                 }
             }
         }
-        Ok(state)
+        Ok(records)
     }
 
     /// One durable append; the first record in a fresh file is the meta
@@ -829,11 +892,8 @@ impl RlmSpawnLedger {
         Ok(())
     }
 
-    /// Seed a missing ledger from the legacy per-parent registries, then
-    /// publish atomically: the ledger file only exists once the seed is
-    /// complete, so an interrupted seed leaves nothing to mis-read, and a
-    /// concurrent append wins over the seed (its data is fresher than the
-    /// registries).
+    /// Seed a missing ledger from the legacy per-parent registries, then publish atomically (an
+    /// interrupted seed leaves nothing to mis-read; a concurrent append wins).
     fn seed(&self) -> Result<()> {
         if self.path.exists() {
             return Ok(());
@@ -869,8 +929,8 @@ impl RlmSpawnLedger {
                 }
                 visited.push(child_path.clone());
                 // A registry depth < 1 (legacy 0-depth entries exist in real
-                // data) is unwritable under the spawn invariants; derive
-                // parent depth + 1 instead of skipping the edge.
+                // data) is unwritable; derive parent depth + 1 instead of
+                // skipping the edge.
                 let child_depth = if entry.rlm_depth >= 1 {
                     entry.rlm_depth
                 } else {

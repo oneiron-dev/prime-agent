@@ -220,7 +220,6 @@ async fn a_deadline_settles_a_request_whose_write_never_drains() {
         Duration::from_secs(60),
         manager.enqueue_request(
             Request::Execute { code: code.clone() },
-            &code,
             ExecuteOptions {
                 internal: true,
                 ..ExecuteOptions::default()

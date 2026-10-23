@@ -102,6 +102,9 @@ pub(crate) async fn run_owned(
     }
     // Hidden window on Windows (TS `spawnHidden`).
     crate::platform::process::set_no_window(child.as_std_mut());
+    if cfg!(windows) {
+        child.env("PYTHONUTF8", "1");
+    }
     let started = Instant::now();
     let shown = trace_command(command, args);
     let mut child = child

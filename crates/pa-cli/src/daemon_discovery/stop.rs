@@ -1,16 +1,11 @@
-//! Stopping the discovered daemons (TS `cli/daemon-ps.ts` reap/shutdown
-//! half): the pure action planners, the safe re-probing executors, and the
-//! three command drivers (`status`/`doctor`/`shutdown` output).
+//! Stopping the discovered daemons: the pure action planners, the safe
+//! re-probing executors, and the three command drivers (`status`/`doctor`/
+//! `shutdown`).
 //!
-//! Divergences from TS, deliberate:
-//! - TS's `stopHiddenSupervisors` loop kills duplicate daemons it finds
-//!   listening on one socket path (a handoff-era artifact); the Rust
-//!   supervisor's socket lease makes two owners of one path impossible, so
-//!   the loop is not ported.
-//! - TS's `acquireDaemonShutdownAdmission` (supervisor-ownership
-//!   coordination during update handoffs) has no Rust counterpart yet.
-//! - The supervisor-ownership registry rule of the TS state-root matcher is
-//!   not ported (see the module docs).
+//! Deliberate TS divergences: the `stopHiddenSupervisors` duplicate-kill loop
+//! is not ported (the socket lease makes two owners of one path impossible);
+//! `acquireDaemonShutdownAdmission` and the supervisor-ownership registry rule
+//! have no Rust counterpart yet.
 
 use std::path::Path;
 
@@ -26,12 +21,10 @@ use super::plan::{
     plan_reap, plan_shutdown_all, plan_shutdown_confirmation, ReapActionKind,
     ShutdownConfirmationPlan,
 };
-use super::{
-    discover_daemons, is_daemon_process_listening, probe_daemon, DaemonInfo, DaemonStateRoot,
-};
+use super::{discover_daemons, is_daemon_process_listening, probe_daemon, DaemonStateRoot};
 
-/// `status` (TS `runPs`): the daemons discovered in the given state root as
-/// JSON or as the table.
+/// `status`: the daemons discovered in the given state root as JSON or
+/// as the table.
 pub(crate) fn run_ps(json: bool, root: &DaemonStateRoot) {
     let daemons = discover_daemons(root);
     if json {
@@ -48,8 +41,8 @@ pub(crate) fn run_ps(json: bool, root: &DaemonStateRoot) {
     println!("{}", super::format_daemon_list_table(&daemons));
 }
 
-/// `doctor --fix` (TS `runReap`): clean up clearly-safe daemons. Returns the
-/// process exit code (always 0 — failures are reported as kept lines).
+/// `doctor --fix`: clean up clearly-safe daemons. Returns the process
+/// exit code (always 0 — failures are reported as kept lines).
 pub(crate) fn run_reap(json: bool, root: &DaemonStateRoot) -> i32 {
     let daemons = discover_daemons(root);
     let mut reaped: Vec<(String, String)> = Vec::new();
@@ -74,9 +67,8 @@ pub(crate) fn run_reap(json: bool, root: &DaemonStateRoot) -> i32 {
                 }
             }
             ReapActionKind::Kill => {
-                // Re-probe right before killing: a daemon classified
-                // unreachable at discovery may have started answering; never
-                // signal one that now responds.
+                // Re-probe right before killing: a daemon classified unreachable at
+                // discovery may have started answering; never signal one that responds.
                 if probe_daemon(&action.daemon.socket_path).reachable {
                     apply(
                         reap_reachable_daemon(&action.daemon.socket_path, pid),
@@ -111,8 +103,8 @@ pub(crate) fn run_reap(json: bool, root: &DaemonStateRoot) -> i32 {
     0
 }
 
-/// Ask a reachable daemon to stop, but only after a fresh probe confirms it
-/// is idle (TS `reapReachableDaemon`).
+/// Ask a reachable daemon to stop, but only after a fresh probe confirms
+/// it is idle.
 fn reap_reachable_daemon(socket_path: &Path, pid: Option<u32>) -> StopOutcome {
     let probe = probe_daemon(socket_path);
     if !probe.reachable {
@@ -152,9 +144,8 @@ fn apply(
     }
 }
 
-/// `shutdown` (TS `runShutdownAll` + `runShutdownAllConverging`). Returns the
-/// process exit code: 1 when anything failed (or the JSON confirmation
-/// error), 0 otherwise.
+/// `shutdown`. Returns the process exit code: 1 when anything failed
+/// (or the JSON confirmation error), 0 otherwise.
 pub(crate) fn run_shutdown_all(json: bool, force: bool, root: &DaemonStateRoot) -> i32 {
     let daemons = discover_daemons(root);
     match plan_shutdown_confirmation(
@@ -178,10 +169,8 @@ pub(crate) fn run_shutdown_all(json: bool, force: bool, root: &DaemonStateRoot) 
             1
         }
         ShutdownConfirmationPlan::TtyError => {
-            // TS throws this out of `runShutdownAll` and the public-command
-            // wrapper turns the throw into the standard `Error: …` failure
-            // (stderr + exit 1); only reachable once there are daemons to
-            // stop, so an empty machine shuts down cleanly without a TTY.
+            // The public-command wrapper turns the throw into the standard `Error: …`
+            // failure (stderr + exit 1); only reachable once there are daemons to stop.
             eprintln!(
                 "Error: Shutdown requires confirmation in an interactive terminal. Use \"prime-agent shutdown --force\"."
             );
@@ -200,17 +189,14 @@ pub(crate) fn run_shutdown_all(json: bool, force: bool, root: &DaemonStateRoot) 
     }
 }
 
-/// TS `runShutdownAllConverging`: run the planned actions, then (with
-/// `force`) sweep residuals until the listener set quiets down.
+/// Run the planned actions, then (with `force`) sweep residuals until
+/// the listener set quiets down.
 fn run_shutdown_converging(json: bool, force: bool, root: &DaemonStateRoot) -> i32 {
     let mut stopped: Vec<(String, String)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
     let mut handled_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
-    let daemons: Vec<DaemonInfo> = discover_daemons(root)
-        .into_iter()
-        .filter(|daemon| !super::is_worker_socket_path(&daemon.socket_path, &root.socket_dir))
-        .collect();
+    let daemons = discover_daemons(root);
     let action_order = |kind: &ReapActionKind| match kind {
         ReapActionKind::Shutdown => 0,
         ReapActionKind::RemoveFile => 1,
@@ -326,8 +312,7 @@ fn run_shutdown_converging(json: bool, force: bool, root: &DaemonStateRoot) -> i
         terminate_verified_residuals(root, &mut stopped, &mut failed, &handled_pids);
     }
 
-    // The exit code follows the failures in both output modes (TS sets
-    // process.exitCode = 1 for any failed stop).
+    // The exit code follows the failures in both output modes.
     if json {
         println!("{}", shutdown_report_json(&stopped, &failed));
         return i32::from(!failed.is_empty());
@@ -348,8 +333,7 @@ fn apply_stop(
     }
 }
 
-/// Stop one daemon gracefully, escalating only with `force` (TS
-/// `stopBackgroundService`).
+/// Stop one daemon gracefully, escalating only with `force`.
 fn stop_background_service(
     socket_path: &Path,
     pid: Option<u32>,
@@ -385,10 +369,9 @@ fn stop_background_service(
 
 /// Verified force-kill for one daemon (the supervisor-side contract the
 /// worker-side `stop_tracked_process` already implements): the pid joins
-/// `handled_pids` and the socket file is removed only on confirmed death —
-/// a daemon that survives SIGKILL is reported as failed, with its socket
-/// file deliberately kept so the invisible listener stays discoverable
-/// for the `--force` residual sweep and the doctor's re-probe.
+/// `handled_pids` and the socket file is removed only on confirmed death — a
+/// survivor of SIGKILL is reported failed, its socket file kept so the
+/// invisible listener stays discoverable for the sweep and the doctor.
 fn verified_force_kill(
     pid: u32,
     socket_path: &Path,
@@ -406,8 +389,7 @@ fn verified_force_kill(
 }
 
 /// Ask the daemon to stop and confirm it actually stopped listening: the ack
-/// alone is not proof, so success is reported only once the socket stops
-/// accepting connections (TS `shutdownDaemon`).
+/// alone is not proof; success only once the socket stops accepting.
 fn shutdown_daemon(socket_path: &Path, force: bool) -> bool {
     let Ok(mut client) = crate::daemon_client::DaemonClient::connect_probe(socket_path) else {
         return false;
@@ -431,7 +413,7 @@ fn shutdown_daemon(socket_path: &Path, force: bool) -> bool {
     false
 }
 
-/// `promptYesNo`: empty or anything-but-yes resolves false (default No).
+/// Empty or anything-but-yes resolves false (default No).
 pub(crate) fn prompt_yes_no(message: &str) -> bool {
     use std::io::Write as _;
     print!("{message} [y/N] ");
@@ -444,8 +426,8 @@ pub(crate) fn prompt_yes_no(message: &str) -> bool {
     normalized == "y" || normalized == "yes"
 }
 
-/// One acted-on service in the JSON reports (TS prints the socket path
-/// first, then the action, or the reason on failure).
+/// One acted-on service in the JSON reports: the socket path first,
+/// then the action, or the reason on failure.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ActionEntry {
@@ -460,7 +442,7 @@ struct ReasonEntry {
     reason: String,
 }
 
-/// The reap JSON report (TS prints `{reaped, skipped}` in that order).
+/// The reap JSON report, `{reaped, skipped}` in that order.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReapReport {
@@ -468,7 +450,7 @@ struct ReapReport {
     skipped: Vec<ReasonEntry>,
 }
 
-/// The shutdown JSON report (TS prints `{stopped, failed}` in that order).
+/// The shutdown JSON report, `{stopped, failed}` in that order.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShutdownReport {
@@ -541,8 +523,6 @@ mod tests {
             }
             StopOutcome::Skipped(reason) => panic!("expected a reaped outcome, got {reason}"),
         }
-        // Only the confirmed death joins the handled set and unlinks the
-        // socket (the contract this helper enforces).
         assert!(handled_pids.contains(&pid));
         assert!(
             !socket_path.exists(),
@@ -553,9 +533,8 @@ mod tests {
 
     #[test]
     fn shutdown_report_json_pins_the_failure_shape() {
-        // Every failure path funnels into this report (TS prints
-        // `{stopped, failed}`); the shape is the `--json` contract, so a
-        // survived SIGKILL must surface as a `failed` reason entry.
+        // Every failure path funnels into this report; a survived
+        // SIGKILL must surface as a `failed` reason entry.
         let report = serde_json::from_str::<serde_json::Value>(&shutdown_report_json(
             &[],
             &[(

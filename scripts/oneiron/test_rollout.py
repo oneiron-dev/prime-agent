@@ -719,6 +719,45 @@ class RolloutTests(RolloutFixture):
         self.assertEqual(self.receipt(V1, "ROLLBACK-RECEIPT.json")["status"], "refused")
         self.assertEqual(os.readlink(self.prefix / "current"), V2)
 
+    def test_rollout_and_rollback_still_refuse_ts_launcher_aliased_to_rust(self) -> None:
+        rust_launcher = self.bin_dir / side_by_side.LAUNCHER_NAME
+        rust_launcher.write_text("existing launcher\n")
+        rust_launcher.chmod(0o755)
+        ts_launcher = self.bin_dir / side_by_side.TS_LAUNCHER_NAME
+        ts_launcher.unlink()
+        ts_launcher.symlink_to(side_by_side.LAUNCHER_NAME)
+        before = (rust_launcher.read_bytes(), side_by_side.link_state(ts_launcher))
+
+        for command in (("rollout", "--version", V1), ("rollback",)):
+            with self.subTest(command=command), self.assertRaisesRegex(
+                    SystemExit, "would alias the TS prime-agent launcher"):
+                self.main(*command)
+
+        self.assertEqual((rust_launcher.read_bytes(), side_by_side.link_state(ts_launcher)), before)
+        self.assertFalse(self.prefix.exists())
+
+    def test_status_is_read_only_with_ts_launcher_aliased_to_rust(self) -> None:
+        rust_launcher = self.bin_dir / side_by_side.LAUNCHER_NAME
+        rust_launcher.write_text("existing launcher\n")
+        rust_launcher.chmod(0o755)
+        ts_launcher = self.bin_dir / side_by_side.TS_LAUNCHER_NAME
+        ts_launcher.unlink()
+        ts_launcher.symlink_to(side_by_side.LAUNCHER_NAME)
+        before = (rust_launcher.read_bytes(), side_by_side.link_state(ts_launcher))
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(self.main("status", "--json"), 0)
+
+        state = json.loads(output.getvalue())
+        self.assertEqual((state["current"], state["previous"]), (None, None))
+        self.assertEqual((state["launcher"]["state"], state["launcher"]["matchesTemplate"],
+                          state["tsLauncher"]["state"]),
+                         ({"kind": "file", "sha256": side_by_side.sha256_file(rust_launcher)}, False,
+                          {"kind": "symlink", "target": side_by_side.LAUNCHER_NAME}))
+        self.assertEqual((rust_launcher.read_bytes(), side_by_side.link_state(ts_launcher)), before)
+        self.assertFalse(self.prefix.exists())
+
     def test_status_reports_versions_pointers_receipts_and_the_feed(self) -> None:
         self.publish(V1)
         self.publish(V2)

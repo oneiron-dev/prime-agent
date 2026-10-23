@@ -1,6 +1,4 @@
 //! Codex API error types and event mapping.
-//! Section of the port of
-//! `packages/ai/src/providers/openai-codex-responses.ts`.
 
 use std::collections::HashMap;
 
@@ -10,10 +8,11 @@ use crate::types::{AssistantMessage, Usage};
 use crate::utils::stream_failure::parse_retry_after_ms;
 use crate::utils_inner::diagnostics::now_ms;
 use crate::utils_inner::http::HttpResponse;
-use crate::utils_inner::stream_failure::ProviderError;
+use crate::utils_inner::stream_failure::{
+    ProviderError, StreamTransportFailureCause, StreamTransportFailureDetail,
+};
 
-/// Codex API error (`CodexApiError` in the TS reference). Carries the wire
-/// error code, HTTP status, and retry delay parsed from headers/body.
+/// Codex API error.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // full TS error surface; fields are read by future retry plumbing
 pub struct CodexApiError {
@@ -36,16 +35,14 @@ impl CodexApiError {
         }
     }
 
-    /// The TS provider surfaces `CodexApiError.message` verbatim (its catch
-    /// sets `output.errorMessage = error.message`, keeping the usage-limit
-    /// friendly text); the structured pieces ride along for the
-    /// `provider_stream_failure` diagnostic and retry classification.
+    /// The TS provider surfaces `CodexApiError.message` verbatim (the usage-limit friendly text
+    /// included) instead of the classified rewrite.
     pub fn into_provider_error(self) -> ProviderError {
         ProviderError::Http(crate::utils_inner::stream_failure::ProviderHttpError {
             message: self.message,
             status: self.status,
-            // The TS error carries its wire `code` and no body/error field:
-            // the classification reads the code, not a parsed body.
+            // The TS error carries its wire `code` and no body/error field: the classification
+            // reads the code, not a parsed body.
             body: None,
             headers: HashMap::new(),
             request_id: None,
@@ -62,21 +59,19 @@ impl std::fmt::Display for CodexApiError {
     }
 }
 
-/// Codex protocol (framing/JSON) error (`CodexProtocolError` in the TS).
+/// Codex protocol (framing/JSON) error.
 #[derive(Debug, Clone)]
 pub struct CodexProtocolError {
     pub message: String,
-    /// The invalid frame the TS error keeps for debugging; user-facing text
-    /// never embeds it.
+    /// The invalid frame the TS error keeps for debugging; user-facing text never embeds it.
     #[allow(dead_code)] // full TS error surface; parity helper for debugging
     pub payload: Option<Value>,
 }
 
 impl CodexProtocolError {
     pub fn into_provider_error(self) -> ProviderError {
-        // TS surfaces `CodexProtocolError.message` verbatim; the payload
-        // stays on the error (here: nowhere user-facing), and the class name
-        // is recorded for the diagnostic.
+        // TS surfaces `CodexProtocolError.message` verbatim; the payload stays non-user-facing and
+        // the class name is recorded for the diagnostic.
         ProviderError::Http(crate::utils_inner::stream_failure::ProviderHttpError {
             message: self.message,
             status: None,
@@ -90,17 +85,19 @@ impl CodexProtocolError {
     }
 }
 
-/// The TS WebSocket transport-error surface, probe-verified against the TS
-/// binary (bun runtime): close-event failures compose the
-/// `WebSocket closed {code} {reason}` message, carry the numeric close code
-/// the diagnostics record, and record the `WebSocketCloseError` class name;
-/// every other runtime failure (connect, send) is a plain `Error` with no
-/// close code.
+/// The TS WebSocket transport-error surface, probe-verified against the TS binary (bun runtime):
+/// close-event failures compose `WebSocket closed {code} {reason}` and record the
+/// `WebSocketCloseError` class name; every other runtime failure is a plain `Error` with no close
+/// code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebSocketTransportError {
     /// A close-event failure (`WebSocketCloseError` in the TS): the composed
     /// close message plus the numeric close code.
-    Close { message: String, code: u16 },
+    Close {
+        message: String,
+        code: u16,
+        reason: String,
+    },
     /// A connect- or send-phase runtime failure (plain `Error` in the TS).
     Runtime { message: String },
 }
@@ -121,9 +118,8 @@ pub const WEBSOCKET_CLOSE_CODE_TOO_BIG: u16 = 1009;
 pub const WEBSOCKET_CONNECTION_ENDED_REASON: &str = "Connection ended";
 
 impl WebSocketTransportError {
-    /// Port of `extractWebSocketCloseError`'s composition:
-    /// `WebSocket closed {code} {reason}` (trimmed), with the 1009 no-reason
-    /// special case (`"message too big"`).
+    /// `extractWebSocketCloseError`'s composition: `WebSocket closed {code} {reason}` (trimmed),
+    /// with the 1009 no-reason special case (`"message too big"`).
     pub fn close(code: u16, reason: &str) -> Self {
         let mut reason_text = if reason.is_empty() {
             String::new()
@@ -136,7 +132,11 @@ impl WebSocketTransportError {
         let message = format!("WebSocket closed {code}{reason_text}")
             .trim()
             .to_string();
-        Self::Close { message, code }
+        Self::Close {
+            message,
+            code,
+            reason: reason.to_string(),
+        }
     }
 
     /// A plain runtime failure (`Error` in the TS) with the given text.
@@ -182,8 +182,7 @@ impl std::fmt::Display for WebSocketTransportError {
 pub enum CodexStreamError {
     Api(CodexApiError),
     Protocol(CodexProtocolError),
-    /// Transport-level failure (WebSocket close/connect error) with the TS
-    /// runtime's error surface.
+    /// Transport-level failure with the TS runtime's error surface.
     Transport(WebSocketTransportError),
     /// Abort requested by the cancellation token.
     Aborted,
@@ -213,16 +212,29 @@ impl CodexStreamError {
                 crate::utils_inner::stream_failure::ProviderWsTransportError {
                     message: error.message().to_string(),
                     close_code: error.close_code(),
-                    // The codex transport keeps its unclassified runtime
-                    // surface (the provider error type is the class name).
-                    transport: None,
+                    sdk_name: Some(error.error_name().to_string()),
+                    transport: Some(match &error {
+                        WebSocketTransportError::Close { code, reason, .. } => {
+                            StreamTransportFailureDetail {
+                                close_code: Some(*code),
+                                close_reason: (!reason.is_empty()).then(|| reason.clone()),
+                                ..StreamTransportFailureDetail::websocket(
+                                    StreamTransportFailureCause::Closed,
+                                )
+                            }
+                        }
+                        WebSocketTransportError::Runtime { .. } => {
+                            StreamTransportFailureDetail::websocket(
+                                StreamTransportFailureCause::Connect,
+                            )
+                        }
+                    }),
                 },
             ),
             CodexStreamError::Aborted => ProviderError::Aborted,
         }
     }
 
-    /// Port of `isCodexNonTransportError`.
     pub fn is_non_transport_error(&self) -> bool {
         matches!(
             self,
@@ -242,8 +254,8 @@ impl std::fmt::Display for CodexStreamError {
     }
 }
 
-/// Port of `isStaleCodexContinuationError`: a `previous_response_not_found`
-/// API error means the request must be resent in full instead of chained.
+/// A `previous_response_not_found` API error means the request must be resent in full instead of
+/// chained.
 pub fn is_stale_codex_continuation_error(error: &CodexStreamError) -> bool {
     match error {
         CodexStreamError::Api(api) => api
@@ -256,7 +268,6 @@ pub fn is_stale_codex_continuation_error(error: &CodexStreamError) -> bool {
 
 const STALE_CONTINUATION_ERROR_CODE: &str = "previous_response_not_found";
 
-/// Codex error payload fields (`CodexErrorPayload` in the TS).
 struct CodexErrorPayload<'a> {
     code: Option<&'a str>,
     type_: Option<&'a str>,
@@ -276,7 +287,6 @@ fn error_payload(value: &Value) -> CodexErrorPayload<'_> {
     }
 }
 
-/// Port of `codexUsageLimitMessage`.
 fn codex_usage_limit_message(
     error: &CodexErrorPayload<'_>,
     status: Option<u16>,
@@ -326,9 +336,8 @@ fn code_regex_match(code: &str) -> bool {
         || code.contains("rate_limit_exceeded")
 }
 
-/// Port of `parseErrorResponse`: map an HTTP error response to a
-/// [`CodexApiError`], honoring usage-limit friendly messages and the
-/// max(Retry-After header, `resets_at`) rule.
+/// Map an HTTP error response to a [`CodexApiError`], honoring usage-limit friendly messages and
+/// the max(Retry-After header, `resets_at`) rule.
 pub async fn parse_error_response(response: &mut HttpResponse) -> CodexApiError {
     let status = response.status;
     let mut message;
@@ -336,8 +345,8 @@ pub async fn parse_error_response(response: &mut HttpResponse) -> CodexApiError 
     let mut retry_after_ms = parse_retry_after_ms(&response.headers);
 
     let raw = response.read_all_text().await.unwrap_or_default();
-    // TS: `raw || response.statusText || "Request failed"`. The HTTP reason
-    // phrase is the canonical one (what real servers send).
+    // TS: `raw || response.statusText || "Request failed"`. The HTTP reason phrase is the canonical
+    // one (what real servers send).
     message = if raw.is_empty() {
         reqwest::StatusCode::from_u16(status)
             .ok()
@@ -356,8 +365,7 @@ pub async fn parse_error_response(response: &mut HttpResponse) -> CodexApiError 
                 codex_usage_limit_message(&payload, Some(status))
             {
                 message = friendly;
-                // Neither server delay (Retry-After header, resets_at body)
-                // may undercut the other.
+                // Neither server delay (Retry-After header, resets_at body) may undercut the other.
                 if let Some(body_retry_after_ms) = body_retry_after_ms {
                     retry_after_ms = Some(retry_after_ms.unwrap_or(0).max(body_retry_after_ms));
                 }
@@ -384,8 +392,7 @@ pub struct MappedCodexEvent {
     pub done: bool,
 }
 
-/// Port of `mapCodexEvents` for one event. Errors arrive flat
-/// (`{ code, message }`) or nested under `event.error`.
+/// Errors arrive flat (`{ code, message }`) or nested under `event.error`.
 pub fn map_codex_event(event: Value) -> Result<MappedCodexEvent, CodexStreamError> {
     let Some(event_type) = event.get("type").and_then(Value::as_str) else {
         return Ok(MappedCodexEvent { event, done: false });
@@ -490,7 +497,6 @@ pub fn map_codex_event(event: Value) -> Result<MappedCodexEvent, CodexStreamErro
     Ok(MappedCodexEvent { event, done: false })
 }
 
-/// Port of `normalizeCodexStatus`.
 fn normalize_codex_status(status: &Value) -> Option<&'static str> {
     match status.as_str() {
         Some("completed") => Some("completed"),
@@ -503,9 +509,7 @@ fn normalize_codex_status(status: &Value) -> Option<&'static str> {
     }
 }
 
-/// Multipliers per <https://developers.openai.com/api/docs/pricing>
-/// (retrieved 2026-08-21). Takes the wire-tier string to match the shared
-/// Responses hook signature.
+/// Multipliers per <https://developers.openai.com/api/docs/pricing> (retrieved 2026-08-21).
 pub fn get_codex_service_tier_cost_multiplier(model_id: &str, service_tier: Option<&str>) -> f64 {
     match service_tier {
         Some("flex") => 0.5,
@@ -520,7 +524,6 @@ pub fn get_codex_service_tier_cost_multiplier(model_id: &str, service_tier: Opti
     }
 }
 
-/// Port of `applyServiceTierPricing` (codex variant).
 pub fn apply_codex_service_tier_pricing(
     usage: &mut Usage,
     service_tier: Option<&str>,
@@ -543,7 +546,6 @@ pub fn apply_codex_service_tier_pricing(
     .into();
 }
 
-/// Port of `resolveCodexServiceTier`.
 pub fn resolve_codex_service_tier(
     response_service_tier: Option<String>,
     request_service_tier: Option<String>,
@@ -556,12 +558,9 @@ pub fn resolve_codex_service_tier(
     response_service_tier.or(request_service_tier)
 }
 
-/// Port of the transport-failure diagnostic payload. The TS attaches it via
-/// `appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic(...))`,
-/// and `extractDiagnosticError` records the thrown error's runtime class
-/// name (`WebSocketCloseError` for close events, plain `Error` otherwise)
-/// and, for close events, the numeric close code as `error.code`
-/// (TS-binary probe-verified).
+/// The transport-failure diagnostic payload (TS-binary probe-verified): the thrown error's runtime
+/// class name (`WebSocketCloseError` for close events, plain `Error` otherwise) and, for close
+/// events, the numeric close code as `error.code`.
 pub fn append_transport_failure_diagnostic(
     output: &mut AssistantMessage,
     error: &WebSocketTransportError,
@@ -589,9 +588,8 @@ pub fn append_transport_failure_diagnostic(
     crate::utils_inner::diagnostics::append_assistant_message_diagnostic(output, diagnostic);
 }
 
-/// Port of the diagnostic's `details`: the TS sets `fallbackTransport:
-/// websocketStarted ? undefined : "sse"`, and `JSON.stringify` omits the
-/// undefined key entirely, so the after-start diagnostic carries no key.
+/// The diagnostic's `details`: after start the TS leaves `fallbackTransport` undefined, and
+/// `JSON.stringify` omits the key entirely.
 fn transport_failure_details(
     configured_transport: &str,
     events_emitted: bool,
@@ -642,8 +640,8 @@ mod tests {
             panic!("expected API error");
         };
         assert_eq!(api.status, Some(429));
-        // Flat errors surface the raw message with the codex prefix (the TS
-        // only builds friendly usage-limit text from nested payloads).
+        // Flat errors surface the raw message with the codex prefix; friendly usage-limit text is
+        // built only from nested payloads.
         assert_eq!(api.message, "Codex error: limit hit");
     }
 
@@ -733,10 +731,8 @@ mod tests {
         assert_eq!(resolve_codex_service_tier(None, None), None);
     }
 
-    /// The TS provider surfaces `CodexApiError.message` verbatim — the
-    /// usage-limit friendly text included — instead of the classified
-    /// stream-failure rewrite, while the diagnostic keeps the structured
-    /// classification (kind, provider type, status, retry delay).
+    /// The TS provider surfaces `CodexApiError.message` verbatim instead of the classified rewrite,
+    /// while the diagnostic keeps the structured classification.
     #[test]
     fn api_error_message_stays_verbatim_with_structured_info() {
         let api_error = CodexApiError {
@@ -762,14 +758,12 @@ mod tests {
             crate::utils_inner::stream_failure::StreamFailureKind::RateLimit,
             info.kind
         );
-        // The diagnostic records the TS SDK error class name.
         let diagnostic = crate::utils_inner::stream_failure::diagnostic_error_info(&error);
         assert_eq!(diagnostic.name.as_deref(), Some("CodexApiError"));
     }
 
-    /// A plain HTTP-level codex error keeps the server's error message text
-    /// (the classified rewrite would turn it into
-    /// "Provider rejected the request (400): ...").
+    /// A plain HTTP-level codex error keeps the server's error message text (the classified rewrite
+    /// would turn it into "Provider rejected the request (400): ...").
     #[test]
     fn api_error_http_message_stays_verbatim() {
         let api_error = CodexApiError {
@@ -789,8 +783,8 @@ mod tests {
         );
     }
 
-    /// A flat mid-stream error event keeps its "Codex error: ..." composed
-    /// message through the provider error.
+    /// A flat mid-stream error event keeps its "Codex error: ..." composed message through the
+    /// provider error.
     #[test]
     fn flat_error_event_message_survives_provider_error() {
         let error = map_codex_event(json!({
@@ -809,8 +803,8 @@ mod tests {
         );
     }
 
-    /// Protocol errors surface their message verbatim and record the TS
-    /// `CodexProtocolError` class name.
+    /// Protocol errors surface their message verbatim and record the TS `CodexProtocolError` class
+    /// name.
     #[test]
     fn protocol_error_message_and_name() {
         let error = CodexStreamError::Protocol(CodexProtocolError {
@@ -841,10 +835,8 @@ mod tests {
         assert_eq!(mapped.event["type"], "response.output_text.delta");
     }
 
-    /// The transport-failure diagnostic for a close event, before the SSE
-    /// fallback (TS-binary probe ground truth): the `WebSocketCloseError`
-    /// name, the numeric close code as `error.code`, and the fallback
-    /// details; `error.code` is absent for non-close runtime failures.
+    /// The transport-failure diagnostic for a close event before the SSE fallback (TS-binary probe
+    /// ground truth); `error.code` is absent for non-close runtime failures.
     #[test]
     fn transport_failure_diagnostic_shapes() {
         let close = WebSocketTransportError::close(1011, "mock server reason");
@@ -908,11 +900,9 @@ mod tests {
         );
     }
 
-    /// A transport error thrown mid-stream (after events were emitted)
-    /// carries its TS surface through the provider error: the verbatim
-    /// runtime text, the `WebSocketCloseError` name, and the close code —
-    /// exactly what the TS `provider_stream_failure` diagnostic records
-    /// (TS-binary probe ground truth).
+    /// A transport error thrown mid-stream carries its TS surface through the provider error,
+    /// exactly what the TS `provider_stream_failure` diagnostic records (TS-binary probe ground
+    /// truth).
     #[test]
     fn transport_error_provider_stream_failure_shape() {
         let error =
@@ -956,11 +946,77 @@ mod tests {
                         "code": 1011
                     },
                     "details": {
-                        "kind": "unknown",
-                        "providerErrorType": "WebSocketCloseError"
+                        "kind": "transport",
+                        "providerErrorType": "websocket_closed",
+                        "transport": {
+                            "protocol": "websocket", "cause": "closed",
+                            "closeCode": 1011, "closeReason": "mock server reason"
+                        }
                     }
                 }
             ])
         );
+    }
+
+    #[test]
+    fn codex_transport_classification_preserves_runtime_diagnostics_and_unknown_cleanliness() {
+        for runtime in [
+            WebSocketTransportError::close(1006, "Connection ended"),
+            WebSocketTransportError::close(1011, "protocol read failure"),
+            WebSocketTransportError::close(1000, "normal but incomplete"),
+            WebSocketTransportError::runtime("WebSocket send failed"),
+        ] {
+            let mut expected_error = json!({
+                "name": runtime.error_name(), "message": runtime.message(),
+            });
+            let mut transport = json!({"protocol": "websocket"});
+            match &runtime {
+                WebSocketTransportError::Close { code, reason, .. } => {
+                    expected_error["code"] = json!(code);
+                    transport["cause"] = json!("closed");
+                    transport["closeCode"] = json!(code);
+                    transport["closeReason"] = json!(reason);
+                }
+                WebSocketTransportError::Runtime { .. } => {
+                    transport["cause"] = json!("connect");
+                }
+            }
+            let error = CodexStreamError::Transport(runtime).into_provider_error();
+            let mut output = AssistantMessage {
+                content: Vec::new(),
+                api: API_OPENAI_CODEX_RESPONSES.to_string(),
+                provider: "openai-codex".to_string(),
+                model: "gpt-5-codex".to_string(),
+                response_model: None,
+                response_model_source: None,
+                response_id: None,
+                diagnostics: None,
+                usage: crate::types::Usage::default(),
+                stop_reason: crate::types::StopReason::Error,
+                stop_reason_raw: None,
+                error_message: Some(error.to_string()),
+                timestamp: 0,
+                rest: Map::default(),
+            };
+            crate::utils_inner::stream_failure::record_stream_failure(
+                ("openai-codex", "gpt-5-codex", API_OPENAI_CODEX_RESPONSES),
+                &mut output,
+                &error,
+            );
+            let diagnostics = serde_json::to_value(output.diagnostics.as_deref()).unwrap();
+            assert_eq!(
+                diagnostics,
+                json!([{
+                    "type": "provider_stream_failure",
+                    "timestamp": diagnostics[0]["timestamp"],
+                    "error": expected_error,
+                    "details": {
+                        "kind": "transport",
+                        "providerErrorType": format!("websocket_{}", transport["cause"].as_str().unwrap()),
+                        "transport": transport,
+                    },
+                }])
+            );
+        }
     }
 }

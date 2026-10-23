@@ -139,7 +139,7 @@ impl AnthropicToolChoice {
     }
 }
 
-/// Provider-native options (`AnthropicOptions` in the TS reference).
+/// Provider-native options.
 #[derive(Clone, Default)]
 pub struct AnthropicOptions {
     pub base: StreamOptions,
@@ -236,9 +236,8 @@ pub(crate) fn get_cache_control(
     (retention, Some(CacheControl { ttl }))
 }
 
-/// Fable/Mythos models — and Claude Opus 5.5 — think every turn and reject an
-/// explicit `thinking: {type: "disabled"}` (and any sampling params) with a
-/// 400.
+/// Fable/Mythos models — and Claude Opus 5.5 — think every turn and reject an explicit `thinking:
+/// {type: "disabled"}` (and any sampling params) with a 400.
 pub(crate) fn is_always_on_adaptive_thinking_model(model_id: &str) -> bool {
     model_id.contains("fable-5")
         || model_id.contains("mythos-5")

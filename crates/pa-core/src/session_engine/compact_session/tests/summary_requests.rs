@@ -63,6 +63,7 @@ async fn summary_requests_carry_the_session_and_retry_transient_failures() {
             abort: None,
             harness_digest: None,
             auxiliary: None,
+            semantic_edges: None,
             summary_delta: None,
             summary_requests: crate::session_engine::compaction_exec::SummaryRequestOptions {
                 session_id: Some("compact-session".to_string()),
@@ -106,6 +107,7 @@ fn cancellation_options(
         abort,
         harness_digest: None,
         auxiliary: None,
+        semantic_edges: None,
         summary_delta: None,
         summary_requests: crate::session_engine::compaction_exec::SummaryRequestOptions {
             session_id: Some("compact-cancel".to_string()),

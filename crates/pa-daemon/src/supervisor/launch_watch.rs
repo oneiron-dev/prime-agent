@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use tokio::process::Child;
+use super::supervision::SpawnedWorker;
 
 use super::{DaemonErrorInfo, Result, Supervisor, TypedCreateRejection};
 
@@ -35,7 +35,7 @@ impl Supervisor {
     pub(super) async fn watch_launch_stage<T>(
         &self,
         worker_id: &str,
-        child: &mut Child,
+        child: &mut SpawnedWorker,
         stage: impl Future<Output = Result<T>>,
     ) -> Result<T> {
         let stage_error = tokio::select! {
@@ -111,7 +111,7 @@ impl Supervisor {
     async fn worker_startup_failed(
         &self,
         worker_id: &str,
-        child: &mut Child,
+        child: &mut SpawnedWorker,
         status: Option<ExitStatus>,
     ) -> anyhow::Error {
         if status.is_none() {
@@ -182,16 +182,27 @@ mod tests {
 
     /// A stand-in worker: `sh -c <script>` with its stderr in the worker's
     /// own log, as the supervisor spawns the real one.
-    fn spawn_worker(supervisor: &Supervisor, worker_id: &str, script: &str) -> Child {
+    fn spawn_worker(supervisor: &Supervisor, worker_id: &str, script: &str) -> SpawnedWorker {
         let log = crate::worker_stderr::log_path(&supervisor.options.agent_dir, worker_id);
         let stderr = crate::worker_stderr::open_for_spawn(&log).expect("worker log");
-        tokio::process::Command::new("sh")
+        let child = tokio::process::Command::new("sh")
             .args(["-c", script])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(stderr))
             .spawn()
-            .expect("spawn stand-in worker")
+            .expect("spawn stand-in worker");
+        SpawnedWorker {
+            orphan_generation: crate::supervisor::supervision::OrphanGeneration {
+                pid: child.id().expect("stand-in pid"),
+                path: supervisor
+                    .descriptor_dir
+                    .join(format!("{worker_id}-orphans.jsonl"))
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+            child,
+        }
     }
 
     fn rejection(error: &anyhow::Error) -> (String, DaemonErrorInfo) {
@@ -252,7 +263,7 @@ mod tests {
             )
         );
         assert!(
-            matches!(child.try_wait(), Ok(Some(_))),
+            matches!(child.child.try_wait(), Ok(Some(_))),
             "the child is reaped"
         );
     }
@@ -398,7 +409,10 @@ mod tests {
             .watch_launch_stage("dddddddddddd", &mut child, async { Ok(7) })
             .await
             .expect("the stage finished first");
-        assert_eq!((value, child.try_wait().expect("try_wait")), (7, None));
+        assert_eq!(
+            (value, child.child.try_wait().expect("try_wait")),
+            (7, None)
+        );
         let error = supervisor
             .watch_launch_stage("dddddddddddd", &mut child, async {
                 Err::<(), _>(anyhow::anyhow!("worker authentication failed: bad token"))
@@ -410,6 +424,7 @@ mod tests {
             "worker authentication failed: bad token"
         );
         let status = child
+            .child
             .try_wait()
             .expect("try_wait")
             .expect("killed and reaped");

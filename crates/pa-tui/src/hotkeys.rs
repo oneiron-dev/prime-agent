@@ -1,7 +1,6 @@
-//! The `/hotkeys` guide (TS `getHotkeysGuide` in
-//! `modes/interactive/interactive-mode.ts`): the full keyboard-shortcut
-//! reference rendered from the EFFECTIVE bindings, so user
-//! `keybindings.json` overrides show their keys in the guide.
+//! The `/hotkeys` guide (TS `getHotkeysGuide`): the full
+//! keyboard-shortcut reference rendered from the EFFECTIVE bindings, so
+//! user `keybindings.json` overrides show their keys in the guide.
 
 use crate::keybindings::{format_key_text, KeybindingsManager};
 use std::fmt::Write;
@@ -180,34 +179,37 @@ mod tests {
         );
         // The interrupt row is conditional: no default binding, no row.
         assert!(!guide.contains("Interrupt current operation |"), "{guide}");
-        // The `?` quick-shortcut overlay is removed (the operator's
-        // 2026-09-26 directive): the guide keeps no reference to it.
+        // The `?` quick-shortcut overlay is removed (the operator's 2026-09-26
+        // directive): the guide keeps no reference to it.
         assert!(!guide.contains("quick shortcuts"), "{guide}");
-        // The fullscreen toggle is retired (the surface is
-        // fullscreen-only, the operator's 2026-09-28 ruling): the guide's
-        // navigation section keeps the transcript keys under the plain
-        // heading and never advertises `/fullscreen`.
+        // The fullscreen toggle is retired (the operator's 2026-09-28 ruling):
+        // the guide never advertises `/fullscreen`.
         assert!(
             guide.contains("**Transcript navigation (the always-fullscreen surface)**"),
             "{guide}"
         );
         assert!(!guide.contains("/fullscreen"), "{guide}");
-        // The completeness audit's additions: the suspend binding and
-        // the paragraph/doc selection pairs gained rows, and the queue
-        // browse row names both of its keys.
+        // The suspend binding and the paragraph/doc selection pairs gained rows,
+        // and the queue browse row names both of its keys.
         assert!(
             guide.contains("| `Ctrl+Z` | Suspend to background |"),
             "{guide}"
         );
         assert!(
-            guide.contains(
+            guide.contains(if cfg!(target_os = "macos") {
+                "| `Shift+Ctrl+\u{2191}` / `Shift+Option+\u{2193}` | Select one paragraph |"
+            } else {
                 "| `Shift+Ctrl+\u{2191}` / `Shift+Alt+\u{2193}` | Select one paragraph |"
-            ),
+            }),
             "{guide}"
         );
         assert!(guide.contains("Select to start / end of text"), "{guide}");
         assert!(
-            guide.contains("| `Alt+\u{2191}` / `Alt+\u{2193}` | Browse and edit queued messages |"),
+            guide.contains(if cfg!(target_os = "macos") {
+                "| `Option+\u{2191}` / `Option+\u{2193}` | Browse and edit queued messages |"
+            } else {
+                "| `Alt+\u{2191}` / `Alt+\u{2193}` | Browse and edit queued messages |"
+            }),
             "{guide}"
         );
     }
@@ -221,21 +223,27 @@ mod tests {
         );
         let kb = KeybindingsManager::with_user_bindings(cfg);
         let guide = hotkeys_guide(&kb);
-        assert!(guide.contains("| `Ctrl+Alt+X` | Cycle overview"), "{guide}");
+        assert!(
+            guide.contains(if cfg!(target_os = "macos") {
+                "| `Ctrl+Option+X` | Cycle overview"
+            } else {
+                "| `Ctrl+Alt+X` | Cycle overview"
+            }),
+            "{guide}"
+        );
         assert!(!guide.contains("`Ctrl+O`"), "{guide}");
     }
 
     #[test]
     fn guide_renders_disabled_binding_with_empty_key_cell() {
-        // TS renders the expandTools row unconditionally: a disabled
-        // binding (an empty user override) keeps the row with an empty
-        // key cell; only `app.interrupt` is conditional (its row omits
-        // when unbound).
+        // TS renders the expandTools row unconditionally: a disabled binding
+        // (an empty user override) keeps the row with an empty key cell; only
+        // `app.interrupt` is conditional (its row omits when unbound).
         let mut cfg = crate::keybindings::KeybindingsConfig::new();
         cfg.insert("app.tools.expand".to_string(), Vec::new());
         let kb = KeybindingsManager::with_user_bindings(cfg);
         let guide = hotkeys_guide(&kb);
         assert!(guide.contains("| `` | Cycle overview"), "{guide}");
-        assert!(!guide.contains("Ctrl+O"), "{guide}");
+        assert!(!guide.contains("`Ctrl+O`"), "{guide}");
     }
 }

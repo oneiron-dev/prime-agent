@@ -1,7 +1,6 @@
-//! Headless completion and print-mode terminal selection. Port of
-//! modes/headless-completion.ts (selection half) and the text-output half of
-//! modes/print-mode.ts: pick the terminal result from a headless run and turn
-//! it into stdout/stderr/exit-code.
+//! Headless completion and print-mode terminal selection: pick the
+//! terminal result from a headless run and turn it into
+//! stdout/stderr/exit-code.
 
 use pa_types::session::{AgentMessage, FileEntry};
 

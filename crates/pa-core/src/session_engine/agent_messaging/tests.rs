@@ -1,5 +1,4 @@
-//! The agent-messaging unit battery: the message validation and prompt
-//! shapes, the host-handler round trips, and the observe rows.
+//! Agent-messaging unit battery: validation/prompt shapes, handler round trips, observe rows.
 use super::*;
 
 /// TS #2493: an observation row carries the typed family status and
@@ -13,14 +12,20 @@ fn observe_rows_carry_the_typed_status_and_activity() {
         session_name: Some("worker".to_string()),
         relationship: Some(AgentFamilyRelationship::Child),
         runtime_kind: Some("subagent".to_string()),
+        cwd: None,
         status: AgentFamilyStatus::Running,
         activity: Some(AgentObserveActivity::Tool),
         is_current: false,
         is_streaming: true,
         is_compacting: false,
         attached_clients: 1,
+        message_count: None,
         queued_count: 0,
         is_session_active: true,
+        parent_active_session_id: None,
+        parent_session_id: None,
+        rlm_child_id: None,
+        first_message: None,
     };
     let value = row.to_value();
     assert_eq!(value["status"], "running");
@@ -92,7 +97,6 @@ fn message_prompts_and_id_parsing() {
     };
     let prompt = create_agent_session_message_prompt(&payload);
     assert_eq!(prompt, "[agent-message from child:worker-1]\n\nkeep going");
-    // Header values are sanitized.
     let evil = AgentMessagePromptPayload {
         message: "m".to_string(),
         sender_name: "bad name!".to_string(),
@@ -102,7 +106,6 @@ fn message_prompts_and_id_parsing() {
         create_agent_session_message_prompt(&evil),
         "[agent-message from bad name!]\n\nm"
     );
-    // Legacy transcript header parsing.
     let header = format!(
         "Agent-to-agent message received.\nSource: {AGENT_MESSAGE_SOURCE}\nTo: worker\nMessage id: {}",
         create_agent_session_message_id()
@@ -133,12 +136,11 @@ fn the_custom_row_carries_the_ts_agent_message_shape() {
         message: "finished the research",
         from: &from,
         from_relationship: Some(AgentFamilyRelationship::Child),
-        target: &target,
+        target: Some(&target),
         timestamp: 123,
     });
-    // TS `createAgentSessionMessage`: the custom role, the agent_message
-    // type, the prompt as the content, display on, and the identity
-    // details the `agent_message` UI reads.
+    // TS `createAgentSessionMessage`: custom role, agent_message type, prompt as content, and the
+    // identity details the UI reads.
     assert_eq!(row["role"], "custom");
     assert_eq!(row["customType"], AGENT_MESSAGE_CUSTOM_TYPE);
     assert_eq!(row["content"], prompt);
@@ -157,10 +159,13 @@ fn the_custom_row_carries_the_ts_agent_message_shape() {
         message: "finished the research",
         from: &Value::Null,
         from_relationship: None,
-        target: &target,
+        // An absent target omits the key too (TS `spawnMessage` carries
+        // none), not a null.
+        target: None,
         timestamp: 124,
     });
     assert!(plain["details"].get("fromRelationship").is_none());
+    assert!(plain["details"].get("target").is_none());
     assert_eq!(plain["details"]["from"], Value::Null);
 }
 
@@ -266,10 +271,7 @@ impl AgentMessageController for RecordingMessageController {
 fn send_request(send: &crate::kernel::shared::HostHandlerFn, data: Value) -> anyhow::Result<Value> {
     // The handler futures here are plain (no tokio IO), so driving
     // them on the test executor is safe.
-    futures::executor::block_on(send(crate::kernel::shared::HostRequestPayload {
-        data,
-        cell_source_code: None,
-    }))
+    futures::executor::block_on(send(crate::kernel::shared::HostRequestPayload { data }))
 }
 
 #[tokio::test]
@@ -281,7 +283,6 @@ async fn message_host_handler_round_trip() {
     );
     let send = handlers.get("agent_message.send").unwrap().clone();
 
-    // Role-addressed send resolves the name through the family.
     let receipt = send_request(
         &send,
         json!({
@@ -299,7 +300,6 @@ async fn message_host_handler_round_trip() {
     assert_eq!(receipt["receiverRole"], "sibling");
     assert!(receipt["id"].as_str().unwrap().starts_with("agentmsg_"));
 
-    // Unnamed members resolve by id (TS agentFamilyMemberName).
     let by_id = send_request(
         &send,
         json!({ "message": "hi", "receiver_role": "sibling", "receiver_name": "sib-2" }),
@@ -307,7 +307,6 @@ async fn message_host_handler_round_trip() {
     .unwrap();
     assert_eq!(by_id["target"]["activeSessionId"], "sib-2");
 
-    // Parent sends need no name.
     let parent = send_request(
         &send,
         json!({ "message": "reply to parent", "receiver_role": "parent" }),
@@ -343,7 +342,6 @@ async fn message_host_handler_round_trip() {
         "agent_message.send receiver_name is required for sibling and child messages"
     );
 
-    // Resolution failures keep the TS wording.
     let no_match = send_request(
         &send,
         json!({ "message": "hi", "receiver_role": "child", "receiver_name": "ghost" }),
@@ -375,7 +373,6 @@ async fn message_host_handler_round_trip() {
     .unwrap();
     assert_eq!(by_session_alias["target"]["activeSessionId"], "kid-1");
 
-    // Broadcast sends to every family member, all-settled.
     let broadcast =
         send_request(&send, json!({ "target": "all", "message": "  everyone  " })).unwrap();
     let receipts = broadcast["receipts"].as_array().expect("receipts");
@@ -433,7 +430,6 @@ async fn broadcast_without_family_is_empty_and_failures_settle() {
     let broadcast = send_request(&send, json!({ "target": "all", "message": "hi" })).unwrap();
     assert_eq!(broadcast["receipts"].as_array().map(Vec::len), Some(0));
 
-    // A role send against an empty family: no parent matches.
     let no_parent =
         send_request(&send, json!({ "message": "hi", "receiver_role": "parent" })).unwrap_err();
     assert_eq!(no_parent.to_string(), "No parent matches the current agent");
@@ -448,4 +444,149 @@ async fn broadcast_without_family_is_empty_and_failures_settle() {
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0]["target"], "sib-1");
     assert_eq!(receipts[0]["error"], "peer unreachable");
+}
+
+/// The static roster the observe handler tests read: the caller's own
+/// row plus one child.
+struct StaticObserveController;
+
+fn observe_row(active_session_id: &str, is_current: bool) -> AgentObserveSummary {
+    AgentObserveSummary {
+        active_session_id: Some(active_session_id.to_string()),
+        session_id: format!("sess-{active_session_id}"),
+        session_name: Some(active_session_id.to_string()),
+        relationship: (!is_current).then_some(AgentFamilyRelationship::Child),
+        runtime_kind: Some("subagent".to_string()),
+        cwd: None,
+        status: AgentFamilyStatus::Running,
+        activity: Some(AgentObserveActivity::Model),
+        is_current,
+        is_streaming: true,
+        is_compacting: false,
+        attached_clients: 0,
+        message_count: None,
+        queued_count: 1,
+        is_session_active: true,
+        parent_active_session_id: None,
+        parent_session_id: None,
+        rlm_child_id: None,
+        first_message: None,
+    }
+}
+
+/// The child row with the supervisor facts TS `AgentObserveAgentSummary`
+/// carries.
+fn child_row() -> AgentObserveSummary {
+    AgentObserveSummary {
+        cwd: Some("/agent/kid".to_string()),
+        message_count: Some(42),
+        parent_active_session_id: Some("me-1".to_string()),
+        parent_session_id: Some("sess-me-1".to_string()),
+        rlm_child_id: Some("sub-kid-1".to_string()),
+        first_message: Some("the task prompt".to_string()),
+        ..observe_row("kid-1", false)
+    }
+}
+
+fn observe_preview(index: usize) -> AgentObserveMessagePreview {
+    AgentObserveMessagePreview {
+        index,
+        role: "user".to_string(),
+        timestamp: Some(index as u64),
+        text: "hello".to_string(),
+        truncated: false,
+        tool_calls: Vec::new(),
+        custom_type: None,
+    }
+}
+
+impl AgentObserveController for StaticObserveController {
+    fn list_agents(&self) -> impl Future<Output = anyhow::Result<AgentObserveListResult>> + Send {
+        std::future::ready(Ok(AgentObserveListResult {
+            current: observe_row("me-1", true),
+            agents: vec![child_row()],
+        }))
+    }
+
+    fn get_agent(
+        &self,
+        target: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<AgentObserveSummary>>> + Send {
+        std::future::ready(Ok((target == "kid-1").then(child_row)))
+    }
+
+    fn recent_messages(
+        &self,
+        _target: &str,
+        limit: usize,
+        max_chars: usize,
+    ) -> impl Future<Output = anyhow::Result<AgentObserveRecentMessagesResult>> + Send {
+        std::future::ready(Ok(AgentObserveRecentMessagesResult {
+            agent: child_row(),
+            messages: (0..3).map(observe_preview).collect(),
+            limit,
+            max_chars,
+            truncated: true,
+        }))
+    }
+}
+
+/// TS `AgentObserveListResult`: the caller's own row rides `current`,
+/// the family roster excludes it, and each row carries the supervisor
+/// facts the roster already holds.
+#[tokio::test]
+async fn observe_list_returns_current_and_family_without_self() {
+    let mut handlers = HostRequestHandlers::default();
+    register_agent_observe_host_handlers(
+        std::sync::Arc::new(StaticObserveController),
+        &mut handlers,
+    );
+    let list = handlers.get("agent_observe.list").unwrap().clone();
+    let response = send_request(&list, json!({})).unwrap();
+    let agents = response
+        .get("agents")
+        .and_then(Value::as_array)
+        .expect("family rows");
+    assert_eq!(agents.len(), 1, "{agents:?}");
+    assert!(
+        agents.iter().all(|row| row["isCurrent"] != true),
+        "the family roster excludes the caller: {agents:?}"
+    );
+    let row = &agents[0];
+    assert_eq!(row["activeSessionId"], "kid-1");
+    assert_eq!(row["relationship"], "child");
+    assert_eq!(row["cwd"], "/agent/kid");
+    assert_eq!(row["messageCount"], 42);
+    assert_eq!(row["parentActiveSessionId"], "me-1");
+    assert_eq!(row["parentSessionId"], "sess-me-1");
+    assert_eq!(row["rlmChildId"], "sub-kid-1");
+    assert_eq!(row["firstMessage"], "the task prompt");
+    let current = response
+        .get("current")
+        .expect("the caller's own row rides the response");
+    assert_eq!(current["activeSessionId"], "me-1");
+    assert_eq!(current["isCurrent"], true);
+    assert_eq!(current["relationship"], Value::Null);
+}
+
+/// TS `AgentObserveRecentMessagesResult`: the preview window rides with
+/// the target summary and the clamped bounds.
+#[tokio::test]
+async fn observe_recent_returns_the_ts_envelope() {
+    let mut handlers = HostRequestHandlers::default();
+    register_agent_observe_host_handlers(
+        std::sync::Arc::new(StaticObserveController),
+        &mut handlers,
+    );
+    let recent = handlers.get("agent_observe.recent").unwrap().clone();
+    let response = send_request(
+        &recent,
+        json!({ "target": "kid-1", "limit": 2, "max_chars": 90 }),
+    )
+    .unwrap();
+    assert_eq!(response["agent"]["activeSessionId"], "kid-1");
+    assert_eq!(response["limit"], 2);
+    assert_eq!(response["maxChars"], 90);
+    assert_eq!(response["truncated"], true);
+    assert_eq!(response["messages"].as_array().map(Vec::len), Some(3));
 }

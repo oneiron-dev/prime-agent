@@ -4,35 +4,17 @@ Session supervision and wire serving.
 
 ## Scope
 ACP stdio transport (`acp`): the JSON-RPC serve surface for Agent
-Client Protocol clients - a thin transport over the pa-core session engine
-(initialize, session/new, session/prompt, session/close, session/cancel,
-and the outgoing session/update notification with namespaced `_meta`
-correlation), owned by this crate because wire-protocol serving is its area;
-the in-process transport hosts the automatic compaction arms at its turn
-boundaries (`acp/compaction_arms.rs`: the TS `_checkCompaction` /
-`_runPreTurnCompaction` / `_consumePendingRequestedRefine` flows — the
-overflow compact-and-retry, the model-requested arm, and the threshold
-arm, publishing the ACP `compaction_end` mapping and aborting an in-flight
-run on session/cancel+close; the daemon-attached transport runs the
-worker turn loop's arms instead), because the TS arms live in the session
-turn loop every transport shares and the in-process ACP path drives the
-pa-core engine directly. The compact-trigger auto-refine scheduling owns
-its surface here (`compact_autorefine.rs` for the daemon worker: every
-compaction arm plus the manual `compact` command arm the pa-core
-trigger, and the quiescent turn boundaries / the command path consume
-the gated review - TS `_scheduleAutoRefineAfterCompaction` plus the
-background `_maybeAutoRefine("compact")`; `acp/autorefine.rs` for ACP:
-the serialized checkpoint consumes the armed trigger after the
-requested refine.run and session close drains what no turn serviced -
-TS's serialized scheduling for the acp app mode). The direct-ACP goal
-continuation boundary owns its surface here too (`acp/goal_continuation.rs`:
-the TS session's continuation hook `_getContinuationMessages` runs inside
-the one `session/prompt` request on the in-process path — the goal arm with
-exclusive priority over the autonomous arm, the budget-limit wrap-up steer,
-the natural continuation mint per settled boundary, the terminal-error
-goal failure, the threshold-arm goal queue before its compaction (with
-the cancel rollback), and the compact-with-active-goal continue; the
-daemon-attached transport rides the worker's #244 loop instead).
+Client Protocol clients, served over a daemon session (initialize, session/new, session/prompt, session/close,
+session/cancel, and the outgoing session/update notification with
+namespaced `_meta` correlation), owned by this crate because
+wire-protocol serving is its area; the worker turn loop owns compaction
+arms, auto-refine, and goal continuation. The compact-trigger
+auto-refine scheduling owns its surface here (`compact_autorefine.rs`
+for the daemon worker: every compaction arm plus the manual `compact`
+command arm the pa-core trigger, and the quiescent turn boundaries /
+the command path consume the gated review - TS
+`_scheduleAutoRefineAfterCompaction` plus the background
+`_maybeAutoRefine("compact")`).
 Supervisor process (one worker process per active session), restart/backoff
 supervision, session registry/roster + worker self-registration (session
 identity survives supervisor restarts: workers re-register with backoff and
@@ -48,21 +30,13 @@ command gating on peer links), kernel agent_message/agent_observe bridge (`agent
 `worker`-purpose single-use grants minted by `get_worker_peer_transport`
 for a source worker's kernel `agent_message.send`, direct
 `worker_deliver_message` on the target worker's socket with the supervisor
-routed `send_message` as the never-retried fallback), session archiving
-(`session_archive.rs`: the sessions directory must not grow forever — a
-supervisor boot sweep plus a periodic re-sweep at the TS idle-eviction
-cadence retire sessions by age (settings `sessionArchiveMaxAgeDays`,
-default 30) and count (settings `sessionArchiveMaxSessions`, default 200;
-each rule independently off-able) by MOVING them into
-`<agent-dir>/sessions-archive`; resident-worker sessions and sessions with
-active scheduled jobs are never archived; an archived session stays
-resumable — the catalog resolve falls back to the archive, restores the
-file into the sessions dir, and the wake spawns over the live path),
+routed `send_message` as the never-retried fallback),
 saved-session wake
 for non-resident `send_message` targets (`session_catalog.rs`: catalog
-resolve by session-id prefix or exact name, cwd-scoped first, archived
-fallback with restore; a resident
-worker hosting the file is reused, otherwise one spawns over it; RLM
+resolve by session-id prefix or exact name, cwd-scoped first; a live miss
+lazily restores a matching file from `sessions-archive/` without
+overwriting an existing live file; no new sessions are physically archived;
+a resident worker hosting the file is reused, otherwise one spawns over it; RLM
 children fall back to the spawn ledger's live child edges when the catalog
 misses - children persist outside the sessions dir, under the parent's
 session-artifacts tree - and wake over their own session file), wire protocol serve/negotiation (including the
@@ -102,10 +76,7 @@ merge non-resident ledger children (walk roots = saved + resident session
 files), so passivated children stay roster-visible (TS
 `walkPassiveRlmSubagents` / `withPassiveRlmDescendantInfos`). The saved
 session scan (`session_store.rs`) folds each file once into the durable
-catalog row, including the agents-view search corpus the TS scan builds:
-the capped `allMessagesText` transcript text (64 KiB). Archived sessions live in
-`<agent-dir>/sessions-archive` and never reach the catalog scan, so search
-covers live sessions only.
+catalog row.
 Supervisor-backed RLM child sessions
 (`rlm_children.rs`, the daemon side of the pa-core `RlmSubagentHost` seam):
 `rlm.spawn`/`rlm.create_session` create real daemon sessions through the
@@ -209,6 +180,12 @@ order match uncoalesced streaming. The supervisor stays payload-free:
 deltas ride the worker -> client session-event stream (direct-attach or
 supervisor-routed).
 
+The worker projects pa-core's connection-cap refresh through the existing
+`auto_retry_start`/`auto_retry_end` events. The optional reason string is
+`connection_reset`, with attempt 1/max 1/delay 0; End keeps the ordinary retry count,
+including zero. Existing outcome rows supersede failed partials while preserving committed
+tool results. No wire fields, event types, retry policy, or dependencies are added here.
+
 Autonomous
 continuation driving in the worker's engine: per-message usage accounting
 runs in the agent-loop subscription, and the in-run continuation hook
@@ -260,7 +237,12 @@ boot), re-arms scheduled work (a boot scan of `scheduled-jobs.json`;
 due active jobs of sessionless files are woken once, never archived), and
 reports the pass over `update_restore_status` while `hello.update_resume`
 carries the settle state; client attaches to a not-yet-restored roster row
-queue behind the pass instead of failing. The heartbeat-catalog change
+queue behind the pass instead of failing.
+For historical TypeScript update manifests, the restore pass recreates parents
+before their children, remaps active parent IDs, and restores pending context
+and action queues explicitly because those manifests predate Rust's journals.
+Attaches remain gated until that replay completes.
+The heartbeat-catalog change
 broadcast owns its surface here too (the worker's cron-store
 `on_heartbeat_change` listener emits a `heartbeats_changed` outbound frame
 — TS daemon-mode's `broadcastGlobal` — and the supervisor re-broadcasts it
@@ -271,8 +253,14 @@ attached UIs daemon-wide).
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 
 ## Public API
-Supervisor entrypoint, worker entrypoint, `mcp_login::{WorkerMcpLoginUi, wire_worker_mcp_login}` (the worker's browser+callback login behind `mcp.begin_login`; wired by the agent engine before sessions register host handlers), client connection API for pa-tui/pa-cli, `acp::{run_acp_mode, AcpOptions}` (pa-cli dispatches `--mode acp` through it), `agent_messaging::LinkAgentMessageController` + `rlm_children::{SupervisorChildSessions, ParentIdentity, RlmChildIdentity}` (e2e verifiers construct the worker-side family controller and the children registry; the engine wires the same types), `agent_engine::AgentSessionEngine::dispose_kernel` (the session-end kernel teardown the worker invokes at kill/shutdown/orphan exit — the engine outlives the session, so the pa-core engine-drop teardown cannot run there), the worker's `get_mcp_connections` command (`mcp_connections.rs`: the `/mcp` view's roster from the session's MCP manager overlaid with the session kernel's per-server tool listing — Rust-native session-plane extension; the TS daemon has no counterpart), `headless_client::{HostedHeadlessSession, HostedSessionOptions, HostedSessionOpened, HostedPrompt, HostedEventSink}` (the `--daemon-hosted` print/json driver pa-cli composes: create a resident session — or attach the live worker that already hosts the same session file — attach, stream the inner session events, `prompt_and_wait` with its own `admissionId` (read back with `cancel_prompt_admission` when the route budget answers first), `wait_for_headless_completion` with a stream barrier so the run's last events reach the sink, `get_messages`, then detach (waiting at most the caller's exit budget, `HostedHeadlessSession::close(detach_bound)`) and close; it never kills or completes the session and uses schema-31 commands only; a non-default `--tools`/`--no-tools`/`--no-builtin-tools` selection needs the daemon's `session_tool_selection` capability, and a live session whose tools resolve differently is refused, never reused: the supervisor's create refuses it when the daemon advertises `session_policy` (every open is a create there), the client's list-and-attach reuse compares the published `toolSelection` otherwise), `session_policy::{SessionPolicy, SESSION_POLICY_CAPABILITY}` (the fork's revision-31 create-config policy `offline`/`noSkills`: the hosted client sends it only to a daemon advertising the capability; the supervisor validates it, persists it in the durable create command, starts an offline session's worker with `PI_OFFLINE=1` in that worker's launch env, and reuses a live worker for the same file only under the same policy and a tool selection that resolves the same (the refusal names which differs), gives a create without the keys (a wake, a revival, a pre-policy open) the policy its session file was created with (a record under `daemon-workers/<socket-key>/session-policies/`, which outlives the worker; `SessionLaunch` keeps the launch tool selection `tools`/`noTools`/`noBuiltinTools` in the same record under the same rules, so a create with neither the tool keys nor the policy keys runs under the kept selection, a record without them reads as the defaults, and a worker created without tool keys that comes to serve a file with a record writes the default selection it runs with into it) and an RLM child its parent's, and launches an online-policy worker without an inherited `PI_OFFLINE`; the worker refuses an offline create it was not launched offline for and assembles a `noSkills` session without skill discovery; the record is written where the session file changes: at the create (a create whose record cannot be written is refused, and the launch retires its worker and resident) and at every identity move (a failed write leaves the resident policy-repair-pending, retried on every later roster write and once, best effort, at the stop). Kills, per-session stops, the daemon's shutdown and failed launches never wait on the policy store. The residual: a disk that keeps rejecting the write after a move loses the moved-to session's record (logged as `SESSION POLICY LOST`), so that session's next worker (a wake, a revival) starts under an earlier record for that file or under none). The supervisor client link both daemon-attached clients share (`daemon_link.rs`: JSONL envelopes out, responses matched by id, the owner's consumer ordering events before the response that overtook them) stays `pub(crate)`. Supervision internals `pub(crate)`.
+Supervisor entrypoint, worker entrypoint, `mcp_login::{WorkerMcpLoginUi, wire_worker_mcp_login}` (the worker's browser+callback login behind `mcp.begin_login`; wired by the agent engine before sessions register host handlers), client connection API for pa-tui/pa-cli, `acp::daemon::{run_daemon_attached_acp_mode, DaemonAcpOptions}` (pa-cli dispatches `--mode acp` through it), `agent_messaging::LinkAgentMessageController` + `rlm_children::{SupervisorChildSessions, ParentIdentity, RlmChildIdentity}` (e2e verifiers construct the worker-side family controller and the children registry; the engine wires the same types), `agent_engine::AgentSessionEngine::dispose_kernel` (the session-end kernel teardown the worker invokes at kill/shutdown/orphan exit — the engine outlives the session, so the pa-core engine-drop teardown cannot run there), the worker's `get_mcp_connections` command (`mcp_connections.rs`: the `/mcp` view's roster from the session's MCP manager overlaid with the session kernel's per-server tool listing and API-key credentials — Rust-native session-plane extension; the TS daemon has no counterpart), `headless_client::{HostedHeadlessSession, HostedSessionOptions, HostedSessionOpened, HostedPrompt, HostedEventSink}` (the `--daemon-hosted` print/json driver pa-cli composes: create a resident session — or attach the live worker that already hosts the same session file — attach, stream the inner session events, `prompt_and_wait` with its own `admissionId` (read back with `cancel_prompt_admission` when the route budget answers first), `wait_for_headless_completion` with a stream barrier so the run's last events reach the sink, `get_messages`, then detach (waiting at most the caller's exit budget, `HostedHeadlessSession::close(detach_bound)`) and close; it never kills or completes the session and uses capability-gated commands from the combined schema 33; a non-default `--tools`/`--no-tools`/`--no-builtin-tools` selection needs the daemon's `session_tool_selection` capability, and a live session whose tools resolve differently is refused, never reused: the supervisor's create refuses it when the daemon advertises `session_policy` (every open is a create there), the client's list-and-attach reuse compares the published `toolSelection` otherwise), `session_policy::{SessionPolicy, SESSION_POLICY_CAPABILITY}` (the fork's revision-31 create-config policy `offline`/`noSkills`: the hosted client sends it only to a daemon advertising the capability; the supervisor validates it, persists it in the durable create command, starts an offline session's worker with `PI_OFFLINE=1` in that worker's launch env, and reuses a live worker for the same file only under the same policy and a tool selection that resolves the same (the refusal names which differs), gives a create without the keys (a wake, a revival, a pre-policy open) the policy its session file was created with (a record under `daemon-workers/<socket-key>/session-policies/`, which outlives the worker; `SessionLaunch` keeps the launch tool selection `tools`/`noTools`/`noBuiltinTools` in the same record under the same rules, so a create with neither the tool keys nor the policy keys runs under the kept selection, a record without them reads as the defaults, and a worker created without tool keys that comes to serve a file with a record writes the default selection it runs with into it) and an RLM child its parent's, and launches an online-policy worker without an inherited `PI_OFFLINE`; the worker refuses an offline create it was not launched offline for and assembles a `noSkills` session without skill discovery; the record is written where the session file changes: at the create (a create whose record cannot be written is refused, and the launch retires its worker and resident) and at every identity move (a failed write leaves the resident policy-repair-pending, retried on every later roster write and once, best effort, at the stop). Kills, per-session stops, the daemon's shutdown and failed launches never wait on the policy store. The residual: a disk that keeps rejecting the write after a move loses the moved-to session's record (logged as `SESSION POLICY LOST`), so that session's next worker (a wake, a revival) starts under an earlier record for that file or under none). The supervisor client link both daemon-attached clients share (`daemon_link.rs`: JSONL envelopes out, responses matched by id, the owner's consumer ordering events before the response that overtook them) stays `pub(crate)`. Supervision internals `pub(crate)`.
 
 
 ## Depends on
 pa-types, pa-core (one-way).
+
+The composition root initializes the packaged product version with
+`protocol::configure_app_version` before entering daemon or worker mode.
+`protocol::app_version` supplies that identity to both hello frames and update
+checkpoints; library embedders fall back to the compiled version. Release
+manifest restamping therefore remains consistent with CLI `--version`.

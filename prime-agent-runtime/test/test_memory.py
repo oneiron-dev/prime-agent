@@ -46,6 +46,15 @@ class MemoryRequestTest(unittest.TestCase):
         self.repl.send({"type": "execute", "id": "f2", "code": hold})
         while "holding" not in stream_text([self.repl.read_event()], "stdout"):
             pass
+        # Stdout can arrive before print returns; observe the parked frame.
+        for attempt in range(100):
+            rid = f"f2-parked-{attempt}"
+            self.repl.send({"type": "memory_report", "id": rid, "count": 0})
+            parked = one(self.repl.until_done(rid), "done")
+            if parked["line"] == {"lineno": 5, "source": "threading.Event().wait()"}:
+                break
+        else:
+            self.fail("cell did not reach the blocking wait")
         self.repl.send({"type": "interrupt"})
         error = one(self.repl.until_done("f2"), "error")
         self.assertEqual(

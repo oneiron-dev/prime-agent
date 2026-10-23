@@ -1,20 +1,12 @@
-//! Terminal hyperlinks (OSC 8), gated on terminal capabilities.
-//!
-//! TS parity port of the link rendering split in
-//! `packages/tui/src/components/markdown.ts` (`case "link"`): when the
-//! terminal is positively known to implement OSC 8 hyperlinks
-//! (`getCapabilities().hyperlinks`, `terminal-image.ts detectCapabilities`),
-//! the link text is wrapped in an OSC 8 sequence pair so it is clickable and
-//! the URL is never printed inline; otherwise the legacy form is used, with
-//! the URL shown after the text unless it equals the link text.
-//!
-//! The renderer embeds the zero-width sequences in span content, exactly
-//! like the TS renderer's ANSI strings. `width` skips them, the ratatui
+//! Terminal hyperlinks (OSC 8). Markdown retains label metadata even when
+//! the capability decision selects a visible URL fallback, matching TS's
+//! fullscreen backend and keeping in-app hit testing available. Other UI
+//! surfaces may gate their link presentation on terminal capabilities.
+//! The renderer embeds the
+//! zero-width sequences in span content; `width` skips them, the ratatui
 //! paint path strips them (`to_ratatui_line`), and [`HyperlinkWriter`]
-//! re-emits them into the terminal byte stream around the painted link
-//! cells: terminals attach hyperlinks to the cells printed between the open
-//! and close sequences, so the sequences must ride inline with the cell
-//! bytes (a post-paint write at cursor positions would not link them).
+//! re-emits them around the painted link cells (the sequences must ride
+//! inline with the cell bytes).
 
 use std::cell::RefCell;
 use std::io::{self, Write};
@@ -23,11 +15,9 @@ use crate::Line;
 
 /// The chat paint backend: a crossterm backend over the stdout
 /// [`HyperlinkWriter`], so painted link cells carry their OSC 8 regions.
-/// Every draw through a [`LinkBackend`] must install its composed frame
-/// first ([`install_frame`]); the ranges drive the writer's injection.
+/// Every draw must install its composed frame first ([`install_frame`]).
 pub type LinkBackend = ratatui::backend::CrosstermBackend<HyperlinkWriter<std::io::Stdout>>;
 
-/// Construct the stdout paint backend with the hyperlink writer.
 #[must_use]
 pub fn stdout_backend() -> LinkBackend {
     LinkBackend::new(HyperlinkWriter::new(std::io::stdout()))
@@ -43,10 +33,6 @@ pub fn osc8_open(url: &str) -> String {
 /// OSC 8 close: ends the active hyperlink region.
 pub const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
 
-/// Rewrite a Windows drive-letter path (`c:\...` / `C:/...`) to a `file:///`
-/// URL, mirroring the TS href normalization that classifies it as a path
-/// rather than a URL scheme and lets `new URL()` canonicalize the
-/// backslashes. Other targets pass through unchanged.
 #[must_use]
 pub fn rewrite_drive_path(url: &str) -> String {
     let bytes = url.as_bytes();
@@ -61,41 +47,32 @@ pub fn rewrite_drive_path(url: &str) -> String {
     }
 }
 
-/// TS `markdown.ts` `case "link"` href resolution: drive-path rewrite,
-/// then a WHATWG `new URL()` pass. The deployed interactive renderer
-/// always sets `options.baseUrl` (`assistant-message.ts` derives it from
-/// the session cwd), so every non-fragment target that parses is emitted
-/// through `new URL(target, baseUrl).href`: absolute urls canonicalize
-/// (a bare host gains its `/`, the scheme and host lower-case), drive
-/// paths re-canonicalize their `file:///` form. `WhatWG` parsing with no
-/// base only succeeds for absolute urls, so relative targets pass
-/// through raw here - the one documented gap: resolving them against the
-/// session cwd needs cwd plumbing the markdown pipeline does not carry,
-/// and no battery covers a relative link target.
+/// TS `case "link"` href resolution: drive-path rewrite, then a WHATWG
+/// `new URL(target, baseUrl)` pass. Standalone callers have no base; the
+/// session view supplies its own base through the crate-private Markdown context.
 #[must_use]
 pub fn resolve_link_href(token_href: &str) -> String {
+    resolve_link_href_with_base(token_href, None)
+}
+
+pub(crate) fn resolve_link_href_with_base(token_href: &str, base: Option<&url::Url>) -> String {
     let target = rewrite_drive_path(token_href);
     if target.starts_with('#') {
         return sanitize_control_bytes(target);
     }
     match url::Url::parse(&target) {
         Ok(parsed) => parsed.to_string(),
-        Err(_) => sanitize_control_bytes(target),
+        Err(_) => base
+            .and_then(|base| base.join(&target).ok())
+            .map_or_else(|| sanitize_control_bytes(target), |url| url.to_string()),
     }
 }
 
-/// The parse-bypass paths above return the target raw, exactly like the
-/// TS renderer (its `!target.startsWith('#')` short-circuit and the
-/// `canParse` fallthrough both hand the raw string to `hyperlink()`).
-/// A raw C0/DEL byte in that string would ride the OSC 8 `href` field as
-/// a second terminal escape (e.g. an OSC 52 clipboard write), so those
-/// paths percent-encode the bytes first - the same bytes WHATWG URL
-/// parsing percent-encodes on every parseable target in both products.
-/// The TS renderer shares the hole (its fragment and unparseable targets
-/// reach `hyperlink()` unsanitized); this is deliberate hardening past
-/// parity on an input class no battery covers. The markdown URL bracket
-/// applies the same hardening to the destination it renders as visible
-/// text.
+/// The parse-bypass paths return the target raw. A raw C0/DEL byte there would ride
+/// the OSC 8 `href` field as a second terminal escape (e.g. an OSC 52 clipboard
+/// write), so those paths percent-encode the bytes first. Deliberate hardening past
+/// parity (the TS renderer shares the hole); the markdown URL bracket reuses this
+/// hardening.
 pub(crate) fn sanitize_control_bytes(target: String) -> String {
     if !target
         .as_bytes()
@@ -118,10 +95,9 @@ pub(crate) fn sanitize_control_bytes(target: String) -> String {
 }
 
 /// The env-based hyperlink-capability gate (TS `detectCapabilities`):
-/// hyperlinks are enabled only in terminals positively known to implement
-/// OSC 8, forced off under tmux/screen (which swallow the sequences by
-/// default), and off in unknown terminals (a swallowed OSC 8 hides the URL
-/// from the rendered output).
+/// enabled only in terminals positively known to implement OSC 8, forced
+/// off under tmux/screen, and off in unknown terminals (a swallowed OSC 8
+/// hides the URL).
 #[must_use]
 pub fn hyperlinks_enabled() -> bool {
     if let Some(overridden) = OVERRIDE.with(|c| *c.borrow()) {
@@ -156,18 +132,16 @@ pub fn hyperlinks_enabled() -> bool {
 }
 
 thread_local! {
-    /// Test seam mirroring TS `setCapabilities`: force the capability
-    /// decision regardless of the environment. `None` restores detection.
+    /// Test seam mirroring TS `setCapabilities`: force the capability decision; `None` restores
+    /// detection.
     static OVERRIDE: RefCell<Option<bool>> = const { RefCell::new(None) };
 }
 
-/// Set (or clear) the test override for the capability gate.
 pub fn set_hyperlinks_override(enabled: Option<bool>) {
     OVERRIDE.with(|c| *c.borrow_mut() = enabled);
 }
 
-/// One clickable region of a composed frame: terminal row, visible column
-/// range, and destination URL.
+/// One clickable region of a composed frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkRange {
     pub row: usize,
@@ -177,11 +151,9 @@ pub struct LinkRange {
 }
 
 /// Scan a composed frame for OSC 8 sequences embedded in span content and
-/// convert them into row/column ranges (the paint-time truth). The
-/// sequences are zero-width, so visible columns are unaffected. A link left
-/// open at a row end (its label wrapped mid-link) extends to the end of the
-/// row and resumes at column 0 of the next row, matching the TS renderer's
-/// stream where the region stays open across the wrap.
+/// convert them into row/column ranges (the paint-time truth; visible
+/// columns unaffected). A link left open at a row end extends to the row's
+/// end and resumes at column 0 of the next row, matching the TS stream.
 #[must_use]
 pub fn frame_link_ranges(frame: &[Line]) -> Vec<LinkRange> {
     let mut ranges: Vec<LinkRange> = Vec::new();
@@ -192,9 +164,6 @@ pub fn frame_link_ranges(frame: &[Line]) -> Vec<LinkRange> {
             scan_span(&span.content, row, &mut col, &mut carry, &mut ranges);
         }
         if let Some((start_row, start_col, url)) = carry.take() {
-            // A label wrapped mid-link closes its piece at the row end and
-            // resumes at column 0 of the next row (the original start row
-            // only matters for pieces closed inside `scan_span`).
             let _ = start_row;
             ranges.push(LinkRange {
                 row,
@@ -256,9 +225,9 @@ fn is_osc8_close(seq: &str) -> bool {
     seq == OSC8_CLOSE || seq == "\x1b]8;;\x07"
 }
 
-/// Remove OSC 8 sequences from a rendered line's span contents (the ratatui
-/// paint path and the plain-text verifiers must not see the zero-width
-/// bytes; the sequences are re-emitted by [`HyperlinkWriter`] at paint).
+/// Remove OSC 8 sequences from a rendered line's span contents (the
+/// paint path must not see the zero-width bytes; [`HyperlinkWriter`]
+/// re-emits them at paint).
 pub fn strip_osc8(line: &mut Line) {
     for span in line.iter_mut() {
         if span.content.contains("\x1b]8;;") {
@@ -272,9 +241,8 @@ pub fn strip_osc8(line: &mut Line) {
 ///
 /// # Panics
 ///
-/// Cannot panic for any valid `str`: the `expect` guards the scanner
-/// invariant that the loop only ever advances by whole escape sequences
-/// and chars, so a char always starts at the visited index.
+/// Cannot panic for any valid `str`: the scanner only ever advances by
+/// whole escape sequences and chars.
 #[must_use]
 pub fn strip_osc8_content(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -320,17 +288,14 @@ pub(crate) fn link_at(ranges: &[LinkRange], row: usize, col: usize) -> Option<&s
         .map(|r| r.url.as_str())
 }
 
-/// The URL a click at `row`/`col` opens (TS `viewport.hyperlinkAt`'s
-/// lookup over the last composed frame's ranges).
+/// The URL a click at `row`/`col` opens.
 pub(crate) fn url_at(ranges: &[LinkRange], row: usize, col: usize) -> Option<String> {
     link_at(ranges, row, col).map(str::to_string)
 }
 
 /// TS `openHyperlink`'s guard: a control byte never rides an opener
 /// argument, and only http/https/file targets open — a terminal-origin
-/// URL is still renderer output, so the click path keeps the opener
-/// surfaces closed to everything a browser could execute beyond a web
-/// or file location. Canonical href on success, `None` when refused.
+/// URL is still renderer output.
 pub(crate) fn openable_href(url: &str) -> Option<String> {
     if url.chars().any(char::is_control) {
         return None;
@@ -342,16 +307,13 @@ pub(crate) fn openable_href(url: &str) -> Option<String> {
     }
 }
 
-/// Terminal writer wrapper that injects OSC 8 hyperlink sequences around the
-/// cells painted inside installed link ranges.
+/// Terminal writer wrapper that injects OSC 8 hyperlink sequences around
+/// the cells painted inside installed link ranges.
 ///
-/// The backend byte stream is parsed on the fly: crossterm `MoveTo` updates
-/// the tracked cursor position, printable runs advance the column by their
-/// visible width, and other escape sequences pass through untouched. When a
-/// printable run begins inside a link region, the open sequence is written
-/// immediately before the cell bytes; a run outside the active region (or a
-/// cursor jump) closes it first. `flush` always closes an open region, so
-/// no later output can inherit the hyperlink.
+/// The backend byte stream is parsed on the fly: `MoveTo` updates the
+/// tracked cursor, printable runs advance the column, other escapes pass
+/// through; a run beginning inside a link region opens it first, and
+/// `flush` always closes an open region.
 pub struct HyperlinkWriter<W> {
     inner: W,
     pos: Option<(u16, u16)>,
@@ -388,9 +350,9 @@ impl<W: Write> HyperlinkWriter<W> {
         }
     }
 
-    /// Emit open/close sequences for a printable run starting at the
-    /// tracked position: open when the run lands inside a link region,
-    /// re-opening (after closing) when the region changed.
+    /// Emit open/close sequences for a printable run starting at the tracked
+    /// position: open when the run lands inside a link region, re-opening when
+    /// the region changed.
     fn link_for_run(&mut self, ranges: &[LinkRange]) {
         let Some((row, col)) = self.pos else {
             self.close_active();
@@ -414,14 +376,28 @@ impl<W: Write> HyperlinkWriter<W> {
 
     /// Emit the buffered printable run and advance the tracked column.
     fn flush_text(&mut self) -> io::Result<()> {
+        use unicode_segmentation::UnicodeSegmentation;
         if self.text.is_empty() {
             return Ok(());
         }
         let chunk = std::mem::take(&mut self.text);
-        self.inner.write_all(&chunk)?;
-        if let Ok(text) = std::str::from_utf8(&chunk) {
+        let Ok(text) = std::str::from_utf8(&chunk) else {
+            return self.inner.write_all(&chunk);
+        };
+        for grapheme in text.graphemes(true) {
+            let width = crate::width::str_width(grapheme) as u16;
+            // Terminals disagree on the width of a multi-codepoint two-column cluster (a VS16
+            // emoji, a ZWJ sequence, a flag): blank both of its cells first, so a terminal that
+            // advances one column keeps no stale cell beside the glyph.
+            if let Some((row, col)) = self
+                .pos
+                .filter(|_| width == 2 && grapheme.chars().nth(1).is_some())
+            {
+                write!(self.inner, "  \x1b[{};{}H", row + 1, col + 1)?;
+            }
+            self.inner.write_all(grapheme.as_bytes())?;
             if let Some((_, col)) = self.pos.as_mut() {
-                *col = col.saturating_add(crate::width::str_width(text) as u16);
+                *col = col.saturating_add(width);
             }
         }
         Ok(())
@@ -535,9 +511,9 @@ mod tests {
     #[test]
     fn resolve_link_href_canonicalizes_parseable_targets() {
         // The deployed renderer always sets baseUrl, so every parseable
-        // non-fragment href goes through `new URL().href`: hosts gain a
-        // trailing `/`, scheme and host lower-case, drive paths
-        // re-canonicalize. Unparseable targets and fragments pass raw.
+        // non-fragment href goes through `new URL().href` (hosts gain a trailing
+        // `/`, scheme and host lower-case); unparseable targets and fragments
+        // pass raw.
         assert_eq!(
             resolve_link_href("https://x.dev/a?b=1"),
             "https://x.dev/a?b=1"
@@ -555,11 +531,9 @@ mod tests {
 
     #[test]
     fn parse_bypass_targets_percent_encode_control_bytes() {
-        // Fragment and unparseable targets reach the OSC 8 href raw (the
-        // TS renderer's own bypass paths); a raw control byte there would
-        // ride the terminal stream as a second escape (an OSC 52 clipboard
-        // write), so those paths percent-encode C0 and DEL first - the
-        // same bytes URL parsing encodes on every parseable target.
+        // Fragment and unparseable targets reach the OSC 8 href raw; a raw control
+        // byte there would ride the terminal stream as a second escape (an OSC 52
+        // clipboard write), so those paths percent-encode C0 and DEL first.
         assert_eq!(resolve_link_href("#a]52;cb"), "#a%1B]52;c%07b");
         assert_eq!(resolve_link_href("not a url]8;;x"), "not a url%1B]8;;x");
         assert_eq!(resolve_link_href("#s"), "#s%7F");
@@ -569,9 +543,6 @@ mod tests {
 
     #[test]
     fn openable_href_gates_the_click_opener() {
-        // TS `openHyperlink`: control bytes never reach the opener, and
-        // only http/https/file targets open; a parseable target opens as
-        // its canonical href.
         assert_eq!(
             openable_href("https://example.com/docs"),
             Some("https://example.com/docs".to_string())
@@ -699,6 +670,110 @@ mod tests {
         String::from_utf8(writer.into_inner()).expect("utf-8")
     }
 
+    /// The bytes the chat paint writes for consecutive frames of one row each: every frame
+    /// passes `to_ratatui_line` and the [`HyperlinkWriter`], as `app::draw` does.
+    fn paint_frames(frames: &[&str], width: u16) -> Vec<u8> {
+        #[derive(Clone, Default)]
+        struct Sink(std::rc::Rc<RefCell<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let area = ratatui::layout::Rect::new(0, 0, width, 1);
+        let mut terminal = ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(HyperlinkWriter::new(sink.clone())),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
+        for text in frames {
+            let line = crate::markdown::to_ratatui_line(&vec![crate::Span::raw(*text)]);
+            terminal
+                .draw(|frame| frame.render_widget(line, area))
+                .unwrap();
+        }
+        let bytes = sink.0.borrow().clone();
+        bytes
+    }
+
+    /// A minimal terminal that measures graphemes with `columns` (the width choice vt100 cannot
+    /// model): it follows cursor moves, skips the other escape sequences, and records the first
+    /// row's cells.
+    fn screen_row(bytes: &[u8], width: usize, columns: impl Fn(&str) -> usize) -> Vec<String> {
+        use unicode_segmentation::UnicodeSegmentation;
+        let text = std::str::from_utf8(bytes).unwrap();
+        let mut row = vec![" ".to_string(); width];
+        let mut col = 0;
+        let mut rest = text;
+        while !rest.is_empty() {
+            if let Some(len) = crate::width::escape_len(rest) {
+                let sequence = &rest[..len];
+                if let Some(position) = sequence
+                    .strip_prefix("\x1b[")
+                    .and_then(|s| s.strip_suffix('H'))
+                {
+                    col = position
+                        .split(';')
+                        .nth(1)
+                        .and_then(|c| c.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        - 1;
+                }
+                rest = &rest[len..];
+                continue;
+            }
+            let grapheme = rest.graphemes(true).next().unwrap();
+            let advance = columns(grapheme);
+            if advance > 0 && col < width {
+                row[col] = grapheme.to_string();
+                for cell in row.iter_mut().skip(col + 1).take(advance - 1) {
+                    cell.clear();
+                }
+            }
+            col += advance;
+            rest = &rest[grapheme.len()..];
+        }
+        row
+    }
+
+    /// A terminal that gives the soft hyphen a column (glibc `wcwidth`, pyte) and one that gives
+    /// it none (iTerm2) paint the same row: the hyphen never reaches the terminal.
+    #[test]
+    fn a_soft_hyphen_never_shifts_the_cells_after_it() {
+        let bytes = paint_frames(&["a\u{ad}b"], 4);
+        let row = screen_row(&bytes, 4, |grapheme| {
+            usize::from(grapheme == "\u{ad}") + crate::width::str_width(grapheme)
+        });
+        assert_eq!(
+            row[..2],
+            ["a", "b"],
+            "the row a one-column soft hyphen terminal paints"
+        );
+    }
+
+    /// A terminal that measures a VS16 emoji one column wide (vt100, like iTerm2) keeps no stale
+    /// character in the second cell the paint assigns it.
+    #[test]
+    fn a_two_column_cluster_leaves_no_stale_cell_on_a_narrow_measuring_terminal() {
+        let bytes = paint_frames(&["abcd", "\u{26a0}\u{fe0f}cd"], 4);
+        let mut parser = vt100::Parser::new(1, 4, 0);
+        parser.process(&bytes);
+        let screen = parser.screen();
+        assert_eq!(screen.cell(0, 0).unwrap().contents(), "\u{26a0}\u{fe0f}");
+        let second = screen.cell(0, 1).unwrap().contents();
+        assert!(
+            second.trim().is_empty(),
+            "the second cell still shows the previous frame's {second:?}"
+        );
+    }
+
     #[test]
     fn writer_injects_open_close_around_link_cells() {
         // Link covers the `cd` label at columns 4..6 of row 0.
@@ -713,6 +788,34 @@ mod tests {
             out,
             "\x1b[1;3Hab\x1b[1;5H\x1b]8;;https://z\x1b\\cd\x1b]8;;\x1b\\\x1b[1;8Hxy"
         );
+    }
+
+    #[test]
+    fn fallback_capability_keeps_markdown_label_metadata_and_hit_testing() {
+        set_hyperlinks_override(Some(false));
+        let style = crate::markdown::MarkdownStyle::default();
+        let frame = vec![crate::markdown::render_inline(
+            "[docs](https://example.com)",
+            &style,
+        )];
+        let ranges = frame_link_ranges(&frame);
+        assert_eq!(link_at(&ranges, 0, 0), Some("https://example.com/"));
+        assert_eq!(
+            link_at(&ranges, 0, 4),
+            None,
+            "fallback URL is outside the label's region"
+        );
+        // The actual render has separate label/body and dim fallback spans.
+        // Pin that boundary; this is not a test of splitting a homogeneous
+        // writer chunk across a link range in the middle of its bytes.
+        let out = paint(&frame, &[b"\x1b[1;1Hdocs", b" (https://example.com)"]);
+        assert!(out.contains(&format!(
+            "{}docs{}",
+            osc8_open("https://example.com/"),
+            OSC8_CLOSE
+        )));
+        assert!(out.ends_with(" (https://example.com)"));
+        set_hyperlinks_override(None);
     }
 
     #[test]

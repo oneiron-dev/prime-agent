@@ -291,6 +291,51 @@ class InstallerTests(Fixture):
         self.assertFalse((self.bin_dir / "prime-agent-rs").exists())
         self.assertFalse(self.agent_dir.exists())
 
+    def test_no_activate_stages_with_ts_launcher_aliased_to_rust_without_changing_live_paths(self) -> None:
+        rust_launcher = self.bin_dir / "prime-agent-rs"
+        rust_launcher.write_text("existing launcher\n")
+        rust_launcher.chmod(0o755)
+        ts_launcher = self.bin_dir / "prime-agent"
+        ts_launcher.unlink()
+        ts_launcher.symlink_to(side_by_side.LAUNCHER_NAME)
+
+        self.prefix.mkdir(parents=True)
+        current = self.prefix / "current"
+        previous = self.prefix / "previous"
+        current.symlink_to("0.9.8-oneiron.20260930.1")
+        previous.symlink_to("0.9.8-oneiron.20260929.1")
+        live_feed = self.prefix / "feed"
+        live_feed.mkdir()
+        stable = live_feed / "stable"
+        latest = live_feed / "latest.json"
+        stable.write_text("v0.9.8-oneiron.20260930.1\n")
+        latest.write_text('{"version":"v0.9.8-oneiron.20260930.1"}\n')
+        before = (os.readlink(current), os.readlink(previous), rust_launcher.read_bytes(),
+                  side_by_side.link_state(ts_launcher), stable.read_bytes(), latest.read_bytes())
+
+        self.assertEqual(self.run_main("install", "--no-activate", "--stage-dir", str(self.stage())), 0)
+
+        after = (os.readlink(current), os.readlink(previous), rust_launcher.read_bytes(),
+                 side_by_side.link_state(ts_launcher), stable.read_bytes(), latest.read_bytes())
+        self.assertEqual(after, before)
+        self.assertTrue((self.prefix / VERSION / "prime-agent").is_file())
+        self.assertFalse(self.agent_dir.exists())
+
+    def test_activating_install_refuses_ts_launcher_aliased_to_rust(self) -> None:
+        rust_launcher = self.bin_dir / "prime-agent-rs"
+        rust_launcher.write_text("existing launcher\n")
+        rust_launcher.chmod(0o755)
+        ts_launcher = self.bin_dir / "prime-agent"
+        ts_launcher.unlink()
+        ts_launcher.symlink_to(side_by_side.LAUNCHER_NAME)
+        before = (rust_launcher.read_bytes(), side_by_side.link_state(ts_launcher))
+
+        with self.assertRaisesRegex(SystemExit, "would alias the TS prime-agent launcher"):
+            self.run_main("install", "--stage-dir", str(self.stage()))
+
+        self.assertEqual((rust_launcher.read_bytes(), side_by_side.link_state(ts_launcher)), before)
+        self.assertFalse(self.prefix.exists())
+
     def test_tarball_install_matches_the_staged_layout(self) -> None:
         stage = make_stage(self.root)
         tarball = self.root / f"{stage.name}.tar.gz"
@@ -1182,6 +1227,7 @@ class GateTests(unittest.TestCase):
         self.out = self.root / "out"
         self.out.mkdir()
         stubs = self.root / "stubs"
+        self.stubs = stubs
         write_executable(stubs / "cargo", STUB_CARGO)
         write_executable(stubs / "sccache", "#!/bin/sh\nexit 0\n")
         write_executable(self.root / "target" / "debug" / "prime-agent", STUB_BOOTSTRAP)
@@ -1203,6 +1249,13 @@ class GateTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_gate(self, **env: str) -> tuple[subprocess.CompletedProcess, Path]:
+        controls = {name: value for name, value in {**self.env, **env}.items()
+                    if name.startswith("STUB_")}
+        import shlex
+        prefix = "".join(f"export {name}={shlex.quote(value)}\n" for name, value in controls.items())
+        write_executable(self.stubs / "cargo", STUB_CARGO.replace("#!/bin/sh\n", f"#!/bin/sh\n{prefix}", 1))
+        write_executable(self.root / "target" / "debug" / "prime-agent",
+                         STUB_BOOTSTRAP.replace("#!/bin/sh\n", f"#!/bin/sh\n{prefix}", 1))
         result = subprocess.run(["bash", str(self.gate), "crates", "pa-core", "--", "some_filter"],
                                 capture_output=True, text=True, env={**self.env, **env})
         self.assertTrue(result.stdout.startswith("gate: local mode\n"), result.stdout)
@@ -1250,7 +1303,9 @@ class GateTests(unittest.TestCase):
                      "RLM_SESSION_DIR": "/ts/s", "RLM_HARNESS_STATE_DIR": "/ts/h", "RLM_CUSTOM": "/ts/c",
                      "RLM_GLOBAL_HARNESS_STATE_DIR": "/ts/g", "PA_COMPACTION_TRACE": "/ts/trace",
                      "PA_MCP_LOGIN_URL_FILE": "/ts/url", "PA_DAEMON_EVENT_LOG": "/ts/log",
-                     "PA_TS_REFERENCE": "1", "DO_NOT_TRACK": "1", "PA_TS_BINARY": "/ts/bin/prime-agent"}
+                     "PA_TS_REFERENCE": "1", "DO_NOT_TRACK": "1", "PA_TS_BINARY": "/ts/bin/prime-agent",
+                     "FIREWORKS_API_KEY": "fixture-only-key", "GITHUB_TOKEN": "fixture-only-token",
+                     "MOONSHOT_API_KEY": "fixture-only-key"}
         result, sandbox = self.run_gate(**inherited)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         seen = dict(line.split("=", 1) for line in (self.out / "env").read_text().splitlines() if "=" in line)
@@ -1258,6 +1313,7 @@ class GateTests(unittest.TestCase):
                           if name.startswith(("PRIME_AGENT_", "PI_", "RLM_", "PA_")) or name == "DO_NOT_TRACK"},
                          {"PA_TS_BINARY": "/ts/bin/prime-agent"})
         self.assertEqual((seen["HOME"], seen["TMPDIR"]), (f"{sandbox}/h", f"{sandbox}/t"))
+        self.assertFalse(set(("FIREWORKS_API_KEY", "GITHUB_TOKEN", "MOONSHOT_API_KEY")) & seen.keys())
 
     def test_gate_shadows_each_prime_agent_dir_in_place(self) -> None:
         result, sandbox = self.run_gate()

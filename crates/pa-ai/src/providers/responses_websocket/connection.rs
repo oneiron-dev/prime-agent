@@ -271,7 +271,12 @@ pub(crate) async fn connect(
     if cancel.is_some_and(CancellationToken::is_cancelled) {
         return Err(ConnectFailure::Cancelled);
     }
-    let handshake = tokio_tungstenite::connect_async(request);
+    let handshake = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        None,
+        false,
+        Some(crate::utils_inner::tls::websocket_connector()),
+    );
     let (stream, _response) = match cancel {
         Some(cancel) => {
             // The handshake settles once, at this select, like the TS connect

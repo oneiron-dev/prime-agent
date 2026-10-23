@@ -128,6 +128,21 @@ class ReplTest(unittest.TestCase):
         self.addCleanup(self.repl.close)
         self.ready_event, self.ready_ms = self.repl.ready()
 
+    def enabled_factory_repl(self) -> ReplProcess:
+        """One repl whose kernel runs with the factory opt-in gate enabled:
+        the agent dir points at a temp dir whose settings.json carries the
+        enabled setting in the real shape (the same file `/factory on`
+        writes and the daemon's lane advertisement reads), so the
+        out-of-band lane answers through the live gate instead of reading
+        whatever the host machine's settings happen to say."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with open(os.path.join(temp.name, "settings.json"), "w", encoding="utf-8") as handle:
+            json.dump({"factory": {"enabled": True}}, handle)
+        repl = ReplProcess(env={"PRIME_AGENT_CODING_AGENT_DIR": temp.name})
+        self.addCleanup(repl.close)
+        return repl
+
     def test_bash_activity_is_available_while_cell_is_running(self):
         self.repl.send({"type": "execute", "id": "cell", "code": "from rlm import bash\nimport asyncio\nh = bash('echo ready; sleep 20'); await asyncio.sleep(20)"})
         # Wait for the activity start display before requesting list.
@@ -166,6 +181,43 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(event["event"], "error")
         self.assertEqual(event["ename"], "ProtocolError")
         self.assertIn("256", event["evalue"])
+
+    def test_factory_activity_is_available_while_cell_is_running(self):
+        repl = self.enabled_factory_repl()
+        before = repl.execute("factory-import-check", "import sys\n'rlm.factory' in sys.modules")
+        self.assertEqual(one(before, "result")["text"], "False")
+        repl.send({"type": "execute", "id": "cell", "code": "import asyncio\nawait asyncio.sleep(20)"})
+        # The factory graph answers out of band while the cell runs: no
+        # live runs exist yet, so the graph action lists the empty registry.
+        repl.send({"type": "factory_activity", "id": "g", "action": "graph"})
+        listed = repl.until_done("g")[-1]
+        self.assertEqual(listed["status"], "ok")
+        self.assertEqual(listed["result"]["runs"], [])
+        # unknown-run watch answers with the error reply (not a hang)
+        repl.send({"type": "factory_activity", "id": "w", "action": "watch", "runId": "nope", "timeoutMs": 100})
+        missing = repl.until_done("w")[-1]
+        self.assertEqual(missing["status"], "error")
+        self.assertIn("unknown factory run", missing["reason"])
+        repl.send({"type": "interrupt", "id": "cell"})
+        repl.until_done("cell")
+        loaded = repl.execute("factory-imported-check", "'rlm.factory' in sys.modules")
+        self.assertEqual(one(loaded, "result")["text"], "True")
+
+    def test_factory_activity_rejects_malformed_frames(self):
+        for frame, fragment in (
+            ({"type": "factory_activity", "id": "b", "action": "bogus"}, "unknown factory activity action"),
+            ({"type": "factory_activity", "id": "x" * 300, "action": "graph"}, "256"),
+            (
+                {"type": "factory_activity", "id": "t", "action": "watch", "runId": "r", "timeoutMs": "soon"},
+                "timeoutMs",
+            ),
+            ({"type": "factory_activity", "id": "n", "action": "graph", "runId": 5}, "runId"),
+        ):
+            self.repl.send(frame)
+            event = self.repl.read_event()
+            self.assertEqual(event["event"], "error", frame)
+            self.assertEqual(event["ename"], "ProtocolError")
+            self.assertIn(fragment, event["evalue"], frame)
 
     def test_ready_handshake_and_startup_time(self):
         self.assertEqual(self.ready_event["event"], "ready")
@@ -467,6 +519,28 @@ class ReplTest(unittest.TestCase):
             time.sleep(1.6)
             self.assertFalse(os.path.exists(marker))
 
+    def test_interrupted_await_inside_bounded_window_still_kills(self):
+        # The bounded wait observes an interrupt instead of abandoning on it:
+        # inside the window the owned await keeps its kill-on-cancel contract.
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "marker")
+            code = "\n".join(
+                [
+                    "import rlm",
+                    "rlm._set_completion_notices_wired(True)",
+                    "from rlm import bash",
+                    f"r = await bash('sleep 1.5 && touch {marker}', yield_after=3)",
+                ]
+            )
+            self.repl.send({"type": "execute", "id": "ibash-bounded", "code": code})
+            time.sleep(0.4)
+            self.repl.send({"type": "interrupt"})
+            events = self.repl.until_done("ibash-bounded")
+            self.assertEqual(one(events, "error")["ename"], "KeyboardInterrupt")
+            self.assertEqual(one(events, "done")["status"], "error")
+            time.sleep(1.6)
+            self.assertFalse(os.path.exists(marker))
+
     def _interrupt_after_running(self, rid: str, code: str) -> list[dict]:
         self.repl.send({"type": "execute", "id": rid, "code": code})
         # Give the cell time to enter its blocking region before interrupting.
@@ -654,6 +728,117 @@ class ReplTest(unittest.TestCase):
             events = fresh.execute("r2", "bump(x)")
             self.assertEqual(one(events, "result")["text"], "42")
             self.assertEqual(fresh.shutdown(), 0)
+
+    def test_snapshot_skips_off_cell_bash_handles(self):
+        # A handle created outside any cell (here: a plain thread) carries no
+        # unpicklable cell-task reference, so dill would happily persist its
+        # pipe fds; restoring a saved fd number reopens (and closes) it in the
+        # new kernel, killing whatever owns the fd there.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "kernel-state.dill")
+            manifest_path = os.path.join(tmp, "kernel-state.json")
+            setup = (
+                "import threading\n"
+                "from rlm import bash\n"
+                "hs = []\n"
+                "t = threading.Thread(target=lambda: hs.append(bash('echo done-h1')))\n"
+                "t.start()\n"
+                "t.join()\n"
+                "h1 = hs[0]\n"
+                "await h1\n"
+                "del t\n"
+                "keep = 1\n"
+            )
+            self.assertEqual(one(self.repl.execute("s1", setup), "done")["status"], "ok")
+            self.repl.send(
+                {"type": "snapshot", "id": "s2", "path": path, "manifest_path": manifest_path}
+            )
+            done = one(self.repl.until_done("s2"), "done")
+            self.assertEqual(done["status"], "ok")
+            skipped = {entry["name"]: entry["reason"] for entry in done["skipped"]}
+            self.assertEqual(sorted(skipped), ["h1", "hs"])
+            for reason in skipped.values():
+                self.assertIn("live process handle", reason)
+            self.assertIn("keep", done["saved"])
+
+    # test-policy: allow conditional-or-disabled-test -- Windows lacks the POSIX raw-FD reopening hazard this regression targets.
+    @unittest.skipIf(os.name == "nt", "pickled raw fd numbers are a POSIX landmine")
+    def test_restore_refuses_to_reopen_pickled_raw_fds(self):
+        import dill
+
+        sys.path.insert(0, SRC)
+        self.addCleanup(sys.path.remove, SRC)
+        from rlm import repl as repl_module
+
+        fresh = ReplProcess()
+        self.addCleanup(fresh.close)
+        fresh.ready()
+        # The loop's self-pipe READ end is the wakeup fd the selector waits on:
+        # reopening its number from a snapshot and closing it parks the kernel.
+        events = fresh.execute(
+            "fd", "import asyncio\nasyncio.get_running_loop()._ssock.fileno()"
+        )
+        fd = int(one(events, "result")["text"])
+
+        class Landmine:
+            def __reduce__(self):
+                # The exact reconstructor dill saves for a closed pipe-backed
+                # file: name is the fd NUMBER.
+                return (dill._dill._create_filehandle, (fd, "rb", 0, True, open, False, 0, b""))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            writer_path = os.path.join(tmp, "writer-state.dill")
+            writer_manifest = os.path.join(tmp, "writer-state.json")
+            writer_result = repl_module._snapshot_state(
+                {"boom": Landmine(), "keep": 7},
+                writer_path,
+                writer_manifest,
+                repl_module.DEFAULT_SNAPSHOT_MAX_BYTES,
+                repl_module.DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES,
+                False,
+            )
+            self.assertEqual(writer_result["saved"], ["keep"])
+            self.assertEqual(
+                writer_result["skipped"],
+                [{"name": "boom", "reason": "unsafe dill file-handle reducer"}],
+            )
+
+            # Build a hostile snapshot directly, bypassing only the writer.
+            # This lets restore prove that the unsafe record fails alone while
+            # the safe name survives; no preflight mock disables either guard.
+            path = os.path.join(tmp, "hostile-state.dill")
+            records = {"boom": dill.dumps(Landmine()), "keep": dill.dumps(7)}
+            self.assertTrue(repl_module._has_filehandle_reducer(records["boom"]))
+            with open(path, "wb") as fh:
+                fh.write(repl_module._SNAPSHOT_MAGIC)
+                for name, blob in records.items():
+                    encoded = name.encode("utf-8")
+                    fh.write(len(encoded).to_bytes(4, "little") + encoded + len(blob).to_bytes(8, "little") + blob)
+
+            fresh.send({"type": "restore", "id": "r1", "path": path})
+            done = one(fresh.until_done("r1"), "done")
+            self.assertEqual(done["status"], "ok")
+            self.assertEqual(done["restored"], ["keep"])
+            failed = {entry["name"]: entry["reason"] for entry in done["failed"]}
+            self.assertEqual(failed, {"boom": "unsafe legacy dill file-handle reducer rejected"})
+            keep = fresh.execute("keep-probe", "keep")
+            self.assertEqual(one(keep, "result")["text"], "7")
+
+            # A timed thread wake proves the selector is still listening on its
+            # self-pipe after restore; closing that raw descriptor wedges this
+            # request instead of completing it.
+            probe = (
+                "import asyncio, threading\n"
+                "loop = asyncio.get_running_loop()\n"
+                "fut = loop.create_future()\n"
+                "threading.Timer(0.3, lambda: loop.call_soon_threadsafe(\n"
+                "    lambda: fut.done() or fut.set_result('woken'))).start()\n"
+                "await fut\n"
+            )
+            events = fresh.execute("wakeup-probe", probe)
+            self.assertEqual(one(events, "done")["status"], "ok")
+            self.assertEqual(one(events, "result")["text"], "'woken'")
+
 
     def test_stdin_eof_flushes_final_snapshot(self):
         # Host death (EOF, no shutdown request) must persist the namespace
@@ -1010,6 +1195,70 @@ class ReplTest(unittest.TestCase):
         reply_ok(self.repl, request)
         inspected = self.repl.execute("bash-inspect", "handle.poll().output")
         self.assertIn("detached", one(inspected, "result")["text"])
+
+    def test_degraded_await_in_creating_cell_still_sends_bash_completion(self):
+        # A bounded await that degrades inside the creating cell must count as
+        # neither awaited nor consumed, or the [bash-done] notice (the only
+        # wake-up) would never fire.
+        code = "\n".join(
+            [
+                "import rlm",
+                "rlm._set_completion_notices_wired(True)",
+                "from rlm import bash",
+                "handle = bash('sleep 0.6; printf degraded', yield_after=0.3)",
+                "await handle",
+                "handle.pid",
+            ]
+        )
+        events = self.repl.execute("bash-degrade", code)
+        pid = int(one(events, "result")["text"])
+        request = wait_for_host_request(self.repl, events)
+        self.assertEqual(
+            request["data"],
+            {
+                "type": "bash.completed",
+                "pid": pid,
+                "command": "sleep 0.6; printf degraded",
+                "exitCode": 0,
+            },
+        )
+        reply_ok(self.repl, request)
+
+    def test_degraded_await_of_a_persistent_shell_keeps_it_running_to_its_notice(self):
+        # yield_after and persistent= compose: the persistent handle's await
+        # degrades like any handle's, and the shell (never owned by an await)
+        # runs on to its [bash-done] notice.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        repl = ReplProcess(
+            env={"PRIME_AGENT_CODING_AGENT_DIR": temp.name, "RLM_SESSION_ID": "own-session"}
+        )
+        self.addCleanup(repl.close)
+        repl.ready()
+        code = "\n".join(
+            [
+                "import rlm",
+                "rlm._set_completion_notices_wired(True)",
+                "from rlm import bash",
+                "handle = bash('sleep 0.6; printf persisted', persistent=True, yield_after=0.3)",
+                "snapshot = await handle",
+                "(snapshot.running, snapshot.handle is handle, handle.pid)",
+            ]
+        )
+        events = repl.execute("persistent-degrade", code)
+        running, same, pid = one(events, "result")["text"].strip("()").split(", ")
+        self.assertEqual((running, same), ("True", "True"))
+        request = wait_for_host_request(repl, events)
+        self.assertEqual(
+            request["data"],
+            {
+                "type": "bash.completed",
+                "pid": int(pid),
+                "command": "sleep 0.6; printf persisted",
+                "exitCode": 0,
+            },
+        )
+        reply_ok(repl, request)
 
     def test_result_read_after_notice_requests_one_withdrawal(self):
         reads = (
@@ -2298,24 +2547,30 @@ class RestoreApplyShieldTest(unittest.TestCase):
                 signal.raise_signal(signal.SIGINT)
 
     def test_sigint_during_staging_leaves_namespace_unchanged(self):
-        import dill
-
+        from rlm import repl as repl_module
         from rlm.repl import _restore_state
 
-        real_loads = dill.loads
         calls = {"n": 0}
 
-        def loads_then_sigint(blob):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                # Synchronous SIGINT mid-deserialize: nothing may have touched ns yet.
-                signal.raise_signal(signal.SIGINT)
-            return real_loads(blob)
+        real_unpickler = repl_module._snapshot_unpickler
+
+        def unpickler_then_sigint(dill):
+            guarded = real_unpickler(dill)
+
+            class SigintOnSecondLoad(guarded):
+                def load(self):
+                    calls["n"] += 1
+                    if calls["n"] == 2:
+                        # Synchronous SIGINT mid-deserialize: nothing may have touched ns yet.
+                        signal.raise_signal(signal.SIGINT)
+                    return super().load()
+
+            return SigintOnSecondLoad
 
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_snapshot(tmp, {"a": 1, "b": 2})
             ns = {"a": "old", "unrelated": "keep"}
-            with mock.patch.object(dill, "loads", loads_then_sigint):
+            with mock.patch.object(repl_module, "_snapshot_unpickler", unpickler_then_sigint):
                 with self.assertRaises(KeyboardInterrupt):
                     _restore_state(ns, path)
         # The old namespace is byte-identical: no partial old/new mixture.
@@ -2984,6 +3239,49 @@ class OwnerWatchdogTest(unittest.TestCase):
         ):
             repl_module._wait_owner_windows(778)
         self.assertEqual(calls, [("OpenProcess", 0x00100000, False, 778)])
+
+
+class OwnerExitWaitTest(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, SRC)
+        self.addCleanup(sys.path.remove, SRC)
+        import rlm.repl as repl_module
+
+        self.repl_module = repl_module
+        self.owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+        self.addCleanup(self.owner.wait)
+        self.addCleanup(self.owner.kill)
+
+    def test_owner_exit_wakes_the_wait_without_polling(self):
+        real_alive = self.repl_module._owner_alive_posix
+
+        def owner_exits_once_watched(*args):
+            alive = real_alive(*args)  # runs after the exit registration, before the wait
+            self.owner.kill()
+            return alive
+
+        waiter = threading.Thread(
+            target=self.repl_module._wait_owner_posix, args=(self.owner.pid, os.getppid()), daemon=True
+        )
+        with (
+            mock.patch.object(self.repl_module, "_owner_alive_posix", owner_exits_once_watched),
+            mock.patch.object(self.repl_module.time, "sleep") as sleep,
+        ):
+            waiter.start()
+            waiter.join(timeout=10)
+        self.assertFalse(waiter.is_alive(), "the owner's exit must wake the watchdog")
+        sleep.assert_not_called()
+
+    def test_owner_wait_polls_when_exit_registration_fails(self):
+        with (
+            mock.patch.object(self.repl_module.select, "kqueue", create=True, side_effect=OSError("unavailable")),
+            mock.patch.object(self.repl_module.os, "pidfd_open", create=True, side_effect=OSError("unavailable")),
+            mock.patch.object(
+                self.repl_module.time, "sleep", side_effect=lambda _: (self.owner.kill(), self.owner.wait())
+            ) as sleep,
+        ):
+            self.repl_module._wait_owner_posix(self.owner.pid, os.getppid())
+        sleep.assert_called_once()
 
 
 if __name__ == "__main__":

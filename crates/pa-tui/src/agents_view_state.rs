@@ -1,8 +1,6 @@
-//! The agents-view data layer: one reconcile of the daemon's live roster and
-//! the saved-session catalog into unified records, then section grouping,
-//! search, and the row/layout shapes the view renders. Pure functions on
-//! JSON summaries (the wire forms the supervisor serves), mirroring the TS
-//! agents-view state module; the view module owns input and painting.
+//! The agents-view data layer: one reconcile of the daemon's live roster and the saved-session
+//! catalog into unified records, then section grouping, search, and the row/layout shapes the
+//! view renders. Pure functions on JSON summaries; the view module owns input and painting.
 
 use std::collections::HashMap;
 
@@ -21,7 +19,6 @@ pub enum Section {
     Inactive,
 }
 
-/// The display heading of a section.
 #[must_use]
 pub fn section_title(section: Section) -> &'static str {
     match section {
@@ -47,25 +44,20 @@ fn section_from_status(status: AgentRosterStatus) -> Section {
     }
 }
 
-/// One merged row source: the live roster summary, the saved catalog row, or
-/// both. Daemon data stays authoritative; saved data only enriches the
-/// durable/search fields.
+/// One merged row source: the live roster summary, the saved catalog row, or both. Daemon data
+/// stays authoritative; saved data only enriches the durable/search fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnifiedRecord {
     /// The slim session summary of a roster entry (`summary` field).
     pub daemon: Option<Value>,
     /// One saved-session catalog row (`session_list_item.session`).
     pub saved: Option<Value>,
-    /// The supervisor's classification of the roster entry.
     pub status: Option<AgentRosterStatus>,
     /// The stable UI key (first alias).
     pub identity: String,
     /// Every key this record is reachable by (selection survival).
     pub aliases: Vec<String>,
     pub section: Section,
-    /// The picker's match targets: the SESSION column's title, the
-    /// durable session id, and the cwd (see `agents_view_search`).
-    pub search: SessionSearchText,
     /// The query-relevance score behind the ranked list (lower is better);
     /// `None` for retained ancestors and unqueried rosters.
     pub search_score: Option<f64>,
@@ -78,19 +70,42 @@ fn get_str<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-/// The canonical file identity (TS canonicalizes; the saved catalog already
-/// serves absolute paths, so lexical normalization is enough here).
-fn file_identity(path: &str) -> String {
-    format!("file:{path}")
+/// The stable key form of a session-file path. The daemon publishes the
+/// SAME file in two string forms on Windows (the operator's 2026-10-08
+/// grouped-sessions report): live worker summaries and the saved-catalog
+/// scan serve the raw `C:\...` form, while the spawn ledger's seeded
+/// roster rows and passive saved rows serve `Path::canonicalize`'s
+/// verbatim `\\?\C:\...` form - and Windows paths compare
+/// case-insensitively on the filesystem. The join keys must converge the
+/// same two forms the daemon's own `same_session_file` converges, or
+/// ledger-derived children detach and each family re-groups under one
+/// wrong root.
+pub(crate) fn normalize_session_file_path(path: &str) -> String {
+    let trimmed = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| path.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| path.to_string());
+    if cfg!(windows) {
+        trimmed.to_lowercase()
+    } else {
+        trimmed
+    }
+}
+
+/// The canonical file identity: the normalized path under the `file:` key
+/// prefix (the saved catalog already serves absolute paths, so lexical
+/// normalization is enough; TS canonicalizes).
+pub(crate) fn file_identity(path: &str) -> String {
+    format!("file:{}", normalize_session_file_path(path))
 }
 
 /// The aliases of one roster entry summary, in TS order.
 fn daemon_aliases(summary: &Value) -> Vec<String> {
     let mut aliases = Vec::new();
     if get_str(summary, "runtimeKind") == Some("subagent") && summary.get("rlmChildId").is_some() {
-        // The roster entry's agentId is the parent-qualified child id (TS
-        // computes it client-side from the summary fields; pa-types owns the
-        // one formula).
+        // The roster entry's agentId is the parent-qualified child id (TS computes it client-side;
+        // pa-types owns the one formula).
         let agent_id = pa_types::daemon::agent_roster::roster_agent_id_for_summary(summary);
         aliases.push(format!("agent:{agent_id}"));
     }
@@ -120,30 +135,23 @@ fn saved_aliases(saved: &Value) -> Vec<String> {
     aliases
 }
 
-/// The SESSION column's width cap (TS `buildCompactAgentsViewLayout`'s
-/// `Math.min(28, ...)`, which `build_layout` mirrors): the widest the
-/// name column ever renders.
+/// The SESSION column's width cap (TS `Math.min(28, ...)`, which `build_layout` mirrors): the
+/// widest the name column ever renders.
 const SESSION_NAME_COLUMN_MAX_CELLS: usize = 28;
 
-/// The widest title the SESSION column renders: the column cap minus the
-/// two cells every agent row spends on its icon and gap (nested rows
-/// render strictly less).
+/// The widest title the SESSION column renders: the column cap minus the two cells every agent
+/// row spends on its icon and gap.
 const SESSION_TITLE_MAX_CELLS: usize = SESSION_NAME_COLUMN_MAX_CELLS - 2;
 
-/// The picker's name target: the SESSION column's own title — the same
-/// `session_title` ladder over the same merged summary the row renders —
-/// clipped by the column's own truncation rule at the column's own cap.
-/// The corpus never carries text the column cannot display: a
-/// prompt-derived title is searchable exactly as far as the column shows
-/// it, and the TS transcript corpus (`allMessagesText`) stays excluded.
+/// The picker's name target: the SESSION column's own title, clipped at the column's own cap;
+/// transcript text stays excluded.
 fn session_search_name(summary: &Value) -> String {
     truncate_text(&session_title(summary), SESSION_TITLE_MAX_CELLS)
 }
 
-/// The picker targets of one unified record: the SESSION column's own
-/// title as the name target, plus the durable session id and the cwd.
-/// Daemon data wins for the id and cwd; a saved row fills the gaps.
-fn record_search_text(record: &UnifiedRecord) -> SessionSearchText {
+/// The picker targets of one unified record: the SESSION column's own title as the name target,
+/// plus the durable session id and the cwd. Daemon data wins; a saved row fills the gaps.
+pub(crate) fn record_search_text(record: &UnifiedRecord) -> SessionSearchText {
     let summary = summary_for_record(record);
     let pick = |daemon: Option<&str>, saved: Option<&str>| {
         daemon
@@ -171,20 +179,25 @@ fn record_search_text(record: &UnifiedRecord) -> SessionSearchText {
     }
 }
 
-/// Merge the live roster entries and the saved catalog rows into unified
-/// records without inventing runtime ancestry: roster data wins, saved rows
-/// only join through a shared alias and enrich search text.
-pub fn reconcile_unified_sessions(roster: &[Value], saved: &[Value]) -> Vec<UnifiedRecord> {
+/// Merge the live roster entries and the saved catalog rows into unified records without
+/// inventing runtime ancestry: roster data wins, saved rows only join through a shared alias.
+/// `scope_root_session` names a scoped view's root: the view resolves its subtree through the
+/// root's record but never lists the root, so that record stays whatever its lifecycle.
+pub fn reconcile_unified_sessions(
+    roster: &[Value],
+    saved: &[Value],
+    scope_root_session: Option<&str>,
+) -> Vec<UnifiedRecord> {
     let mut records: Vec<UnifiedRecord> = Vec::new();
     let mut by_alias: HashMap<String, usize> = HashMap::new();
 
     for entry in roster {
         let summary = entry.get("summary").cloned().unwrap_or(Value::Null);
-        // TS `shouldShowAgentsViewSession`: only live rows render. A
-        // message-less top-level draft (lifecycle "draft") never surfaces a
-        // conversation-less roster row; subagent workers are live before
-        // their first message and the ledger seeds carry live.
-        if get_str(&summary, "lifecycle") != Some("live") {
+        // Only live rows render (TS `shouldShowAgentsViewSession`): a message-less draft never
+        // surfaces a roster row; subagent workers are live before their first message.
+        let scope_root =
+            scope_root_session.is_some_and(|root| get_str(&summary, "sessionId") == Some(root));
+        if get_str(&summary, "lifecycle") != Some("live") && !scope_root {
             continue;
         }
         let status = entry
@@ -200,18 +213,15 @@ pub fn reconcile_unified_sessions(roster: &[Value], saved: &[Value]) -> Vec<Unif
         for alias in &aliases {
             by_alias.insert(alias.clone(), index);
         }
-        let mut record = UnifiedRecord {
+        let record = UnifiedRecord {
             daemon: Some(summary),
             saved: None,
             status,
             identity,
             aliases,
             section,
-            search: SessionSearchText::default(),
             search_score: None,
         };
-        let search = record_search_text(&record);
-        record.search = search;
         records.push(record);
     }
 
@@ -234,26 +244,21 @@ pub fn reconcile_unified_sessions(roster: &[Value], saved: &[Value]) -> Vec<Unif
                 }
                 by_alias.insert(alias.clone(), index);
             }
-            let search = record_search_text(record);
-            record.search = search;
             continue;
         }
         let index = records.len();
         for alias in &aliases {
             by_alias.insert(alias.clone(), index);
         }
-        let mut record = UnifiedRecord {
+        let record = UnifiedRecord {
             daemon: None,
             saved: Some(row.clone()),
             status: None,
             identity,
             aliases,
             section: Section::Inactive,
-            search: SessionSearchText::default(),
             search_score: None,
         };
-        let search = record_search_text(&record);
-        record.search = search;
         records.push(record);
     }
     records
@@ -268,16 +273,14 @@ fn parse_status(status: &str) -> Option<AgentRosterStatus> {
     }
 }
 
-/// The merged summary a row renders and acts on (TS `summaryForUnifiedRecord`):
-/// the live summary when one exists, with saved fields filling the gaps;
-/// saved-only records synthesize the archived shape.
+/// The merged summary a row renders and acts on (TS `summaryForUnifiedRecord`): the live summary
+/// when one exists, saved fields fill the gaps; saved-only records synthesize the archived shape.
 pub fn summary_for_record(record: &UnifiedRecord) -> Value {
     let saved = record.saved.as_ref();
     if let Some(daemon) = &record.daemon {
         let mut merged = daemon.clone();
         if let Some(saved) = saved {
-            // Saved fields only fill gaps in the live summary (TS
-            // `summaryForUnifiedRecord`); live data stays authoritative.
+            // Saved fields only fill gaps; live data stays authoritative.
             let enrich = |merged: &mut Value, field: &str, saved: &Value| {
                 if merged.get(field).is_none_or(Value::is_null) {
                     if let Some(value) = saved.get(field).filter(|v| !v.is_null()) {
@@ -306,10 +309,8 @@ pub fn summary_for_record(record: &UnifiedRecord) -> Value {
                     merged["model"] = json_model(model);
                 }
             }
-            // The saved catalog row carries the persisted thinking level
-            // (the daemon's `thinkingLevel`): it fills the same gap the
-            // model does, so a row the live summary lost its level for
-            // keeps rendering "model:level".
+            // The saved catalog row carries the persisted thinking level: it fills the same gap
+            // the model does, so a row that lost its level keeps rendering "model:level".
             enrich(&mut merged, "thinkingLevel", saved);
         }
         merged
@@ -362,13 +363,23 @@ fn json_model(model: &Value) -> Value {
     serde_json::json!({ "id": model_id, "provider": provider })
 }
 
-/// Hide abandoned empty catalog rows (TS `filterEmptyAgentsViewSessions`):
-/// an inactive row with no messages, name, usage, or transcript stays out
-/// unless the session is the view's anchor.
+/// A session with no messages and no name. A name makes an empty session intentional: it lists
+/// and ranks like any other session, while an unnamed one hides once inactive and sinks in its
+/// section.
+pub(crate) fn is_unnamed_empty(summary: &Value) -> bool {
+    summary
+        .get("messageCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        == 0
+        && get_str(summary, "sessionName").is_none()
+}
+
+/// Hide abandoned empty catalog rows (TS `filterEmptyAgentsViewSessions`): an inactive row with
+/// no messages, name, usage, or transcript stays out unless it is the view's anchor.
 pub fn filter_empty_sessions(records: &[UnifiedRecord], preserved: &[&str]) -> Vec<UnifiedRecord> {
-    // Ancestors of every kept row stay visible (TS filterEmpty… retains the
-    // parent chain): nesting must never orphan a child whose parent record
-    // looks empty.
+    // Ancestors of every kept row stay visible: nesting must never orphan a child whose parent
+    // record looks empty.
     let by_alias: HashMap<&str, usize> = records
         .iter()
         .enumerate()
@@ -403,12 +414,7 @@ pub fn filter_empty_sessions(records: &[UnifiedRecord], preserved: &[&str]) -> V
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
                 > 0
-            || summary
-                .get("messageCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                > 0
-            || get_str(&summary, "sessionName").is_some()
+            || !is_unnamed_empty(&summary)
             || get_str(&summary, "firstMessage")
                 .is_some_and(|text| !text.trim().is_empty() && text.trim() != "(no messages)")
             || summary
@@ -417,7 +423,7 @@ pub fn filter_empty_sessions(records: &[UnifiedRecord], preserved: &[&str]) -> V
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0)
                 > 0.0
-            || crate::agents_view_forest::is_subagent_summary(&summary)
+            || crate::subagents::is_subagent_summary(&summary)
             || get_str(&summary, "sessionId").is_some_and(|id| preserved.contains(&id));
         if keep_row {
             keep(index, &mut retained);
@@ -433,7 +439,7 @@ pub fn filter_empty_sessions(records: &[UnifiedRecord], preserved: &[&str]) -> V
 
 pub use crate::agents_view_search::{parse_search_query, ParsedSearchQuery, SessionSearchText};
 
-/// The keys by which a record's parent is referenced (TS `getParentKeys`).
+/// The keys by which a record's parent is referenced.
 fn parent_keys(record: &UnifiedRecord) -> Vec<String> {
     let mut keys = Vec::new();
     if let Some(daemon) = &record.daemon {
@@ -460,11 +466,8 @@ fn parent_keys(record: &UnifiedRecord) -> Vec<String> {
     }
     keys
 }
-/// TS `filterUnifiedSessions`: keep the matching records plus every
-/// ancestor, so the hierarchy leading to a match stays reachable (a child
-/// hit keeps its parent rows in the set). Catalog order decides nesting;
-/// hits carry their relevance score (`search_score`, lower is better) for
-/// the view's ranked rendering, retained ancestors keep `None`.
+/// Keep the matching records plus every ancestor, so the hierarchy leading to a match stays
+/// reachable. Hits carry `search_score` (lower is better); retained ancestors keep `None`.
 #[must_use]
 pub fn filter_unified_sessions(
     records: &[UnifiedRecord],
@@ -485,7 +488,7 @@ pub fn filter_unified_sessions(
     for index in 0..records.len() {
         // Every directly matching record carries its score, even one
         // already retained as an ancestor of an earlier hit.
-        let Some(score) = score_search(&records[index].search, query) else {
+        let Some(score) = score_search(&record_search_text(&records[index]), query) else {
             continue;
         };
         scores[index] = Some(score);
@@ -576,7 +579,7 @@ pub fn relative_age(value: Option<&str>, now_ms: u64) -> String {
     format!("{}d", hours / 24)
 }
 
-/// The column layout of the list (TS `buildCompactAgentsViewLayout`).
+/// The column layout of the list.
 pub struct RowLayout {
     pub legend: String,
     pub name_width: usize,
@@ -623,15 +626,22 @@ fn pad_start(value: &str, width: usize) -> String {
 /// Compute the compact column layout for the rows at `width`.
 #[must_use]
 pub fn build_layout(rows: &[crate::agents_view_forest::AgentsViewRow], width: usize) -> RowLayout {
-    // TS `buildCompactAgentsViewLayout` (:3078) excludes the program's
-    // code rows: they contribute no columns and read no detail cell.
+    // The program's code rows contribute no columns and read no detail cell (TS
+    // `buildCompactAgentsViewLayout` excludes them).
     let rows: Vec<_> = rows
         .iter()
         .filter(|row| row.kind != crate::agents_view_forest::RowKind::Code)
         .collect();
+    let cost = |row: &crate::agents_view_forest::AgentsViewRow| {
+        if row.kind == crate::agents_view_forest::RowKind::PersistentShell {
+            "-".to_string()
+        } else {
+            format!("${:.2}", row.cost)
+        }
+    };
     let cost_width = rows
         .iter()
-        .map(|row| str_width(&format!("${:.2}", row.cost)))
+        .map(|row| str_width(&cost(row)))
         .max()
         .unwrap_or(0)
         .max(4);
@@ -665,12 +675,7 @@ pub fn build_layout(rows: &[crate::agents_view_forest::AgentsViewRow], width: us
     headings.push(detail_line("Cost", "Age"));
     let details = rows
         .iter()
-        .map(|row| {
-            (
-                row.identity.clone(),
-                detail_line(&format!("${:.2}", row.cost), &row.age),
-            )
-        })
+        .map(|row| (row.identity.clone(), detail_line(&cost(row), &row.age)))
         .collect();
     RowLayout {
         legend: table_cell(&headings.join("  "), width),
@@ -703,20 +708,17 @@ mod tests {
             "name": "Bug fix",
             "messageCount": 4,
         })];
-        let records = reconcile_unified_sessions(&roster, &saved);
+        let records = reconcile_unified_sessions(&roster, &saved, None);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].section, Section::Idle);
         assert_eq!(records[0].identity, "file:/x/s1.jsonl");
-        assert_eq!(records[0].search.name, "Bug fix");
-        assert_eq!(records[0].search.id, "s1");
+        assert_eq!(record_search_text(&records[0]).name, "Bug fix");
+        assert_eq!(record_search_text(&records[0]).id, "s1");
         let summary = summary_for_record(&records[0]);
         assert_eq!(summary["firstMessage"], "fix the bug");
         assert_eq!(summary["sessionName"], "Bug fix");
     }
 
-    /// TS `shouldShowAgentsViewSession`: only live roster rows render — a
-    /// message-less top-level draft (lifecycle "draft") never surfaces a
-    /// roster row, and a message-less subagent worker is live and visible.
     #[test]
     fn reconcile_hides_draft_roster_rows() {
         let roster = vec![
@@ -743,7 +745,7 @@ mod tests {
                 }),
             ),
         ];
-        let records = reconcile_unified_sessions(&roster, &[]);
+        let records = reconcile_unified_sessions(&roster, &[], None);
         assert_eq!(records.len(), 1);
         assert_eq!(
             get_str(records[0].daemon.as_ref().unwrap(), "sessionId"),
@@ -751,10 +753,8 @@ mod tests {
         );
     }
 
-    /// The persisted thinking level reaches the rendered summary both ways:
-    /// the saved catalog row fills a live summary that lost its level, and a
-    /// saved-only record carries it directly (TS renders "model:level" for
-    /// every session kind; `session_model` shows it whenever present).
+    /// The persisted thinking level reaches the rendered summary both ways: the saved catalog
+    /// row fills a live summary that lost its level, and a saved-only record carries it directly.
     #[test]
     fn summary_merges_the_saved_thinking_level() {
         // The live roster row lost its level (a passivated or restarted
@@ -775,10 +775,9 @@ mod tests {
             "thinkingLevel": "high",
             "messageCount": 2,
         })];
-        let records = reconcile_unified_sessions(&roster, &saved);
+        let records = reconcile_unified_sessions(&roster, &saved, None);
         let summary = summary_for_record(&records[0]);
         assert_eq!(summary["thinkingLevel"], json!("high"));
-        // The live summary's own level wins over the saved one.
         let roster_with_level = vec![roster_entry(
             "s1",
             "idle",
@@ -789,11 +788,10 @@ mod tests {
                 "thinkingLevel": "medium",
             }),
         )];
-        let records = reconcile_unified_sessions(&roster_with_level, &saved);
+        let records = reconcile_unified_sessions(&roster_with_level, &saved, None);
         let summary = summary_for_record(&records[0]);
         assert_eq!(summary["thinkingLevel"], json!("medium"));
 
-        // A saved-only record synthesizes its summary with the level.
         let saved_only = vec![json!({
             "id": "s2",
             "path": "/x/s2.jsonl",
@@ -801,17 +799,15 @@ mod tests {
             "thinkingLevel": "high",
             "messageCount": 3,
         })];
-        let records = reconcile_unified_sessions(&[], &saved_only);
+        let records = reconcile_unified_sessions(&[], &saved_only, None);
         let summary = summary_for_record(&records[0]);
         assert_eq!(summary["thinkingLevel"], json!("high"));
-        // And the rendered Model column shows "model:level".
         assert_eq!(
             crate::agents_view_forest::session_model(&summary),
             "mock-1:high"
         );
-        // A saved row without a level stays bare.
         let bare = vec![json!({ "id": "s3", "path": "/x/s3.jsonl", "messageCount": 3 })];
-        let records = reconcile_unified_sessions(&[], &bare);
+        let records = reconcile_unified_sessions(&[], &bare, None);
         assert!(summary_for_record(&records[0])
             .get("thinkingLevel")
             .is_none());
@@ -825,13 +821,12 @@ mod tests {
             "firstMessage": "hello world",
             "messageCount": 3,
         })];
-        let records = reconcile_unified_sessions(&[], &saved);
+        let records = reconcile_unified_sessions(&[], &saved, None);
         assert_eq!(records[0].section, Section::Inactive);
         let filtered = filter_empty_sessions(&records, &[]);
         assert_eq!(filtered.len(), 1);
-        // An empty unnamed saved row hides unless it is preserved.
         let empty = vec![json!({ "id": "s3", "path": "/x/s3.jsonl", "messageCount": 0 })];
-        let records = reconcile_unified_sessions(&[], &empty);
+        let records = reconcile_unified_sessions(&[], &empty, None);
         assert!(filter_empty_sessions(&records, &[]).is_empty());
         assert_eq!(filter_empty_sessions(&records, &["s3"]).len(), 1);
     }
@@ -856,12 +851,13 @@ mod tests {
             "firstMessage": "old chat",
             "messageCount": 2,
         })];
-        let records = reconcile_unified_sessions(&roster, &saved);
+        let records = reconcile_unified_sessions(&roster, &saved, None);
         let rows = crate::agents_view_forest::build_rows::<std::collections::hash_map::RandomState>(
             &records,
             None,
             &std::collections::HashSet::default(),
             &std::collections::HashSet::default(),
+            &std::collections::HashMap::default(),
             &std::collections::HashMap::default(),
             None,
         );
@@ -873,9 +869,8 @@ mod tests {
 
     #[test]
     fn search_matches_the_restricted_corpus_case_insensitively() {
-        // The picker corpus is the session NAME, the durable ID, and the
-        // CWD; the TS corpus fields — first message, transcript text,
-        // file paths — never match.
+        // The picker corpus is the session NAME, the durable ID, and the CWD; the TS corpus
+        // fields — first message, transcript text, file paths — never match.
         let saved = vec![json!({
             "id": "sess-alpha",
             "path": "/x/alpha.jsonl",
@@ -885,20 +880,20 @@ mod tests {
             "cwd": "/home/u/API-server",
             "parentSessionPath": "/x/parent.jsonl",
         })];
-        let records = reconcile_unified_sessions(&[], &saved);
-        let targets = &records[0].search;
+        let records = reconcile_unified_sessions(&[], &saved, None);
+        let targets = record_search_text(&records[0]);
         for query in ["alpha", "roster", "ROSTER", "api-server", "sess-al"] {
             let parsed = parse_search_query(query);
             assert!(
-                score_search(targets, &parsed).is_some(),
+                score_search(&targets, &parsed).is_some(),
                 "query {query:?} should match the restricted corpus"
             );
         }
         // Partial words need the fuzzy path on the name (ordered
         // subsequence).
-        assert!(score_search(targets, &parse_search_query("rtwr")).is_some());
-        // Content fields are gone from the picker: first messages, the
-        // capped transcript, and file paths never match.
+        assert!(score_search(&targets, &parse_search_query("rtwr")).is_some());
+        // Content fields are gone from the picker: first messages, the capped transcript, and
+        // file paths never match.
         for query in [
             "deploy the gateway",
             "GATEWAY PROBE",
@@ -910,7 +905,7 @@ mod tests {
         ] {
             let parsed = parse_search_query(query);
             assert!(
-                score_search(targets, &parsed).is_none(),
+                score_search(&targets, &parsed).is_none(),
                 "query {query:?} must not match content or path fields"
             );
         }
@@ -918,7 +913,6 @@ mod tests {
 
     #[test]
     fn merged_records_take_the_live_name() {
-        // A merged record: live daemon summary plus saved enrichment.
         let roster = vec![roster_entry(
             "s1",
             "idle",
@@ -937,22 +931,20 @@ mod tests {
             "name": "stale catalog name",
             "allMessagesText": "we bumped the backoff ceiling to 30s",
         })];
-        let records = reconcile_unified_sessions(&roster, &saved);
+        let records = reconcile_unified_sessions(&roster, &saved, None);
         assert_eq!(records.len(), 1);
         // Daemon data wins for the merged targets; the saved transcript
         // stays out of the corpus.
-        assert_eq!(records[0].search.name, "tuned retry policy");
-        assert_eq!(records[0].search.id, "s1");
-        assert_eq!(records[0].search.cwd, "/work/retry");
-        assert!(score_search(&records[0].search, &parse_search_query("retry")).is_some());
-        assert!(score_search(&records[0].search, &parse_search_query("backoff")).is_none());
+        let targets = record_search_text(&records[0]);
+        assert_eq!(targets.name, "tuned retry policy");
+        assert_eq!(targets.id, "s1");
+        assert_eq!(targets.cwd, "/work/retry");
+        assert!(score_search(&targets, &parse_search_query("retry")).is_some());
+        assert!(score_search(&targets, &parse_search_query("backoff")).is_none());
     }
 
     #[test]
     fn search_retains_the_ancestors_of_a_match() {
-        // A saved child session whose parentSessionPath names the parent
-        // row: a query matching only the child keeps the parent visible
-        // (TS `filterUnifiedSessions` ancestor retention).
         let saved = vec![
             json!({
                 "id": "parent",
@@ -970,9 +962,7 @@ mod tests {
                 "messageCount": 1,
             }),
         ];
-        // "child" hits the child row's NAME (the corpus no longer
-        // carries first messages), and the parent stays as its ancestor.
-        let records = reconcile_unified_sessions(&[], &saved);
+        let records = reconcile_unified_sessions(&[], &saved, None);
         let filtered = filter_unified_sessions(&records, &parse_search_query("child"));
         let titles: Vec<&str> = filtered
             .iter()
@@ -981,8 +971,6 @@ mod tests {
             })
             .collect();
         assert_eq!(titles, vec!["root agent", "child agent"]);
-        // An unrelated query matches nothing, and the parent alone matches
-        // only its own query.
         assert!(filter_unified_sessions(&records, &parse_search_query("zebra")).is_empty());
         let parent_only = filter_unified_sessions(&records, &parse_search_query("root"));
         assert_eq!(parent_only.len(), 1);
@@ -1054,12 +1042,13 @@ mod tests {
                 "usage": { "cost": 1.5 },
             }),
         )];
-        let records = reconcile_unified_sessions(&roster, &[]);
+        let records = reconcile_unified_sessions(&roster, &[], None);
         let rows = crate::agents_view_forest::build_rows::<std::collections::hash_map::RandomState>(
             &records,
             None,
             &std::collections::HashSet::default(),
             &std::collections::HashSet::default(),
+            &std::collections::HashMap::default(),
             &std::collections::HashMap::default(),
             None,
         );
@@ -1072,12 +1061,9 @@ mod tests {
 
     #[test]
     fn saved_only_age_reads_modified_first_and_falls_back_to_created() {
-        // TS formatSessionDuration: a row without an activeSessionId is a
-        // saved-only record - the age column reads `modified` first. The
-        // daemon scan's `modified` is the durable fallback (header time,
-        // then mtime), so an old record keeps its real age here; pin the
-        // ordering so a days-old record can never read as minutes-old
-        // through a scan-time value.
+        // A row without an activeSessionId is a saved-only record — the age column reads
+        // `modified` first. The scan's `modified` is the durable fallback (header time, then
+        // mtime); pin the ordering so a days-old record never reads as minutes-old.
         let now = now_ms();
         let iso = |ms: i64| {
             let total = ms.div_euclid(1000);
@@ -1093,9 +1079,8 @@ mod tests {
         };
         let created_days_ago = iso(now as i64 - 3 * 86_400_000);
         let modified_minutes_ago = iso(now as i64 - 5 * 60_000);
-        // The catalog contract the daemon serves: every row carries the
-        // scan's durable `modified` (a real message timestamp, the header
-        // time, or the file mtime) alongside `created`.
+        // The catalog contract: every row carries the scan's durable `modified` (a real message
+        // timestamp, the header time, or the file mtime) alongside `created`.
         let saved = vec![json!({
             "id": "old-record",
             "path": "/x/old-record.jsonl",
@@ -1104,12 +1089,13 @@ mod tests {
             "created": created_days_ago,
             "modified": modified_minutes_ago,
         })];
-        let records = reconcile_unified_sessions(&[], &saved);
+        let records = reconcile_unified_sessions(&[], &saved, None);
         let rows = crate::agents_view_forest::build_rows::<std::collections::hash_map::RandomState>(
             &records,
             None,
             &std::collections::HashSet::default(),
             &std::collections::HashSet::default(),
+            &std::collections::HashMap::default(),
             &std::collections::HashMap::default(),
             None,
         );
@@ -1125,17 +1111,15 @@ mod tests {
                 },
                 |row| row.age.clone(),
             );
-        // `modified` first: the column reads the durable last-activity
-        // value, not `created` - and a scan-time fabrication would read
-        // "0s" here, not the record's own five-minute-old value.
+        // `modified` first: the column reads the durable last-activity value, not `created` —
+        // a scan-time fabrication would read "0s" here, not the record's own five-minute-old value.
         assert_eq!(age, "5m");
     }
 
     #[test]
     fn an_unnamed_sessions_prompt_derived_title_matches() {
-        // The SESSION column titles an unnamed session by its first
-        // prompt ("hey"), so searching "hey" must surface it — the
-        // corpus once carried only `sessionName` and missed it.
+        // The SESSION column titles an unnamed session by its first prompt ("hey"), so
+        // searching "hey" must surface it — the corpus once carried only `sessionName`.
         let roster = vec![roster_entry(
             "hey",
             "idle",
@@ -1145,8 +1129,8 @@ mod tests {
                 "firstMessage": "hey",
             }),
         )];
-        let records = reconcile_unified_sessions(&roster, &[]);
-        assert_eq!(records[0].search.name, "hey");
+        let records = reconcile_unified_sessions(&roster, &[], None);
+        assert_eq!(record_search_text(&records[0]).name, "hey");
         for query in ["hey", "HEY", "Hey"] {
             let filtered = filter_unified_sessions(&records, &parse_search_query(query));
             assert_eq!(
@@ -1163,10 +1147,8 @@ mod tests {
 
     #[test]
     fn long_first_prompts_enter_only_the_visible_title_head() {
-        // The column titles an unnamed session with the HEAD of its
-        // first prompt; only that head is searchable. Text past the
-        // column's clip never matches (the TS corpus joined the whole
-        // prompt and transcript, which flooded unrelated sessions).
+        // Only the visible HEAD of the first prompt is searchable: text past the column's clip
+        // never matches (the TS corpus joined the whole prompt and transcript).
         let prompt = format!(
             "fix the agents view search{}",
             " and then also check the queue lane backoff ceiling because CI is red".repeat(3)
@@ -1181,23 +1163,18 @@ mod tests {
                 "cwd": "/work/ops",
             }),
         )];
-        let records = reconcile_unified_sessions(&roster, &[]);
+        let records = reconcile_unified_sessions(&roster, &[], None);
         let title = session_title(&summary_for_record(&records[0]));
         let visible = truncate_text(&title, SESSION_TITLE_MAX_CELLS);
-        assert_eq!(records[0].search.name, visible);
-        // The visible head matches...
+        let targets = record_search_text(&records[0]);
+        assert_eq!(targets.name, visible);
         assert!(
-            score_search(
-                &records[0].search,
-                &parse_search_query("agents view search")
-            )
-            .is_some(),
+            score_search(&targets, &parse_search_query("agents view search")).is_some(),
             "the visible title head matches"
         );
-        // ...text the column cannot display never does.
         for query in ["backoff ceiling", "queue lane", "CI is red"] {
             assert!(
-                score_search(&records[0].search, &parse_search_query(query)).is_none(),
+                score_search(&targets, &parse_search_query(query)).is_none(),
                 "{query:?} lives past the column clip and must not match"
             );
         }
@@ -1205,8 +1182,6 @@ mod tests {
 
     #[test]
     fn the_corpus_name_is_the_sessions_column_title() {
-        // Every row shape: the name target equals the title the SESSION
-        // column renders, clipped to the column's cap.
         let roster = vec![
             roster_entry(
                 "named",
@@ -1240,17 +1215,20 @@ mod tests {
             "id": "archived-01", "path": "/x/archived-01.jsonl",
             "firstMessage": "orchestrate the fleet", "messageCount": 2,
         })];
-        let records = reconcile_unified_sessions(&roster, &saved);
-        // The explicit name, the prompt-derived title, the cwd-basename
-        // fallback, and the archived row's prompt-derived title.
-        assert_eq!(records[0].search.name, "gateway worker");
-        assert_eq!(records[1].search.name, "deploy the gateway now");
-        assert_eq!(records[2].search.name, "gateway");
-        assert_eq!(records[3].search.name, "orchestrate the fleet");
+        let records = reconcile_unified_sessions(&roster, &saved, None);
+        let names: Vec<String> = records
+            .iter()
+            .map(record_search_text)
+            .map(|targets| targets.name)
+            .collect();
+        assert_eq!(names[0], "gateway worker");
+        assert_eq!(names[1], "deploy the gateway now");
+        assert_eq!(names[2], "gateway");
+        assert_eq!(names[3], "orchestrate the fleet");
         for record in &records {
             let title = session_title(&summary_for_record(record));
             assert_eq!(
-                record.search.name,
+                record_search_text(record).name,
                 truncate_text(&title, SESSION_TITLE_MAX_CELLS),
                 "the corpus equals the SESSION column's title"
             );
@@ -1259,9 +1237,6 @@ mod tests {
 
     #[test]
     fn a_named_sessions_first_message_stays_out_of_the_corpus() {
-        // The explicit name wins the title ladder, so a named session's
-        // first prompt never enters the corpus — the over-match side of
-        // the report: queries matching only prompt text stay misses.
         let roster = vec![roster_entry(
             "named",
             "idle",
@@ -1273,15 +1248,16 @@ mod tests {
                 "cwd": "/work/gateway",
             }),
         )];
-        let records = reconcile_unified_sessions(&roster, &[]);
-        assert_eq!(records[0].search.name, "gateway worker");
+        let records = reconcile_unified_sessions(&roster, &[], None);
+        let targets = record_search_text(&records[0]);
+        assert_eq!(targets.name, "gateway worker");
         assert!(
-            score_search(&records[0].search, &parse_search_query("gateway")).is_some(),
+            score_search(&targets, &parse_search_query("gateway")).is_some(),
             "the name still matches"
         );
         for query in ["deploy", "backoff", "flaky"] {
             assert!(
-                score_search(&records[0].search, &parse_search_query(query)).is_none(),
+                score_search(&targets, &parse_search_query(query)).is_none(),
                 "{query:?} lives in the first prompt, not the displayed title"
             );
         }

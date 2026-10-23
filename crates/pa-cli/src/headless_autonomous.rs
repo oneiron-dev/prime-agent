@@ -1,23 +1,17 @@
 //! The autonomous run state for headless print/json runs — the verifier and
-//! eval composition surface. CLI autonomous flags build the run state (TS
-//! `runtimeAutonomousConfigFromArgs`); after every settled model turn the
-//! [`ShellAutonomousDriver`] runs the configured gate commands in the
-//! session cwd (the #98 seams, reused unmodified). The continuation itself
-//! rides the agent's natural-turn-end hook
-//! ([`crate::print_autonomous`], the TS in-run shape): continuations land
-//! as durable user rows churned inside the one prompt wait, and a stop
-//! surfaces only through the process exit code and its stderr line (the TS
-//! print-mode contract, `print-mode.ts` + the selection half of
-//! `headless-completion.ts`, which live in pa-core).
+//! eval composition surface. After every settled turn the [`ShellAutonomousDriver`]
+//! runs the gate commands in the session cwd (the #98 seams, unmodified); the
+//! continuation rides the natural-turn-end hook ([`crate::print_autonomous`]),
+//! a stop surfaces only through the exit code and its stderr line.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use pa_core::autonomous::{
-    autonomous_limit_reason_of_status, autonomous_status, create_autonomous_runtime_state,
-    describe_autonomous_limit, latest_autonomous_gate_attempt, now_millis, AgentAutonomousConfig,
-    AgentAutonomousStatus, AutonomousDriver, AutonomousFollowUp, AutonomousRuntimeState,
-    ShellAutonomousDriver,
+    autonomous_limit_reason, autonomous_limit_reason_of_status, autonomous_status,
+    create_autonomous_runtime_state, describe_autonomous_limit, latest_autonomous_gate_attempt,
+    now_millis, AgentAutonomousConfig, AgentAutonomousStatus, AutonomousDriver, AutonomousFollowUp,
+    AutonomousRuntimeState, ShellAutonomousDriver,
 };
 use pa_core::session_engine::engine::SessionEngine;
 use pa_core::session_engine::provider_adapter::json_round_trip;
@@ -26,8 +20,8 @@ use pa_types::session::CustomMessage;
 
 use crate::args::AutonomousConfig;
 
-/// The autonomous runtime config from the typed CLI flags (TS
-/// `runtimeAutonomousConfigFromArgs`: any autonomous flag enables the run).
+/// The autonomous runtime config from the typed CLI flags: any
+/// autonomous flag enables the run.
 pub fn autonomous_runtime_config(config: &AutonomousConfig) -> AgentAutonomousConfig {
     AgentAutonomousConfig {
         enabled: Some(true),
@@ -48,17 +42,17 @@ pub fn autonomous_runtime_config(config: &AutonomousConfig) -> AgentAutonomousCo
     }
 }
 
-/// One headless autonomous run: the runtime state plus the shell-gate
-/// driver, shared with the per-message accounting subscription, the in-run
-/// continuation hook, and the session-command executor (`/autonomous`
-/// rewrites the same state live).
+/// One headless autonomous run: the runtime state plus the shell-gate driver.
 pub struct HeadlessAutonomous {
     state: Arc<tokio::sync::Mutex<AutonomousRuntimeState>>,
     driver: ShellAutonomousDriver,
-    /// The continuation the threshold arm minted ahead of its compaction
-    /// (TS `_queueAutonomousContinuationForThresholdCompaction`): held for
-    /// the settled boundary's queued `followUp` admission.
+    /// The continuation the threshold arm minted ahead of its compaction,
+    /// held for the settled boundary's queued `followUp` admission.
     held: tokio::sync::Mutex<Option<String>>,
+    /// A continuation is held behind unsettled inline-subagent work (TS
+    /// `_holdAutonomousContinuationForRlmWork`): the flag only — the
+    /// decision and its count happen at the post-settle delivery.
+    awaits_rlm_work: std::sync::atomic::AtomicBool,
 }
 
 impl HeadlessAutonomous {
@@ -69,9 +63,8 @@ impl HeadlessAutonomous {
         Self::from_state(state, cwd)
     }
 
-    /// The session's default run (TS `createAgentSession` always carries an
-    /// autonomous state; a print run without CLI flags starts disabled, and
-    /// `/autonomous on` rewrites it live).
+    /// The session's default run: a print run without CLI flags starts
+    /// disabled, and `/autonomous on` rewrites it live.
     pub fn disabled(cwd: impl Into<PathBuf>) -> Self {
         let state = create_autonomous_runtime_state(None, None);
         Self::from_state(state, cwd)
@@ -82,6 +75,7 @@ impl HeadlessAutonomous {
             state: Arc::new(tokio::sync::Mutex::new(state)),
             driver: ShellAutonomousDriver::new(cwd),
             held: tokio::sync::Mutex::new(None),
+            awaits_rlm_work: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -91,9 +85,8 @@ impl HeadlessAutonomous {
         Arc::clone(&self.state)
     }
 
-    /// Per-message usage accounting: every settled assistant message is
-    /// forwarded to the driver as it arrives (the daemon worker runs the
-    /// same policy through its own subscription).
+    /// Per-message usage accounting: every settled assistant message forwards to
+    /// the driver as it arrives (the daemon worker runs the same policy).
     pub async fn wire_accounting(
         &self,
         agent: &Arc<pa_agent::agent::Agent>,
@@ -125,12 +118,8 @@ impl HeadlessAutonomous {
             .await
     }
 
-    /// The in-run continuation decision for one settled turn (TS
-    /// `nextAutonomousContinuation` inside `_getContinuationMessages`):
-    /// the driver decides, a `Continue` returns the continuation text, a
-    /// stop (or an inactive mode) ends the loop. The budget bump rides
-    /// the driver's decision (the caller owns the admission: the in-run
-    /// hook runs the text as the next turn, the threshold arm holds it).
+    /// The in-run continuation decision for one settled turn: the driver decides,
+    /// `Continue` returns the text, a stop (or inactive mode) ends the loop.
     pub(crate) async fn follow_up_text(
         &self,
         message: &pa_agent::types::AssistantMessage,
@@ -146,22 +135,65 @@ impl HeadlessAutonomous {
         }
     }
 
-    /// Hold the continuation the threshold arm minted ahead of its
-    /// compaction (TS `_queueAutonomousContinuationForThresholdCompaction`
-    /// queues it as a `followUp` admission): the print boundary compacts
-    /// at the settled turn, then [`HeadlessAutonomous::drive_boundary`]
-    /// admits the held turn through the boundary pair.
+    /// Hold the continuation the threshold arm minted ahead of its compaction; the
+    /// boundary compacts at the settled turn, then `drive_boundary` admits it.
     pub(crate) async fn hold_threshold_continuation(&self, text: String) {
         *self.held.lock().await = Some(text);
     }
 
-    /// The settled boundary's autonomous drain (the print driver's queue
-    /// loop, the TS queued `followUp` admission): each held continuation
-    /// runs as this invocation's follow-up turn through the boundary pair
-    /// (the pre-turn compaction arm runs before it, the settled-turn arms
-    /// after it), and its own natural end churns the in-run hook again —
-    /// a re-crossing threshold holds the next continuation for the next
-    /// drain.
+    /// Hold the continuation while inline-subagent work settles (TS
+    /// `_holdAutonomousContinuationForRlmWork`): nothing is spent on the
+    /// pre-settle turn — a disabled mode or a spent run holds nothing, so
+    /// the normal mint applies their stop. Returns whether the hold owns
+    /// the boundary (the hook mints no row).
+    pub(crate) async fn hold_rlm_continuation(&self) -> bool {
+        let state = self.state.lock().await;
+        if !state.enabled || autonomous_limit_reason(&state, now_millis()).is_some() {
+            return false;
+        }
+        self.awaits_rlm_work
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    /// The RLM settle site (the daemon's `autonomous_children_settled`):
+    /// deliver the held continuation once the descendants settled —
+    /// decided fresh from the latest settled turn and counted at the
+    /// delivery, dropped behind a goal that owns the wake-up. Returns
+    /// whether a held flag was consumed.
+    pub(crate) async fn deliver_rlm_continuation(
+        &self,
+        engine: &SessionEngine,
+        boundary: &mut crate::print_boundary::TurnBoundary,
+        model: &Model,
+        api_key: Option<String>,
+        global_harness_dir: PathBuf,
+    ) -> Result<bool, String> {
+        if !self
+            .awaits_rlm_work
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(false);
+        }
+        // An active goal's own continuation loop owns the wake-up: the
+        // held turn is dropped behind it.
+        if engine.goal_owns_continuation_wakeup().await {
+            return Ok(true);
+        }
+        let Some(message) = engine.latest_settled_assistant().await else {
+            return Ok(true);
+        };
+        if let Some(text) = self.follow_up_text(&message).await {
+            boundary
+                .admit_continuation(engine, model, api_key, &text, global_harness_dir)
+                .await?;
+        }
+        Ok(true)
+    }
+
+    /// The settled boundary's autonomous drain: each held continuation runs as
+    /// this invocation's follow-up turn; a re-crossing threshold holds the
+    /// next. Returns whether any turn ran.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn drive_boundary(
         &self,
@@ -170,7 +202,8 @@ impl HeadlessAutonomous {
         model: &Model,
         api_key: Option<String>,
         global_harness_dir: PathBuf,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
+        let mut ran = false;
         while let Some(text) = self.held.lock().await.take() {
             boundary
                 .admit_continuation(
@@ -181,12 +214,15 @@ impl HeadlessAutonomous {
                     global_harness_dir.clone(),
                 )
                 .await?;
+            ran = true;
         }
-        Ok(())
+        Ok(ran)
     }
 
-    /// The TS print-mode exit contract over this run's state (see
-    /// [`autonomous_exit_stderr`]).
+    /// The print-mode exit contract: stderr text when the run must exit
+    /// non-zero — a configured gate still failing (after its retry window or
+    /// an autonomous limit), or an ungated run stopping before terminal
+    /// evidence.
     pub async fn exit_stderr(&self) -> Option<String> {
         let status = autonomous_status(&*self.state.lock().await);
         autonomous_exit_stderr(&status, now_millis())
@@ -232,7 +268,6 @@ pub(crate) fn autonomous_exit_stderr(status: &AgentAutonomousStatus, now: u64) -
     None
 }
 
-/// The latest settled assistant message of the loop state, if any.
 async fn latest_assistant(engine: &SessionEngine) -> Option<pa_types::ai::AssistantMessage> {
     let state = engine.session.agent().state().await;
     state
@@ -247,9 +282,8 @@ async fn latest_assistant(engine: &SessionEngine) -> Option<pa_types::ai::Assist
         })
 }
 
-/// The latest settled assistant message's error text, when the loop's
-/// terminal state is a failed model request (the goal's terminal-error
-/// surface: a failed turn fails an active goal, an abort keeps it).
+/// The latest settled assistant message's error text, when the loop's terminal
+/// state is a failed model request.
 pub(crate) async fn latest_assistant_error(engine: &SessionEngine) -> Option<Option<String>> {
     latest_assistant(engine).await.and_then(|message| {
         (message.stop_reason == pa_types::ai::StopReason::Error)
