@@ -217,8 +217,13 @@ impl AgentSessionEngine {
         let Some(route) = slot.as_ref() else {
             return false;
         };
-        let target = route.target.clone();
-        *self.provider_target.write().expect("provider target lock") = Some(target);
+        // The route serves on the session's current transport, read under
+        // the provider slot's lock like the other installs: a transport
+        // switch that landed before it reached the armed route is kept.
+        let mut target = self.provider_target.write().expect("provider target lock");
+        let mut routed = route.target.clone();
+        routed.transport = *self.transport.read().expect("transport lock");
+        *target = Some(routed);
         true
     }
 
