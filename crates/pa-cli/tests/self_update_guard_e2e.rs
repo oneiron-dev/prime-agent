@@ -334,34 +334,21 @@ impl Wire {
 #[tokio::test]
 async fn the_daemon_refuses_prepare_update_restart() {
     let sandbox = Sandbox::new();
-    // The product launch path spawns its executable with this process's
-    // environment; a wrapper hands the daemon the sandbox one, guard set.
-    let launcher = sandbox.path().join("prime-agent-sandboxed");
-    let quoted = |path: &Path| format!("'{}'", path.display());
-    std::fs::write(
-        &launcher,
-        format!(
-            "#!/bin/sh\nexec env -i PATH=\"$PATH\" HOME={home} TMPDIR={tmp} \
-             PRIME_AGENT_CODING_AGENT_DIR={agent_dir} PRIME_AGENT_DISABLE_SELF_UPDATE=1 \
-             PI_OFFLINE=1 DO_NOT_TRACK=1 {binary} \"$@\"\n",
-            home = quoted(&sandbox.home()),
-            tmp = quoted(&sandbox.tmp()),
-            agent_dir = quoted(&sandbox.agent_dir()),
-            binary = quoted(Path::new(env!("CARGO_BIN_EXE_prime-agent"))),
-        ),
-    )
-    .expect("write launcher");
-    std::fs::set_permissions(
-        &launcher,
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )
-    .expect("chmod launcher");
+    let launcher =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/self_update_guard_launcher.sh");
+    let mut launch_data = std::fs::File::create(sandbox.path().join("prime-agent-binary"))
+        .expect("create launch data");
+    let binary = env!("CARGO_BIN_EXE_prime-agent");
+    writeln!(launch_data, "{binary}").expect("write launch data");
+    // Concurrent forks can retain generated launch data's writable descriptor.
+    // Keep it open through spawn: only the immutable fixture may be executed.
     let daemon = SandboxDaemon {
         socket: sandbox.path().join("d.sock"),
     };
     pa_cli::ensure_daemon_running_with(&launcher, &daemon.socket, sandbox.path())
         .await
         .expect("start the sandbox daemon");
+    drop(launch_data);
 
     let mut wire = Wire::connect(&daemon.socket).expect("connect the daemon");
     wire.send(

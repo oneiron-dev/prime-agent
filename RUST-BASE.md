@@ -45,7 +45,9 @@ The Oneiron fork of prime-agent on the Rust product. Upstream replaced the TypeS
   Mac portable/fork checks and unsupported Linux-only fixtures in the first Mac run. The
   lease liveness probe also demotes kernel-confirmed dead `X`/`Z` states and rechecks a
   disappearing proc entry, while unverifiable/live/stopped owners remain protected; the
-  stop verifier proves the lease's exact owner PID without relaxing its escalation bounds.
+  stop verifier proves the lease's exact owner PID without relaxing its escalation bounds. The
+  self-update guard verifier executes an immutable tracked launcher with separate writable
+  path data, preserving real daemon startup/RPC checks without a generated-script exec race.
 
 ## Carried upstream patches
 
