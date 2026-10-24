@@ -44,18 +44,22 @@ pick any of them with `--model` or `/model`. Absent or empty: no limit (upstream
   list's first entry. The process warns once on stderr; the status reports it.
 - A person's choice is always allowed: the session override (`--subagent-model`,
   `PRIME_SUBAGENT_MODEL`, `/subagent-model`) may name a model off the list, and an agent may
-  then name that model too.
+  then name that model too. A short form the person typed joins the list as its catalog
+  selector.
 - A person can widen the list for one session: `--subagent-models a,b`, the env var
   `PRIME_SUBAGENT_MODELS=a,b`, or `/subagent-models a,b` in the TUI. The session's entries
   follow the settings file's, so the first entry stays the settings file's first. With no
   settings list there is no limit to widen.
-- `rlm.find_models` lists only the models on the list.
+- `rlm.find_models` lists only the models on the list. A listed model the catalog does not
+  have fails with the allowed models named, never catalog close matches.
 - Entries match the resolved selector exactly (case-insensitive). Write the full
   `provider/model-id`: a short form is not an entry.
 - `subagentModels` is read from the global settings file only, like `allowedModels`. A project
   file, which an agent can write, cannot widen it.
-- The list's first entry must be in the catalog: a fallback to an unknown first entry fails the
-  spawn.
+- The list's first entry must be in the catalog under that exact selector: a fallback to an
+  unknown first entry fails the spawn instead of running another route.
+- A daemon that predates the list ignores it. `--daemon-hosted` refuses such a daemon when a
+  list is set, and the TUI warns when the session opens; stop the daemon so a current one starts.
 
 The list covers the whole agent tree: an RLM child carries its parent's session additions
 (create key `subagentModels`), and the daemon persists them in the `subagent_model_state` row.

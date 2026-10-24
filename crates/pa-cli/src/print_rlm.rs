@@ -684,7 +684,8 @@ impl RlmSubagentHost for InlineHost {
                 // model off the helper model list is refused as on the real lane.
                 if let (Some(reference), Some(list)) = (
                     request.model.as_deref(),
-                    pa_core::session_engine::helper_model::HelperModelList::active(
+                    pa_daemon::rlm_child_model::helper_model_list(
+                        &config.agent_dir,
                         &config.subagent_override,
                         &settings,
                     ),
@@ -1040,7 +1041,8 @@ impl RlmSubagentHost for InlineHost {
         &self,
     ) -> RlmHostFuture<Option<pa_core::session_engine::helper_model::HelperModelList>> {
         let config = &self.0.recipe.options.config;
-        let list = pa_core::session_engine::helper_model::HelperModelList::active(
+        let list = pa_daemon::rlm_child_model::helper_model_list(
+            &config.agent_dir,
             &config.subagent_override,
             &pa_core::session_engine::helper_model::HelperDefaults::load_settings(
                 &config.cwd,

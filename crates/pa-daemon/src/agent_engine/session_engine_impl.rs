@@ -1356,6 +1356,7 @@ impl SessionEngine for AgentSessionEngine {
 
     fn subagent_model_status(&self) -> Value {
         use pa_core::session_engine::helper_model::{HelperModelList, HelperSource};
+        let agent_dir = &self.config.agent_dir;
         let session = crate::engine::SessionEngine::subagent_override(self);
         let settings = pa_core::session_engine::helper_model::HelperDefaults::load_settings(
             &self.cwd(),
@@ -1366,7 +1367,7 @@ impl SessionEngine for AgentSessionEngine {
         let model_known = plan.model.value.as_deref().map(|reference| {
             crate::rlm_child_model::helper_model_known(&self.config.agent_dir, reference)
         });
-        let list = HelperModelList::active(&session, &settings);
+        let list = crate::rlm_child_model::helper_model_list(agent_dir, &session, &settings);
         // Whether the model the spawns default to is on the list (`null` without a list, or when
         // the parent's model is unknown); off it, they run on the list's first entry.
         let model_allowed = list.as_ref().and_then(|list| match plan.model.source {

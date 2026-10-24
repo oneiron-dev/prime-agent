@@ -155,6 +155,13 @@ async fn hosted_print_main(options: &RunOptions) -> Result<i32, String> {
             no_skills: config.no_skills,
         },
         subagent_override: config.subagent_override.clone(),
+        enforce_helper_model_list:
+            pa_core::session_engine::helper_model::HelperDefaults::load_settings(
+                &cwd,
+                &config.agent_dir,
+            )
+            .models
+            .is_some(),
     })
     .await
     .map_err(|error| format!("{error:#}"))?;

@@ -890,6 +890,23 @@ impl SessionUi {
     /// name a helper model or a helper model list checks them, so an unknown default or one off
     /// the list warns at open. Sessions without either skip the round trip.
     pub(crate) async fn apply_launch_subagent_model(&mut self, view: &mut AgentView) {
+        // A daemon without `subagent_models` ignores the settings list: say so before anything.
+        let list_configured = self
+            .client_settings
+            .as_ref()
+            .is_some_and(|settings| settings.subagent_models().is_some());
+        if list_configured
+            && !self
+                .client
+                .supports_server_capability(pa_types::daemon::SUBAGENT_MODELS_CAPABILITY)
+        {
+            self.note_as(
+                "The running daemon does not enforce subagentModels (no subagent_models capability): spawned agents may run on any model; stop it so a current one starts",
+                StatusKind::Warning,
+                view,
+            );
+            return;
+        }
         let model = self.model_selection.subagent_model.clone();
         let thinking = self.model_selection.subagent_thinking.clone();
         let mut commands = Vec::new();
@@ -910,9 +927,11 @@ impl SessionUi {
                 rest: Map::default(),
             });
         }
-        let configured = self.client_settings.as_ref().is_some_and(|settings| {
-            settings.subagent_default_model().is_some() || settings.subagent_models().is_some()
-        });
+        let configured = list_configured
+            || self
+                .client_settings
+                .as_ref()
+                .is_some_and(|settings| settings.subagent_default_model().is_some());
         if commands.is_empty() && configured {
             commands.push(DaemonCommand::GetSubagentModelStatus {
                 id: None,

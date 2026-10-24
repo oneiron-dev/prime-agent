@@ -8,7 +8,7 @@ use pa_ai::models::{get_supported_thinking_levels, thinking_level_from_str};
 use pa_core::kernel::rlm_runtime::{find_rlm_model_matches, RlmModelInfo};
 use pa_core::session_engine::helper_model::{
     first_helper_notice, plan_helper, unknown_helper_model_warning, HelperDefaults,
-    HelperModelList, HelperSource,
+    HelperModelList, HelperSource, INHERIT_PARENT,
 };
 
 /// Close matches listed in model-resolution errors.
@@ -120,6 +120,36 @@ pub fn resolve_child_model_unchecked(
     Err(model_unavailable_error(reference, target, &candidates))
 }
 
+/// The helper model list a session's spawns check (the roster, the spawn check and the status
+/// read the same one): [`HelperModelList::active`] with the person's own helper model resolved
+/// to its catalog selector first, so a short form the person typed matches the selector an agent
+/// names. A model the catalog does not know stays as typed.
+#[must_use]
+pub fn helper_model_list(
+    agent_dir: &Path,
+    session: &HelperDefaults,
+    settings: &HelperDefaults,
+) -> Option<HelperModelList> {
+    settings.models.as_ref()?;
+    let person = session
+        .model
+        .as_deref()
+        .filter(|model| *model != INHERIT_PARENT)
+        .and_then(|model| {
+            resolve_child_model_unchecked(agent_dir, Some(model), None, "subagent").ok()
+        });
+    match person {
+        Some(selector) => HelperModelList::active(
+            &HelperDefaults {
+                model: Some(selector),
+                ..session.clone()
+            },
+            settings,
+        ),
+        None => HelperModelList::active(session, settings),
+    }
+}
+
 /// What one spawn resolves its helper model and thinking from: the call's own values, the
 /// parent's model, and the two default layers (`pa_core::session_engine::helper_model`).
 #[derive(Debug, Clone, Copy)]
@@ -190,7 +220,7 @@ pub fn resolve_helper_unchecked(
         request.session,
         request.settings,
     );
-    let list = HelperModelList::active(request.session, request.settings);
+    let list = helper_model_list(agent_dir, request.session, request.settings);
     let parent = || resolve_child_model_unchecked(agent_dir, None, request.parent_model, target);
     let (selector, model_source) = match (plan.model.value.as_deref(), plan.model.source) {
         (Some(reference), HelperSource::Spawn) => {
@@ -200,15 +230,17 @@ pub fn resolve_helper_unchecked(
                 request.parent_model,
                 target,
             );
-            // Off the list, the refusal names the allowed models so the agent retries with one
-            // (an unresolved reference too: its close matches would list models off the list).
+            // Off the list, the refusal names the allowed models so the agent retries with one.
+            // An unresolved reference gets a list-scoped error too: the catalog's close matches
+            // would name models off the list.
             if let Some(list) = &list {
-                let allowed = match &resolved {
-                    Ok(selector) => list.allows(selector),
-                    Err(_) => list.allows(reference),
-                };
-                if !allowed {
-                    bail!(list.refusal(reference, target));
+                match &resolved {
+                    Ok(selector) if list.allows(selector) => {}
+                    Err(_) if list.allows(reference) => bail!(
+                        "Requested {target} model \"{reference}\" is unavailable, unauthenticated, or expired; use one of: {} (or omit model= for the default)",
+                        list.entries().join(", ")
+                    ),
+                    Ok(_) | Err(_) => bail!(list.refusal(reference, target)),
                 }
             }
             (resolved?, HelperSource::Spawn)
@@ -250,15 +282,19 @@ pub fn resolve_helper_unchecked(
             if first_helper_notice(&warning) {
                 eprintln!("{warning}");
             }
-            (
-                resolve_child_model_unchecked(
-                    agent_dir,
-                    Some(list.first()),
-                    request.parent_model,
-                    target,
-                )?,
-                HelperSource::List,
-            )
+            // The first entry must resolve to itself: a short-form or nested-provider match
+            // would run a route off the list.
+            let first = list.first();
+            let fallback =
+                resolve_child_model_unchecked(agent_dir, Some(first), request.parent_model, target)
+                    .ok()
+                    .filter(|fallback| list.allows(fallback))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Spawned agents fall back to the helper model list's first entry \"{first}\", which is not in the model catalog; fix subagentModels or name a listed model"
+                        )
+                    })?;
+            (fallback, HelperSource::List)
         }
         _ => (selector, model_source),
     };
@@ -1073,17 +1109,57 @@ mod tests {
             .selector,
             "test-provider/glm-5.3"
         );
-        // The fallback is the first entry itself: one the catalog lacks fails the spawn.
-        let missing_first = none.clone().with_models(Some(vec![
-            "cpa-r/missing-helper".to_string(),
-            "test-provider/glm-5.3-turbo".to_string(),
-        ]));
-        let error = helper(dir.path(), (None, None), &none, &missing_first).unwrap_err();
-        assert!(
-            error
+        // The fallback is the first entry itself: one the catalog lacks fails the spawn, and so
+        // does one that only resolves to another route (a short form here).
+        let fallback_error = |first: &str| {
+            let settings = none.clone().with_models(Some(vec![
+                first.to_string(),
+                "cpa-r/other-helper".to_string(),
+            ]));
+            helper(dir.path(), (None, None), &none, &settings)
+                .unwrap_err()
                 .to_string()
-                .contains("\"cpa-r/missing-helper\" is unavailable"),
-            "{error}"
+        };
+        for first in ["cpa-r/missing-helper", "glm-5.3-turbo"] {
+            assert_eq!(
+                fallback_error(first),
+                format!("Spawned agents fall back to the helper model list's first entry \"{first}\", which is not in the model catalog; fix subagentModels or name a listed model")
+            );
+        }
+        // A listed model the catalog lacks: a list-scoped error, no catalog close matches.
+        let listed_missing = none.clone().with_models(Some(vec![
+            "test-provider/glm-5.3-turbo".to_string(),
+            "test-provider/glm-5.3-t".to_string(),
+        ]));
+        let error = helper(
+            dir.path(),
+            (Some("test-provider/glm-5.3-t"), None),
+            &none,
+            &listed_missing,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Requested subagent model \"test-provider/glm-5.3-t\" is unavailable, unauthenticated, or expired; use one of: test-provider/glm-5.3-turbo, test-provider/glm-5.3-t (or omit model= for the default)"
+        );
+        // A person's short form joins the list as its catalog selector.
+        let short = helper_layer(Some("glm-5.3"), None);
+        assert_eq!(
+            helper_model_list(dir.path(), &short, &settings)
+                .unwrap()
+                .entries(),
+            ["test-provider/glm-5.3-turbo", "test-provider/glm-5.3"]
+        );
+        assert_eq!(
+            helper(
+                dir.path(),
+                (Some("test-provider/glm-5.3"), None),
+                &short,
+                &settings
+            )
+            .unwrap()
+            .selector,
+            "test-provider/glm-5.3"
         );
     }
 

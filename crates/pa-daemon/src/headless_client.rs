@@ -81,6 +81,9 @@ pub struct HostedSessionOptions {
     /// The session's helper-model override (`--subagent-model`/`--subagent-thinking` or their
     /// env vars): set on the session right after its create, before any prompt.
     pub subagent_override: pa_core::session_engine::helper_model::HelperDefaults,
+    /// The global settings set a helper model list (`subagentModels`): a daemon without the
+    /// `subagent_models` capability would ignore it, so the open refuses one.
+    pub enforce_helper_model_list: bool,
 }
 
 /// What the daemon reported for the hosted session.
@@ -214,11 +217,11 @@ impl HostedHeadlessSession {
                 pa_types::daemon::SUBAGENT_MODEL_CAPABILITY
             );
         }
-        if options.subagent_override.models.is_some()
+        if (options.subagent_override.models.is_some() || options.enforce_helper_model_list)
             && !advertises(pa_types::daemon::SUBAGENT_MODELS_CAPABILITY)
         {
             anyhow::bail!(
-                "The running daemon cannot apply --subagent-models to a hosted session (it does not advertise {}); stop it so a current one starts, or run without --daemon-hosted",
+                "The running daemon cannot enforce the helper model list (subagentModels, --subagent-models) on a hosted session (it does not advertise {}); stop it so a current one starts, or run without --daemon-hosted",
                 pa_types::daemon::SUBAGENT_MODELS_CAPABILITY
             );
         }
