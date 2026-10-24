@@ -198,17 +198,28 @@ impl HostedHeadlessSession {
             anyhow::bail!("{refusal}");
         }
         // A daemon without `subagent_model` would run the session's helpers on the parent's
-        // model: refuse instead of dropping the override.
-        if !options.subagent_override.is_empty()
-            && !self
-                .link
+        // model, one without `subagent_models` ignores the helper model list: refuse instead of
+        // dropping the override.
+        let advertises = |wanted: &str| {
+            self.link
                 .server_capabilities
                 .iter()
-                .any(|capability| capability == pa_types::daemon::SUBAGENT_MODEL_CAPABILITY)
-        {
+                .any(|capability| capability == wanted)
+        };
+        let override_model = options.subagent_override.model.is_some()
+            || options.subagent_override.thinking.is_some();
+        if override_model && !advertises(pa_types::daemon::SUBAGENT_MODEL_CAPABILITY) {
             anyhow::bail!(
                 "The running daemon cannot apply --subagent-model/--subagent-thinking to a hosted session (it does not advertise {}); stop it so a current one starts, or run without --daemon-hosted",
                 pa_types::daemon::SUBAGENT_MODEL_CAPABILITY
+            );
+        }
+        if options.subagent_override.models.is_some()
+            && !advertises(pa_types::daemon::SUBAGENT_MODELS_CAPABILITY)
+        {
+            anyhow::bail!(
+                "The running daemon cannot apply --subagent-models to a hosted session (it does not advertise {}); stop it so a current one starts, or run without --daemon-hosted",
+                pa_types::daemon::SUBAGENT_MODELS_CAPABILITY
             );
         }
         let policy_supported = self
@@ -281,12 +292,21 @@ impl HostedHeadlessSession {
             .ok_or_else(|| anyhow::anyhow!("Daemon returned an invalid create response"))?;
         // The override lands before the first prompt and persists in the session file (the
         // latest explicit choice wins on a resume).
-        if !options.subagent_override.is_empty() {
+        if override_model {
             let set = DaemonCommand::SetSubagentModel {
                 id: None,
                 active_session_id: active_session_id.clone(),
                 model: options.subagent_override.model.clone(),
                 thinking: options.subagent_override.thinking.clone(),
+                rest: Map::default(),
+            };
+            success_data(self.link.request(set, REQUEST_BOUND).await?)?;
+        }
+        if let Some(models) = &options.subagent_override.models {
+            let set = DaemonCommand::SetSubagentModels {
+                id: None,
+                active_session_id: active_session_id.clone(),
+                models: models.clone(),
                 rest: Map::default(),
             };
             success_data(self.link.request(set, REQUEST_BOUND).await?)?;

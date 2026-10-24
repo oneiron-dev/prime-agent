@@ -2,7 +2,7 @@
 //! (`spawn`, `create_session`, `list_subagents`, `delete_subagent`,
 //! `collect`, `rename`) over the supervisor's child-sessions registry,
 //! with the spawn-admission helpers only this surface uses.
-use pa_core::session_engine::helper_model::HelperDefaults;
+use pa_core::session_engine::helper_model::{HelperDefaults, HelperModelList};
 
 use crate::rlm_child_model::{resolve_helper, HelperRequest, ResolvedHelper};
 
@@ -754,6 +754,25 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 record.lock().await.session_name = name.clone();
             }
             Ok(name)
+        })
+    }
+
+    fn helper_model_list(&self) -> RlmHostFuture<Option<HelperModelList>> {
+        let this = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let identity = this.identity.lock().expect("identity lock").clone();
+            let cwd = identity.cwd.unwrap_or_else(|| "/".to_string());
+            let agent_dir = this.agent_dir.clone();
+            // The same layers the spawn reads, the settings file on the blocking pool.
+            let settings = tokio::task::spawn_blocking(move || {
+                HelperDefaults::load_settings(Path::new(&cwd), &agent_dir)
+            })
+            .await
+            .context("the settings load task join failed")?;
+            Ok(HelperModelList::active(
+                &identity.subagent_override,
+                &settings,
+            ))
         })
     }
 }

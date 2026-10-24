@@ -49,9 +49,14 @@ process). A child that names no model or thinking level runs on the helper
 model (fork-only, `docs/oneiron/HELPER-MODEL.md`): the invocation's
 `--subagent-model`/`--subagent-thinking` (else `PRIME_SUBAGENT_MODEL`/
 `PRIME_SUBAGENT_THINKING`), then the settings file's
-`subagentDefaultModel`/`subagentDefaultThinking`, then the parent's.
+`subagentDefaultModel`/`subagentDefaultThinking`, then the parent's. The
+helper model list (`subagentModels`, widened for the run by
+`--subagent-models`/`PRIME_SUBAGENT_MODELS`) refuses a spawn naming a model
+off it, moves a default off it to its first entry, and limits
+`rlm.find_models` (the inline host's `helper_model_list`).
 `--daemon-hosted` and the interactive launch set the same override on their
-session (`set_subagent_model`, behind the `subagent_model` capability).
+session (`set_subagent_model`/`set_subagent_models`, behind the
+`subagent_model`/`subagent_models` capabilities).
 Session slash commands (`print_session_command.rs`, the #253 residue): print
 prompts that are `/compact`, `/refine`, `/goal`, or `/autonomous` execute
 through the pa-core session-command executor (the daemon worker's seam — no

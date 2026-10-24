@@ -788,6 +788,10 @@ impl SessionUi {
                 self.handle_subagent_model_command(view, &resolved.args)
                     .await;
             }
+            "subagent-models" => {
+                self.handle_subagent_models_command(view, &resolved.args)
+                    .await;
+            }
             "speed" => {
                 let arg = resolved.args.trim().to_lowercase();
                 if !arg.is_empty() && arg != "on" && arg != "off" {

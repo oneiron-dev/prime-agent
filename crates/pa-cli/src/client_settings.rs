@@ -114,6 +114,10 @@ impl ClientSettings for CliClientSettings {
         self.manager().get_subagent_default_thinking()
     }
 
+    fn subagent_models(&self) -> Option<Vec<String>> {
+        self.manager().get_subagent_models()
+    }
+
     fn set_subagent_default_thinking(&self, level: Option<&str>) -> Result<()> {
         if let Some(level) =
             level.filter(|level| pa_types::ai::thinking_level_from_str(level).is_none())

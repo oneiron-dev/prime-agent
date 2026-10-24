@@ -7,8 +7,8 @@ use anyhow::{anyhow, bail, Result};
 use pa_ai::models::{get_supported_thinking_levels, thinking_level_from_str};
 use pa_core::kernel::rlm_runtime::{find_rlm_model_matches, RlmModelInfo};
 use pa_core::session_engine::helper_model::{
-    first_unknown_helper_model, plan_helper, unknown_helper_model_warning, HelperDefaults,
-    HelperSource,
+    first_helper_notice, plan_helper, unknown_helper_model_warning, HelperDefaults,
+    HelperModelList, HelperSource,
 };
 
 /// Close matches listed in model-resolution errors.
@@ -148,12 +148,13 @@ pub struct ResolvedHelper {
 }
 
 /// Resolve a child's model and thinking through the helper order (the spawn call, the session
-/// override, the settings file, the parent), then enforce the daemon `allowedModels` allowlist
-/// on the selector.
+/// override, the settings file, the parent) and the helper model list, then enforce the daemon
+/// `allowedModels` allowlist on the selector.
 ///
 /// # Errors
-/// Returns an error when the spawn call's own model or thinking level does not resolve, when no
-/// model resolves at all, or when the selector is outside the allowlist.
+/// Returns an error when the spawn call's own model or thinking level does not resolve or is off
+/// the helper model list, when no model resolves at all, or when the selector is outside the
+/// allowlist.
 pub fn resolve_helper(
     agent_dir: &Path,
     request: HelperRequest<'_>,
@@ -170,9 +171,14 @@ pub fn resolve_helper(
 /// warns once on stderr and falls back to the parent's model; a default thinking level, or the
 /// parent's, clamps to what the resolved model supports.
 ///
+/// With a helper model list ([`HelperModelList`]) set, a spawn call naming a model off the list
+/// is refused, and a settings default or the parent's model off the list falls to the list's
+/// first entry with a warning once on stderr. The session override is a person's choice: always
+/// allowed.
+///
 /// # Errors
-/// Returns an error when the spawn call's own model or thinking level does not resolve, or when
-/// no model resolves at all.
+/// Returns an error when the spawn call's own model or thinking level does not resolve or is off
+/// the helper model list, or when no model resolves at all.
 pub fn resolve_helper_unchecked(
     agent_dir: &Path,
     request: HelperRequest<'_>,
@@ -184,17 +190,29 @@ pub fn resolve_helper_unchecked(
         request.session,
         request.settings,
     );
+    let list = HelperModelList::active(request.session, request.settings);
     let parent = || resolve_child_model_unchecked(agent_dir, None, request.parent_model, target);
     let (selector, model_source) = match (plan.model.value.as_deref(), plan.model.source) {
-        (Some(reference), HelperSource::Spawn) => (
-            resolve_child_model_unchecked(
+        (Some(reference), HelperSource::Spawn) => {
+            let resolved = resolve_child_model_unchecked(
                 agent_dir,
                 Some(reference),
                 request.parent_model,
                 target,
-            )?,
-            HelperSource::Spawn,
-        ),
+            );
+            // Off the list, the refusal names the allowed models so the agent retries with one
+            // (an unresolved reference too: its close matches would list models off the list).
+            if let Some(list) = &list {
+                let allowed = match &resolved {
+                    Ok(selector) => list.allows(selector),
+                    Err(_) => list.allows(reference),
+                };
+                if !allowed {
+                    bail!(list.refusal(reference, target));
+                }
+            }
+            (resolved?, HelperSource::Spawn)
+        }
         (Some(reference), source) => {
             if let Ok(selector) = resolve_child_model_unchecked(
                 agent_dir,
@@ -204,13 +222,45 @@ pub fn resolve_helper_unchecked(
             ) {
                 (selector, source)
             } else {
-                if first_unknown_helper_model(reference, source) {
-                    eprintln!("{}", unknown_helper_model_warning(reference, source));
+                let warning = unknown_helper_model_warning(reference, source);
+                if first_helper_notice(&warning) {
+                    eprintln!("{warning}");
                 }
                 (parent()?, HelperSource::Parent)
             }
         }
         (None, _) => (parent()?, HelperSource::Parent),
+    };
+    // The defaults stay on the list too: a settings default or the parent's model off it falls to
+    // the list's first entry.
+    let (selector, model_source) = match &list {
+        Some(list)
+            if matches!(model_source, HelperSource::Settings | HelperSource::Parent)
+                && !list.allows(&selector) =>
+        {
+            let origin = if model_source == HelperSource::Settings {
+                "subagentDefaultModel"
+            } else {
+                "The parent's model"
+            };
+            let warning = format!(
+                "Warning: {origin} \"{selector}\" is not on the helper model list (subagentModels); spawned agents use \"{}\"",
+                list.first()
+            );
+            if first_helper_notice(&warning) {
+                eprintln!("{warning}");
+            }
+            (
+                resolve_child_model_unchecked(
+                    agent_dir,
+                    Some(list.first()),
+                    request.parent_model,
+                    target,
+                )?,
+                HelperSource::List,
+            )
+        }
+        _ => (selector, model_source),
     };
     let thinking = match (plan.thinking.value, plan.thinking.source) {
         (Some(level), HelperSource::Spawn) => {
@@ -260,9 +310,11 @@ pub fn unknown_helper_model_notice(
     let settings = HelperDefaults::load_settings(cwd, agent_dir);
     let plan = plan_helper(None, None, session, &settings);
     let reference = plan.model.value.as_deref()?;
-    (!helper_model_known(agent_dir, reference)
-        && first_unknown_helper_model(reference, plan.model.source))
-    .then(|| unknown_helper_model_warning(reference, plan.model.source))
+    if helper_model_known(agent_dir, reference) {
+        return None;
+    }
+    let warning = unknown_helper_model_warning(reference, plan.model.source);
+    first_helper_notice(&warning).then_some(warning)
 }
 
 /// Whether a default helper model reference resolves against the catalog the spawns use
@@ -919,6 +971,120 @@ mod tests {
             "test-provider/glm-5.3-turbo"
         ));
         assert!(!helper_model_known(dir.path(), "cpa-r/missing-helper"));
+    }
+
+    /// The helper model list: a spawn call naming a model off it is refused with the allowed
+    /// models named; a settings default or the parent's model off it falls to its first entry; a
+    /// person's choice (the session override or the session's own list) is allowed.
+    #[test]
+    fn the_helper_model_list_refuses_off_list_spawns_and_keeps_defaults_on_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_catalog(dir.path());
+        let none = HelperDefaults::default();
+        let listed = |model: Option<&str>| {
+            helper_layer(model, None)
+                .with_models(Some(vec!["test-provider/glm-5.3-turbo".to_string()]))
+        };
+        let settings = listed(None);
+        let refusal = "Requested subagent model \"test-provider/glm-5.3\" is not on the helper model list; use one of: test-provider/glm-5.3-turbo (or omit model= for the default)";
+        let error = helper(
+            dir.path(),
+            (Some("test-provider/glm-5.3"), None),
+            &none,
+            &settings,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), refusal);
+        // An unresolved reference gets the same refusal, never catalog matches off the list.
+        let error = helper(dir.path(), (Some("zzz"), None), &none, &settings).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("use one of: test-provider/glm-5.3-turbo"),
+            "{error}"
+        );
+        // A listed model, by selector or short form.
+        let on_list = ResolvedHelper {
+            selector: "test-provider/glm-5.3-turbo".to_string(),
+            model_source: HelperSource::Spawn,
+            thinking: None,
+            thinking_source: HelperSource::Parent,
+        };
+        assert_eq!(
+            helper(dir.path(), (Some("glm-5.3-turbo"), None), &none, &settings).unwrap(),
+            on_list
+        );
+        // The parent's model and a settings default off the list fall to its first entry.
+        let fallback = ResolvedHelper {
+            model_source: HelperSource::List,
+            ..on_list
+        };
+        assert_eq!(
+            helper(dir.path(), (None, None), &none, &settings).unwrap(),
+            fallback
+        );
+        assert_eq!(
+            helper(
+                dir.path(),
+                (None, None),
+                &none,
+                &listed(Some("test-provider/glm-5.3"))
+            )
+            .unwrap(),
+            fallback
+        );
+        // A person's choices are allowed: the session override, by default or by name, and the
+        // session's own list.
+        let session = helper_layer(Some("test-provider/glm-5.3"), None);
+        assert_eq!(
+            helper(dir.path(), (None, None), &session, &settings).unwrap(),
+            ResolvedHelper {
+                selector: "test-provider/glm-5.3".to_string(),
+                model_source: HelperSource::Session,
+                thinking: None,
+                thinking_source: HelperSource::Parent,
+            }
+        );
+        let widened = none
+            .clone()
+            .with_models(Some(vec!["test-provider/glm-5.3".to_string()]));
+        for session in [&session, &widened] {
+            assert_eq!(
+                helper(
+                    dir.path(),
+                    (Some("test-provider/glm-5.3"), None),
+                    session,
+                    &settings
+                )
+                .unwrap()
+                .selector,
+                "test-provider/glm-5.3"
+            );
+        }
+        // No settings list: the session's list limits nothing.
+        assert_eq!(
+            helper(
+                dir.path(),
+                (Some("test-provider/glm-5.3"), None),
+                &widened,
+                &none
+            )
+            .unwrap()
+            .selector,
+            "test-provider/glm-5.3"
+        );
+        // The fallback is the first entry itself: one the catalog lacks fails the spawn.
+        let missing_first = none.clone().with_models(Some(vec![
+            "cpa-r/missing-helper".to_string(),
+            "test-provider/glm-5.3-turbo".to_string(),
+        ]));
+        let error = helper(dir.path(), (None, None), &none, &missing_first).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("\"cpa-r/missing-helper\" is unavailable"),
+            "{error}"
+        );
     }
 
     /// The daemon allowlist gates the helper model like any resolved model.

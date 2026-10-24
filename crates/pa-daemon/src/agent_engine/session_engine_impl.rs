@@ -1355,11 +1355,8 @@ impl SessionEngine for AgentSessionEngine {
     }
 
     fn subagent_model_status(&self) -> Value {
-        let session = self
-            .children
-            .as_ref()
-            .map(|children| children.subagent_override())
-            .unwrap_or_default();
+        use pa_core::session_engine::helper_model::{HelperModelList, HelperSource};
+        let session = crate::engine::SessionEngine::subagent_override(self);
         let settings = pa_core::session_engine::helper_model::HelperDefaults::load_settings(
             &self.cwd(),
             &self.config.agent_dir,
@@ -1369,15 +1366,47 @@ impl SessionEngine for AgentSessionEngine {
         let model_known = plan.model.value.as_deref().map(|reference| {
             crate::rlm_child_model::helper_model_known(&self.config.agent_dir, reference)
         });
+        let list = HelperModelList::active(&session, &settings);
+        // Whether the model the spawns default to is on the list (`null` without a list, or when
+        // the parent's model is unknown); off it, they run on the list's first entry.
+        let model_allowed = list.as_ref().and_then(|list| match plan.model.source {
+            HelperSource::Session => Some(true),
+            HelperSource::Settings => plan.model.value.as_deref().map(|reference| {
+                list.allows(
+                    &crate::rlm_child_model::resolve_child_model_unchecked(
+                        &self.config.agent_dir,
+                        Some(reference),
+                        None,
+                        "subagent",
+                    )
+                    .unwrap_or_else(|_| reference.to_string()),
+                )
+            }),
+            HelperSource::Parent | HelperSource::Spawn | HelperSource::List => self
+                .children
+                .as_ref()
+                .and_then(|children| children.parent_model())
+                .map(|model| list.allows(&model)),
+        });
         json!({
             "model": plan.model.value,
             "modelSource": plan.model.source.wire_name(),
             "modelKnown": model_known,
+            "modelAllowed": model_allowed,
             "thinking": plan.thinking.value,
             "thinkingSource": plan.thinking.source.wire_name(),
+            "models": list.as_ref().map(HelperModelList::entries),
+            "modelsSource": list.as_ref().map(HelperModelList::source),
             "session": session,
             "settings": settings,
         })
+    }
+
+    fn subagent_override(&self) -> pa_core::session_engine::helper_model::HelperDefaults {
+        self.children
+            .as_ref()
+            .map(|children| children.subagent_override())
+            .unwrap_or_default()
     }
 
     fn set_subagent_model(

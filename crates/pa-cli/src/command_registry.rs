@@ -367,6 +367,10 @@ const TOP_LEVEL_OPTION_GROUPS: &[OptionGroup] = &[
                 "--subagent-thinking <level>",
                 "Set this session's reasoning for spawned agents (or parent)",
             ),
+            (
+                "--subagent-models <ids>",
+                "Add models spawned agents may run on, this session (comma-separated)",
+            ),
         ],
     },
     OptionGroup {

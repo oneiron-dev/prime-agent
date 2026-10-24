@@ -86,10 +86,13 @@ parent-side registry serves `rlm.list_subagents`/`rlm.collect`/
 and thinking-level validation live in `rlm_child_model.rs`, including the
 fork's helper-model order for a spawn that names no model (`resolve_helper`:
 the session override, then `subagentDefaultModel`/`subagentDefaultThinking`,
-then the parent; the override rides the child create as
-`subagentModel`/`subagentThinking`, persists as a `subagent_model_state`
-row, and `get_subagent_model_status`/`set_subagent_model` serve it behind
-the `subagent_model` capability); the create
+then the parent, and the helper model list `subagentModels`: a spawn naming a
+model off it is refused, a default off it falls to its first entry; the
+override rides the child create as
+`subagentModel`/`subagentThinking`/`subagentModels`, persists as a
+`subagent_model_state` row, and `get_subagent_model_status`/
+`set_subagent_model` serve it behind the `subagent_model` capability,
+`set_subagent_models` behind `subagent_models`); the create
 command carries the RLM recursion identity (`rlmDepth`/`rlmMaxDepth`/
 `parentSessionPath`/`thinking`) so respawned children keep their depth. Per-session model binding: the
 create-config `provider`/`model`/`apiKey` are authoritative for worker model

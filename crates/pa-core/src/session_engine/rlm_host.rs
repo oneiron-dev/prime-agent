@@ -185,6 +185,12 @@ pub trait RlmSubagentHost: Send + Sync {
     /// Rename the current session (`session_id` absent) or one direct
     /// child (TS `rlm.rename`); answers the applied name.
     fn rename(&self, name: String, session_id: Option<String>) -> RlmHostFuture<String>;
+    /// The helper model list this host's spawns check (Oneiron fork, settings `subagentModels`
+    /// plus the session's additions): `rlm.find_models` lists only its models. `None` when no
+    /// list limits spawns; the default suits hosts that cannot spawn.
+    fn helper_model_list(&self) -> RlmHostFuture<Option<super::helper_model::HelperModelList>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Host behavior for sessions with no child runtime: truthful empties and the
@@ -524,10 +530,12 @@ pub fn register_rlm_host_handlers(handlers: &mut HostRequestHandlers, bridge: &A
 
 fn register_find_models(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>) {
     let registry = Arc::clone(&bridge.registry);
+    let host = Arc::clone(&bridge.host);
     handlers.register(
         "rlm.find_models",
         host_handler(move |payload| {
             let registry = Arc::clone(&registry);
+            let host = Arc::clone(&host);
             Box::pin(async move {
                 let data = &payload.data;
                 let Some(query) = data.get("query").and_then(Value::as_str) else {
@@ -544,9 +552,17 @@ fn register_find_models(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHost
                         "rlm.find_models limit must be an integer from 1 to {MAX_RLM_MODEL_SEARCH_LIMIT}"
                     );
                 };
+                // With a helper model list set, the roster shows only the models a spawn may
+                // name.
+                let list = host.helper_model_list().await?;
                 let models: Vec<RlmModelInfo> = registry
                     .get_rlm_searchable_models()
                     .into_iter()
+                    .filter(|model| {
+                        list.as_ref().is_none_or(|list| {
+                            list.allows(&format!("{}/{}", model.provider, model.id))
+                        })
+                    })
                     .map(|model| RlmModelInfo {
                         provider: model.provider.clone(),
                         id: model.id.clone(),
@@ -900,16 +916,24 @@ mod tests {
         targets: Arc<Mutex<Vec<String>>>,
         collects: Arc<Mutex<Vec<CollectCall>>>,
         renames: Arc<Mutex<Vec<RecordedRename>>>,
+        helper_models: Option<crate::session_engine::helper_model::HelperModelList>,
     }
 
     impl RecordingHost {
         fn new() -> Arc<Self> {
+            Self::with_helper_models(None)
+        }
+
+        fn with_helper_models(
+            helper_models: Option<crate::session_engine::helper_model::HelperModelList>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 spawn_requests: Arc::new(Mutex::new(Vec::new())),
                 create_requests: Arc::new(Mutex::new(Vec::new())),
                 targets: Arc::new(Mutex::new(Vec::new())),
                 collects: Arc::new(Mutex::new(Vec::new())),
                 renames: Arc::new(Mutex::new(Vec::new())),
+                helper_models,
             })
         }
     }
@@ -1024,6 +1048,12 @@ mod tests {
                 renames.lock().await.push((name.clone(), session_id));
                 Ok(name)
             })
+        }
+        fn helper_model_list(
+            &self,
+        ) -> RlmHostFuture<Option<crate::session_engine::helper_model::HelperModelList>> {
+            let list = self.helper_models.clone();
+            Box::pin(async move { Ok(list) })
         }
     }
 
@@ -1195,6 +1225,33 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "rlm.find_models limit must be an integer from 1 to 20"
+        );
+    }
+
+    /// With a helper model list set, the roster lists only the models a spawn may name.
+    #[tokio::test]
+    async fn find_models_lists_only_the_helper_model_list() {
+        use crate::session_engine::helper_model::{HelperDefaults, HelperModelList};
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings =
+            HelperDefaults::default().with_models(Some(vec!["test-provider/glm-5.3".to_string()]));
+        let list = HelperModelList::active(&HelperDefaults::default(), &settings);
+        let wiring = wired(dir.path(), Some(RecordingHost::with_helper_models(list)));
+        let response = call(
+            &wiring,
+            "rlm.find_models",
+            json!({ "type": "rlm.find_models", "query": "" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response["models"],
+            json!([{
+                "provider": "test-provider",
+                "id": "glm-5.3",
+                "name": "GLM 5.3",
+                "selector": "test-provider/glm-5.3",
+            }])
         );
     }
 

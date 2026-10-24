@@ -173,6 +173,7 @@ impl Worker {
             "set_rlm_max_depth" => self.handle_set_rlm_max_depth(payload).await,
             "get_subagent_model_status" => self.handle_get_subagent_model_status().await,
             "set_subagent_model" => self.handle_set_subagent_model(payload).await,
+            "set_subagent_models" => self.handle_set_subagent_models(payload).await,
             "acquire_session_input_pause" => self.handle_acquire_session_input_pause(payload),
             "release_session_input_pause" => self.handle_release_session_input_pause(payload),
             "cancel_prompt_admission" => self.handle_cancel_prompt_admission(payload),

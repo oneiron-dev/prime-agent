@@ -171,6 +171,8 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     // Oneiron fork (capability `subagent_model`): the session's helper-model override.
     "get_subagent_model_status",
     "set_subagent_model",
+    // Oneiron fork (capability `subagent_models`): the session's helper model list additions.
+    "set_subagent_models",
 ];
 
 /// Parsed client command envelope.
@@ -369,6 +371,8 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 // Fork-only: `get_subagent_model_status`/`set_subagent_model`, the
                 // session's helper-model override.
                 pa_types::daemon::SUBAGENT_MODEL_CAPABILITY,
+                // Fork-only: the helper model list and `set_subagent_models`.
+                pa_types::daemon::SUBAGENT_MODELS_CAPABILITY,
             ]
             .iter()
             .map(std::string::ToString::to_string),
@@ -878,6 +882,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::SetSubagentModel {
             active_session_id, ..
         }
+        | DaemonCommand::SetSubagentModels {
+            active_session_id, ..
+        }
         | DaemonCommand::GetSessionContext {
             active_session_id, ..
         }
@@ -1070,6 +1077,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::SetRlmMaxDepth { .. } => "set_rlm_max_depth",
         DaemonCommand::GetSubagentModelStatus { .. } => "get_subagent_model_status",
         DaemonCommand::SetSubagentModel { .. } => "set_subagent_model",
+        DaemonCommand::SetSubagentModels { .. } => "set_subagent_models",
         DaemonCommand::RenameSavedSession { .. } => "rename_saved_session",
         DaemonCommand::DeleteSavedSession { .. } => "delete_saved_session",
         DaemonCommand::GetSessionContext { .. } => "get_session_context",

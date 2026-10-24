@@ -73,6 +73,7 @@ fn supervisor_end_to_end_scripted_session_lifecycle() {
             "session_tool_selection",
             "session_policy",
             "subagent_model",
+            "subagent_models",
         ])
     );
 

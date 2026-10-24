@@ -671,10 +671,28 @@ impl RlmSubagentHost for InlineHost {
                 .as_deref()
                 .and_then(pa_ai::models::thinking_level_from_str)
                 .unwrap_or(parent_thinking);
+            // The settings layer of the helper order and the helper model list.
+            let settings = pa_core::session_engine::helper_model::HelperDefaults::load_settings(
+                &config.cwd,
+                &config.agent_dir,
+            );
             // The model lane: a scripted child runs its own faux queue under
             // `children.<spawn name>`; a real-provider child resolves against
             // the catalog, inheriting the parent's selector.
             let (selector, lane, thinking) = if let Some(script) = recipe.faux.as_ref() {
+                // A scripted child runs the faux model whatever the call names, but a named
+                // model off the helper model list is refused as on the real lane.
+                if let (Some(reference), Some(list)) = (
+                    request.model.as_deref(),
+                    pa_core::session_engine::helper_model::HelperModelList::active(
+                        &config.subagent_override,
+                        &settings,
+                    ),
+                ) {
+                    if !list.allows(reference) {
+                        anyhow::bail!(list.refusal(reference, "subagent"));
+                    }
+                }
                 let queue = script
                 .get("children")
                 .and_then(|children| children.get(&name))
@@ -710,11 +728,8 @@ impl RlmSubagentHost for InlineHost {
                 )
             } else {
                 // The helper order: the call, the invocation's override (`--subagent-model`,
-                // `PRIME_SUBAGENT_MODEL`), the settings file, the parent.
-                let settings = pa_core::session_engine::helper_model::HelperDefaults::load_settings(
-                    &config.cwd,
-                    &config.agent_dir,
-                );
+                // `PRIME_SUBAGENT_MODEL`), the settings file, the parent; then the helper model
+                // list (`subagentModels` plus `--subagent-models`).
                 let parent_selector = node.model_selector.lock().unwrap().clone();
                 let helper = pa_daemon::rlm_child_model::resolve_helper_unchecked(
                     &config.agent_dir,
@@ -1019,6 +1034,20 @@ impl RlmSubagentHost for InlineHost {
             rename_session(&child.node, &name).await?;
             Ok(name)
         })
+    }
+
+    fn helper_model_list(
+        &self,
+    ) -> RlmHostFuture<Option<pa_core::session_engine::helper_model::HelperModelList>> {
+        let config = &self.0.recipe.options.config;
+        let list = pa_core::session_engine::helper_model::HelperModelList::active(
+            &config.subagent_override,
+            &pa_core::session_engine::helper_model::HelperDefaults::load_settings(
+                &config.cwd,
+                &config.agent_dir,
+            ),
+        );
+        Box::pin(async move { Ok(list) })
     }
 }
 

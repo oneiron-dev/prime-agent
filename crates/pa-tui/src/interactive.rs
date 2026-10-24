@@ -115,6 +115,9 @@ pub struct ModelSelection {
     pub subagent_model: Option<String>,
     /// The launch helper thinking level (`--subagent-thinking`, `PRIME_SUBAGENT_THINKING`).
     pub subagent_thinking: Option<String>,
+    /// The launch additions to the helper model list (`--subagent-models`,
+    /// `PRIME_SUBAGENT_MODELS`): set on the opened session like `/subagent-models`.
+    pub subagent_models: Option<Vec<String>>,
 }
 
 /// Adoption telemetry for interactive-view interactions: the composition

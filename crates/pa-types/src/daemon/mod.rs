@@ -47,6 +47,11 @@ pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-33-20261024a1f7";
 /// session's helper-model override, and its RLM creates carry `subagentModel`/`subagentThinking`.
 pub const SUBAGENT_MODEL_CAPABILITY: &str = "subagent_model";
 
+/// Fork-only server capability (no schema bump): the daemon enforces the helper model list
+/// (settings `subagentModels`) on spawns, answers `set_subagent_models`, reports the list in
+/// `get_subagent_model_status`, and its RLM creates carry `subagentModels`.
+pub const SUBAGENT_MODELS_CAPABILITY: &str = "subagent_models";
+
 pub type DaemonClientId = String;
 pub type DaemonCommandId = String;
 pub type DaemonEventId = String;

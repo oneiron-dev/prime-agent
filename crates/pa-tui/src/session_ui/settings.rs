@@ -1,5 +1,5 @@
 //! The `/settings` menu and its row-apply/persist switches, the `/import`
-//! confirm flow, and the fast/rlm-max-depth/subagent-model/reload command surface. The
+//! confirm flow, and the fast/rlm-max-depth/subagent-model(s)/reload command surface. The
 //! fullscreen toggle is retired (the operator's 2026-09-28 ruling removed
 //! the setting and the command).
 use super::{
@@ -803,7 +803,7 @@ impl SessionUi {
         }
     }
 
-    // Helper model (/subagent-model)
+    // Helper model (/subagent-model, /subagent-models)
 
     /// No argument reports the helper model and thinking level this session's spawns resolve to
     /// when the call names none, with the layer each comes from; `<model> [<thinking>]` replaces
@@ -846,66 +846,131 @@ impl SessionUi {
                 return;
             }
         };
-        self.subagent_model_request(command, view).await;
+        if let Some(status) = self.subagent_model_request(command, view).await {
+            self.report_subagent_model_status(&status, view);
+        }
     }
 
-    /// The launch override (`--subagent-model`/`--subagent-thinking` or their env vars) lands on
-    /// the opened session before the first prompt; a session whose settings name a helper model
-    /// checks it, so an unknown default warns at open. Sessions without either skip the round
-    /// trip.
+    /// No argument reports the helper model list this session's spawns may run on (settings
+    /// `subagentModels`); `<provider/model>,...` replaces the session's additions to it
+    /// immediately, and `default` clears them, leaving the settings file's list.
+    pub(super) async fn handle_subagent_models_command(
+        &mut self,
+        view: &mut AgentView,
+        args: &str,
+    ) {
+        let command = match args.trim() {
+            "" => DaemonCommand::GetSubagentModelStatus {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                rest: Map::default(),
+            },
+            list => DaemonCommand::SetSubagentModels {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                // Entries split on commas or whitespace; the daemon trims and drops repeats.
+                models: if list == "default" {
+                    Vec::new()
+                } else {
+                    list.split(|c: char| c == ',' || c.is_whitespace())
+                        .filter(|entry| !entry.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                },
+                rest: Map::default(),
+            },
+        };
+        if let Some(status) = self.subagent_model_request(command, view).await {
+            self.report_subagent_model_status(&status, view);
+        }
+    }
+
+    /// The launch override (`--subagent-model`/`--subagent-thinking`/`--subagent-models` or their
+    /// env vars) lands on the opened session before the first prompt; a session whose settings
+    /// name a helper model or a helper model list checks them, so an unknown default or one off
+    /// the list warns at open. Sessions without either skip the round trip.
     pub(crate) async fn apply_launch_subagent_model(&mut self, view: &mut AgentView) {
         let model = self.model_selection.subagent_model.clone();
         let thinking = self.model_selection.subagent_thinking.clone();
-        let launch = model.is_some() || thinking.is_some();
-        let configured = self
-            .client_settings
-            .as_ref()
-            .is_some_and(|settings| settings.subagent_default_model().is_some());
-        if !launch && !configured {
-            return;
-        }
-        let command = if launch {
-            DaemonCommand::SetSubagentModel {
+        let mut commands = Vec::new();
+        if model.is_some() || thinking.is_some() {
+            commands.push(DaemonCommand::SetSubagentModel {
                 id: None,
                 active_session_id: self.active_session_id.clone(),
                 model,
                 thinking,
                 rest: Map::default(),
-            }
-        } else {
-            DaemonCommand::GetSubagentModelStatus {
+            });
+        }
+        if let Some(models) = self.model_selection.subagent_models.clone() {
+            commands.push(DaemonCommand::SetSubagentModels {
+                id: None,
+                active_session_id: self.active_session_id.clone(),
+                models,
+                rest: Map::default(),
+            });
+        }
+        let configured = self.client_settings.as_ref().is_some_and(|settings| {
+            settings.subagent_default_model().is_some() || settings.subagent_models().is_some()
+        });
+        if commands.is_empty() && configured {
+            commands.push(DaemonCommand::GetSubagentModelStatus {
                 id: None,
                 active_session_id: self.active_session_id.clone(),
                 rest: Map::default(),
+            });
+        }
+        // Each command answers the whole status: report the last one.
+        let mut status = None;
+        for command in commands {
+            match self.subagent_model_request(command, view).await {
+                Some(answer) => status = Some(answer),
+                None => return,
             }
-        };
-        self.subagent_model_request(command, view).await;
+        }
+        if let Some(status) = status {
+            self.report_subagent_model_status(&status, view);
+        }
     }
 
-    /// Send one helper-model command and report the resulting status: the status row, plus a
-    /// warning when the model the spawns default to is not in the catalog (they use the parent's).
-    async fn subagent_model_request(&mut self, command: DaemonCommand, view: &mut AgentView) {
-        if !self
-            .client
-            .supports_server_capability(pa_types::daemon::SUBAGENT_MODEL_CAPABILITY)
-        {
+    /// Send one helper-model command and answer the resulting status; a daemon without the
+    /// command's capability, or a failed request, reports a row and answers `None`.
+    async fn subagent_model_request(
+        &mut self,
+        command: DaemonCommand,
+        view: &mut AgentView,
+    ) -> Option<Value> {
+        let capability = if matches!(command, DaemonCommand::SetSubagentModels { .. }) {
+            pa_types::daemon::SUBAGENT_MODELS_CAPABILITY
+        } else {
+            pa_types::daemon::SUBAGENT_MODEL_CAPABILITY
+        };
+        if !self.client.supports_server_capability(capability) {
             self.note_as(
-                "The running daemon does not support helper-model overrides (no subagent_model capability); stop it so a current one starts",
+                &format!(
+                    "The running daemon does not support this helper-model setting (no {capability} capability); stop it so a current one starts"
+                ),
                 StatusKind::Warning,
                 view,
             );
-            return;
+            return None;
         }
-        let status = match self
+        match self
             .bounded_request(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), command)
             .await
         {
-            Ok(status) => status,
+            Ok(status) => Some(status),
             Err(error) => {
                 self.error_row(&format!("{error:#}"), view);
-                return;
+                None
             }
-        };
+        }
+    }
+
+    /// Report one helper-model status: the helper model row, the helper model list row when a
+    /// list is set, and a warning when the model the spawns default to is not in the catalog
+    /// (they use the parent's) or not on the list (they use its first entry).
+    fn report_subagent_model_status(&mut self, status: &Value, view: &mut AgentView) {
         let described = |value: &str, source: &str, fallback: &str| match status
             .get(value)
             .and_then(Value::as_str)
@@ -922,6 +987,30 @@ impl SessionUi {
         let model = described("model", "modelSource", "the parent's model");
         let thinking = described("thinking", "thinkingSource", "the parent's level");
         self.plain_row(&format!("Helper model: {model}, thinking {thinking}"), view);
+        let models: Vec<&str> = status
+            .get("models")
+            .and_then(Value::as_array)
+            .map(|models| models.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if let Some(first) = models.first() {
+            let source = status
+                .get("modelsSource")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            self.plain_row(
+                &format!("Helper model list: {} ({source})", models.join(", ")),
+                view,
+            );
+            if status.get("modelAllowed").and_then(Value::as_bool) == Some(false) {
+                self.note_as(
+                    &format!(
+                        "The spawns' default model ({model}) is not on the helper model list; spawned agents use {first}"
+                    ),
+                    StatusKind::Warning,
+                    view,
+                );
+            }
+        }
         if status.get("modelKnown").and_then(Value::as_bool) == Some(false) {
             self.note_as(
                 &format!(
