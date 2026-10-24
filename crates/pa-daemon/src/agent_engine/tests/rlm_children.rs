@@ -1,4 +1,5 @@
-//! The rlm-children tests (the persisted max-depth scan, the settled-child release probe).
+//! The rlm-children tests (the persisted max-depth scan, the settled-child release probe, the
+//! helper-model session override).
 use super::*;
 use pa_core::session_engine::rlm_host::persisted_rlm_max_depth;
 
@@ -383,4 +384,129 @@ fn can_passivate_worker_mirrors_the_release_gates_and_adds_the_registry_rule() {
             &*engine,
         ));
     assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// The session override of the helper model: `set_subagent_model` replaces what the spawns read
+/// (the status names each field's layer and checks the model against the catalog), and a
+/// session re-seeds from its persisted `subagent_model_state` row ahead of the create's own
+/// override.
+#[test]
+fn the_session_override_beats_the_settings_file_and_reseeds_from_the_session_file() {
+    use pa_core::session_engine::helper_model::{session_override_row, HelperDefaults};
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("models.json"),
+        json!({
+            "providers": {
+                "test-provider": {
+                    "baseUrl": "http://localhost:9",
+                    "apiKey": "test-key",
+                    "api": "openai-completions",
+                    "models": [
+                        { "id": "helper-flash", "name": "Helper", "contextWindow": 1000, "maxTokens": 100 }
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({ "subagentDefaultModel": "test-provider/helper-flash", "subagentDefaultThinking": "high" })
+            .to_string(),
+    )
+    .unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir,
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: None,
+        supervisor_link: Some(crate::agent_engine::SupervisorLinkConfig {
+            socket_path: dir.path().join("dead.sock"),
+            active_session_id: "parent-session".to_string(),
+            worker_token: "token".to_string(),
+        }),
+        telemetry_disabled: None,
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    assert_eq!(
+        crate::engine::SessionEngine::subagent_model_status(&engine),
+        json!({
+            "model": "test-provider/helper-flash",
+            "modelSource": "settings",
+            "modelKnown": true,
+            "thinking": "high",
+            "thinkingSource": "settings",
+            "session": {},
+            "settings": { "model": "test-provider/helper-flash", "thinking": "high" },
+        })
+    );
+    let unknown = HelperDefaults::new(Some("cpa-r/not-in-catalog"), None).unwrap();
+    crate::engine::SessionEngine::set_subagent_model(&engine, unknown.clone()).unwrap();
+    assert_eq!(
+        crate::engine::SessionEngine::subagent_model_status(&engine),
+        json!({
+            "model": "cpa-r/not-in-catalog",
+            "modelSource": "session",
+            "modelKnown": false,
+            "thinking": "high",
+            "thinkingSource": "settings",
+            "session": { "model": "cpa-r/not-in-catalog" },
+            "settings": { "model": "test-provider/helper-flash", "thinking": "high" },
+        })
+    );
+    let children = engine
+        .children
+        .as_ref()
+        .expect("a linked engine hosts children");
+    assert_eq!(children.subagent_override(), unknown);
+
+    // A re-seed: the session file's latest row (the worker writes it) beats the create's own
+    // override; a cleared row clears it.
+    let session_file = dir.path().join("session.jsonl");
+    let row = |layer: &HelperDefaults| {
+        let mut entry = session_override_row(layer);
+        entry["type"] = json!("custom");
+        entry["id"] = json!("o1");
+        entry["timestamp"] = json!("2026-01-01T00:00:01.000Z");
+        entry.to_string()
+    };
+    let header = json!({ "type": "session", "version": 3, "id": "s", "timestamp": "2026-01-01T00:00:00.000Z", "cwd": "/w" })
+        .to_string();
+    let inherited = HelperDefaults::new(Some("test-provider/helper-flash"), None).unwrap();
+    let configure = |session_file: Option<String>| {
+        crate::engine::SessionEngine::configure_rlm_identity(
+            &engine,
+            crate::engine::RlmSessionIdentity {
+                session_file,
+                subagent_override: inherited.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    };
+    let persisted = HelperDefaults::new(Some("parent"), Some("max")).unwrap();
+    std::fs::write(&session_file, [header.clone(), row(&persisted)].join("\n")).unwrap();
+    configure(Some(session_file.to_string_lossy().to_string()));
+    assert_eq!(children.subagent_override(), persisted);
+    std::fs::write(
+        &session_file,
+        [header, row(&persisted), row(&HelperDefaults::default())].join("\n"),
+    )
+    .unwrap();
+    configure(Some(session_file.to_string_lossy().to_string()));
+    assert_eq!(children.subagent_override(), HelperDefaults::default());
+    // No row (a fresh RLM child before its birth row, or no file): the create's override.
+    configure(None);
+    assert_eq!(children.subagent_override(), inherited);
 }

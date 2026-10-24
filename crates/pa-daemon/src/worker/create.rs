@@ -205,6 +205,12 @@ impl Worker {
             .get("childScript")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // The helper-model override an RLM parent passes down (`subagentModel`/
+        // `subagentThinking`); the durable create replays it.
+        let subagent_override = payload
+            .as_object()
+            .map(pa_core::session_engine::helper_model::HelperDefaults::from_create_config)
+            .unwrap_or_default();
 
         // Set by the fresh-path arm when the name landed in its single rewrite:
         // the shared name persist must not append a second `session_info` line.
@@ -558,6 +564,28 @@ impl Worker {
         // record only once the disclosure is durable (a requested record with no
         // disclosure row is vacuously durable; no requested record adds no key).
         let mut interrupted_compaction_persisted = interrupted_compaction_requested;
+        // An RLM child's inherited helper-model override is its birth row: a resume, an idle
+        // wake or a reopen of the child's own file reads it back (the durable create keys replay
+        // only on a respawn), and a later `set_subagent_model` row supersedes it. A file that
+        // already holds a row keeps it; a failed write fails the create.
+        if !subagent_override.is_empty() && !store.path.as_os_str().is_empty() {
+            let path = store.path.to_string_lossy().to_string();
+            if pa_core::session_engine::helper_model::persisted_session_override(Some(&path))
+                .is_none()
+            {
+                if let Err(error) = store.persist_entry(
+                    "custom",
+                    pa_core::session_engine::helper_model::session_override_row(&subagent_override),
+                ) {
+                    return response_failure(
+                        None,
+                        "create",
+                        &format!("the inherited helper-model override was not saved: {error:#}"),
+                        None,
+                    );
+                }
+            }
+        }
         // The core lock stays inside this block: everything after it may await,
         // and a std MutexGuard must never ride an await point.
         let (summary, rlm_depth) = {
@@ -636,6 +664,7 @@ impl Worker {
             thinking,
             child_script: child_script.clone(),
             semantic_spawn,
+            subagent_override,
         }) {
             return response_failure(None, "create", &error.to_string(), None);
         }

@@ -1123,6 +1123,28 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Fork-only (capability `subagent_model`): the helper model and thinking level the
+    /// session's spawns resolve to when the call names none, with the layer each came from.
+    GetSubagentModelStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Fork-only (capability `subagent_model`): replace the session's helper-model override.
+    /// An absent field leaves it to the settings file; `parent` keeps the parent's value.
+    SetSubagentModel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     RenameSavedSession {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

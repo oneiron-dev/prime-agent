@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use pa_core::kernel::rlm_runtime::create_default_rlm_subagent_session_name;
+use pa_core::session_engine::helper_model::HelperDefaults;
 use pa_core::session_engine::rlm_host::{
     RlmChildResult, RlmCreateSessionHandle, RlmCreateSessionRequest, RlmDeleteSubagentResult,
     RlmHostFuture, RlmSpawnHandle, RlmSpawnRequest, RlmSubagentActivity, RlmSubagentEntry,
@@ -28,10 +29,7 @@ use pa_core::session_engine::rlm_host::{
     rlm_child_session_dir, rlm_depth_limit_error, spawn_name_unavailable_error,
 };
 
-use crate::rlm_child_model::{
-    assert_thinking_supported, cap_text, compact_rlm_text, resolve_child_model, rlm_child_label,
-    ANSWER_TEXT_MAX_CHARS,
-};
+use crate::rlm_child_model::{cap_text, compact_rlm_text, rlm_child_label, ANSWER_TEXT_MAX_CHARS};
 use crate::supervisor_link::SupervisorLink;
 use crate::util::now_ms;
 
@@ -100,6 +98,9 @@ pub struct ParentIdentity {
     pub thinking: Option<String>,
     /// Verification seam: create children with a scripted engine file.
     pub child_script: Option<String>,
+    /// The session override of the helper model (`--subagent-model`, `/subagent-model`, or the
+    /// parent's own override for an RLM child): spawns read it before the settings file.
+    pub subagent_override: HelperDefaults,
 }
 
 impl ParentIdentity {
@@ -782,6 +783,34 @@ impl SupervisorChildSessions {
     /// Panics when the identity mutex is poisoned.
     pub fn set_model(&self, model: String) {
         self.inner.identity.lock().expect("identity lock").model = Some(model);
+    }
+
+    /// The session override of the helper model that spawns read.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the identity mutex is poisoned.
+    #[must_use]
+    pub fn subagent_override(&self) -> HelperDefaults {
+        self.inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .subagent_override
+            .clone()
+    }
+
+    /// Replace the session override of the helper model: the next spawn reads it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the identity mutex is poisoned.
+    pub fn set_subagent_override(&self, layer: HelperDefaults) {
+        self.inner
+            .identity
+            .lock()
+            .expect("identity lock")
+            .subagent_override = layer;
     }
 
     /// Set the session's RLM depth bound: the registry is the bound every

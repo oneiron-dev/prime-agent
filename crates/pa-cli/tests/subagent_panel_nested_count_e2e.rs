@@ -215,6 +215,7 @@ fn children_host(
         session_file: Some(parent.session_file.clone()),
         thinking: None,
         child_script: Some(script.to_string_lossy().to_string()),
+        subagent_override: pa_core::session_engine::helper_model::HelperDefaults::default(),
     });
     sessions
 }

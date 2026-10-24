@@ -6,6 +6,10 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Result};
 use pa_ai::models::{get_supported_thinking_levels, thinking_level_from_str};
 use pa_core::kernel::rlm_runtime::{find_rlm_model_matches, RlmModelInfo};
+use pa_core::session_engine::helper_model::{
+    first_unknown_helper_model, plan_helper, unknown_helper_model_warning, HelperDefaults,
+    HelperSource,
+};
 
 /// Close matches listed in model-resolution errors.
 const MODEL_ERROR_SUGGESTION_LIMIT: usize = 3;
@@ -114,6 +118,159 @@ pub fn resolve_child_model_unchecked(
         _ => {}
     }
     Err(model_unavailable_error(reference, target, &candidates))
+}
+
+/// What one spawn resolves its helper model and thinking from: the call's own values, the
+/// parent's model, and the two default layers (`pa_core::session_engine::helper_model`).
+#[derive(Debug, Clone, Copy)]
+pub struct HelperRequest<'a> {
+    pub model: Option<&'a str>,
+    pub thinking: Option<&'a str>,
+    pub parent_model: Option<&'a str>,
+    /// The parent's thinking level, when the host knows it.
+    pub parent_thinking: Option<&'a str>,
+    /// The session override.
+    pub session: &'a HelperDefaults,
+    /// The settings file (`subagentDefaultModel`/`subagentDefaultThinking`).
+    pub settings: &'a HelperDefaults,
+}
+
+/// A child's model and thinking after the helper order, with the layer each came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedHelper {
+    /// The catalog selector the child runs on.
+    pub selector: String,
+    pub model_source: HelperSource,
+    /// The level the child runs at (clamped to its catalog model); `None` when neither a layer
+    /// nor the parent names one (the child's worker picks its default).
+    pub thinking: Option<String>,
+    pub thinking_source: HelperSource,
+}
+
+/// Resolve a child's model and thinking through the helper order (the spawn call, the session
+/// override, the settings file, the parent), then enforce the daemon `allowedModels` allowlist
+/// on the selector.
+///
+/// # Errors
+/// Returns an error when the spawn call's own model or thinking level does not resolve, when no
+/// model resolves at all, or when the selector is outside the allowlist.
+pub fn resolve_helper(
+    agent_dir: &Path,
+    request: HelperRequest<'_>,
+    target: &str,
+    allowlist: &crate::model_allowlist::DaemonAllowlist,
+) -> Result<ResolvedHelper> {
+    let resolved = resolve_helper_unchecked(agent_dir, request, target)?;
+    crate::model_allowlist::assert_allowed(allowlist, &resolved.selector)?;
+    Ok(resolved)
+}
+
+/// The helper resolution before the allowlist gate (the daemonless print host's entry). The
+/// spawn call's own values keep their strict checks; a default model the catalog does not know
+/// warns once on stderr and falls back to the parent's model; a default thinking level, or the
+/// parent's, clamps to what the resolved model supports.
+///
+/// # Errors
+/// Returns an error when the spawn call's own model or thinking level does not resolve, or when
+/// no model resolves at all.
+pub fn resolve_helper_unchecked(
+    agent_dir: &Path,
+    request: HelperRequest<'_>,
+    target: &str,
+) -> Result<ResolvedHelper> {
+    let plan = plan_helper(
+        request.model,
+        request.thinking,
+        request.session,
+        request.settings,
+    );
+    let parent = || resolve_child_model_unchecked(agent_dir, None, request.parent_model, target);
+    let (selector, model_source) = match (plan.model.value.as_deref(), plan.model.source) {
+        (Some(reference), HelperSource::Spawn) => (
+            resolve_child_model_unchecked(
+                agent_dir,
+                Some(reference),
+                request.parent_model,
+                target,
+            )?,
+            HelperSource::Spawn,
+        ),
+        (Some(reference), source) => {
+            if let Ok(selector) = resolve_child_model_unchecked(
+                agent_dir,
+                Some(reference),
+                request.parent_model,
+                target,
+            ) {
+                (selector, source)
+            } else {
+                if first_unknown_helper_model(reference, source) {
+                    eprintln!("{}", unknown_helper_model_warning(reference, source));
+                }
+                (parent()?, HelperSource::Parent)
+            }
+        }
+        (None, _) => (parent()?, HelperSource::Parent),
+    };
+    let thinking = match (plan.thinking.value, plan.thinking.source) {
+        (Some(level), HelperSource::Spawn) => {
+            assert_thinking_supported(agent_dir, Some(&level), &selector)?;
+            Some(level)
+        }
+        // A default level, else the parent's own, clamps to what the selector's catalog model
+        // supports (the level the child runs at); a model outside the catalog (a scripted
+        // verification model) keeps the level as given.
+        (level, _) => level
+            .or_else(|| request.parent_thinking.map(str::to_string))
+            .map(|level| {
+                let catalog_model = selector.split_once('/').and_then(|(provider, id)| {
+                    crate::state_getters::worker_model_registry(agent_dir)
+                        .get_rlm_searchable_models()
+                        .into_iter()
+                        .find(|model| model.provider == provider && model.id == id)
+                        .cloned()
+                });
+                match (catalog_model, thinking_level_from_str(&level)) {
+                    (Some(model), Some(requested)) => {
+                        pa_ai::models::clamp_thinking_level(&model, requested)
+                            .wire_name()
+                            .to_string()
+                    }
+                    _ => level,
+                }
+            }),
+    };
+    Ok(ResolvedHelper {
+        selector,
+        model_source,
+        thinking,
+        thinking_source: plan.thinking.source,
+    })
+}
+
+/// The startup check of the helper model a session's spawns default to (the session override,
+/// else the settings file): the warning line when the catalog does not know it, `None` when it
+/// does, when none is set, or when this process already warned about it.
+#[must_use]
+pub fn unknown_helper_model_notice(
+    cwd: &Path,
+    agent_dir: &Path,
+    session: &HelperDefaults,
+) -> Option<String> {
+    let settings = HelperDefaults::load_settings(cwd, agent_dir);
+    let plan = plan_helper(None, None, session, &settings);
+    let reference = plan.model.value.as_deref()?;
+    (!helper_model_known(agent_dir, reference)
+        && first_unknown_helper_model(reference, plan.model.source))
+    .then(|| unknown_helper_model_warning(reference, plan.model.source))
+}
+
+/// Whether a default helper model reference resolves against the catalog the spawns use
+/// (`parent` always does).
+#[must_use]
+pub fn helper_model_known(agent_dir: &Path, reference: &str) -> bool {
+    reference == pa_core::session_engine::helper_model::INHERIT_PARENT
+        || resolve_child_model_unchecked(agent_dir, Some(reference), None, "subagent").is_ok()
 }
 
 /// A requested thinking level must be supported by the resolved model;
@@ -608,6 +765,188 @@ mod tests {
         let preview = compact_rlm_text(&long_answer);
         assert_eq!(preview.chars().count(), ANSWER_PREVIEW_MAX_CHARS);
         assert!(preview.ends_with("..."));
+    }
+
+    fn helper_layer(model: Option<&str>, thinking: Option<&str>) -> HelperDefaults {
+        HelperDefaults::new(model, thinking).unwrap()
+    }
+
+    fn helper(
+        dir: &Path,
+        (model, thinking): (Option<&str>, Option<&str>),
+        session: &HelperDefaults,
+        settings: &HelperDefaults,
+    ) -> Result<ResolvedHelper> {
+        resolve_helper(
+            dir,
+            HelperRequest {
+                model,
+                thinking,
+                parent_model: Some("test-provider/glm-5.3"),
+                parent_thinking: None,
+                session,
+                settings,
+            },
+            "subagent",
+            &crate::model_allowlist::DaemonAllowlist::Unrestricted,
+        )
+    }
+
+    /// The helper order per field: the spawn call, the session override, the settings file,
+    /// the parent.
+    #[test]
+    fn an_unpinned_spawn_takes_the_helper_defaults_in_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_catalog(dir.path());
+        let settings = helper_layer(Some("test-provider/glm-5.3-turbo"), Some("max"));
+        let session = helper_layer(Some("test-provider/glm-5.3"), None);
+        let none = HelperDefaults::default();
+        // A spawn without model= gets the settings file's model; the default thinking level
+        // clamps to the non-reasoning catalog model.
+        assert_eq!(
+            helper(dir.path(), (None, None), &none, &settings).unwrap(),
+            ResolvedHelper {
+                selector: "test-provider/glm-5.3-turbo".to_string(),
+                model_source: HelperSource::Settings,
+                thinking: Some("off".to_string()),
+                thinking_source: HelperSource::Settings,
+            }
+        );
+        // The session override beats the settings file, field by field.
+        assert_eq!(
+            helper(dir.path(), (None, None), &session, &settings).unwrap(),
+            ResolvedHelper {
+                selector: "test-provider/glm-5.3".to_string(),
+                model_source: HelperSource::Session,
+                thinking: Some("off".to_string()),
+                thinking_source: HelperSource::Settings,
+            }
+        );
+        // The spawn call's own values beat both.
+        assert_eq!(
+            helper(
+                dir.path(),
+                (Some("glm-5.3-turbo"), Some("off")),
+                &session,
+                &settings
+            )
+            .unwrap(),
+            ResolvedHelper {
+                selector: "test-provider/glm-5.3-turbo".to_string(),
+                model_source: HelperSource::Spawn,
+                thinking: Some("off".to_string()),
+                thinking_source: HelperSource::Spawn,
+            }
+        );
+        // Nothing configured: the parent's model, and the host keeps the parent's level.
+        assert_eq!(
+            helper(dir.path(), (None, None), &none, &none).unwrap(),
+            ResolvedHelper {
+                selector: "test-provider/glm-5.3".to_string(),
+                model_source: HelperSource::Parent,
+                thinking: None,
+                thinking_source: HelperSource::Parent,
+            }
+        );
+    }
+
+    /// An unknown default never fails a spawn: it falls back to the parent's model. The spawn
+    /// call's own model and thinking level keep their strict checks.
+    #[test]
+    fn an_unknown_default_falls_back_to_the_parent_but_a_pinned_one_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_catalog(dir.path());
+        let none = HelperDefaults::default();
+        let unknown = helper_layer(Some("cpa-r/missing-helper"), Some("high"));
+        assert_eq!(
+            helper(dir.path(), (None, None), &none, &unknown).unwrap(),
+            ResolvedHelper {
+                selector: "test-provider/glm-5.3".to_string(),
+                model_source: HelperSource::Parent,
+                thinking: Some("off".to_string()),
+                thinking_source: HelperSource::Settings,
+            }
+        );
+        let error = helper(
+            dir.path(),
+            (Some("cpa-r/missing-helper"), None),
+            &none,
+            &none,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("is unavailable"), "{error}");
+        let error = helper(dir.path(), (None, Some("high")), &none, &none).unwrap_err();
+        assert!(error.to_string().contains("not supported"), "{error}");
+        // `parent` in a default layer pins the parent's model and level past the settings file.
+        let pinned = helper_layer(Some("parent"), Some("parent"));
+        let settings = helper_layer(Some("test-provider/glm-5.3-turbo"), Some("off"));
+        assert_eq!(
+            helper(dir.path(), (None, None), &pinned, &settings).unwrap(),
+            ResolvedHelper {
+                selector: "test-provider/glm-5.3".to_string(),
+                model_source: HelperSource::Parent,
+                thinking: None,
+                thinking_source: HelperSource::Parent,
+            }
+        );
+        // The parent's own level reports the level the child runs at: clamped to the helper's
+        // non-reasoning model.
+        let resolved = resolve_helper_unchecked(
+            dir.path(),
+            HelperRequest {
+                model: None,
+                thinking: None,
+                parent_model: Some("scripted/faux-1"),
+                parent_thinking: Some("high"),
+                session: &HelperDefaults::default(),
+                settings: &helper_layer(Some("test-provider/glm-5.3"), None),
+            },
+            "subagent",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            ResolvedHelper {
+                selector: "test-provider/glm-5.3".to_string(),
+                model_source: HelperSource::Settings,
+                thinking: Some("off".to_string()),
+                thinking_source: HelperSource::Parent,
+            }
+        );
+        assert!(helper_model_known(dir.path(), "parent"));
+        assert!(helper_model_known(
+            dir.path(),
+            "test-provider/glm-5.3-turbo"
+        ));
+        assert!(!helper_model_known(dir.path(), "cpa-r/missing-helper"));
+    }
+
+    /// The daemon allowlist gates the helper model like any resolved model.
+    #[test]
+    fn the_allowlist_refuses_a_helper_model_outside_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_catalog(dir.path());
+        let settings = helper_layer(Some("test-provider/glm-5.3-turbo"), None);
+        let error = resolve_helper(
+            dir.path(),
+            HelperRequest {
+                model: None,
+                thinking: None,
+                parent_model: Some("prime-inference/z-ai/glm-5.3"),
+                parent_thinking: None,
+                session: &HelperDefaults::default(),
+                settings: &settings,
+            },
+            "subagent",
+            &crate::model_allowlist::DaemonAllowlist::Allowed(
+                vec!["prime-inference/*".to_string()],
+            ),
+        )
+        .unwrap_err();
+        let refusal = error
+            .downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
+            .expect("typed refusal");
+        assert_eq!(refusal.selector, "test-provider/glm-5.3-turbo");
     }
 
     #[test]

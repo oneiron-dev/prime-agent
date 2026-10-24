@@ -50,6 +50,15 @@ impl crate::mode::Runtime for PrintRuntime {
             // Runtime failures print themselves and exit non-zero; the typed
             // MissingSubsystem channel stays reserved for unwired subsystems.
             AppMode::Print | AppMode::Json => {
+                // The helper model this run's spawns default to, checked against the catalog
+                // once at startup: an unknown one warns here and its spawns use the parent's.
+                if let Some(warning) = pa_daemon::rlm_child_model::unknown_helper_model_notice(
+                    &options.config.cwd,
+                    &options.config.agent_dir,
+                    &options.config.subagent_override,
+                ) {
+                    eprintln!("{warning}");
+                }
                 let run = match options.headless_hosting {
                     crate::mode::HeadlessHosting::InProcess => run_print_mode(options),
                     crate::mode::HeadlessHosting::Daemon => {

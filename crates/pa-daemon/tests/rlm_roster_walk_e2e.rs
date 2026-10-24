@@ -351,6 +351,7 @@ async fn subscribe_after_spawn_then_shutdown_seeds_the_passive_child() {
         session_file: Some(parent_file.clone()),
         thinking: None,
         child_script: Some(script.to_string_lossy().to_string()),
+        subagent_override: pa_core::session_engine::helper_model::HelperDefaults::default(),
     });
     let handle = children
         .spawn(RlmSpawnRequest {

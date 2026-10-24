@@ -78,6 +78,9 @@ pub struct HostedSessionOptions {
     pub telemetry_disabled: bool,
     /// The session's `--offline`/`--no-skills` policy.
     pub session_policy: SessionPolicy,
+    /// The session's helper-model override (`--subagent-model`/`--subagent-thinking` or their
+    /// env vars): set on the session right after its create, before any prompt.
+    pub subagent_override: pa_core::session_engine::helper_model::HelperDefaults,
 }
 
 /// What the daemon reported for the hosted session.
@@ -194,6 +197,20 @@ impl HostedHeadlessSession {
         ) {
             anyhow::bail!("{refusal}");
         }
+        // A daemon without `subagent_model` would run the session's helpers on the parent's
+        // model: refuse instead of dropping the override.
+        if !options.subagent_override.is_empty()
+            && !self
+                .link
+                .server_capabilities
+                .iter()
+                .any(|capability| capability == pa_types::daemon::SUBAGENT_MODEL_CAPABILITY)
+        {
+            anyhow::bail!(
+                "The running daemon cannot apply --subagent-model/--subagent-thinking to a hosted session (it does not advertise {}); stop it so a current one starts, or run without --daemon-hosted",
+                pa_types::daemon::SUBAGENT_MODEL_CAPABILITY
+            );
+        }
         let policy_supported = self
             .link
             .server_capabilities
@@ -262,6 +279,18 @@ impl HostedHeadlessSession {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| anyhow::anyhow!("Daemon returned an invalid create response"))?;
+        // The override lands before the first prompt and persists in the session file (the
+        // latest explicit choice wins on a resume).
+        if !options.subagent_override.is_empty() {
+            let set = DaemonCommand::SetSubagentModel {
+                id: None,
+                active_session_id: active_session_id.clone(),
+                model: options.subagent_override.model.clone(),
+                thinking: options.subagent_override.thinking.clone(),
+                rest: Map::default(),
+            };
+            success_data(self.link.request(set, REQUEST_BOUND).await?)?;
+        }
         let attach = DaemonCommand::Attach {
             id: None,
             active_session_id: active_session_id.clone(),

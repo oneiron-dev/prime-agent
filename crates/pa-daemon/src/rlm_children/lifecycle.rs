@@ -99,6 +99,11 @@ impl SupervisorChildSessionsInner {
         if let Some(thinking) = thinking {
             config["thinking"] = json!(thinking);
         }
+        // The parent's helper-model override rides down the recursion: the child's own spawns
+        // resolve through it, and the child persists it at birth.
+        if let Some(config) = config.as_object_mut() {
+            identity.subagent_override.write_into(config);
+        }
         if let Some(parent_file) = &identity.session_file {
             config["parentSessionPath"] = json!(parent_file);
         }

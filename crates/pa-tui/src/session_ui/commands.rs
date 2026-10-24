@@ -784,6 +784,10 @@ impl SessionUi {
                 self.handle_rlm_max_depth_command(view, &resolved.args)
                     .await;
             }
+            "subagent-model" => {
+                self.handle_subagent_model_command(view, &resolved.args)
+                    .await;
+            }
             "speed" => {
                 let arg = resolved.args.trim().to_lowercase();
                 if !arg.is_empty() && arg != "on" && arg != "off" {

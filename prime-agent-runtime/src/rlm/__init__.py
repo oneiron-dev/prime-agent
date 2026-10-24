@@ -21,6 +21,7 @@ class RLMSpawnHandle:
     name: str
     session_dir: Path
     model: str
+    thinking: str | None = None
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class RLMCreateSessionHandle:
     name: str
     session_file: Path
     model: str
+    thinking: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,11 +107,13 @@ def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     model = payload.get("model")
     if not all(isinstance(value, str) and value for value in (child_id, name, session_dir, model)):
         raise RuntimeError("rlm.spawn returned an invalid spawn handle")
+    thinking = payload.get("thinking")
     return RLMSpawnHandle(
         rlm_child_id=child_id,
         name=name,
         session_dir=Path(session_dir),
         model=model,
+        thinking=thinking if isinstance(thinking, str) and thinking else None,
     )
 
 
@@ -123,12 +127,14 @@ def _create_session_handle_from_payload(payload: Any) -> RLMCreateSessionHandle:
     model = payload.get("model")
     if not all(isinstance(value, str) and value for value in (active_session_id, session_id, name, session_file, model)):
         raise RuntimeError("rlm.create_session returned an invalid payload structure")
+    thinking = payload.get("thinking")
     return RLMCreateSessionHandle(
         active_session_id=active_session_id,
         session_id=session_id,
         name=name,
         session_file=Path(session_file),
         model=model,
+        thinking=thinking if isinstance(thinking, str) and thinking else None,
     )
 
 
@@ -177,9 +183,13 @@ async def spawn(
     """Spawn a recursive Prime Agent child and return once its task is admitted.
 
     ``name`` is required and must be unique among siblings.
-    ``model`` selects a child with an exact ``provider/model`` selector.
+    ``model`` selects a child with an exact ``provider/model`` selector; omitted, the child runs
+    on the configured helper model (the session's override, then settings
+    ``subagentDefaultModel``), else the parent model.
     ``thinking`` sets the child reasoning level (e.g. 'off', 'low', 'medium', 'high');
-    defaults to the parent level; levels invalid for the resolved model fail the spawn.
+    omitted, the helper thinking level applies (session override, then
+    ``subagentDefaultThinking``), else the parent level; levels invalid for the resolved model
+    fail the spawn. The handle's ``model`` and ``thinking`` report what the child runs on.
     """
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")

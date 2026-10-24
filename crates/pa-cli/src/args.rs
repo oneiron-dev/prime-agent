@@ -144,6 +144,11 @@ pub struct Args {
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
     pub thinking: Option<ModelThinkingLevel>,
+    /// `--subagent-model`: this session's helper model for spawned agents (`provider/model-id`
+    /// or `parent`).
+    pub subagent_model: Option<String>,
+    /// `--subagent-thinking`: this session's helper thinking level (a level or `parent`).
+    pub subagent_thinking: Option<String>,
     pub continue_: bool,
     /// `true` when `--resume` was given without a selector.
     pub resume_bare: bool,
@@ -358,6 +363,20 @@ pub fn parse_args(args: &[String]) -> Args {
                 } else {
                     result.diagnostics.push(Diagnostic::error(format!(
                         "Invalid thinking level \"{level}\". Valid values: {}",
+                        THINKING_LEVELS.join(", ")
+                    )));
+                }
+            }
+            "--subagent-model" => result.subagent_model = Some(require_value!(arg)),
+            "--subagent-thinking" => {
+                let level = require_value!(arg);
+                if level == pa_core::session_engine::helper_model::INHERIT_PARENT
+                    || parse_thinking_level(&level).is_some()
+                {
+                    result.subagent_thinking = Some(level);
+                } else {
+                    result.diagnostics.push(Diagnostic::error(format!(
+                        "Invalid --subagent-thinking level \"{level}\". Valid values: parent, {}",
                         THINKING_LEVELS.join(", ")
                     )));
                 }
@@ -618,6 +637,42 @@ mod tests {
 
     fn error(message: &str) -> Diagnostic {
         Diagnostic::error(message)
+    }
+
+    /// The helper-model flags carry the session's override; an unknown level is an error.
+    #[test]
+    fn subagent_flags_carry_the_helper_override() {
+        let expected = Args {
+            subagent_model: Some("cpa-r/deepseek-flash-1017".to_string()),
+            subagent_thinking: Some("max".to_string()),
+            print: true,
+            messages: vec!["hi".to_string()],
+            ..Args::default()
+        };
+        assert_eq!(
+            format!(
+                "{:?}",
+                parse(&[
+                    "--subagent-model",
+                    "cpa-r/deepseek-flash-1017",
+                    "--subagent-thinking",
+                    "max",
+                    "-p",
+                    "hi"
+                ])
+            ),
+            format!("{expected:?}")
+        );
+        assert_eq!(
+            parse(&["--subagent-thinking", "parent"])
+                .subagent_thinking
+                .as_deref(),
+            Some("parent")
+        );
+        assert_eq!(
+            last_error(&parse(&["--subagent-thinking", "loud"])),
+            "Invalid --subagent-thinking level \"loud\". Valid values: parent, off, minimal, low, medium, high, xhigh, max"
+        );
     }
 
     /// Both syntaxes select the profile on an explicit json run.

@@ -511,6 +511,36 @@ pub trait SessionEngine: Send + Sync {
         let _ = global;
         Ok(json!({ "maxDepth": max_depth, "source": "chat", "globalSaved": false }))
     }
+
+    /// The helper model and thinking level this session's spawns resolve to when the call names
+    /// none (`get_subagent_model_status`): `{ model, modelSource, modelKnown, thinking,
+    /// thinkingSource, session, settings }`. A session without a settings surface (the scripted
+    /// harness engine) answers the parent's values.
+    fn subagent_model_status(&self) -> Value {
+        json!({
+            "model": null,
+            "modelSource": "parent",
+            "modelKnown": null,
+            "thinking": null,
+            "thinkingSource": "parent",
+            "session": {},
+            "settings": {},
+        })
+    }
+
+    /// Replace this session's live helper-model override (`set_subagent_model`; the worker writes
+    /// the durable row under the same lock). Cheap and lock-only: no I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session cannot hold an override.
+    fn set_subagent_model(
+        &self,
+        layer: pa_core::session_engine::helper_model::HelperDefaults,
+    ) -> Result<()> {
+        let _ = layer;
+        anyhow::bail!("This session does not support a helper-model override")
+    }
 }
 
 #[cfg(test)]

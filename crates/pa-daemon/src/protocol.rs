@@ -168,6 +168,9 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "list_persistent_shells",
     "tail_persistent_shell",
     "kill_persistent_shell",
+    // Oneiron fork (capability `subagent_model`): the session's helper-model override.
+    "get_subagent_model_status",
+    "set_subagent_model",
 ];
 
 /// Parsed client command envelope.
@@ -363,6 +366,9 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 // Fork-only (revision 31): the create config's
                 // `offline`/`noSkills` session policy.
                 crate::session_policy::SESSION_POLICY_CAPABILITY,
+                // Fork-only: `get_subagent_model_status`/`set_subagent_model`, the
+                // session's helper-model override.
+                pa_types::daemon::SUBAGENT_MODEL_CAPABILITY,
             ]
             .iter()
             .map(std::string::ToString::to_string),
@@ -866,6 +872,12 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::SetRlmMaxDepth {
             active_session_id, ..
         }
+        | DaemonCommand::GetSubagentModelStatus {
+            active_session_id, ..
+        }
+        | DaemonCommand::SetSubagentModel {
+            active_session_id, ..
+        }
         | DaemonCommand::GetSessionContext {
             active_session_id, ..
         }
@@ -1056,6 +1068,8 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::SetSessionName { .. } => "set_session_name",
         DaemonCommand::GetRlmMaxDepthStatus { .. } => "get_rlm_max_depth_status",
         DaemonCommand::SetRlmMaxDepth { .. } => "set_rlm_max_depth",
+        DaemonCommand::GetSubagentModelStatus { .. } => "get_subagent_model_status",
+        DaemonCommand::SetSubagentModel { .. } => "set_subagent_model",
         DaemonCommand::RenameSavedSession { .. } => "rename_saved_session",
         DaemonCommand::DeleteSavedSession { .. } => "delete_saved_session",
         DaemonCommand::GetSessionContext { .. } => "get_session_context",

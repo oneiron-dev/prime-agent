@@ -58,7 +58,13 @@ fn tabs_partition_the_settings_rows() {
             ),
             (
                 "Models",
-                vec!["thinking", "transport", "default-service-tier"]
+                vec![
+                    "thinking",
+                    "transport",
+                    "default-service-tier",
+                    "subagent-model",
+                    "subagent-thinking"
+                ]
             ),
             (
                 "Display",
@@ -221,6 +227,79 @@ fn enter_opens_the_service_tier_submenu_preselected_and_selection_applies() {
     assert!(text
         .iter()
         .any(|row| row.contains("Enter/Space change · Esc close")));
+}
+
+#[test]
+fn the_helper_model_rows_persist_a_catalog_model_and_a_thinking_level() {
+    let values = SettingsCurrentValues {
+        subagent_model: "cpa-r/deepseek-flash-1017".to_string(),
+        available_helper_models: vec![
+            HELPER_PARENT.to_string(),
+            "cpa-r/deepseek-flash-1017".to_string(),
+            "cpa-r/kimi-k3.1".to_string(),
+        ],
+        subagent_thinking: HELPER_PARENT.to_string(),
+        ..Default::default()
+    };
+    let mut menu = SettingsMenu::new(settings_menu_rows(&values));
+    // 2 jumps to the Models tab; three downs reach the helper-model row
+    // (thinking, transport, default-service-tier, subagent-model).
+    menu.handle_key("2", &kb());
+    for _ in 0..3 {
+        menu.handle_key("down", &kb());
+    }
+    let text = render_text(&menu);
+    assert!(text
+        .iter()
+        .any(|row| row.contains("Helper model") && row.contains("cpa-r/deepseek-flash-1017")));
+    assert_eq!(menu.handle_key("enter", &kb()), SettingsMenuAction::None);
+    let text = render_text(&menu);
+    assert!(text.iter().any(|row| row.contains("Helper Model")));
+    assert!(text
+        .iter()
+        .any(|row| row.contains("parent") && row.contains("The spawning agent's model")));
+    // The submenu preselects the saved model; one down picks the next catalog model.
+    menu.handle_key("down", &kb());
+    assert_eq!(
+        menu.handle_key("enter", &kb()),
+        SettingsMenuAction::Change {
+            id: "subagent-model",
+            value: "cpa-r/kimi-k3.1".to_string()
+        }
+    );
+    // Back on the list: `parent` (no settings default) is the first choice.
+    assert_eq!(menu.handle_key("enter", &kb()), SettingsMenuAction::None);
+    menu.handle_key("down", &kb());
+    assert_eq!(
+        menu.handle_key("enter", &kb()),
+        SettingsMenuAction::Change {
+            id: "subagent-model",
+            value: HELPER_PARENT.to_string()
+        }
+    );
+    // The thinking row cycles from `parent` through the levels in place.
+    menu.handle_key("down", &kb());
+    assert_eq!(
+        menu.handle_key("right", &kb()),
+        SettingsMenuAction::Change {
+            id: "subagent-thinking",
+            value: "off".to_string()
+        }
+    );
+    assert_eq!(
+        menu.handle_key("left", &kb()),
+        SettingsMenuAction::Change {
+            id: "subagent-thinking",
+            value: HELPER_PARENT.to_string()
+        }
+    );
+    assert_eq!(
+        menu.handle_key("left", &kb()),
+        SettingsMenuAction::Change {
+            id: "subagent-thinking",
+            value: "max".to_string()
+        }
+    );
 }
 
 #[test]

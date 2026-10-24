@@ -564,7 +564,7 @@ impl SettingsManager {
         self.merged.default_model.as_deref()
     }
 
-    /// Model for `rlm.spawn` without a pinned model; unset inherits parent.
+    /// Model for `rlm.spawn`/`rlm.create_session` without a pinned model; unset inherits parent.
     #[must_use]
     pub fn get_subagent_default_model(&self) -> Option<String> {
         self.merged
@@ -572,6 +572,40 @@ impl SettingsManager {
             .as_ref()
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty())
+    }
+
+    /// Thinking level for spawns without a pinned level: a level name or `parent`; unset, blank
+    /// or unknown values read as unset (the parent's level).
+    #[must_use]
+    pub fn get_subagent_default_thinking(&self) -> Option<String> {
+        self.merged
+            .subagent_default_thinking
+            .as_ref()
+            .map(|level| level.trim().to_string())
+            .filter(|level| {
+                level == crate::session_engine::helper_model::INHERIT_PARENT
+                    || pa_types::ai::thinking_level_from_str(level).is_some()
+            })
+    }
+
+    /// Set (or, with `None`, remove) the global `subagentDefaultModel`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the global settings file cannot be written.
+    pub fn set_subagent_default_model(&mut self, model: Option<String>) -> Result<()> {
+        self.global.subagent_default_model = model;
+        self.save_global(&["subagentDefaultModel"])
+    }
+
+    /// Set (or, with `None`, remove) the global `subagentDefaultThinking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the global settings file cannot be written.
+    pub fn set_subagent_default_thinking(&mut self, level: Option<String>) -> Result<()> {
+        self.global.subagent_default_thinking = level;
+        self.save_global(&["subagentDefaultThinking"])
     }
 
     #[must_use]

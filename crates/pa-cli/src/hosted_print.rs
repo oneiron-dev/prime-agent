@@ -154,6 +154,7 @@ async fn hosted_print_main(options: &RunOptions) -> Result<i32, String> {
             offline: options.offline,
             no_skills: config.no_skills,
         },
+        subagent_override: config.subagent_override.clone(),
     })
     .await
     .map_err(|error| format!("{error:#}"))?;
