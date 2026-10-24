@@ -442,6 +442,86 @@ fn print_inline_subagents_enforce_the_depth_limit() {
     );
 }
 
+/// The helper model list (settings `subagentModels`) in the in-process host: a spawn naming a
+/// model off the list fails in the agent's tool result, naming the allowed models, and starts no
+/// child; a spawn naming a listed model starts; `rlm.find_models` lists only the listed models.
+#[test]
+fn print_inline_spawns_off_the_helper_model_list_are_refused() {
+    let lane = lane();
+    let kernel = PrintLane::kernel_python();
+    std::fs::write(
+        lane.agent_dir.join("models.json"),
+        serde_json::json!({
+            "providers": {
+                "test-provider": {
+                    "baseUrl": "http://localhost:9",
+                    "apiKey": "test-key",
+                    "api": "openai-completions",
+                    "models": [
+                        { "id": "helper-flash", "name": "Helper", "contextWindow": 1000, "maxTokens": 100 },
+                        { "id": "paid-route", "name": "Paid", "contextWindow": 1000, "maxTokens": 100 }
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        lane.agent_dir.join("settings.json"),
+        serde_json::json!({ "subagentModels": ["test-provider/helper-flash"] }).to_string(),
+    )
+    .unwrap();
+    let cell = "try:\n    await rlm.spawn(\"use the paid route\", name=\"paid\", model=\"test-provider/paid-route\")\n    print(\"PAID_SPAWNED\")\nexcept Exception as error:\n    print(\"PAID_REFUSED:\", error)\nprint(\"ROSTER\", \",\".join(m.selector for m in await rlm.find_models(\"\")))\nkid = await rlm.spawn(\"run the kid task\", name=\"kid\", model=\"test-provider/helper-flash\")\nprint(\"KID\", kid.rlm_child_id)";
+    let script = serde_json::json!({
+        "responses": [
+            { "content": [
+                { "type": "toolCall", "name": "ipython", "arguments": { "code": cell } },
+            ] },
+            "PARENT DONE",
+        ],
+        "repeatLastResponse": true,
+        "children": {
+            "kid": { "responses": ["kid finished"] },
+        },
+    });
+    let (stdout, stderr, code) = lane.run(&["-p", "delegate once"], &script, &kernel, &[]);
+    assert_eq!(code, 0, "stderr: {stderr}\nstdout: {stdout}");
+    assert_eq!(stdout.trim_end(), "PARENT DONE");
+
+    let parent_file = lane.parent_session_file();
+    let parent_text = serde_json::to_string(&PrintLane::entries(&parent_file)).unwrap();
+    assert!(
+        parent_text.contains("PAID_REFUSED:")
+            && parent_text.contains(
+                "is not on the helper model list; use one of: test-provider/helper-flash (or omit model= for the default)"
+            ),
+        "the off-list spawn failed with the refusal: {parent_text}"
+    );
+    // The printed line, not the cell's source.
+    assert!(!parent_text.contains("PAID_SPAWNED\\n"), "{parent_text}");
+    assert!(
+        parent_text.contains("ROSTER test-provider/helper-flash\\n"),
+        "the roster lists only the listed model: {parent_text}"
+    );
+    assert!(
+        parent_text.contains("KID sub-"),
+        "the listed spawn started: {parent_text}"
+    );
+    // One child session: the refused spawn left none.
+    let parent_id = parent_file
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("the parent session id")
+        .to_string();
+    let child_dirs = std::fs::read_dir(lane.agent_dir.join("session-artifacts").join(&parent_id))
+        .expect("the kid's session dir exists")
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("sub-"))
+        .count();
+    assert_eq!(child_dirs, 1);
+}
+
 /// A settled child re-tasked by its parent must keep the run open: the
 /// parent sends the follow-up, ends its turn, and the print run waits
 /// for the re-tasked child's second reply before the terminal answer.

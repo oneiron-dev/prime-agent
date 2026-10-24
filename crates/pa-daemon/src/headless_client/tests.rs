@@ -105,6 +105,7 @@ impl FakeSupervisor {
             telemetry_disabled: false,
             session_policy: SessionPolicy::default(),
             subagent_override: pa_core::session_engine::helper_model::HelperDefaults::default(),
+            enforce_helper_model_list: false,
         }
     }
 
@@ -599,6 +600,25 @@ async fn same_file_resume_attaches_the_live_worker() {
     let (_session, opened) = bounded(HostedHeadlessSession::open(options)).await.unwrap();
     assert_eq!(opened.active_session_id, "live-1");
     assert_eq!(fake.commands(), ["list", "attach"]);
+}
+
+/// A helper model list (global `subagentModels`, or `--subagent-models`): a daemon without
+/// `subagent_models` would ignore it, so the open is refused before any command.
+#[tokio::test]
+async fn a_helper_model_list_needs_the_daemon_capability() {
+    let old = FakeSupervisor::start(Box::new(|kind, _| panic!("unexpected command {kind}")));
+    let error = bounded(HostedHeadlessSession::open(HostedSessionOptions {
+        enforce_helper_model_list: true,
+        ..old.options()
+    }))
+    .await
+    .err()
+    .expect("an older daemon is refused");
+    assert_eq!(
+        error.to_string(),
+        "The running daemon cannot enforce the helper model list (subagentModels, --subagent-models) on a hosted session (it does not advertise subagent_models); stop it so a current one starts, or run without --daemon-hosted"
+    );
+    assert_eq!(old.commands(), Vec::<String>::new());
 }
 
 /// The launch tool selection: an older daemon (no

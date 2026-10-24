@@ -421,7 +421,7 @@ fn the_session_override_beats_the_settings_file_and_reseeds_from_the_session_fil
     .unwrap();
     let engine = AgentSessionEngine::new(AgentEngineConfig {
         cwd: dir.path().to_path_buf(),
-        agent_dir,
+        agent_dir: agent_dir.clone(),
         provider: None,
         model: None,
         api_key: None,
@@ -445,12 +445,72 @@ fn the_session_override_beats_the_settings_file_and_reseeds_from_the_session_fil
             "model": "test-provider/helper-flash",
             "modelSource": "settings",
             "modelKnown": true,
+            "modelAllowed": null,
             "thinking": "high",
             "thinkingSource": "settings",
+            "models": null,
+            "modelsSource": null,
             "session": {},
             "settings": { "model": "test-provider/helper-flash", "thinking": "high" },
         })
     );
+    // A helper model list without the settings default: the status names the list and flags
+    // the default (spawns run on the list's first entry).
+    let with_list = json!({
+        "subagentDefaultModel": "test-provider/helper-flash",
+        "subagentDefaultThinking": "high",
+        "subagentModels": ["test-provider/listed"],
+    });
+    std::fs::write(agent_dir.join("settings.json"), with_list.to_string()).unwrap();
+    let status = crate::engine::SessionEngine::subagent_model_status(&engine);
+    assert_eq!(
+        [
+            &status["models"],
+            &status["modelsSource"],
+            &status["modelAllowed"]
+        ],
+        [
+            &json!(["test-provider/listed"]),
+            &json!("settings"),
+            &json!(false)
+        ]
+    );
+    let children = engine.children.as_ref().unwrap();
+    children.set_model("test-provider/helper-flash".to_string());
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({
+            "subagentDefaultModel": "test-provider/unknown",
+            "subagentDefaultThinking": "high",
+            "subagentModels": ["test-provider/listed", "test-provider/helper-flash"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::engine::SessionEngine::subagent_model_status(&engine),
+        json!({
+            "model": "test-provider/unknown",
+            "modelSource": "settings",
+            "modelKnown": false,
+            "modelAllowed": true,
+            "thinking": "high",
+            "thinkingSource": "settings",
+            "models": ["test-provider/listed", "test-provider/helper-flash"],
+            "modelsSource": "settings",
+            "session": {},
+            "settings": {
+                "model": "test-provider/unknown", "thinking": "high",
+                "models": ["test-provider/listed", "test-provider/helper-flash"],
+            },
+        })
+    );
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({ "subagentDefaultModel": "test-provider/helper-flash", "subagentDefaultThinking": "high" })
+            .to_string(),
+    )
+    .unwrap();
     let unknown = HelperDefaults::new(Some("cpa-r/not-in-catalog"), None).unwrap();
     crate::engine::SessionEngine::set_subagent_model(&engine, unknown.clone()).unwrap();
     assert_eq!(
@@ -459,8 +519,11 @@ fn the_session_override_beats_the_settings_file_and_reseeds_from_the_session_fil
             "model": "cpa-r/not-in-catalog",
             "modelSource": "session",
             "modelKnown": false,
+            "modelAllowed": null,
             "thinking": "high",
             "thinkingSource": "settings",
+            "models": null,
+            "modelsSource": null,
             "session": { "model": "cpa-r/not-in-catalog" },
             "settings": { "model": "test-provider/helper-flash", "thinking": "high" },
         })

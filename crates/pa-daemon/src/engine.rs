@@ -513,19 +513,29 @@ pub trait SessionEngine: Send + Sync {
     }
 
     /// The helper model and thinking level this session's spawns resolve to when the call names
-    /// none (`get_subagent_model_status`): `{ model, modelSource, modelKnown, thinking,
-    /// thinkingSource, session, settings }`. A session without a settings surface (the scripted
-    /// harness engine) answers the parent's values.
+    /// none, and the helper model list they may run on (`get_subagent_model_status`): `{ model,
+    /// modelSource, modelKnown, modelAllowed, thinking, thinkingSource, models, modelsSource,
+    /// session, settings }`. A session without a settings surface (the scripted harness engine)
+    /// answers the parent's values and no list.
     fn subagent_model_status(&self) -> Value {
         json!({
             "model": null,
             "modelSource": "parent",
             "modelKnown": null,
+            "modelAllowed": null,
             "thinking": null,
             "thinkingSource": "parent",
+            "models": null,
+            "modelsSource": null,
             "session": {},
             "settings": {},
         })
+    }
+
+    /// This session's live helper-model override (the layer `set_subagent_model` and
+    /// `set_subagent_models` each replace part of). Lock-only: no I/O.
+    fn subagent_override(&self) -> pa_core::session_engine::helper_model::HelperDefaults {
+        pa_core::session_engine::helper_model::HelperDefaults::default()
     }
 
     /// Replace this session's live helper-model override (`set_subagent_model`; the worker writes

@@ -313,6 +313,12 @@ pub struct Settings {
     /// parent's level. Clamped to what the helper's model supports. Raw text: the getter
     /// validates it.
     pub subagent_default_thinking: Option<String>,
+    /// The helper model list (fork-only): the models ("provider/model-id") spawned agents may run
+    /// on, in order. A spawn call naming another model is refused; a default or parent model
+    /// outside it falls to the first entry. Raw JSON (an array of strings, or one comma-separated
+    /// string) so a malformed entry drops alone instead of the whole list; the getter validates.
+    /// Absent or empty: no limit.
+    pub subagent_models: Option<serde_json::Value>,
     pub update_channel: Option<UpdateChannel>,
     pub recent_models: Option<Vec<String>>,
     pub auxiliary_model: Option<String>,

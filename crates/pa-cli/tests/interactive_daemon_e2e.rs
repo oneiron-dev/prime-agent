@@ -4864,6 +4864,7 @@ fn subscription_options(
         thinking: None,
         subagent_model: None,
         subagent_thinking: None,
+        subagent_models: None,
     };
     options.provider_auth = Some(pa_tui::provider_auth::ProviderAuthCommandsHandle(
         std::sync::Arc::new(E2ESubscriptionAuth),

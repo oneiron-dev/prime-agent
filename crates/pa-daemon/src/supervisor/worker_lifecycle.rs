@@ -323,6 +323,7 @@ impl Supervisor {
             // The helper-model override an RLM parent passes down.
             pa_core::session_engine::helper_model::SUBAGENT_MODEL_CONFIG_KEY,
             pa_core::session_engine::helper_model::SUBAGENT_THINKING_CONFIG_KEY,
+            pa_core::session_engine::helper_model::SUBAGENT_MODELS_CONFIG_KEY,
         ] {
             if let Some(value) = config_object.and_then(|config| config.get(key)) {
                 durable_rest.insert(key.to_string(), value.clone());

@@ -240,9 +240,10 @@ async fn run_agents_view_flow(
     notice: Option<String>,
 ) -> Result<()> {
     // The launch helper-model override belongs to the session the launch opened; a session
-    // opened from the view keeps its own (`/subagent-model` changes it there).
+    // opened from the view keeps its own (`/subagent-model`/`/subagent-models` change it there).
     base.model_selection.subagent_model = None;
     base.model_selection.subagent_thinking = None;
+    base.model_selection.subagent_models = None;
     let mut anchor = anchor;
     // Every view run reuses the roster connection (a chat run hands it
     // back), so a switch back from a chat skips the handshake.
@@ -496,6 +497,7 @@ fn build_tui_options(
             // The launch helper-model override, set on the opened session.
             subagent_model: config.subagent_override.model.clone(),
             subagent_thinking: config.subagent_override.thinking.clone(),
+            subagent_models: config.subagent_override.models.clone(),
         },
         // The raw `--models` patterns ride the create config (the daemon
         // owns the resolution).

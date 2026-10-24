@@ -637,8 +637,11 @@ impl SupervisorChildSessions {
             .rlm_max_depth
     }
 
-    /// Test-only read of the identity's model selector (for the regression test).
-    #[cfg(test)]
+    /// The identity's model selector: the parent's model a spawn inherits.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the identity mutex is poisoned.
     pub(crate) fn parent_model(&self) -> Option<String> {
         self.inner
             .identity

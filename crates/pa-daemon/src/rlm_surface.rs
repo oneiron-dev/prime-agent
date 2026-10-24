@@ -1,6 +1,6 @@
 //! The RLM child-management surface: the worker arms for
 //! `cancel_rlm_child`, `delete_rlm_subagent`, and `set_rlm_max_depth`,
-//! plus the fork's `get_subagent_model_status`/`set_subagent_model`.
+//! plus the fork's `get_subagent_model_status`/`set_subagent_model`/`set_subagent_models`.
 //! Each handler answers the exact TS wire shape; the behavior lives in
 //! the engine seams and the supervisor-backed children registry.
 
@@ -116,9 +116,10 @@ impl Worker {
         }
     }
 
-    /// `set_subagent_model` (fork-only): replace this session's helper-model override with
-    /// `{ model, thinking }` (an absent or null field leaves it to the settings file; `parent`
-    /// keeps the parent's value) and answer the resulting status. The override persists as a
+    /// `set_subagent_model` (fork-only): replace the model and thinking level of this session's
+    /// helper-model override with `{ model, thinking }` (an absent or null field leaves it to the
+    /// settings file; `parent` keeps the parent's value) and answer the resulting status; the
+    /// session's helper model list additions stay. The override persists as a
     /// `subagent_model_state` row in the session file; an unknown model is kept and reported as
     /// `modelKnown: false`.
     pub(crate) async fn handle_set_subagent_model(&self, payload: &Value) -> DaemonResponse {
@@ -133,6 +134,51 @@ impl Worker {
             Ok(layer) => layer,
             Err(error) => return response_failure(None, "set_subagent_model", &error, None),
         };
+        self.apply_subagent_override("set_subagent_model", |current| {
+            layer.with_models(current.models)
+        })
+        .await
+    }
+
+    /// `set_subagent_models` (fork-only): replace this session's additions to the helper model
+    /// list with `{ models }` (an empty or absent list clears them) and answer the resulting
+    /// status; the override's model and thinking level stay. Persisted like
+    /// `set_subagent_model`.
+    pub(crate) async fn handle_set_subagent_models(&self, payload: &Value) -> DaemonResponse {
+        if let Err(response) = self.require_created("set_subagent_models") {
+            return response;
+        }
+        let models: Vec<String> = match payload.get("models") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(entries)) if entries.iter().all(Value::is_string) => entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            Some(_) => {
+                return response_failure(
+                    None,
+                    "set_subagent_models",
+                    "set_subagent_models models must be an array of strings",
+                    None,
+                )
+            }
+        };
+        self.apply_subagent_override("set_subagent_models", |current| {
+            current.with_models(Some(models))
+        })
+        .await
+    }
+
+    /// Replace this session's helper-model override with `compose(current)` and answer the
+    /// resulting status.
+    async fn apply_subagent_override(
+        &self,
+        command: &'static str,
+        compose: impl FnOnce(
+            pa_core::session_engine::helper_model::HelperDefaults,
+        ) -> pa_core::session_engine::helper_model::HelperDefaults,
+    ) -> DaemonResponse {
         // The live override and its durable row change together under the core lock, so
         // concurrent setters (and a session replacement's store swap) leave the latest row equal
         // to the live value. The row goes to the worker-owned session file (a cleared override is
@@ -140,15 +186,16 @@ impl Worker {
         // file keeps the override for this worker only.
         {
             let mut core = self.core.lock().unwrap();
+            let layer = compose(self.engine.subagent_override());
             let row = pa_core::session_engine::helper_model::session_override_row(&layer);
             if let Err(error) = self.engine.set_subagent_model(layer) {
-                return response_failure(None, "set_subagent_model", &error.to_string(), None);
+                return response_failure(None, command, &error.to_string(), None);
             }
             if let Some(store) = core.store.as_mut() {
                 if let Err(error) = store.persist_entry("custom", row) {
                     return response_failure(
                         None,
-                        "set_subagent_model",
+                        command,
                         &format!(
                             "the helper model applies to this worker but was not saved: {error}"
                         ),
@@ -165,13 +212,13 @@ impl Worker {
             Err(error) => {
                 return response_failure(
                     None,
-                    "set_subagent_model",
+                    command,
                     &format!("helper model status task failed: {error}"),
                     None,
                 )
             }
         };
-        response_success(None, "set_subagent_model", Some(status))
+        response_success(None, command, Some(status))
     }
 }
 
@@ -331,8 +378,84 @@ mod tests {
                     entry["data"]["thinking"].as_str(),
                 )
                 .unwrap()
+                .with_models(serde_json::from_value(entry["data"]["models"].clone()).ok())
             })
             .collect()
+    }
+
+    /// `set_subagent_models` replaces only the session's additions to the helper model list and
+    /// `set_subagent_model` only the model and thinking level; each row carries the whole
+    /// override, and the status names the active list and where it came from.
+    #[tokio::test]
+    async fn the_list_and_the_model_override_replace_only_their_own_fields() {
+        use pa_core::session_engine::helper_model::HelperDefaults;
+        let root = std::env::temp_dir().join(format!("pa-worker-list-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("agent")).unwrap();
+        std::fs::write(
+            root.join("agent").join("settings.json"),
+            json!({ "subagentModels": ["cpa-r/deepseek-flash-1017"] }).to_string(),
+        )
+        .unwrap();
+        let worker = agent_worker_at(&root, &json!({})).await;
+        let set_models = |models: Value| {
+            let worker = Arc::clone(&worker);
+            async move {
+                let mut payload = json!({ "activeSessionId": "helper-session" });
+                payload["models"] = models;
+                worker.dispatch("set_subagent_models", &payload).await
+            }
+        };
+        let widened = set_models(json!(["cpa-a/gpt-6", " cpa-a/gpt-6 "])).await;
+        assert!(widened.success, "{widened:?}");
+        let status = widened.data.unwrap();
+        assert_eq!(
+            [
+                &status["models"],
+                &status["modelsSource"],
+                &status["session"]
+            ],
+            [
+                &json!(["cpa-r/deepseek-flash-1017", "cpa-a/gpt-6"]),
+                &json!("settings+session"),
+                &json!({ "models": ["cpa-a/gpt-6"] })
+            ]
+        );
+        let set = worker
+            .dispatch(
+                "set_subagent_model",
+                &json!({ "activeSessionId": "helper-session", "model": "parent", "thinking": "max" }),
+            )
+            .await;
+        assert_eq!(
+            set.data.map(|status| status["session"].clone()),
+            Some(json!({ "model": "parent", "thinking": "max", "models": ["cpa-a/gpt-6"] }))
+        );
+        let cleared = set_models(Value::Null).await;
+        let status = cleared.data.unwrap();
+        assert_eq!(
+            [
+                &status["models"],
+                &status["modelsSource"],
+                &status["session"]
+            ],
+            [
+                &json!(["cpa-r/deepseek-flash-1017"]),
+                &json!("settings"),
+                &json!({ "model": "parent", "thinking": "max" })
+            ]
+        );
+        let invalid = set_models(json!("cpa-a/gpt-6")).await;
+        assert!(!invalid.success);
+        let pinned = HelperDefaults::new(Some("parent"), Some("max")).unwrap();
+        let gpt = Some(vec!["cpa-a/gpt-6".to_string()]);
+        assert_eq!(
+            override_rows(&root),
+            vec![
+                HelperDefaults::default().with_models(gpt.clone()),
+                pinned.clone().with_models(gpt),
+                pinned,
+            ]
+        );
     }
 
     /// `set_subagent_model` writes its row to the worker-owned session file (the row a resume,

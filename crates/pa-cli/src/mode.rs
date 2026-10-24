@@ -93,7 +93,8 @@ pub struct RuntimeConfig {
     pub serialized_refine: bool,
     pub initial_goal: Option<InitialGoal>,
     /// The session's helper-model override for spawned agents: `--subagent-model`/
-    /// `--subagent-thinking`, else `PRIME_SUBAGENT_MODEL`/`PRIME_SUBAGENT_THINKING`.
+    /// `--subagent-thinking`/`--subagent-models`, else `PRIME_SUBAGENT_MODEL`/
+    /// `PRIME_SUBAGENT_THINKING`/`PRIME_SUBAGENT_MODELS`.
     pub subagent_override: pa_core::session_engine::helper_model::HelperDefaults,
 }
 
@@ -387,21 +388,27 @@ pub fn runtime_config_from_args(
         }),
         subagent_override: {
             use pa_core::session_engine::helper_model::{
-                HelperDefaults, SUBAGENT_MODEL_ENV, SUBAGENT_THINKING_ENV,
+                parse_model_list, HelperDefaults, SUBAGENT_MODELS_ENV, SUBAGENT_MODEL_ENV,
+                SUBAGENT_THINKING_ENV,
             };
             // Each flag beats its env var; an invalid env level warns and is ignored.
             let env_model = std::env::var(SUBAGENT_MODEL_ENV).ok();
             let env_thinking = std::env::var(SUBAGENT_THINKING_ENV).ok();
+            let env_models = std::env::var(SUBAGENT_MODELS_ENV)
+                .ok()
+                .map(|text| parse_model_list(&text));
             let env_layer = HelperDefaults::new(env_model.as_deref(), env_thinking.as_deref())
                 .unwrap_or_else(|error| {
                     eprintln!("Warning: {SUBAGENT_THINKING_ENV}: {error}");
                     HelperDefaults::new(env_model.as_deref(), None).unwrap_or_default()
-                });
+                })
+                .with_models(env_models);
             HelperDefaults::new(
                 parsed.subagent_model.as_deref(),
                 parsed.subagent_thinking.as_deref(),
             )
             .unwrap_or_default()
+            .with_models(parsed.subagent_models.clone())
             .or(&env_layer)
         },
     }
@@ -447,17 +454,20 @@ pub(crate) mod tests {
     #[test]
     fn subagent_flags_beat_their_env_vars_field_by_field() {
         use pa_core::session_engine::helper_model::{
-            HelperDefaults, SUBAGENT_MODEL_ENV, SUBAGENT_THINKING_ENV,
+            HelperDefaults, SUBAGENT_MODELS_ENV, SUBAGENT_MODEL_ENV, SUBAGENT_THINKING_ENV,
         };
-        let resolve = |argv: &[&str], model: Option<&str>, thinking: Option<&str>| {
-            let saved: Vec<(&str, Option<String>)> = [SUBAGENT_MODEL_ENV, SUBAGENT_THINKING_ENV]
+        // `env` holds the model, thinking and models env values.
+        let resolve = |argv: &[&str], env: [Option<&str>; 3]| {
+            let keys = [
+                SUBAGENT_MODEL_ENV,
+                SUBAGENT_THINKING_ENV,
+                SUBAGENT_MODELS_ENV,
+            ];
+            let saved: Vec<(&str, Option<String>)> = keys
                 .iter()
                 .map(|key| (*key, std::env::var(key).ok()))
                 .collect();
-            for (key, value) in [
-                (SUBAGENT_MODEL_ENV, model),
-                (SUBAGENT_THINKING_ENV, thinking),
-            ] {
+            for (key, value) in keys.into_iter().zip(env) {
                 match value {
                     Some(value) => std::env::set_var(key, value),
                     None => std::env::remove_var(key),
@@ -483,40 +493,53 @@ pub(crate) mod tests {
         let layer = |model: Option<&str>, thinking: Option<&str>| {
             HelperDefaults::new(model, thinking).unwrap()
         };
+        let models = |models: &[&str]| Some(models.iter().map(ToString::to_string).collect());
         assert_eq!(
             resolve(
                 &["-p", "hi"],
-                Some("cpa-r/deepseek-flash-1017"),
-                Some("max")
+                [
+                    Some("cpa-r/deepseek-flash-1017"),
+                    Some("max"),
+                    Some("cpa-a/gpt-6, cpa-a/claude-opus-5")
+                ]
             ),
             layer(Some("cpa-r/deepseek-flash-1017"), Some("max"))
+                .with_models(models(&["cpa-a/gpt-6", "cpa-a/claude-opus-5"]))
         );
         assert_eq!(
             resolve(
-                &["--subagent-model", "cpa-r/kimi-k3.1", "-p", "hi"],
-                Some("cpa-r/deepseek-flash-1017"),
-                Some("max")
+                &[
+                    "--subagent-model",
+                    "cpa-r/kimi-k3.1",
+                    "--subagent-models",
+                    "cpa-a/gpt-6",
+                    "-p",
+                    "hi"
+                ],
+                [
+                    Some("cpa-r/deepseek-flash-1017"),
+                    Some("max"),
+                    Some("cpa-a/claude-opus-5")
+                ]
             ),
-            layer(Some("cpa-r/kimi-k3.1"), Some("max"))
+            layer(Some("cpa-r/kimi-k3.1"), Some("max")).with_models(models(&["cpa-a/gpt-6"]))
         );
         assert_eq!(
             resolve(
                 &["--subagent-thinking", "parent", "-p", "hi"],
-                None,
-                Some("max")
+                [None, Some("max"), None]
             ),
             layer(None, Some("parent"))
         );
         assert_eq!(
             resolve(
                 &["-p", "hi"],
-                Some("cpa-r/deepseek-flash-1017"),
-                Some("loud")
+                [Some("cpa-r/deepseek-flash-1017"), Some("loud"), None]
             ),
             layer(Some("cpa-r/deepseek-flash-1017"), None)
         );
         assert_eq!(
-            resolve(&["-p", "hi"], None, None),
+            resolve(&["-p", "hi"], [None, None, None]),
             HelperDefaults::default()
         );
     }

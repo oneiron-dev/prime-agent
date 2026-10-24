@@ -686,6 +686,122 @@ async fn an_unpinned_spawn_runs_on_the_helper_model() {
     children.notify_turn_done();
 }
 
+/// The helper model list (settings `subagentModels`): a spawn naming a model off the list is
+/// refused with the allowed models named and starts no child; a listed model starts; an unpinned
+/// spawn whose parent model is off the list runs on the list's first entry; a person's session
+/// additions widen the list. `rlm.create_session` checks the same list.
+#[tokio::test]
+async fn a_spawn_off_the_helper_model_list_is_refused() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    std::fs::write(
+        agent_dir.join("models.json"),
+        json!({
+            "providers": {
+                "test-provider": {
+                    "baseUrl": "http://localhost:9",
+                    "apiKey": "test-key",
+                    "api": "openai-completions",
+                    "models": [
+                        { "id": "helper-flash", "name": "Helper", "contextWindow": 1000, "maxTokens": 100 },
+                        { "id": "helper-pro", "name": "Helper Pro", "contextWindow": 1000, "maxTokens": 100 },
+                        { "id": "paid-route", "name": "Paid", "contextWindow": 1000, "maxTokens": 100 }
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("models.json");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({ "subagentModels": ["test-provider/helper-flash", "test-provider/helper-pro"] })
+            .to_string(),
+    )
+    .expect("settings.json");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let script = write_script(dir.path(), "helper answer");
+    let children = children(&socket, &agent_dir, &script, 0);
+
+    let error = children
+        .spawn(RlmSpawnRequest {
+            model: Some("test-provider/paid-route".to_string()),
+            ..spawn_request("paid", "use the paid route")
+        })
+        .await
+        .expect_err("a model off the list is refused");
+    assert_eq!(
+        error.to_string(),
+        "Requested subagent model \"test-provider/paid-route\" is not on the helper model list; use one of: test-provider/helper-flash, test-provider/helper-pro (or omit model= for the default)"
+    );
+    assert!(
+        children.list_subagents().await.expect("roster").is_empty(),
+        "a refused spawn starts no child"
+    );
+
+    let handle = children
+        .spawn(RlmSpawnRequest {
+            model: Some("test-provider/helper-pro".to_string()),
+            ..spawn_request("listed", "use a listed model")
+        })
+        .await
+        .expect("a listed model starts");
+    assert_eq!(handle.model, "test-provider/helper-pro");
+    // The parent's model (`scripted/faux-1`) is off the list: the list's first entry.
+    let handle = children
+        .spawn(spawn_request("unpinned", "use the default"))
+        .await
+        .expect("an unpinned spawn starts");
+    assert_eq!(handle.model, "test-provider/helper-flash");
+
+    let error = children
+        .create_session(RlmCreateSessionRequest {
+            prompt: "use the paid route".to_string(),
+            name: None,
+            model: Some("test-provider/paid-route".to_string()),
+            thinking: None,
+            cwd: None,
+        })
+        .await
+        .expect_err("create_session checks the list too");
+    assert!(
+        error
+            .to_string()
+            .starts_with("Requested top-level session model \"test-provider/paid-route\" is not on the helper model list"),
+        "{error}"
+    );
+
+    // A person's addition widens the list for this session: the roster and the spawn agree.
+    children.set_subagent_override(
+        pa_core::session_engine::helper_model::HelperDefaults::default()
+            .with_models(Some(vec!["test-provider/paid-route".to_string()])),
+    );
+    let list = children
+        .helper_model_list()
+        .await
+        .expect("list")
+        .expect("a list is set");
+    assert_eq!(
+        list.entries(),
+        [
+            "test-provider/helper-flash",
+            "test-provider/helper-pro",
+            "test-provider/paid-route"
+        ]
+    );
+    let handle = children
+        .spawn(RlmSpawnRequest {
+            model: Some("test-provider/paid-route".to_string()),
+            ..spawn_request("widened", "use the person's addition")
+        })
+        .await
+        .expect("a person's addition starts");
+    assert_eq!(handle.model, "test-provider/paid-route");
+    children.notify_turn_done();
+}
+
 /// TS #2396's daemon-wide half: the supervisor holds a subagent spawn's name under a
 /// reservation for the whole fresh-launch admission; once the winner is gone, the name
 /// admits again.

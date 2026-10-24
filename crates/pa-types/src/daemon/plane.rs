@@ -91,6 +91,7 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         // Oneiron fork: the helper-model override serves one session.
         | "get_subagent_model_status"
         | "set_subagent_model"
+        | "set_subagent_models"
         | "get_session_context"
         | "get_session_tree"
         | "get_user_messages_for_forking"

@@ -1145,6 +1145,18 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Fork-only (capability `subagent_models`): replace the session's additions to the helper
+    /// model list (settings `subagentModels`). An empty list clears them; the override's model
+    /// and thinking level stay.
+    SetSubagentModels {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default)]
+        models: Vec<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     RenameSavedSession {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

@@ -35,6 +35,10 @@ pub trait ClientSettings: Send + Sync {
     fn subagent_default_thinking(&self) -> Option<String> {
         None
     }
+    /// `subagentModels`: the helper model list spawned agents may run on; `None` is no limit.
+    fn subagent_models(&self) -> Option<Vec<String>> {
+        None
+    }
     /// Persist (or, with `None`, remove) `subagentDefaultThinking` globally.
     ///
     /// # Errors

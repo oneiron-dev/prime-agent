@@ -149,6 +149,8 @@ pub struct Args {
     pub subagent_model: Option<String>,
     /// `--subagent-thinking`: this session's helper thinking level (a level or `parent`).
     pub subagent_thinking: Option<String>,
+    /// `--subagent-models a,b`: this session's additions to the helper model list.
+    pub subagent_models: Option<Vec<String>>,
     pub continue_: bool,
     /// `true` when `--resume` was given without a selector.
     pub resume_bare: bool,
@@ -368,6 +370,11 @@ pub fn parse_args(args: &[String]) -> Args {
                 }
             }
             "--subagent-model" => result.subagent_model = Some(require_value!(arg)),
+            "--subagent-models" => {
+                result.subagent_models = Some(
+                    pa_core::session_engine::helper_model::parse_model_list(&require_value!(arg)),
+                );
+            }
             "--subagent-thinking" => {
                 let level = require_value!(arg);
                 if level == pa_core::session_engine::helper_model::INHERIT_PARENT
@@ -645,6 +652,10 @@ mod tests {
         let expected = Args {
             subagent_model: Some("cpa-r/deepseek-flash-1017".to_string()),
             subagent_thinking: Some("max".to_string()),
+            subagent_models: Some(vec![
+                "cpa-a/claude-opus-5".to_string(),
+                "cpa-a/gpt-6".to_string(),
+            ]),
             print: true,
             messages: vec!["hi".to_string()],
             ..Args::default()
@@ -657,6 +668,8 @@ mod tests {
                     "cpa-r/deepseek-flash-1017",
                     "--subagent-thinking",
                     "max",
+                    "--subagent-models",
+                    "cpa-a/claude-opus-5, cpa-a/gpt-6",
                     "-p",
                     "hi"
                 ])

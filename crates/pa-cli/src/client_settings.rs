@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 use pa_tui::client_settings::ClientSettings;
 
+#[cfg(all(test, unix))]
+mod helper_launch_tests;
+
 /// The seam handle the interactive run carries.
 #[derive(Clone)]
 pub struct CliClientSettings {
@@ -112,6 +115,10 @@ impl ClientSettings for CliClientSettings {
 
     fn subagent_default_thinking(&self) -> Option<String> {
         self.manager().get_subagent_default_thinking()
+    }
+
+    fn subagent_models(&self) -> Option<Vec<String>> {
+        self.manager().get_subagent_models()
     }
 
     fn set_subagent_default_thinking(&self, level: Option<&str>) -> Result<()> {

@@ -588,6 +588,23 @@ impl SettingsManager {
             })
     }
 
+    /// The helper model list (`subagentModels`): the models spawned agents may run on, trimmed,
+    /// blanks, non-strings and repeats dropped. Global scope only, like `allowedModels`: a project
+    /// file (which an agent can write) cannot widen it. `None` (absent, or a list that trims to
+    /// empty) is no limit.
+    #[must_use]
+    pub fn get_subagent_models(&self) -> Option<Vec<String>> {
+        use crate::session_engine::helper_model::{normalize_model_list, parse_model_list};
+        let models = match self.global.subagent_models.as_ref()? {
+            serde_json::Value::Array(entries) => {
+                normalize_model_list(entries.iter().filter_map(serde_json::Value::as_str))
+            }
+            serde_json::Value::String(text) => parse_model_list(text),
+            _ => Vec::new(),
+        };
+        (!models.is_empty()).then_some(models)
+    }
+
     /// Set (or, with `None`, remove) the global `subagentDefaultModel`.
     ///
     /// # Errors
