@@ -475,6 +475,36 @@ fn the_session_override_beats_the_settings_file_and_reseeds_from_the_session_fil
             &json!(false)
         ]
     );
+    let children = engine.children.as_ref().unwrap();
+    children.set_model("test-provider/helper-flash".to_string());
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({
+            "subagentDefaultModel": "test-provider/unknown",
+            "subagentDefaultThinking": "high",
+            "subagentModels": ["test-provider/listed", "test-provider/helper-flash"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::engine::SessionEngine::subagent_model_status(&engine),
+        json!({
+            "model": "test-provider/unknown",
+            "modelSource": "settings",
+            "modelKnown": false,
+            "modelAllowed": true,
+            "thinking": "high",
+            "thinkingSource": "settings",
+            "models": ["test-provider/listed", "test-provider/helper-flash"],
+            "modelsSource": "settings",
+            "session": {},
+            "settings": {
+                "model": "test-provider/unknown", "thinking": "high",
+                "models": ["test-provider/listed", "test-provider/helper-flash"],
+            },
+        })
+    );
     std::fs::write(
         agent_dir.join("settings.json"),
         json!({ "subagentDefaultModel": "test-provider/helper-flash", "subagentDefaultThinking": "high" })

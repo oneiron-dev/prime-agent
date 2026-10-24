@@ -905,7 +905,6 @@ impl SessionUi {
                 StatusKind::Warning,
                 view,
             );
-            return;
         }
         let model = self.model_selection.subagent_model.clone();
         let thinking = self.model_selection.subagent_thinking.clone();
@@ -1023,7 +1022,7 @@ impl SessionUi {
             if status.get("modelAllowed").and_then(Value::as_bool) == Some(false) {
                 self.note_as(
                     &format!(
-                        "The spawns' default model ({model}) is not on the helper model list; spawned agents use {first}"
+                        "The resolved default helper model is not on the helper model list; spawned agents use {first}"
                     ),
                     StatusKind::Warning,
                     view,
@@ -1033,7 +1032,7 @@ impl SessionUi {
         if status.get("modelKnown").and_then(Value::as_bool) == Some(false) {
             self.note_as(
                 &format!(
-                    "Helper model {model} is not in the model catalog; spawned agents use the parent's model"
+                    "Helper model {model} is not in the model catalog; spawned agents fall back to the parent's model, subject to the helper model list"
                 ),
                 StatusKind::Warning,
                 view,

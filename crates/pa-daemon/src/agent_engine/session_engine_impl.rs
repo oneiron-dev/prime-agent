@@ -1370,24 +1370,27 @@ impl SessionEngine for AgentSessionEngine {
         let list = crate::rlm_child_model::helper_model_list(agent_dir, &session, &settings);
         // Whether the model the spawns default to is on the list (`null` without a list, or when
         // the parent's model is unknown); off it, they run on the list's first entry.
+        let parent_model = self
+            .children
+            .as_ref()
+            .and_then(|children| children.parent_model());
         let model_allowed = list.as_ref().and_then(|list| match plan.model.source {
-            HelperSource::Session => Some(true),
-            HelperSource::Settings => plan.model.value.as_deref().map(|reference| {
-                list.allows(
-                    &crate::rlm_child_model::resolve_child_model_unchecked(
-                        &self.config.agent_dir,
-                        Some(reference),
-                        None,
-                        "subagent",
-                    )
-                    .unwrap_or_else(|_| reference.to_string()),
+            HelperSource::Session if model_known != Some(false) => Some(true),
+            HelperSource::Settings => plan.model.value.as_deref().and_then(|reference| {
+                crate::rlm_child_model::resolve_child_model_unchecked(
+                    &self.config.agent_dir,
+                    Some(reference),
+                    parent_model.as_deref(),
+                    "subagent",
                 )
+                .ok()
+                .or_else(|| parent_model.clone())
+                .map(|model| list.allows(&model))
             }),
-            HelperSource::Parent | HelperSource::Spawn | HelperSource::List => self
-                .children
-                .as_ref()
-                .and_then(|children| children.parent_model())
-                .map(|model| list.allows(&model)),
+            HelperSource::Session
+            | HelperSource::Parent
+            | HelperSource::Spawn
+            | HelperSource::List => parent_model.as_deref().map(|model| list.allows(model)),
         });
         json!({
             "model": plan.model.value,

@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 use pa_tui::client_settings::ClientSettings;
 
+#[cfg(all(test, unix))]
+mod helper_launch_tests;
+
 /// The seam handle the interactive run carries.
 #[derive(Clone)]
 pub struct CliClientSettings {
