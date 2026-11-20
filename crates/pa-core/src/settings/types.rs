@@ -293,9 +293,16 @@ pub enum McpServerConfig {
     },
 }
 
-/// The default per-cell watchdog budget for user `python_repl` cells: 60
-/// seconds.
-pub const DEFAULT_PYTHON_CELL_TIMEOUT_MS: u64 = 60_000;
+/// The default time limit for user `python_repl` cells: 30 minutes in the
+/// Oneiron build (upstream: 60 seconds), long enough for a sanctioned long
+/// `await bash()` in a print-mode leg, short enough that a spinning cell
+/// cannot hold a leg for hours.
+pub const DEFAULT_PYTHON_CELL_TIMEOUT_MS: u64 = 1_800_000;
+
+/// The environment variable that sets the default `python_repl` cell time
+/// limit in whole seconds, over the `pythonCellTimeoutMs` setting; `0` means
+/// no limit. A value that does not parse is ignored.
+pub const PYTHON_CELL_TIMEOUT_ENV: &str = "PRIME_AGENT_REPL_CELL_TIMEOUT_S";
 
 /// The settings document: every known field optional; unknown keys preserved.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -345,9 +352,10 @@ pub struct Settings {
     /// session model does not accept image input. Default: none - image turns on a text-only model
     /// fail with a configuration hint instead of silently dropping the images.
     pub image_model: Option<String>,
-    /// Per-cell watchdog budget for user `python_repl` cells, in milliseconds
-    /// (default [`DEFAULT_PYTHON_CELL_TIMEOUT_MS`]; `0` disables). Daemonless
-    /// sessions never arm it.
+    /// Default time limit for user `python_repl` cells, in milliseconds
+    /// (default [`DEFAULT_PYTHON_CELL_TIMEOUT_MS`]; `0` disables). A cell
+    /// running longer is interrupted; the model can pass a per-call
+    /// `timeout` instead. [`PYTHON_CELL_TIMEOUT_ENV`] overrides it.
     pub python_cell_timeout_ms: Option<u64>,
     pub autonomous: Option<AutonomousSettings>,
     /// Custom shell that runs every kernel `bash()` and user-bash command as

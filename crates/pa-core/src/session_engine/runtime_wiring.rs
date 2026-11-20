@@ -333,8 +333,8 @@ pub fn kernel_provisioner(wiring: KernelProvisionerWiring<'_>) -> Arc<KernelProv
             // Only persistent sessions (which have an artifact dir) get
             // a revivable snapshot (TS `snapshotDir`).
             snapshot_dir: session_artifact_dir,
-            // The engine-resolved watchdog budget (`None`: daemonless or
-            // disabled; the runtime bootstrap and state ops never arm it).
+            // The engine-resolved default cell time limit (`0`: disabled;
+            // the runtime bootstrap and state ops never arm it).
             cell_timeout_ms,
             ready_gate: None,
             on_restore,
@@ -408,7 +408,7 @@ impl IpythonKernelProvisioner for KernelProvisioner {
 /// Adapts the kernel manager to the ipython tool's executor contract.
 struct KernelManagerExecutor {
     manager: crate::kernel::manager::ReplKernelManager,
-    /// The provisioner-resolved per-cell watchdog budget (`None`: never armed).
+    /// The session's default cell time limit (`None`: never armed; `0`: disabled).
     cell_timeout_ms: Option<u64>,
 }
 
@@ -427,7 +427,12 @@ impl KernelExecutor for KernelManagerExecutor {
         let code = code.to_string();
         let signal = options.signal;
         let on_late_sent_agent_message = options.on_late_sent_agent_message;
-        let cell_timeout_ms = self.cell_timeout_ms;
+        // The session decides whether cells are limited at all; the model's
+        // per-call `timeout` only replaces the default limit.
+        let cell_timeout_ms = self
+            .cell_timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(|default_ms| options.timeout_ms.unwrap_or(default_ms));
         Box::pin(async move {
             let result = manager
                 .execute(
@@ -446,16 +451,14 @@ impl KernelExecutor for KernelManagerExecutor {
     }
 }
 
-/// Whether the per-cell watchdog arms for this session. Daemonless sessions
-/// keep `await bash()` unbounded by design (#3523): every over-budget cell
-/// there would be a sanctioned long await with no background lane to move
-/// to, so the watchdog arms only in daemon-backed sessions.
-pub(crate) fn arm_cell_timeout_ms(daemonless: bool, settings_ms: u64) -> Option<u64> {
-    if daemonless {
-        None
-    } else {
-        Some(settings_ms)
-    }
+/// The cell time limit this session arms. Upstream arms it only in
+/// daemon-backed sessions, since a daemonless `await bash()` is unbounded by
+/// design (#3523). The Oneiron build arms it in daemonless (print-mode)
+/// sessions too: a leg's spinning cell otherwise holds its process and its
+/// slot for hours. Its 30-minute default leaves room for a sanctioned long
+/// await, and `0` (setting or environment) still disarms it.
+pub(crate) fn arm_cell_timeout_ms(_daemonless: bool, settings_ms: u64) -> Option<u64> {
+    Some(settings_ms)
 }
 
 fn convert_status(
@@ -499,6 +502,7 @@ fn convert_execute_result(
             .collect(),
         sent_agent_messages: result.sent_agent_messages.unwrap_or_default(),
         bash_commands: result.bash_commands,
+        timed_out_after_ms: result.timed_out_after_ms,
     }
 }
 
@@ -613,11 +617,11 @@ mod tests {
     }
 
     #[test]
-    fn cell_watchdog_arms_only_in_daemon_backed_sessions() {
-        // Daemonless sessions keep `await bash()` unbounded by design
-        // (#3523): their over-budget cells are sanctioned long awaits.
-        assert_eq!(arm_cell_timeout_ms(true, 60_000), None);
-        assert_eq!(arm_cell_timeout_ms(true, 0), None);
+    fn cell_timeout_arms_in_daemon_backed_and_daemonless_sessions() {
+        // The Oneiron build arms print-mode (daemonless) sessions too: a
+        // spinning leg cell must not hold its process for hours.
+        assert_eq!(arm_cell_timeout_ms(true, 1_800_000), Some(1_800_000));
+        assert_eq!(arm_cell_timeout_ms(true, 0), Some(0));
         assert_eq!(arm_cell_timeout_ms(false, 60_000), Some(60_000));
         // A zero setting is the explicit disable: it must reach the
         // executor as an armed zero budget, not fall back to a default.

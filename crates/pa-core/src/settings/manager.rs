@@ -699,14 +699,19 @@ impl SettingsManager {
         self.merged.recent_models.clone().unwrap_or_default()
     }
 
-    /// The per-cell watchdog budget for user `python_repl` cells, in
-    /// milliseconds (`0` disables; the default is 60s). Daemonless
-    /// sessions never arm the watchdog.
+    /// The default time limit for user `python_repl` cells, in
+    /// milliseconds (`0` disables): the
+    /// [`PYTHON_CELL_TIMEOUT_ENV`](crate::settings::types::PYTHON_CELL_TIMEOUT_ENV)
+    /// variable when it holds whole seconds, else the setting, else 30
+    /// minutes.
     #[must_use]
     pub fn get_python_cell_timeout_ms(&self) -> u64 {
-        self.merged
-            .python_cell_timeout_ms
-            .unwrap_or(crate::settings::types::DEFAULT_PYTHON_CELL_TIMEOUT_MS)
+        python_cell_timeout_ms_from(
+            std::env::var(crate::settings::types::PYTHON_CELL_TIMEOUT_ENV)
+                .ok()
+                .as_deref(),
+            self.merged.python_cell_timeout_ms,
+        )
     }
 
     /// The steering queue's delivery mode: `all` co-delivers every queued message at
@@ -1097,6 +1102,21 @@ fn load_scope(
         other => other,
     };
     (from_value_lenient(&migrated), Some(migrated), None)
+}
+
+/// The default `python_repl` cell time limit in milliseconds from the
+/// environment variable's text (whole seconds, `0` = no limit) and the
+/// setting: the variable wins when it parses, then the setting, then
+/// [`DEFAULT_PYTHON_CELL_TIMEOUT_MS`](crate::settings::types::DEFAULT_PYTHON_CELL_TIMEOUT_MS).
+pub(crate) fn python_cell_timeout_ms_from(
+    env_seconds: Option<&str>,
+    setting_ms: Option<u64>,
+) -> u64 {
+    env_seconds
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1000))
+        .or(setting_ms)
+        .unwrap_or(crate::settings::types::DEFAULT_PYTHON_CELL_TIMEOUT_MS)
 }
 
 #[cfg(test)]
