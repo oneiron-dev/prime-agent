@@ -523,6 +523,7 @@ async fn golden_ipython_group_matches_ts() {
             None,
             None,
             None,
+            None,
         )
         .await;
         let recorded = &case["result"];
@@ -671,6 +672,7 @@ async fn ipython_places_memory_notices_around_the_cell_output() {
     let result = ipython::execute_ipython(
         &options,
         "frames = load()",
+        None,
         None,
         None,
         /*on_late_sent_agent_message*/ None,

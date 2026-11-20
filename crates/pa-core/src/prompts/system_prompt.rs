@@ -325,6 +325,10 @@ fn session_role_section(options: &BuildSystemPromptOptions) -> String {
                 .to_string()
         });
     }
+    lines.push(
+        "Do not run long blocking work in a cell; start long Python work as an asyncio task and check on it in later cells."
+            .to_string(),
+    );
     if options.allow_recursion == Some(false) {
         lines.push("Subagent spawning is disabled in this session.".to_string());
     }
