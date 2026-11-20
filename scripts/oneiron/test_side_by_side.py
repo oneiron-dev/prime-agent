@@ -567,6 +567,26 @@ class InstallerTests(Fixture):
                 self.run_main("install", "--stage-dir", str(newer))
         self.assertEqual(os.listdir(ts_site), [])
 
+    def test_installer_admits_an_older_release_venv_but_no_dir_leading_out_of_it(self) -> None:
+        # The launcher keys the kernel venv by release (24 Oct), so the agent dir holds the venv of the
+        # release in use while the next one installs (20 Nov: `install --no-activate` refused sel's).
+        older = self.agent_dir / "kernel-venv-0.10.1-oneiron.20261024.3"
+        site = older / "lib" / "python3.13" / "site-packages"
+        site.mkdir(parents=True)
+        (older / "bin").mkdir()
+        (older / "lib64").symlink_to("lib")
+        (older / "bin" / "python").symlink_to(sys.executable)
+        self.install()
+        ts_site = self.ts_agent / "kernel-venv" / "lib" / "python3.13" / "site-packages"
+        ts_site.mkdir(parents=True)
+        shutil.rmtree(site)
+        site.symlink_to(ts_site)
+        newer = self.stage("0.9.8-oneiron.20261001.2")
+        with self.assertRaisesRegex(SystemExit, f"refusing kernel venv {re.escape(str(older))}: "
+                                                f"a linked dir in it leads out of it: {re.escape(str(site))}$"):
+            self.run_main("install", "--stage-dir", str(newer))
+        self.assertEqual(os.listdir(ts_site), [])
+
     def test_installer_refuses_links_in_the_prefix(self) -> None:
         self.prefix.mkdir(parents=True)
         (self.prefix / "receipts").symlink_to(self.ts_agent)
@@ -907,7 +927,7 @@ class LauncherTests(Fixture):
         self.assert_refused(f"refusing agent dir {re.escape(str(self.agent_dir))}: only models.json may be a link "
                             f"in it, found: {re.escape(str(named))}")
         named.unlink()
-        self.assertEqual(self.launcher_env()["KERNEL_VENV"], str(venv))
+        self.assertEqual(self.launcher_env()["KERNEL_VENV"], str(self.agent_dir / f"kernel-venv-{VERSION}"))
 
     def test_launcher_refuses_a_python_cache_that_leads_out_of_the_agent_dir(self) -> None:
         # Bytecode is written wherever the cache resolves: a link out of the
@@ -949,7 +969,8 @@ class LauncherTests(Fixture):
         (venv / "bin").mkdir()
         (venv / "lib64").symlink_to("lib")
         (venv / "bin" / "python").symlink_to(sys.executable)
-        self.assertEqual(self.launcher_env()["KERNEL_VENV"], str(venv))
+        # One venv per release: the release's own is the default, and the old shared one is held to the rule.
+        self.assertEqual(self.launcher_env()["KERNEL_VENV"], str(self.agent_dir / f"kernel-venv-{VERSION}"))
         ts_site = self.ts_agent / "kernel-venv" / "lib" / "python3.13" / "site-packages"
         ts_site.mkdir(parents=True)
         shutil.rmtree(site)
@@ -959,6 +980,23 @@ class LauncherTests(Fixture):
         self.assert_refused("it holds the agent dir", PRIME_AGENT_RS_KERNEL_VENV=str(self.agent_dir))
         self.assertEqual(os.listdir(ts_site), [])
 
+
+    def test_launcher_admits_an_older_release_venv_but_no_dir_leading_out_of_it(self) -> None:
+        os.environ.pop("PRIME_AGENT_RS_KERNEL_VENV")
+        older = self.agent_dir / "kernel-venv-0.9.8-oneiron.20260930.1"
+        site = older / "lib" / "python3.13" / "site-packages"
+        site.mkdir(parents=True)
+        (older / "bin").mkdir()
+        (older / "lib64").symlink_to("lib")
+        (older / "bin" / "python").symlink_to(sys.executable)
+        self.assertEqual(self.launcher_env()["KERNEL_VENV"], str(self.agent_dir / f"kernel-venv-{VERSION}"))
+        ts_site = self.ts_agent / "kernel-venv" / "lib" / "python3.13" / "site-packages"
+        ts_site.mkdir(parents=True)
+        shutil.rmtree(site)
+        site.symlink_to(ts_site)
+        self.assert_refused(f"refusing kernel venv {re.escape(str(older))}: a linked dir in it leads out of it: "
+                            f"{re.escape(str(site))}$")
+        self.assertEqual(os.listdir(ts_site), [])
 
     def render_for(self, platform: str) -> None:
         """Rewrite the launcher as the installer renders it on `platform`."""

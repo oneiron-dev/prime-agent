@@ -60,7 +60,7 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Collection, Iterator
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 HOME = Path.home()
@@ -191,7 +191,11 @@ fi
 agent_dir=$(checked PRIME_AGENT_RS_AGENT_DIR "${{PRIME_AGENT_RS_AGENT_DIR:-$home/.prime/agent-rs}}")
 agent_dir=$(canon "$agent_dir")
 refuse_ts_state "agent dir" "$agent_dir"
-kernel_venv=$(checked PRIME_AGENT_RS_KERNEL_VENV "${{PRIME_AGENT_RS_KERNEL_VENV:-$agent_dir/kernel-venv}}")
+# One kernel venv per release (24 Oct): a shared venv is rebuilt whenever a different release bootstraps it, which
+# breaks the kernels of every process still running the other release. 0.9.8-oneiron.20261006.1 keeps the old path.
+release=$(basename "$(cd "$prefix/current" && pwd -P)")
+case "$release" in 0.9.8-oneiron.20261006.1) venv_default=$agent_dir/kernel-venv ;; *) venv_default=$agent_dir/kernel-venv-$release ;; esac
+kernel_venv=$(checked PRIME_AGENT_RS_KERNEL_VENV "${{PRIME_AGENT_RS_KERNEL_VENV:-$venv_default}}")
 kernel_venv=$(canon "$kernel_venv")
 refuse_ts_state "kernel venv" "$kernel_venv"
 case "$agent_dir/" in "$kernel_venv"/*) die "refusing kernel venv $kernel_venv: it holds the agent dir" ;; esac
@@ -218,21 +222,24 @@ if [ -d "$agent_dir" ]; then
   links=$(find "$agent_dir" -type l -exec sh -c '
     agent=$1 venv=$2; shift 2
     for link; do
-      case "$link" in "$venv"/*) continue ;; esac
+      case "$link" in "$venv"/*|"$agent"/kernel-venv/*|"$agent"/kernel-venv-*/*) continue ;; esac
       if [ "$link" = "$agent/models.json" ] && [ -f "$link" ]; then continue; fi
       printf "%s\\n" "$link"
     done' sh "$agent_dir" "$kernel_venv" {{}} +) || die "cannot scan the agent dir $agent_dir for links"
   if [ -n "$links" ]; then die "refusing agent dir $agent_dir: only models.json may be a link in it, found: $links"; fi
 fi
-if [ -d "$kernel_venv" ]; then
-  links=$(find "$kernel_venv" -type l -exec sh -c '
+# Every kernel venv in the agent dir is held to this rule, not only this release's: the scan above skips them all,
+# and an older release's venv is the one its rollback runs.
+for venv in "$kernel_venv" "$agent_dir"/kernel-venv "$agent_dir"/kernel-venv-*; do
+  [ -d "$venv" ] || continue
+  links=$(find "$venv" -type l -exec sh -c '
     venv=$1; shift
     for link; do
       [ -d "$link" ] || continue
       case "$(cd -P "$link" 2>/dev/null && pwd)/" in "$venv"/*) ;; *) printf "%s\\n" "$link" ;; esac
-    done' sh "$kernel_venv" {{}} +) || die "cannot scan the kernel venv $kernel_venv for links"
-  if [ -n "$links" ]; then die "refusing kernel venv $kernel_venv: a linked dir in it leads out of it: $links"; fi
-fi
+    done' sh "$venv" {{}} +) || die "cannot scan the kernel venv $venv for links"
+  if [ -n "$links" ]; then die "refusing kernel venv $venv: a linked dir in it leads out of it: $links"; fi
+done
 
 if [ ! -e "$sock_dir" ]; then (umask 077 && mkdir -p "$sock_dir"); fi
 if [ -L "$sock_dir" ] || [ ! -d "$sock_dir" ] || [ ! -O "$sock_dir" ]; then
@@ -564,8 +571,8 @@ def runtime_dirs() -> dict[str, Path]:
     return {"agent dir": agent_dir, "socket dir": socket_dir, "kernel venv": kernel_venv}
 
 
-def tree_links(root: Path, skip: Path | None = None) -> list[Path]:
-    """Every symlink under `root` (none followed), the `skip` subtree aside.
+def tree_links(root: Path, skip: Collection[Path] = ()) -> list[Path]:
+    """Every symlink under `root` (none followed), the `skip` subtrees aside.
     A subtree that cannot be read is an error, not an empty answer."""
     if not root.exists():
         return []
@@ -576,29 +583,48 @@ def tree_links(root: Path, skip: Path | None = None) -> list[Path]:
     found = []
     for dirpath, dirnames, filenames in os.walk(root, onerror=unreadable):
         here = Path(dirpath)
-        dirnames[:] = [name for name in dirnames if here / name != skip]
+        dirnames[:] = [name for name in dirnames if here / name not in skip]
         found.extend(here / name for name in dirnames + filenames if (here / name).is_symlink())
     return found
+
+
+def kernel_venvs(agent_dir: Path, kernel_venv: Path) -> list[Path]:
+    """The kernel venvs the agent-dir rules hold: `kernel_venv` and every
+    venv in the agent dir the launcher keys by release (`kernel-venv`,
+    `kernel-venv-<release>`), each a real dir; a link there is no venv, and
+    the agent-dir scan refuses it as a link."""
+    try:
+        children = sorted(agent_dir.iterdir()) if agent_dir.is_dir() else []
+    except OSError as error:
+        raise SystemExit(f"error: cannot scan {agent_dir} for links: {error}") from error
+    found = [kernel_venv] + [child for child in children
+                             if (child.name == "kernel-venv" or child.name.startswith("kernel-venv-"))
+                             and child.is_dir() and not child.is_symlink()]
+    return list(dict.fromkeys(found))
 
 
 def check_agent_tree(agent_dir: Path, kernel_venv: Path, *, old_skills_link: bool) -> None:
     """Nothing in the agent dir may alias out of it (`sessions -> <TS
     sessions>` would hand TS state to the Rust daemon): only models.json may
-    be a link, to a regular file. The kernel venv holds uv's links (its
-    interpreter, lib64 -> lib): a linked dir there must stay inside it.
+    be a link, to a regular file. A kernel venv holds uv's links (its
+    interpreter, lib64 -> lib): a linked dir there must stay inside that
+    venv. Every release's venv in the agent dir is held to it, not only
+    `kernel_venv` (an older release's is the one its rollback runs).
     `old_skills_link` admits the pre-snapshot skills link the seeder is about
     to replace. The launcher applies the same rules."""
+    venvs = kernel_venvs(agent_dir, kernel_venv)
     allowed = {agent_dir / "skills"} if old_skills_link else set()
-    bad = [link for link in tree_links(agent_dir, skip=kernel_venv) if link not in allowed
+    bad = [link for link in tree_links(agent_dir, skip=set(venvs)) if link not in allowed
            and not (link == agent_dir / "models.json" and link.is_file())]
     if bad:
         raise SystemExit(f"error: refusing agent dir {agent_dir}: only models.json may be a link in it, "
                          f"found: {' '.join(map(str, bad))}")
-    escapes = [link for link in tree_links(kernel_venv) if link.is_dir()
-               and not (link.resolve() == kernel_venv or is_within(link.resolve(), kernel_venv))]
-    if escapes:
-        raise SystemExit(f"error: refusing kernel venv {kernel_venv}: a linked dir in it leads out of it: "
-                         f"{' '.join(map(str, escapes))}")
+    for venv in venvs:
+        escapes = [link for link in tree_links(venv) if link.is_dir()
+                   and not (link.resolve() == venv or is_within(link.resolve(), venv))]
+        if escapes:
+            raise SystemExit(f"error: refusing kernel venv {venv}: a linked dir in it leads out of it: "
+                             f"{' '.join(map(str, escapes))}")
 
 
 # One path component: the version names the install dir, the `current`
