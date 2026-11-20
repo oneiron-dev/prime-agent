@@ -674,6 +674,7 @@ async fn ipython_places_memory_notices_around_the_cell_output() {
         "frames = load()",
         None,
         None,
+        None,
         /*on_late_sent_agent_message*/ None,
     )
     .await

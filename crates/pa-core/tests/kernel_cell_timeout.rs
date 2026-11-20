@@ -99,7 +99,7 @@ fn session_config(
     agent_dir: PathBuf,
     model: pa_agent::types::Model,
     session: SessionManager,
-    provider: &ScriptedProvider,
+    provider: &std::sync::Arc<ScriptedProvider>,
     daemonless: bool,
 ) -> SessionEngineConfig {
     SessionEngineConfig {
